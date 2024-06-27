@@ -9,6 +9,7 @@ This repository hosts its technical report and will also be utilized for the for
 
 <h2 id="updates">🔥 Updates</h2>
 
+ - **June 27, 2024**: We present a Chinese blog with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu</a>.
  - **June 26, 2024**: Initial technical report release.
 
 
