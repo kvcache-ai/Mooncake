@@ -29,7 +29,6 @@ Please kindly cite our paper if you find it is useful:
   title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},
   year         = {2024}
+  url={https://arxiv.org/abs/2407.00079}, 
 }
 ```
-
-Remark: arXiv version is still on holding.
