@@ -1,6 +1,6 @@
 <div align="center">
   <h1>Mooncake: A KVCache-centric Disaggregated<br/> Architecture for LLM Serving</h1>
-  <a href="Mooncake-v1.pdf" target="_blank"><strong>📃 Technical Report</strong></a>
+  <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>📃 Technical Report</strong></a>
 </div>
 <br/>
 
@@ -28,7 +28,7 @@ Please kindly cite our paper if you find it is useful:
 @article{qin2024mooncake,
   title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},
-  year         = {2024}
-  url={https://arxiv.org/abs/2407.00079}, 
+  year         = {2024},
+  url          = {https://arxiv.org/abs/2407.00079}
 }
 ```
