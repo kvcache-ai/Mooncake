@@ -1,0 +1,17 @@
+[package]
+name = "transfer_engine_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.79"
+libc = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3.0"
+hostname = "0.3"
+dns-lookup = "1.0"
+
+[build-dependencies]
+bindgen = "0.59"
+cmake = "0.1.50"
