@@ -1,4 +1,4 @@
-module p2pstore
+module github.com/kvcache-ai/Mooncake/mooncake-p2p-store/src/p2pstore
 
 go 1.20
 
