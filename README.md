@@ -68,7 +68,7 @@ Thanks to the high performance of Transfer Engine, P2P Stores can also distribut
 ![p2p-store.gif](image/p2p-store.gif)
 
 ### vLLM Integration ([Guide](doc/en/vllm-integration.md))
-To optmize LLM inference, the vLLM's community is working at supporting [disaggregated prefilling (PR 8498)](https://github.com/vllm-project/vllm/pull/8498). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
+To optimize LLM inference, the vLLM's community is working at supporting [disaggregated prefilling (PR 8498)](https://github.com/vllm-project/vllm/pull/8498). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
 
 We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer**. Transfer Engine provides simpler interface and more efficient use of RDMA devices. In the future, we plan to build Mooncake Store on the basis of Transfer Engine, which supports pooled prefill/decode disaggregation.
 
