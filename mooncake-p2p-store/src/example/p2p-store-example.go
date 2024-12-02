@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"p2pstore"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/kvcache-ai/Mooncake/mooncake-p2p-store/src/p2pstore"
 )
 
 var (
