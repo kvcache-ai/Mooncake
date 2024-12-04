@@ -1,7 +1,9 @@
 # vLLM Disaggregated Prefill/Decode Demo
 
 ## Overview
-This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. Benchmark results will be added soon.
+This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. Benchmark results will be added soon.
+
+**_Please note that this is not a fully ready version and will be modified anytime based on feedback from the vLLM community._**
 
 ## Installation
 ### Prerequisite
