@@ -3,8 +3,6 @@
 ## Overview
 This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. Benchmark results will be added soon.
 
-![vllm-integration-demo](../../image/vllm-integration-demo.gif)
-
 ## Installation
 ### Prerequisite
 Please install the Mooncake Transfer Engine according to the [instructions](build.md) first.
