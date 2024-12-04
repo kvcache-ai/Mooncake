@@ -72,7 +72,7 @@ To optimize LLM inference, the vLLM's community is working at supporting [disagg
 
 We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer**. Transfer Engine provides simpler interface and more efficient use of RDMA devices. In the future, we plan to build Mooncake Store on the basis of Transfer Engine, which supports pooled prefill/decode disaggregation.
 
-**_Update[Dec 3, 2024]: Here is the nightly vLLM Integration ([Guide v0.2-Nightly](doc/en/vllm-integration-v0.2-nightly.md)) that is based on vLLM's main branch._**
+**_Update[Dec 4, 2024]: Here is the nightly vLLM Integration ([Guide v0.2-Nightly](doc/en/vllm-integration-v0.2-nightly.md)) that is based on vLLM's main branch._**
 
 #### Performance
 By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, TTFT of vLLM with Transfer Engine is up to 33% lower than traditional TCP-based transports.
