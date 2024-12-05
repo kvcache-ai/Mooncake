@@ -16,7 +16,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-link-search=native=../../../build/mooncake-transfer-engine/src");
+    println!("cargo:rustc-link-search=native=../build/src");
     println!("cargo:rustc-link-lib=static=transfer_engine");
 
     println!("cargo:rustc-link-lib=stdc++");
@@ -29,7 +29,7 @@ fn main() {
     println!("cargo:rustc-link-lib=etcd-cpp-api");
 
     let bindings = bindgen::builder()
-        .header("../../include/transfer_engine_c.h")
+        .header("../include/transfer_engine_c.h")
         .generate()
         .expect("Unable to generate bindings");
 
