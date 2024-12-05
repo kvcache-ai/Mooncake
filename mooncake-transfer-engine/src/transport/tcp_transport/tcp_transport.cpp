@@ -239,7 +239,7 @@ int TcpTransport::allocateLocalSegmentID() {
 }
 
 int TcpTransport::registerLocalMemory(void *addr, size_t length,
-                                      const string &location,
+                                      const std::string &location,
                                       bool remote_accessible,
                                       bool update_metadata) {
     (void)remote_accessible;
