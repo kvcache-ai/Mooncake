@@ -454,7 +454,7 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/example/rust-example`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](../../../mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile rust-example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](../../mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.

@@ -13,5 +13,5 @@ hostname = "0.3"
 dns-lookup = "1.0"
 
 [build-dependencies]
-bindgen = "0.59"
+bindgen = "0.70"
 cmake = "0.1.50"
