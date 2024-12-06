@@ -51,10 +51,17 @@ static inline int bindToSocket(int socket_id) {
     if (socket_id < 0 || socket_id >= num_nodes) socket_id = 0;
     struct bitmask *cpu_list = numa_allocate_cpumask();
     numa_node_to_cpus(socket_id, cpu_list);
+    int nr_cpus = 0;
     for (int cpu = 0; cpu < numa_num_possible_cpus(); ++cpu) {
-        if (numa_bitmask_isbitset(cpu_list, cpu)) CPU_SET(cpu, &cpu_set);
+        if (numa_bitmask_isbitset(cpu_list, cpu) &&
+            numa_bitmask_isbitset(numa_all_cpus_ptr, cpu)) {
+            CPU_SET(cpu, &cpu_set);
+            nr_cpus++;
+        }
     }
     numa_free_cpumask(cpu_list);
+    if (nr_cpus == 0)
+        return 0;
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set)) {
         LOG(ERROR) << "Failed to set socket affinity";
         return ERR_NUMA;
