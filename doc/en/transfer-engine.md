@@ -325,7 +325,7 @@ Unregisters the region.
 - `addr`: The starting address of the registration space;
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 
-### Segment Management and etcd Metadata
+### Segment Management and Metadata Format
 
 TransferEngine provides the `openSegment` function, which obtains a `SegmentHandle` for subsequent `Transport` transfers.
 ```cpp
@@ -343,7 +343,7 @@ int closeSegment(SegmentHandle segment_id);
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 
 <details>
-<summary><strong>etcd Metadata Form</strong></summary>
+<summary><strong>Metadata Format</strong></summary>
 
 ```
 // Used to find the communicable address and exposed rpc port based on server_name.
@@ -416,10 +416,10 @@ Value = {
 
 ```cpp
 TransferEngine(std::unique_ptr<TransferMetadata> metadata_client);
-TransferMetadata(const std::string &metadata_server);
+TransferMetadata(const std::string &metadata_server, const std::string &protocol = "etcd");
 ```
 
-- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server/etcd, facilitating user deployment in different environments. `metadata_server` represents the IP address or hostname of the etcd server.
+- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd` and `redis` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server.
 
 For easy exception handling, TransferEngine needs to call the init function for secondary construction after construction:
 ```cpp

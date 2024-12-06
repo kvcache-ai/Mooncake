@@ -90,7 +90,7 @@ class TransferMetadata {
     };
 
    public:
-    TransferMetadata(const std::string &metadata_uri);
+    TransferMetadata(const std::string &metadata_uri, const std::string &protocol = "etcd");
 
     ~TransferMetadata();
 

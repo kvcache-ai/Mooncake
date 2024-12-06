@@ -23,6 +23,12 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#include <cufile.h>
+#endif // USE_CUDA
+
 // Experimental: Per-thread SegmentDesc & EndPoint Caches
 // #define CONFIG_CACHE_SEGMENT_DESC
 // #define CONFIG_CACHE_ENDPOINT
@@ -196,8 +202,13 @@ void WorkerPool::performPostSend(int thread_id) {
         if (entry.second[0]->target_id == LOCAL_SEGMENT_ID) {
             for (auto &slice : entry.second) {
                 LOG_ASSERT(slice->target_id == LOCAL_SEGMENT_ID);
+#ifdef USE_CUDA
+                cudaMemcpy((void *)slice->rdma.dest_addr, slice->source_addr,
+                           slice->length, cudaMemcpyDefault);
+#else
                 memcpy((void *)slice->rdma.dest_addr, slice->source_addr,
                        slice->length);
+#endif
                 slice->markSuccess();
             }
             processed_slice_count_.fetch_add(entry.second.size());
