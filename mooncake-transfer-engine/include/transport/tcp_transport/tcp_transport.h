@@ -58,7 +58,7 @@ class TcpTransport : public Transport {
 
     int allocateLocalSegmentID();
 
-    int registerLocalMemory(void *addr, size_t length, const string &location,
+    int registerLocalMemory(void *addr, size_t length, const std::string &location,
                             bool remote_accessible, bool update_metadata);
 
     int unregisterLocalMemory(void *addr, bool update_metadata = false);
