@@ -33,6 +33,7 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
+  include_directories(/usr/local/cuda/include)
 endif()
 
 add_subdirectory(mooncake-transfer-engine)
