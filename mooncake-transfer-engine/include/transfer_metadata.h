@@ -118,7 +118,7 @@ class TransferMetadata {
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
-    int addLocalSegment(SegmentID segment_id, const string &segment_name,
+    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
     
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);

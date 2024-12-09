@@ -189,7 +189,7 @@ class Transport {
 
    private:
     virtual int registerLocalMemory(void *addr, size_t length,
-                                    const string &location,
+                                    const std::string &location,
                                     bool remote_accessible,
                                     bool update_metadata = true) = 0;
 

@@ -135,9 +135,8 @@ impl TransferEngine {
         location: &str,
     ) -> Result<()> {
         let location_c = CString::new(location).map_err(|_| anyhow!("CString::new failed"))?;
-        let length_c = length as bindings::size_t;
         let ret = unsafe {
-            bindings::registerLocalMemory(self.engine, addr, length_c, location_c.as_ptr(), 1)
+            bindings::registerLocalMemory(self.engine, addr, length, location_c.as_ptr(), 1)
         };
         if ret < 0 {
             bail!("Failed to register local memory")
@@ -162,11 +161,11 @@ impl TransferEngine {
     ) -> Result<()> {
         let location_c = CString::new(location).map_err(|_| anyhow!("CString::new failed"))?;
         let mut buffer_list_c: Vec<bindings::buffer_entry_t> = vec![];
-        let buffer_len_c = buffer_list.len() as bindings::size_t;
+        let buffer_len_c = buffer_list.len();
         for i in 0..buffer_list.len() {
             buffer_list_c.push(bindings::buffer_entry_t {
                 addr: buffer_list[i].addr,
-                length: buffer_list[i].length as bindings::size_t,
+                length: buffer_list[i].length as usize,
             });
         }
         let ret = unsafe {
@@ -186,7 +185,7 @@ impl TransferEngine {
 
     pub fn unregister_local_memory_batch(&self, buffer_list: &[BufferEntry]) -> Result<()> {
         let mut addr_list: Vec<*mut c_void> = buffer_list.iter().map(|entry| entry.addr).collect();
-        let addr_len = buffer_list.len() as bindings::size_t;
+        let addr_len = buffer_list.len();
         let ret = unsafe {
             bindings::unregisterLocalMemoryBatch(self.engine, addr_list.as_mut_ptr(), addr_len)
         };
@@ -198,8 +197,7 @@ impl TransferEngine {
     }
 
     pub fn allocate_batch_id(&self, batch_size: usize) -> Result<BatchID> {
-        let batch_size_c = batch_size as bindings::size_t;
-        let ret = unsafe { bindings::allocateBatchID(self.xport, batch_size_c) };
+        let ret = unsafe { bindings::allocateBatchID(self.xport, batch_size) };
         if ret == u64::MAX {
             bail!("Failed to allocate batch ID")
         } else {
@@ -222,9 +220,8 @@ impl TransferEngine {
                 length: requests[i].length,
             })
         }
-        let count_c = requests.len() as bindings::size_t;
         let ret = unsafe {
-            bindings::submitTransfer(self.xport, batch_id, requests_c.as_mut_ptr(), count_c)
+            bindings::submitTransfer(self.xport, batch_id, requests_c.as_mut_ptr(), requests.len())
         };
         if ret < 0 {
             bail!("Failed to submit transfer")
@@ -239,7 +236,7 @@ impl TransferEngine {
             transferred_bytes: 0,
         };
         let ret =
-            unsafe { bindings::getTransferStatus(self.xport, batch_id, task_id, &mut status) };
+            unsafe { bindings::getTransferStatus(self.xport, batch_id, task_id as usize, &mut status) };
         if ret < 0 {
             bail!("Failed to get transfer status")
         } else {
