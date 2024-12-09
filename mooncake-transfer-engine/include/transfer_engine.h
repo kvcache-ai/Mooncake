@@ -79,7 +79,7 @@ class TransferEngine {
     Transport *initTransport(const char *proto);
 
     std::vector<Transport *> installed_transports_;
-    string local_server_name_;
+    std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
     std::vector<MemoryRegion> local_memory_regions_;
 };

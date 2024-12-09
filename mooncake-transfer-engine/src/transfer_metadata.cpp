@@ -362,7 +362,7 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
 }
 
 int TransferMetadata::addLocalSegment(SegmentID segment_id,
-                                      const string &segment_name,
+                                      const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
