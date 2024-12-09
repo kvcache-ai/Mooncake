@@ -83,7 +83,7 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 | Transfer Engine (RDMA) | 12.07                           | 2046.78                        | 1165.25        | 678.74           | 4576.57       |
 | TCP  | 12.06                           | 2045.51                        | 1925.52        | 1011.58          | 8149.52       |
 
-- Click [here](doc/en/vllm_benchmark_results.md) to access detailed benchmark results.
+- Click [here](doc/en/vllm-benchmark-results.md) to access detailed benchmark results.
 
 **More advanced features will coming soon, so stay tuned!**
 
