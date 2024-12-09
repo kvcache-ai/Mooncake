@@ -24,9 +24,7 @@
 #include "transport/rdma_transport/rdma_transport.h"
 
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
-#include <cufile.h>
 #endif // USE_CUDA
 
 // Experimental: Per-thread SegmentDesc & EndPoint Caches
