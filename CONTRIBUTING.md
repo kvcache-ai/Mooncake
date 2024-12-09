@@ -4,7 +4,7 @@
 Thank you for your interest in contributing to Mooncake! Our community warmly welcomes everyone and values all contributions, whether big or small. Motivated by the [contribution guidelines](https://docs.vllm.ai/en/latest/contributing/overview.html) in the vLLM community, here are several ways you can get involved in the project:
 
 - Identify and report any issues or bugs.
-- Request or add support for a new components of Mooncake (such as new transport class).
+- Request or add support for a new component of Mooncake (such as a new transport class).
 - Suggest or implement new features.
 - Improve documentation or contribute a how-to guide.
 - More unit tests and evaluation scripts.
@@ -16,7 +16,7 @@ Thank you for your interest in contributing to Mooncake! Our community warmly we
 
 ### PR Title and Classification
 
-Use prefixed PR title to indicate the type of change. Please use one of the following:
+Use a prefixed PR title to indicate the type of changes. Please use one of the following:
 
 - ``[Bugfix]`` for bug fixes.
 - ``[CI/Build]`` for build or continuous integration improvements.
