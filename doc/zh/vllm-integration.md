@@ -1,7 +1,7 @@
 # vLLM 分布式预填充/解码分离演示
 
 ## 概述
-目前，我们基于 [PR 8498](https://github.com/vllm-project/vllm/pull/8498) 支持了 mooncake-transfer-engine 与 vLLM 项目的集成（vllm 版本：v0.6.2），以加速跨节点的分布式预填充/解码分离场景下的 KVCache 传输（[基准测试结果](../en/vllm_benchmark_results.md)）。未来，我们将不依赖 PR 8498 进行开发，发布一个分布式的 KVStore，并将其与 vLLM 的前缀缓存功能进行集成，以支持多实例间的 KVCache 共享。
+目前，我们基于 [PR 8498](https://github.com/vllm-project/vllm/pull/8498) 支持了 mooncake-transfer-engine 与 vLLM 项目的集成（vllm 版本：v0.6.2），以加速跨节点的分布式预填充/解码分离场景下的 KVCache 传输（[基准测试结果](../en/vllm-benchmark-results.md)）。未来，我们将不依赖 PR 8498 进行开发，发布一个分布式的 KVStore，并将其与 vLLM 的前缀缓存功能进行集成，以支持多实例间的 KVCache 共享。
 
 ![vllm-integration-demo](../../image/vllm-integration-demo.gif)
 

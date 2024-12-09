@@ -1,7 +1,7 @@
 # vLLM Disaggregated Prefill/Decode Demo
 
 ## Overview
-This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. Benchmark results will be added soon.
+This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
 
 **_Please note that this is not a fully ready version and will be modified anytime based on feedback from the vLLM community._**
 
@@ -74,10 +74,10 @@ etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://loc
 # You may need to terminate other etcd processes before running the above command
 
 # 2. Run on the prefilling side (producer role)
-MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8100 --max-model-len 10000 --gpu-memory-utilization 0.95 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":5e9, "kv_ip": "192.168.0.137", "kv_port": 51000 }'
+MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8100 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":2e9}'
 
 # 3. Run on the decoding side (consumer role)
-MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8200 --max-model-len 10000 --gpu-memory-utilization 0.95 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":5e9, "kv_ip": "192.168.0.137", "kv_port": 51000}'
+MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8200 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":2e9}'
 ```
 
 - `MOONCAKE_CONFIG_PATH` is the path to the mooncake.json configuration file.
@@ -92,7 +92,9 @@ MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.en
   - Please set up `kv_connector` to `MooncakeConnector`.
   - `kv_role` is the node's role, either 'kv_producer' or 'kv_consumer'.
   - `kv_rank` is the rank of the instance. Currently, `kv_producer`'s rank is 0, `kv_consumer`'s rank is 1.
-  - `kv_ip` and `kv_port` are used to specify the IP address and port of the master node in a distributed setup for disaggregated prefill feature. **_Be sure to set up the same `kv_ip` and same `kv_port` on each node._**
+  - `kv_parallel_size` is fixed to 2 currently.
+  - `kv_buffer_size` is the size of the KVCache lookup buffer, if the average `input_len` of the prompt is large, please increase the buffer size. If the OOM still occurs, please decrease the ratio of `--gpu-memory-utilization`.
+  - `kv_ip` and `kv_port` are used to specify the IP address and port of the master node for "PyNcclConnector" distributed setup. It is not used for "MooncakeConnector" currently. Instead, "MooncakeConnector" uses a config file to set up the distributed connection. Therefore, you don't need to set these params for "MooncakeConnector" currently.
 
 ```bash
 # 4. Start the proxy server on one node (Let's take the prefill node as an example)
