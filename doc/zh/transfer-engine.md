@@ -296,7 +296,7 @@ int unregisterLocalMemory(void *addr);
 - addr: 注册空间起始地址；
 - 返回值：若成功，返回 0；否则返回负数值。
 
-### Segment 管理与 etcd 元数据
+### Segment 管理与元数据格式
 
 TranferEngine 提供 `openSegment` 函数，该函数获取一个 `SegmentHandle`，用于后续 `Transport` 的传输。
 ```cpp
@@ -312,7 +312,7 @@ int closeSegment(SegmentHandle segment_id);
 - 返回值：若成功，返回 0；否则返回负数值。
 
 <details>
-<summary><strong>etcd 元数据形态</strong></summary>
+<summary><strong>元数据格式</strong></summary>
 
 ```
 // 用于根据 server_name 查找可通信的地址以及暴露的 rpc 端口。
@@ -385,10 +385,11 @@ Value = {
 
 ```cpp
 TransferEngine(std::unique_ptr<TransferMetadata> metadata_client);
-TransferMetadata(const std::string &metadata_server);
+TransferMetadata(const std::string &metadata_server, const std::string &protocol = "etcd");
 ```
 
-- TransferMetadata 对象指针，该对象将 TransferEngine 框架与元数据服务器/etcd 等带外通信逻辑抽取出来，以方便用户将其部署到不同的环境中。metadata_server 表示 etcd 服务器的 IP 地址或主机名。
+- TransferMetadata 对象指针，该对象将 TransferEngine 框架与元数据服务器等带外通信逻辑抽取出来，以方便用户将其部署到不同的环境中。
+  目前支持 `etcd` 及 `redis` 两种元数据服务。`metadata_server` 表示元数据服务器/集群的 IP 地址或主机名。
 
 为了便于异常处理，TransferEngine 在完成构造后需要调用init函数进行二次构造：
 ```cpp
