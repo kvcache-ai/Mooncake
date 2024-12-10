@@ -47,16 +47,6 @@ class TCPTransportTest : public ::testing::Test {
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#ifdef USE_CUDA
-    if (from_vram) {
-        int gpu_id = FLAGS_gpu_id;
-        void *d_buf;
-        checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-        checkCudaError(cudaMalloc(&d_buf, size),
-                       "Failed to allocate device memory");
-        return d_buf;
-    }
-#endif
     return numa_alloc_onnode(size, socket_id);
 }
 

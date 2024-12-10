@@ -30,7 +30,8 @@ sudo apt-get install -y build-essential \
                         libgrpc++-dev \
                         libprotobuf-dev \
                         protobuf-compiler-grpc \
-                        pybind11-dev
+                        pybind11-dev \
+                        libhiredis-dev
 
 echo "*** Download and installing [cpprest sdk] ***"
 mkdir ${REPO_ROOT}/thirdparties

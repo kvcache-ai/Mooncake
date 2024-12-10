@@ -20,6 +20,10 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#ifdef USE_REDIS
+#include <hiredis/hiredis.h>
+#endif
+
 #include <cassert>
 #include <set>
 
@@ -41,12 +45,80 @@ static inline std::string getFullMetadataKey(const std::string &segment_name) {
 }
 
 struct TransferMetadataImpl {
-    TransferMetadataImpl(const std::string &metadata_uri)
+    TransferMetadataImpl() {}
+    virtual ~TransferMetadataImpl() {}
+    virtual bool get(const std::string &key, Json::Value &value) = 0;
+    virtual bool set(const std::string &key, const Json::Value &value) = 0;
+    virtual bool remove(const std::string &key) = 0;
+};
+
+#ifdef USE_REDIS
+struct TransferMetadataImpl4Redis : public TransferMetadataImpl {
+    TransferMetadataImpl4Redis(const std::string &metadata_uri)
+        : client_(nullptr), metadata_uri_(metadata_uri) {
+        auto hostname_port = parseHostNameWithPort(metadata_uri);
+        client_ = redisConnect(hostname_port.first.c_str(), hostname_port.second);
+        if (!client_ || client_->err) {
+            LOG(ERROR) << "redis error: " << client_->errstr;
+        }
+    }
+
+    virtual ~TransferMetadataImpl4Redis() {}
+
+    virtual bool get(const std::string &key, Json::Value &value) {
+        Json::Reader reader;
+        redisReply *resp = (redisReply *) redisCommand(client_, "GET %s", key.c_str());
+        if (!resp) {
+            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            return false;
+        }
+        auto json_file = std::string(resp->str);
+        freeReplyObject(resp);
+        if (!reader.parse(json_file, value)) return false;
+        if (globalConfig().verbose)
+            LOG(INFO) << "Get segment desc, key=" << key
+                      << ", value=" << json_file;
+        return true;
+    }
+
+    virtual bool set(const std::string &key, const Json::Value &value) {
+        Json::FastWriter writer;
+        const std::string json_file = writer.write(value);
+        if (globalConfig().verbose)
+            LOG(INFO) << "Put segment desc, key=" << key
+                      << ", value=" << json_file;
+        
+        redisReply *resp = (redisReply *) redisCommand(client_,"SET %s %s", key.c_str(), json_file.c_str());
+        if (!resp) {
+            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            return false;
+        }
+        freeReplyObject(resp);
+        return true;
+    }
+
+    virtual bool remove(const std::string &key) {
+        redisReply *resp = (redisReply *) redisCommand(client_,"DEL %s", key.c_str());
+        if (!resp) {
+            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            return false;
+        }
+        freeReplyObject(resp);
+        return true;
+    }
+
+    redisContext *client_;
+    const std::string metadata_uri_;
+};
+#endif // USE_REDIS
+
+struct TransferMetadataImpl4Etcd : public TransferMetadataImpl {
+    TransferMetadataImpl4Etcd(const std::string &metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
 
-    ~TransferMetadataImpl() {}
+    virtual ~TransferMetadataImpl4Etcd() {}
 
-    bool get(const std::string &key, Json::Value &value) {
+    virtual bool get(const std::string &key, Json::Value &value) {
         Json::Reader reader;
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
@@ -63,7 +135,7 @@ struct TransferMetadataImpl {
         return true;
     }
 
-    bool set(const std::string &key, const Json::Value &value) {
+    virtual bool set(const std::string &key, const Json::Value &value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         if (globalConfig().verbose)
@@ -79,7 +151,7 @@ struct TransferMetadataImpl {
         return true;
     }
 
-    bool remove(const std::string &key) {
+    virtual bool remove(const std::string &key) {
         auto resp = client_.rm(key);
         if (!resp.is_ok()) {
             LOG(ERROR) << "Error from etcd client, etcd uri: " << metadata_uri_
@@ -94,11 +166,24 @@ struct TransferMetadataImpl {
     const std::string metadata_uri_;
 };
 
-TransferMetadata::TransferMetadata(const std::string &metadata_uri)
+TransferMetadata::TransferMetadata(const std::string &metadata_uri, const std::string &protocol)
     : listener_running_(false) {
-    impl_ = std::make_shared<TransferMetadataImpl>(metadata_uri);
-    if (!impl_) {
-        LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
+    if (protocol == "etcd") {
+        impl_ = std::make_shared<TransferMetadataImpl4Etcd>(metadata_uri);
+        if (!impl_) {
+            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
+            exit(EXIT_FAILURE);
+        }
+#ifdef USE_REDIS
+    } else if (protocol == "redis") {
+        impl_ = std::make_shared<TransferMetadataImpl4Redis>(metadata_uri);
+        if (!impl_) {
+            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
+            exit(EXIT_FAILURE);
+        }
+#endif // USE_REDIS
+    } else {
+        LOG(ERROR) << "Unsupported metdata protocol " << protocol;
         exit(EXIT_FAILURE);
     }
     next_segment_id_.store(1);

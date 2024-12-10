@@ -54,6 +54,7 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(metadata_type, "etcd", "Metadata type: etcd|redis");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -221,7 +222,7 @@ std::string loadNicPriorityMatrix() {
 
 int initiator() {
     auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
+        std::make_shared<TransferMetadata>(FLAGS_metadata_server, FLAGS_metadata_type);
     LOG_ASSERT(metadata_client);
 
     const size_t ram_buffer_size = 1ull << 30;
@@ -306,7 +307,7 @@ int initiator() {
 
 int target() {
     auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
+        std::make_shared<TransferMetadata>(FLAGS_metadata_server, FLAGS_metadata_type);
     LOG_ASSERT(metadata_client);
 
     const size_t ram_buffer_size = 1ull << 30;

@@ -49,7 +49,16 @@ std::string formatDeviceNames(const std::string &device_names) {
 int VLLMAdaptor::initialize(const char *local_hostname,
                             const char *metadata_server, const char *protocol,
                             const char *device_name) {
-    auto metadata_client = std::make_shared<TransferMetadata>(metadata_server);
+    return initializeExt(local_hostname, metadata_server, protocol, device_name,
+                         "etcd");
+}
+
+int VLLMAdaptor::initializeExt(const char *local_hostname,
+                               const char *metadata_server,
+                               const char *protocol, const char *device_name,
+                               const char *metadata_type) {
+    auto metadata_client =
+        std::make_shared<TransferMetadata>(metadata_server, metadata_type);
     if (!metadata_client) return -1;
 
     engine_ = std::make_unique<TransferEngine>(metadata_client);
@@ -203,6 +212,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
     py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
         .def(py::init<>())
         .def("initialize", &VLLMAdaptor::initialize)
+        .def("initializeExt", &VLLMAdaptor::initializeExt)
         .def("allocateManagedBuffer", &VLLMAdaptor::allocateManagedBuffer)
         .def("freeManagedBuffer", &VLLMAdaptor::freeManagedBuffer)
         .def("transferSync", &VLLMAdaptor::transferSync)

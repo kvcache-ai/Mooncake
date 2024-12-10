@@ -32,6 +32,7 @@ This document describes how to build Mooncake.
 - googletest: 1.12.x
 - gcc: 10.2.1
 - go: 1.19+
+- hiredis
 
 ### Steps
 
@@ -45,6 +46,7 @@ This document describes how to build Mooncake.
                    libgtest-dev \
                    libjsoncpp-dev \
                    libnuma-dev \
+                   libhiredis-dev
 
     # For centos/alibaba linux os
     yum install cmake \
@@ -142,3 +144,4 @@ Mooncake supports the following advanced compile options:
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL protocols. 
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store. 
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust language support.
+- `-DWITH_REDIS_=[ON|OFF]`: Enable Redis as metadata server in Mooncake (`hiredis` required).

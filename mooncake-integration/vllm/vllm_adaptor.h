@@ -46,6 +46,10 @@ class VLLMAdaptor {
 
     int initialize(const char *local_hostname, const char *metadata_server,
                    const char *protocol, const char *device_name);
+    
+    int initializeExt(const char *local_hostname, const char *metadata_server,
+                      const char *protocol, const char *device_name, 
+                      const char *metadata_type);
 
     uintptr_t allocateManagedBuffer(size_t length);
 
