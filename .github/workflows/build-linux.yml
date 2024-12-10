@@ -1,0 +1,26 @@
+name: 'Build(linux)'
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: configure
+      run: |
+        sudo apt update -y
+        sudo bash -x dependencies.sh
+        mkdir build 
+        cd build
+        cmake ..
+      shell: bash
+    - name: make
+      run: |
+        cd build
+        make -j
+      shell: bash
