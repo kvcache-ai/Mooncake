@@ -212,6 +212,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
     py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
         .def(py::init<>())
         .def("initialize", &VLLMAdaptor::initialize)
+        .def("initializeExt", &VLLMAdaptor::initializeExt)
         .def("allocateManagedBuffer", &VLLMAdaptor::allocateManagedBuffer)
         .def("freeManagedBuffer", &VLLMAdaptor::freeManagedBuffer)
         .def("transferSync", &VLLMAdaptor::transferSync)
