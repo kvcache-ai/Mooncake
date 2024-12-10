@@ -14,11 +14,12 @@
 # limitations under the License.
 
 REPO_ROOT=`pwd`
-GITHUB_PROXY="https://mirror.ghproxy.com/github.com"
+GITHUB_PROXY="https://github.com"
 
 sudo apt-get install -y build-essential \
                         cmake \
                         libibverbs-dev \
+                        libunwind-dev \
                         libgoogle-glog-dev \
                         libgtest-dev \
                         libjsoncpp-dev \
