@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  runs-on: ubuntu-latest
+  build:
+    - name: 'get code'
+      uses: actions/checkout@v4
+    - name: "get deps"
+      run: |
+        apt update -y
+        bash -x dependencies.sh
+
+
