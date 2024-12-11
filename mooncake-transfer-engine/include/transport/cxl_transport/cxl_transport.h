@@ -58,7 +58,7 @@ class CxlTransport : public Transport {
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta, void **args) override;
 
-    int registerLocalMemory(void *addr, size_t length, const string &location,
+    int registerLocalMemory(void *addr, size_t length, const std::string &location,
                             bool remote_accessible,
                             bool update_metadata) override;
 
