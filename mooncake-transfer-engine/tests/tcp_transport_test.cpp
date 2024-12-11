@@ -22,8 +22,29 @@
 #include <iomanip>
 #include <memory>
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#include <cufile.h>
+
+#include <cassert>
+
+static void checkCudaError(cudaError_t result, const char *message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << " (Error code: " << result << " - "
+                   << cudaGetErrorString(result) << ")" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+#endif
+
 #include "transfer_engine.h"
 #include "transport/transport.h"
+
+#ifdef USE_CUDA
+DEFINE_int32(gpu_id, 0, "GPU ID to use");
+#endif
 
 using namespace mooncake;
 

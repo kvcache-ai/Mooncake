@@ -256,7 +256,7 @@ int initiator() {
         LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(ram_buffer_size, i, FLAGS_use_vram);
-        string name_prefix = FLAGS_use_vram ? "gpu:" : "cpu:";
+        std::string name_prefix = FLAGS_use_vram ? "gpu:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], ram_buffer_size,
                                              name_prefix + std::to_string(i));
         LOG_ASSERT(!rc);
