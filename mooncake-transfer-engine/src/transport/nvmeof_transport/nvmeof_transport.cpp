@@ -207,7 +207,7 @@ int NVMeoFTransport::install(std::string &local_server_name,
 }
 
 int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
-                                         const string &location,
+                                         const std::string &location,
                                          bool remote_accessible,
                                          bool update_metadata) {
     (void)remote_accessible;
