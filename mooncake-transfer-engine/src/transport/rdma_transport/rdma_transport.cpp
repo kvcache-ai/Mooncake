@@ -376,9 +376,9 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         } else {
             size_t index = (retry_count - 1) % rnic_list_len;
             if (index < preferred_rnic_list_len)
-                device_id = index;
+                device_id = priority.preferred_rnic_id_list[index];
             else
-                device_id = index - preferred_rnic_list_len;
+                device_id = priority.available_rnic_id_list[index - preferred_rnic_list_len];
         }
 
         return 0;
