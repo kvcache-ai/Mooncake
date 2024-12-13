@@ -23,7 +23,7 @@ namespace mooncake {
 
 // RdmaEndPoint represents all QP connections between the local NIC1 (identified
 // by its RdmaContext) and the remote NIC2 (identified by peer_nic_path).
-// 1. After ctor, resources are allocated without specifying the peers.
+// 1. After construct, resources are allocated without specifying the peers.
 // 2. Handshake information needs to be exchanged with remote RdmaEndPoint.
 //    - Local side calls the setupConnectionsByActive() function, passing in the
 //    peer_nic_path of the remote side
