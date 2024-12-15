@@ -106,7 +106,8 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommand
   ```
 - Go 1.20+, if you want to build with `-DWITH_P2P_STORE`. You may download it from [here](https://go.dev/dl/).
 - Rust Toolclain, if you want to build with `-DWITH_WITH_RUST_EXAMPLE`.
-- `hiredis`, if you want to build with `-DWITH_REDIS`, so that you use Redis instead of etcd as metadata servers.
+- `hiredis`, if you want to build with `-DUSE_REDIS`, so that you use Redis instead of etcd as metadata servers.
+- `curl`, if you want to build with `-DUSE_HTTP`, so that you use HTTP instead of etcd as metadata servers.
 
 ### Installation
 1. Init source code
