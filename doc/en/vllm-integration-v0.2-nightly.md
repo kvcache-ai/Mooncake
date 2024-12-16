@@ -1,24 +1,23 @@
 # vLLM Disaggregated Prefill/Decode Demo
 
 ## Overview
-This is the nightly version of mooncake-transfer-engine integration with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
+This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
 
-**_Please note that this is not a fully ready version and will be modified anytime based on feedback from the vLLM community._**
+**_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
 
 ## Installation
 ### Prerequisite
 Please install the Mooncake Transfer Engine according to the [instructions](build.md) first.
 
-### Install an experimental version of vLLM
-#### 1. Clone vLLM from an indicated repo
+### Install the latest version of vLLM
+#### 1. Clone vLLM from official repo
 ```bash
-git clone git@github.com:kvcache-ai/vllm.git
+git clone git@github.com:vllm-project/vllm.git
 ```
 #### 2. Build
 ##### 2.1 Build from source (Include C++ and CUDA code)
 ```bash
 cd vllm
-git checkout upstream-mooncake-integration
 pip3 uninstall vllm -y
 pip3 install -e .
 ```
