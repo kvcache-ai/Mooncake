@@ -419,7 +419,7 @@ TransferEngine(std::unique_ptr<TransferMetadata> metadata_client);
 TransferMetadata(const std::string &metadata_server, const std::string &protocol = "etcd");
 ```
 
-- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd` and `redis` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server.
+- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd`, `redis` and `http` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server, or the base HTTP URI of http server.
 
 For easy exception handling, TransferEngine needs to call the init function for secondary construction after construction:
 ```cpp
