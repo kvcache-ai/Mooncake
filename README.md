@@ -79,15 +79,15 @@ We have implemented vLLM integration, which uses Transfer Engine as the network 
 **_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md)) that is based on vLLM's main branch._**
 
 #### Performance
-By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, TTFT of vLLM with Transfer Engine is up to 33% lower than traditional TCP-based transports.
+By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, Mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
 In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy.
 
 | Backend/Setting                                         | Output Token Throughput (tok/s) | Total Token Throughput (tok/s) | Mean TTFT (ms) | Median TTFT (ms) | P99 TTFT (ms)|
 |---------------------------------------------------------|---------------------------------|--------------------------------|----------------|------------------|---------------|
-| Transfer Engine (RDMA) | 12.07                           | 2046.78                        | 1165.25        | 678.74           | 4576.57       |
-| TCP  | 12.06                           | 2045.51                        | 1925.52        | 1011.58          | 8149.52       |
+| Transfer Engine (RDMA) | 12.06                           | 2042.74                        | 1056.76        | 635.00           | 4006.59       |
+| TCP  | 12.05                           | 2041.13                        | 1414.05        | 766.23          | 6035.36       |
 
-- Click [here](doc/en/vllm-benchmark-results.md) to access detailed benchmark results.
+- Click [here](doc/en/vllm-benchmark-results-v0.2.md) to access detailed benchmark results.
 
 **More advanced features will coming soon, so stay tuned!**
 
