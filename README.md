@@ -71,23 +71,23 @@ Thanks to the high performance of Transfer Engine, P2P Stores can also distribut
 
 ![p2p-store.gif](image/p2p-store.gif)
 
-### vLLM Integration ([Guide v0.1](doc/en/vllm-integration.md), [v0.2-Nightly](doc/en/vllm-integration-v0.2-nightly.md))
-To optimize LLM inference, the vLLM's community is working at supporting [disaggregated prefilling (PR 8498)](https://github.com/vllm-project/vllm/pull/8498). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
+### vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md))
+To optimize LLM inference, the vLLM community is working on supporting [disaggregated prefilling (PR 10502)](https://github.com/vllm-project/vllm/pull/10502). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
 
-We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer**. Transfer Engine provides simpler interface and more efficient use of RDMA devices. In the future, we plan to build Mooncake Store on the basis of Transfer Engine, which supports pooled prefill/decode disaggregation.
+We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer** [(PR 10884)](https://github.com/vllm-project/vllm/pull/10884). Transfer Engine provides simpler interfaces and more efficient use of RDMA devices. In the future, we plan to build Mooncake Store on the basis of Transfer Engine, which supports pooled prefill/decode disaggregation.
 
-**_Update[Dec 4, 2024]: Here is the nightly vLLM Integration ([Guide v0.2-Nightly](doc/en/vllm-integration-v0.2-nightly.md)) that is based on vLLM's main branch._**
+**_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md)) that is based on vLLM's main branch._**
 
 #### Performance
-By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, TTFT of vLLM with Transfer Engine is up to 33% lower than traditional TCP-based transports.
+By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, Mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
 In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy.
 
 | Backend/Setting                                         | Output Token Throughput (tok/s) | Total Token Throughput (tok/s) | Mean TTFT (ms) | Median TTFT (ms) | P99 TTFT (ms)|
 |---------------------------------------------------------|---------------------------------|--------------------------------|----------------|------------------|---------------|
-| Transfer Engine (RDMA) | 12.07                           | 2046.78                        | 1165.25        | 678.74           | 4576.57       |
-| TCP  | 12.06                           | 2045.51                        | 1925.52        | 1011.58          | 8149.52       |
+| Transfer Engine (RDMA) | 12.06                           | 2042.74                        | 1056.76        | 635.00           | 4006.59       |
+| TCP  | 12.05                           | 2041.13                        | 1414.05        | 766.23          | 6035.36       |
 
-- Click [here](doc/en/vllm-benchmark-results.md) to access detailed benchmark results.
+- Click [here](doc/en/vllm-benchmark-results-v0.2.md) to access detailed benchmark results.
 
 **More advanced features will coming soon, so stay tuned!**
 
