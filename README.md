@@ -1,5 +1,8 @@
 <div align="center">
-  <h1>Mooncake: A KVCache-centric Disaggregated<br/> Architecture for LLM Serving</h1>
+  <img src=image/mooncake-icon.png width=44% />
+  <h3 align="center">
+      A KVCache-centric Disaggregated<br/> Architecture for LLM Serving
+  </h3>
   <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>📃 Technical Report</strong></a>
 </div>
 <br/>
