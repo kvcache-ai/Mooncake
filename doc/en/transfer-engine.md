@@ -61,6 +61,8 @@ For instance, as illustrated in figure above, to transfer data from buffer 0 (as
 To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exeeds 16KB. 
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
+If you do not want to manually configure the topology matrix, we also provide a function (`mooncake::discoverTopologyMatrix` in `topology.h`) to automatically discover the toplogy between CPU/CUDA and RDMA devices. The automatic discovery mechanism might not always be accurate, and we welcome your feedbacks and improvement ideas!
+
 ### Endpoint Management
 Mooncake Store employs a pair of end-
 points to represent the connection between a local RDMA
