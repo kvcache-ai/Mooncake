@@ -9,7 +9,7 @@
 #include <vector>
 
 #ifdef USE_CUDA
-#include "cuda_runtime.h"
+#include <cuda_runtime.h>
 #endif
 
 #include <ctype.h>
@@ -66,6 +66,9 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
 
         char path[PATH_MAX];
         char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        // "/sys/class/infiniband/mlx5_X/" is a symlink to
+        // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  entry->d_name);
         if (realpath(path, resolved_path) == NULL) {
@@ -105,6 +108,7 @@ static std::vector<TopologyEntry> discover_cpu_topology(
         int node_id = atoi(entry->d_name + strlen(prefix));
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
+        // an HCA connected to the same cpu NUMA node is preferred
         for (const auto &hca : all_hca) {
             if (hca.numa_node == node_id) {
                 preferred_hca.push_back(hca.name);
@@ -172,6 +176,8 @@ static std::vector<TopologyEntry> discover_cuda_topology(
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
         for (const auto &hca : all_hca) {
+            // FIXME: currently we only identify the NICs connected to the same
+            // PCIe switch/RC with GPU as preferred.
             if (get_pci_distance(hca.pci_bus_id.c_str(), pci_bus_id) == 0) {
                 preferred_hca.push_back(hca.name);
             } else {
@@ -189,6 +195,7 @@ static std::vector<TopologyEntry> discover_cuda_topology(
 #endif  // USE_CUDA
 
 namespace mooncake {
+// TODO: add black/white lists for devices.
 std::string discoverTopologyMatrix() {
     auto all_hca = list_infiniband_devices();
     Json::Value value(Json::objectValue);
