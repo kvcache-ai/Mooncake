@@ -54,7 +54,7 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
-DEFINE_string(metadata_type, "etcd", "Metadata type: etcd|redis");
+DEFINE_string(metadata_type, "etcd", "Metadata type: etcd|redis|http");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
