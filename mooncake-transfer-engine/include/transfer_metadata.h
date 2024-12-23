@@ -33,6 +33,8 @@
 namespace mooncake {
 struct TransferMetadataImpl;
 
+struct TransferHandshakeImpl;
+
 class TransferMetadata {
    public:
     struct DeviceDesc {
@@ -90,7 +92,8 @@ class TransferMetadata {
     };
 
    public:
-    TransferMetadata(const std::string &metadata_uri, const std::string &protocol = "etcd");
+    TransferMetadata(const std::string &metadata_uri,
+                     const std::string &protocol = "etcd");
 
     ~TransferMetadata();
 
@@ -105,7 +108,8 @@ class TransferMetadata {
     int updateSegmentDesc(const std::string &segment_name,
                           const SegmentDesc &desc);
 
-    std::shared_ptr<SegmentDesc> getSegmentDesc(const std::string &segment_name);
+    std::shared_ptr<SegmentDesc> getSegmentDesc(
+        const std::string &segment_name);
 
     SegmentID getSegmentID(const std::string &segment_name);
 
@@ -120,7 +124,7 @@ class TransferMetadata {
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
-    
+
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
@@ -143,17 +147,6 @@ class TransferMetadata {
                                       std::vector<std::string> &rnic_list);
 
    private:
-    int doSendHandshake(struct addrinfo *addr, const HandShakeDesc &local_desc,
-                        HandShakeDesc &peer_desc);
-
-    std::string encode(const HandShakeDesc &desc);
-
-    int decode(const std::string &ser, HandShakeDesc &desc);
-
-   private:
-    std::atomic<bool> listener_running_;
-    std::thread listener_;
-    OnReceiveHandShake on_receive_handshake_;
     // local cache
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
@@ -166,6 +159,7 @@ class TransferMetadata {
 
     std::atomic<SegmentID> next_segment_id_;
 
+    std::shared_ptr<TransferHandshakeImpl> handshake_impl_;
     std::shared_ptr<TransferMetadataImpl> impl_;
 };
 
