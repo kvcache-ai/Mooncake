@@ -52,6 +52,8 @@ BatchTransfer API 使用请求（Request）对象数组传入用户请求，需�
 
 为了进一步最大化带宽利用率，如果单个请求的传输长度超过16KB，则其内部被划分为多个切片。每个切片可能使用不同的路径，使所有RDMA NIC能够协同工作。
 
+如果不想手动配置拓扑矩阵，也可以直接调用`mooncake::discoverTopologyMatrix`（位于`topology.h`）来自动生成拓扑矩阵。该函数能够自动探查CPU/CUDA和RDMA网卡之间的拓扑关系。对于更多设备种类的支持正在开发中。目前，拓扑自动发现机制可能无法给出准确的硬件拓扑，我们欢迎您的反馈和改进建议！
+
 ### 端点管理
 Transfer Engine 使用一对端点来表示本地RDMA NIC和远程RDMA NIC之间的连接。实际上，每个端点包括一个或多个RDMA QP对象。
 Transfer Engine 中的连接是按需建立的；端点在第一次请求之前保持未配对状态。
