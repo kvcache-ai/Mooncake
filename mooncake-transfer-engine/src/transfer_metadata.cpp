@@ -14,15 +14,7 @@
 
 #include "transfer_metadata.h"
 
-#include <arpa/inet.h>
-#include <bits/stdint-uintn.h>
 #include <jsoncpp/json/value.h>
-#include <netdb.h>
-#include <sys/socket.h>
-
-#ifdef USE_REDIS
-#include <hiredis/hiredis.h>
-#endif
 
 #include <cassert>
 #include <set>
@@ -30,6 +22,7 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#include "transfer_metadata_plugin.h"
 
 namespace mooncake {
 
@@ -44,166 +37,8 @@ static inline std::string getFullMetadataKey(const std::string &segment_name) {
         return keyPrefix + segment_name;
 }
 
-static inline const std::string toString(struct sockaddr *addr) {
-    if (addr->sa_family == AF_INET) {
-        struct sockaddr_in *sock_addr = (struct sockaddr_in *)addr;
-        char ip[INET_ADDRSTRLEN];
-        if (inet_ntop(addr->sa_family, &(sock_addr->sin_addr), ip,
-                      INET_ADDRSTRLEN) != NULL)
-            return ip;
-    } else if (addr->sa_family == AF_INET6) {
-        struct sockaddr_in6 *sock_addr = (struct sockaddr_in6 *)addr;
-        char ip[INET6_ADDRSTRLEN];
-        if (inet_ntop(addr->sa_family, &(sock_addr->sin6_addr), ip,
-                      INET6_ADDRSTRLEN) != NULL)
-            return ip;
-    }
-    LOG(ERROR) << "Invalid address, cannot convert to string";
-    return "<unknown>";
-}
-
-struct TransferMetadataImpl {
-    TransferMetadataImpl() {}
-    virtual ~TransferMetadataImpl() {}
-    virtual bool get(const std::string &key, Json::Value &value) = 0;
-    virtual bool set(const std::string &key, const Json::Value &value) = 0;
-    virtual bool remove(const std::string &key) = 0;
-};
-
-#ifdef USE_REDIS
-struct TransferMetadataImpl4Redis : public TransferMetadataImpl {
-    TransferMetadataImpl4Redis(const std::string &metadata_uri)
-        : client_(nullptr), metadata_uri_(metadata_uri) {
-        auto hostname_port = parseHostNameWithPort(metadata_uri);
-        client_ =
-            redisConnect(hostname_port.first.c_str(), hostname_port.second);
-        if (!client_ || client_->err) {
-            LOG(ERROR) << "redis error: " << client_->errstr;
-        }
-    }
-
-    virtual ~TransferMetadataImpl4Redis() {}
-
-    virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
-        if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
-            return false;
-        }
-        auto json_file = std::string(resp->str);
-        freeReplyObject(resp);
-        if (!reader.parse(json_file, value)) return false;
-        if (globalConfig().verbose)
-            LOG(INFO) << "Get segment desc, key=" << key
-                      << ", value=" << json_file;
-        return true;
-    }
-
-    virtual bool set(const std::string &key, const Json::Value &value) {
-        Json::FastWriter writer;
-        const std::string json_file = writer.write(value);
-        if (globalConfig().verbose)
-            LOG(INFO) << "Put segment desc, key=" << key
-                      << ", value=" << json_file;
-
-        redisReply *resp = (redisReply *)redisCommand(
-            client_, "SET %s %s", key.c_str(), json_file.c_str());
-        if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
-            return false;
-        }
-        freeReplyObject(resp);
-        return true;
-    }
-
-    virtual bool remove(const std::string &key) {
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
-        if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
-            return false;
-        }
-        freeReplyObject(resp);
-        return true;
-    }
-
-    redisContext *client_;
-    const std::string metadata_uri_;
-};
-#endif  // USE_REDIS
-
-struct TransferMetadataImpl4Etcd : public TransferMetadataImpl {
-    TransferMetadataImpl4Etcd(const std::string &metadata_uri)
-        : client_(metadata_uri), metadata_uri_(metadata_uri) {}
-
-    virtual ~TransferMetadataImpl4Etcd() {}
-
-    virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
-        auto resp = client_.get(key);
-        if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, etcd uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
-            return false;
-        }
-        auto json_file = resp.value().as_string();
-        if (!reader.parse(json_file, value)) return false;
-        if (globalConfig().verbose)
-            LOG(INFO) << "Get segment desc, key=" << key
-                      << ", value=" << json_file;
-        return true;
-    }
-
-    virtual bool set(const std::string &key, const Json::Value &value) {
-        Json::FastWriter writer;
-        const std::string json_file = writer.write(value);
-        if (globalConfig().verbose)
-            LOG(INFO) << "Put segment desc, key=" << key
-                      << ", value=" << json_file;
-        auto resp = client_.put(key, json_file);
-        if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, etcd uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
-            return false;
-        }
-        return true;
-    }
-
-    virtual bool remove(const std::string &key) {
-        auto resp = client_.rm(key);
-        if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, etcd uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
-            return false;
-        }
-        return true;
-    }
-
-    etcd::SyncClient client_;
-    const std::string metadata_uri_;
-};
-
-struct TransferHandshakeImpl {
-    TransferHandshakeImpl() {}
-    virtual ~TransferHandshakeImpl() {}
-
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-    using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
-                                                 HandShakeDesc &local_desc)>;
-
-    virtual int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                                     uint16_t listen_port) = 0;
-
-    virtual int sendHandshake(TransferMetadata::RpcMetaDesc peer_location,
-                              const HandShakeDesc &local_desc,
-                              HandShakeDesc &peer_desc) = 0;
-
-    std::string encode(const HandShakeDesc &desc) {
+struct TransferHandshakeUtil {
+    static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
         root["peer_nic_path"] = desc.peer_nic_path;
@@ -211,278 +46,28 @@ struct TransferHandshakeImpl {
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
         root["reply_msg"] = desc.reply_msg;
-        Json::FastWriter writer;
-        auto serialized = writer.write(root);
-        if (globalConfig().verbose)
-            LOG(INFO) << "Send Endpoint Handshake Info: " << serialized;
-        return serialized;
+        return root;
     }
 
-    int decode(const std::string &serialized, HandShakeDesc &desc) {
-        Json::Value root;
+    static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         Json::Reader reader;
-
-        if (serialized.empty() || !reader.parse(serialized, root))
-            return ERR_MALFORMED_JSON;
-
-        if (globalConfig().verbose)
-            LOG(INFO) << "Receive Endpoint Handshake Info: " << serialized;
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
-
         return 0;
     }
-};
-
-struct TransferHandshakeImpl4DirectExchange : public TransferHandshakeImpl {
-    TransferHandshakeImpl4DirectExchange() : listener_running_(false) {}
-
-    virtual ~TransferHandshakeImpl4DirectExchange() {
-        if (listener_running_) {
-            listener_running_ = false;
-            listener_.join();
-        }
-    }
-
-    virtual int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                                     uint16_t listen_port) {
-        sockaddr_in bind_address;
-        int on = 1, listen_fd = -1;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(listen_port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-
-        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) {
-            PLOG(ERROR) << "Failed to create socket";
-            return ERR_SOCKET;
-        }
-
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            PLOG(ERROR) << "Failed to set socket timeout";
-            close(listen_fd);
-            return ERR_SOCKET;
-        }
-
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "Failed to set address reusable";
-            close(listen_fd);
-            return ERR_SOCKET;
-        }
-
-        if (bind(listen_fd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
-            0) {
-            PLOG(ERROR) << "Failed to bind address, rpc port: " << listen_port;
-            close(listen_fd);
-            return ERR_SOCKET;
-        }
-
-        if (listen(listen_fd, 5)) {
-            PLOG(ERROR) << "Failed to listen";
-            close(listen_fd);
-            return ERR_SOCKET;
-        }
-
-        listener_running_ = true;
-        listener_ = std::thread([this, listen_fd, on_receive_handshake]() {
-            while (listener_running_) {
-                sockaddr_in addr;
-                socklen_t addr_len = sizeof(sockaddr_in);
-                int conn_fd = accept(listen_fd, (sockaddr *)&addr, &addr_len);
-                if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK)
-                        PLOG(ERROR) << "Failed to accept socket connection";
-                    continue;
-                }
-
-                if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
-                    LOG(ERROR) << "Unsupported socket type, should be AF_INET "
-                                  "or AF_INET6";
-                    close(conn_fd);
-                    continue;
-                }
-
-                struct timeval timeout;
-                timeout.tv_sec = 60;
-                timeout.tv_usec = 0;
-                if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                               sizeof(timeout))) {
-                    PLOG(ERROR) << "Failed to set socket timeout";
-                    close(conn_fd);
-                    continue;
-                }
-
-                if (globalConfig().verbose)
-                    LOG(INFO) << "New connection: "
-                              << toString((struct sockaddr *)&addr) << ":"
-                              << ntohs(addr.sin_port);
-
-                HandShakeDesc local_desc, peer_desc;
-                int ret = decode(readString(conn_fd), peer_desc);
-                if (ret) {
-                    PLOG(ERROR)
-                        << "Failed to receive handshake message: malformed "
-                           "json format, check tcp connection";
-                    close(conn_fd);
-                    continue;
-                }
-
-                on_receive_handshake(peer_desc, local_desc);
-                ret = writeString(conn_fd, encode(local_desc));
-                if (ret) {
-                    PLOG(ERROR)
-                        << "Failed to send handshake message: malformed "
-                           "json format, check tcp connection";
-                    close(conn_fd);
-                    continue;
-                }
-
-                close(conn_fd);
-            }
-            return;
-        });
-
-        return 0;
-    }
-
-    virtual int sendHandshake(TransferMetadata::RpcMetaDesc peer_location,
-                              const HandShakeDesc &local_desc,
-                              HandShakeDesc &peer_desc) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", peer_location.rpc_port);
-        if (getaddrinfo(peer_location.ip_or_host_name.c_str(), service, &hints,
-                        &result)) {
-            PLOG(ERROR)
-                << "Failed to get IP address of peer server "
-                << peer_location.ip_or_host_name << ":"
-                << peer_location.rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendHandshake(rp, local_desc, peer_desc);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    int doSendHandshake(struct addrinfo *addr, const HandShakeDesc &local_desc,
-                        HandShakeDesc &peer_desc) {
-        if (globalConfig().verbose)
-            LOG(INFO) << "Try connecting " << toString(addr->ai_addr);
-
-        int on = 1;
-        int conn_fd =
-            socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-        if (conn_fd == -1) {
-            PLOG(ERROR) << "Failed to create socket";
-            return ERR_SOCKET;
-        }
-        if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "Failed to set address reusable";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        struct timeval timeout;
-        timeout.tv_sec = 60;
-        timeout.tv_usec = 0;
-        if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            PLOG(ERROR) << "Failed to set socket timeout";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "Failed to connect " << toString(addr->ai_addr)
-                        << " via socket";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        int ret = writeString(conn_fd, encode(local_desc));
-        if (ret) {
-            LOG(ERROR) << "Failed to send handshake message: malformed json "
-                          "format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        ret = decode(readString(conn_fd), peer_desc);
-        if (ret) {
-            LOG(ERROR) << "Failed to receive handshake message: malformed json "
-                          "format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        if (!peer_desc.reply_msg.empty()) {
-            LOG(ERROR) << "Handshake request is rejected by peer endpoint "
-                       << peer_desc.local_nic_path
-                       << ", message: " << peer_desc.reply_msg
-                       << ". Please check peer's configuration.";
-            close(conn_fd);
-            return ERR_REJECT_HANDSHAKE;
-        }
-
-        close(conn_fd);
-        return 0;
-    }
-
-    std::atomic<bool> listener_running_;
-    std::thread listener_;
 };
 
 TransferMetadata::TransferMetadata(const std::string &metadata_uri,
                                    const std::string &protocol) {
-    handshake_impl_ = std::make_shared<TransferHandshakeImpl4DirectExchange>();
-    if (protocol == "etcd") {
-        impl_ = std::make_shared<TransferMetadataImpl4Etcd>(metadata_uri);
-        if (!impl_) {
-            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
-            exit(EXIT_FAILURE);
-        }
-#ifdef USE_REDIS
-    } else if (protocol == "redis") {
-        impl_ = std::make_shared<TransferMetadataImpl4Redis>(metadata_uri);
-        if (!impl_) {
-            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
-            exit(EXIT_FAILURE);
-        }
-#endif  // USE_REDIS
-    } else {
-        LOG(ERROR) << "Unsupported metdata protocol " << protocol;
-        exit(EXIT_FAILURE);
-    }
+    handshake_plugin_ = MetadataHandShakePlugin::Create(metadata_uri);
+    storage_plugin_ = MetadataStoragePlugin::Create(metadata_uri);
     next_segment_id_.store(1);
 }
 
-TransferMetadata::~TransferMetadata() { handshake_impl_.reset(); }
+TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
 
 int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
                                         const SegmentDesc &desc) {
@@ -547,7 +132,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
         return ERR_METADATA;
     }
 
-    if (!impl_->set(getFullMetadataKey(segment_name), segmentJSON)) {
+    if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to put segment description: " << segment_name;
         return ERR_METADATA;
     }
@@ -556,7 +141,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 }
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
-    if (!impl_->remove(getFullMetadataKey(segment_name))) {
+    if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
         LOG(ERROR) << "Failed to remove segment description: " << segment_name;
         return ERR_METADATA;
     }
@@ -566,7 +151,7 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value segmentJSON;
-    if (!impl_->get(getFullMetadataKey(segment_name), segmentJSON)) {
+    if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to get segment description: " << segment_name;
         return nullptr;
     }
@@ -795,7 +380,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
-    if (!impl_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+    if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to insert rpc meta of " << server_name;
         return ERR_METADATA;
     }
@@ -804,7 +389,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 }
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
-    if (!impl_->remove(kRpcMetaPrefix + server_name)) {
+    if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
         LOG(ERROR) << "Failed to remove rpc meta of " << server_name;
         return ERR_METADATA;
     }
@@ -822,7 +407,7 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
     }
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     Json::Value rpcMetaJSON;
-    if (!impl_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+    if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to get rpc meta of " << server_name;
         return ERR_METADATA;
     }
@@ -834,8 +419,17 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port) {
-    return handshake_impl_->startHandshakeDaemon(on_receive_handshake,
-                                                 listen_port);
+    return handshake_plugin_->startDaemon(
+        [on_receive_handshake](const Json::Value &local,
+                               Json::Value &peer) -> int {
+            HandShakeDesc local_desc, peer_desc;
+            TransferHandshakeUtil::decode(local, local_desc);
+            int ret = on_receive_handshake(local_desc, peer_desc);
+            if (ret) return ret;
+            peer = TransferHandshakeUtil::encode(peer_desc);
+            return 0;
+        },
+        listen_port);
 }
 
 int TransferMetadata::sendHandshake(const std::string &peer_server_name,
@@ -846,7 +440,12 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
         PLOG(ERROR) << "Cannot find rpc meta entry for " << peer_server_name;
         return ERR_METADATA;
     }
-    return handshake_impl_->sendHandshake(peer_location, local_desc, peer_desc);
+    auto local = TransferHandshakeUtil::encode(local_desc);
+    Json::Value peer;
+    int ret = handshake_plugin_->send(peer_location, local, peer);
+    if (ret) return ret;
+    TransferHandshakeUtil::decode(peer, peer_desc);
+    return 0;
 }
 
 int TransferMetadata::parseNicPriorityMatrix(
