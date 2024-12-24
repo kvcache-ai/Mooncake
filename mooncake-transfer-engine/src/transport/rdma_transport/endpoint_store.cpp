@@ -45,7 +45,7 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
     }
     auto endpoint = std::make_shared<RdmaEndPoint>(*context);
     if (!endpoint) {
-        PLOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
+        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
         return nullptr;
     }
     auto &config = globalConfig();
@@ -131,7 +131,7 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
     }
     auto endpoint = std::make_shared<RdmaEndPoint>(*context);
     if (!endpoint) {
-        PLOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
+        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
         return nullptr;
     }
     auto &config = globalConfig();

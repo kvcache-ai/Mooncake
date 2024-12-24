@@ -171,6 +171,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
                 else if (status.s == TransferStatusEnum::FAILED) {
                     LOG(INFO) << "FAILED";
                     completed = true;
+                    exit(EXIT_FAILURE);
                 }
             }
         }

@@ -91,8 +91,8 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     auto port_str = server_name.substr(pos + 1);
     int val = std::atoi(port_str.c_str());
     if (val <= 0 || val > 65535)
-        PLOG(WARNING) << "Illegal port number in " << server_name
-                      << ". Use default port " << port << " instead";
+        LOG(WARNING) << "Illegal port number in " << server_name
+                     << ". Use default port " << port << " instead";
     else
         port = (uint16_t)val;
     return std::make_pair(trimmed_server_name, port);

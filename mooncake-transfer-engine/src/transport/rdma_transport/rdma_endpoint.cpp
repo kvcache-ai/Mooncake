@@ -37,7 +37,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
                             size_t max_inline_bytes) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
-        PLOG(ERROR) << "Endpoint has already been constructed";
+        LOG(ERROR) << "Endpoint has already been constructed";
         return ERR_ENDPOINT;
     }
 
@@ -46,7 +46,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     max_wr_depth_ = (int)max_wr_depth;
     wr_depth_list_ = new volatile int[num_qp_list];
     if (!wr_depth_list_) {
-        PLOG(ERROR) << "Failed to allocate memory for work request depth list";
+        LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
@@ -74,11 +74,11 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 int RdmaEndPoint::deconstruct() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (wr_depth_list_[i] != 0)
-            PLOG(WARNING)
+            LOG(WARNING)
                 << "Outstanding work requests found, CQ will not be generated";
 
         if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP";
+            LOG(ERROR) << "Failed to destroy QP";
             return ERR_ENDPOINT;
         }
     }
@@ -118,10 +118,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
-    if (rc) {
-        LOG(ERROR) << "Failed to exchange handshake description";
-        return rc;
-    }
+    if (rc) return rc;
 
     if (peer_desc.local_nic_path != peer_nic_path_ ||
         peer_desc.peer_nic_path != local_desc.local_nic_path) {
@@ -190,15 +187,15 @@ void RdmaEndPoint::disconnect() {
 void RdmaEndPoint::disconnectUnlocked() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (wr_depth_list_[i] != 0)
-            PLOG(WARNING)
-                << "Outstanding work requests found, CQ will not be generated";
+            LOG(WARNING) << "Outstanding work requests will be dropped";
     }
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE))
-            PLOG(ERROR) << "Failed to modity QP to RESET";
+        int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (ret)
+            LOG(ERROR) << "Failed to modity QP to RESET: " << strerror(ret);
     }
     peer_nic_path_.clear();
     for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
@@ -264,7 +261,7 @@ int RdmaEndPoint::submitPostSend(
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "ibv_post_send failed";
+        LOG(ERROR) << "ibv_post_send: " << strerror(rc);
         while (bad_wr) {
             int i = bad_wr - wr_list;
             failed_slice_list.push_back(slice_list[i]);
@@ -317,9 +314,10 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
-    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE)) {
-        std::string message = "Failed to modity QP to RESET";
-        PLOG(ERROR) << message;
+    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    if (ret) {
+        std::string message = "Failed to modity QP to RESET: ";
+        message += strerror(ret);
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -331,12 +329,13 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.pkey_index = 0;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-    if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                          IBV_QP_ACCESS_FLAGS)) {
+    ret = ibv_modify_qp(
+        qp, &attr,
+        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    if (ret) {
         std::string message =
-            "Failed to modity QP to INIT, check local context port num";
-        PLOG(ERROR) << message;
+            "Failed to modity QP to INIT, check local context port num: ";
+        message += strerror(ret);
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -369,13 +368,15 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.rq_psn = 0;
     attr.max_dest_rd_atomic = 16;
     attr.min_rnr_timer = 12;  // 12 in previous implementation
-    if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
-                          IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC |
-                          IBV_QP_DEST_QPN | IBV_QP_RQ_PSN)) {
+    ret = ibv_modify_qp(qp, &attr,
+                        IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
+                            IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC |
+                            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
+    if (ret) {
         std::string message =
-            "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp num";
-        PLOG(ERROR) << message;
+            "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp "
+            "num: ";
+        message += strerror(ret);
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -388,13 +389,13 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;
     attr.max_rd_atomic = 16;
-
-    if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
-                          IBV_QP_MAX_QP_RD_ATOMIC)) {
-        std::string message = "Failed to modity QP to RTS";
-        PLOG(ERROR) << message;
+    ret = ibv_modify_qp(qp, &attr,
+                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                            IBV_QP_MAX_QP_RD_ATOMIC);
+    if (ret) {
+        std::string message = "Failed to modity QP to RTS: ";
+        message += strerror(ret);
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }

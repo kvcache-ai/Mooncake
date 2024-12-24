@@ -208,17 +208,14 @@ int TcpTransport::install(std::string &local_server_name,
 
     int ret = allocateLocalSegmentID();
     if (ret) {
-        LOG(ERROR) << "*** Transfer engine cannot be initialized: cannot "
-                      "allocate local segment";
+        LOG(ERROR) << "TcpTransport: cannot allocate local segment";
         return -1;
     }
 
     ret = metadata_->updateLocalSegmentDesc();
     if (ret) {
-        LOG(ERROR) << "*** Transfer engine cannot be initialized: cannot "
-                      "publish segments";
-        LOG(ERROR) << "*** Check the connectivity between this server and "
-                      "metadata server (etcd server)";
+        LOG(ERROR) << "TcpTransport: cannot publish segments, "
+                      "check the availability of metadata storage";
         return -1;
     }
 
@@ -327,7 +324,7 @@ void TcpTransport::worker() {
             context_->doAccept();
             context_->io_context.run();
         } catch (std::exception &e) {
-            LOG(ERROR) << "Exception: " << e.what();
+            LOG(ERROR) << "TcpTransport: exception: " << e.what();
         }
     }
 }
@@ -348,10 +345,9 @@ void TcpTransport::startTransfer(Slice *slice) {
             return;
         }
 
-        auto endpoint_iterator =
-            resolver.resolve(boost::asio::ip::tcp::v4(), 
-                             meta_entry.ip_or_host_name,
-                             std::to_string(meta_entry.rpc_port));
+        auto endpoint_iterator = resolver.resolve(
+            boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
+            std::to_string(meta_entry.rpc_port));
         boost::asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
@@ -363,7 +359,7 @@ void TcpTransport::startTransfer(Slice *slice) {
         session->initiate(slice->source_addr, slice->tcp.dest_addr,
                           slice->length, slice->opcode);
     } catch (std::exception &e) {
-        LOG(ERROR) << "ASIO Exception: " << e.what();
+        LOG(ERROR) << "TcpTransport: ASIO exception: " << e.what();
         slice->markFailed();
     }
 }

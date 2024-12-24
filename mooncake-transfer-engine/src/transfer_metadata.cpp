@@ -428,7 +428,7 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     HandShakeDesc &peer_desc) {
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
-        LOG(ERROR) << "cannot find location of " << peer_server_name;
+        LOG(ERROR) << "[Handshake] cannot find location of " << peer_server_name;
         return ERR_METADATA;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
@@ -437,7 +437,8 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     if (ret) return ret;
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "connection rejected by peer: " << peer_desc.reply_msg;
+        LOG(ERROR) << "[Handshake] rejected by " << peer_server_name << ": "
+                   << peer_desc.reply_msg;
         return ERR_METADATA;
     }
     return 0;

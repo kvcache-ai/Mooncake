@@ -174,10 +174,6 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 #ifdef USE_REDIS
     } else if (parsed_conn_string.first == "redis") {
         return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second);
-        if (!impl_) {
-            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
-            exit(EXIT_FAILURE);
-        }
 #endif  // USE_REDIS
     } else {
         LOG(ERROR) << "unsupported metadata storage plugin "
@@ -186,22 +182,24 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     }
 }
 
-static inline const std::string toString(struct sockaddr *addr) {
+static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     if (addr->sa_family == AF_INET) {
         struct sockaddr_in *sock_addr = (struct sockaddr_in *)addr;
         char ip[INET_ADDRSTRLEN];
         if (inet_ntop(addr->sa_family, &(sock_addr->sin_addr), ip,
                       INET_ADDRSTRLEN) != NULL)
-            return ip;
+            return std::string(ip) + ":" +
+                   std::to_string(ntohs(sock_addr->sin_port));
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *sock_addr = (struct sockaddr_in6 *)addr;
         char ip[INET6_ADDRSTRLEN];
         if (inet_ntop(addr->sa_family, &(sock_addr->sin6_addr), ip,
                       INET6_ADDRSTRLEN) != NULL)
-            return ip;
+            return std::string(ip) + ":" +
+                   std::to_string(ntohs(sock_addr->sin6_port));
     }
     LOG(ERROR) << "invalid address, cannot convert to string";
-    return "<unknown>";
+    return "";
 }
 
 struct SocketHandShakePlugin : public MetadataHandShakePlugin {
@@ -286,8 +284,8 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
                     continue;
                 }
 
-                auto peer_hostname = toString((struct sockaddr *)&addr) + ":" +
-                                     std::to_string(ntohs(addr.sin_port));
+                auto peer_hostname =
+                    getNetworkAddress((struct sockaddr *)&addr);
                 if (globalConfig().verbose)
                     LOG(INFO) << "new connection: " << peer_hostname.c_str();
 
@@ -356,7 +354,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
     int doSend(struct addrinfo *addr, const Json::Value &local,
                Json::Value &peer) {
         if (globalConfig().verbose)
-            LOG(INFO) << "try connecting " << toString(addr->ai_addr);
+            LOG(INFO) << "try connecting " << getNetworkAddress(addr->ai_addr);
 
         int on = 1;
         int conn_fd =
@@ -382,7 +380,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         }
 
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "connect " << toString(addr->ai_addr);
+            PLOG(ERROR) << "connect " << getNetworkAddress(addr->ai_addr);
             close(conn_fd);
             return ERR_SOCKET;
         }

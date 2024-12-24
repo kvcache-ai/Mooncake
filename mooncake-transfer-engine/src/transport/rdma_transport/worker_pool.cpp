@@ -398,7 +398,7 @@ void WorkerPool::monitorWorker() {
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {
-            PLOG(ERROR) << "Failed to call epoll wait";
+            PLOG(ERROR) << "epoll_wait";
             continue;
         }
 
