@@ -26,15 +26,16 @@
 
 namespace mooncake {
 
-const static std::string kRpcMetaPrefix = "mooncake/rpc_meta/";
+const static std::string kCommonKeyPrefix = "mooncake/";
+const static std::string kRpcMetaPrefix = kCommonKeyPrefix + "rpc_meta/";
+
 // mooncake/segments/[...]
 static inline std::string getFullMetadataKey(const std::string &segment_name) {
-    const static std::string keyPrefix = "mooncake/";
     auto pos = segment_name.find("/");
     if (pos == segment_name.npos)
-        return keyPrefix + "ram/" + segment_name;
+        return kCommonKeyPrefix + "ram/" + segment_name;
     else
-        return keyPrefix + segment_name;
+        return kCommonKeyPrefix + segment_name;
 }
 
 struct TransferHandshakeUtil {
@@ -60,10 +61,9 @@ struct TransferHandshakeUtil {
     }
 };
 
-TransferMetadata::TransferMetadata(const std::string &metadata_uri,
-                                   const std::string &protocol) {
-    handshake_plugin_ = MetadataHandShakePlugin::Create(metadata_uri);
-    storage_plugin_ = MetadataStoragePlugin::Create(metadata_uri);
+TransferMetadata::TransferMetadata(const std::string &conn_string) {
+    handshake_plugin_ = MetadataHandShakePlugin::Create(conn_string);
+    storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
     next_segment_id_.store(1);
 }
 
@@ -133,7 +133,6 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
     }
 
     if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
-        LOG(ERROR) << "Failed to put segment description: " << segment_name;
         return ERR_METADATA;
     }
 
@@ -142,7 +141,6 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
-        LOG(ERROR) << "Failed to remove segment description: " << segment_name;
         return ERR_METADATA;
     }
     return 0;
@@ -152,15 +150,14 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value segmentJSON;
     if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
-        LOG(ERROR) << "Failed to get segment description: " << segment_name;
         return nullptr;
     }
 
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) {
-        LOG(ERROR) << "Failed to allocate SegmentDesc object";
         return nullptr;
     }
+
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
 
@@ -307,7 +304,6 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     auto segment_desc = this->getSegmentDesc(segment_name);
     if (!segment_desc) return -1;
     SegmentID id = next_segment_id_.fetch_add(1);
-    // LOG(INFO) << "put " << id;
     segment_id_to_desc_map_[id] = segment_desc;
     segment_name_to_id_map_[segment_name] = id;
     return id;
@@ -334,7 +330,6 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
         if (!new_segment_desc) {
-            LOG(ERROR) << "Failed to allocate segment description";
             return ERR_MEMORY;
         }
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
@@ -353,7 +348,6 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
         if (!new_segment_desc) {
-            LOG(ERROR) << "Failed to allocate segment description";
             return ERR_MEMORY;
         }
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
@@ -381,7 +375,6 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
     if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
-        LOG(ERROR) << "Failed to insert rpc meta of " << server_name;
         return ERR_METADATA;
     }
     local_rpc_meta_ = desc;
@@ -390,7 +383,6 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
-        LOG(ERROR) << "Failed to remove rpc meta of " << server_name;
         return ERR_METADATA;
     }
     return 0;
@@ -408,7 +400,6 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     Json::Value rpcMetaJSON;
     if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
-        LOG(ERROR) << "Failed to get rpc meta of " << server_name;
         return ERR_METADATA;
     }
     desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
@@ -437,7 +428,7 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     HandShakeDesc &peer_desc) {
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
-        PLOG(ERROR) << "Cannot find rpc meta entry for " << peer_server_name;
+        LOG(ERROR) << "cannot find location of " << peer_server_name;
         return ERR_METADATA;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
@@ -445,6 +436,10 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     int ret = handshake_plugin_->send(peer_location, local, peer);
     if (ret) return ret;
     TransferHandshakeUtil::decode(peer, peer_desc);
+    if (!peer_desc.reply_msg.empty()) {
+        LOG(ERROR) << "connection rejected by peer: " << peer_desc.reply_msg;
+        return ERR_METADATA;
+    }
     return 0;
 }
 
@@ -457,14 +452,12 @@ int TransferMetadata::parseNicPriorityMatrix(
 
     if (nic_priority_matrix.empty() ||
         !reader.parse(nic_priority_matrix, root)) {
-        LOG(ERROR)
-            << "Malformed format of NIC priority matrix: illegal JSON format";
+        LOG(ERROR) << "malformed format of NIC priority matrix";
         return ERR_MALFORMED_JSON;
     }
 
     if (!root.isObject()) {
-        LOG(ERROR)
-            << "Malformed format of NIC priority matrix: root is not an object";
+        LOG(ERROR) << "malformed format of NIC priority matrix";
         return ERR_MALFORMED_JSON;
     }
 
@@ -499,8 +492,7 @@ int TransferMetadata::parseNicPriorityMatrix(
             }
             priority_map[key] = item;
         } else {
-            LOG(ERROR)
-                << "Malformed format of NIC priority matrix: format error";
+            LOG(ERROR) << "malformed format of NIC priority matrix";
             return ERR_MALFORMED_JSON;
         }
     }

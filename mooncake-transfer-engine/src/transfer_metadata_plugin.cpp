@@ -40,7 +40,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         client_ =
             redisConnect(hostname_port.first.c_str(), hostname_port.second);
         if (!client_ || client_->err) {
-            LOG(ERROR) << "redis error: " << client_->errstr;
+            LOG(ERROR) << "redis error: unable to connect " << metadata_uri_
+                       << ": " << client_->errstr;
+            client_ = nullptr;
         }
     }
 
@@ -51,15 +53,15 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            LOG(ERROR) << "redis error: unable to get " << key << " from "
+                       << metadata_uri_;
             return false;
         }
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
         if (!reader.parse(json_file, value)) return false;
         if (globalConfig().verbose)
-            LOG(INFO) << "Get segment desc, key=" << key
-                      << ", value=" << json_file;
+            LOG(INFO) << "get: key=" << key << ", value=" << json_file;
         return true;
     }
 
@@ -67,13 +69,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         if (globalConfig().verbose)
-            LOG(INFO) << "Put segment desc, key=" << key
-                      << ", value=" << json_file;
-
+            LOG(INFO) << "set: key=" << key << ", value=" << json_file;
         redisReply *resp = (redisReply *)redisCommand(
             client_, "SET %s %s", key.c_str(), json_file.c_str());
         if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            LOG(ERROR) << "redis error: unable to put " << key << " from "
+                       << metadata_uri_;
             return false;
         }
         freeReplyObject(resp);
@@ -84,7 +85,8 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         redisReply *resp =
             (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
         if (!resp) {
-            LOG(ERROR) << "Error from redis client uri: " << metadata_uri_;
+            LOG(ERROR) << "redis error: unable to remove " << key << " from "
+                       << metadata_uri_;
             return false;
         }
         freeReplyObject(resp);
@@ -106,16 +108,14 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         Json::Reader reader;
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
+            LOG(ERROR) << "etcd error: unable to get " << key << " from "
+                       << metadata_uri_ << ": " << resp.error_message();
             return false;
         }
         auto json_file = resp.value().as_string();
         if (!reader.parse(json_file, value)) return false;
         if (globalConfig().verbose)
-            LOG(INFO) << "Get segment desc, key=" << key
-                      << ", value=" << json_file;
+            LOG(INFO) << "get: key=" << key << ", value=" << json_file;
         return true;
     }
 
@@ -123,13 +123,11 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         if (globalConfig().verbose)
-            LOG(INFO) << "Put segment desc, key=" << key
-                      << ", value=" << json_file;
+            LOG(INFO) << "set: key=" << key << ", value=" << json_file;
         auto resp = client_.put(key, json_file);
         if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
+            LOG(ERROR) << "etcd error: unable to set " << key << " from "
+                       << metadata_uri_ << ": " << resp.error_message();
             return false;
         }
         return true;
@@ -138,9 +136,8 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual bool remove(const std::string &key) {
         auto resp = client_.rm(key);
         if (!resp.is_ok()) {
-            LOG(ERROR) << "Error from etcd client, uri: " << metadata_uri_
-                       << " error: " << resp.error_code()
-                       << " message: " << resp.error_message();
+            LOG(ERROR) << "etcd error: unable to delete " << key << " from "
+                       << metadata_uri_ << ": " << resp.error_message();
             return false;
         }
         return true;
@@ -183,7 +180,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
         }
 #endif  // USE_REDIS
     } else {
-        LOG(ERROR) << "Unsupported metdata protocol "
+        LOG(ERROR) << "unsupported metadata storage plugin "
                    << parsed_conn_string.first;
         return nullptr;
     }
@@ -203,7 +200,7 @@ static inline const std::string toString(struct sockaddr *addr) {
                       INET6_ADDRSTRLEN) != NULL)
             return ip;
     }
-    LOG(ERROR) << "Invalid address, cannot convert to string";
+    LOG(ERROR) << "invalid address, cannot convert to string";
     return "<unknown>";
 }
 
@@ -228,7 +225,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
 
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd < 0) {
-            PLOG(ERROR) << "Failed to create socket";
+            PLOG(ERROR) << "socket";
             return ERR_SOCKET;
         }
 
@@ -237,26 +234,26 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         timeout.tv_usec = 0;
         if (setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
-            PLOG(ERROR) << "Failed to set socket timeout";
+            PLOG(ERROR) << "setsockopt(SO_RCVTIMEO)";
             close(listen_fd);
             return ERR_SOCKET;
         }
 
         if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "Failed to set address reusable";
+            PLOG(ERROR) << "setsockopt(SO_REUSEADDR)";
             close(listen_fd);
             return ERR_SOCKET;
         }
 
         if (bind(listen_fd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
             0) {
-            PLOG(ERROR) << "Failed to bind address, rpc port: " << listen_port;
+            PLOG(ERROR) << "bind (port " << listen_port << ")";
             close(listen_fd);
             return ERR_SOCKET;
         }
 
         if (listen(listen_fd, 5)) {
-            PLOG(ERROR) << "Failed to listen";
+            PLOG(ERROR) << "listen";
             close(listen_fd);
             return ERR_SOCKET;
         }
@@ -268,13 +265,12 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
                 socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK)
-                        PLOG(ERROR) << "Failed to accept socket connection";
+                    if (errno != EWOULDBLOCK) PLOG(ERROR) << "accept";
                     continue;
                 }
 
                 if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
-                    LOG(ERROR) << "Unsupported socket type, should be AF_INET "
+                    LOG(ERROR) << "unsupported socket type, should be AF_INET "
                                   "or AF_INET6";
                     close(conn_fd);
                     continue;
@@ -285,31 +281,30 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
                 timeout.tv_usec = 0;
                 if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                                sizeof(timeout))) {
-                    PLOG(ERROR) << "Failed to set socket timeout";
+                    PLOG(ERROR) << "setsockopt(SO_RCVTIMEO)";
                     close(conn_fd);
                     continue;
                 }
 
+                auto peer_hostname = toString((struct sockaddr *)&addr) + ":" +
+                                     std::to_string(ntohs(addr.sin_port));
                 if (globalConfig().verbose)
-                    LOG(INFO) << "New connection: "
-                              << toString((struct sockaddr *)&addr) << ":"
-                              << ntohs(addr.sin_port);
+                    LOG(INFO) << "new connection: " << peer_hostname.c_str();
 
                 Json::Value local, peer;
                 Json::Reader reader;
                 if (!reader.parse(readString(conn_fd), peer)) {
-                    LOG(ERROR) << "Failed to receive handshake message: malformed json "
-                                  "format, check tcp connection";
+                    LOG(ERROR) << "failed to receive handshake message: "
+                                  "malformed json format, check tcp connection";
                     close(conn_fd);
-                    continue;;
+                    continue;
                 }
 
                 on_recv_callback(peer, local);
                 int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
                 if (ret) {
-                    PLOG(ERROR)
-                        << "Failed to send handshake message: malformed "
-                           "json format, check tcp connection";
+                    LOG(ERROR) << "failed to send handshake message: "
+                                  "malformed json format, check tcp connection";
                     close(conn_fd);
                     continue;
                 }
@@ -335,7 +330,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         if (getaddrinfo(peer_location.ip_or_host_name.c_str(), service, &hints,
                         &result)) {
             PLOG(ERROR)
-                << "Failed to get IP address of peer server "
+                << "failed to get IP address of peer server "
                 << peer_location.ip_or_host_name << ":"
                 << peer_location.rpc_port
                 << ", check DNS and /etc/hosts, or use IPv4 address instead";
@@ -358,19 +353,20 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         return ret;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local, Json::Value &peer) {
+    int doSend(struct addrinfo *addr, const Json::Value &local,
+               Json::Value &peer) {
         if (globalConfig().verbose)
-            LOG(INFO) << "Try connecting " << toString(addr->ai_addr);
+            LOG(INFO) << "try connecting " << toString(addr->ai_addr);
 
         int on = 1;
         int conn_fd =
             socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (conn_fd == -1) {
-            PLOG(ERROR) << "Failed to create socket";
+            PLOG(ERROR) << "socket";
             return ERR_SOCKET;
         }
         if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "Failed to set address reusable";
+            PLOG(ERROR) << "setsockopt(SO_REUSEADDR)";
             close(conn_fd);
             return ERR_SOCKET;
         }
@@ -380,30 +376,29 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         timeout.tv_usec = 0;
         if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
-            PLOG(ERROR) << "Failed to set socket timeout";
+            PLOG(ERROR) << "setsockopt(SO_RCVTIMEO)";
             close(conn_fd);
             return ERR_SOCKET;
         }
 
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "Failed to connect " << toString(addr->ai_addr)
-                        << " via socket";
+            PLOG(ERROR) << "connect " << toString(addr->ai_addr);
             close(conn_fd);
             return ERR_SOCKET;
         }
 
         int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
         if (ret) {
-            LOG(ERROR) << "Failed to send handshake message: malformed json "
-                          "format, check tcp connection";
+            LOG(ERROR) << "failed to send handshake message: "
+                          "malformed json format, check tcp connection";
             close(conn_fd);
             return ret;
         }
 
         Json::Reader reader;
         if (!reader.parse(readString(conn_fd), peer)) {
-            LOG(ERROR) << "Failed to receive handshake message: malformed json "
-                          "format, check tcp connection";
+            LOG(ERROR) << "failed to receive handshake message: "
+                          "malformed json format, check tcp connection";
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }

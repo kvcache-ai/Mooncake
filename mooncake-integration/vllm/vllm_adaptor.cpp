@@ -57,8 +57,7 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_server,
                                const char *protocol, const char *device_name,
                                const char *metadata_type) {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(metadata_server, metadata_type);
+    auto metadata_client = std::make_shared<TransferMetadata>(metadata_server);
     if (!metadata_client) return -1;
 
     engine_ = std::make_unique<TransferEngine>(metadata_client);
