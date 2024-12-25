@@ -101,7 +101,7 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
     for (auto &local_memory_region : local_memory_regions_) {
         if (overlap(addr, length, local_memory_region.addr,
                     local_memory_region.length)) {
-            LOG(ERROR) << "Memory region overlap";
+            LOG(ERROR) << "Transfer Engine does not support overlapped memory region";
             return ERR_ADDRESS_OVERLAPPED;
         }
     }
@@ -167,7 +167,7 @@ Transport *TransferEngine::initTransport(const char *proto) {
     }
 #endif
     else {
-        LOG(ERROR) << "Unsupported Transport Protocol: " << proto;
+        LOG(ERROR) << "Unsupported transport " << proto;
         return NULL;
     }
 }

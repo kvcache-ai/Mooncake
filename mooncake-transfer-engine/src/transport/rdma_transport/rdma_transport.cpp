@@ -54,11 +54,10 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
-    int ret = parseNicPriorityMatrix(
-        nic_priority_matrix, local_priority_matrix, device_name_list_);
+    int ret = parseNicPriorityMatrix(nic_priority_matrix, local_priority_matrix,
+                                     device_name_list_);
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot parse "
-                      "NIC priority matrix: "
+        LOG(ERROR) << "RdmaTransport: incorrect NIC priority matrix: "
                    << nic_priority_matrix;
         return ret;
     }
@@ -69,8 +68,7 @@ int RdmaTransport::install(std::string &local_server_name,
 
     ret = initializeRdmaResources();
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
-                      "initialize RDMA resources";
+        LOG(ERROR) << "RdmaTransport: cannot initialize RDMA resources";
         return ret;
     }
 
@@ -83,16 +81,13 @@ int RdmaTransport::install(std::string &local_server_name,
 
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot start "
-                      "handshake daemon";
+        LOG(ERROR) << "RdmaTransport: cannot start handshake daemon";
         return ret;
     }
 
     ret = metadata_->updateLocalSegmentDesc();
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
-                      "publish segments. Check the connectivity between this "
-                      "server and etcd servers";
+        LOG(ERROR) << "RdmaTransport: cannot publish segments";
         return ret;
     }
 
@@ -166,7 +161,7 @@ int RdmaTransport::registerLocalMemoryBatch(
 
     for (size_t i = 0; i < buffer_list.size(); ++i) {
         if (results[i].get()) {
-            LOG(WARNING) << "Failed to register memory: addr "
+            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
         }
@@ -187,7 +182,7 @@ int RdmaTransport::unregisterLocalMemoryBatch(
 
     for (size_t i = 0; i < addr_list.size(); ++i) {
         if (results[i].get())
-            LOG(WARNING) << "Failed to unregister memory: addr "
+            LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
     }
 
@@ -198,7 +193,8 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                                   const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "Exceed the limitation of current batch's capacity";
+        LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
+                      "capacity";
         return ERR_TOO_MANY_REQUESTS;
     }
 
@@ -242,8 +238,9 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                 break;
             }
             if (device_id < 0) {
-                LOG(ERROR) << "Address not registered by any device(s) "
-                           << slice->source_addr;
+                LOG(ERROR)
+                    << "RdmaTransport: Address not registered by any device(s) "
+                    << slice->source_addr;
                 return ERR_ADDRESS_NOT_REGISTERED;
             }
         }
@@ -319,7 +316,7 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 
 int RdmaTransport::initializeRdmaResources() {
     if (device_name_list_.empty()) {
-        LOG(ERROR) << "No available RNIC!";
+        LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
 
@@ -379,7 +376,9 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             if (index < preferred_rnic_list_len)
                 device_id = priority.preferred_rnic_id_list[index];
             else
-                device_id = priority.available_rnic_id_list[index - preferred_rnic_list_len];
+                device_id =
+                    priority.available_rnic_id_list[index -
+                                                    preferred_rnic_list_len];
         }
 
         return 0;

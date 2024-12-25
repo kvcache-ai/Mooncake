@@ -292,7 +292,8 @@ int TcpTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "Exceed the limitation of current batch's capacity";
+        LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
+                      "capacity";
         return ERR_TOO_MANY_REQUESTS;
     }
 

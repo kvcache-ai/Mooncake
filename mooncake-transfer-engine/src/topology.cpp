@@ -55,7 +55,7 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
     std::vector<InfinibandDevice> devices;
 
     if (dir == NULL) {
-        LOG(WARNING) << "failed to list /sys/class/infiniband";
+        LOG(WARNING) << "Failed to list /sys/class/infiniband";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -73,7 +73,7 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  entry->d_name);
         if (realpath(path, resolved_path) == NULL) {
-            LOG(ERROR) << "realpath: " << strerror(errno);
+            PLOG(ERROR) << "Failed to parse realpath";
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
@@ -97,7 +97,7 @@ static std::vector<TopologyEntry> discover_cpu_topology(
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        LOG(WARNING) << "failed to list /sys/devices/system/node";
+        LOG(WARNING) << "Failed to list /sys/devices/system/node";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -219,12 +219,12 @@ int parseNicPriorityMatrix(const std::string &nic_priority_matrix,
 
     if (nic_priority_matrix.empty() ||
         !reader.parse(nic_priority_matrix, root)) {
-        LOG(ERROR) << "malformed format of NIC priority matrix";
+        LOG(ERROR) << "PriorityMatrix: malformed format";
         return ERR_MALFORMED_JSON;
     }
 
     if (!root.isObject()) {
-        LOG(ERROR) << "malformed format of NIC priority matrix";
+        LOG(ERROR) << "PriorityMatrix: malformed format";
         return ERR_MALFORMED_JSON;
     }
 
@@ -259,7 +259,7 @@ int parseNicPriorityMatrix(const std::string &nic_priority_matrix,
             }
             priority_map[key] = item;
         } else {
-            LOG(ERROR) << "malformed format of NIC priority matrix";
+            LOG(ERROR) << "PriorityMatrix: malformed format";
             return ERR_MALFORMED_JSON;
         }
     }

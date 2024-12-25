@@ -57,6 +57,12 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
+        if (globalConfig().verbose) {
+            LOG(INFO) << "TransferHandshakeUtil::decode: local_nic_path "
+                      << desc.local_nic_path << " peer_nic_path "
+                      << desc.peer_nic_path << " qp_num count "
+                      << desc.qp_num.size();
+        }
         return 0;
     }
 };
@@ -64,6 +70,10 @@ struct TransferHandshakeUtil {
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
     handshake_plugin_ = MetadataHandShakePlugin::Create(conn_string);
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
+    if (!handshake_plugin_ || !storage_plugin_) {
+        LOG(ERROR) << "Unable to create metadata plugins with conn string "
+                   << conn_string;
+    }
     next_segment_id_.store(1);
 }
 
@@ -127,12 +137,14 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
         }
         segmentJSON["buffers"] = buffersJSON;
     } else {
-        LOG(FATAL)
-            << "For NVMeoF, the transfer engine should not modify the metadata";
+        LOG(ERROR) << "Unsupported segment descriptor for register, name "
+                   << desc.name << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
 
     if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
+        LOG(ERROR) << "Failed to register segment descriptor, name "
+                   << desc.name << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
 
@@ -141,6 +153,8 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
+        LOG(ERROR) << "Failed to unregister segment descriptor, name "
+                   << segment_name;
         return ERR_METADATA;
     }
     return 0;
@@ -150,14 +164,12 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value segmentJSON;
     if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
+        LOG(WARNING) << "Failed to retrieve segment descriptor, name "
+                     << segment_name;
         return nullptr;
     }
 
     auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) {
-        return nullptr;
-    }
-
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
 
@@ -167,6 +179,11 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             device.name = deviceJSON["name"].asString();
             device.lid = deviceJSON["lid"].asUInt();
             device.gid = deviceJSON["gid"].asString();
+            if (device.name.empty() || device.gid.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
             desc->devices.push_back(device);
         }
 
@@ -179,6 +196,13 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
                 buffer.rkey.push_back(rkeyJSON.asUInt());
             for (const auto &lkeyJSON : bufferJSON["lkey"])
                 buffer.lkey.push_back(lkeyJSON.asUInt());
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.rkey.empty() ||
+                buffer.rkey.size() != buffer.lkey.size()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
             desc->buffers.push_back(buffer);
         }
 
@@ -214,6 +238,9 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
                     LOG_ASSERT(device_index != (int)desc->devices.size());
                 }
                 desc->priority_matrix[key] = item;
+            } else {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
             }
         }
     } else if (desc->protocol == "tcp") {
@@ -222,6 +249,11 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvmeof") {
@@ -235,12 +267,18 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             }
             desc->nvmeof_buffers.push_back(buffer);
         }
+    } else {
+        LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
+                   << " protocol " << desc->protocol;
+        return nullptr;
     }
+
     return desc;
 }
 
 int TransferMetadata::syncSegmentCache() {
     RWSpinlock::WriteGuard guard(segment_lock_);
+    LOG(INFO) << "Invalidate segment descriptor cache";
     for (auto &entry : segment_id_to_desc_map_) {
         if (entry.first == LOCAL_SEGMENT_ID) continue;
         auto segment_desc = getSegmentDesc(entry.second->name);
@@ -329,9 +367,6 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
-        if (!new_segment_desc) {
-            return ERR_MEMORY;
-        }
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
@@ -347,9 +382,6 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
-        if (!new_segment_desc) {
-            return ERR_MEMORY;
-        }
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
@@ -375,6 +407,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
     if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+        LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
     }
     local_rpc_meta_ = desc;
@@ -383,6 +416,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
+        LOG(ERROR) << "Failed to remove location of " << server_name;
         return ERR_METADATA;
     }
     return 0;
@@ -400,6 +434,7 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     Json::Value rpcMetaJSON;
     if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+        LOG(ERROR) << "Failed to find location of " << server_name;
         return ERR_METADATA;
     }
     desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
@@ -428,7 +463,6 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     HandShakeDesc &peer_desc) {
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
-        LOG(ERROR) << "[Handshake] cannot find location of " << peer_server_name;
         return ERR_METADATA;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
@@ -437,7 +471,7 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     if (ret) return ret;
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "[Handshake] rejected by " << peer_server_name << ": "
+        LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;
         return ERR_METADATA;
     }

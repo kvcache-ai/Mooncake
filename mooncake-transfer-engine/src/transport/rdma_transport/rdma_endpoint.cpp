@@ -92,7 +92,7 @@ int RdmaEndPoint::destroyQP() { return deconstruct(); }
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
-        LOG(WARNING) << "Previous connection is discarded";
+        LOG(WARNING) << "Previous connection will be discarded";
         disconnectUnlocked();
     }
     peer_nic_path_ = peer_nic_path;
@@ -101,7 +101,7 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 int RdmaEndPoint::setupConnectionsByActive() {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
-        // LOG(WARNING) << "Connection already connected";
+        LOG(INFO) << "Connection has been established";
         return 0;
     }
     HandShakeDesc local_desc, peer_desc;
