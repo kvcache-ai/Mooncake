@@ -288,7 +288,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
             "MC_MAX_EP_PER_CTX";
-        LOG(ERROR) << message;
+        LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_INVALID_ARGUMENT;
     }
@@ -318,6 +318,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     if (ret) {
         std::string message = "Failed to modity QP to RESET: ";
         message += strerror(ret);
+        LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -336,6 +337,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         std::string message =
             "Failed to modity QP to INIT, check local context port num: ";
         message += strerror(ret);
+        LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -377,6 +379,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
             "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp "
             "num: ";
         message += strerror(ret);
+        LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -396,6 +399,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     if (ret) {
         std::string message = "Failed to modity QP to RTS: ";
         message += strerror(ret);
+        LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }

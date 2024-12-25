@@ -11,7 +11,7 @@ TEST(ToplogyTest, GetTopologyMatrix)
     LOG(INFO) << topo;
     mooncake::TransferMetadata::PriorityMatrix matrix;
     std::vector<std::string> rnic_list;
-    mooncake::TransferMetadata::parseNicPriorityMatrix(topo, matrix, rnic_list);
+    mooncake::parseNicPriorityMatrix(topo, matrix, rnic_list);
 }
 
 int main(int argc, char **argv)

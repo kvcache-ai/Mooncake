@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -170,8 +171,7 @@ static std::vector<TopologyEntry> discover_cuda_topology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
-            ;
+        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
@@ -208,5 +208,65 @@ std::string discoverTopologyMatrix() {
     }
 #endif
     return value.toStyledString();
+}
+
+int parseNicPriorityMatrix(const std::string &nic_priority_matrix,
+                           TransferMetadata::PriorityMatrix &priority_map,
+                           std::vector<std::string> &rnic_list) {
+    std::set<std::string> rnic_set;
+    Json::Value root;
+    Json::Reader reader;
+
+    if (nic_priority_matrix.empty() ||
+        !reader.parse(nic_priority_matrix, root)) {
+        LOG(ERROR) << "malformed format of NIC priority matrix";
+        return ERR_MALFORMED_JSON;
+    }
+
+    if (!root.isObject()) {
+        LOG(ERROR) << "malformed format of NIC priority matrix";
+        return ERR_MALFORMED_JSON;
+    }
+
+    priority_map.clear();
+    for (const auto &key : root.getMemberNames()) {
+        const Json::Value &value = root[key];
+        if (value.isArray() && value.size() == 2) {
+            TransferMetadata::PriorityItem item;
+            for (const auto &array : value[0]) {
+                auto device_name = array.asString();
+                item.preferred_rnic_list.push_back(device_name);
+                auto iter = rnic_set.find(device_name);
+                if (iter == rnic_set.end()) {
+                    item.preferred_rnic_id_list.push_back(rnic_set.size());
+                    rnic_set.insert(device_name);
+                } else {
+                    item.preferred_rnic_id_list.push_back(
+                        std::distance(rnic_set.begin(), iter));
+                }
+            }
+            for (const auto &array : value[1]) {
+                auto device_name = array.asString();
+                item.available_rnic_list.push_back(device_name);
+                auto iter = rnic_set.find(device_name);
+                if (iter == rnic_set.end()) {
+                    item.available_rnic_id_list.push_back(rnic_set.size());
+                    rnic_set.insert(device_name);
+                } else {
+                    item.available_rnic_id_list.push_back(
+                        std::distance(rnic_set.begin(), iter));
+                }
+            }
+            priority_map[key] = item;
+        } else {
+            LOG(ERROR) << "malformed format of NIC priority matrix";
+            return ERR_MALFORMED_JSON;
+        }
+    }
+
+    rnic_list.clear();
+    for (auto &entry : rnic_set) rnic_list.push_back(entry);
+
+    return 0;
 }
 }  // namespace mooncake

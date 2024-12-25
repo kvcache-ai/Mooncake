@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -53,7 +54,7 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
-    int ret = metadata_->parseNicPriorityMatrix(
+    int ret = parseNicPriorityMatrix(
         nic_priority_matrix, local_priority_matrix, device_name_list_);
     if (ret) {
         LOG(ERROR) << "Transfer engine cannot be initialized: cannot parse "
