@@ -105,7 +105,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 #endif  // USE_REDIS
 
 #ifdef USE_HTTP
-struct HTTPStoragePlugin: public MetadataStoragePlugin {
+struct HTTPStoragePlugin : public MetadataStoragePlugin {
     HTTPStoragePlugin(const std::string &metadata_uri)
         : client_(nullptr), metadata_uri_(metadata_uri) {
         curl_global_init(CURL_GLOBAL_ALL);
@@ -121,8 +121,9 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
         curl_global_cleanup();
     }
 
-    static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-        userp->append(static_cast<char*>(contents), size * nmemb);
+    static size_t writeCallback(void *contents, size_t size, size_t nmemb,
+                                std::string *userp) {
+        userp->append(static_cast<char *>(contents), size * nmemb);
         return size * nmemb;
     }
 
@@ -136,7 +137,7 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
 
     virtual bool get(const std::string &key, Json::Value &value) {
         curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
         std::string url = encodeUrl(key);
         curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
@@ -173,7 +174,7 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
 
     virtual bool set(const std::string &key, const Json::Value &value) {
         curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
@@ -197,7 +198,7 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(client_, CURLOPT_HTTPHEADER, headers);
         CURLcode res = curl_easy_perform(client_);
-        curl_slist_free_all(headers); // Free headers
+        curl_slist_free_all(headers);  // Free headers
         if (res != CURLE_OK) {
             LOG(ERROR) << "Error from http client, PUT " << url
                        << " error: " << curl_easy_strerror(res);
@@ -219,7 +220,7 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
 
     virtual bool remove(const std::string &key) {
         curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
         if (globalConfig().verbose)
             LOG(INFO) << "Remove segment desc, key=" << key;
@@ -254,7 +255,7 @@ struct HTTPStoragePlugin: public MetadataStoragePlugin {
     CURL *client_;
     const std::string metadata_uri_;
 };
-#endif // USE_HTTP
+#endif  // USE_HTTP
 
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
@@ -336,6 +337,12 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     } else if (parsed_conn_string.first == "redis") {
         return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second);
 #endif  // USE_REDIS
+#ifdef USE_HTTP
+    } else if (parsed_conn_string.first == "http" ||
+               parsed_conn_string.first == "https") {
+        return std::make_shared<HttpStoragePlugin>(
+            conn_string);  // including prefix
+#endif                     // USE_HTTP
     } else {
         LOG(FATAL) << "Unable to find metadata storage plugin "
                    << parsed_conn_string.first;
