@@ -24,6 +24,10 @@
 #include <hiredis/hiredis.h>
 #endif
 
+#ifdef USE_HTTP
+#include <curl/curl.h>
+#endif
+
 #include <cassert>
 #include <set>
 
@@ -112,6 +116,158 @@ struct TransferMetadataImpl4Redis : public TransferMetadataImpl {
 };
 #endif // USE_REDIS
 
+#ifdef USE_HTTP
+struct TransferMetadataImpl4Http: public TransferMetadataImpl {
+    TransferMetadataImpl4Http(const std::string &metadata_uri)
+        : client_(nullptr), metadata_uri_(metadata_uri) {
+        curl_global_init(CURL_GLOBAL_ALL);
+        client_ = curl_easy_init();
+        if (!client_) {
+            LOG(ERROR) << "Cannot allocate CURL objects";
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    virtual ~TransferMetadataImpl4Http() {
+        curl_easy_cleanup(client_);
+        curl_global_cleanup();
+    }
+
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
+        userp->append(static_cast<char*>(contents), size * nmemb);
+        return size * nmemb;
+    }
+
+    std::string encodeUrl(const std::string &key) {
+        char *newkey = curl_easy_escape(client_, key.c_str(), key.size());
+        std::string encodedKey(newkey);
+        std::string url = metadata_uri_ + "?key=" + encodedKey;
+        curl_free(newkey);
+        return url;
+    }
+
+    virtual bool get(const std::string &key, Json::Value &value) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        CURLcode res = curl_easy_perform(client_);
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, GET " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, GET " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+
+        if (globalConfig().verbose)
+            LOG(INFO) << "Get segment desc, key=" << key
+                      << ", value=" << readBuffer;
+
+        Json::Reader reader;
+        if (!reader.parse(readBuffer, value)) return false;
+        return true;
+    }
+
+    virtual bool set(const std::string &key, const Json::Value &value) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+
+        Json::FastWriter writer;
+        const std::string json_file = writer.write(value);
+        if (globalConfig().verbose)
+            LOG(INFO) << "Put segment desc, key=" << key
+                      << ", value=" << json_file;
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(client_, CURLOPT_POSTFIELDS, json_file.c_str());
+        curl_easy_setopt(client_, CURLOPT_POSTFIELDSIZE, json_file.size());
+        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "PUT");
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+
+        // set content-type to application/json
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(client_, CURLOPT_HTTPHEADER, headers);
+        CURLcode res = curl_easy_perform(client_);
+        curl_slist_free_all(headers); // Free headers
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, PUT " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, PUT " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+
+        return true;
+    }
+
+    virtual bool remove(const std::string &key) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000); // 3s timeout
+
+        if (globalConfig().verbose)
+            LOG(INFO) << "Remove segment desc, key=" << key;
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        CURLcode res = curl_easy_perform(client_);
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, DELETE " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, DELETE " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+        return true;
+    }
+
+    CURL *client_;
+    const std::string metadata_uri_;
+};
+#endif // USE_HTTP
+
 struct TransferMetadataImpl4Etcd : public TransferMetadataImpl {
     TransferMetadataImpl4Etcd(const std::string &metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
@@ -182,6 +338,14 @@ TransferMetadata::TransferMetadata(const std::string &metadata_uri, const std::s
             exit(EXIT_FAILURE);
         }
 #endif // USE_REDIS
+#ifdef USE_HTTP
+    } else if (protocol == "http") {
+        impl_ = std::make_shared<TransferMetadataImpl4Http>(metadata_uri);
+        if (!impl_) {
+            LOG(ERROR) << "Cannot allocate TransferMetadataImpl objects";
+            exit(EXIT_FAILURE);
+        }
+#endif // USE_HTTP
     } else {
         LOG(ERROR) << "Unsupported metdata protocol " << protocol;
         exit(EXIT_FAILURE);

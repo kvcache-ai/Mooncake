@@ -94,13 +94,28 @@ The sample program provided in `mooncake-transfer-engine/example/transfer_engine
 
 After successfully compiling Transfer Engine, the test program `transfer_engine_bench` can be found in the `build/mooncake-transfer-engine/example` directory.
 
-1. **Start the `etcd` service.** This service is used for the centralized highly available management of various metadata for Mooncake, including the internal connection status of Transfer Engine. It is necessary to ensure that both the initiator and target nodes can smoothly access this etcd service, so pay attention to:
-   - The listening IP of the etcd service should not be 127.0.0.1; it should be determined in conjunction with the network environment. In the experimental environment, 0.0.0.0 can be used. For example, the following command line can be used to start the required service:
+1. **Start the `metadata` service.** This service is used for the centralized highly available management of various metadata for Mooncake, including the internal connection status of Transfer Engine. It is necessary to ensure that both the initiator and target nodes can smoothly access this metadata service, so pay attention to:
+   - The listening IP of the metadata service should not be 127.0.0.1; it should be determined in conjunction with the network environment. In the experimental environment, 0.0.0.0 can be used.
+   - On some platforms, if the initiator and target nodes have set the `http_proxy` or `https_proxy` environment variables, it will also affect the communication between Transfer Engine and the metadata service.
+
+   Transfer Engine support multiple kinds of metadata services, including `etcd`, `redis`, and `http`. The following describes how to start the metadata service using `etcd` and `http` as examples.
+
+   1.1. **`etcd`**
+
+   For example, the following command line can be used to start the etcd service:
       ```bash
       # This is 10.0.0.1
       etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
       ```
-   - On some platforms, if the initiator and target nodes have set the `http_proxy` or `https_proxy` environment variables, it will also affect the communication between Transfer Engine and the etcd service, reporting the "Error from etcd client: 14" error.
+
+   1.2. **`http`**
+
+   For example, you can use the `http` service in the `mooncake-transfer-engine/example/http-metadata-server` example:
+      ```bash
+      # This is 10.0.0.1
+      # cd mooncake-transfer-engine/example/http-metadata-server
+      go run . --addr=:8080
+      ```
 
 2. **Start the target node.**
     ```bash
@@ -117,6 +132,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
    - `--mode=target` indicates the start of the target node. The target node does not initiate read/write requests; it passively supplies or writes data as required by the initiator node.
       > Note: In actual applications, there is no need to distinguish between target nodes and initiator nodes; each node can freely initiate read/write requests to other nodes in the cluster.
    - `--metadata_server` is the address of the metadata server (the full address of the etcd service).
+      > Change `--metadata_server` to `--metadata_server=http://10.0.0.1:8080/metadata` and add `--metadata_type=http` when using `http` as the `metadata` service.
    - `--local_server_name` represents the address of this machine, which does not need to be set in most cases. If this option is not set, the value is equivalent to the hostname of this machine (i.e., `hostname(2)`). Other nodes in the cluster will use this address to attempt out-of-band communication with this node to establish RDMA connections.
       > Note: If out-of-band communication fails, the connection cannot be established. Therefore, if necessary, you need to modify the `/etc/hosts` file on all nodes in the cluster to locate the correct node through the hostname.
    - `--device_name` indicates the name of the RDMA network card used in the transfer process.
@@ -414,6 +430,16 @@ Value = {
 ```
 </details>
 
+### HTTP Metadata Server
+
+The HTTP server should implement three following RESTful APIs, while the metadata server configured to `http://host:port/metadata` as an example:
+
+1. `GET /metadata?key=$KEY`: Get the metadata corresponding to `$KEY`.
+2. `PUT /metadata?key=$KEY`: Update the metadata corresponding to `$KEY` to the value of the request body.
+3. `DELETE /metadata?key=$KEY`: Delete the metadata corresponding to `$KEY`.
+
+For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](../../mooncake-transfer-engine/example/http-metadata-server).
+
 ### Initialization
 
 ```cpp
@@ -421,7 +447,7 @@ TransferEngine(std::unique_ptr<TransferMetadata> metadata_client);
 TransferMetadata(const std::string &metadata_server, const std::string &protocol = "etcd");
 ```
 
-- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd` and `redis` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server.
+- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd`, `redis` and `http` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server, or the base HTTP URI of http server.
 
 For easy exception handling, TransferEngine needs to call the init function for secondary construction after construction:
 ```cpp
