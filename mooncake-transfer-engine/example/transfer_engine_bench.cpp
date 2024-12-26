@@ -119,7 +119,7 @@ static void freeMemoryPool(void *addr, size_t size) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
+int initiatorWorker(TransferEngine *xport, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
@@ -132,7 +132,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
         exit(EXIT_FAILURE);
     }
 
-    auto segment_desc = xport->meta()->getSegmentDescByID(segment_id);
+    auto segment_desc = xport->getMetadata()->getSegmentDescByID(segment_id);
     if (!segment_desc) {
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
@@ -278,7 +278,7 @@ int initiator() {
     gettimeofday(&start_tv, nullptr);
 
     for (int i = 0; i < FLAGS_threads; ++i)
-        workers[i] = std::thread(initiatorWorker, xport, segment_id, i,
+        workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
                                  addr[i % buffer_num]);
 
     sleep(FLAGS_duration);

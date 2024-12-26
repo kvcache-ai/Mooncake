@@ -49,6 +49,9 @@ class TcpTransport : public Transport {
     int submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries) override;
 
+    int submitTransferTask(const TransferRequest &request,
+                           TransferTask &task) override;
+
     int getTransferStatus(BatchID batch_id, size_t task_id,
                           TransferStatus &status) override;
 
@@ -58,8 +61,9 @@ class TcpTransport : public Transport {
 
     int allocateLocalSegmentID();
 
-    int registerLocalMemory(void *addr, size_t length, const std::string &location,
-                            bool remote_accessible, bool update_metadata);
+    int registerLocalMemory(void *addr, size_t length,
+                            const std::string &location, bool remote_accessible,
+                            bool update_metadata);
 
     int unregisterLocalMemory(void *addr, bool update_metadata = false);
 

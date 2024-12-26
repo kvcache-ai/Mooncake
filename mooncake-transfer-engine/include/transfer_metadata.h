@@ -111,7 +111,7 @@ class TransferMetadata {
 
     SegmentID getSegmentID(const std::string &segment_name);
 
-    int syncSegmentCache();
+    int invalidateSegmentCache();
 
     int removeSegmentDesc(const std::string &segment_name);
 

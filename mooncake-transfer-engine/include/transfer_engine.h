@@ -28,10 +28,19 @@
 #include <utility>
 #include <vector>
 
+#include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+using TransferRequest = Transport::TransferRequest;
+using TransferStatus = Transport::TransferStatus;
+using TransferStatusEnum = Transport::TransferStatusEnum;
+using SegmentHandle = Transport::SegmentHandle;
+using SegmentID = Transport::SegmentID;
+using BatchID = Transport::BatchID;
+using BufferEntry = Transport::BufferEntry;
+
 class TransferEngine {
    public:
     TransferEngine(std::shared_ptr<TransferMetadata> meta) : metadata_(meta) {}
@@ -47,9 +56,9 @@ class TransferEngine {
 
     int uninstallTransport(const char *proto);
 
-    Transport::SegmentHandle openSegment(const char *segment_name);
+    SegmentHandle openSegment(const char *segment_name);
 
-    int closeSegment(Transport::SegmentHandle seg_id);
+    int closeSegment(SegmentHandle handle);
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location,
@@ -58,13 +67,32 @@ class TransferEngine {
 
     int unregisterLocalMemory(void *addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(
-        const std::vector<Transport::BufferEntry> &buffer_list,
-        const std::string &location);
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
+                                 const std::string &location);
 
     int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
 
-    int syncSegmentCache() { return metadata_->syncSegmentCache(); }
+    BatchID allocateBatchID(size_t batch_size) {
+        return multi_transports_->allocateBatchID(batch_size);
+    }
+
+    int freeBatchID(BatchID batch_id) {
+        return multi_transports_->freeBatchID(batch_id);
+    }
+
+    int submitTransfer(BatchID batch_id,
+                       const std::vector<TransferRequest> &entries) {
+        return multi_transports_->submitTransfer(batch_id, entries);
+    }
+
+    int getTransferStatus(BatchID batch_id, size_t task_id,
+                          TransferStatus &status) {
+        return multi_transports_->getTransferStatus(batch_id, task_id, status);
+    }
+
+    int syncSegmentCache() { return metadata_->invalidateSegmentCache(); }
+
+    std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
    private:
     struct MemoryRegion {
@@ -74,22 +102,11 @@ class TransferEngine {
         bool remote_accessible;
     };
 
-    Transport *findName(const char *name, size_t n = SIZE_MAX);
-
-    Transport *initTransport(const char *proto);
-
-    std::vector<Transport *> installed_transports_;
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
+    std::shared_ptr<MultiTransport> multi_transports_;
     std::vector<MemoryRegion> local_memory_regions_;
 };
-
-using TransferRequest = Transport::TransferRequest;
-using TransferStatus = Transport::TransferStatus;
-using TransferStatusEnum = Transport::TransferStatusEnum;
-using SegmentID = Transport::SegmentID;
-using BatchID = Transport::BatchID;
-using BufferEntry = Transport::BufferEntry;
 }  // namespace mooncake
 
 #endif

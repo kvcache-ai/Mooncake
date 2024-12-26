@@ -65,7 +65,7 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
 
         std::string device_name = entry->d_name;
 
-        char path[PATH_MAX];
+        char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that
         // "/sys/class/infiniband/mlx5_X/" is a symlink to
