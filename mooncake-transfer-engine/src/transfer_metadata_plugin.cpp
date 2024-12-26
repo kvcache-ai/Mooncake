@@ -340,7 +340,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 #ifdef USE_HTTP
     } else if (parsed_conn_string.first == "http" ||
                parsed_conn_string.first == "https") {
-        return std::make_shared<HttpStoragePlugin>(
+        return std::make_shared<HTTPStoragePlugin>(
             conn_string);  // including prefix
 #endif                     // USE_HTTP
     } else {
