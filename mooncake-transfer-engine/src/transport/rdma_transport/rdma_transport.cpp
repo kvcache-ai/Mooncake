@@ -250,45 +250,49 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
     return 0;
 }
 
-int RdmaTransport::submitTransferTask(const TransferRequest &request,
-                                      TransferTask &task) {
+int RdmaTransport::submitTransferTask(const std::vector<TransferRequest *> &request_list,
+                                      const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    for (uint64_t offset = 0; offset < request.length; offset += kBlockSize) {
-        auto slice = new Slice();
-        slice->source_addr = (char *)request.source + offset;
-        slice->length = std::min(request.length - offset, kBlockSize);
-        slice->opcode = request.opcode;
-        slice->rdma.dest_addr = request.target_offset + offset;
-        slice->rdma.retry_cnt = 0;
-        slice->rdma.max_retry_cnt = kMaxRetryCount;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
+    for (size_t index = 0; index < request_list.size(); ++index) {
+        auto &request = *request_list[index];
+        auto &task = *task_list[index];
+        for (uint64_t offset = 0; offset < request.length; offset += kBlockSize) {
+            auto slice = new Slice();
+            slice->source_addr = (char *)request.source + offset;
+            slice->length = std::min(request.length - offset, kBlockSize);
+            slice->opcode = request.opcode;
+            slice->rdma.dest_addr = request.target_offset + offset;
+            slice->rdma.retry_cnt = 0;
+            slice->rdma.max_retry_cnt = kMaxRetryCount;
+            slice->task = &task;
+            slice->target_id = request.target_id;
+            slice->status = Slice::PENDING;
 
-        int buffer_id = -1, device_id = -1, retry_cnt = 0;
-        while (retry_cnt < kMaxRetryCount) {
-            if (selectDevice(local_segment_desc.get(),
-                             (uint64_t)slice->source_addr, slice->length,
-                             buffer_id, device_id, retry_cnt++))
-                continue;
-            auto &context = context_list_[device_id];
-            if (!context->active()) continue;
-            slice->rdma.source_lkey =
-                local_segment_desc->buffers[buffer_id].lkey[device_id];
-            slices_to_post[context].push_back(slice);
-            task.total_bytes += slice->length;
-            task.slices.push_back(slice);
-            break;
-        }
-        if (device_id < 0) {
-            LOG(ERROR)
-                << "RdmaTransport: Address not registered by any device(s) "
-                << slice->source_addr;
-            return ERR_ADDRESS_NOT_REGISTERED;
+            int buffer_id = -1, device_id = -1, retry_cnt = 0;
+            while (retry_cnt < kMaxRetryCount) {
+                if (selectDevice(local_segment_desc.get(),
+                                (uint64_t)slice->source_addr, slice->length,
+                                buffer_id, device_id, retry_cnt++))
+                    continue;
+                auto &context = context_list_[device_id];
+                if (!context->active()) continue;
+                slice->rdma.source_lkey =
+                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                slices_to_post[context].push_back(slice);
+                task.total_bytes += slice->length;
+                task.slices.push_back(slice);
+                break;
+            }
+            if (device_id < 0) {
+                LOG(ERROR)
+                    << "RdmaTransport: Address not registered by any device(s) "
+                    << slice->source_addr;
+                return ERR_ADDRESS_NOT_REGISTERED;
+            }
         }
     }
     for (auto &entry : slices_to_post)

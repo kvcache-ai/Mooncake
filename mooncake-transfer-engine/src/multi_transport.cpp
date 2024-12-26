@@ -74,18 +74,28 @@ int MultiTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
+    struct SubmitTasks {
+        std::vector<TransferRequest *> request_list;
+        std::vector<Transport::TransferTask *> task_list;
+    };
+    std::unordered_map<Transport *, SubmitTasks> submit_tasks;
     for (auto &request : entries) {
         auto transport = selectTransport(request);
         auto &task = batch_desc.task_list[task_id];
         ++task_id;
-        int ret = transport->submitTransferTask(request, task);
+        submit_tasks[transport].request_list.push_back(
+            (TransferRequest *)&request);
+        submit_tasks[transport].task_list.push_back(&task);
+    }
+    for (auto &entry : submit_tasks) {
+        int ret = entry.first->submitTransferTask(entry.second.request_list,
+                                                  entry.second.task_list);
         if (ret) {
             LOG(ERROR) << "MultiTransport: Failed to submit transfer task to "
-                       << transport->getName();
+                       << entry.first->getName();
             return ret;
         }
     }
-
     return 0;
 }
 

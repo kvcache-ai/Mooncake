@@ -319,19 +319,24 @@ int TcpTransport::submitTransfer(BatchID batch_id,
     return 0;
 }
 
-int TcpTransport::submitTransferTask(const TransferRequest &request,
-                                     TransferTask &task) {
-    task.total_bytes = request.length;
-    auto slice = new Slice();
-    slice->source_addr = (char *)request.source;
-    slice->length = request.length;
-    slice->opcode = request.opcode;
-    slice->tcp.dest_addr = request.target_offset;
-    slice->task = &task;
-    slice->target_id = request.target_id;
-    slice->status = Slice::PENDING;
-    task.slices.push_back(slice);
-    startTransfer(slice);
+int TcpTransport::submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list) {
+    for (size_t index = 0; index < request_list.size(); ++index) {
+        auto &request = *request_list[index];
+        auto &task = *task_list[index];
+        task.total_bytes = request.length;
+        auto slice = new Slice();
+        slice->source_addr = (char *)request.source;
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->tcp.dest_addr = request.target_offset;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        task.slices.push_back(slice);
+        startTransfer(slice);
+    }
     return 0;
 }
 

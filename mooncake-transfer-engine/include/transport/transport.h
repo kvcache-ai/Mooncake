@@ -164,8 +164,9 @@ class Transport {
     virtual int submitTransfer(BatchID batch_id,
                                const std::vector<TransferRequest> &entries) = 0;
 
-    virtual int submitTransferTask(const TransferRequest &request,
-                                   TransferTask &task) {
+    virtual int submitTransferTask(
+        const std::vector<TransferRequest *> &request_list,
+        const std::vector<TransferTask *> &task_list) {
         return ERR_NOT_IMPLEMENTED;
     }
 
