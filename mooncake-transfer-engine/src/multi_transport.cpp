@@ -112,8 +112,8 @@ int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return 0;
 }
 
-Transport *MultiTransport::installOrGetTransport(const std::string &proto,
-                                                 void **args) {
+Transport *MultiTransport::installTransport(const std::string &proto,
+                                            void **args) {
     Transport *transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
@@ -157,11 +157,14 @@ Transport *MultiTransport::selectTransport(const TransferRequest &entry) {
     return transport_map_[proto];
 }
 
-std::vector<Transport *> MultiTransport::getTransportList() {
+Transport *MultiTransport::getTransport(const std::string &proto) {
+    if (!transport_map_.count(proto)) return nullptr;
+    return transport_map_[proto];
+}
+
+std::vector<Transport *> MultiTransport::listTransports() {
     std::vector<Transport *> transport_list;
-    for (auto &entry : transport_map_) {
-        transport_list.push_back(entry.second);
-    }
+    for (auto &entry : transport_map_) transport_list.push_back(entry.second);
     return transport_list;
 }
 

@@ -32,7 +32,7 @@
 
 namespace mooncake {
 struct MetadataStoragePlugin;
-struct MetadataHandShakePlugin;
+struct HandShakePlugin;
 
 class TransferMetadata {
    public:
@@ -157,7 +157,7 @@ class TransferMetadata {
 
     std::atomic<SegmentID> next_segment_id_;
 
-    std::shared_ptr<MetadataHandShakePlugin> handshake_plugin_;
+    std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
 };
 

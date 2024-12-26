@@ -18,7 +18,8 @@
 
 namespace mooncake {
 
-int TransferEngine::init(const char *server_name, const char *connectable_name,
+int TransferEngine::init(const std::string &server_name,
+                         const std::string &connectable_name,
                          uint64_t rpc_port) {
     local_server_name_ = server_name;
     multi_transports_ =
@@ -34,21 +35,31 @@ int TransferEngine::freeEngine() {
     return 0;
 }
 
-Transport *TransferEngine::installOrGetTransport(const char *proto,
+Transport *TransferEngine::installOrGetTransport(const std::string &proto,
                                                  void **args) {
-    auto transport = multi_transports_->installOrGetTransport(proto, args);
-    for (const auto &entry : local_memory_regions_)
-        if (transport->registerLocalMemory(entry.addr, entry.length,
-                                           entry.location,
-                                           entry.remote_accessible) < 0)
-            return nullptr;
+    Transport *transport = multi_transports_->getTransport(proto);
+    if (transport) {
+        LOG(INFO) << "Transport " << proto << " already installed";
+        return transport;
+    }
+    transport = multi_transports_->installTransport(proto, args);
+    if (!transport) return nullptr;
+    for (auto &entry : local_memory_regions_) {
+        for (auto transport : multi_transports_->listTransports()) {
+            int ret = transport->registerLocalMemory(entry.addr, entry.length,
+                                                     entry.location,
+                                                     entry.remote_accessible);
+            if (ret < 0) return nullptr;
+        }
+    }
     return transport;
 }
 
-int TransferEngine::uninstallTransport(const char *proto) { return 0; }
+int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
 
-Transport::SegmentHandle TransferEngine::openSegment(const char *segment_name) {
-    if (!segment_name) return ERR_INVALID_ARGUMENT;
+Transport::SegmentHandle TransferEngine::openSegment(
+    const std::string &segment_name) {
+    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
         trimmed_segment_name.erase(0, 1);
@@ -56,41 +67,45 @@ Transport::SegmentHandle TransferEngine::openSegment(const char *segment_name) {
     return metadata_->getSegmentID(trimmed_segment_name);
 }
 
-int TransferEngine::closeSegment(Transport::SegmentHandle seg_id) {
-    // Not used
-    return 0;
+int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
+
+bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
+    for (auto &local_memory_region : local_memory_regions_) {
+        if (overlap(addr, length, local_memory_region.addr,
+                    local_memory_region.length)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int TransferEngine::registerLocalMemory(void *addr, size_t length,
                                         const std::string &location,
                                         bool remote_accessible,
                                         bool update_metadata) {
-    for (auto &local_memory_region : local_memory_regions_) {
-        if (overlap(addr, length, local_memory_region.addr,
-                    local_memory_region.length)) {
-            LOG(ERROR)
-                << "Transfer Engine does not support overlapped memory region";
-            return ERR_ADDRESS_OVERLAPPED;
-        }
+    if (checkOverlap(addr, length)) {
+        LOG(ERROR)
+            << "Transfer Engine does not support overlapped memory region";
+        return ERR_ADDRESS_OVERLAPPED;
     }
-    for (auto &xport : multi_transports_->getTransportList()) {
-        int ret = xport->registerLocalMemory(
+    for (auto transport : multi_transports_->listTransports()) {
+        int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) return ret;
     }
     local_memory_regions_.push_back(
-        {addr, length, location.c_str(), remote_accessible});
+        {addr, length, location, remote_accessible});
     return 0;
 }
 
 int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
+    for (auto &transport : multi_transports_->listTransports()) {
+        int ret = transport->unregisterLocalMemory(addr, update_metadata);
+        if (ret) return ret;
+    }
     for (auto it = local_memory_regions_.begin();
          it != local_memory_regions_.end(); ++it) {
         if (it->addr == addr) {
-            for (auto &xport : multi_transports_->getTransportList()) {
-                if (xport->unregisterLocalMemory(addr, update_metadata) < 0)
-                    return ERR_MEMORY;
-            }
             local_memory_regions_.erase(it);
             break;
         }
@@ -100,18 +115,38 @@ int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
 
 int TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list, const std::string &location) {
-    for (auto &xport : multi_transports_->getTransportList()) {
-        int ret = xport->registerLocalMemoryBatch(buffer_list, location);
+    for (auto &buffer : buffer_list) {
+        if (checkOverlap(buffer.addr, buffer.length)) {
+            LOG(ERROR)
+                << "Transfer Engine does not support overlapped memory region";
+            return ERR_ADDRESS_OVERLAPPED;
+        }
+    }
+    for (auto transport : multi_transports_->listTransports()) {
+        int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret < 0) return ret;
+    }
+    for (auto &buffer : buffer_list) {
+        local_memory_regions_.push_back(
+            {buffer.addr, buffer.length, location, true});
     }
     return 0;
 }
 
 int TransferEngine::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &xport : multi_transports_->getTransportList()) {
-        int ret = xport->unregisterLocalMemoryBatch(addr_list);
+    for (auto transport : multi_transports_->listTransports()) {
+        int ret = transport->unregisterLocalMemoryBatch(addr_list);
         if (ret < 0) return ret;
+    }
+    for (auto &addr : addr_list) {
+        for (auto it = local_memory_regions_.begin();
+             it != local_memory_regions_.end(); ++it) {
+            if (it->addr == addr) {
+                local_memory_regions_.erase(it);
+                break;
+            }
+        }
     }
     return 0;
 }

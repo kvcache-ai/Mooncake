@@ -44,9 +44,11 @@ class MultiTransport {
     int getTransferStatus(BatchID batch_id, size_t task_id,
                           TransferStatus &status);
 
-    Transport *installOrGetTransport(const std::string &proto, void **args);
+    Transport *installTransport(const std::string &proto, void **args);
 
-    std::vector<Transport *> getTransportList();
+    Transport *getTransport(const std::string &proto);
+
+    std::vector<Transport *> listTransports();
 
    private:
     Transport *selectTransport(const TransferRequest &entry);

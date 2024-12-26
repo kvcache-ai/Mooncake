@@ -30,20 +30,25 @@ struct MetadataStoragePlugin {
     virtual bool remove(const std::string &key) = 0;
 };
 
-struct MetadataHandShakePlugin {
-    static std::shared_ptr<MetadataHandShakePlugin> Create(
+struct HandShakePlugin {
+    static std::shared_ptr<HandShakePlugin> Create(
         const std::string &conn_string);
 
-    MetadataHandShakePlugin() {}
-    virtual ~MetadataHandShakePlugin() {}
+    HandShakePlugin() {}
+    virtual ~HandShakePlugin() {}
 
+    // When accept a new connection, this function will be called.
+    // The first param represents peer endpoint's attributes, while
+    // the second param represents local endpoint's attributes
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
 
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
                             uint16_t listen_port) = 0;
 
-    virtual int send(TransferMetadata::RpcMetaDesc peer_location,
+    // Connect to peer endpoint, and wait for receiving
+    // peer endpoint's attributes
+    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
 };
 

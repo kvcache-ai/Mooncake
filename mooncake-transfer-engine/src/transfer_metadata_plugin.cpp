@@ -370,7 +370,7 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     return "";
 }
 
-struct SocketHandShakePlugin : public MetadataHandShakePlugin {
+struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false) {}
 
     virtual ~SocketHandShakePlugin() {
@@ -489,7 +489,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         return 0;
     }
 
-    virtual int send(TransferMetadata::RpcMetaDesc peer_location,
+    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
@@ -498,14 +498,12 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];
-        sprintf(service, "%u", peer_location.rpc_port);
-        if (getaddrinfo(peer_location.ip_or_host_name.c_str(), service, &hints,
-                        &result)) {
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
             PLOG(ERROR)
                 << "SocketHandShakePlugin: failed to get IP address of peer "
                    "server "
-                << peer_location.ip_or_host_name << ":"
-                << peer_location.rpc_port
+                << ip_or_host_name << ":" << rpc_port
                 << ", check DNS and /etc/hosts, or use IPv4 address instead";
             return ERR_DNS;
         }
@@ -588,7 +586,7 @@ struct SocketHandShakePlugin : public MetadataHandShakePlugin {
     std::thread listener_;
 };
 
-std::shared_ptr<MetadataHandShakePlugin> MetadataHandShakePlugin::Create(
+std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
     const std::string &conn_string) {
     return std::make_shared<SocketHandShakePlugin>();
 }

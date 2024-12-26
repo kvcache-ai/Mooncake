@@ -68,7 +68,7 @@ struct TransferHandshakeUtil {
 };
 
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
-    handshake_plugin_ = MetadataHandShakePlugin::Create(conn_string);
+    handshake_plugin_ = HandShakePlugin::Create(conn_string);
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
     if (!handshake_plugin_ || !storage_plugin_) {
         LOG(ERROR) << "Unable to create metadata plugins with conn string "
@@ -467,7 +467,8 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->send(peer_location, local, peer);
+    int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
+                                      peer_location.rpc_port, local, peer);
     if (ret) return ret;
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {

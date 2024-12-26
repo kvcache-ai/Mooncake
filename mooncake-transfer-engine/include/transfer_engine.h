@@ -43,20 +43,21 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
-    TransferEngine(std::shared_ptr<TransferMetadata> meta) : metadata_(meta) {}
+    TransferEngine(std::shared_ptr<TransferMetadata> metadata)
+        : metadata_(metadata) {}
 
     ~TransferEngine() { freeEngine(); }
 
-    int init(const char *server_name, const char *connectable_name,
-             uint64_t rpc_port = 12345);
+    int init(const std::string &server_name,
+             const std::string &connectable_name, uint64_t rpc_port = 12345);
 
     int freeEngine();
 
-    Transport *installOrGetTransport(const char *proto, void **args);
+    Transport *installOrGetTransport(const std::string &proto, void **args);
 
-    int uninstallTransport(const char *proto);
+    int uninstallTransport(const std::string &proto);
 
-    SegmentHandle openSegment(const char *segment_name);
+    SegmentHandle openSegment(const std::string &segment_name);
 
     int closeSegment(SegmentHandle handle);
 
@@ -94,16 +95,18 @@ class TransferEngine {
 
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
+    bool checkOverlap(void *addr, uint64_t length);
+
    private:
     struct MemoryRegion {
         void *addr;
         uint64_t length;
-        const char *location;
+        std::string location;
         bool remote_accessible;
     };
 
-    std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
+    std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::vector<MemoryRegion> local_memory_regions_;
 };
