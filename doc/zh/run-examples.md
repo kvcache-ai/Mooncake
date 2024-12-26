@@ -62,13 +62,28 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
 ## Transfer Engine Bench 使用方法
 编译 Transfer Engine 成功后，可在 `build/mooncake-transfer-engine/example` 目录下产生测试程序 `transfer_engine_bench`。该工具通过调用 Transfer Engine 接口，发起节点从目标节点的 DRAM 处反复读取/写入数据块，以展示 Transfer Engine 的基本用法，并可用于测量读写吞吐率。目前 Transfer Engine Bench 工具可用于 RDMA 协议（GPUDirect 正在测试） 及 TCP 协议。
 
-1. **启动 `etcd` 服务。** 该服务用于 Mooncake 各类元数据的集中高可用管理，包括 Transfer Engine 的内部连接状态等。需确保发起节点和目标节点都能顺利通达该 etcd 服务，因此需要注意：
-   - etcd 服务的监听 IP 不应为 127.0.0.1，需结合网络环境确定。在实验环境中，可使用 0.0.0.0。例如，可使用下列命令行启动合要求的服务：
+1. **启动 `metadata` 服务。** 该服务用于 Mooncake 各类元数据的集中高可用管理，包括 Transfer Engine 的内部连接状态等。需确保发起节点和目标节点都能顺利通达该 metadata 服务，因此需要注意：
+   - metadata 服务的监听 IP 不应为 127.0.0.1，需结合网络环境确定。在实验环境中，可使用 0.0.0.0。
+   - 在某些平台下，如果发起节点和目标节点设置了 `http_proxy` 或 `https_proxy` 环境变量，也会影响 Transfer Engine 与 metadata 服务的通信。
+
+   Transfer Engine 支持多种 metadata 服务，包括 `etcd`, `redis` 和 `http`。下面以 `etcd` 和 `http` 为例说明如何启动 metadata 服务。
+
+   1.1. **`etcd`**
+
+   例如，可使用如下命令行启动 `etcd` 服务：
       ```bash
       # This is 10.0.0.1
       etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://10.0.0.1:2379
       ```
-   - 在某些平台下，如果发起节点和目标节点设置了 `http_proxy` 或 `https_proxy` 环境变量，也会影响 Transfer Engine 与 etcd 服务的通信，报告“Error from etcd client: 14”错误。
+
+   1.2. **启动 `http` 作为 `metadata` 服务**
+
+   例如，可使用 `mooncake-transfer-engine/example/http-metadata-server` 示例中的 `http` 服务：
+      ```bash
+      # This is 10.0.0.1
+      # cd mooncake-transfer-engine/example/http-metadata-server
+      go run . --addr=:8080
+      ```
 
 2. **启动目标节点。**
     ```bash
@@ -84,6 +99,7 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
    - `--mode=target` 表示启动目标节点。目标节点不发起读写请求，只是被动按发起节点的要求供给或写入数据。
       > 注意：实际应用中可不区分目标节点和发起节点，每个节点可以向集群内其他节点自由发起读写请求。
    - `--metadata_server` 为元数据服务器地址（etcd 服务的完整地址）。
+      > 如果使用 `http` 作为 `metadata` 服务，需要将 `--metadata_server` 参数改为 `--metadata_server=http://10.0.0.1:8080/metadata`，并且指定 `--metadata_type=http`。
    - `--local_server_name` 表示本机器地址，大多数情况下无需设置。如果不设置该选项，则该值等同于本机的主机名（即 `hostname(2)` ）。集群内的其它节点会使用此地址尝试与该节点进行带外通信，从而建立 RDMA 连接。
       > 注意：若带外通信失败则连接无法建立。因此，若有必要需修改集群所有节点的 `/etc/hosts` 文件，使得可以通过主机名定位到正确的节点。
    - `--device_name` 表示传输过程使用的 RDMA 网卡名称。
