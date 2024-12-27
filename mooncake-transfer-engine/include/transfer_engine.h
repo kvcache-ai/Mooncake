@@ -43,13 +43,14 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
-    TransferEngine(std::shared_ptr<TransferMetadata> metadata)
-        : metadata_(metadata) {}
+    TransferEngine() : metadata_(nullptr) {}
 
     ~TransferEngine() { freeEngine(); }
 
-    int init(const std::string &server_name,
-             const std::string &connectable_name, uint64_t rpc_port = 12345);
+    int init(const std::string &metadata_conn_string,
+             const std::string &local_server_name,
+             const std::string &ip_or_host_name, 
+             uint64_t rpc_port = 12345);
 
     int freeEngine();
 

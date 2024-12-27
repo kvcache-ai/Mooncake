@@ -18,20 +18,25 @@
 
 namespace mooncake {
 
-int TransferEngine::init(const std::string &server_name,
-                         const std::string &connectable_name,
+int TransferEngine::init(const std::string &metadata_conn_string,
+                         const std::string &local_server_name,
+                         const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
-    local_server_name_ = server_name;
+    local_server_name_ = local_server_name;
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
     TransferMetadata::RpcMetaDesc desc;
-    desc.ip_or_host_name = connectable_name;
+    desc.ip_or_host_name = ip_or_host_name;
     desc.rpc_port = rpc_port;
-    return metadata_->addRpcMetaEntry(server_name, desc);
+    return metadata_->addRpcMetaEntry(local_server_name_, desc);
 }
 
 int TransferEngine::freeEngine() {
-    metadata_->removeRpcMetaEntry(local_server_name_);
+    if (metadata_) {
+        metadata_->removeRpcMetaEntry(local_server_name_);
+        metadata_.reset();
+    }
     return 0;
 }
 

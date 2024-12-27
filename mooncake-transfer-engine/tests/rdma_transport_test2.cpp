@@ -121,12 +121,9 @@ class RDMATransportTest : public ::testing::Test {
         LOG(INFO) << "HERE \n";
         google::InitGoogleLogging("RDMATransportTest");
         FLAGS_logtostderr = 1;
-        metadata_client =
-            std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-        LOG_ASSERT(metadata_client);
-        engine = std::make_unique<TransferEngine>(metadata_client);
+        engine = std::make_unique<TransferEngine>();
         hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-        engine->init(FLAGS_local_server_name.c_str(),
+        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                      hostname_port.first.c_str(),
                      hostname_port.second + offset++);
         xport = nullptr;

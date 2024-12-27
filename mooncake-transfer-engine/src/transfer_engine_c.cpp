@@ -22,16 +22,18 @@
 
 using namespace mooncake;
 
-transfer_engine_t createTransferEngine(const char *metadata_uri) {
-    auto metadata_client = std::make_shared<TransferMetadata>(metadata_uri);
-    TransferEngine *native = new TransferEngine(metadata_client);
+transfer_engine_t createTransferEngine(const char *metadata_conn_string,
+                                       const char *local_server_name,
+                                       const char *ip_or_host_name,
+                                       uint64_t rpc_port) {
+    TransferEngine *native = new TransferEngine();
+    int ret = native->init(metadata_conn_string, local_server_name,
+                           ip_or_host_name, rpc_port);
+    if (ret) {
+        delete native;
+        return nullptr;
+    }
     return (transfer_engine_t)native;
-}
-
-int initTransferEngine(transfer_engine_t engine, const char *local_server_name,
-                       const char *connectable_name, uint64_t rpc_port) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->init(local_server_name, connectable_name, rpc_port);
 }
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,

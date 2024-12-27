@@ -85,10 +85,10 @@ typedef struct segment_desc segment_desc_t;
 typedef void *transfer_engine_t;
 typedef void *transport_t;
 
-transfer_engine_t createTransferEngine(const char *metadata_uri);
-
-int initTransferEngine(transfer_engine_t engine, const char *local_server_name,
-                       const char *connectable_name, uint64_t rpc_port);
+transfer_engine_t createTransferEngine(const char *metadata_conn_string,
+                                       const char *local_server_name,
+                                       const char *ip_or_host_name,
+                                       uint64_t rpc_port);
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args);

@@ -73,22 +73,18 @@ std::string loadNicPriorityMatrix() {
 }
 
 int target() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-    LOG_ASSERT(metadata_client);
-
     auto nic_priority_matrix = loadNicPriorityMatrix();
 
     const size_t dram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     void **args = (void **)malloc(2 * sizeof(void *));
     args[0] = (void *)nic_priority_matrix.c_str();
     args[1] = nullptr;
 
     const std::string &connectable_name = FLAGS_local_server_name;
-    engine->init(FLAGS_local_server_name.c_str(), connectable_name.c_str(),
-                 12345);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 connectable_name.c_str(), 12345);
     engine->installTransport("rdma", args);
 
     LOG_ASSERT(engine);

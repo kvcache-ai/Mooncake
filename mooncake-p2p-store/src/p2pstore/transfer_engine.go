@@ -46,20 +46,14 @@ func parseServerName(serverName string) (host string, port int) {
 }
 
 func NewTransferEngine(metadata_uri string, local_server_name string, nic_priority_matrix string) (*TransferEngine, error) {
-	native_engine := C.createTransferEngine(C.CString(metadata_uri))
-	if native_engine == nil {
-		return nil, ErrTransferEngine
-	}
-
 	// For simplifiy, local_server_name must be a valid IP address or hostname
 	connectable_name, rpc_port := parseServerName(local_server_name)
-	ret := C.initTransferEngine(native_engine, 
-		C.CString(local_server_name),
-		C.CString(connectable_name),
-		C.uint64_t(rpc_port))
-	
-	if ret < 0 {
-		C.destroyTransferEngine(native_engine)
+
+	native_engine := C.createTransferEngine(C.CString(metadata_uri), 
+	                                        C.CString(local_server_name),
+											C.CString(connectable_name),
+											C.uint64_t(rpc_port))
+	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
 

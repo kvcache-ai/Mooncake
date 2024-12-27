@@ -72,14 +72,10 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 TEST_F(TCPTransportTest, GetTcpTest) {
-    auto metadata_client = std::make_shared<TransferMetadata>("127.0.0.1:2379");
-    LOG_ASSERT(metadata_client);
-
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
-
+    auto engine = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.2:12345", hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+                 hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -89,14 +85,10 @@ TEST_F(TCPTransportTest, Writetest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto metadata_client = std::make_shared<TransferMetadata>("127.0.0.1:2379");
-    LOG_ASSERT(metadata_client);
-
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
-
+    auto engine = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.2:12345", hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+                 hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -136,14 +128,10 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto metadata_client = std::make_shared<TransferMetadata>("127.0.0.1:2379");
-    LOG_ASSERT(metadata_client);
-
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
-
+    auto engine = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.2:12345", hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+                 hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -211,14 +199,10 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto metadata_client = std::make_shared<TransferMetadata>("127.0.0.1:2379");
-    LOG_ASSERT(metadata_client);
-
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
-
+    auto engine = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.2:12345", hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+                 hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);

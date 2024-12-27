@@ -239,16 +239,12 @@ std::string loadNicPriorityMatrix() {
 }
 
 int initiator() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     Transport *xport = nullptr;
     if (FLAGS_protocol == "rdma") {
@@ -288,16 +284,12 @@ int initiator() {
 }
 
 int target() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix();

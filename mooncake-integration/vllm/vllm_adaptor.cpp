@@ -79,15 +79,11 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_type) {
     auto conn_string =
         std::string(metadata_type) + "://" + std::string(metadata_server);
-    auto metadata_client = std::make_shared<TransferMetadata>(conn_string);
-    if (!metadata_client) return -1;
 
-    engine_ = std::make_unique<TransferEngine>(metadata_client);
-    if (!engine_) return -1;
-
+    engine_ = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort(local_hostname);
-    int ret = engine_->init(local_hostname, hostname_port.first.c_str(),
-                            hostname_port.second);
+    int ret = engine_->init(conn_string, local_hostname,
+                            hostname_port.first.c_str(), hostname_port.second);
     if (ret) return -1;
 
     xport_ = nullptr;

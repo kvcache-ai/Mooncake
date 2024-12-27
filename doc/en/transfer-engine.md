@@ -131,7 +131,8 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
    - `--mode=target` indicates the start of the target node. The target node does not initiate read/write requests; it passively supplies or writes data as required by the initiator node.
       > Note: In actual applications, there is no need to distinguish between target nodes and initiator nodes; each node can freely initiate read/write requests to other nodes in the cluster.
    - `--metadata_server` is the address of the metadata server. Its form is `[proto]://[hostname:port]`. For example, the following addresses are VALID:
-      - Use `etcd` as metadata storage: `"10.0.0.1:2379"` or `"etcd://10.0.0.1:2379"`
+      - Use `etcd` as metadata storage: `"10.0.0.1:2379"`, `"etcd://10.0.0.1:2379"` or `"etcd://10.0.0.1:2379,10.0.0.2:2379"`
+      - Use `redis` as metadata storage: `"redis://10.0.0.1:6379"`
       - Use `http` as metadata storage: `"http://10.0.0.1:8080/metadata"`
    - `--local_server_name` represents the address of this machine, which does not need to be set in most cases. If this option is not set, the value is equivalent to the hostname of this machine (i.e., `hostname(2)`). Other nodes in the cluster will use this address to attempt out-of-band communication with this node to establish RDMA connections.
       > Note: If out-of-band communication fails, the connection cannot be established. Therefore, if necessary, you need to modify the `/etc/hosts` file on all nodes in the cluster to locate the correct node through the hostname.
@@ -442,20 +443,23 @@ For specific implementation, refer to the demo service implemented in Golang at 
 
 ### Initialization
 
+TransferEngine needs to initializing by calling the `init` method before further actions:
 ```cpp
-TransferEngine(std::unique_ptr<TransferMetadata> metadata_client);
-TransferMetadata(const std::string &metadata_server, const std::string &protocol = "etcd");
+TransferEngine();
+
+int init(const std::string &metadata_conn_string,
+         const std::string &local_server_name,
+         const std::string &ip_or_host_name, 
+         uint64_t rpc_port = 12345);
 ```
+- `metadata_conn_string`: Connecting string of metadata storage servers, i.e., the IP address/hostname of `etcd`/`redis` or the URI of the http service.
+The general form is `[proto]://[hostname:port]`. For example, the following metadata server addresses are legal:
+    - Using `etcd` as a metadata storage service: `“10.0.0.1:2379”` or `“etcd://10.0.0.1:2379”`.
+    - Using `redis` as a metadata storage service: `“redis://10.0.0.1:6379”`
+    - Using `http` as a metadata storage service: `“http://10.0.0.1:8080/metadata”`
 
-- Pointer to a `TransferMetadata` object, which abstracts the communication logic between the TransferEngine framework and the metadata server. We currently support `etcd`, `redis` and `http` protocols, while `metadata_server` represents the IP address or hostname of the etcd or redis server, or the base HTTP URI of http server.
-
-For easy exception handling, TransferEngine needs to call the init function for secondary construction after construction:
-```cpp
-int init(std::string& server_name, std::string& connectable_name, uint64_t rpc_port = 12345);
-```
-
-- `server_name`: The local server name, ensuring uniqueness within the cluster. It also serves as the name of the RAM Segment that other nodes refer to the current instance (i.e., Segment Name).
-- `connectable_name`: The name used for other clients to connect, which can be a hostname or IP address.
+- `local_server_name`: The local server name, ensuring uniqueness within the cluster. It also serves as the name of the RAM Segment that other nodes refer to the current instance (i.e., Segment Name).
+- `ip_or_host_name`: The name used for other clients to connect, which can be a hostname or IP address.
 - `rpc_port`: The rpc port used for interaction with other clients.
 - Return value: If successful, returns 0; if TransferEngine has already been init, returns -1.
 

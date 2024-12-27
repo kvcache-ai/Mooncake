@@ -106,7 +106,8 @@ static void freeMemoryPool(void *addr, size_t size) {
 
     if (attributes.type == cudaMemoryTypeDevice) {
         cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost || attributes.type == cudaMemoryTypeUnregistered) {
+    } else if (attributes.type == cudaMemoryTypeHost ||
+               attributes.type == cudaMemoryTypeUnregistered) {
         numa_free(addr, size);
     } else {
         LOG(ERROR) << "Unknown memory type, " << addr << " " << attributes.type;
@@ -185,7 +186,7 @@ int initiatorWorker(TransferEngine *xport, SegmentID segment_id, int thread_id,
     return 0;
 }
 
-std::string formatDeviceNames(const std::string& device_names) {
+std::string formatDeviceNames(const std::string &device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -215,22 +216,22 @@ std::string loadNicPriorityMatrix() {
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
-    return "{\"cpu:0\": [[" + device_names + "], []], "
-           " \"cpu:1\": [[" + device_names + "], []], "
-           " \"gpu:0\": [[" + device_names + "], []]}";
+    return "{\"cpu:0\": [[" + device_names +
+           "], []], "
+           " \"cpu:1\": [[" +
+           device_names +
+           "], []], "
+           " \"gpu:0\": [[" +
+           device_names + "], []]}";
 }
 
 int initiator() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     Transport *xport = nullptr;
     if (FLAGS_protocol == "rdma") {
@@ -252,8 +253,7 @@ int initiator() {
 
 #ifdef USE_CUDA
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
-    if (FLAGS_use_vram)
-        LOG(INFO) << "VRAM is used";
+    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(ram_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? "gpu:" : "cpu:";
@@ -306,16 +306,12 @@ int initiator() {
 }
 
 int target() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix();
