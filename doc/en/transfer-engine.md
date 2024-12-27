@@ -258,9 +258,9 @@ Recycles `BatchID`, and subsequent operations on `submitTransfer` and `getTransf
 ### Multi-Transport Management
 The `TransferEngine` class internally manages multiple backend `Transport` classes, and users can load or unload `Transport` for different backends in `TransferEngine`.
 
-#### TransferEngine::installOrGetTransport
+#### TransferEngine::installTransport
 ```cpp
-Transport* installOrGetTransport(const std::string& proto, void** args);
+Transport* installTransport(const std::string& proto, void** args);
 ```
 
 Registers `Transport` in `TransferEngine`. If a `Transport` for a certain protocol already exists, it returns that `Transport`.
@@ -272,7 +272,7 @@ Registers `Transport` in `TransferEngine`. If a `Transport` for a certain protoc
 ##### TCP Transfer Mode
 For TCP transfer mode, there is no need to pass `args` objects when registering the `Transport` object.
 ```cpp
-engine->installOrGetTransport("tcp", nullptr);
+engine->installTransport("tcp", nullptr);
 ```
 
 ##### RDMA Transfer Mode
@@ -281,7 +281,7 @@ For RDMA transfer mode, the network card priority marrix must be specified throu
 void** args = (void**) malloc(2 * sizeof(void*));
 args[0] = /* topology matrix */;
 args[1] = nullptr;
-engine->installOrGetTransport("rdma", args);
+engine->installTransport("rdma", args);
 ```
 The network card priority marrix is a JSON string indicating the storage medium name and the list of network cards to be used preferentially, as shown in the example below:
 ```json
@@ -302,7 +302,7 @@ For NVMeOF transfer mode, the file path must be specified through `args` during 
 void** args = (void**) malloc(2 * sizeof(void*));
 args[0] = /* topology matrix */;
 args[1] = nullptr;
-engine->installOrGetTransport("nvmeof", args);
+engine->installTransport("nvmeof", args);
 ```
 
 #### TransferEngine::uninstallTransport
@@ -328,7 +328,7 @@ Registers a space starting at address `addr` with a length of `size` on the loca
 
 - `addr`: The starting address of the registration space;
 - `size`: The length of the registration space;
-- `location`: The `device` corresponding to this memory segment, such as `cuda:0` indicating the GPU device, `cpu:0` indicating the CPU socket, by matching with the network card priority order table (see `installOrGetTransport`), the preferred network card is identified.
+- `location`: The `device` corresponding to this memory segment, such as `cuda:0` indicating the GPU device, `cpu:0` indicating the CPU socket, by matching with the network card priority order table (see `installTransport`), the preferred network card is identified.
 - `remote_accessible`: Indicates whether this memory can be accessed by remote nodes.
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 

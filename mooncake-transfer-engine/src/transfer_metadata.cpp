@@ -276,7 +276,7 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     return desc;
 }
 
-int TransferMetadata::invalidateSegmentCache() {
+int TransferMetadata::syncSegmentCache() {
     RWSpinlock::WriteGuard guard(segment_lock_);
     LOG(INFO) << "Invalidate segment descriptor cache";
     for (auto &entry : segment_id_to_desc_map_) {

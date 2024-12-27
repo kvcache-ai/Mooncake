@@ -35,8 +35,8 @@ int TransferEngine::freeEngine() {
     return 0;
 }
 
-Transport *TransferEngine::installOrGetTransport(const std::string &proto,
-                                                 void **args) {
+Transport *TransferEngine::installTransport(const std::string &proto,
+                                            void **args) {
     Transport *transport = multi_transports_->getTransport(proto);
     if (transport) {
         LOG(INFO) << "Transport " << proto << " already installed";

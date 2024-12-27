@@ -232,9 +232,9 @@ int freeBatchID(BatchID batch_id);
 ### 多 Transport 管理
 `TransferEngine` 类内部管理多后端的 `Transport` 类，用户可向 `TransferEngine` 中装载或卸载对不同后端进行传输的 `Transport`。
 
-#### TransferEngine::installOrGetTransport
+#### TransferEngine::installTransport
 ```cpp
-Transport* installOrGetTransport(const std::string& proto, void** args);
+Transport* installTransport(const std::string& proto, void** args);
 ```
 在 `TransferEngine` 中注册 `Transport`。如果某个协议对应的 `Transport` 已存在，则返回该 `Transport`。
 
@@ -245,7 +245,7 @@ Transport* installOrGetTransport(const std::string& proto, void** args);
 **TCP 传输模式：**
 对于 TCP 传输模式，注册 `Transport` 期间不需要传入 `args` 对象。
 ```cpp
-engine->installOrGetTransport("tcp", nullptr);
+engine->installTransport("tcp", nullptr);
 ```
 
 **RDMA 传输模式：**
@@ -254,7 +254,7 @@ engine->installOrGetTransport("tcp", nullptr);
 void** args = (void**) malloc(2 * sizeof(void*));
 args[0] = /* topology matrix */;
 args[1] = nullptr;
-engine->installOrGetTransport("rdma", args);
+engine->installTransport("rdma", args);
 ```
 网卡优先级顺序是一个 JSON 字符串，表示使用的存储介质名称及优先使用的网卡列表，样例如下：
 ```json
@@ -274,7 +274,7 @@ engine->installOrGetTransport("rdma", args);
 void** args = (void**) malloc(2 * sizeof(void*));
 args[0] = /* topology matrix */;
 args[1] = nullptr;
-engine->installOrGetTransport("nvmeof", args);
+engine->installTransport("nvmeof", args);
 ```
 
 #### TransferEngine::uinstallTransport
@@ -299,7 +299,7 @@ int registerLocalMemory(void *addr, size_t size, string location, bool remote_ac
 
 - `addr`: 注册空间起始地址；
 - `size`：注册空间长度；
-- `location`: 这一段内存对应的 `device`，比如 `cuda:0` 表示对应 GPU 设备，`cpu:0` 表示对应 CPU socket，通过和网卡优先级顺序表（见`installOrGetTransport`） 匹配，识别优选的网卡。
+- `location`: 这一段内存对应的 `device`，比如 `cuda:0` 表示对应 GPU 设备，`cpu:0` 表示对应 CPU socket，通过和网卡优先级顺序表（见`installTransport`） 匹配，识别优选的网卡。
 - `remote_accessible`: 标识这一块内存能否被远端节点访问。
 - 返回值：若成功，返回 0；否则返回负数值。
 

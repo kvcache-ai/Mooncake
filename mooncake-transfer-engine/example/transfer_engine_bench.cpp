@@ -238,9 +238,9 @@ int initiator() {
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        xport = engine->installOrGetTransport("rdma", args);
+        xport = engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        xport = engine->installOrGetTransport("tcp", nullptr);
+        xport = engine->installTransport("tcp", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }
@@ -322,9 +322,9 @@ int target() {
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        engine->installOrGetTransport("rdma", args);
+        engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        engine->installOrGetTransport("tcp", nullptr);
+        engine->installTransport("tcp", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }

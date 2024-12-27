@@ -111,7 +111,7 @@ class TransferMetadata {
 
     SegmentID getSegmentID(const std::string &segment_name);
 
-    int invalidateSegmentCache();
+    int syncSegmentCache();
 
     int removeSegmentDesc(const std::string &segment_name);
 
@@ -139,10 +139,6 @@ class TransferMetadata {
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
-
-    static int parseNicPriorityMatrix(const std::string &nic_priority_matrix,
-                                      PriorityMatrix &priority_map,
-                                      std::vector<std::string> &rnic_list);
 
    private:
     // local cache

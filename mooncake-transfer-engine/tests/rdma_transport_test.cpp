@@ -121,10 +121,10 @@ static void freeMemoryPool(void *addr, size_t size) {
 #endif
 }
 
-int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
+int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(0);
-    auto segment_desc = xport->meta()->getSegmentDescByID(segment_id);
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
     const size_t kDataLength = 4096000;
     {
@@ -134,7 +134,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
 
         LOG(INFO) << "Write Data: " << std::string((char *)(addr), 16) << "...";
 
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
 
         TransferRequest entry;
@@ -143,12 +143,12 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = xport->submitTransfer(batch_id, {entry});
+        ret = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(!ret);
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = xport->getTransferStatus(batch_id, 0, status);
+            int ret = engine->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(!ret);
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -157,13 +157,13 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
                 completed = true;
             }
         }
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         LOG_ASSERT(!ret);
     }
 
     {
         LOG(INFO) << "Stage 2: Read Data";
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
 
         TransferRequest entry;
@@ -172,12 +172,12 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = xport->submitTransfer(batch_id, {entry});
+        ret = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(!ret);
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = xport->getTransferStatus(batch_id, 0, status);
+            int ret = engine->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(!ret);
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -186,7 +186,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
                 completed = true;
             }
         }
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         LOG_ASSERT(!ret);
     }
 
@@ -256,11 +256,11 @@ int initiator() {
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        xport = engine->installOrGetTransport("rdma", args);
+        xport = engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        xport = engine->installOrGetTransport("tcp", nullptr);
+        xport = engine->installTransport("tcp", nullptr);
     } else if (FLAGS_protocol == "nvmeof") {
-        xport = engine->installOrGetTransport("nvmeof", nullptr);
+        xport = engine->installTransport("nvmeof", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }
@@ -280,7 +280,7 @@ int initiator() {
 #endif
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
-    std::thread workers(initiatorWorker, xport, segment_id, 0, addr);
+    std::thread workers(initiatorWorker, engine.get(), segment_id, 0, addr);
     workers.join();
     engine->unregisterLocalMemory(addr);
     freeMemoryPool(addr, ram_buffer_size);
@@ -304,11 +304,11 @@ int target() {
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        engine->installOrGetTransport("rdma", args);
+        engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        engine->installOrGetTransport("tcp", nullptr);
+        engine->installTransport("tcp", nullptr);
     } else if (FLAGS_protocol == "nvmeof") {
-        engine->installOrGetTransport("nvmeof", nullptr);
+        engine->installTransport("nvmeof", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }

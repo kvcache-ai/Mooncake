@@ -53,7 +53,7 @@ class TransferEngine {
 
     int freeEngine();
 
-    Transport *installOrGetTransport(const std::string &proto, void **args);
+    Transport *installTransport(const std::string &proto, void **args);
 
     int uninstallTransport(const std::string &proto);
 
@@ -91,7 +91,7 @@ class TransferEngine {
         return multi_transports_->getTransferStatus(batch_id, task_id, status);
     }
 
-    int syncSegmentCache() { return metadata_->invalidateSegmentCache(); }
+    int syncSegmentCache() { return metadata_->syncSegmentCache(); }
 
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 

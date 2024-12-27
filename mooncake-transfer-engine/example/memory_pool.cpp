@@ -89,7 +89,7 @@ int target() {
     const std::string &connectable_name = FLAGS_local_server_name;
     engine->init(FLAGS_local_server_name.c_str(), connectable_name.c_str(),
                  12345);
-    engine->installOrGetTransport("rdma", args);
+    engine->installTransport("rdma", args);
 
     LOG_ASSERT(engine);
 
