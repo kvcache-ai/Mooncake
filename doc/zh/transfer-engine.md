@@ -11,7 +11,7 @@ Mooncake Transfer Engine 是一个围绕 Segment 和 BatchTransfer 两个核心�
 
 如上图所示，每个特定的客户端对应一个 TransferEngine，其中不仅包含一个 RAM Segment，还集成了对于多线程多网卡高速传输的管理。RAM Segment 原则上就对应这个 TransferEngine 的全部虚拟地址空间，但实际上仅仅会注册其中的部分区域（被称为一个 Buffer）供外部 (GPUDirect) RDMA Read/Write。每一段 Buffer 可以分别设置权限（对应 RDMA rkey 等）和网卡亲和性（比如基于拓扑优先从哪张卡读写等）。
 
-Mooncake Transfer Engine 通过 `TransferEngine` 类对外提供接口（位于 `mooncake-transfer-engine/include/transfer_engine.h`），其中对应不同后端的具体的数据传输功能由 `Transport` 类实现，目前支持 `TcpTransport`、`RdmaTransport` 和 `NVMeoFTransport`。
+Mooncake Transfer Engine 通过 `TransferEngine` 类对外提供接口（位于 `mooncake-transfer-engine/include/transfer_engine.h`），其中对应不同后端的具体的数据传输功能在内部由 `Transport` 类实现，包括`TcpTransport`、`RdmaTransport` 和 `NVMeoFTransport`。
 
 ### Segment
 Segment 表示 Transfer Engine 实现数据传输过程期间可使用的源地址范围及目标地址范围集合。也就是说，所有 BatchTransfer 请求中涉及的本地与远程地址都需要位于合法的 Segment 区间里。Transfer Engine 支持以下两种类型的 Segment。
@@ -87,26 +87,25 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
    例如，可使用 `mooncake-transfer-engine/example/http-metadata-server` 示例中的 `http` 服务：
       ```bash
       # This is 10.0.0.1
-      # cd mooncake-transfer-engine/example/http-metadata-server
+      cd mooncake-transfer-engine/example/http-metadata-server
       go run . --addr=:8080
       ```
 
 2. **启动目标节点。**
     ```bash
     # This is 10.0.0.2
-    export MC_GID_INDEX=n
     ./transfer_engine_bench --mode=target \
-                            --metadata_server=10.0.0.1:2379 \
+                            --metadata_server=etcd://10.0.0.1:2379 \
                             --local_server_name=10.0.0.2:12345 \
                             --device_name=erdma_0
     ```
    各个参数的含义如下：
-   - 环境变量 `MC_GID_INDEX` 对应参数的默认值为 0，表示由 Transfer Engine 选取一个最可能连通的 GID。
-     如果连接被挂起，用户仍需手工设置改环境变量的值。
+   - 环境变量 `MC_GID_INDEX` 对应参数的默认值为 0，表示由 Transfer Engine 选取一个最可能连通的 GID。由于该参数取决于具体的网络环境存在差异，如果连接被挂起，用户需手工设置环境变量的值。环境变量 `NCCL_IB_GID_INDEX` 与此功能等价。
    - `--mode=target` 表示启动目标节点。目标节点不发起读写请求，只是被动按发起节点的要求供给或写入数据。
       > 注意：实际应用中可不区分目标节点和发起节点，每个节点可以向集群内其他节点自由发起读写请求。
-   - `--metadata_server` 为元数据服务器地址（etcd 服务的完整地址）。
-      > 如果使用 `http` 作为 `metadata` 服务，需要将 `--metadata_server` 参数改为 `--metadata_server=http://10.0.0.1:8080/metadata`，并且指定 `--metadata_type=http`。
+   - `--metadata_server` 为元数据服务器地址，一般形式是 `[proto]://[hostname:port]`。例如，下列元数据服务器地址是合法的：
+      - 使用 `etcd` 作为元数据存储服务：`"10.0.0.1:2379"` 或 `"etcd://10.0.0.1:2379"`
+      - 使用 `http` 作为元数据存储服务：`"http://10.0.0.1:8080/metadata"`
    - `--local_server_name` 表示本机器地址，大多数情况下无需设置。如果不设置该选项，则该值等同于本机的主机名（即 `hostname(2)` ）。集群内的其它节点会使用此地址尝试与该节点进行带外通信，从而建立 RDMA 连接。
       > 注意：若带外通信失败则连接无法建立。因此，若有必要需修改集群所有节点的 `/etc/hosts` 文件，使得可以通过主机名定位到正确的节点。
    - `--device_name` 表示传输过程使用的 RDMA 网卡名称。
@@ -138,15 +137,15 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
 > 如果在执行期间发生异常，大多数情况是参数设置不正确所致，建议参考[故障排除文档](troubleshooting.md)先行排查。
 
 ## C/C++ API
-Transfer Engine 通过 `TransferEngine` 类对外提供接口（位于 `mooncake-transfer-engine/include/transfer_engine.h`），其中对应不同后端的具体的数据传输功能由 `Transport` 类实现，目前支持 `TcpTransport`,`RdmaTransport` 和 `NVMeoFTransport`。
+Transfer Engine 通过 `TransferEngine` 类统一对外提供接口（位于 `mooncake-transfer-engine/include/transfer_engine.h`），其中对应不同后端的具体的数据传输功能在内部由 `Transport` 类实现，目前支持 `TcpTransport`,`RdmaTransport` 和 `NVMeoFTransport`。
 
 ### 数据传输
 
-#### Transport::TransferRequest
+#### TransferEngine::TransferRequest
 
-Mooncake Transfer Engine 提供的最核心 API 是：通过 `Transport::submitTransfer` 接口提交一组异步的 `Transport::TransferRequest` 任务，并通过 `Transport::getTransferStatus` 接口查询其状态。每个 `Transport::TransferRequest` 规定从本地的起始地址 `source` 开始，读取或写入长度为 `length` 的连续数据空间，到 `target_id` 对应的段、从 `target_offset` 开始的位置。
+Mooncake Transfer Engine 提供的最核心 API 是：通过 `submitTransfer()` 接口提交一组异步的由 `TransferRequest` 结构体表示的任务，并通过 `getTransferStatus()` 接口查询其状态。每个 `TransferRequest` 结构体规定从本地的起始地址 `source` 开始，读取或写入长度为 `length` 的连续数据空间，到 `target_id` 对应的段、从 `target_offset` 开始的位置。
 
-`Transport::TransferRequest` 结构体定义如下：
+`TransferRequest` 结构体定义如下：
 
 ```cpp
 using SegmentID = int32_t;
@@ -168,7 +167,7 @@ struct TransferRequest
   - NVMeOF 空间型，每个文件对应一个 Segment。此时 `openSegment` 接口传入的 Segment 名称等同于文件的唯一标识符。`target_offset` 为目标文件的偏移量。
 - `length` 表示传输的数据量。TransferEngine 在内部可能会进一步拆分成多个读写请求。
 
-#### Transport::allocateBatchID
+#### TransferEngine::allocateBatchID
 
 ```cpp
 BatchID allocateBatchID(size_t batch_size);
@@ -179,7 +178,7 @@ BatchID allocateBatchID(size_t batch_size);
 - `batch_size`: 同一 `BatchID` 下最多可提交的 `TransferRequest` 数量；
 - 返回值：若成功，返回 `BatchID`（非负）；否则返回负数值。
 
-#### Transport::submitTransfer
+#### TransferEngine::submitTransfer
 
 ```cpp
 int submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries);
@@ -191,7 +190,7 @@ int submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries
 - `entries`: `TransferRequest` 数组；
 - 返回值：若成功，返回 0；否则返回负数值。
 
-#### Transport::getTransferStatus
+#### TransferEngine::getTransferStatus
 
 ```cpp
 enum TaskStatus
@@ -218,7 +217,7 @@ int getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status)
 - `status`: 输出 Transfer 状态；
 - 返回值：若成功，返回 0；否则返回负数值。
 
-#### Transport::freeBatchID
+#### TransferEngine::freeBatchID
 
 ```cpp
 int freeBatchID(BatchID batch_id);
