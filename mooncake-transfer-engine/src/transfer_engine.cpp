@@ -50,12 +50,9 @@ Transport *TransferEngine::installTransport(const std::string &proto,
     transport = multi_transports_->installTransport(proto, args);
     if (!transport) return nullptr;
     for (auto &entry : local_memory_regions_) {
-        for (auto transport : multi_transports_->listTransports()) {
-            int ret = transport->registerLocalMemory(entry.addr, entry.length,
-                                                     entry.location,
-                                                     entry.remote_accessible);
-            if (ret < 0) return nullptr;
-        }
+        int ret = transport->registerLocalMemory(
+            entry.addr, entry.length, entry.location, entry.remote_accessible);
+        if (ret < 0) return nullptr;
     }
     return transport;
 }
