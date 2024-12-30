@@ -81,6 +81,7 @@ int MultiTransport::submitTransfer(
     std::unordered_map<Transport *, SubmitTasks> submit_tasks;
     for (auto &request : entries) {
         auto transport = selectTransport(request);
+        if (!transport) return ERR_INVALID_ARGUMENT;
         auto &task = batch_desc.task_list[task_id];
         ++task_id;
         submit_tasks[transport].request_list.push_back(
