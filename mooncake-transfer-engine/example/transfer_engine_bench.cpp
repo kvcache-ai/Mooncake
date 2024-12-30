@@ -133,7 +133,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         exit(EXIT_FAILURE);
     }
 
-    auto segment_desc = xport->getMetadata()->getSegmentDescByID(segment_id);
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     if (!segment_desc) {
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
@@ -143,7 +143,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
 
     size_t batch_count = 0;
     while (running) {
-        auto batch_id = xport->allocateBatchID(FLAGS_batch_size);
+        auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         int ret = 0;
         std::vector<TransferRequest> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
@@ -159,13 +159,13 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             requests.emplace_back(entry);
         }
 
-        ret = xport->submitTransfer(batch_id, requests);
+        ret = engine->submitTransfer(batch_id, requests);
         LOG_ASSERT(!ret);
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
-                int ret = xport->getTransferStatus(batch_id, task_id, status);
+                int ret = engine->getTransferStatus(batch_id, task_id, status);
                 LOG_ASSERT(!ret);
                 if (status.s == TransferStatusEnum::COMPLETED)
                     completed = true;
@@ -177,7 +177,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             }
         }
 
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         LOG_ASSERT(!ret);
         batch_count++;
     }
