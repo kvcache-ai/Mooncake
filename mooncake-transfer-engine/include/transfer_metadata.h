@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include "common.h"
+#include "topology.h"
 
 namespace mooncake {
 struct MetadataStoragePlugin;
@@ -56,14 +57,6 @@ class TransferMetadata {
         std::unordered_map<std::string, std::string> local_path_map;
     };
 
-    struct PriorityItem {
-        std::vector<std::string> preferred_rnic_list;
-        std::vector<std::string> available_rnic_list;
-        std::vector<int> preferred_rnic_id_list;
-        std::vector<int> available_rnic_id_list;
-    };
-
-    using PriorityMatrix = std::unordered_map<std::string, PriorityItem>;
     using SegmentID = uint64_t;
 
     struct SegmentDesc {
@@ -71,7 +64,7 @@ class TransferMetadata {
         std::string protocol;
         // this is for rdma
         std::vector<DeviceDesc> devices;
-        PriorityMatrix priority_matrix;
+        Topology topology;
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;

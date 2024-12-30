@@ -111,21 +111,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
-
-        Json::Value priorityMatrixJSON;
-        for (auto &entry : desc.priority_matrix) {
-            Json::Value priorityItemJSON(Json::arrayValue);
-            Json::Value preferredRnicListJSON(Json::arrayValue);
-            for (auto &device_name : entry.second.preferred_rnic_list)
-                preferredRnicListJSON.append(device_name);
-            priorityItemJSON.append(preferredRnicListJSON);
-            Json::Value availableRnicListJSON(Json::arrayValue);
-            for (auto &device_name : entry.second.available_rnic_list)
-                availableRnicListJSON.append(device_name);
-            priorityItemJSON.append(availableRnicListJSON);
-            priorityMatrixJSON[entry.first] = priorityItemJSON;
-        }
-        segmentJSON["priority_matrix"] = priorityMatrixJSON;
+        segmentJSON["priority_matrix"] = desc.topology.toJson();
     } else if (segmentJSON["protocol"] == "tcp") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -206,42 +192,11 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             desc->buffers.push_back(buffer);
         }
 
-        auto priorityMatrixJSON = segmentJSON["priority_matrix"];
-        for (const auto &key : priorityMatrixJSON.getMemberNames()) {
-            const Json::Value &value = priorityMatrixJSON[key];
-            if (value.isArray() && value.size() == 2) {
-                PriorityItem item;
-                for (const auto &array : value[0]) {
-                    auto device_name = array.asString();
-                    item.preferred_rnic_list.push_back(device_name);
-                    int device_index = 0;
-                    for (auto &entry : desc->devices) {
-                        if (entry.name == device_name) {
-                            item.preferred_rnic_id_list.push_back(device_index);
-                            break;
-                        }
-                        device_index++;
-                    }
-                    LOG_ASSERT(device_index != (int)desc->devices.size());
-                }
-                for (const auto &array : value[1]) {
-                    auto device_name = array.asString();
-                    item.available_rnic_list.push_back(device_name);
-                    int device_index = 0;
-                    for (auto &entry : desc->devices) {
-                        if (entry.name == device_name) {
-                            item.available_rnic_id_list.push_back(device_index);
-                            break;
-                        }
-                        device_index++;
-                    }
-                    LOG_ASSERT(device_index != (int)desc->devices.size());
-                }
-                desc->priority_matrix[key] = item;
-            } else {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-            }
+        int ret = desc->topology.parse(
+            segmentJSON["priority_matrix"].toStyledString());
+        if (ret) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
         }
     } else if (desc->protocol == "tcp") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {

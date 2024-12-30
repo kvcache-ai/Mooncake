@@ -47,24 +47,18 @@ int RdmaTransport::install(std::string &local_server_name,
                            void **args) {
     const std::string nic_priority_matrix = static_cast<char *>(args[0]);
     bool dry_run = args[1] ? *static_cast<bool *>(args[1]) : false;
-    TransferMetadata::PriorityMatrix local_priority_matrix;
 
     if (dry_run) return 0;
 
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
-    int ret = parseNicPriorityMatrix(nic_priority_matrix, local_priority_matrix,
-                                     device_name_list_);
+    int ret = local_topology_.parse(nic_priority_matrix);
     if (ret) {
         LOG(ERROR) << "RdmaTransport: incorrect NIC priority matrix: "
                    << nic_priority_matrix;
         return ret;
     }
-
-    int device_index = 0;
-    for (auto &device_name : device_name_list_)
-        device_name_to_index_map_[device_name] = device_index++;
 
     ret = initializeRdmaResources();
     if (ret) {
@@ -72,7 +66,7 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
-    ret = allocateLocalSegmentID(local_priority_matrix);
+    ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
                       "allocate local segment";
@@ -128,8 +122,7 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return 0;
 }
 
-int RdmaTransport::allocateLocalSegmentID(
-    TransferMetadata::PriorityMatrix &priority_matrix) {
+int RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
@@ -141,7 +134,7 @@ int RdmaTransport::allocateLocalSegmentID(
         device_desc.gid = entry->gid();
         desc->devices.push_back(device_desc);
     }
-    desc->priority_matrix = priority_matrix;
+    desc->topology = local_topology_;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -250,8 +243,9 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
     return 0;
 }
 
-int RdmaTransport::submitTransferTask(const std::vector<TransferRequest *> &request_list,
-                                      const std::vector<TransferTask *> &task_list) {
+int RdmaTransport::submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -260,7 +254,8 @@ int RdmaTransport::submitTransferTask(const std::vector<TransferRequest *> &requ
     for (size_t index = 0; index < request_list.size(); ++index) {
         auto &request = *request_list[index];
         auto &task = *task_list[index];
-        for (uint64_t offset = 0; offset < request.length; offset += kBlockSize) {
+        for (uint64_t offset = 0; offset < request.length;
+             offset += kBlockSize) {
             auto slice = new Slice();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
@@ -275,8 +270,8 @@ int RdmaTransport::submitTransferTask(const std::vector<TransferRequest *> &requ
             int buffer_id = -1, device_id = -1, retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
                 if (selectDevice(local_segment_desc.get(),
-                                (uint64_t)slice->source_addr, slice->length,
-                                buffer_id, device_id, retry_cnt++))
+                                 (uint64_t)slice->source_addr, slice->length,
+                                 buffer_id, device_id, retry_cnt++))
                     continue;
                 auto &context = context_list_[device_id];
                 if (!context->active()) continue;
@@ -355,23 +350,34 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
-    auto context = context_list_[device_name_to_index_map_[local_nic_name]];
+
+    std::shared_ptr<RdmaContext> context;
+    int index = 0;
+    for (auto &entry : local_topology_.getHcaList()) {
+        if (entry == local_nic_name) {
+            context = context_list_[index];
+        }
+        index++;
+    }
+    if (!context) return ERR_INVALID_ARGUMENT;
+
 #ifdef CONFIG_ERDMA
     if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
 #endif
+
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    if (device_name_list_.empty()) {
+    if (local_topology_.empty()) {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
 
     std::vector<int> device_speed_list;
-    for (auto &device_name : device_name_list_) {
+    for (auto &device_name : local_topology_.getHcaList()) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
         if (!context) return ERR_MEMORY;
 
@@ -403,35 +409,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-
-        auto &priority = desc->priority_matrix[buffer_desc.name];
-        size_t preferred_rnic_list_len = priority.preferred_rnic_list.size();
-        size_t available_rnic_list_len = priority.available_rnic_list.size();
-        size_t rnic_list_len =
-            preferred_rnic_list_len + available_rnic_list_len;
-        if (rnic_list_len == 0) return ERR_DEVICE_NOT_FOUND;
-
-        if (retry_count == 0) {
-            int rand_value = SimpleRandom::Get().next();
-            if (preferred_rnic_list_len)
-                device_id =
-                    priority.preferred_rnic_id_list[rand_value %
-                                                    preferred_rnic_list_len];
-            else
-                device_id =
-                    priority.available_rnic_id_list[rand_value %
-                                                    available_rnic_list_len];
-        } else {
-            size_t index = (retry_count - 1) % rnic_list_len;
-            if (index < preferred_rnic_list_len)
-                device_id = priority.preferred_rnic_id_list[index];
-            else
-                device_id =
-                    priority.available_rnic_id_list[index -
-                                                    preferred_rnic_list_len];
-        }
-
-        return 0;
+        device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        if (device_id >= 0) return device_id;
     }
 
     return ERR_ADDRESS_NOT_REGISTERED;

@@ -7,11 +7,13 @@
 
 TEST(ToplogyTest, GetTopologyMatrix)
 {
-    std::string topo = mooncake::discoverTopologyMatrix();
-    LOG(INFO) << topo;
-    mooncake::TransferMetadata::PriorityMatrix matrix;
-    std::vector<std::string> rnic_list;
-    mooncake::parseNicPriorityMatrix(topo, matrix, rnic_list);
+    mooncake::Topology topology;
+    topology.discover();
+    std::string json_str = topology.toString();
+    LOG(INFO) << json_str;
+    topology.clear();
+    topology.parse(json_str);
+    ASSERT_EQ(topology.toString(), json_str);
 }
 
 int main(int argc, char **argv)

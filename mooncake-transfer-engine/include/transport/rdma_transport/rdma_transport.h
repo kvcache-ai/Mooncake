@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -74,8 +75,9 @@ class RdmaTransport : public Transport {
     int submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries) override;
 
-    int submitTransferTask(const std::vector<TransferRequest *> &request_list,
-                           const std::vector<TransferTask *> &task_list) override;
+    int submitTransferTask(
+        const std::vector<TransferRequest *> &request_list,
+        const std::vector<TransferTask *> &task_list) override;
 
     int getTransferStatus(BatchID batch_id,
                           std::vector<TransferStatus> &status);
@@ -86,8 +88,7 @@ class RdmaTransport : public Transport {
     SegmentID getSegmentID(const std::string &segment_name);
 
    private:
-    int allocateLocalSegmentID(
-        TransferMetadata::PriorityMatrix &priority_matrix);
+    int allocateLocalSegmentID();
 
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -110,10 +111,9 @@ class RdmaTransport : public Transport {
                             int &buffer_id, int &device_id, int retry_cnt = 0);
 
    private:
-    std::vector<std::string> device_name_list_;
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
-    std::unordered_map<std::string, int> device_name_to_index_map_;
     std::atomic<SegmentID> next_segment_id_;
+    Topology local_topology_;
 };
 
 using TransferRequest = Transport::TransferRequest;
