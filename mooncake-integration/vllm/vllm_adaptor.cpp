@@ -77,8 +77,10 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_server,
                                const char *protocol, const char *device_name,
                                const char *metadata_type) {
-    auto conn_string =
-        std::string(metadata_type) + "://" + std::string(metadata_server);
+    std::string conn_string = metadata_server;
+    if (conn_string.find("://") == std::string::npos)
+        conn_string =
+            std::string(metadata_type) + "://" + std::string(metadata_server);
 
     engine_ = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort(local_hostname);
