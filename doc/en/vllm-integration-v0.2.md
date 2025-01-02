@@ -34,8 +34,8 @@ pip3 install -e .
 {
   "prefill_url": "192.168.0.137:13003",
   "decode_url": "192.168.0.139:13003",
-  "metadata_backend": "etcd",
   "metadata_server": "192.168.0.139:2379",
+  "metadata_backend": "etcd",
   "protocol": "rdma",
   "device_name": "erdma_0"
 }
@@ -45,8 +45,11 @@ pip3 install -e .
 - "decode_url": The IP address and port of the Decode node.
   - The port in the URL is used to communicate with etcd server for metadata.
   - **_If you want to run the prefill instance and decode instance on the same node, please set up a different port for the `decode_url`. To avoid port conflicts, ensure that the port number differs by at least 50 from the port number in `prefill_url`. For example, "decode_url": "192.168.0.137:13103". Please note that if you set up the same URL for both instances, we will automatically add 100 to the port of the `decode_url`._**
-- "metadata_backend": Currently we support "etcd" and "redis" backends. If this parameter is absent, the mooncake transfer engine will use "etcd" automatically.
-- "metadata_server": The etcd server of the mooncake transfer engine.
+- "metadata_server": The etcd server of the mooncake transfer engine. For examples,
+  - Use `etcd` as backend: `"192.168.0.137:2379"`, `"etcd://192.168.0.137:2379"` or `"etcd://192.168.0.137:2379,192.168.0.138:2379"`
+  - Use `redis` as backend: `"redis://192.168.0.137:6379"`
+  - Use `http` as backend: `"http://192.168.0.137:8080/metadata"`
+- "metadata_backend": Currently we support "etcd", "redis", and "http" backends. If this parameter is absent and the `metadata_server` is not a complete URL with the backend prefix, the mooncake transfer engine will use "etcd" automatically. Please note that this parameter will be deprecated in the next version, we recommend you provide a complete URL for `metadata_server` with the prefix of the target backend.
 - "protocol": The protocol to be used for data transmission. ("rdma/tcp")
 - "device_name": The device to be used for data transmission, it is required when "protocol" is set to "rdma". If multiple NIC devices are used, they can be separated by commas such as "erdma_0,erdma_1". Please note that there are no spaces between them.
 
@@ -57,8 +60,8 @@ pip3 install -e .
 {
   "prefill_url": "192.168.0.137:13003",
   "decode_url": "192.168.0.139:13003",
-  "metadata_backend": "etcd",
   "metadata_server": "192.168.0.139:2379",
+  "metadata_backend": "etcd",
   "protocol": "tcp",
   "device_name": ""
 }
