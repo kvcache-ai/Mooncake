@@ -121,12 +121,9 @@ class RDMATransportTest : public ::testing::Test {
         LOG(INFO) << "HERE \n";
         google::InitGoogleLogging("RDMATransportTest");
         FLAGS_logtostderr = 1;
-        metadata_client =
-            std::make_shared<TransferMetadata>(FLAGS_metadata_server);
-        LOG_ASSERT(metadata_client);
-        engine = std::make_unique<TransferEngine>(metadata_client);
+        engine = std::make_unique<TransferEngine>();
         hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-        engine->init(FLAGS_local_server_name.c_str(),
+        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                      hostname_port.first.c_str(),
                      hostname_port.second + offset++);
         xport = nullptr;
@@ -134,14 +131,14 @@ class RDMATransportTest : public ::testing::Test {
         args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        xport = engine->installOrGetTransport("rdma", args);
+        xport = engine->installTransport("rdma", args);
         ASSERT_NE(xport, nullptr);
         addr = allocateMemoryPool(ram_buffer_size, 0, false);
         int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
         ASSERT_EQ(rc, 0);
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
-        segment_desc = xport->meta()->getSegmentDescByID(segment_id);
+        segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
         remote_base = (uint64_t)segment_desc->buffers[0].addr;
     }
 
@@ -158,7 +155,7 @@ TEST_F(RDMATransportTest, MultiWrite) {
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
@@ -166,12 +163,12 @@ TEST_F(RDMATransportTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = xport->submitTransfer(batch_id, {entry});
+        ret = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(!ret);
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = xport->getTransferStatus(batch_id, 0, status);
+            int ret = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(ret, 0);
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -180,7 +177,7 @@ TEST_F(RDMATransportTest, MultiWrite) {
                 completed = true;
             }
         }
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         ASSERT_EQ(ret, 0);
     }
 }
@@ -192,7 +189,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
@@ -200,12 +197,12 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = xport->submitTransfer(batch_id, {entry});
+        ret = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(!ret);
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = xport->getTransferStatus(batch_id, 0, status);
+            int ret = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(ret, 0);
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -214,12 +211,12 @@ TEST_F(RDMATransportTest, MultipleRead) {
                 completed = true;
             }
         }
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         ASSERT_EQ(ret, 0);
     }
     times = 10;
     while (times--) {
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
@@ -227,12 +224,12 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = xport->submitTransfer(batch_id, {entry});
+        ret = engine->submitTransfer(batch_id, {entry});
         ASSERT_EQ(ret, 0);
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = xport->getTransferStatus(batch_id, 0, status);
+            int ret = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(ret, 0);
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -240,7 +237,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
                 completed = true;
             }
         }
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         ASSERT_EQ(ret, 0);
         ret = memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                      kDataLength);

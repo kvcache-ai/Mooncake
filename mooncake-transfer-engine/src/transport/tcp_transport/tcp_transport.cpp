@@ -208,17 +208,14 @@ int TcpTransport::install(std::string &local_server_name,
 
     int ret = allocateLocalSegmentID();
     if (ret) {
-        LOG(ERROR) << "*** Transfer engine cannot be initialized: cannot "
-                      "allocate local segment";
+        LOG(ERROR) << "TcpTransport: cannot allocate local segment";
         return -1;
     }
 
     ret = metadata_->updateLocalSegmentDesc();
     if (ret) {
-        LOG(ERROR) << "*** Transfer engine cannot be initialized: cannot "
-                      "publish segments";
-        LOG(ERROR) << "*** Check the connectivity between this server and "
-                      "metadata server (etcd server)";
+        LOG(ERROR) << "TcpTransport: cannot publish segments, "
+                      "check the availability of metadata storage";
         return -1;
     }
 
@@ -295,7 +292,8 @@ int TcpTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "Exceed the limitation of current batch's capacity";
+        LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
+                      "capacity";
         return ERR_TOO_MANY_REQUESTS;
     }
 
@@ -321,13 +319,34 @@ int TcpTransport::submitTransfer(BatchID batch_id,
     return 0;
 }
 
+int TcpTransport::submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list) {
+    for (size_t index = 0; index < request_list.size(); ++index) {
+        auto &request = *request_list[index];
+        auto &task = *task_list[index];
+        task.total_bytes = request.length;
+        auto slice = new Slice();
+        slice->source_addr = (char *)request.source;
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->tcp.dest_addr = request.target_offset;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        task.slices.push_back(slice);
+        startTransfer(slice);
+    }
+    return 0;
+}
+
 void TcpTransport::worker() {
     while (running_) {
         try {
             context_->doAccept();
             context_->io_context.run();
         } catch (std::exception &e) {
-            LOG(ERROR) << "Exception: " << e.what();
+            LOG(ERROR) << "TcpTransport: exception: " << e.what();
         }
     }
 }
@@ -348,10 +367,9 @@ void TcpTransport::startTransfer(Slice *slice) {
             return;
         }
 
-        auto endpoint_iterator =
-            resolver.resolve(boost::asio::ip::tcp::v4(), 
-                             meta_entry.ip_or_host_name,
-                             std::to_string(meta_entry.rpc_port));
+        auto endpoint_iterator = resolver.resolve(
+            boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
+            std::to_string(meta_entry.rpc_port));
         boost::asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
@@ -363,7 +381,7 @@ void TcpTransport::startTransfer(Slice *slice) {
         session->initiate(slice->source_addr, slice->tcp.dest_addr,
                           slice->length, slice->opcode);
     } catch (std::exception &e) {
-        LOG(ERROR) << "ASIO Exception: " << e.what();
+        LOG(ERROR) << "TcpTransport: ASIO exception: " << e.what();
         slice->markFailed();
     }
 }

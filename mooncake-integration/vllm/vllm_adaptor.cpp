@@ -46,27 +46,44 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
+std::pair<std::string, std::string> parseConnectionString(
+    const std::string &conn_string) {
+    std::pair<std::string, std::string> result;
+    std::string proto = "etcd";
+    std::string domain;
+    std::size_t pos = conn_string.find("://");
+
+    if (pos != std::string::npos) {
+        proto = conn_string.substr(0, pos);
+        domain = conn_string.substr(pos + 3);
+    } else {
+        domain = conn_string;
+    }
+
+    result.first = proto;
+    result.second = domain;
+    return result;
+}
+
 int VLLMAdaptor::initialize(const char *local_hostname,
                             const char *metadata_server, const char *protocol,
                             const char *device_name) {
-    return initializeExt(local_hostname, metadata_server, protocol, device_name,
-                         "etcd");
+    auto conn_string = parseConnectionString(metadata_server);
+    return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
+                         device_name, conn_string.first.c_str());
 }
 
 int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_server,
                                const char *protocol, const char *device_name,
                                const char *metadata_type) {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(metadata_server, metadata_type);
-    if (!metadata_client) return -1;
+    auto conn_string =
+        std::string(metadata_type) + "://" + std::string(metadata_server);
 
-    engine_ = std::make_unique<TransferEngine>(metadata_client);
-    if (!engine_) return -1;
-
+    engine_ = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort(local_hostname);
-    int ret = engine_->init(local_hostname, hostname_port.first.c_str(),
-                            hostname_port.second);
+    int ret = engine_->init(conn_string, local_hostname,
+                            hostname_port.first.c_str(), hostname_port.second);
     if (ret) return -1;
 
     xport_ = nullptr;
@@ -77,9 +94,9 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        xport_ = engine_->installOrGetTransport("rdma", args);
+        xport_ = engine_->installTransport("rdma", args);
     } else if (strcmp(protocol, "tcp") == 0) {
-        xport_ = engine_->installOrGetTransport("tcp", nullptr);
+        xport_ = engine_->installTransport("tcp", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
         return -1;
@@ -171,7 +188,7 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
         handle_map_[target_hostname] = handle;
     }
 
-    auto batch_id = xport_->allocateBatchID(1);
+    auto batch_id = engine_->allocateBatchID(1);
     TransferRequest entry;
     entry.opcode = TransferRequest::READ;
     entry.length = length;
@@ -179,18 +196,18 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
 
-    int ret = xport_->submitTransfer(batch_id, {entry});
+    int ret = engine_->submitTransfer(batch_id, {entry});
     if (ret < 0) return -1;
 
     TransferStatus status;
     while (true) {
-        int ret = xport_->getTransferStatus(batch_id, 0, status);
+        int ret = engine_->getTransferStatus(batch_id, 0, status);
         LOG_ASSERT(!ret);
         if (status.s == TransferStatusEnum::COMPLETED) {
-            xport_->freeBatchID(batch_id);
+            engine_->freeBatchID(batch_id);
             return 0;
         } else if (status.s == TransferStatusEnum::FAILED) {
-            xport_->freeBatchID(batch_id);
+            engine_->freeBatchID(batch_id);
             return -1;
         }
     }

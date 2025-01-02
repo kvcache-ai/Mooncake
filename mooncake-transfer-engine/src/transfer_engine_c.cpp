@@ -22,22 +22,24 @@
 
 using namespace mooncake;
 
-transfer_engine_t createTransferEngine(const char *metadata_uri) {
-    auto metadata_client = std::make_shared<TransferMetadata>(metadata_uri);
-    TransferEngine *native = new TransferEngine(metadata_client);
+transfer_engine_t createTransferEngine(const char *metadata_conn_string,
+                                       const char *local_server_name,
+                                       const char *ip_or_host_name,
+                                       uint64_t rpc_port) {
+    TransferEngine *native = new TransferEngine();
+    int ret = native->init(metadata_conn_string, local_server_name,
+                           ip_or_host_name, rpc_port);
+    if (ret) {
+        delete native;
+        return nullptr;
+    }
     return (transfer_engine_t)native;
 }
 
-int initTransferEngine(transfer_engine_t engine, const char *local_server_name,
-                       const char *connectable_name, uint64_t rpc_port) {
+transport_t installTransport(transfer_engine_t engine, const char *proto,
+                             void **args) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->init(local_server_name, connectable_name, rpc_port);
-}
-
-transport_t installOrGetTransport(transfer_engine_t engine, const char *proto,
-                                  void **args) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return (transport_t)native->installOrGetTransport(proto, args);
+    return (transport_t)native->installTransport(proto, args);
 }
 
 int uninstallTransport(transfer_engine_t engine, const char *proto) {
@@ -95,14 +97,14 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
     return native->unregisterLocalMemoryBatch(native_addr_list);
 }
 
-batch_id_t allocateBatchID(transport_t xport, size_t batch_size) {
-    Transport *native = (Transport *)xport;
+batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
+    TransferEngine *native = (TransferEngine *)engine;
     return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
-int submitTransfer(transport_t xport, batch_id_t batch_id,
+int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count) {
-    Transport *native = (Transport *)xport;
+    TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
     for (size_t index = 0; index < count; index++) {
@@ -116,9 +118,9 @@ int submitTransfer(transport_t xport, batch_id_t batch_id,
     return native->submitTransfer((Transport::BatchID)batch_id, native_entries);
 }
 
-int getTransferStatus(transport_t xport, batch_id_t batch_id, size_t task_id,
-                      struct transfer_status *status) {
-    Transport *native = (Transport *)xport;
+int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                      size_t task_id, struct transfer_status *status) {
+    TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
     int rc = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
                                        native_status);
@@ -129,8 +131,8 @@ int getTransferStatus(transport_t xport, batch_id_t batch_id, size_t task_id,
     return rc;
 }
 
-int freeBatchID(transport_t xport, batch_id_t batch_id) {
-    Transport *native = (Transport *)xport;
+int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
+    TransferEngine *native = (TransferEngine *)engine;
     return native->freeBatchID(batch_id);
 }
 

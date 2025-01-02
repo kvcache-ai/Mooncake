@@ -1,9 +1,24 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <glog/logging.h>
 #include <jsoncpp/json/json.h>
 
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,40 +36,20 @@
 
 #include "topology.h"
 
+namespace mooncake {
 struct InfinibandDevice {
     std::string name;
     std::string pci_bus_id;
     int numa_node;
 };
 
-struct TopologyEntry {
-    std::string name;
-    std::vector<std::string> preferred_hca;
-    std::vector<std::string> avail_hca;
-
-    Json::Value to_json() {
-        Json::Value matrix(Json::arrayValue);
-        Json::Value hca_list(Json::arrayValue);
-        for (auto &hca : preferred_hca) {
-            hca_list.append(hca);
-        }
-        matrix.append(hca_list);
-        hca_list.clear();
-        for (auto &hca : avail_hca) {
-            hca_list.append(hca);
-        }
-        matrix.append(hca_list);
-        return matrix;
-    }
-};
-
-static std::vector<InfinibandDevice> list_infiniband_devices() {
+static std::vector<InfinibandDevice> listInfiniBandDevices() {
     DIR *dir = opendir("/sys/class/infiniband");
     struct dirent *entry;
     std::vector<InfinibandDevice> devices;
 
     if (dir == NULL) {
-        LOG(WARNING) << "failed to list /sys/class/infiniband";
+        LOG(WARNING) << "Failed to list /sys/class/infiniband";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -64,7 +59,7 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
 
         std::string device_name = entry->d_name;
 
-        char path[PATH_MAX];
+        char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that
         // "/sys/class/infiniband/mlx5_X/" is a symlink to
@@ -72,7 +67,7 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  entry->d_name);
         if (realpath(path, resolved_path) == NULL) {
-            LOG(ERROR) << "realpath: " << strerror(errno);
+            PLOG(ERROR) << "Failed to parse realpath";
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
@@ -89,14 +84,14 @@ static std::vector<InfinibandDevice> list_infiniband_devices() {
     return devices;
 }
 
-static std::vector<TopologyEntry> discover_cpu_topology(
+static std::vector<TopologyEntry> discoverCpuTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     DIR *dir = opendir("/sys/devices/system/node");
     struct dirent *entry;
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        LOG(WARNING) << "failed to list /sys/devices/system/node";
+        LOG(WARNING) << "Failed to list /sys/devices/system/node";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -127,7 +122,7 @@ static std::vector<TopologyEntry> discover_cpu_topology(
 
 #ifdef USE_CUDA
 
-static int get_pci_distance(const char *bus1, const char *bus2) {
+static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
     char path1[PATH_MAX];
     char path2[PATH_MAX];
@@ -157,7 +152,7 @@ static int get_pci_distance(const char *bus1, const char *bus2) {
     return distance;
 }
 
-static std::vector<TopologyEntry> discover_cuda_topology(
+static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
     int device_count;
@@ -170,15 +165,14 @@ static std::vector<TopologyEntry> discover_cuda_topology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
-            ;
+        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
         for (const auto &hca : all_hca) {
             // FIXME: currently we only identify the NICs connected to the same
             // PCIe switch/RC with GPU as preferred.
-            if (get_pci_distance(hca.pci_bus_id.c_str(), pci_bus_id) == 0) {
+            if (getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id) == 0) {
                 preferred_hca.push_back(hca.name);
             } else {
                 avail_hca.push_back(hca.name);
@@ -194,19 +188,125 @@ static std::vector<TopologyEntry> discover_cuda_topology(
 
 #endif  // USE_CUDA
 
-namespace mooncake {
-// TODO: add black/white lists for devices.
-std::string discoverTopologyMatrix() {
-    auto all_hca = list_infiniband_devices();
-    Json::Value value(Json::objectValue);
-    for (auto &ent : discover_cpu_topology(all_hca)) {
-        value[ent.name] = ent.to_json();
+Topology::Topology() {}
+
+Topology::~Topology() {}
+
+bool Topology::empty() const { return matrix_.empty(); }
+
+void Topology::clear() {
+    matrix_.clear();
+    hca_list_.clear();
+    resolved_matrix_.clear();
+}
+
+int Topology::discover() {
+    matrix_.clear();
+    auto all_hca = listInfiniBandDevices();
+    for (auto &ent : discoverCpuTopology(all_hca)) {
+        matrix_[ent.name] = ent;
     }
 #ifdef USE_CUDA
-    for (auto &ent : discover_cuda_topology(all_hca)) {
-        value[ent.name] = ent.to_json();
+    for (auto &ent : discoverCudaTopology(all_hca)) {
+        matrix_[ent.name] = ent;
     }
 #endif
+    return resolve();
+}
+
+int Topology::parse(const std::string &topology_json) {
+    std::set<std::string> rnic_set;
+    Json::Value root;
+    Json::Reader reader;
+
+    if (topology_json.empty() || !reader.parse(topology_json, root)) {
+        LOG(ERROR) << "Topology: malformed json format";
+        return ERR_MALFORMED_JSON;
+    }
+
+    matrix_.clear();
+    for (const auto &key : root.getMemberNames()) {
+        const Json::Value &value = root[key];
+        if (value.isArray() && value.size() == 2) {
+            TopologyEntry topo_entry;
+            topo_entry.name = key;
+            for (const auto &array : value[0]) {
+                auto device_name = array.asString();
+                topo_entry.preferred_hca.push_back(device_name);
+            }
+            for (const auto &array : value[1]) {
+                auto device_name = array.asString();
+                topo_entry.avail_hca.push_back(device_name);
+            }
+            matrix_[key] = topo_entry;
+        } else {
+            LOG(ERROR) << "Topology: malformed json format";
+            return ERR_MALFORMED_JSON;
+        }
+    }
+
+    return resolve();
+}
+
+std::string Topology::toString() const {
+    Json::Value value(Json::objectValue);
+    for (auto &entry : matrix_) {
+        value[entry.first] = entry.second.toJson();
+    }
     return value.toStyledString();
+}
+
+Json::Value Topology::toJson() const {
+    Json::Value root;
+    Json::Reader reader;
+    reader.parse(toString(), root);
+    return root;
+}
+
+int Topology::selectDevice(const std::string storage_type, int retry_count) {
+    if (!resolved_matrix_.count(storage_type)) return ERR_DEVICE_NOT_FOUND;
+    auto &entry = resolved_matrix_[storage_type];
+    if (retry_count == 0) {
+        int rand_value = SimpleRandom::Get().next();
+        if (!entry.preferred_hca.empty())
+            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
+        else
+            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+    } else {
+        size_t index = (retry_count - 1) %
+                       (entry.preferred_hca.size() + entry.avail_hca.size());
+        if (index < entry.preferred_hca.size())
+            return entry.preferred_hca[index];
+        else {
+            index -= entry.preferred_hca.size();
+            return entry.avail_hca[index];
+        }
+    }
+    return 0;
+}
+
+int Topology::resolve() {
+    std::map<std::string, int> hca_id_map;
+    int next_hca_map_index = 0;
+    for (auto &entry : matrix_) {
+        for (auto &hca : entry.second.preferred_hca) {
+            if (!hca_id_map.count(hca)) {
+                hca_list_.push_back(hca);
+                hca_id_map[hca] = next_hca_map_index;
+                next_hca_map_index++;
+            }
+            resolved_matrix_[entry.first].preferred_hca.push_back(
+                hca_id_map[hca]);
+        }
+        for (auto &hca : entry.second.avail_hca) {
+            if (!hca_id_map.count(hca)) {
+                hca_list_.push_back(hca);
+                hca_id_map[hca] = next_hca_map_index;
+                next_hca_map_index++;
+            }
+            resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
+        }
+    }
+    return 0;
 }
 }  // namespace mooncake

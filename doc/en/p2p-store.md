@@ -42,7 +42,7 @@ func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix 
 Creates an instance of `P2PStore`, which internally starts a Transfer Engine service.
 - `metadataUri`: The hostname or IP address of the metadata server/etcd service.
 - `localSegmentName`: The local server name (hostname/IP address:port), ensuring uniqueness within the cluster.
-- `nicPriorityMatrix`: The network interface card priority order matrix, see the related description in the Transfer Engine API documentation (`TransferEngine::installOrGetTransport`).
+- `nicPriorityMatrix`: The network interface card priority order matrix, see the related description in the Transfer Engine API documentation (`TransferEngine::installTransport`).
 - Return value: If successful, returns a pointer to the `P2PStore` instance, otherwise returns `error`.
 
 ```go

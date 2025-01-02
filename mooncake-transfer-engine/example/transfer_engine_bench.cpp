@@ -54,7 +54,6 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
-DEFINE_string(metadata_type, "etcd", "Metadata type: etcd|redis|http");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -107,7 +106,8 @@ static void freeMemoryPool(void *addr, size_t size) {
 
     if (attributes.type == cudaMemoryTypeDevice) {
         cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost || attributes.type == cudaMemoryTypeUnregistered) {
+    } else if (attributes.type == cudaMemoryTypeHost ||
+               attributes.type == cudaMemoryTypeUnregistered) {
         numa_free(addr, size);
     } else {
         LOG(ERROR) << "Unknown memory type, " << addr << " " << attributes.type;
@@ -120,7 +120,7 @@ static void freeMemoryPool(void *addr, size_t size) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
+int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
@@ -133,7 +133,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
         exit(EXIT_FAILURE);
     }
 
-    auto segment_desc = xport->meta()->getSegmentDescByID(segment_id);
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     if (!segment_desc) {
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
@@ -143,7 +143,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
 
     size_t batch_count = 0;
     while (running) {
-        auto batch_id = xport->allocateBatchID(FLAGS_batch_size);
+        auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         int ret = 0;
         std::vector<TransferRequest> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
@@ -159,24 +159,25 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
             requests.emplace_back(entry);
         }
 
-        ret = xport->submitTransfer(batch_id, requests);
+        ret = engine->submitTransfer(batch_id, requests);
         LOG_ASSERT(!ret);
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
-                int ret = xport->getTransferStatus(batch_id, task_id, status);
+                int ret = engine->getTransferStatus(batch_id, task_id, status);
                 LOG_ASSERT(!ret);
                 if (status.s == TransferStatusEnum::COMPLETED)
                     completed = true;
                 else if (status.s == TransferStatusEnum::FAILED) {
                     LOG(INFO) << "FAILED";
                     completed = true;
+                    exit(EXIT_FAILURE);
                 }
             }
         }
 
-        ret = xport->freeBatchID(batch_id);
+        ret = engine->freeBatchID(batch_id);
         LOG_ASSERT(!ret);
         batch_count++;
     }
@@ -185,7 +186,7 @@ int initiatorWorker(Transport *xport, SegmentID segment_id, int thread_id,
     return 0;
 }
 
-std::string formatDeviceNames(const std::string& device_names) {
+std::string formatDeviceNames(const std::string &device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -215,22 +216,22 @@ std::string loadNicPriorityMatrix() {
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
-    return "{\"cpu:0\": [[" + device_names + "], []], "
-           " \"cpu:1\": [[" + device_names + "], []], "
-           " \"gpu:0\": [[" + device_names + "], []]}";
+    return "{\"cpu:0\": [[" + device_names +
+           "], []], "
+           " \"cpu:1\": [[" +
+           device_names +
+           "], []], "
+           " \"gpu:0\": [[" +
+           device_names + "], []]}";
 }
 
 int initiator() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server, FLAGS_metadata_type);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     Transport *xport = nullptr;
     if (FLAGS_protocol == "rdma") {
@@ -238,9 +239,9 @@ int initiator() {
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        xport = engine->installOrGetTransport("rdma", args);
+        xport = engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        xport = engine->installOrGetTransport("tcp", nullptr);
+        xport = engine->installTransport("tcp", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }
@@ -252,8 +253,7 @@ int initiator() {
 
 #ifdef USE_CUDA
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
-    if (FLAGS_use_vram)
-        LOG(INFO) << "VRAM is used";
+    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(ram_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? "gpu:" : "cpu:";
@@ -278,7 +278,7 @@ int initiator() {
     gettimeofday(&start_tv, nullptr);
 
     for (int i = 0; i < FLAGS_threads; ++i)
-        workers[i] = std::thread(initiatorWorker, xport, segment_id, i,
+        workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
                                  addr[i % buffer_num]);
 
     sleep(FLAGS_duration);
@@ -306,25 +306,21 @@ int initiator() {
 }
 
 int target() {
-    auto metadata_client =
-        std::make_shared<TransferMetadata>(FLAGS_metadata_server, FLAGS_metadata_type);
-    LOG_ASSERT(metadata_client);
-
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>(metadata_client);
+    auto engine = std::make_unique<TransferEngine>();
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_local_server_name.c_str(), hostname_port.first.c_str(),
-                 hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second);
 
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix();
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        engine->installOrGetTransport("rdma", args);
+        engine->installTransport("rdma", args);
     } else if (FLAGS_protocol == "tcp") {
-        engine->installOrGetTransport("tcp", nullptr);
+        engine->installTransport("tcp", nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol";
     }

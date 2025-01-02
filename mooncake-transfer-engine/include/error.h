@@ -34,5 +34,6 @@
 #define ERR_NUMA (-300)
 #define ERR_CLOCK (-301)
 #define ERR_MEMORY (-302)
+#define ERR_NOT_IMPLEMENTED (-303)
 
 #endif  // ERROR_H
