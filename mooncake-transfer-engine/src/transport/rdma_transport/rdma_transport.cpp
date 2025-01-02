@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -46,34 +47,26 @@ int RdmaTransport::install(std::string &local_server_name,
                            void **args) {
     const std::string nic_priority_matrix = static_cast<char *>(args[0]);
     bool dry_run = args[1] ? *static_cast<bool *>(args[1]) : false;
-    TransferMetadata::PriorityMatrix local_priority_matrix;
 
     if (dry_run) return 0;
 
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
-    int ret = metadata_->parseNicPriorityMatrix(
-        nic_priority_matrix, local_priority_matrix, device_name_list_);
+    int ret = local_topology_.parse(nic_priority_matrix);
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot parse "
-                      "NIC priority matrix: "
+        LOG(ERROR) << "RdmaTransport: incorrect NIC priority matrix: "
                    << nic_priority_matrix;
         return ret;
     }
 
-    int device_index = 0;
-    for (auto &device_name : device_name_list_)
-        device_name_to_index_map_[device_name] = device_index++;
-
     ret = initializeRdmaResources();
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
-                      "initialize RDMA resources";
+        LOG(ERROR) << "RdmaTransport: cannot initialize RDMA resources";
         return ret;
     }
 
-    ret = allocateLocalSegmentID(local_priority_matrix);
+    ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
                       "allocate local segment";
@@ -82,16 +75,13 @@ int RdmaTransport::install(std::string &local_server_name,
 
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot start "
-                      "handshake daemon";
+        LOG(ERROR) << "RdmaTransport: cannot start handshake daemon";
         return ret;
     }
 
     ret = metadata_->updateLocalSegmentDesc();
     if (ret) {
-        LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
-                      "publish segments. Check the connectivity between this "
-                      "server and etcd servers";
+        LOG(ERROR) << "RdmaTransport: cannot publish segments";
         return ret;
     }
 
@@ -132,8 +122,7 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return 0;
 }
 
-int RdmaTransport::allocateLocalSegmentID(
-    TransferMetadata::PriorityMatrix &priority_matrix) {
+int RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
@@ -145,7 +134,7 @@ int RdmaTransport::allocateLocalSegmentID(
         device_desc.gid = entry->gid();
         desc->devices.push_back(device_desc);
     }
-    desc->priority_matrix = priority_matrix;
+    desc->topology = local_topology_;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -165,7 +154,7 @@ int RdmaTransport::registerLocalMemoryBatch(
 
     for (size_t i = 0; i < buffer_list.size(); ++i) {
         if (results[i].get()) {
-            LOG(WARNING) << "Failed to register memory: addr "
+            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
         }
@@ -186,7 +175,7 @@ int RdmaTransport::unregisterLocalMemoryBatch(
 
     for (size_t i = 0; i < addr_list.size(); ++i) {
         if (results[i].get())
-            LOG(WARNING) << "Failed to unregister memory: addr "
+            LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
     }
 
@@ -197,7 +186,8 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                                   const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "Exceed the limitation of current batch's capacity";
+        LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
+                      "capacity";
         return ERR_TOO_MANY_REQUESTS;
     }
 
@@ -241,8 +231,61 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                 break;
             }
             if (device_id < 0) {
-                LOG(ERROR) << "Address not registered by any device(s) "
-                           << slice->source_addr;
+                LOG(ERROR)
+                    << "RdmaTransport: Address not registered by any device(s) "
+                    << slice->source_addr;
+                return ERR_ADDRESS_NOT_REGISTERED;
+            }
+        }
+    }
+    for (auto &entry : slices_to_post)
+        entry.first->submitPostSend(entry.second);
+    return 0;
+}
+
+int RdmaTransport::submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list) {
+    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+        slices_to_post;
+    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    const size_t kBlockSize = globalConfig().slice_size;
+    const int kMaxRetryCount = globalConfig().retry_cnt;
+    for (size_t index = 0; index < request_list.size(); ++index) {
+        auto &request = *request_list[index];
+        auto &task = *task_list[index];
+        for (uint64_t offset = 0; offset < request.length;
+             offset += kBlockSize) {
+            auto slice = new Slice();
+            slice->source_addr = (char *)request.source + offset;
+            slice->length = std::min(request.length - offset, kBlockSize);
+            slice->opcode = request.opcode;
+            slice->rdma.dest_addr = request.target_offset + offset;
+            slice->rdma.retry_cnt = 0;
+            slice->rdma.max_retry_cnt = kMaxRetryCount;
+            slice->task = &task;
+            slice->target_id = request.target_id;
+            slice->status = Slice::PENDING;
+
+            int buffer_id = -1, device_id = -1, retry_cnt = 0;
+            while (retry_cnt < kMaxRetryCount) {
+                if (selectDevice(local_segment_desc.get(),
+                                 (uint64_t)slice->source_addr, slice->length,
+                                 buffer_id, device_id, retry_cnt++))
+                    continue;
+                auto &context = context_list_[device_id];
+                if (!context->active()) continue;
+                slice->rdma.source_lkey =
+                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                slices_to_post[context].push_back(slice);
+                task.total_bytes += slice->length;
+                task.slices.push_back(slice);
+                break;
+            }
+            if (device_id < 0) {
+                LOG(ERROR)
+                    << "RdmaTransport: Address not registered by any device(s) "
+                    << slice->source_addr;
                 return ERR_ADDRESS_NOT_REGISTERED;
             }
         }
@@ -307,23 +350,35 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
-    auto context = context_list_[device_name_to_index_map_[local_nic_name]];
+
+    std::shared_ptr<RdmaContext> context;
+    int index = 0;
+    for (auto &entry : local_topology_.getHcaList()) {
+        if (entry == local_nic_name) {
+            context = context_list_[index];
+            break;
+        }
+        index++;
+    }
+    if (!context) return ERR_INVALID_ARGUMENT;
+
 #ifdef CONFIG_ERDMA
     if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
 #endif
+
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    if (device_name_list_.empty()) {
-        LOG(ERROR) << "No available RNIC!";
+    if (local_topology_.empty()) {
+        LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
 
     std::vector<int> device_speed_list;
-    for (auto &device_name : device_name_list_) {
+    for (auto &device_name : local_topology_.getHcaList()) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
         if (!context) return ERR_MEMORY;
 
@@ -355,33 +410,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-
-        auto &priority = desc->priority_matrix[buffer_desc.name];
-        size_t preferred_rnic_list_len = priority.preferred_rnic_list.size();
-        size_t available_rnic_list_len = priority.available_rnic_list.size();
-        size_t rnic_list_len =
-            preferred_rnic_list_len + available_rnic_list_len;
-        if (rnic_list_len == 0) return ERR_DEVICE_NOT_FOUND;
-
-        if (retry_count == 0) {
-            int rand_value = SimpleRandom::Get().next();
-            if (preferred_rnic_list_len)
-                device_id =
-                    priority.preferred_rnic_id_list[rand_value %
-                                                    preferred_rnic_list_len];
-            else
-                device_id =
-                    priority.available_rnic_id_list[rand_value %
-                                                    available_rnic_list_len];
-        } else {
-            size_t index = (retry_count - 1) % rnic_list_len;
-            if (index < preferred_rnic_list_len)
-                device_id = priority.preferred_rnic_id_list[index];
-            else
-                device_id = priority.available_rnic_id_list[index - preferred_rnic_list_len];
-        }
-
-        return 0;
+        device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        if (device_id >= 0) return device_id;
     }
 
     return ERR_ADDRESS_NOT_REGISTERED;

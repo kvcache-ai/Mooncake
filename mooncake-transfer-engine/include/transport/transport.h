@@ -35,6 +35,7 @@ class TransferMetadata;
 /// failure.
 class Transport {
     friend class TransferEngine;
+    friend class MultiTransport;
 
    public:
     using SegmentID = uint64_t;
@@ -163,6 +164,12 @@ class Transport {
     virtual int submitTransfer(BatchID batch_id,
                                const std::vector<TransferRequest> &entries) = 0;
 
+    virtual int submitTransferTask(
+        const std::vector<TransferRequest *> &request_list,
+        const std::vector<TransferTask *> &task_list) {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
     /// @return Return 1 on completed (either success or failure); 0 if still in
@@ -207,4 +214,4 @@ class Transport {
 };
 }  // namespace mooncake
 
-#endif // TRANSPORT_H_
+#endif  // TRANSPORT_H_

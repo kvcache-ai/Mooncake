@@ -105,7 +105,7 @@ impl TransferEngine {
             std::ptr::null_mut(),
         ];
         let xport =
-            unsafe { bindings::installOrGetTransport(engine, proto_c.as_ptr(), args.as_mut_ptr()) };
+            unsafe { bindings::installTransport(engine, proto_c.as_ptr(), args.as_mut_ptr()) };
 
         if xport.is_null() {
             unsafe {
@@ -197,7 +197,7 @@ impl TransferEngine {
     }
 
     pub fn allocate_batch_id(&self, batch_size: usize) -> Result<BatchID> {
-        let ret = unsafe { bindings::allocateBatchID(self.xport, batch_size) };
+        let ret = unsafe { bindings::allocateBatchID(self.engine, batch_size) };
         if ret == u64::MAX {
             bail!("Failed to allocate batch ID")
         } else {
@@ -221,7 +221,7 @@ impl TransferEngine {
             })
         }
         let ret = unsafe {
-            bindings::submitTransfer(self.xport, batch_id, requests_c.as_mut_ptr(), requests.len())
+            bindings::submitTransfer(self.engine, batch_id, requests_c.as_mut_ptr(), requests.len())
         };
         if ret < 0 {
             bail!("Failed to submit transfer")
@@ -236,7 +236,7 @@ impl TransferEngine {
             transferred_bytes: 0,
         };
         let ret =
-            unsafe { bindings::getTransferStatus(self.xport, batch_id, task_id as usize, &mut status) };
+            unsafe { bindings::getTransferStatus(self.engine, batch_id, task_id as usize, &mut status) };
         if ret < 0 {
             bail!("Failed to get transfer status")
         } else {
@@ -245,7 +245,7 @@ impl TransferEngine {
     }
 
     pub fn free_batch_id(&self, batch_id: BatchID) -> Result<()> {
-        let ret = unsafe { bindings::freeBatchID(self.xport, batch_id) };
+        let ret = unsafe { bindings::freeBatchID(self.engine, batch_id) };
         if ret < 0 {
             bail!("Failed to free batch ID")
         } else {

@@ -25,7 +25,7 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
-#endif // USE_CUDA
+#endif  // USE_CUDA
 
 // Experimental: Per-thread SegmentDesc & EndPoint Caches
 // #define CONFIG_CACHE_SEGMENT_DESC
@@ -82,6 +82,8 @@ int WorkerPool::submitPostSend(
                 context_.engine().meta()->getSegmentDescByID(target_id);
             if (!segment_desc_map[target_id]) {
                 segment_desc_map.clear();
+                LOG(ERROR) << "Cannot get target segment description #"
+                           << target_id;
                 return ERR_INVALID_ARGUMENT;
             }
         }
@@ -90,12 +92,14 @@ int WorkerPool::submitPostSend(
     std::unordered_map<SegmentID, std::shared_ptr<RdmaTransport::SegmentDesc>>
         segment_desc_map;
     for (auto &slice : slice_list) {
-        assert(slice);
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id))
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id);
-        if (!segment_desc_map[target_id]) return ERR_INVALID_ARGUMENT;
+        if (!segment_desc_map[target_id]) {
+            LOG(ERROR) << "Cannot get target segment #" << target_id;
+            return ERR_INVALID_ARGUMENT;
+        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
@@ -107,11 +111,13 @@ int WorkerPool::submitPostSend(
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
                                         slice->rdma.dest_addr, slice->length,
                                         buffer_id, device_id)) {
+            LOG(WARNING) << "Reselect remote NIC for address "
+                         << (void *)slice->rdma.dest_addr << " on segment #"
+                         << slice->target_id;
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
-                LOG(ERROR) << "Cannot get segment description for slice: "
-                           << (void *)slice;
+                LOG(ERROR) << "Cannot get target segment #" << slice->target_id;
                 slice->markFailed();
                 continue;
             }
@@ -119,7 +125,8 @@ int WorkerPool::submitPostSend(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 LOG(ERROR) << "Failed to select remote NIC for address "
-                           << (void *)slice->rdma.dest_addr;
+                           << (void *)slice->rdma.dest_addr << " on segment #"
+                           << slice->target_id;
                 slice->markFailed();
                 continue;
             }
@@ -313,9 +320,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id))
+        if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id, true);
+        }
     }
 
     for (auto &slice : slice_list) {
@@ -325,7 +333,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         } else {
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
-            if (RdmaTransport::selectDevice(peer_segment_desc.get(),
+            if (!peer_segment_desc ||
+                RdmaTransport::selectDevice(peer_segment_desc.get(),
                                             slice->rdma.dest_addr,
                                             slice->length, buffer_id, device_id,
                                             slice->rdma.retry_cnt)) {
@@ -374,19 +383,19 @@ void WorkerPool::transferWorker(int thread_id) {
 int WorkerPool::doProcessContextEvents() {
     ibv_async_event event;
     if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
-    LOG(INFO) << "Received context async event: "
-              << ibv_event_type_str(event.event_type) << " for context "
-              << context_.deviceName();
+    LOG(WARNING) << "Worker: Received context async event "
+                 << ibv_event_type_str(event.event_type) << " for context "
+                 << context_.deviceName();
     if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
         event.event_type == IBV_EVENT_CQ_ERR ||
         event.event_type == IBV_EVENT_WQ_FATAL ||
         event.event_type == IBV_EVENT_PORT_ERR ||
         event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
-        LOG(INFO) << "Context " << context_.deviceName() << " is inactive";
+        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now inactive";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context_.set_active(true);
-        LOG(INFO) << "Context " << context_.deviceName() << " is active";
+        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now active";
     }
     ibv_ack_async_event(&event);
     return 0;
@@ -398,14 +407,11 @@ void WorkerPool::monitorWorker() {
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {
-            PLOG(ERROR) << "Failed to call epoll wait";
+            PLOG(ERROR) << "Worker: epoll_wait()";
             continue;
         }
 
         if (num_events == 0) continue;
-
-        LOG(ERROR) << "Received event, fd: " << event.data.fd
-                   << ", events: " << event.events;
 
         if (!(event.events & EPOLLIN)) continue;
 

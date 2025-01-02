@@ -46,27 +46,21 @@ func parseServerName(serverName string) (host string, port int) {
 }
 
 func NewTransferEngine(metadata_uri string, local_server_name string, nic_priority_matrix string) (*TransferEngine, error) {
-	native_engine := C.createTransferEngine(C.CString(metadata_uri))
-	if native_engine == nil {
-		return nil, ErrTransferEngine
-	}
-
 	// For simplifiy, local_server_name must be a valid IP address or hostname
 	connectable_name, rpc_port := parseServerName(local_server_name)
-	ret := C.initTransferEngine(native_engine, 
-		C.CString(local_server_name),
-		C.CString(connectable_name),
-		C.uint64_t(rpc_port))
-	
-	if ret < 0 {
-		C.destroyTransferEngine(native_engine)
+
+	native_engine := C.createTransferEngine(C.CString(metadata_uri), 
+	                                        C.CString(local_server_name),
+											C.CString(connectable_name),
+											C.uint64_t(rpc_port))
+	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
 
 	var args [2]unsafe.Pointer
 	args[0] = unsafe.Pointer(C.CString(nic_priority_matrix))
 	args[1] = nil
-	xport := C.installOrGetTransport(native_engine, C.CString("rdma"), &args[0])
+	xport := C.installTransport(native_engine, C.CString("rdma"), &args[0])
 	if xport == nil {
 		C.destroyTransferEngine(native_engine)
 		return nil, ErrTransferEngine
@@ -105,7 +99,7 @@ func (engine *TransferEngine) unregisterLocalMemory(addr uintptr) error {
 }
 
 func (engine *TransferEngine) allocateBatchID(batchSize int) (BatchID, error) {
-	ret := C.allocateBatchID(engine.xport, C.size_t(batchSize))
+	ret := C.allocateBatchID(engine.engine, C.size_t(batchSize))
 	if ret == C.UINT64_MAX {
 		return BatchID(-1), ErrTransferEngine
 	}
@@ -144,7 +138,7 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 		}
 	}
 
-	ret := C.submitTransfer(engine.xport, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)))
+	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)))
 	if ret < 0 {
 		return ErrTransferEngine
 	}
@@ -153,7 +147,7 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 
 func (engine *TransferEngine) getTransferStatus(batchID BatchID, taskID int) (int, uint64, error) {
 	var status C.transfer_status_t
-	ret := C.getTransferStatus(engine.xport, C.batch_id_t(batchID), C.size_t(taskID), &status)
+	ret := C.getTransferStatus(engine.engine, C.batch_id_t(batchID), C.size_t(taskID), &status)
 	if ret < 0 {
 		return -1, 0, ErrTransferEngine
 	}
@@ -161,7 +155,7 @@ func (engine *TransferEngine) getTransferStatus(batchID BatchID, taskID int) (in
 }
 
 func (engine *TransferEngine) freeBatchID(batchID BatchID) error {
-	ret := C.freeBatchID(engine.xport, C.batch_id_t(batchID))
+	ret := C.freeBatchID(engine.engine, C.batch_id_t(batchID))
 	if ret < 0 {
 		return ErrTransferEngine
 	}
