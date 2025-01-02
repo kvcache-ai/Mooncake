@@ -356,6 +356,7 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     for (auto &entry : local_topology_.getHcaList()) {
         if (entry == local_nic_name) {
             context = context_list_[index];
+            break;
         }
         index++;
     }
