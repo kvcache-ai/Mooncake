@@ -85,6 +85,14 @@ typedef struct segment_desc segment_desc_t;
 typedef void *transfer_engine_t;
 typedef void *transport_t;
 
+/*
+ * All memory pointed to by the "char *" parameters will not be used
+ * after the C function returns.
+ * This means that the caller can free the memory pointed to by "char *"
+ * parameters, after the call is completed.
+ * All the C functions here follow this convention.
+*/
+
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
