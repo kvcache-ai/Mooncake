@@ -402,6 +402,9 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
         metadata_->localRpcMeta().rpc_port);
 }
 
+// According to the request desc, offset and length information, find proper
+// buffer_id and device_id as output.
+// Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {
