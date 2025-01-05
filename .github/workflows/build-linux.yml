@@ -15,7 +15,7 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh
-        mkdir build 
+        mkdir build
         cd build
         cmake ..
       shell: bash
@@ -23,4 +23,15 @@ jobs:
       run: |
         cd build
         make -j
+      shell: bash
+    - name: start-metadata-server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server
+        export PATH=$PATH:/usr/local/go/bin
+        go run . --addr=:8090 &
+      shell: bash
+    - name: test
+      run: |
+        cd build
+        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j
       shell: bash

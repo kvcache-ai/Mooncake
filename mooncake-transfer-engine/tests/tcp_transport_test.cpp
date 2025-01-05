@@ -48,8 +48,6 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 
 using namespace mooncake;
 
-//// etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls
-/// http://10.0.0.1:2379 / ./tcp_transport_test
 namespace mooncake {
 
 class TCPTransportTest : public ::testing::Test {
@@ -58,12 +56,29 @@ class TCPTransportTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("TCPTransportTest");
         FLAGS_logtostderr = 1;
+
+        const char *env = std::getenv("MC_METADATA_SERVER");
+        if (env)
+            metadata_server = env;
+        else
+            metadata_server = metadata_server;
+        LOG(INFO) << "metadata_server: " << metadata_server;
+
+        env = std::getenv("MC_LOCAL_SERVER_NAME");
+        if (env)
+            local_server_name = env;
+        else
+            local_server_name = "127.0.0.2:12345";
+        LOG(INFO) << "local_server_name: " << local_server_name;
     }
 
     void TearDown() override {
         // 清理 glog
         google::ShutdownGoogleLogging();
     }
+
+    std::string metadata_server;
+    std::string local_server_name;
 };
 
 static void *allocateMemoryPool(size_t size, int socket_id,
@@ -73,9 +88,10 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 TEST_F(TCPTransportTest, GetTcpTest) {
     auto engine = std::make_unique<TransferEngine>();
-    auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
-                 hostname_port.first.c_str(), hostname_port.second);
+    auto hostname_port = parseHostNameWithPort(local_server_name);
+    auto rc = engine->init(metadata_server, local_server_name,
+                           hostname_port.first.c_str(), hostname_port.second);
+    LOG_ASSERT(rc == 0);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -86,22 +102,23 @@ TEST_F(TCPTransportTest, Writetest) {
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
     auto engine = std::make_unique<TransferEngine>();
-    auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
-                 hostname_port.first.c_str(), hostname_port.second);
+    auto hostname_port = parseHostNameWithPort(local_server_name);
+    auto rc = engine->init(metadata_server, local_server_name,
+                           hostname_port.first.c_str(), hostname_port.second);
+    LOG_ASSERT(rc == 0);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+    rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
     LOG_ASSERT(!rc);
 
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
     auto batch_id = engine->allocateBatchID(1);
     int ret = 0;
-    auto segment_id = engine->openSegment("127.0.0.2:12345");
+    auto segment_id = engine->openSegment(local_server_name);
     TransferRequest entry;
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
@@ -129,8 +146,8 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
     auto engine = std::make_unique<TransferEngine>();
-    auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+    auto hostname_port = parseHostNameWithPort(local_server_name);
+    engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
@@ -142,7 +159,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
-    auto segment_id = engine->openSegment("127.0.0.2:12345");
+    auto segment_id = engine->openSegment(local_server_name);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
     {
@@ -200,8 +217,8 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
     auto engine = std::make_unique<TransferEngine>();
-    auto hostname_port = parseHostNameWithPort("127.0.0.2:12345");
-    engine->init("127.0.0.1:2379", "127.0.0.2:12345",
+    auto hostname_port = parseHostNameWithPort(local_server_name);
+    engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
     xport = engine->installTransport("tcp", nullptr);
@@ -213,7 +230,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
-    auto segment_id = engine->openSegment("127.0.0.2:12345");
+    auto segment_id = engine->openSegment(local_server_name);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
 
