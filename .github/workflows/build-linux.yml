@@ -17,7 +17,7 @@ jobs:
         sudo bash -x dependencies.sh
         mkdir build
         cd build
-        cmake ..
+        cmake .. -DUSE_HTTP=ON
       shell: bash
     - name: make
       run: |
@@ -28,10 +28,13 @@ jobs:
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server
         export PATH=$PATH:/usr/local/go/bin
-        go run . --addr=:8090 &
+        go mod tidy && go build -o http-metadata-server .
+        ./http-metadata-server --addr=:8090 &
       shell: bash
     - name: test
       run: |
         cd build
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        ldconfig -v || echo "always continue"
+        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
       shell: bash
