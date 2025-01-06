@@ -54,7 +54,8 @@ int CxlTransport::submitTransfer(BatchID batch_id,
 int CxlTransport::freeBatchID(BatchID batch_id) { return 0; }
 
 int CxlTransport::install(std::string &local_server_name,
-                          std::shared_ptr<TransferMetadata> meta, void **args) {
+                          std::shared_ptr<TransferMetadata> meta,
+                          std::shared_ptr<Topology> topo) {
     return 0;
 }
 

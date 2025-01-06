@@ -28,24 +28,6 @@ VLLMAdaptor::~VLLMAdaptor() {
     large_buffer_list_.clear();
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
-    std::stringstream ss(device_names);
-    std::string item;
-    std::vector<std::string> tokens;
-    while (getline(ss, item, ',')) {
-        tokens.push_back(item);
-    }
-
-    std::string formatted;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        formatted += "\"" + tokens[i] + "\"";
-        if (i < tokens.size() - 1) {
-            formatted += ",";
-        }
-    }
-    return formatted;
-}
-
 std::pair<std::string, std::string> parseConnectionString(
     const std::string &conn_string) {
     std::pair<std::string, std::string> result;
@@ -66,16 +48,14 @@ std::pair<std::string, std::string> parseConnectionString(
 }
 
 int VLLMAdaptor::initialize(const char *local_hostname,
-                            const char *metadata_server, const char *protocol,
-                            const char *device_name) {
+                            const char *metadata_server) {
     auto conn_string = parseConnectionString(metadata_server);
-    return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
-                         device_name, conn_string.first.c_str());
+    return initializeExt(local_hostname, conn_string.second.c_str(),
+                         conn_string.first.c_str());
 }
 
 int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_server,
-                               const char *protocol, const char *device_name,
                                const char *metadata_type) {
     std::string conn_string = metadata_server;
     if (conn_string.find("://") == std::string::npos)
@@ -88,23 +68,6 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
                             hostname_port.first.c_str(), hostname_port.second);
     if (ret) return -1;
 
-    xport_ = nullptr;
-    if (strcmp(protocol, "rdma") == 0) {
-        auto device_names = formatDeviceNames(device_name);
-        std::string nic_priority_matrix =
-            "{\"cpu:0\": [[" + device_names + "], []]}";
-        void **args = (void **)malloc(2 * sizeof(void *));
-        args[0] = (void *)nic_priority_matrix.c_str();
-        args[1] = nullptr;
-        xport_ = engine_->installTransport("rdma", args);
-    } else if (strcmp(protocol, "tcp") == 0) {
-        xport_ = engine_->installTransport("tcp", nullptr);
-    } else {
-        LOG(ERROR) << "Unsupported protocol";
-        return -1;
-    }
-
-    if (!xport_) return -1;
     free_list_.resize(kSlabSizeKBTabLen);
     doBuddyAllocate(kMaxClassId);
     return 0;

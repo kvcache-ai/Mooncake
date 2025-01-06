@@ -26,6 +26,20 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
+
+    if (auto_discover_) {
+        // discover topology automatically
+        local_topology_->discover();
+
+        // install TCP transport by default
+        multi_transports_->installTransport("tcp", nullptr);
+        if (local_topology_->getHcaList().size() > 0) {
+            // only install RDMA transport when there is at least one HCA
+            multi_transports_->installTransport("rdma", local_topology_);
+        }
+        // TODO: install other transports automatically
+    }
+
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = ip_or_host_name;
     desc.rpc_port = rpc_port;
@@ -40,6 +54,7 @@ int TransferEngine::freeEngine() {
     return 0;
 }
 
+// Only for testing
 Transport *TransferEngine::installTransport(const std::string &proto,
                                             void **args) {
     Transport *transport = multi_transports_->getTransport(proto);
@@ -47,7 +62,17 @@ Transport *TransferEngine::installTransport(const std::string &proto,
         LOG(INFO) << "Transport " << proto << " already installed";
         return transport;
     }
-    transport = multi_transports_->installTransport(proto, args);
+
+    if (args != nullptr && args[0] != nullptr) {
+        const std::string nic_priority_matrix = static_cast<char *>(args[0]);
+        int ret = local_topology_->parse(nic_priority_matrix);
+        if (ret) {
+            LOG(ERROR) << "Failed to parse NIC priority matrix";
+            return nullptr;
+        }
+    }
+
+    transport = multi_transports_->installTransport(proto, local_topology_);
     if (!transport) return nullptr;
     for (auto &entry : local_memory_regions_) {
         int ret = transport->registerLocalMemory(

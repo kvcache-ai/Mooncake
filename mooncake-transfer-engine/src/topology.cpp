@@ -49,7 +49,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
     std::vector<InfinibandDevice> devices;
 
     if (dir == NULL) {
-        LOG(WARNING) << "Failed to list /sys/class/infiniband";
+        PLOG(WARNING) << "Failed to open /sys/class/infiniband";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -91,7 +91,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        LOG(WARNING) << "Failed to list /sys/devices/system/node";
+        PLOG(WARNING) << "Failed to open /sys/devices/system/node";
         return {};
     }
     while ((entry = readdir(dir))) {

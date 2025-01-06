@@ -43,17 +43,20 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
-    TransferEngine() : metadata_(nullptr) {}
+    TransferEngine(bool auto_discover = true)
+        : metadata_(nullptr),
+          local_topology_(std::make_shared<Topology>()),
+          auto_discover_(auto_discover) {}
 
     ~TransferEngine() { freeEngine(); }
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
-             const std::string &ip_or_host_name, 
-             uint64_t rpc_port = 12345);
+             const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
 
     int freeEngine();
 
+    // Only for testing.
     Transport *installTransport(const std::string &proto, void **args);
 
     int uninstallTransport(const std::string &proto);
@@ -110,6 +113,10 @@ class TransferEngine {
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::vector<MemoryRegion> local_memory_regions_;
+    std::shared_ptr<Topology> local_topology_;
+    // Discover topology and install transports automatically when it's true.
+    // Set it to false only for testing.
+    bool auto_discover_;
 };
 }  // namespace mooncake
 

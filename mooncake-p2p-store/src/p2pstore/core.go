@@ -37,13 +37,13 @@ type P2PStore struct {
 	transfer         *TransferEngine
 }
 
-func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error) {
+func NewP2PStore(metadataUri string, localSegmentName string) (*P2PStore, error) {
 	metadata, err := NewMetadata(metadataUri, METADATA_KEY_PREFIX)
 	if err != nil {
 		return nil, err
 	}
 
-	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName, nicPriorityMatrix)
+	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName)
 	if err != nil {
 		innerErr := metadata.Close()
 		if innerErr != nil {

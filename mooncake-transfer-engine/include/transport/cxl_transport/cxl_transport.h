@@ -56,10 +56,11 @@ class CxlTransport : public Transport {
 
    private:
     int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta, void **args) override;
+                std::shared_ptr<TransferMetadata> meta,
+                std::shared_ptr<Topology> topo) override;
 
-    int registerLocalMemory(void *addr, size_t length, const std::string &location,
-                            bool remote_accessible,
+    int registerLocalMemory(void *addr, size_t length,
+                            const std::string &location, bool remote_accessible,
                             bool update_metadata) override;
 
     int unregisterLocalMemory(void *addr,

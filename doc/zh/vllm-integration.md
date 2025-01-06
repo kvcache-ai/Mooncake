@@ -37,7 +37,6 @@ pip3 install -e .
  - 如果遇到任何无法解决的问题，请参照[vLLM官方的编译指南](https://docs.vllm.ai/en/v0.6.4.post1/getting_started/installation.html#install-the-latest-code)。
 
 ## 配置
-### 使用 RDMA 运行示例所需配置文件
 
 - 为预填充和解码实例准备一个 mooncake.json 文件
 - **在解码实例侧，你无须更改配置文件里的`prefill_url` 与 `decode_url`，使用完同相同的配置文件即可。**
@@ -46,9 +45,7 @@ pip3 install -e .
 {
   "prefill_url": "192.168.0.137:13003",
   "decode_url": "192.168.0.139:13003",
-  "metadata_server": "192.168.0.139:2379",
-  "protocol": "rdma",
-  "device_name": "erdma_0"
+  "metadata_server": "192.168.0.139:2379"
 }
 ```
 - "prefill_url": 预填充节点的 IP 地址和端口。
@@ -56,23 +53,6 @@ pip3 install -e .
 - "decode_url": 解码节点的 IP 地址和端口。
   - URL 中的端口用于与 etcd 服务器通信以获取元数据。
 - "metadata_server": mooncake 传输引擎的 etcd 服务器。
-- "protocol": 数据传输协议("rdma/tcp")。
-- "device_name": 用于数据传输的设备，当 "protocol" 设置为 "rdma" 时必填。如果使用多个 NIC 设备，它们可以用逗号分隔，如 "erdma_0,erdma_1"。请注意它们之间没有空格。
-
-
-### 使用 TCP 运行示例所需配置文件
-
-- 为预填充和解码实例准备一个 mooncake.json 文件
-```json
-{
-  "prefill_url": "192.168.0.137:13003",
-  "decode_url": "192.168.0.139:13003",
-  "metadata_server": "192.168.0.139:2379",
-  "protocol": "tcp",
-  "device_name": ""
-}
-```
-
 
 ## 运行示例
  - 请根据您的环境更改以下指南中的 IP 地址和端口。

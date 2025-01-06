@@ -61,8 +61,6 @@ For instance, as illustrated in figure above, to transfer data from buffer 0 (as
 To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exeeds 16KB. 
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
-If you do not want to manually configure the topology matrix, we also provide a function (`mooncake::discoverTopologyMatrix` in `topology.h`) to automatically discover the toplogy between CPU/CUDA and RDMA devices. Supports for more device types are working in progress. The automatic discovery mechanism might not always be accurate, and we welcome your feedbacks and improvement ideas!
-
 ### Endpoint Management
 Mooncake Store employs a pair of end-
 points to represent the connection between a local RDMA
@@ -257,63 +255,11 @@ Recycles `BatchID`, and subsequent operations on `submitTransfer` and `getTransf
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 
 ### Multi-Transport Management
-The `TransferEngine` class internally manages multiple backend `Transport` classes, and users can load or unload `Transport` for different backends in `TransferEngine`.
 
-#### TransferEngine::installTransport
-```cpp
-Transport* installTransport(const std::string& proto, void** args);
-```
-
-Registers `Transport` in `TransferEngine`. If a `Transport` for a certain protocol already exists, it returns that `Transport`.
-
-- `proto`: The name of the transport protocol used by `Transport`, currently supporting `tcp`, `rdma`, `nvmeof`.
-- `args`: Additional parameters required for `Transport` initialization, presented as a variable-length array, with the last member being `nullptr`.
-- Return value: If `proto` is within the determined range, returns the `Transport` corresponding to `proto`; otherwise, returns a null pointer.
-
-##### TCP Transfer Mode
-For TCP transfer mode, there is no need to pass `args` objects when registering the `Transport` object.
-```cpp
-engine->installTransport("tcp", nullptr);
-```
-
-##### RDMA Transfer Mode
-For RDMA transfer mode, the network card priority marrix must be specified through `args` during the registration of `Transport`.
-```cpp
-void** args = (void**) malloc(2 * sizeof(void*));
-args[0] = /* topology matrix */;
-args[1] = nullptr;
-engine->installTransport("rdma", args);
-```
-The network card priority marrix is a JSON string indicating the storage medium name and the list of network cards to be used preferentially, as shown in the example below:
-```json
-{
-    "cpu:0": [["mlx0", "mlx1"], ["mlx2", "mlx3"]],
-    "cuda:0": [["mlx1", "mlx0"]],
-    ...
-}
-```
-Each `key` represents the device name corresponding to a CPU socket or a GPU device.
-Each `value` is a tuple of (`preferred_nic_list`, `accessable_nic_list`), each of which is a list of NIC names.
-- `preferred_nic_list` indicates the preferred NICs, such as NICs directly connected to the CPU rather than across NUMA, or NICs under the same PCIe Switch for GPUs.
-- `accessable_nic_list` indicates NICs that are not preferred but can theoretically connect, used for fault retry scenarios.
-
-##### NVMeOF Transfer Mode
-For NVMeOF transfer mode, the file path must be specified through `args` during the registration of `Transport`.
-```cpp
-void** args = (void**) malloc(2 * sizeof(void*));
-args[0] = /* topology matrix */;
-args[1] = nullptr;
-engine->installTransport("nvmeof", args);
-```
-
-#### TransferEngine::uninstallTransport
-```cpp
-int uninstallTransport(const std::string& proto);
-```
-
-Unloads `Transport` from `TransferEngine`.
-- `proto`: The name of the transport protocol used by `Transport`, currently supporting `rdma`, `nvmeof`.
-- Return value: If successful, returns 0; otherwise, returns a negative value.
+The `TransferEngine` class internally manages multiple backend `Transport` classes.
+And it will discover the toplogy between CPU/CUDA and RDMA devices automatically
+(more device types are working in progress, feedbacks are welcome when the automatic discovery mechanism is not accurate),
+and it will install `Transport` automatically based on the topology.
 
 ### Space Registration
 

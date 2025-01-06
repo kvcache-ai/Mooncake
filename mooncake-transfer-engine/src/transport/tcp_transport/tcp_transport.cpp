@@ -202,7 +202,8 @@ TcpTransport::~TcpTransport() {
 }
 
 int TcpTransport::install(std::string &local_server_name,
-                          std::shared_ptr<TransferMetadata> meta, void **args) {
+                          std::shared_ptr<TransferMetadata> meta,
+                          std::shared_ptr<Topology> topo) {
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
