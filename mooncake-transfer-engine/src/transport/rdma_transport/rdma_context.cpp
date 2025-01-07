@@ -49,9 +49,7 @@ RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     static std::once_flag g_once_flag;
     auto fork_init = []() {
         int ret = ibv_fork_init();
-        if (ret)
-            LOG(ERROR) << "RDMA context setup failed: fork compatibility: "
-                       << strerror(ret);
+        if (ret) PLOG(ERROR) << "RDMA context setup failed: fork compatibility";
     };
     std::call_once(g_once_flag, fork_init);
 }
@@ -64,52 +62,47 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                            uint8_t port, int gid_index, size_t max_cqe,
                            int max_endpoints) {
     endpoint_store_ = std::make_shared<SIEVEEndpointStore>(max_endpoints);
-    if (!endpoint_store_) {
-        LOG(ERROR) << "RDMA context setup failed: endpoint store";
-        return ERR_MEMORY;
-    }
-
     if (openRdmaDevice(device_name_, port, gid_index)) {
-        LOG(ERROR) << "RDMA context setup failed: open device";
+        LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
+                   << port << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
 
     pd_ = ibv_alloc_pd(context_);
     if (!pd_) {
-        PLOG(ERROR) << "RDMA context setup failed: protection domain";
+        PLOG(ERROR) << "Failed to allocate new protection domain on device "
+                    << device_name_;
         return ERR_CONTEXT;
     }
 
     num_comp_channel_ = num_comp_channels;
     comp_channel_ = new ibv_comp_channel *[num_comp_channels];
-    if (!comp_channel_) {
-        PLOG(ERROR) << "RDMA context setup failed: completion channel array";
-        return ERR_MEMORY;
-    }
     for (size_t i = 0; i < num_comp_channels; ++i) {
         comp_channel_[i] = ibv_create_comp_channel(context_);
         if (!comp_channel_[i]) {
-            PLOG(ERROR) << "RDMA context setup failed: completion channel";
+            PLOG(ERROR) << "Failed to create completion channel on device "
+                        << device_name_;
             return ERR_CONTEXT;
         }
     }
 
     event_fd_ = epoll_create1(0);
     if (event_fd_ < 0) {
-        PLOG(ERROR) << "RDMA context setup failed: event file descriptor";
+        PLOG(ERROR) << "Failed to create epoll";
         return ERR_CONTEXT;
     }
 
     if (joinNonblockingPollList(event_fd_, context_->async_fd)) {
-        LOG(ERROR)
-            << "RDMA context setup failed: register event file descriptor";
+        LOG(ERROR) << "Failed to register context async fd to epoll";
+        close(event_fd_);
         return ERR_CONTEXT;
     }
 
     for (size_t i = 0; i < num_comp_channel_; ++i)
         if (joinNonblockingPollList(event_fd_, comp_channel_[i]->fd)) {
-            LOG(ERROR)
-                << "RDMA context setup failed: register event file descriptor";
+            LOG(ERROR) << "Failed to register completion channel " << i
+                       << " to epoll";
+            close(event_fd_);
             return ERR_CONTEXT;
         }
 
@@ -118,16 +111,13 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i] = ibv_create_cq(context_, max_cqe, this /* CQ context */,
                                     compChannel(), compVector());
         if (!cq_list_[i]) {
-            PLOG(ERROR) << "RDMA context setup failed: completion queue";
+            PLOG(ERROR) << "Failed to create completion queue";
+            close(event_fd_);
             return ERR_CONTEXT;
         }
     }
 
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
-    if (!worker_pool_) {
-        LOG(ERROR) << "RDMA context setup failed: worker pool";
-        return ERR_MEMORY;
-    }
 
     LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
@@ -157,7 +147,7 @@ int RdmaContext::deconstruct() {
     for (auto &entry : memory_region_list_) {
         int ret = ibv_dereg_mr(entry);
         if (ret) {
-            LOG(ERROR) << "Fail to unregister memory region: " << strerror(ret);
+            PLOG(ERROR) << "Failed to unregister memory region";
         }
     }
     memory_region_list_.clear();
@@ -165,14 +155,13 @@ int RdmaContext::deconstruct() {
     for (size_t i = 0; i < cq_list_.size(); ++i) {
         int ret = ibv_destroy_cq(cq_list_[i]);
         if (ret) {
-            PLOG(ERROR) << "Fail to destroy completion queue: "
-                        << strerror(ret);
+            PLOG(ERROR) << "Failed to destroy completion queue";
         }
     }
     cq_list_.clear();
 
     if (event_fd_ >= 0) {
-        if (close(event_fd_)) LOG(ERROR) << "Fail to close epoll fd";
+        if (close(event_fd_)) LOG(ERROR) << "Failed to close epoll fd";
         event_fd_ = -1;
     }
 
@@ -180,20 +169,20 @@ int RdmaContext::deconstruct() {
         for (size_t i = 0; i < num_comp_channel_; ++i)
             if (comp_channel_[i])
                 if (ibv_destroy_comp_channel(comp_channel_[i]))
-                    LOG(ERROR) << "Fail to destroy completion channel";
+                    LOG(ERROR) << "Failed to destroy completion channel";
         delete[] comp_channel_;
         comp_channel_ = nullptr;
     }
 
     if (pd_) {
         if (ibv_dealloc_pd(pd_))
-            LOG(ERROR) << "Fail to deallocate protection domain";
+            PLOG(ERROR) << "Failed to deallocate protection domain";
         pd_ = nullptr;
     }
 
     if (context_) {
         if (ibv_close_device(context_))
-            LOG(ERROR) << "Fail to close device context";
+            PLOG(ERROR) << "Failed to close device context";
         context_ = nullptr;
     }
 
@@ -218,7 +207,7 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
                 addr <= entry->addr &&
                 (char *)entry->addr + entry->length <= (char *)addr + length;
             if (start_overlapped || end_overlapped || covered) {
-                LOG(ERROR) << "Fail to register memory " << addr
+                LOG(ERROR) << "Failed to register memory " << addr
                            << ": overlap existing memory regions";
                 return ERR_ADDRESS_OVERLAPPED;
             }
@@ -228,7 +217,7 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
     // No overlap, continue
     ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
     if (!mr) {
-        PLOG(ERROR) << "Fail to register memory " << addr;
+        PLOG(ERROR) << "Failed to register memory " << addr;
         return ERR_CONTEXT;
     }
 
@@ -257,7 +246,7 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
             if ((*iter)->addr <= addr &&
                 addr < (char *)((*iter)->addr) + (*iter)->length) {
                 if (ibv_dereg_mr(*iter)) {
-                    LOG(ERROR) << "Fail to unregister memory " << addr;
+                    LOG(ERROR) << "Failed to unregister memory " << addr;
                     return ERR_CONTEXT;
                 }
                 memory_region_list_.erase(iter);
@@ -359,22 +348,32 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
-int RdmaContext::getBestGidIndex(struct ibv_context *context,
+int RdmaContext::getBestGidIndex(const std::string &device_name,
+                                 struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
     int gid_index = 0, i;
     union ibv_gid temp_gid, temp_gid_rival;
     int is_ipv4, is_ipv4_rival;
 
-    if (ibv_query_gid(context, port, gid_index, &temp_gid)) return -1;
+    if (ibv_query_gid(context, port, gid_index, &temp_gid)) {
+        PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
+                    << device_name << "/" << port;
+        return -1;
+    }
     is_ipv4 = ipv6_addr_v4mapped((struct in6_addr *)temp_gid.raw);
 
     for (i = 1; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid(context, port, i, &temp_gid_rival)) {
+            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
+                        << "/" << port;
             return -1;
         }
         is_ipv4_rival =
             ipv6_addr_v4mapped((struct in6_addr *)temp_gid_rival.raw);
-        if (is_ipv4_rival && !is_ipv4) gid_index = i;
+        if (is_ipv4_rival && !is_ipv4) {
+            gid_index = i;
+            break;
+        }
     }
     return gid_index;
 }
@@ -402,10 +401,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            LOG(WARNING) << "Fail to query port " << port << " on "
-                         << device_name << ": " << strerror(ret);
+            PLOG(ERROR) << "Failed to query port " << port << " on "
+                        << device_name;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -414,7 +413,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         if (attr.state != IBV_PORT_ACTIVE) {
             LOG(WARNING) << "Device " << device_name << " port not active";
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -423,10 +422,9 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_device_attr device_attr;
         ret = ibv_query_device(context, &device_attr);
         if (ret) {
-            LOG(WARNING) << "Fail to query attributes on " << device_name
-                         << ": " << strerror(ret);
+            PLOG(WARNING) << "Failed to query attributes on " << device_name;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -435,10 +433,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr port_attr;
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
-            LOG(WARNING) << "Fail to query port attributes on " << device_name
-                         << "/" << port << ": " << strerror(ret);
+            PLOG(WARNING) << "Failed to query port attributes on "
+                          << device_name << "/" << port;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -446,17 +444,20 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         updateGlobalConfig(device_attr);
         if (gid_index == 0) {
-            int ret = getBestGidIndex(context, port_attr, port);
-            if (ret >= 0) gid_index = ret;
+            int ret = getBestGidIndex(device_name, context, port_attr, port);
+            if (ret >= 0) {
+                LOG(INFO) << "Find best gid index: " << ret << " on "
+                          << device_name << "/" << port;
+                gid_index = ret;
+            }
         }
 
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
-            LOG(WARNING) << "Fail to query GID " << gid_index
-                         << " attributes on " << device_name << "/" << port
-                         << ": " << strerror(ret);
+            PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
+                        << device_name << "/" << port;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -467,7 +468,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             LOG(WARNING) << "GID is NULL, please check your GID index by "
                             "specifying MC_GID_INDEX";
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -496,11 +497,11 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
 
     int flags = fcntl(data_fd, F_GETFL, 0);
     if (flags == -1) {
-        PLOG(ERROR) << "Get file descriptor flags failed";
+        PLOG(ERROR) << "Failed to get file descriptor flags";
         return ERR_CONTEXT;
     }
     if (fcntl(data_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        PLOG(ERROR) << "Set file descriptor nonblocking failed";
+        PLOG(ERROR) << "Failed to set file descriptor nonblocking";
         return ERR_CONTEXT;
     }
 
@@ -508,7 +509,6 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
     event.data.fd = data_fd;
     if (epoll_ctl(event_fd, EPOLL_CTL_ADD, event.data.fd, &event)) {
         PLOG(ERROR) << "Failed to register file descriptor to epoll";
-        close(event_fd);
         return ERR_CONTEXT;
     }
 
@@ -518,8 +518,8 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
 int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
     int nr_poll = ibv_poll_cq(cq_list_[cq_index], num_entries, wc);
     if (nr_poll < 0) {
-        PLOG(ERROR) << "Failed to poll CQ " << cq_index << " of device "
-                    << device_name_;
+        LOG(ERROR) << "Failed to poll CQ " << cq_index << " of device "
+                   << device_name_;
         return ERR_CONTEXT;
     }
     return nr_poll;
