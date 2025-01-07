@@ -89,7 +89,7 @@ MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.en
 - The `--model` parameter specifies the model to use.
 - The `--port` parameter specifies the vllm service port on which to listen.
 - The `--max-model-len` parameter specifies the maximum length of the model.
-- Option `--tensor_parallel_size` \ `-tp` is supported now. But you need to set up `--enforce_eager` to disable cuda graph. Example: append `-tp 2 --enforce_eager` to the run command.
+- Option `--tensor_parallel_size` \ `-tp` is supported now. Example: append `-tp 2` to the run command to run vllm with multiple GPUs.
   - If you want to run the prefill instance and decode instance on the same node, please set up different `CUDA_VISIBLE_DEVICES`. For example, `CUDA_VISIBLE_DEVICES=0,1` for the prefill instance and `CUDA_VISIBLE_DEVICES=2,3` for the decode instance.
 
 - The `--kv-transfer-config` parameter specifies the connector and its config to be used.
