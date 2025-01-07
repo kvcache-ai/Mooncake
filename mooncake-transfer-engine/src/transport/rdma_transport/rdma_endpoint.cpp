@@ -78,7 +78,7 @@ int RdmaEndPoint::deconstruct() {
                 << "Outstanding work requests found, CQ will not be generated";
 
         if (ibv_destroy_qp(qp_list_[i])) {
-            LOG(ERROR) << "Failed to destroy QP: " << getErrorString();
+            PLOG(ERROR) << "Failed to destroy QP";
             return ERR_ENDPOINT;
         }
     }
@@ -194,8 +194,7 @@ void RdmaEndPoint::disconnectUnlocked() {
     attr.qp_state = IBV_QPS_RESET;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (ret)
-            LOG(ERROR) << "Failed to modity QP to RESET: " << getErrorString();
+        if (ret) PLOG(ERROR) << "Failed to modity QP to RESET";
     }
     peer_nic_path_.clear();
     for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
@@ -261,7 +260,7 @@ int RdmaEndPoint::submitPostSend(
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
-        LOG(ERROR) << "ibv_post_send: " << getErrorString();
+        PLOG(ERROR) << "Failed to ibv_post_send";
         while (bad_wr) {
             int i = bad_wr - wr_list;
             failed_slice_list.push_back(slice_list[i]);
@@ -316,10 +315,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.qp_state = IBV_QPS_RESET;
     int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (ret) {
-        std::string message = "Failed to modity QP to RESET: ";
-        message += getErrorString();
-        LOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message;
+        std::string message = "Failed to modity QP to RESET";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
     }
 
@@ -335,10 +333,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         std::string message =
-            "Failed to modity QP to INIT, check local context port num: ";
-        message += getErrorString();
-        LOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message;
+            "Failed to modity QP to INIT, check local context port num";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
     }
 
@@ -376,11 +373,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
         std::string message =
-            "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp "
-            "num: ";
-        message += getErrorString();
-        LOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message;
+            "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp num";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
     }
 
@@ -397,10 +392,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
-        std::string message = "Failed to modity QP to RTS: ";
-        message += getErrorString();
-        LOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message;
+        std::string message = "Failed to modity QP to RTS";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
     }
 

@@ -49,9 +49,7 @@ RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     static std::once_flag g_once_flag;
     auto fork_init = []() {
         int ret = ibv_fork_init();
-        if (ret)
-            LOG(ERROR) << "RDMA context setup failed: fork compatibility: "
-                       << getErrorString();
+        if (ret) PLOG(ERROR) << "RDMA context setup failed: fork compatibility";
     };
     std::call_once(g_once_flag, fork_init);
 }
@@ -90,7 +88,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     event_fd_ = epoll_create1(0);
     if (event_fd_ < 0) {
-        PLOG(ERROR) << "Failed to create epoll: " << getErrorString();
+        PLOG(ERROR) << "Failed to create epoll";
         return ERR_CONTEXT;
     }
 
@@ -149,8 +147,7 @@ int RdmaContext::deconstruct() {
     for (auto &entry : memory_region_list_) {
         int ret = ibv_dereg_mr(entry);
         if (ret) {
-            LOG(ERROR) << "Failed to unregister memory region: "
-                       << getErrorString();
+            PLOG(ERROR) << "Failed to unregister memory region";
         }
     }
     memory_region_list_.clear();
@@ -158,8 +155,7 @@ int RdmaContext::deconstruct() {
     for (size_t i = 0; i < cq_list_.size(); ++i) {
         int ret = ibv_destroy_cq(cq_list_[i]);
         if (ret) {
-            PLOG(ERROR) << "Failed to destroy completion queue: "
-                        << getErrorString();
+            PLOG(ERROR) << "Failed to destroy completion queue";
         }
     }
     cq_list_.clear();
@@ -180,14 +176,13 @@ int RdmaContext::deconstruct() {
 
     if (pd_) {
         if (ibv_dealloc_pd(pd_))
-            LOG(ERROR) << "Failed to deallocate protection domain";
+            PLOG(ERROR) << "Failed to deallocate protection domain";
         pd_ = nullptr;
     }
 
     if (context_) {
         if (ibv_close_device(context_))
-            LOG(ERROR) << "Failed to close device context: "
-                       << getErrorString();
+            PLOG(ERROR) << "Failed to close device context";
         context_ = nullptr;
     }
 
@@ -361,16 +356,16 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
     int is_ipv4, is_ipv4_rival;
 
     if (ibv_query_gid(context, port, gid_index, &temp_gid)) {
-        LOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                   << device_name << "/" << port << ": " << getErrorString();
+        PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
+                    << device_name << "/" << port;
         return -1;
     }
     is_ipv4 = ipv6_addr_v4mapped((struct in6_addr *)temp_gid.raw);
 
     for (i = 1; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid(context, port, i, &temp_gid_rival)) {
-            LOG(ERROR) << "Failed to query GID " << i << " on " << device_name
-                       << "/" << port << ": " << getErrorString();
+            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
+                        << "/" << port;
             return -1;
         }
         is_ipv4_rival =
@@ -406,11 +401,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            LOG(ERROR) << "Failed to query port " << port << " on "
-                       << device_name << ": " << getErrorString();
+            PLOG(ERROR) << "Failed to query port " << port << " on "
+                        << device_name;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -419,8 +413,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         if (attr.state != IBV_PORT_ACTIVE) {
             LOG(WARNING) << "Device " << device_name << " port not active";
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -429,11 +422,9 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_device_attr device_attr;
         ret = ibv_query_device(context, &device_attr);
         if (ret) {
-            LOG(WARNING) << "Failed to query attributes on " << device_name
-                         << ": " << getErrorString();
+            PLOG(WARNING) << "Failed to query attributes on " << device_name;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -442,11 +433,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr port_attr;
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
-            LOG(WARNING) << "Failed to query port attributes on " << device_name
-                         << "/" << port << ": " << getErrorString();
+            PLOG(WARNING) << "Failed to query port attributes on "
+                          << device_name << "/" << port;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -464,12 +454,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
-            LOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                       << device_name << "/" << port << ": "
-                       << getErrorString();
+            PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
+                        << device_name << "/" << port;
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -480,8 +468,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             LOG(WARNING) << "GID is NULL, please check your GID index by "
                             "specifying MC_GID_INDEX";
             if (ibv_close_device(context)) {
-                LOG(ERROR) << "ibv_close_device(" << device_name
-                           << ") failed: " << getErrorString();
+                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -510,21 +497,18 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
 
     int flags = fcntl(data_fd, F_GETFL, 0);
     if (flags == -1) {
-        PLOG(ERROR) << "Failed to get file descriptor flags: "
-                    << getErrorString();
+        PLOG(ERROR) << "Failed to get file descriptor flags";
         return ERR_CONTEXT;
     }
     if (fcntl(data_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        PLOG(ERROR) << "Failed to set file descriptor nonblocking: "
-                    << getErrorString();
+        PLOG(ERROR) << "Failed to set file descriptor nonblocking";
         return ERR_CONTEXT;
     }
 
     event.events = EPOLLIN | EPOLLET;
     event.data.fd = data_fd;
     if (epoll_ctl(event_fd, EPOLL_CTL_ADD, event.data.fd, &event)) {
-        PLOG(ERROR) << "Failed to register file descriptor to epoll: "
-                    << getErrorString();
+        PLOG(ERROR) << "Failed to register file descriptor to epoll";
         return ERR_CONTEXT;
     }
 
@@ -534,8 +518,8 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
 int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
     int nr_poll = ibv_poll_cq(cq_list_[cq_index], num_entries, wc);
     if (nr_poll < 0) {
-        PLOG(ERROR) << "Failed to poll CQ " << cq_index << " of device "
-                    << device_name_;
+        LOG(ERROR) << "Failed to poll CQ " << cq_index << " of device "
+                   << device_name_;
         return ERR_CONTEXT;
     }
     return nr_poll;

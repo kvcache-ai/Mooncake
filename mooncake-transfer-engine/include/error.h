@@ -15,8 +15,6 @@
 #ifndef ERROR_H
 #define ERROR_H
 
-#include <string>
-
 #define ERR_INVALID_ARGUMENT (-1)
 #define ERR_TOO_MANY_REQUESTS (-2)
 #define ERR_ADDRESS_NOT_REGISTERED (-3)
@@ -37,7 +35,5 @@
 #define ERR_CLOCK (-301)
 #define ERR_MEMORY (-302)
 #define ERR_NOT_IMPLEMENTED (-303)
-
-std::string getErrorString();
 
 #endif  // ERROR_H
