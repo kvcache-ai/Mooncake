@@ -371,9 +371,18 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 }
 
 struct SocketHandShakePlugin : public HandShakePlugin {
-    SocketHandShakePlugin() : listener_running_(false) {}
+    SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {}
+
+    void closeListen() {
+        if (listen_fd_ >= 0) {
+            LOG(INFO) << "SocketHandShakePlugin: closing listen socket";
+            close(listen_fd_);
+            listen_fd_ = -1;
+        }
+    }
 
     virtual ~SocketHandShakePlugin() {
+        closeListen();
         if (listener_running_) {
             listener_running_ = false;
             listener_.join();
@@ -383,14 +392,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
                             uint16_t listen_port) {
         sockaddr_in bind_address;
-        int on = 1, listen_fd = -1;
+        int on = 1;
         memset(&bind_address, 0, sizeof(sockaddr_in));
         bind_address.sin_family = AF_INET;
         bind_address.sin_port = htons(listen_port);
         bind_address.sin_addr.s_addr = INADDR_ANY;
 
-        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
             return ERR_SOCKET;
         }
@@ -398,39 +407,39 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-            close(listen_fd);
+            closeListen();
             return ERR_SOCKET;
         }
 
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-            close(listen_fd);
+            closeListen();
             return ERR_SOCKET;
         }
 
-        if (bind(listen_fd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
+        if (bind(listen_fd_, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
             0) {
             PLOG(ERROR) << "SocketHandShakePlugin: bind (port " << listen_port
                         << ")";
-            close(listen_fd);
+            closeListen();
             return ERR_SOCKET;
         }
 
-        if (listen(listen_fd, 5)) {
+        if (listen(listen_fd_, 5)) {
             PLOG(ERROR) << "SocketHandShakePlugin: listen()";
-            close(listen_fd);
+            closeListen();
             return ERR_SOCKET;
         }
 
         listener_running_ = true;
-        listener_ = std::thread([this, listen_fd, on_recv_callback]() {
+        listener_ = std::thread([this, on_recv_callback]() {
             while (listener_running_) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
-                int conn_fd = accept(listen_fd, (sockaddr *)&addr, &addr_len);
+                int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
@@ -584,6 +593,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     std::atomic<bool> listener_running_;
     std::thread listener_;
+    int listen_fd_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
