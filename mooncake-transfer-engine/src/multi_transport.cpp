@@ -147,13 +147,13 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    transport_map_[proto] = transport;
+    transport_map_[proto] = std::shared_ptr<Transport>(transport);
     return transport;
 }
 
 Transport *MultiTransport::selectTransport(const TransferRequest &entry) {
     if (entry.target_id == LOCAL_SEGMENT_ID && transport_map_.count("local"))
-        return transport_map_["local"];
+        return transport_map_["local"].get();
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         LOG(ERROR) << "MultiTransport: Incorrect target segment id "
@@ -165,17 +165,18 @@ Transport *MultiTransport::selectTransport(const TransferRequest &entry) {
         LOG(ERROR) << "MultiTransport: Transport " << proto << " not installed";
         return nullptr;
     }
-    return transport_map_[proto];
+    return transport_map_[proto].get();
 }
 
 Transport *MultiTransport::getTransport(const std::string &proto) {
     if (!transport_map_.count(proto)) return nullptr;
-    return transport_map_[proto];
+    return transport_map_[proto].get();
 }
 
 std::vector<Transport *> MultiTransport::listTransports() {
     std::vector<Transport *> transport_list;
-    for (auto &entry : transport_map_) transport_list.push_back(entry.second);
+    for (auto &entry : transport_map_)
+        transport_list.push_back(entry.second.get());
     return transport_list;
 }
 
