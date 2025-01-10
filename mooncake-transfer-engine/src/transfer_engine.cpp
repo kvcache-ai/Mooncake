@@ -31,11 +31,11 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         // discover topology automatically
         local_topology_->discover();
 
-        // install TCP transport by default
-        multi_transports_->installTransport("tcp", nullptr);
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
+        } else {
+            multi_transports_->installTransport("tcp", nullptr);
         }
         // TODO: install other transports automatically
     }
