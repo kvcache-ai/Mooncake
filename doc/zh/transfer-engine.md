@@ -79,7 +79,7 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
    例如，可使用如下命令行启动 `etcd` 服务：
       ```bash
       # This is 10.0.0.1
-      etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://10.0.0.1:2379
+      etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379
       ```
 
    1.2. **启动 `http` 作为 `metadata` 服务**
@@ -95,8 +95,8 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
     ```bash
     # This is 10.0.0.2
     ./transfer_engine_bench --mode=target \
-                            --metadata_server=etcd://10.0.0.1:2379 \
-                            --local_server_name=10.0.0.2:12345 \
+                            --metadata_server=etcd://127.0.0.1:2379 \
+                            --local_server_name=127.0.0.1:12345 \
                             --device_name=erdma_0
     ```
    各个参数的含义如下：

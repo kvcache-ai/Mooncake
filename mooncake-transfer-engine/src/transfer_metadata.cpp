@@ -122,6 +122,16 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "shm") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -222,6 +232,19 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             }
             desc->nvmeof_buffers.push_back(buffer);
         }
+    } else if (desc->protocol == "shm") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -317,9 +340,10 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
     return 0;
 }
 
-int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
+int __attribute__((noinline,optimize(0))) TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     {
+        
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];

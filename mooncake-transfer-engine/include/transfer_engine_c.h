@@ -70,6 +70,11 @@ struct segment_desc {
             uint64_t port;
             // maybe more needed for mount
         } nvmeof;
+        struct {
+            void *addr;
+            uint16_t size;
+            const char *location;
+        }shm;
     } desc_;
 };
 

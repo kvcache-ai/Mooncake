@@ -6,6 +6,9 @@ add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>)
 add_subdirectory(tcp_transport)
 target_sources(transport PUBLIC $<TARGET_OBJECTS:tcp_transport>)
 
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
+
 if (USE_CUDA)
   add_subdirectory(nvmeof_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)

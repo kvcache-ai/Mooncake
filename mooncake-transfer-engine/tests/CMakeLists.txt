@@ -21,3 +21,7 @@ add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 add_executable(topology_test topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME topology_test COMMAND topology_test)
+
+add_executable(shm_transport_test shm_transport_test.cpp)
+target_link_libraries(shm_transport_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME shm_transport_test COMMAND shm_transport_test)
