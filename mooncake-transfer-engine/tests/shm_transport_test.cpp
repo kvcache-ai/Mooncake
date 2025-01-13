@@ -63,7 +63,6 @@ class SHMTransportTest : public ::testing::Test {
         else
             metadata_server = metadata_server;
 
-        metadata_server = "127.0.0.1:2379";
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
