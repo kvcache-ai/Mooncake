@@ -21,7 +21,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <etcd/SyncClient.hpp>
 #include <functional>
 #include <memory>
 #include <string>
@@ -98,4 +97,4 @@ class Topology {
 
 }  // namespace mooncake
 
-#endif // TOPOLOGY_H
+#endif  // TOPOLOGY_H

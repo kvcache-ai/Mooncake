@@ -28,6 +28,10 @@
 #include <curl/curl.h>
 #endif
 
+#ifdef USE_ETCD
+#include <etcd/SyncClient.hpp>
+#endif  // USE_ETCD
+
 #include <cassert>
 #include <set>
 
@@ -257,6 +261,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 };
 #endif  // USE_HTTP
 
+#ifdef USE_ETCD
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
@@ -308,6 +313,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     etcd::SyncClient client_;
     const std::string metadata_uri_;
 };
+#endif  // USE_ETCD
 
 std::pair<std::string, std::string> parseConnectionString(
     const std::string &conn_string) {
@@ -331,23 +337,29 @@ std::pair<std::string, std::string> parseConnectionString(
 std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     const std::string &conn_string) {
     auto parsed_conn_string = parseConnectionString(conn_string);
+#ifdef USE_ETCD
     if (parsed_conn_string.first == "etcd") {
         return std::make_shared<EtcdStoragePlugin>(parsed_conn_string.second);
+    }
+#endif  // USE_ETCD
+
 #ifdef USE_REDIS
-    } else if (parsed_conn_string.first == "redis") {
+    if (parsed_conn_string.first == "redis") {
         return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second);
+    }
 #endif  // USE_REDIS
+
 #ifdef USE_HTTP
-    } else if (parsed_conn_string.first == "http" ||
-               parsed_conn_string.first == "https") {
+    if (parsed_conn_string.first == "http" ||
+        parsed_conn_string.first == "https") {
         return std::make_shared<HTTPStoragePlugin>(
             conn_string);  // including prefix
-#endif                     // USE_HTTP
-    } else {
-        LOG(FATAL) << "Unable to find metadata storage plugin "
-                   << parsed_conn_string.first;
-        return nullptr;
     }
+#endif  // USE_HTTP
+
+    LOG(FATAL) << "Unable to find metadata storage plugin "
+               << parsed_conn_string.first;
+    return nullptr;
 }
 
 static inline const std::string getNetworkAddress(struct sockaddr *addr) {

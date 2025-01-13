@@ -28,6 +28,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_CXL "option for using cxl protocol" OFF)
+option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" OFF)
 
@@ -48,6 +49,11 @@ endif()
 if (USE_HTTP)
   add_compile_definitions(USE_HTTP)
   message(STATUS "Http as metadata server support is enabled")
+endif()
+
+if (USE_ETCD)
+  add_compile_definitions(USE_ETCD)
+  message(STATUS "etcd as metadata server support is disabled")
 endif()
 
 add_subdirectory(mooncake-transfer-engine)
