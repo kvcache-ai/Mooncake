@@ -193,28 +193,6 @@ int RdmaContext::deconstruct() {
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
-    // Currently if the memory region overlaps with existing one, return
-    // negative value Or Merge it with existing mr?
-    {
-        RWSpinlock::ReadGuard guard(memory_regions_lock_);
-        for (const auto &entry : memory_region_list_) {
-            bool start_overlapped = entry->addr <= addr &&
-                                    addr < (char *)entry->addr + entry->length;
-            bool end_overlapped =
-                entry->addr < (char *)addr + length &&
-                (char *)addr + length <= (char *)entry->addr + entry->length;
-            bool covered =
-                addr <= entry->addr &&
-                (char *)entry->addr + entry->length <= (char *)addr + length;
-            if (start_overlapped || end_overlapped || covered) {
-                LOG(ERROR) << "Failed to register memory " << addr
-                           << ": overlap existing memory regions";
-                return ERR_ADDRESS_OVERLAPPED;
-            }
-        }
-    }
-
-    // No overlap, continue
     ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
     if (!mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;
