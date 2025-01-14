@@ -27,6 +27,12 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
 
+    TransferMetadata::RpcMetaDesc desc;
+    desc.ip_or_host_name = ip_or_host_name;
+    desc.rpc_port = rpc_port;
+    int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
+    if (ret) return ret;
+
     if (auto_discover_) {
         // discover topology automatically
         local_topology_->discover();
@@ -40,10 +46,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         // TODO: install other transports automatically
     }
 
-    TransferMetadata::RpcMetaDesc desc;
-    desc.ip_or_host_name = ip_or_host_name;
-    desc.rpc_port = rpc_port;
-    return metadata_->addRpcMetaEntry(local_server_name_, desc);
+    return 0;
 }
 
 int TransferEngine::freeEngine() {

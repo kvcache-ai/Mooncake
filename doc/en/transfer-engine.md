@@ -138,6 +138,14 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
       > Tip: Advanced users can also pass in a JSON file of the network card priority matrix through `--nic_priority_matrix`, for details, refer to the developer manual of Transfer Engine.
    - In network environments that only support TCP, the `--protocol=tcp` parameter can be used; in this case, there is no need to specify the `--device_name` parameter.
 
+   You can also specify `--auto_discovery` to enable discovery topology automatically, which generates a network card priority matrix based on the operating system configuration. Then, `--device_name` parameter is not required.
+   ```
+   ./transfer_engine_bench --mode=target \
+                           --metadata_server=10.0.0.1:2379 \
+                           --local_server_name=10.0.0.2:12345 \
+                           --auto_discovery
+   ```
+
 1. **Start the initiator node.**
     ```bash
     # This is 10.0.0.3
