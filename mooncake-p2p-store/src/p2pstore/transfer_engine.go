@@ -22,82 +22,63 @@ package p2pstore
  * All the C functions used here follow this convention.
  */
 
-//#cgo LDFLAGS: -L../../../build/mooncake-transfer-engine/src -L../../../thirdparties/lib -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc
 //#include "../../../mooncake-transfer-engine/include/transfer_engine_c.h"
+//#include <stdlib.h>
 import "C"
-
-import (
-	"net"
-	"strconv"
-	"unsafe"
-)
+import "unsafe"
 
 type BatchID int64
 
 type TransferEngine struct {
 	engine C.transfer_engine_t
-	xport  C.transport_t
 }
 
-func parseServerName(serverName string) (host string, port int) {
-	defaultPort := "12345"
-	host, portStr, err := net.SplitHostPort(serverName)
-	if err != nil {
-		host = serverName
-		portStr = defaultPort
-	}
-	port, err = strconv.Atoi(portStr)
-	if err != nil {
-		port = 12345
-	}
-	return host, port
-}
-
-const (
-	rdmaCStr = C.CString("rdma")
-)
-
-func NewTransferEngine(metadata_uri string, local_server_name string, nic_priority_matrix string) (*TransferEngine, error) {
-	// For simplifiy, local_server_name must be a valid IP address or hostname
-	connectable_name, rpc_port := parseServerName(local_server_name)
-
-	metadataUri := C.CString(metadata_uri)
-	localServerName := C.CString(local_server_name)
-	connectableName := C.CString(connectable_name)
-	nicPriorityMatrix := C.CString(nic_priority_matrix)
-	defer C.free(unsafe.Pointer(metadataUri))
-	defer C.free(unsafe.Pointer(localServerName))
-	defer C.free(unsafe.Pointer(connectableName))
-	defer C.free(unsafe.Pointer(nicPriorityMatrix))
-
-	native_engine := C.createTransferEngine(metadataUri, localServerName, connectableName, C.uint64_t(rpc_port))
+func NewTransferEngine(metadataConnString string,
+	localServerName string,
+	localIpAddress string,
+	rpcPort int) (*TransferEngine, error) {
+	metadataConnStringCStr := C.CString(metadataConnString)
+	localServerNameCStr := C.CString(localServerName)
+	localIpAddressCStr := C.CString(localIpAddress)
+	defer C.free(unsafe.Pointer(metadataConnStringCStr))
+	defer C.free(unsafe.Pointer(localServerNameCStr))
+	defer C.free(unsafe.Pointer(localIpAddressCStr))
+	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort))
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
-
-	var args [2]unsafe.Pointer
-	args[0] = unsafe.Pointer(nicPriorityMatrix)
-	args[1] = nil
-	xport := C.installTransport(native_engine, rdmaCStr, &args[0])
-	if xport == nil {
-		C.destroyTransferEngine(native_engine)
-		return nil, ErrTransferEngine
-	}
-
 	return &TransferEngine{
 		engine: native_engine,
-		xport:  xport,
 	}, nil
 }
 
-func (engine *TransferEngine) Close() error {
-	ret := C.uninstallTransport(engine.engine, rdmaCStr)
+func (engine *TransferEngine) installTransport(protocol string, topologyMatrix string) error {
+	protocolCStr := C.CString(protocol)
+	topologyMatrixCStr := C.CString(topologyMatrix)
+	defer C.free(unsafe.Pointer(protocolCStr))
+	defer C.free(unsafe.Pointer(topologyMatrixCStr))
+	var args [2]unsafe.Pointer
+	args[0] = unsafe.Pointer(topologyMatrixCStr)
+	args[1] = nil
+	xport := C.installTransport(engine.engine, protocolCStr, &args[0])
+	if xport == nil {
+		return ErrTransferEngine
+	}
+	return nil
+}
+
+func (engine *TransferEngine) uninstallTransport(protocol string) error {
+	protocolCStr := C.CString(protocol)
+	defer C.free(unsafe.Pointer(protocolCStr))
+	ret := C.uninstallTransport(engine.engine, protocolCStr)
 	if ret < 0 {
 		return ErrTransferEngine
 	}
-
-	C.destroyTransferEngine(engine.engine)
 	return nil
+}
+
+func (engine *TransferEngine) Close() {
+	C.destroyTransferEngine(engine.engine)
 }
 
 func (engine *TransferEngine) registerLocalMemory(addr uintptr, length uint64, location string) error {
@@ -182,19 +163,19 @@ func (engine *TransferEngine) freeBatchID(batchID BatchID) error {
 	return nil
 }
 
-func (engine *TransferEngine) openSegment(name string) (int64, error) {
-	nameCStr := C.CString(name)
-	defer C.free(unsafe.Pointer(nameCStr))
+func (engine *TransferEngine) openSegment(segmentName string) (int64, error) {
+	segmentNameCStr := C.CString(segmentName)
+	defer C.free(unsafe.Pointer(segmentNameCStr))
 
-	ret := C.openSegment(engine.engine, nameCStr)
+	ret := C.openSegment(engine.engine, segmentNameCStr)
 	if ret < 0 {
 		return -1, ErrTransferEngine
 	}
 	return int64(ret), nil
 }
 
-func (engine *TransferEngine) closeSegment(segment_id int64) error {
-	ret := C.closeSegment(engine.engine, C.segment_id_t(segment_id))
+func (engine *TransferEngine) closeSegment(segmentID int64) error {
+	ret := C.closeSegment(engine.engine, C.segment_id_t(segmentID))
 	if ret < 0 {
 		return ErrTransferEngine
 	}

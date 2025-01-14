@@ -18,6 +18,8 @@ import (
 	"context"
 	"log"
 	"sync"
+	"net"
+	"strconv"
 )
 
 // When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered seperately.
@@ -29,47 +31,67 @@ const MAX_CHUNK_SIZE uint64 = 4096 * 1024 * 1024
 const METADATA_KEY_PREFIX string = "mooncake/checkpoint/"
 
 type P2PStore struct {
-	metadataUri      string
-	localSegmentName string
-	catalog          *Catalog
-	memory           *RegisteredMemory
-	metadata         *Metadata
-	transfer         *TransferEngine
+	metadataConnString string
+	localServerName   string
+	catalog            *Catalog
+	memory             *RegisteredMemory
+	metadata           *Metadata
+	transfer           *TransferEngine
 }
 
-func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error) {
-	metadata, err := NewMetadata(metadataUri, METADATA_KEY_PREFIX)
+const DEFAULT_PORT int = 12345
+
+func parseServerName(serverName string) (host string, port int) {
+	host, portStr, err := net.SplitHostPort(serverName)
+	if err != nil {
+		log.Println("use default port for server name:", serverName)
+		return serverName, DEFAULT_PORT
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil {
+		port = DEFAULT_PORT
+	}
+	return host, port
+}
+
+func NewP2PStore(metadataConnString string, localServerName string, nicPriorityMatrix string) (*P2PStore, error) {
+	metadata, err := NewMetadata(metadataConnString, METADATA_KEY_PREFIX)
 	if err != nil {
 		return nil, err
 	}
 
-	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName, nicPriorityMatrix)
+	localIpAddressCStr, rpcPort := parseServerName(localServerName)
+	transfer, err := NewTransferEngine(metadataConnString, localServerName, localIpAddressCStr, rpcPort)
 	if err != nil {
-		innerErr := metadata.Close()
-		if innerErr != nil {
-			log.Println("cascading error:", innerErr)
-		}
+		metadata.Close()
+		return nil, err
+	}
+
+	if len(nicPriorityMatrix) == 0 {
+		err = transfer.installTransport("tcp", nicPriorityMatrix);
+	} else {
+		err = transfer.installTransport("rdma", nicPriorityMatrix);
+	}
+	if err != nil {
+		metadata.Close()
 		return nil, err
 	}
 
 	store := &P2PStore{
-		metadataUri:      metadataUri,
-		localSegmentName: localSegmentName,
-		catalog:          NewCatalog(),
-		memory:           NewRegisteredMemory(transferEngine, MAX_CHUNK_SIZE),
-		metadata:         metadata,
-		transfer:         transferEngine,
+		metadataConnString: metadataConnString,
+		localServerName:   localServerName,
+		catalog:            NewCatalog(),
+		memory:             NewRegisteredMemory(transfer, MAX_CHUNK_SIZE),
+		metadata:           metadata,
+		transfer:           transfer,
 	}
 	return store, nil
 }
 
 func (store *P2PStore) Close() error {
 	var retErr error = nil
-	err := store.transfer.Close()
-	if err != nil {
-		retErr = err
-	}
-	err = store.metadata.Close()
+	store.transfer.Close()
+	err := store.metadata.Close()
 	if err != nil {
 		retErr = err
 	}
@@ -121,7 +143,7 @@ func (store *P2PStore) Register(ctx context.Context, name string, addrList []uin
 				shardLength = size - offset
 			}
 			goldLocation := Location{
-				SegmentName: store.localSegmentName,
+				SegmentName: store.localServerName,
 				Offset:      uint64(addr) + offset,
 			}
 			shard := Shard{
@@ -189,9 +211,9 @@ func (store *P2PStore) Unregister(ctx context.Context, name string) error {
 
 type PayloadInfo struct {
 	Name         string   // Full name of checkpoint file
-	MaxShardSize uint64   // 
-	TotalSize    uint64   // 
-	SizeList     []uint64 // 
+	MaxShardSize uint64   //
+	TotalSize    uint64   //
+	SizeList     []uint64 //
 }
 
 func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadInfo, error) {
@@ -342,7 +364,7 @@ func (store *P2PStore) updatePayloadMetadata(ctx context.Context, name string, a
 			var offset uint64 = 0
 			for ; offset < size; offset += maxShardSize {
 				replicaLocation := Location{
-					SegmentName: store.localSegmentName,
+					SegmentName: store.localServerName,
 					Offset:      uint64(addr) + offset,
 				}
 				payload.Shards[taskID].ReplicaList = append(payload.Shards[taskID].ReplicaList, replicaLocation)
@@ -394,7 +416,7 @@ func (store *P2PStore) DeleteReplica(ctx context.Context, name string) error {
 		for idx, shard := range payload.Shards {
 			var newReplicaList []Location
 			for _, replica := range shard.ReplicaList {
-				if replica.SegmentName != store.localSegmentName {
+				if replica.SegmentName != store.localServerName {
 					newReplicaList = append(newReplicaList, replica)
 				}
 			}

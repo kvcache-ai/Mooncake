@@ -107,9 +107,9 @@ type Metadata struct {
 	keyPrefix  string
 }
 
-func NewMetadata(metadataUri string, keyPrefix string) (*Metadata, error) {
+func NewMetadata(metadataConnString string, keyPrefix string) (*Metadata, error) {
 	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{metadataUri},
+		Endpoints:   []string{metadataConnString},
 		DialTimeout: 5 * time.Second,
 	})
 
