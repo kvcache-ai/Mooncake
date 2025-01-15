@@ -21,7 +21,7 @@ import (
 	"math/rand"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // key = payload_name
@@ -68,6 +68,10 @@ func (s *Shard) GetLocation(retryTimes int) *Location {
 	} else {
 		return s.getRetryLocation(retryTimes - 1)
 	}
+}
+
+func (s *Shard) Count() int {
+	return len(s.ReplicaList) + len(s.Gold)
 }
 
 func (s *Shard) getRandomLocation() *Location {

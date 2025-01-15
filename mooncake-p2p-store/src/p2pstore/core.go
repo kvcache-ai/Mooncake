@@ -17,9 +17,9 @@ package p2pstore
 import (
 	"context"
 	"log"
-	"sync"
 	"net"
 	"strconv"
+	"sync"
 )
 
 // When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered seperately.
@@ -32,7 +32,7 @@ const METADATA_KEY_PREFIX string = "mooncake/checkpoint/"
 
 type P2PStore struct {
 	metadataConnString string
-	localServerName   string
+	localServerName    string
 	catalog            *Catalog
 	memory             *RegisteredMemory
 	metadata           *Metadata
@@ -68,9 +68,9 @@ func NewP2PStore(metadataConnString string, localServerName string, nicPriorityM
 	}
 
 	if len(nicPriorityMatrix) == 0 {
-		err = transfer.installTransport("tcp", nicPriorityMatrix);
+		err = transfer.installTransport("tcp", nicPriorityMatrix)
 	} else {
-		err = transfer.installTransport("rdma", nicPriorityMatrix);
+		err = transfer.installTransport("rdma", nicPriorityMatrix)
 	}
 	if err != nil {
 		metadata.Close()
@@ -79,7 +79,7 @@ func NewP2PStore(metadataConnString string, localServerName string, nicPriorityM
 
 	store := &P2PStore{
 		metadataConnString: metadataConnString,
-		localServerName:   localServerName,
+		localServerName:    localServerName,
 		catalog:            NewCatalog(),
 		memory:             NewRegisteredMemory(transfer, MAX_CHUNK_SIZE),
 		metadata:           metadata,
@@ -112,7 +112,13 @@ func (store *P2PStore) unregisterBuffers(bufferList []Buffer, maxShardSize uint6
 	}
 }
 
-func (store *P2PStore) Register(ctx context.Context, name string, addrList []uintptr, sizeList []uint64, maxShardSize uint64, location string) error {
+func (store *P2PStore) Register(ctx context.Context,
+	name string,
+	addrList []uintptr,
+	sizeList []uint64,
+	maxShardSize uint64,
+	location string,
+	forceCreate bool) error {
 	if len(addrList) != len(sizeList) || len(addrList) == 0 {
 		return ErrInvalidArgument
 	}
@@ -155,7 +161,13 @@ func (store *P2PStore) Register(ctx context.Context, name string, addrList []uin
 		}
 	}
 
-	err := store.metadata.Put(ctx, name, &payload)
+	var err error
+	if forceCreate {
+		err = store.metadata.Put(ctx, name, &payload)
+	} else {
+		err = store.metadata.Create(ctx, name, &payload)
+	}
+
 	if err != nil {
 		store.unregisterBuffers(bufferList, maxShardSize)
 		return err
@@ -210,10 +222,10 @@ func (store *P2PStore) Unregister(ctx context.Context, name string) error {
 }
 
 type PayloadInfo struct {
-	Name         string   // Full name of checkpoint file
-	MaxShardSize uint64   //
-	TotalSize    uint64   //
-	SizeList     []uint64 //
+	Name         string
+	MaxShardSize uint64
+	TotalSize    uint64
+	SizeList     []uint64
 }
 
 func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadInfo, error) {
@@ -234,33 +246,13 @@ func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadIn
 	return result, nil
 }
 
-// Get replica for same name multiple times in one P2P store will return ErrPayloadOpened
-func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
-	if len(addrList) != len(sizeList) || len(addrList) == 0 {
-		return ErrInvalidArgument
-	}
-
-	if store.catalog.Contains(name) {
-		return ErrPayloadOpened
-	}
-
-	payload, revision, err := store.metadata.Get(ctx, name)
-	if err != nil {
-		return err
-	}
-
-	if payload == nil {
-		return ErrPayloadNotFound
-	}
-
+func (store *P2PStore) doGetReplica(payload *Payload, addrList []uintptr, sizeList []uint64) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
 
 	var offset uint64 = 0
 	taskID := 0
 	maxShardSize := payload.MaxShardSize
-
-	_ = store.transfer.syncSegmentCache()
 
 	for i := 0; i < len(addrList); i++ {
 		addr, size := addrList[i], sizeList[i]
@@ -295,15 +287,76 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		}
 	default:
 	}
+	return nil
+}
 
+func contains(slice []Location, value Location) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func isSubsetOf(old *Payload, new *Payload) bool {
+	if len(old.Shards) != len(new.Shards) {
+		return false
+	}
+	for i := 0; i < len(old.Shards); i += 1 {
+		for _, value := range old.Shards[i].Gold {
+			if !contains(new.Shards[i].Gold, value) {
+				return false
+			}
+		}
+		for _, value := range old.Shards[i].ReplicaList {
+			if !contains(new.Shards[i].ReplicaList, value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
+	if len(addrList) != len(sizeList) || len(addrList) == 0 {
+		return ErrInvalidArgument
+	}
+
+	if store.catalog.Contains(name) {
+		return ErrPayloadOpened
+	}
+
+	payload, revision, err := store.metadata.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		return ErrPayloadNotFound
+	}
+	for {
+		_ = store.transfer.syncSegmentCache()
+		err = store.doGetReplica(payload, addrList, sizeList)
+		if err != nil {
+			return err
+		}
+		newPayload, recheckRevision, err := store.metadata.Get(ctx, name)
+		if err != nil {
+			return err
+		}
+		if revision == recheckRevision {
+			break
+		}
+		if isSubsetOf(payload, newPayload) {
+			break
+		}
+	}
 	return store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 }
 
 func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
-	const MAX_RETRY_COUNT int = 8
 	retryCount := 0
-
-	for retryCount < MAX_RETRY_COUNT {
+	for retryCount < shard.Count() {
 		batchID, err := store.transfer.allocateBatchID(1)
 		if err != nil {
 			return err
