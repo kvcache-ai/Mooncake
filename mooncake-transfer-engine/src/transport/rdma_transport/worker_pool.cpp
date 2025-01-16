@@ -147,7 +147,7 @@ int WorkerPool::submitPostSend(
         slice_queue_lock_[shard_id].lock();
         for (auto &slice : slice_list_map[shard_id])
             slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
-        slice_queue_count_[shard_id].fetch_add(submitted_slice_count,
+        slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
                                                std::memory_order_relaxed);
         slice_queue_lock_[shard_id].unlock();
     }
