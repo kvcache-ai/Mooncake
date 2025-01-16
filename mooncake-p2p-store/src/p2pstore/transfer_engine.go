@@ -163,15 +163,23 @@ func (engine *TransferEngine) freeBatchID(batchID BatchID) error {
 	return nil
 }
 
-func (engine *TransferEngine) openSegment(segmentName string) (int64, error) {
+func (engine *TransferEngine) openSegment(segmentName string, useCache bool) (int64, error) {
 	segmentNameCStr := C.CString(segmentName)
 	defer C.free(unsafe.Pointer(segmentNameCStr))
 
-	ret := C.openSegment(engine.engine, segmentNameCStr)
-	if ret < 0 {
-		return -1, ErrTransferEngine
+	if useCache {
+		ret := C.openSegment(engine.engine, segmentNameCStr)
+		if ret < 0 {
+			return -1, ErrTransferEngine
+		}
+		return int64(ret), nil
+	} else {
+		ret := C.openSegmentNoCache(engine.engine, segmentNameCStr)
+		if ret < 0 {
+			return -1, ErrTransferEngine
+		}
+		return int64(ret), nil
 	}
-	return int64(ret), nil
 }
 
 func (engine *TransferEngine) closeSegment(segmentID int64) error {

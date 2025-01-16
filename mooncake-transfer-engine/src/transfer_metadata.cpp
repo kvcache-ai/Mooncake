@@ -231,13 +231,18 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     return desc;
 }
 
-int TransferMetadata::syncSegmentCache() {
+int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     RWSpinlock::WriteGuard guard(segment_lock_);
-    LOG(INFO) << "Invalidate segment descriptor cache";
     for (auto &entry : segment_id_to_desc_map_) {
         if (entry.first == LOCAL_SEGMENT_ID) continue;
+        if (!segment_name.empty() && entry.second->name != segment_name)
+            continue;
         auto segment_desc = getSegmentDesc(entry.second->name);
-        if (segment_desc) entry.second = segment_desc;
+        if (segment_desc)
+            entry.second = segment_desc;
+        else
+            LOG(WARNING) << "segment " << entry.second->name
+                         << " is now invalid";
     }
     return 0;
 }

@@ -49,8 +49,7 @@ class TransferEngine {
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
-             const std::string &ip_or_host_name, 
-             uint64_t rpc_port = 12345);
+             const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
 
     int freeEngine();
 
@@ -92,7 +91,9 @@ class TransferEngine {
         return multi_transports_->getTransferStatus(batch_id, task_id, status);
     }
 
-    int syncSegmentCache() { return metadata_->syncSegmentCache(); }
+    int syncSegmentCache(const std::string &segment_name = "") {
+        return metadata_->syncSegmentCache(segment_name);
+    }
 
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 

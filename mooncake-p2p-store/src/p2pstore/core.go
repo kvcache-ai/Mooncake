@@ -335,7 +335,6 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		return ErrPayloadNotFound
 	}
 	for {
-		_ = store.transfer.syncSegmentCache()
 		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
 			return err
@@ -356,7 +355,8 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 
 func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shard Shard) error {
 	retryCount := 0
-	for retryCount < shard.Count() {
+	maxRetryCount := max(3, shard.Count())
+	for retryCount < maxRetryCount {
 		batchID, err := store.transfer.allocateBatchID(1)
 		if err != nil {
 			return err
@@ -367,7 +367,7 @@ func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shar
 			break
 		}
 
-		targetID, err := store.transfer.openSegment(location.SegmentName)
+		targetID, err := store.transfer.openSegment(location.SegmentName, retryCount == 0)
 		if err != nil {
 			return err
 		}

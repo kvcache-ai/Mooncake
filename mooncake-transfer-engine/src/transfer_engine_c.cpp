@@ -57,6 +57,13 @@ segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     return native->openSegment(segment_name);
 }
 
+segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_name) {
+    TransferEngine *native = (TransferEngine *)engine;
+    int rc = native->syncSegmentCache(segment_name);
+    if (rc) return rc;
+    return native->openSegment(segment_name);
+}
+
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->closeSegment(segment_id);
