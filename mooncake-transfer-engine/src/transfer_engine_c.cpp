@@ -36,6 +36,17 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
     return (transfer_engine_t)native;
 }
 
+transport_t installTransport(transfer_engine_t engine, const char *proto,
+                             void **args) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return (transport_t)native->installTransport(proto, args);
+}
+
+int uninstallTransport(transfer_engine_t engine, const char *proto) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->uninstallTransport(proto);
+}
+
 void destroyTransferEngine(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
     delete native;

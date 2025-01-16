@@ -39,6 +39,7 @@ type BatchID int64
 
 type TransferEngine struct {
 	engine C.transfer_engine_t
+	xport  C.transport_t
 }
 
 func parseServerName(serverName string) (host string, port int) {
@@ -55,7 +56,11 @@ func parseServerName(serverName string) (host string, port int) {
 	return host, port
 }
 
-func NewTransferEngine(metadata_uri string, local_server_name string) (*TransferEngine, error) {
+var (
+	rdmaCStr = C.CString("rdma")
+)
+
+func NewTransferEngine(metadata_uri string, local_server_name string, nic_priority_matrix string) (*TransferEngine, error) {
 	// For simplifiy, local_server_name must be a valid IP address or hostname
 	connectable_name, rpc_port := parseServerName(local_server_name)
 
@@ -71,13 +76,37 @@ func NewTransferEngine(metadata_uri string, local_server_name string) (*Transfer
 		return nil, ErrTransferEngine
 	}
 
+	var xport C.transport_t
+	if nic_priority_matrix != "" {
+		nicPriorityMatrix := C.CString(nic_priority_matrix)
+		defer C.free(unsafe.Pointer(nicPriorityMatrix))
+		var args [2]unsafe.Pointer
+		args[0] = unsafe.Pointer(nicPriorityMatrix)
+		args[1] = nil
+		xport = C.installTransport(native_engine, rdmaCStr, &args[0])
+		if xport == nil {
+			C.destroyTransferEngine(native_engine)
+			return nil, ErrTransferEngine
+		}
+	}
+
 	return &TransferEngine{
 		engine: native_engine,
+		xport:  xport,
 	}, nil
 }
 
 func (engine *TransferEngine) Close() error {
-	C.destroyTransferEngine(engine.engine)
+	if engine.xport != nil {
+		ret := C.uninstallTransport(engine.engine, rdmaCStr)
+		if ret < 0 {
+			return ErrTransferEngine
+		}
+	}
+
+	if engine.engine != nil {
+		C.destroyTransferEngine(engine.engine)
+	}
 	return nil
 }
 

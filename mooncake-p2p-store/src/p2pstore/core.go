@@ -37,13 +37,13 @@ type P2PStore struct {
 	transfer         *TransferEngine
 }
 
-func NewP2PStore(metadataUri string, localSegmentName string) (*P2PStore, error) {
+func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error) {
 	metadata, err := NewMetadata(metadataUri, METADATA_KEY_PREFIX)
 	if err != nil {
 		return nil, err
 	}
 
-	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName)
+	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName, nicPriorityMatrix)
 	if err != nil {
 		innerErr := metadata.Close()
 		if innerErr != nil {
@@ -189,9 +189,9 @@ func (store *P2PStore) Unregister(ctx context.Context, name string) error {
 
 type PayloadInfo struct {
 	Name         string   // Full name of checkpoint file
-	MaxShardSize uint64   // 
-	TotalSize    uint64   // 
-	SizeList     []uint64 // 
+	MaxShardSize uint64   //
+	TotalSize    uint64   //
+	SizeList     []uint64 //
 }
 
 func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadInfo, error) {
