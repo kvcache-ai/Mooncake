@@ -246,7 +246,7 @@ func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadIn
 	return result, nil
 }
 
-func (store *P2PStore) doGetReplica(payload *Payload, addrList []uintptr, sizeList []uint64) error {
+func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrList []uintptr, sizeList []uint64) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
 
@@ -267,7 +267,7 @@ func (store *P2PStore) doGetReplica(payload *Payload, addrList []uintptr, sizeLi
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err = store.performTransfer(source, shard)
+				err = store.performTransfer(ctx, source, shard)
 				if err != nil {
 					select {
 					case errChan <- err:
@@ -336,7 +336,7 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 	}
 	for {
 		_ = store.transfer.syncSegmentCache()
-		err = store.doGetReplica(payload, addrList, sizeList)
+		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
 			return err
 		}
@@ -354,7 +354,7 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 	return store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 }
 
-func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
+func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shard Shard) error {
 	retryCount := 0
 	for retryCount < shard.Count() {
 		batchID, err := store.transfer.allocateBatchID(1)
@@ -387,9 +387,14 @@ func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
 
 		var status int
 		for status == STATUS_WAITING || status == STATUS_PENDING {
-			status, _, err = store.transfer.getTransferStatus(batchID, 0)
-			if err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				status, _, err = store.transfer.getTransferStatus(batchID, 0)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
