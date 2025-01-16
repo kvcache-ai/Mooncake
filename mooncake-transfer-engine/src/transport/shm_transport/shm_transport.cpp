@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/cxl_transport/cxl_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
@@ -43,14 +43,13 @@
 //one batch[taskid] -> one shared mem
 
 namespace mooncake {
-CxlTransport::CxlTransport() {
+ShmTransport::ShmTransport() {
     // TODO
-    std::cout<<"hhh"<<std::endl;
     //SharedMem_map_ = std::unordered_map<void*, size_t>{{nullptr, nullptr}}; 
     //metadata_ = std::make_shared<TransferMetadata>(); // 在构造函数中初始化 metadata_
 }
 
-CxlTransport::~CxlTransport() {
+ShmTransport::~ShmTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
@@ -62,7 +61,7 @@ CxlTransport::~CxlTransport() {
     SharedMem_map_.clear();
 }
 
-void CxlTransport::createSharedMem(void* addr, size_t size, const std::string& location) {
+void ShmTransport::createSharedMem(void* addr, size_t size, const std::string& location) {
     // 使用 shm_open 创建或打开一个共享内存对象
     int shm_fd = shm_open(location.c_str(), O_CREAT | O_RDWR, 0666);
     if (shm_fd == -1) {
@@ -103,7 +102,7 @@ void CxlTransport::createSharedMem(void* addr, size_t size, const std::string& l
 
 
 
-void CxlTransport::delete_shared_memory(void *addr) {
+void ShmTransport::delete_shared_memory(void *addr) {
     size_t length = SharedMem_map_[addr]; 
     if (addr == NULL) {
         fprintf(stderr, "Invalid arguments.\n");
@@ -115,19 +114,19 @@ void CxlTransport::delete_shared_memory(void *addr) {
         // 处理错误
     }
 }
-CxlTransport::BatchID CxlTransport::allocateBatchID(size_t batch_size) {
-    //auto cxl_desc = new BatchDesc();
+ShmTransport::BatchID ShmTransport::allocateBatchID(size_t batch_size) {
+    //auto shm_desc = new BatchDesc();
     auto batch_id = Transport::allocateBatchID(batch_size);
     auto &batch_desc = *((BatchDesc *)(batch_id));
     batch_desc.batch_size = batch_size;
     batch_desc.task_list.resize(batch_size);
     batch_desc.id = batch_id;
-    //batch_desc.context = cxl_desc;
+    //batch_desc.context = shm_desc;
     
     return batch_id;
 }
 
-int CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+int ShmTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                     TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
@@ -149,12 +148,15 @@ int CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return 0;
 }
 
-int CxlTransport::submitTransfer(BatchID batch_id, const std::vector<TransferRequest>& entries) {
+int ShmTransport::submitTransfer(BatchID batch_id, const std::vector<TransferRequest>& entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
 
     // Check if adding new entries would exceed the batch size
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size)
-        return -1;
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size){
+        LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
+                      "capacity";
+        return ERR_TOO_MANY_REQUESTS;
+    }
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
@@ -167,16 +169,37 @@ int CxlTransport::submitTransfer(BatchID batch_id, const std::vector<TransferReq
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
-        slice->cxl.remote_addr = (void*)request.target_offset;
-        slice->cxl.remote_offset = request.length;
+        slice->local.dest_addr = (void*)request.target_offset;
         slice->status = Slice::PENDING;
+        task.slices.push_back(slice);
         startSlice(slice);
     }
 
     return 0;
 }
 
-int CxlTransport::freeBatchID(BatchID batch_id) { 
+int ShmTransport::submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list) {
+    for (size_t index = 0; index < request_list.size(); ++index) {
+        auto &request = *request_list[index];
+        auto &task = *task_list[index];
+        task.total_bytes = request.length;
+        auto slice = new Slice();
+        slice->source_addr = (char *)request.source;
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->local.dest_addr = (void*)request.target_offset;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        task.slices.push_back(slice);
+        startSlice(slice);
+    }
+    return 0;
+}
+
+int ShmTransport::freeBatchID(BatchID batch_id) { 
     auto &batch_desc = *((BatchDesc *)(batch_id));
     //auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     //int desc_idx = nvmeof_desc.desc_idx_;
@@ -186,25 +209,59 @@ int CxlTransport::freeBatchID(BatchID batch_id) {
     }
     return 0; }
 
-int CxlTransport::install(std::string& local_server_name, std::shared_ptr<TransferMetadata> meta, void** args) {
+int ShmTransport::allocateLocalSegmentID() {
+    auto desc = std::make_shared<SegmentDesc>();
+    if (!desc) return ERR_MEMORY;
+    desc->name = local_server_name_;
+    desc->protocol = "shm";
+    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                               std::move(desc));
+    return 0;
+}
+
+int ShmTransport::install(std::string& local_server_name, std::shared_ptr<TransferMetadata> meta, void** args) {
     // Initialize control shared memory
-    return Transport::install(local_server_name, meta, args);
+
+    metadata_ = meta;
+    local_server_name_ = local_server_name;
+
+    int ret = allocateLocalSegmentID();
+    if (ret) {
+        LOG(ERROR) << "ShmTransport: cannot allocate local segment";
+        return -1;
+    }
+
+    ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(ERROR) << "ShmTransport: cannot publish segments, "
+                      "check the availability of metadata storage";
+        return -1;
+    }
+    return 0;
     //return 0;
 }
 
 // Assuming metadata_ is a shared pointer to TransferMetadata
 // and is initialized properly in the constructor.
 
-int CxlTransport::registerLocalMemory(void* addr, size_t length, const std::string& location, bool remote_accessible, bool update_metadata) {
+int ShmTransport::registerLocalMemory(void* addr, size_t length, const std::string& location, bool remote_accessible, bool update_metadata) {
     // Generate a unique name for the shared memory segment
-    SharedMem_map_[addr] = length;
+    //SharedMem_map_[addr] = length;
     //create linux shared memory
-    createSharedMem(addr, length, location);
+    printf("addr %p",addr);
+    printf("length %d",length);
+    printf("location %s",location.c_str());
+    printf("remote_accessible %d",remote_accessible);
+    printf("update_metadata %d",update_metadata);
+    createSharedMem(addr, length, local_server_name_);
     // Create a BufferDesc and add it to the metadata
+    asm volatile ("nop":::"memory");
     BufferDesc buffer_desc;
+    asm volatile ("nop %0":: "r"(&buffer_desc) :"memory");
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
-    buffer_desc.name = location;
+    buffer_desc.name = local_server_name_;
+    printf("%d",update_metadata);
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret != 0) {
         // Remove the shared memory segment if registration fails
@@ -215,7 +272,7 @@ int CxlTransport::registerLocalMemory(void* addr, size_t length, const std::stri
     return 0;
 }
 
-int CxlTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
+int ShmTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // Generate the unique name for the shared memory segment
     // Remove the buffer's entry from the metadata
     delete_shared_memory(addr);
@@ -224,21 +281,20 @@ int CxlTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     return 0;
 }
 
-void CxlTransport::startSlice(Slice *slice) {
+void ShmTransport::startSlice(Slice *slice) {
     slice->task->is_finished = false;
     //slice->task->status = TransferTask::RUNNING;
     //slice->task->submit_time = std::chrono::high_resolution_clock::now();
     slice->task->total_bytes += slice->length;
     if(slice->opcode == TransferRequest::WRITE) {
-        memcpy((void*)slice->cxl.remote_addr, slice->source_addr, slice->length);
+        memcpy((void*)slice->local.dest_addr, slice->source_addr, slice->length);
     }
     else {
-        memcpy(slice->source_addr, (void*)slice->cxl.remote_addr, slice->length);
+        memcpy(slice->source_addr, (void*)slice->local.dest_addr, slice->length);
     }
-    // if (slice->task->status == TransferStatusEnum::COMPLETED)
-    //     slice->markSuccess();
-    // else
-    //     slice->markFailed();
+    //if (slice->task->status == TransferStatusEnum::COMPLETED)
+    slice->markSuccess();
+
 }
 
 }  // namespace mooncake

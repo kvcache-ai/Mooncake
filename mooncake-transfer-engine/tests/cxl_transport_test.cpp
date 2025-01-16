@@ -50,11 +50,11 @@ using namespace mooncake;
 
 namespace mooncake {
 
-class TCPTransportTest : public ::testing::Test {
+class CXLTransportTest : public ::testing::Test {
    public:
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("TCPTransportTest");
+        google::InitGoogleLogging("CXLTransportTest");
         FLAGS_logtostderr = 1;
 
         const char *env = std::getenv("MC_METADATA_SERVER");
@@ -62,15 +62,13 @@ class TCPTransportTest : public ::testing::Test {
             metadata_server = env;
         else
             metadata_server = metadata_server;
-
-        metadata_server = "127.0.0.1:2379";
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
         if (env)
             local_server_name = env;
         else
-            local_server_name = "127.0.0.1:2222";
+            local_server_name = "127.0.0.2:12345";
         LOG(INFO) << "local_server_name: " << local_server_name;
     }
 
@@ -88,18 +86,18 @@ static void *allocateMemoryPool(size_t size, int socket_id,
     return numa_alloc_onnode(size, socket_id);
 }
 
-TEST_F(TCPTransportTest, GetTcpTest) {
+TEST_F(CXLTransportTest, GetTcpTest) {
     auto engine = std::make_unique<TransferEngine>();
     auto hostname_port = parseHostNameWithPort(local_server_name);
     auto rc = engine->init(metadata_server, local_server_name,
                            hostname_port.first.c_str(), hostname_port.second);
     LOG_ASSERT(rc == 0);
     Transport *xport = nullptr;
-    xport = engine->installTransport("tcp", nullptr);
+    xport = engine->installTransport("cxl", nullptr);
     LOG_ASSERT(xport != nullptr);
 }
 
-TEST_F(TCPTransportTest, Writetest) {
+TEST_F(CXLTransportTest, Writetest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
@@ -109,7 +107,7 @@ TEST_F(TCPTransportTest, Writetest) {
                            hostname_port.first.c_str(), hostname_port.second);
     LOG_ASSERT(rc == 0);
     Transport *xport = nullptr;
-    xport = engine->installTransport("tcp", nullptr);
+    xport = engine->installTransport("cxl", nullptr);
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
@@ -143,7 +141,7 @@ TEST_F(TCPTransportTest, Writetest) {
     ASSERT_EQ(ret, 0);
 }
 
-TEST_F(TCPTransportTest, WriteAndReadtest) {
+TEST_F(CXLTransportTest, WriteAndReadtest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
@@ -152,7 +150,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
-    xport = engine->installTransport("tcp", nullptr);
+    xport = engine->installTransport("c x l", nullptr);
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
@@ -214,7 +212,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
                            kDataLength));
 }
 
-TEST_F(TCPTransportTest, WriteAndRead2test) {
+TEST_F(CXLTransportTest, WriteAndRead2test) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
@@ -223,7 +221,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);
     Transport *xport = nullptr;
-    xport = engine->installTransport("tcp", nullptr);
+    xport = engine->installTransport("cxl", nullptr);
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);

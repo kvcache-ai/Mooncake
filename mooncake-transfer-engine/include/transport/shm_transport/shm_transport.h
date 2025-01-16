@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CXL_TRANSPORT_H_
-#define CXL_TRANSPORT_H_
+#ifndef SHM_TRANSPORT_H_
+#define SHM_TRANSPORT_H_
 
 #include <infiniband/verbs.h>
 
@@ -33,16 +33,16 @@
 namespace mooncake {
 class TransferMetadata;
 
-class CxlTransport : public Transport {
+class ShmTransport : public Transport {
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
    public:
-    CxlTransport();
+    ShmTransport();
 
-    ~CxlTransport();
+    ~ShmTransport();
 
     void createSharedMem(void* addr, size_t size, const std::string& location);
 
@@ -57,6 +57,10 @@ class CxlTransport : public Transport {
                           TransferStatus &status) override;
 
     int freeBatchID(BatchID batch_id) override;
+
+    int submitTransferTask(
+    const std::vector<TransferRequest *> &request_list,
+    const std::vector<TransferTask *> &task_list);
 
    private:
    
@@ -81,11 +85,13 @@ class CxlTransport : public Transport {
         return 0;
     }
 
-    const char *getName() const override { return "cxl"; }
+    const char *getName() const override { return "shm"; }
 
     std::unordered_map<void*,size_t> SharedMem_map_;
 
     void startSlice(Slice *slice);
+
+    int allocateLocalSegmentID();
 };
 }  // namespace mooncake
 

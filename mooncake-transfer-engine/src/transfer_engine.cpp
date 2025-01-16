@@ -91,6 +91,7 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
         return ERR_ADDRESS_OVERLAPPED;
     }
     for (auto transport : multi_transports_->listTransports()) {
+        printf("transport = %p\n", transport);
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) return ret;

@@ -1,6 +1,6 @@
 module github.com/kvcache-ai/Mooncake/mooncake-transfer-engine/example/http-metadata-server
 
-go 1.22.9
+go 1.23
 
 require github.com/gin-gonic/gin v1.10.0
 
