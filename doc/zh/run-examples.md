@@ -106,6 +106,14 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
       > 提示：高级用户还可通过 `--nic_priority_matrix` 传入网卡优先级矩阵 JSON 文件，详细参考 Transfer Engine 的开发者手册。
    - 在仅支持 TCP 的网络环境中，可使用 `--protocol=tcp` 参数，此时不需要指定 `--device_name` 参数。
 
+   也可通过拓扑自动发现功能基于操作系统配置自动生成网卡优先级矩阵，此时不需要指定传输过程使用的 RDMA 网卡名称。
+   ```
+   ./transfer_engine_bench --mode=target \
+                           --metadata_server=10.0.0.1:2379 \
+                           --local_server_name=10.0.0.2:12345 \
+                           --auto_discovery
+   ```
+
 1. **启动发起节点。**
     ```bash
     # This is 10.0.0.3

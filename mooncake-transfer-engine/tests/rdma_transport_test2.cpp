@@ -121,7 +121,8 @@ class RDMATransportTest : public ::testing::Test {
         LOG(INFO) << "HERE \n";
         google::InitGoogleLogging("RDMATransportTest");
         FLAGS_logtostderr = 1;
-        engine = std::make_unique<TransferEngine>();
+        // disable topology auto discovery for testing.
+        engine = std::make_unique<TransferEngine>(false);
         hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
         engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                      hostname_port.first.c_str(),

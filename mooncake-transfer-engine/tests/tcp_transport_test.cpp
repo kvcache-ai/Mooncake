@@ -87,7 +87,8 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 TEST_F(TCPTransportTest, GetTcpTest) {
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     auto rc = engine->init(metadata_server, local_server_name,
                            hostname_port.first.c_str(), hostname_port.second);
@@ -101,7 +102,8 @@ TEST_F(TCPTransportTest, Writetest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     auto rc = engine->init(metadata_server, local_server_name,
                            hostname_port.first.c_str(), hostname_port.second);
@@ -145,7 +147,8 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);
@@ -216,7 +219,8 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     engine->init(metadata_server, local_server_name,
                  hostname_port.first.c_str(), hostname_port.second);

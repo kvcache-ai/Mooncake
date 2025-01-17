@@ -189,9 +189,9 @@ func (store *P2PStore) Unregister(ctx context.Context, name string) error {
 
 type PayloadInfo struct {
 	Name         string   // Full name of checkpoint file
-	MaxShardSize uint64   // 
-	TotalSize    uint64   // 
-	SizeList     []uint64 // 
+	MaxShardSize uint64   //
+	TotalSize    uint64   //
+	SizeList     []uint64 //
 }
 
 func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadInfo, error) {

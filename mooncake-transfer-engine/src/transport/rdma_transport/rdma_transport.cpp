@@ -44,23 +44,17 @@ RdmaTransport::~RdmaTransport() {
 
 int RdmaTransport::install(std::string &local_server_name,
                            std::shared_ptr<TransferMetadata> meta,
-                           void **args) {
-    const std::string nic_priority_matrix = static_cast<char *>(args[0]);
-    bool dry_run = args[1] ? *static_cast<bool *>(args[1]) : false;
-
-    if (dry_run) return 0;
+                           std::shared_ptr<Topology> topo) {
+    if (topo == nullptr) {
+        LOG(ERROR) << "RdmaTransport: missing topology";
+        return ERR_INVALID_ARGUMENT;
+    }
 
     metadata_ = meta;
     local_server_name_ = local_server_name;
+    local_topology_ = topo;
 
-    int ret = local_topology_.parse(nic_priority_matrix);
-    if (ret) {
-        LOG(ERROR) << "RdmaTransport: incorrect NIC priority matrix: "
-                   << nic_priority_matrix;
-        return ret;
-    }
-
-    ret = initializeRdmaResources();
+    auto ret = initializeRdmaResources();
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot initialize RDMA resources";
         return ret;
@@ -134,7 +128,7 @@ int RdmaTransport::allocateLocalSegmentID() {
         device_desc.gid = entry->gid();
         desc->devices.push_back(device_desc);
     }
-    desc->topology = local_topology_;
+    desc->topology = *(local_topology_.get());
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -353,7 +347,7 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 
     std::shared_ptr<RdmaContext> context;
     int index = 0;
-    for (auto &entry : local_topology_.getHcaList()) {
+    for (auto &entry : local_topology_->getHcaList()) {
         if (entry == local_nic_name) {
             context = context_list_[index];
             break;
@@ -372,13 +366,13 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    if (local_topology_.empty()) {
+    if (local_topology_->empty()) {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
 
     std::vector<int> device_speed_list;
-    for (auto &device_name : local_topology_.getHcaList()) {
+    for (auto &device_name : local_topology_->getHcaList()) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
         if (!context) return ERR_MEMORY;
 

@@ -17,7 +17,6 @@ P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当
    ./p2p-store-example --cmd=trainer \
                        --metadata_server=10.0.0.1:2379 \
                        --local_server_name=10.0.0.2:12345 \
-                       --device_name=erdma_0
    ```
 
 3. **启动模拟推理节点。** 该节点会从模拟训练节点或其他模拟推理节点拉取数据。
@@ -27,7 +26,6 @@ P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当
    ./p2p-store-example --cmd=inferencer \
                        --metadata_server=10.0.0.1:2379 \
                        --local_server_name=10.0.0.3:12346 \
-                       --device_name=erdma_1
    ```
    测试完毕显示“ALL DONE”。
 
@@ -48,12 +46,11 @@ P2P Store 基于 [Transfer Engine](transfer-engine.md) 构建，支持在集群�
 Mooncake P2P Store 目前基于 Golang 实现了下列接口：
 
 ```go
-func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error)
+func NewP2PStore(metadataUri string, localSegmentName string) (*P2PStore, error)
 ```
 创建 P2PStore 实例，该实例内部会启动一个 Transfer Engine 服务。
 - `metadataUri`：元数据服务器/etcd服务所在主机名或 IP 地址。
 - `localSegmentName`：本地的服务器名称（主机名/IP地址：端口号），保证在集群内唯一。
-- `nicPriorityMatrix`：网卡优先级顺序表，参见位于 Transfer Engine API 文档的相关描述（`TransferEngine::installTransport`）。
 - 返回值：若成功则返回 `P2PStore` 实例指针，否则返回 `error`。
 
 ```go

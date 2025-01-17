@@ -62,66 +62,35 @@ pub struct BufferEntry {
 
 pub struct TransferEngine {
     engine: bindings::transfer_engine_t,
-    xport: bindings::transport_t,
 }
 
 impl TransferEngine {
     pub fn new(
         metadata_uri: &str,
         local_server_name: &str,
-        nic_priority_matrix: &str,
         rpc_port: u64,
     ) -> Result<Self> {
         let metadata_uri_c =
             CString::new(metadata_uri).map_err(|_| anyhow!("CString::new failed"))?;
         let local_server_name_c =
             CString::new(local_server_name).map_err(|_| anyhow!("CString::new failed"))?;
-        let nic_priority_matrix_c =
-            CString::new(nic_priority_matrix).map_err(|_| anyhow!("CString::new failed"))?;
-        let proto_c = CString::new("rdma").map_err(|_| anyhow!("CString::new failed"))?;
 
-        let engine = unsafe { bindings::createTransferEngine(metadata_uri_c.as_ptr()) };
-        if engine.is_null() {
-            bail!("Failed to create TransferEngine")
-        }
-
-        let ret = unsafe {
-            bindings::initTransferEngine(
-                engine,
+        let engine = unsafe {
+            bindings::createTransferEngine(
+                metadata_uri_c.as_ptr(),
                 local_server_name_c.as_ptr(),
                 local_server_name_c.as_ptr(),
                 rpc_port,
             )
         };
-        if ret < 0 {
-            unsafe {
-                bindings::destroyTransferEngine(engine);
-            }
+        if engine.is_null() {
             bail!("Failed to create TransferEngine")
         }
 
-        let mut args = vec![
-            nic_priority_matrix_c.into_raw() as *mut c_void,
-            std::ptr::null_mut(),
-        ];
-        let xport =
-            unsafe { bindings::installTransport(engine, proto_c.as_ptr(), args.as_mut_ptr()) };
-
-        if xport.is_null() {
-            unsafe {
-                bindings::destroyTransferEngine(engine);
-            }
-            bail!("Failed to install or get Transport")
-        }
-        Ok(Self { engine, xport })
+        Ok(Self { engine })
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let proto_c = CString::new("rdma").map_err(|_| anyhow!("CString::new failed"))?;
-        let ret = unsafe { bindings::uninstallTransport(self.engine, proto_c.as_ptr()) };
-        if ret < 0 {
-            bail!("Failed to uninstall Transport");
-        }
         unsafe {
             bindings::destroyTransferEngine(self.engine);
         }

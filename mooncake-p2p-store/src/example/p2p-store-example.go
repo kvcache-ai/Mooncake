@@ -18,7 +18,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"time"
@@ -28,20 +27,16 @@ import (
 )
 
 var (
-	command               string
-	metadataServer        string
-	localServerName       string
-	deviceName            string
-	nicPriorityMatrixPath string
-	fileSize              int
+	command         string
+	metadataServer  string
+	localServerName string
+	fileSize        int
 )
 
 func main() {
 	flag.StringVar(&command, "cmd", "trainer", "Command: trainer|inferencer")
 	flag.StringVar(&metadataServer, "metadata_server", "localhost:2379", "Metadata server address")
 	flag.StringVar(&localServerName, "local_server_name", "", "Local server name")
-	flag.StringVar(&deviceName, "device_name", "mlx5_2", "RNIC device name")
-	flag.StringVar(&nicPriorityMatrixPath, "nic_priority_matrix", "", "Path to NIC priority matrix file (Advanced)")
 	flag.IntVar(&fileSize, "file_size_mb", 2048, "File size in MB")
 	flag.Parse()
 
@@ -112,7 +107,7 @@ func trainer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating checkpoint engine: %v\n", err)
 		os.Exit(1)
@@ -127,19 +122,6 @@ func trainer() {
 	}
 
 	fmt.Println("ALL DONE")
-}
-
-func getPriorityMatrix() string {
-	if len(nicPriorityMatrixPath) != 0 {
-		data, err := ioutil.ReadFile(nicPriorityMatrixPath)
-		if err != nil {
-			fmt.Println("Error reading file:", err)
-			os.Exit(1)
-		}
-		return string(data)
-	} else {
-		return "{ \"cpu:0\": [[\"" + deviceName + "\"], []]}"
-	}
 }
 
 func doInferencer(ctx context.Context, store *p2pstore.P2PStore, name string) {
@@ -178,7 +160,7 @@ func inferencer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating checkpoint engine: %v\n", err)
 		os.Exit(1)
