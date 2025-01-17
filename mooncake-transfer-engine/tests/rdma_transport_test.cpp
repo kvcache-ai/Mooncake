@@ -240,7 +240,8 @@ std::string loadNicPriorityMatrix() {
 
 int initiator() {
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
@@ -285,7 +286,8 @@ int initiator() {
 
 int target() {
     const size_t ram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),

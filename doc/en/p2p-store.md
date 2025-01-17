@@ -17,7 +17,6 @@ After compiling P2P Store successfully by following the compilation guide with `
    ./p2p-store-example --cmd=trainer \
                        --metadata_server=10.0.0.1:2379 \
                        --local_server_name=10.0.0.2:12345 \
-                       --device_name=erdma_0
    ```
 
 3. **Start the simulated inference node.** This node will pull data from the simulated training node or other simulated inference nodes.
@@ -27,7 +26,6 @@ After compiling P2P Store successfully by following the compilation guide with `
    ./p2p-store-example --cmd=inferencer \
                        --metadata_server=10.0.0.1:2379 \
                        --local_server_name=10.0.0.3:12346 \
-                       --device_name=erdma_1
    ```
    The test is completed with the display of "ALL DONE".
 
@@ -37,12 +35,11 @@ In the above process, the simulated inference nodes search for data sources, whi
 Mooncake P2P Store currently implements the following interfaces in Golang:
 
 ```go
-func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error)
+func NewP2PStore(metadataUri string, localSegmentName string) (*P2PStore, error)
 ```
 Creates an instance of `P2PStore`, which internally starts a Transfer Engine service.
 - `metadataUri`: The hostname or IP address of the metadata server/etcd service.
 - `localSegmentName`: The local server name (hostname/IP address:port), ensuring uniqueness within the cluster.
-- `nicPriorityMatrix`: The network interface card priority order matrix, see the related description in the Transfer Engine API documentation (`TransferEngine::installTransport`).
 - Return value: If successful, returns a pointer to the `P2PStore` instance, otherwise returns `error`.
 
 ```go
@@ -63,7 +60,7 @@ Registers a local file to the cluster, making it downloadable by other peers. En
 - `name`: The file registration name, ensuring uniqueness within the cluster.
 - `addrList` and `sizeList`: These two arrays represent the memory range of the file, with `addrList` indicating the starting address and `sizeList` indicating the corresponding length. The file content corresponds logically to the order in the arrays.
 - `maxShardSize`: The internal data sharding granularity, with a recommended value of 64MB.
-- `location`: The device name corresponding to this memory segment, matching with `nicPriorityMatrix`.
+- `location`: The device name corresponding to this memory segment.
 
 ```go
 func (store *P2PStore) Unregister(ctx context.Context, name string) error
