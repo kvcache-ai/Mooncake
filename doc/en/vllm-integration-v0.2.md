@@ -25,6 +25,7 @@ pip3 install -e .
  - If you encounter any problems that you cannot solve, please refer to the [vLLM official compilation guide](https://docs.vllm.ai/en/v0.6.4.post1/getting_started/installation.html#install-the-latest-code).
 
 ## Configuration
+### Prepare configuration file to Run Example over RDMA
 
 - Prepare a _**mooncake.json**_ file for both Prefill and Decode instances
 - **You don't need to change the `prefill_url` and `decode_url` of the config file in the decode side, please use the identical config file.**
@@ -34,10 +35,11 @@ pip3 install -e .
   "prefill_url": "192.168.0.137:13003",
   "decode_url": "192.168.0.139:13003",
   "metadata_server": "192.168.0.139:2379",
-  "metadata_backend": "etcd"
+  "metadata_backend": "etcd",
+  "protocol": "rdma",
+  "device_name": "erdma_0"
 }
 ```
-
 - "prefill_url": The IP address and port of the Prefill node.
   - The port in the URL is used to communicate with etcd server for metadata.
 - "decode_url": The IP address and port of the Decode node.
@@ -48,6 +50,24 @@ pip3 install -e .
   - Use `redis` as backend: `"redis://192.168.0.137:6379"`
   - Use `http` as backend: `"http://192.168.0.137:8080/metadata"`
 - "metadata_backend": Currently we support "etcd", "redis", and "http" backends. If this parameter is absent and the `metadata_server` is not a complete URL with the backend prefix, the mooncake transfer engine will use "etcd" automatically. Please note that this parameter will be deprecated in the next version, we recommend you provide a complete URL for `metadata_server` with the prefix of the target backend.
+- "protocol": The protocol to be used for data transmission. ("rdma/tcp")
+- "device_name": The device to be used for data transmission, it is required when "protocol" is set to "rdma". If multiple NIC devices are used, they can be separated by commas such as "erdma_0,erdma_1". Please note that there are no spaces between them.
+
+### Prepare configuration file to Run Example over TCP
+
+- Prepare a _**mooncake.json**_ file for both Prefill and Decode instances
+```json
+{
+  "prefill_url": "192.168.0.137:13003",
+  "decode_url": "192.168.0.139:13003",
+  "metadata_server": "192.168.0.139:2379",
+  "metadata_backend": "etcd",
+  "protocol": "tcp",
+  "device_name": ""
+}
+```
+
+Note: we will support auto-detect in the next version when the `protocol` is absent in the config file.
 
 ## Run Example
  - Please change the IP addresses and ports in the following guide according to your env.
