@@ -127,7 +127,7 @@ func trainer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "P2PStore: initialization failed: %v\n", err)
 		os.Exit(1)
@@ -199,7 +199,7 @@ func inferencer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "P2PStore: initialization failed: %v\n", err)
 		os.Exit(1)

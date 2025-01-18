@@ -16,13 +16,13 @@
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
 #include <sys/time.h>
-#include <vector>
-#include <stack>
 
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <stack>
+#include <vector>
 
 #include "transfer_engine.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -46,9 +46,9 @@ class VLLMAdaptor {
 
     int initialize(const char *local_hostname, const char *metadata_server,
                    const char *protocol, const char *device_name);
-    
+
     int initializeExt(const char *local_hostname, const char *metadata_server,
-                      const char *protocol, const char *device_name, 
+                      const char *protocol, const char *device_name,
                       const char *metadata_type);
 
     uintptr_t allocateManagedBuffer(size_t length);
@@ -74,7 +74,8 @@ class VLLMAdaptor {
     // FOR EXPERIMENT ONLY
     int expRegisterMemory(uintptr_t buffer_addr, size_t capacity);
 
-    int expUnregisterMemory(uintptr_t buffer_addr); // must be called before VLLMAdaptor::~VLLMAdaptor()
+    // must be called before VLLMAdaptor::~VLLMAdaptor()
+    int expUnregisterMemory(uintptr_t buffer_addr);
 
    private:
     char *allocateRawBuffer(size_t capacity);

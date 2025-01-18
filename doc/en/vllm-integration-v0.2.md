@@ -67,6 +67,7 @@ pip3 install -e .
 }
 ```
 
+Note: we will support auto-detect in the next version when the `protocol` is absent in the config file.
 
 ## Run Example
  - Please change the IP addresses and ports in the following guide according to your env.

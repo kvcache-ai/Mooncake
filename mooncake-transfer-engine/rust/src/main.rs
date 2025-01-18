@@ -40,9 +40,6 @@ pub struct Args {
     help = "Operation type: read or write")]
     pub operation: String,
 
-    #[clap(long, default_value_t = String::from("{\"cpu:0\": [[\"mlx5_0\"], []]}"))]
-    pub nic_priority_matrix: String,
-
     #[clap(long, default_value_t = String::from("127.0.0.1"), help = "Segment ID to access data")]
     pub segment_id: String,
 
@@ -161,7 +158,6 @@ fn initiator(args: Args) -> Result<()> {
     let engine = Arc::new(TransferEngine::new(
         &args.metadata_server,
         &get_host_ip()?,
-        &args.nic_priority_matrix,
         12345,
     )?);
 
@@ -216,7 +212,6 @@ fn target(args: Args) -> Result<()> {
     let engine = TransferEngine::new(
         &args.metadata_server,
         &get_host_ip()?,
-        &args.nic_priority_matrix,
         12345,
     )?;
 

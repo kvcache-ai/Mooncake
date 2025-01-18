@@ -44,7 +44,8 @@ class MultiTransport {
     int getTransferStatus(BatchID batch_id, size_t task_id,
                           TransferStatus &status);
 
-    Transport *installTransport(const std::string &proto, void **args);
+    Transport *installTransport(const std::string &proto,
+                                std::shared_ptr<Topology> topo);
 
     Transport *getTransport(const std::string &proto);
 
