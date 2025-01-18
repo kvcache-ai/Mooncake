@@ -75,6 +75,8 @@ class RdmaContext {
 
     int deleteEndpoint(const std::string &peer_nic_path);
 
+    int disconnectAllEndpoints();
+
    public:
     // Device name, such as `mlx5_3`
     std::string deviceName() const { return device_name_; }

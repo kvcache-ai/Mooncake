@@ -284,6 +284,10 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     return nullptr;
 }
 
+int RdmaContext::disconnectAllEndpoints() {
+    return endpoint_store_->disconnectQPs();
+}
+
 int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }

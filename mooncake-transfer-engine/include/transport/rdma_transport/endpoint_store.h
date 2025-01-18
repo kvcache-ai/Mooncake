@@ -46,6 +46,7 @@ class EndpointStore {
     virtual size_t getSize() = 0;
 
     virtual int destroyQPs() = 0;
+    virtual int disconnectQPs() = 0;
 };
 
 // FIFO
@@ -61,6 +62,7 @@ class FIFOEndpointStore : public EndpointStore {
     size_t getSize();
 
     int destroyQPs();
+    int disconnectQPs();
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -88,6 +90,7 @@ class SIEVEEndpointStore : public EndpointStore {
     size_t getSize();
 
     int destroyQPs();
+    int disconnectQPs();
 
    private:
     RWSpinlock endpoint_map_lock_;
