@@ -160,7 +160,6 @@ class RdmaContext {
 
     RWSpinlock memory_regions_lock_;
     std::vector<ibv_mr *> memory_region_list_;
-    // std::vector<ibv_cq *> cq_list_;
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
