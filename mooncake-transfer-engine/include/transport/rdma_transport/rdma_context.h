@@ -39,6 +39,12 @@ class RdmaTransport;
 class WorkerPool;
 class EndpointStore;
 
+struct RdmaCq {
+    RdmaCq() : native(nullptr), outstanding(0) {}
+    ibv_cq *native;
+    volatile int outstanding;
+};
+
 // RdmaContext represents the set of resources controlled by each local NIC,
 // including Memory Region, CQ, EndPoint (QPs), etc.
 class RdmaContext {
@@ -111,6 +117,10 @@ class RdmaContext {
 
     ibv_cq *cq();
 
+    volatile int *cqOutstandingCount(int cq_index) {
+        return &cq_list_[cq_index].outstanding;
+    }
+
     int cqCount() const { return cq_list_.size(); }
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
@@ -150,7 +160,8 @@ class RdmaContext {
 
     RWSpinlock memory_regions_lock_;
     std::vector<ibv_mr *> memory_region_list_;
-    std::vector<ibv_cq *> cq_list_;
+    // std::vector<ibv_cq *> cq_list_;
+    std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
 

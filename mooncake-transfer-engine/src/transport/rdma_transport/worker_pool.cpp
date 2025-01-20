@@ -305,6 +305,9 @@ void WorkerPool::performPollCq(int thread_id) {
                 processed_slice_count++;
             }
         }
+        if (nr_poll)
+            __sync_fetch_and_sub(context_.cqOutstandingCount(cq_index),
+                                 nr_poll);
     }
 
     for (auto &entry : qp_depth_set)
@@ -393,10 +396,12 @@ int WorkerPool::doProcessContextEvents() {
         event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
         context_.disconnectAllEndpoints();
-        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now inactive";
+        LOG(INFO) << "Worker: Context " << context_.deviceName()
+                  << " is now inactive";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context_.set_active(true);
-        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now active";
+        LOG(INFO) << "Worker: Context " << context_.deviceName()
+                  << " is now active";
     }
     ibv_ack_async_event(&event);
     return 0;
