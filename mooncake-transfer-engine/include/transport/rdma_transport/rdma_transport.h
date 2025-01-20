@@ -54,7 +54,8 @@ class RdmaTransport : public Transport {
     ~RdmaTransport();
 
     int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta, void **args) override;
+                std::shared_ptr<TransferMetadata> meta,
+                std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
 
@@ -113,7 +114,7 @@ class RdmaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<SegmentID> next_segment_id_;
-    Topology local_topology_;
+    std::shared_ptr<Topology> local_topology_;
 };
 
 using TransferRequest = Transport::TransferRequest;

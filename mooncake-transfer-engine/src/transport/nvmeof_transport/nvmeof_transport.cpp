@@ -86,7 +86,8 @@ int NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
         // LOG(INFO) << "task " << task_id << " i " << i << " upper bound " <<
         // slice_num;
-        auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, slice_id);
+        auto event =
+            desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, slice_id);
         transfer_status.s = from_cufile_transfer_status(event.status);
         // TODO(FIXME): what to do if multi slices have different status?
         if (transfer_status.s == COMPLETED) {
@@ -113,7 +114,8 @@ int NVMeoFTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
     batch_desc.task_list.resize(task_id + entries.size());
-    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>> segment_desc_map;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
     // segment_desc_map[LOCAL_SEGMENT_ID] =
     // getSegmentDescByID(LOCAL_SEGMENT_ID);
     for (auto &request : entries) {
@@ -202,8 +204,8 @@ int NVMeoFTransport::freeBatchID(BatchID batch_id) {
 
 int NVMeoFTransport::install(std::string &local_server_name,
                              std::shared_ptr<TransferMetadata> meta,
-                             void **args) {
-    return Transport::install(local_server_name, meta, args);
+                             std::shared_ptr<Topology> topo) {
+    return Transport::install(local_server_name, meta, topo);
 }
 
 int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
@@ -244,7 +246,8 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh) {
     CUfileIOParams_t params;
     params.mode = CUFILE_BATCH;
-    params.opcode = op == Transport::TransferRequest::READ ? CUFILE_READ : CUFILE_WRITE;
+    params.opcode =
+        op == Transport::TransferRequest::READ ? CUFILE_READ : CUFILE_WRITE;
     params.cookie = (void *)0;
     params.u.batch.devPtr_base = source_addr;
     params.u.batch.devPtr_offset = 0;

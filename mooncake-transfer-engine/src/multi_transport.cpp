@@ -124,7 +124,7 @@ int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Transport *MultiTransport::installTransport(const std::string &proto,
-                                            void **args) {
+                                            std::shared_ptr<Topology> topo) {
     Transport *transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
@@ -143,7 +143,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    if (transport->install(local_server_name_, metadata_, args)) {
+    if (transport->install(local_server_name_, metadata_, topo)) {
         return nullptr;
     }
 

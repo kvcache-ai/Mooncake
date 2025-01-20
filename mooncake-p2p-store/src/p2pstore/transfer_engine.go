@@ -22,8 +22,11 @@ package p2pstore
  * All the C functions used here follow this convention.
  */
 
-//#cgo LDFLAGS: -L../../../build/mooncake-transfer-engine/src -L../../../thirdparties/lib -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc
-//#include "../../../mooncake-transfer-engine/include/transfer_engine_c.h"
+/*
+#cgo LDFLAGS: -L../../../build/mooncake-transfer-engine/src -L../../../thirdparties/lib -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc
+#include "../../../mooncake-transfer-engine/include/transfer_engine_c.h"
+#include <stdlib.h>
+*/
 import "C"
 
 import (
@@ -53,7 +56,7 @@ func parseServerName(serverName string) (host string, port int) {
 	return host, port
 }
 
-const (
+var (
 	rdmaCStr = C.CString("rdma")
 )
 
@@ -64,24 +67,27 @@ func NewTransferEngine(metadata_uri string, local_server_name string, nic_priori
 	metadataUri := C.CString(metadata_uri)
 	localServerName := C.CString(local_server_name)
 	connectableName := C.CString(connectable_name)
-	nicPriorityMatrix := C.CString(nic_priority_matrix)
 	defer C.free(unsafe.Pointer(metadataUri))
 	defer C.free(unsafe.Pointer(localServerName))
 	defer C.free(unsafe.Pointer(connectableName))
-	defer C.free(unsafe.Pointer(nicPriorityMatrix))
 
 	native_engine := C.createTransferEngine(metadataUri, localServerName, connectableName, C.uint64_t(rpc_port))
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
 
-	var args [2]unsafe.Pointer
-	args[0] = unsafe.Pointer(nicPriorityMatrix)
-	args[1] = nil
-	xport := C.installTransport(native_engine, rdmaCStr, &args[0])
-	if xport == nil {
-		C.destroyTransferEngine(native_engine)
-		return nil, ErrTransferEngine
+	var xport C.transport_t
+	if nic_priority_matrix != "" {
+		nicPriorityMatrix := C.CString(nic_priority_matrix)
+		defer C.free(unsafe.Pointer(nicPriorityMatrix))
+		var args [2]unsafe.Pointer
+		args[0] = unsafe.Pointer(nicPriorityMatrix)
+		args[1] = nil
+		xport = C.installTransport(native_engine, rdmaCStr, &args[0])
+		if xport == nil {
+			C.destroyTransferEngine(native_engine)
+			return nil, ErrTransferEngine
+		}
 	}
 
 	return &TransferEngine{
@@ -91,12 +97,16 @@ func NewTransferEngine(metadata_uri string, local_server_name string, nic_priori
 }
 
 func (engine *TransferEngine) Close() error {
-	ret := C.uninstallTransport(engine.engine, rdmaCStr)
-	if ret < 0 {
-		return ErrTransferEngine
+	if engine.xport != nil {
+		ret := C.uninstallTransport(engine.engine, rdmaCStr)
+		if ret < 0 {
+			return ErrTransferEngine
+		}
 	}
 
-	C.destroyTransferEngine(engine.engine)
+	if engine.engine != nil {
+		C.destroyTransferEngine(engine.engine)
+	}
 	return nil
 }
 

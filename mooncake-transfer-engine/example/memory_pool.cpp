@@ -76,7 +76,8 @@ int target() {
     auto nic_priority_matrix = loadNicPriorityMatrix();
 
     const size_t dram_buffer_size = 1ull << 30;
-    auto engine = std::make_unique<TransferEngine>();
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
 
     void **args = (void **)malloc(2 * sizeof(void *));
     args[0] = (void *)nic_priority_matrix.c_str();

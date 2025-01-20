@@ -186,7 +186,8 @@ class Transport {
 
    protected:
     virtual int install(std::string &local_server_name,
-                        std::shared_ptr<TransferMetadata> meta, void **args);
+                        std::shared_ptr<TransferMetadata> meta,
+                        std::shared_ptr<Topology> topo);
 
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;

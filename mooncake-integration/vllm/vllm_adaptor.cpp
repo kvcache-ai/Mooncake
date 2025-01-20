@@ -82,7 +82,8 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
         conn_string =
             std::string(metadata_type) + "://" + std::string(metadata_server);
 
-    engine_ = std::make_unique<TransferEngine>();
+    // TODO: remove `false` in the feature, it's for keep same API in vllm.
+    engine_ = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_hostname);
     int ret = engine_->init(conn_string, local_hostname,
                             hostname_port.first.c_str(), hostname_port.second);
