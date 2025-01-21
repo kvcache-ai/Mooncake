@@ -108,13 +108,16 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     cq_list_.resize(num_cq_list);
     for (size_t i = 0; i < num_cq_list; ++i) {
-        cq_list_[i] = ibv_create_cq(context_, max_cqe, this /* CQ context */,
-                                    compChannel(), compVector());
-        if (!cq_list_[i]) {
+        auto cq =
+            ibv_create_cq(context_, max_cqe,
+                          (void *)&cq_list_[i].outstanding /* CQ context */,
+                          compChannel(), compVector());
+        if (!cq) {
             PLOG(ERROR) << "Failed to create completion queue";
             close(event_fd_);
             return ERR_CONTEXT;
         }
+        cq_list_[i].native = cq;
     }
 
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
@@ -153,7 +156,7 @@ int RdmaContext::deconstruct() {
     memory_region_list_.clear();
 
     for (size_t i = 0; i < cq_list_.size(); ++i) {
-        int ret = ibv_destroy_cq(cq_list_[i]);
+        int ret = ibv_destroy_cq(cq_list_[i].native);
         if (ret) {
             PLOG(ERROR) << "Failed to destroy completion queue";
         }
@@ -284,6 +287,10 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     return nullptr;
 }
 
+int RdmaContext::disconnectAllEndpoints() {
+    return endpoint_store_->disconnectQPs();
+}
+
 int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
@@ -306,7 +313,7 @@ std::string RdmaContext::gid() const {
 
 ibv_cq *RdmaContext::cq() {
     int index = (next_cq_list_index_++) % cq_list_.size();
-    return cq_list_[index];
+    return cq_list_[index].native;
 }
 
 ibv_comp_channel *RdmaContext::compChannel() {
@@ -494,7 +501,7 @@ int RdmaContext::joinNonblockingPollList(int event_fd, int data_fd) {
 }
 
 int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
-    int nr_poll = ibv_poll_cq(cq_list_[cq_index], num_entries, wc);
+    int nr_poll = ibv_poll_cq(cq_list_[cq_index].native, num_entries, wc);
     if (nr_poll < 0) {
         LOG(ERROR) << "Failed to poll CQ " << cq_index << " of device "
                    << device_name_;

@@ -106,6 +106,13 @@ int FIFOEndpointStore::destroyQPs() {
     return 0;
 }
 
+int FIFOEndpointStore::disconnectQPs() {
+    for (auto &kv : endpoint_map_) {
+        kv.second->disconnect();
+    }
+    return 0;
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     std::string peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
@@ -209,6 +216,12 @@ void SIEVEEndpointStore::reclaimEndpoint() {
 int SIEVEEndpointStore::destroyQPs() {
     for (auto &endpoint : waiting_list_) endpoint->destroyQP();
     for (auto &kv : endpoint_map_) kv.second.first->destroyQP();
+    return 0;
+}
+
+int SIEVEEndpointStore::disconnectQPs() {
+    for (auto &endpoint : waiting_list_) endpoint->disconnect();
+    for (auto &kv : endpoint_map_) kv.second.first->disconnect();
     return 0;
 }
 
