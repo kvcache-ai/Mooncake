@@ -25,8 +25,9 @@ using namespace mooncake;
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port) {
-    TransferEngine *native = new TransferEngine();
+                                       uint64_t rpc_port,
+                                       int auto_discover) {
+    TransferEngine *native = new TransferEngine(auto_discover);
     int ret = native->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
     if (ret) {
