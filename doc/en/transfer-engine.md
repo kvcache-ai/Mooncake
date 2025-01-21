@@ -283,7 +283,7 @@ Registers a space starting at address `addr` with a length of `size` on the loca
 
 - `addr`: The starting address of the registration space;
 - `size`: The length of the registration space;
-- `location`: The `device` corresponding to this memory segment, such as `cuda:0` indicating the GPU device, `cpu:0` indicating the CPU socket, by matching with the network card priority order table (see `installTransport`), the preferred network card is identified.
+- `location`: The `device` corresponding to this memory segment, such as `cuda:0` indicating the GPU device, `cpu:0` indicating the CPU socket, by matching with the network card priority order table (see `installTransport`), the preferred network card is identified. You can also use `*`, Transfer Engine will try to automatically recognize the `device` corresponding to `addr`, if it fails to recognize the device, it will print a `WARNING` level log and use all network cards, no preferred network cards.
 - `remote_accessible`: Indicates whether this memory can be accessed by remote nodes.
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 

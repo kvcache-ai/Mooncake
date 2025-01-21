@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "memory_location.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -88,9 +89,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    buffer_desc.name = name;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
@@ -100,9 +98,28 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         buffer_desc.lkey.push_back(context->lkey(addr));
         buffer_desc.rkey.push_back(context->rkey(addr));
     }
-    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
 
-    if (rc) return rc;
+    // Get the memory location automatically after registered MR(pinned),
+    // when the name is "*".
+    if (name == "*") {
+        const std::vector<MemoryLocationEntry> entries =
+            getMemoryLocation(addr, length);
+        for (auto &entry : entries) {
+            buffer_desc.name = entry.location;
+            buffer_desc.addr = entry.start;
+            buffer_desc.length = entry.len;
+            int rc =
+                metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+            if (rc) return rc;
+        }
+    } else {
+        buffer_desc.name = name;
+        buffer_desc.addr = (uint64_t)addr;
+        buffer_desc.length = length;
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+
+        if (rc) return rc;
+    }
 
     return 0;
 }
