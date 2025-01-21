@@ -90,22 +90,34 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     void *start = (void *)((uint64_t)addr + 1024 * 2);
 
     auto entries = mooncake::getMemoryLocation(start, size - 1024 * 4);
-    ASSERT_EQ(entries.size(), 3);
 
-    // check the first memory location
-    EXPECT_EQ(entries[0].start, (uint64_t)start);
-    EXPECT_EQ(entries[0].location, locationb);
-    EXPECT_EQ(entries[0].len, 4096 * 2 - 1024 * 2);
+    if (nodea == nodeb) {
+        // only one numa node
+        ASSERT_EQ(entries.size(), 1);
 
-    // check the second memory location
-    EXPECT_EQ(entries[1].start, (uint64_t)addr + 4096 * 2);
-    EXPECT_EQ(entries[1].location, locationa);
-    EXPECT_EQ(entries[1].len, 4096 * 7);
+        // check the first memory location
+        EXPECT_EQ(entries[0].start, (uint64_t)start);
+        EXPECT_EQ(entries[0].location, locationa);
+        EXPECT_EQ(entries[0].len, size - 1024 * 4);
 
-    // check the third memory location
-    EXPECT_EQ(entries[2].start, (uint64_t)addr + 4096 * 9);
-    EXPECT_EQ(entries[2].location, locationb);
-    EXPECT_EQ(entries[2].len, 4096 - 1024 * 2);
+    } else {
+        ASSERT_EQ(entries.size(), 3);
+
+        // check the first memory location
+        EXPECT_EQ(entries[0].start, (uint64_t)start);
+        EXPECT_EQ(entries[0].location, locationb);
+        EXPECT_EQ(entries[0].len, 4096 * 2 - 1024 * 2);
+
+        // check the second memory location
+        EXPECT_EQ(entries[1].start, (uint64_t)addr + 4096 * 2);
+        EXPECT_EQ(entries[1].location, locationa);
+        EXPECT_EQ(entries[1].len, 4096 * 7);
+
+        // check the third memory location
+        EXPECT_EQ(entries[2].start, (uint64_t)addr + 4096 * 9);
+        EXPECT_EQ(entries[2].location, locationb);
+        EXPECT_EQ(entries[2].len, 4096 - 1024 * 2);
+    }
 
     numa_free(addr, size);
 }
