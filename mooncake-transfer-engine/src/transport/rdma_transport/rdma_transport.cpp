@@ -198,7 +198,15 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
         ++task_id;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            std::unique_ptr<Slice> slice;
+            try {
+                slice = std::make_unique<Slice>();
+            } catch (std::exception &e) {
+                LOG(ERROR) << "RdmaTransport: Failed to allocate memory for "
+                              "slice, error: "
+                           << e.what();
+                return ERR_MEMORY;
+            }
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -250,7 +258,15 @@ int RdmaTransport::submitTransferTask(
         auto &task = *task_list[index];
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            std::unique_ptr<Slice> slice;
+            try {
+                slice = std::make_unique<Slice>();
+            } catch (std::exception &e) {
+                LOG(ERROR) << "RdmaTransport: Failed to allocate memory for "
+                              "slice, error: "
+                           << e.what();
+                return ERR_MEMORY;
+            }
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -273,7 +289,6 @@ int RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                // task.slices.push_back(slice);
                 task.slice_count += 1;
                 break;
             }

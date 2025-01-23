@@ -229,17 +229,26 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
                                      TransferRequest::OpCode op,
                                      TransferTask &task,
                                      const char *file_path) {
-    Slice *slice = new Slice();
-    slice->source_addr = (char *)source_addr;
-    slice->length = slice_len;
-    slice->opcode = op;
-    slice->nvmeof.file_path = file_path;
-    slice->nvmeof.start = target_start;
-    slice->task = &task;
-    slice->status = Slice::PENDING;
-    task.total_bytes += slice->length;
-    task.slice_count += 1;
-    // task.slices.push_back(slice);
+    if (!source_addr || !file_path) {
+        LOG(ERROR) << "Invalid source address or file path";
+        return;
+    }
+
+    try{
+        Slice *slice = std::make_unique<Slice>();
+        slice->source_addr = (char *)source_addr;
+        slice->length = slice_len;
+        slice->opcode = op;
+        slice->nvmeof.file_path = file_path;
+        slice->nvmeof.start = target_start;
+        slice->task = &task;
+        slice->status = Slice::PENDING;
+        task.total_bytes += slice->length;
+        task.slice_count += 1;
+    }catch (std::exception &e) {
+        LOG(ERROR) << "RdmaTransport: Failed to allocate memory for
+                              "slice: " << e.what();
+    }
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(

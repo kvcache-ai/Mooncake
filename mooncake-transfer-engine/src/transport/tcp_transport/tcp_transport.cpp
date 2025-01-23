@@ -305,7 +305,15 @@ int TcpTransport::submitTransfer(BatchID batch_id,
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        std::unique_ptr<Slice> slice;
+        try {
+            slice = std::make_unique<Slice>();
+        } catch (std::exception &e) {
+            LOG(ERROR) << "RdmaTransport: Failed to allocate memory for "
+                            "slice, error: "
+                        << e.what();
+            return ERR_MEMORY;
+        }
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -313,7 +321,7 @@ int TcpTransport::submitTransfer(BatchID batch_id,
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task->slice_count += 1;
+        task.slice_count += 1;
         startTransfer(slice);
     }
 
@@ -327,7 +335,15 @@ int TcpTransport::submitTransferTask(
         auto &request = *request_list[index];
         auto &task = *task_list[index];
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        std::unique_ptr<Slice> slice;
+        try {
+            slice = std::make_unique<Slice>();
+        } catch (std::exception &e) {
+            LOG(ERROR) << "RdmaTransport: Failed to allocate memory for "
+                            "slice, error: "
+                        << e.what();
+            return ERR_MEMORY;
+        }
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -335,7 +351,7 @@ int TcpTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task->slice_count += 1;
+        task.slice_count += 1;
         startTransfer(slice);
     }
     return 0;
