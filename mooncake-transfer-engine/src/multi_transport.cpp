@@ -110,7 +110,7 @@ int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
     if (success_slice_count + failed_slice_count ==
-        (uint64_t)task.slices.size()) {
+        task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
         } else {
