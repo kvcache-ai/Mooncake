@@ -272,7 +272,7 @@ int initiator() {
     LOG_ASSERT(!rc);
 #else
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "*");
     LOG_ASSERT(!rc);
 #endif
 
