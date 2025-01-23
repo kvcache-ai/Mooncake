@@ -71,7 +71,8 @@ func NewTransferEngine(metadata_uri string, local_server_name string, nic_priori
 	defer C.free(unsafe.Pointer(localServerName))
 	defer C.free(unsafe.Pointer(connectableName))
 
-	native_engine := C.createTransferEngine(metadataUri, localServerName, connectableName, C.uint64_t(rpc_port))
+	auto_discover := 0 // disable auto_discover
+	native_engine := C.createTransferEngine(metadataUri, localServerName, connectableName, C.uint64_t(rpc_port), C.uint64_t(auto_discover))
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
