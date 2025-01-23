@@ -253,7 +253,7 @@ int registerLocalMemory(void *addr, size_t size, string location, bool remote_ac
 
 - `addr`: 注册空间起始地址；
 - `size`：注册空间长度；
-- `location`: 这一段内存对应的 `device`，比如 `cuda:0` 表示对应 GPU 设备，`cpu:0` 表示对应 CPU socket，通过和网卡优先级顺序表（见`installTransport`） 匹配，识别优选的网卡。
+- `location`: 这一段内存对应的 `device`，比如 `cuda:0` 表示对应 GPU 设备，`cpu:0` 表示对应 CPU socket，通过和网卡优先级顺序表（见`installTransport`） 匹配，识别优选的网卡。 也可以使用 `*`，Transfer Engine 会尽量自动识别 `addr` 对应的 `device`，如果识别失败，将打印 `WARNING` 级别日志，并且使用全部的网卡，不再区分优选网卡。
 - `remote_accessible`: 标识这一块内存能否被远端节点访问。
 - 返回值：若成功，返回 0；否则返回负数值。
 

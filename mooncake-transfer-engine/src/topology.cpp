@@ -264,7 +264,8 @@ Json::Value Topology::toJson() const {
 }
 
 int Topology::selectDevice(const std::string storage_type, int retry_count) {
-    if (!resolved_matrix_.count(storage_type)) return ERR_DEVICE_NOT_FOUND;
+    if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
+
     auto &entry = resolved_matrix_[storage_type];
     if (retry_count == 0) {
         int rand_value = SimpleRandom::Get().next();
@@ -294,6 +295,9 @@ int Topology::resolve() {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
+
+                // "*" means any device
+                resolved_matrix_["*"].preferred_hca.push_back(hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].preferred_hca.push_back(
                 hca_id_map[hca]);
@@ -303,6 +307,9 @@ int Topology::resolve() {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
+
+                // "*" means any device
+                resolved_matrix_["*"].preferred_hca.push_back(hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
         }
