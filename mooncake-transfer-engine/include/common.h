@@ -61,8 +61,7 @@ static inline int bindToSocket(int socket_id) {
         }
     }
     numa_free_cpumask(cpu_list);
-    if (nr_cpus == 0)
-        return 0;
+    if (nr_cpus == 0) return 0;
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set)) {
         LOG(ERROR) << "Failed to set socket affinity";
         return ERR_NUMA;
