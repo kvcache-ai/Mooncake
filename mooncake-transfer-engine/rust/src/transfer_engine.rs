@@ -81,6 +81,7 @@ impl TransferEngine {
                 local_server_name_c.as_ptr(),
                 local_server_name_c.as_ptr(),
                 rpc_port,
+                0, // disable auto_discover
             )
         };
         if engine.is_null() {
