@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "memory_location.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -88,9 +89,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    buffer_desc.name = name;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
@@ -100,9 +98,28 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         buffer_desc.lkey.push_back(context->lkey(addr));
         buffer_desc.rkey.push_back(context->rkey(addr));
     }
-    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
 
-    if (rc) return rc;
+    // Get the memory location automatically after registered MR(pinned),
+    // when the name is "*".
+    if (name == "*") {
+        const std::vector<MemoryLocationEntry> entries =
+            getMemoryLocation(addr, length);
+        for (auto &entry : entries) {
+            buffer_desc.name = entry.location;
+            buffer_desc.addr = entry.start;
+            buffer_desc.length = entry.len;
+            int rc =
+                metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+            if (rc) return rc;
+        }
+    } else {
+        buffer_desc.name = name;
+        buffer_desc.addr = (uint64_t)addr;
+        buffer_desc.length = length;
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+
+        if (rc) return rc;
+    }
 
     return 0;
 }
@@ -185,7 +202,7 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
         return ERR_TOO_MANY_REQUESTS;
     }
 
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<std::unique_ptr<Slice>>>
         slices_to_post;
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
@@ -229,7 +246,7 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task->slice_count++;
+                task.slice_count++;
                 break;
             }
             if (device_id < 0) {
@@ -248,7 +265,7 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
 int RdmaTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<std::unique_ptr<Slice>>>
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     const size_t kBlockSize = globalConfig().slice_size;

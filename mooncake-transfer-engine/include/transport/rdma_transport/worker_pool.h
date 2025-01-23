@@ -56,7 +56,7 @@ class WorkerPool {
     std::mutex cond_mutex_;
     std::condition_variable cond_var_;
 
-    using SliceList = std::vector<Transport::Slice *>;
+    using SliceList = std::vector<std::unique_ptr<Transport::Slice>>;
 
     const static int kShardCount = 8;
     std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
