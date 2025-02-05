@@ -125,6 +125,7 @@ class RdmaEndPoint {
     int max_wr_depth_;
 
     volatile bool active_;
+    volatile int *cq_outstanding_;
 };
 
 }  // namespace mooncake

@@ -27,7 +27,10 @@ const static uint8_t TIMEOUT = 14;
 const static uint8_t RETRY_CNT = 7;
 
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
-    : context_(context), status_(INITIALIZING), active_(true) {}
+    : context_(context),
+      status_(INITIALIZING),
+      active_(true),
+      cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
     if (!qp_list_.empty()) deconstruct();
@@ -42,6 +45,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
+    cq_outstanding_ = (volatile int *)cq->cq_context;
 
     max_wr_depth_ = (int)max_wr_depth;
     wr_depth_list_ = new volatile int[num_qp_list];
@@ -224,7 +228,9 @@ int RdmaEndPoint::submitPostSend(
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());
-    if (wr_count == 0) return 0;
+    wr_count =
+        std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
+    if (wr_count <= 0) return 0;
 
     ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
     ibv_sge sge_list[wr_count];
@@ -258,6 +264,7 @@ int RdmaEndPoint::submitPostSend(
         // }
     }
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
+    __sync_fetch_and_add(cq_outstanding_, wr_count);
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
         PLOG(ERROR) << "Failed to ibv_post_send";
@@ -265,6 +272,7 @@ int RdmaEndPoint::submitPostSend(
             int i = bad_wr - wr_list;
             failed_slice_list.push_back(slice_list[i]);
             __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
+            __sync_fetch_and_sub(cq_outstanding_, 1);
             bad_wr = bad_wr->next;
         }
     }

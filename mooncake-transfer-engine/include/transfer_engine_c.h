@@ -96,7 +96,8 @@ typedef void *transport_t;
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port);
+                                       uint64_t rpc_port,
+                                       int auto_discover);
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args);
