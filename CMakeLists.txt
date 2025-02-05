@@ -56,6 +56,10 @@ if (USE_ETCD)
   message(STATUS "etcd as metadata server support is disabled")
 endif()
 
+if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
+  message(FATAL_ERROR "Please enable at least one metadata type: USE_ETCD, USE_REDIS, or USE_HTTP")
+endif()
+
 add_subdirectory(mooncake-transfer-engine)
 
 include_directories(mooncake-transfer-engine/include)
