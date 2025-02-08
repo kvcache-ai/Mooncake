@@ -129,12 +129,9 @@ class Transport {
     };
 
     struct TransferTask {
-        ~TransferTask() {
-            for (auto &entry : slices) delete entry;
-            slices.clear();
-        }
 
-        std::vector<Slice *> slices;
+
+        volatile uint64_t slice_count   = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;

@@ -180,9 +180,9 @@ int NVMeoFTransport::submitTransfer(
 
         nvmeof_desc.transfer_status.push_back(
             TransferStatus{.s = PENDING, .transferred_bytes = 0});
-        nvmeof_desc.task_to_slices.push_back({slice_id, task.slices.size()});
+        nvmeof_desc.task_to_slices.push_back({slice_id, task.slice_count});
         ++task_id;
-        slice_id += task.slices.size();
+        slice_id += task.slice_count;
     }
 
     desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
@@ -229,6 +229,10 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
                                      TransferRequest::OpCode op,
                                      TransferTask &task,
                                      const char *file_path) {
+    if (!source_addr || !file_path) {
+        LOG(ERROR) << "Invalid source_addr or file_path";
+        return;
+    }
     Slice *slice = new Slice();
     slice->source_addr = (char *)source_addr;
     slice->length = slice_len;
@@ -238,7 +242,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     slice->task = &task;
     slice->status = Slice::PENDING;
     task.total_bytes += slice->length;
-    task.slices.push_back(slice);
+    task.slice_count += 1;
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(

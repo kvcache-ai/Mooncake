@@ -238,7 +238,7 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task.slices.push_back(slice);
+                task.slice_count++;
                 break;
             }
             if (device_id < 0) {
@@ -290,7 +290,8 @@ int RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task.slices.push_back(slice);
+                // task.slices.push_back(slice);
+                task.slice_count += 1;
                 break;
             }
             if (device_id < 0) {
@@ -317,7 +318,7 @@ int RdmaTransport::getTransferStatus(BatchID batch_id,
         uint64_t success_slice_count = task.success_slice_count;
         uint64_t failed_slice_count = task.failed_slice_count;
         if (success_slice_count + failed_slice_count ==
-            (uint64_t)task.slices.size()) {
+            task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
@@ -340,7 +341,7 @@ int RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
     if (success_slice_count + failed_slice_count ==
-        (uint64_t)task.slices.size()) {
+        task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
         else
