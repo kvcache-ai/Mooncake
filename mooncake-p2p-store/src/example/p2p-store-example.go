@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"syscall"
 	"time"
@@ -27,20 +28,26 @@ import (
 )
 
 var (
-	command         string
-	metadataServer  string
-	localServerName string
-	fileSize        int
+	command               string
+	metadataServer        string
+	localServerName       string
+	deviceName            string
+	nicPriorityMatrixPath string
+	fileSize              int
+	fileSizeMB            int
 )
 
 func main() {
 	flag.StringVar(&command, "cmd", "trainer", "Command: trainer|inferencer")
 	flag.StringVar(&metadataServer, "metadata_server", "localhost:2379", "Metadata server address")
 	flag.StringVar(&localServerName, "local_server_name", "", "Local server name")
-	flag.IntVar(&fileSize, "file_size_mb", 2048, "File size in MB")
+	flag.StringVar(&deviceName, "device_name", "mlx5_2", "RNIC device name")
+	flag.StringVar(&nicPriorityMatrixPath, "nic_priority_matrix", "", "Path to NIC priority matrix file (Advanced)")
+	flag.IntVar(&fileSizeMB, "file_size_mb", 2048, "File size in MB")
 	flag.Parse()
 
-	fileSize = fileSize * 1024 * 1024
+	fileSize = fileSizeMB * 1024 * 1024
+
 	if len(localServerName) == 0 {
 		var err error
 		localServerName, err = os.Hostname()
@@ -56,7 +63,7 @@ func main() {
 	case "inferencer":
 		inferencer()
 	default:
-		fmt.Printf("Invalid command: %s\n", command)
+		fmt.Printf("You must specify a command, either 'trainer' or 'inferencer'\n")
 		os.Exit(1)
 	}
 }
@@ -68,18 +75,30 @@ func doTrainer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("After training, register new object:", name, "file size:", fileSize)
+	fmt.Printf("Object registration: name %s base address %x file size %d MB\n",
+		name,
+		uintptr(unsafe.Pointer(&addr[0])),
+		fileSizeMB)
+
 	startTimestamp := time.Now()
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
 	sizeList := []uint64{uint64(fileSize)}
-	err = store.Register(ctx, name, addrList, sizeList, 64*1024*1024, "cpu:0")
+
+	const MAX_SHARD_SIZE uint64 = 64 * 1024 * 1024
+	const MEMORY_LOCATION string = "cpu:0"
+
+	err = store.Register(ctx, name, addrList, sizeList, MAX_SHARD_SIZE, MEMORY_LOCATION, true)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Register failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Object registration failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	phaseOneTimestamp := time.Now()
-	fmt.Println("Register done, duration (ms):", phaseOneTimestamp.Sub(startTimestamp).Milliseconds())
+	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
+
+	fmt.Printf("Object registration done: duration (ms) %d throughput (GB/s) %.2f\n",
+		duration,
+		float64(fileSizeMB)/float64(duration))
 
 	checkpointInfoList, err := store.List(ctx, "foo")
 	if err != nil {
@@ -88,7 +107,7 @@ func doTrainer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 	}
 
 	fmt.Println(checkpointInfoList)
-	fmt.Println("Idle for 100 seconds")
+	fmt.Println("Idle for 100 seconds, now you can start another terminal to simulate inference")
 	time.Sleep(100 * time.Second)
 
 	err = store.Unregister(ctx, name)
@@ -104,12 +123,13 @@ func doTrainer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 }
 
 func trainer() {
+	fmt.Println("Simulated training process started")
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating checkpoint engine: %v\n", err)
+		fmt.Fprintf(os.Stderr, "P2PStore: initialization failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -117,11 +137,24 @@ func trainer() {
 
 	err = store.Close()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Shutdown failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "P2PStore: close failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("ALL DONE")
+	fmt.Println("Simulated training process stopped gracefully")
+}
+
+func getPriorityMatrix() string {
+	if len(nicPriorityMatrixPath) != 0 {
+		data, err := ioutil.ReadFile(nicPriorityMatrixPath)
+		if err != nil {
+			fmt.Println("Error reading file:", err)
+			os.Exit(1)
+		}
+		return string(data)
+	} else {
+		return "{ \"cpu:0\": [[\"" + deviceName + "\"], []]}"
+	}
 }
 
 func doInferencer(ctx context.Context, store *p2pstore.P2PStore, name string) {
@@ -131,18 +164,22 @@ func doInferencer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("Expecting to retrieve from object", name)
+	fmt.Println("Object retrival started: name", name)
 	startTimestamp := time.Now()
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
 	sizeList := []uint64{uint64(fileSize)}
 	err = store.GetReplica(ctx, name, addrList, sizeList)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "GetLocalCheckpoint failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Object retrival failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	phaseOneTimestamp := time.Now()
-	fmt.Println("GetReplica done, duration (ms):", phaseOneTimestamp.Sub(startTimestamp).Milliseconds())
+	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
+
+	fmt.Printf("Object retrival done: duration (ms) %d throughput (GB/s) %.2f\n",
+		duration,
+		float64(fileSizeMB)/float64(duration))
 
 	err = store.DeleteReplica(ctx, name)
 	if err != nil {
@@ -157,21 +194,24 @@ func doInferencer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 }
 
 func inferencer() {
+	fmt.Println("Simulated inference process started")
+
 	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
 	defer cancel()
 
-	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, "")
+	store, err := p2pstore.NewP2PStore(metadataServer, localServerName, getPriorityMatrix())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating checkpoint engine: %v\n", err)
+		fmt.Fprintf(os.Stderr, "P2PStore: initialization failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	doInferencer(ctx, store, "foo/bar")
+
 	err = store.Close()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Shutdown failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "P2PStore: close failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("ALL DONE")
+	fmt.Println("Simulated inference process stopped gracefully")
 }

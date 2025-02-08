@@ -106,6 +106,8 @@ int uninstallTransport(transfer_engine_t engine, const char *proto);
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name);
 
+segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_name);
+
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
 
 void destroyTransferEngine(transfer_engine_t engine);

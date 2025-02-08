@@ -21,7 +21,7 @@ import (
 	"math/rand"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // key = payload_name
@@ -70,6 +70,10 @@ func (s *Shard) GetLocation(retryTimes int) *Location {
 	}
 }
 
+func (s *Shard) Count() int {
+	return len(s.ReplicaList) + len(s.Gold)
+}
+
 func (s *Shard) getRandomLocation() *Location {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	if len(s.ReplicaList) > 0 {
@@ -107,9 +111,9 @@ type Metadata struct {
 	keyPrefix  string
 }
 
-func NewMetadata(metadataUri string, keyPrefix string) (*Metadata, error) {
+func NewMetadata(metadataConnString string, keyPrefix string) (*Metadata, error) {
 	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{metadataUri},
+		Endpoints:   []string{metadataConnString},
 		DialTimeout: 5 * time.Second,
 	})
 

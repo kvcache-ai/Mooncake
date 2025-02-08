@@ -36,7 +36,7 @@ func NewRegisteredMemory(transferEngine *TransferEngine, maxChunkSize uint64) *R
 	return &RegisteredMemory{engine: transferEngine, maxChunkSize: maxChunkSize}
 }
 
-// Register memory region [addr, addr + length]. If the address has been registered, the reference count is incremented. 
+// Register memory region [addr, addr + length]. If the address has been registered, the reference count is incremented.
 // Registration of intersecting (but inconsistent) memory regions is not supported.
 func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize uint64, location string) error {
 	if memory.maxChunkSize == 0 || memory.maxChunkSize%maxShardSize != 0 {
