@@ -1,0 +1,25 @@
+{
+  "name": "Mooncake Dev",
+  "dockerFile": "Dockerfile",
+  "runArgs": [
+    "--cap-add=SYS_PTRACE",
+    "--cap-add=NET_RAW",
+    "--cap-add=NET_ADMIN",
+    "--security-opt=seccomp=unconfined",
+    "--volume=${env:HOME}:${env:HOME}",
+    "--network=host",
+    // Uncomment next line if you have devcontainer.env
+    // "--env-file=.devcontainer/devcontainer.env"
+  ],
+  "containerEnv": {
+    "SRCDIR": "${containerWorkspaceFolder}",
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash",
+        "bazel.buildifierFixOnFormat": true,
+      }
+    }
+  }
+}
