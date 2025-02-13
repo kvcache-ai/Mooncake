@@ -42,7 +42,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #endif
 
 const static int NR_SOCKETS =
-    numa_available() ? numa_num_configured_nodes() : 1;
+    numa_available() == 0 ? numa_num_configured_nodes() : 1;
 
 static std::string getHostname();
 
@@ -295,11 +295,14 @@ int initiator() {
                     (stop_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
     auto batch_count = total_batch_count.load();
 
+    LOG(INFO) << "numa node num: " << NR_SOCKETS;
+
     LOG(INFO) << "Test completed: duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "
               << batch_count << ", throughput "
               << (batch_count * FLAGS_batch_size * FLAGS_block_size) /
-                     duration / 1000000000.0;
+                     duration / 1000000000.0
+              << " GB/s";
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
@@ -339,6 +342,8 @@ int target() {
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
     }
+
+    LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (true) sleep(1);
 
