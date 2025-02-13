@@ -1,7 +1,10 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(transport)
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+add_library(transfer_engine SHARED ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+install(TARGETS transfer_engine DESTINATION lib)
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
 if (USE_ETCD)
@@ -20,8 +23,7 @@ if (USE_HTTP)
 endif()
 target_link_libraries(transfer_engine PUBLIC transport rdma_transport ibverbs glog gflags pthread jsoncpp numa)
 
-if (USE_CUDA)  
+if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
   target_link_libraries(transfer_engine PUBLIC nvmeof_transport cuda cufile cudart rt)
 endif()
-
