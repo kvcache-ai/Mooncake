@@ -29,6 +29,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <infiniband/verbs.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,20 +45,17 @@ struct InfinibandDevice {
 };
 
 static std::vector<InfinibandDevice> listInfiniBandDevices() {
-    DIR *dir = opendir("/sys/class/infiniband");
-    struct dirent *entry;
+    int num_devices = 0;
     std::vector<InfinibandDevice> devices;
 
-    if (dir == NULL) {
-        PLOG(WARNING) << "Failed to open /sys/class/infiniband";
+    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
+    if (!device_list || num_devices <= 0) {
+        LOG(WARNING) << "No IB devices found";
         return {};
     }
-    while ((entry = readdir(dir))) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
 
-        std::string device_name = entry->d_name;
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = ibv_get_device_name(device_list[i]);
 
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
@@ -65,7 +63,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
         // "/sys/class/infiniband/mlx5_X/" is a symlink to
         // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
-                 entry->d_name);
+                 device_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
             PLOG(ERROR) << "Failed to parse realpath";
             continue;
@@ -80,7 +78,6 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
                                            .pci_bus_id = std::move(pci_bus_id),
                                            .numa_node = numa_node});
     }
-    (void)closedir(dir);
     return devices;
 }
 
