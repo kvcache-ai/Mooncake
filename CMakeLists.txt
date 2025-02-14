@@ -27,6 +27,7 @@ add_definitions(-DCONFIG_ERDMA)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_CUDA "option for using gpu direct" OFF)
+option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
@@ -38,7 +39,16 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
+
+  if (USE_NVMEOF)
+    add_compile_definitions(USE_NVMEOF)
+    message(STATUS "NVMe-oF support is enabled")
+  endif()
+
   include_directories(/usr/local/cuda/include)
+  link_directories(/usr/local/cuda/lib)
+elseif(USE_NVMEOF)
+  message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
 endif()
 
 if (USE_REDIS)

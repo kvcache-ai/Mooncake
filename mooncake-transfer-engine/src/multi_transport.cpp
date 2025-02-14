@@ -17,7 +17,7 @@
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/tcp_transport/tcp_transport.h"
 #include "transport/transport.h"
-#ifdef USE_CUDA
+#ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
 
@@ -109,8 +109,7 @@ int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    if (success_slice_count + failed_slice_count ==
-        task.slice_count) {
+    if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
         } else {
@@ -131,7 +130,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     } else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
     }
-#ifdef USE_CUDA
+#ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
     }
