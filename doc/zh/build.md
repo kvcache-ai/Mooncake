@@ -155,3 +155,4 @@ $ pip install -e .
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: 启用 Rust 支持
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
+- `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF

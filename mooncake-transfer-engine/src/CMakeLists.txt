@@ -3,8 +3,10 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-add_library(transfer_engine SHARED ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-install(TARGETS transfer_engine DESTINATION lib)
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+if (BUILD_SHARED_LIBS)
+  install(TARGETS transfer_engine DESTINATION lib)
+endif()
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
 if (USE_ETCD)

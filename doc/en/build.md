@@ -150,3 +150,4 @@ Mooncake supports the following advanced compile options:
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust language support.
 - `-DUSE_REDIS=[ON|OFF]`: Enable Redis as metadata server in Mooncake (`hiredis` required).
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http as metadata server in Mooncake (`curl` required).
+- `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build transfer engine as shared library (default is OFF).
