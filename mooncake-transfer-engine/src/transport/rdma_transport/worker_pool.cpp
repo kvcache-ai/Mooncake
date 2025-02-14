@@ -208,11 +208,21 @@ void WorkerPool::performPostSend(int thread_id) {
             for (auto &slice : entry.second) {
                 LOG_ASSERT(slice->target_id == LOCAL_SEGMENT_ID);
 #ifdef USE_CUDA
-                cudaMemcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                           slice->length, cudaMemcpyDefault);
+                if (slice->opcode == TransferRequest::READ)
+                    cudaMemcpy(slice->source_addr,
+                               (void *)slice->rdma.dest_addr, slice->length,
+                               cudaMemcpyDefault);
+                else
+                    cudaMemcpy((void *)slice->rdma.dest_addr,
+                               slice->source_addr, slice->length,
+                               cudaMemcpyDefault);
 #else
-                memcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                       slice->length);
+                if (slice->opcode == TransferRequest::READ)
+                    memcpy(slice->source_addr, (void *)slice->rdma.dest_addr,
+                           slice->length);
+                else
+                    memcpy((void *)slice->rdma.dest_addr, slice->source_addr,
+                           slice->length);
 #endif
                 slice->markSuccess();
             }
