@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -114,6 +116,7 @@ class TransferEngine {
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
+    std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
     // Discover topology and install transports automatically when it's true.
