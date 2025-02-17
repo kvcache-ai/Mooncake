@@ -198,7 +198,7 @@ void RdmaEndPoint::disconnectUnlocked() {
     attr.qp_state = IBV_QPS_RESET;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (ret) PLOG(ERROR) << "Failed to modity QP to RESET";
+        if (ret) PLOG(ERROR) << "Failed to modify QP to RESET";
     }
     peer_nic_path_.clear();
     for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
@@ -323,7 +323,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.qp_state = IBV_QPS_RESET;
     int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (ret) {
-        std::string message = "Failed to modity QP to RESET";
+        std::string message = "Failed to modify QP to RESET";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
@@ -341,7 +341,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         std::string message =
-            "Failed to modity QP to INIT, check local context port num";
+            "Failed to modify QP to INIT, check local context port num";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
@@ -381,7 +381,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
         std::string message =
-            "Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp num";
+            "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
@@ -400,7 +400,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
-        std::string message = "Failed to modity QP to RTS";
+        std::string message = "Failed to modify QP to RTS";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
