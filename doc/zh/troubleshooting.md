@@ -47,7 +47,7 @@
 2. 显示 `Device XXX port not active` 错误，表明对应设备的默认 RDMA Port（RDMA 设备端口，需要和 `rpc_port` TCP 端口区分开）没有处于 ACTIVE 状态，这通常是因为 RDMA 网线没有安装好，或者驱动程序没有配置好所致。可使用 `MC_IB_PORT` 环境变量变更默认使用的 RDMA Port。
 3. 显示 `Failed to exchange handshake description` 错误，表明通信双方无法建立 RDMA 可靠连接通路。在大多数情况下，通常是因为某一方配置有误，或者双方本身无法通达所致。首先使用 `ib_send_bw` 等工具确认两个节点的可通达性，并留意输出的 GID、LID、MTU 等参数信息，之后对照报错信息分析可能的出错点：
     1. 在启动后输出日志通常包含数行形如 `RDMA device: XXX, LID: XXX, GID: (X) XX:XX:XX:...` 的日志信息。如果显示的 GID 地址全部为 0（括号内表示 GID Index），则需要结合网络环境选择正确的 GID Index，启动时使用使用 `MC_GID_INDEX` 环境变量加以指定。
-    2. 显示 `Failed to modity QP to RTR, check mtu, gid, peer lid, peer qp num` 错误，首先需要确定发生错误的是哪一方，没有显示 `Handshake request rejected by peer endpoint: ` 前缀的就表明问题来自显示错误的一方。按照错误提示指引，需要检查 MTU 长度配置（使用 `MC_MTU` 环境变量调节）、自己及对方的 GID 地址是否有效等。同时，如果两个节点无法实现物理连接，也可能会在这一步中断，敬请留意。
+    2. 显示 `Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num` 错误，首先需要确定发生错误的是哪一方，没有显示 `Handshake request rejected by peer endpoint: ` 前缀的就表明问题来自显示错误的一方。按照错误提示指引，需要检查 MTU 长度配置（使用 `MC_MTU` 环境变量调节）、自己及对方的 GID 地址是否有效等。同时，如果两个节点无法实现物理连接，也可能会在这一步中断，敬请留意。
 
 ## RDMA 传输期间
 ### 建议排查方向
