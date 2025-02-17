@@ -43,7 +43,7 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
-    TransferEngine(bool auto_discover = true)
+    TransferEngine(bool auto_discover = false)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover) {}
@@ -95,7 +95,9 @@ class TransferEngine {
         return multi_transports_->getTransferStatus(batch_id, task_id, status);
     }
 
-    int syncSegmentCache() { return metadata_->syncSegmentCache(); }
+    int syncSegmentCache(const std::string &segment_name = "") {
+        return metadata_->syncSegmentCache(segment_name);
+    }
 
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
