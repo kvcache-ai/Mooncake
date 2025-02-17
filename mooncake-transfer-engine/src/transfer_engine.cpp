@@ -77,6 +77,12 @@ Transport *TransferEngine::installTransport(const std::string &proto,
 
     transport = multi_transports_->installTransport(proto, local_topology_);
     if (!transport) return nullptr;
+
+    // Since installTransport() is only called once during initialization
+    // and is not expected to be executed concurrently, we do not acquire a
+    // shared lock here. If future modifications allow installTransport() to be
+    // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
+    // added to ensure thread safety.
     for (auto &entry : local_memory_regions_) {
         int ret = transport->registerLocalMemory(
             entry.addr, entry.length, entry.location, entry.remote_accessible);
@@ -100,6 +106,7 @@ Transport::SegmentHandle TransferEngine::openSegment(
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
 
 bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     for (auto &local_memory_region : local_memory_regions_) {
         if (overlap(addr, length, local_memory_region.addr,
                     local_memory_region.length)) {
@@ -123,6 +130,8 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) return ret;
     }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     local_memory_regions_.push_back(
         {addr, length, location, remote_accessible});
     return 0;
@@ -133,6 +142,8 @@ int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
         if (ret) return ret;
     }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto it = local_memory_regions_.begin();
          it != local_memory_regions_.end(); ++it) {
         if (it->addr == addr) {
@@ -156,6 +167,8 @@ int TransferEngine::registerLocalMemoryBatch(
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret < 0) return ret;
     }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto &buffer : buffer_list) {
         local_memory_regions_.push_back(
             {buffer.addr, buffer.length, location, true});
@@ -169,6 +182,8 @@ int TransferEngine::unregisterLocalMemoryBatch(
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
         if (ret < 0) return ret;
     }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto &addr : addr_list) {
         for (auto it = local_memory_regions_.begin();
              it != local_memory_regions_.end(); ++it) {
