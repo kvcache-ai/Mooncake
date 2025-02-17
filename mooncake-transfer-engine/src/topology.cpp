@@ -217,7 +217,7 @@ int Topology::parse(const std::string &topology_json) {
     Json::Reader reader;
 
     if (topology_json.empty() || !reader.parse(topology_json, root)) {
-        LOG(ERROR) << "Topology: malformed json format";
+        LOG(ERROR) << "Topology: malformed json format: " << topology_json;
         return ERR_MALFORMED_JSON;
     }
 
