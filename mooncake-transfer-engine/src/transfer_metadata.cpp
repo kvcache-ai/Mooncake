@@ -406,13 +406,13 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port) {
     return handshake_plugin_->startDaemon(
-        [on_receive_handshake](const Json::Value &local,
-                               Json::Value &peer) -> int {
+        [on_receive_handshake](const Json::Value &peer,
+                               Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
-            TransferHandshakeUtil::decode(local, local_desc);
-            int ret = on_receive_handshake(local_desc, peer_desc);
+            TransferHandshakeUtil::decode(peer, peer_desc);
+            int ret = on_receive_handshake(peer_desc, local_desc);
             if (ret) return ret;
-            peer = TransferHandshakeUtil::encode(peer_desc);
+            local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         },
         listen_port);
