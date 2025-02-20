@@ -25,7 +25,10 @@
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
+
+#ifdef USE_NVMEOF
 #include <cufile.h>
+#endif
 
 #include <cassert>
 
@@ -36,7 +39,6 @@ static void checkCudaError(cudaError_t result, const char *message) {
         exit(EXIT_FAILURE);
     }
 }
-
 #endif
 
 #include "transfer_engine.h"

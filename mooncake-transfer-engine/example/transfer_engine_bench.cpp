@@ -30,7 +30,10 @@
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
+
+#ifdef USE_NVMEOF
 #include <cufile.h>
+#endif
 
 #include <cassert>
 
@@ -41,7 +44,6 @@ static void checkCudaError(cudaError_t result, const char *message) {
         exit(EXIT_FAILURE);
     }
 }
-
 #endif
 
 const static int NR_SOCKETS =
@@ -258,7 +260,7 @@ std::string loadNicPriorityMatrix() {
            " \"cpu:1\": [[" +
            device_names +
            "], []], "
-           " \"gpu:0\": [[" +
+           " \"cuda:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -294,7 +296,7 @@ int initiator() {
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "gpu:" : "cpu:";
+        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
         LOG_ASSERT(!rc);
