@@ -53,7 +53,7 @@ endif()
 
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
-  message(STATUS "etcd as metadata server support is disabled")
+  message(STATUS "etcd as metadata server support is enabled")
 endif()
 
 if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)

@@ -1,3 +1,3 @@
-file(GLOB CXL_SOURCES "*.cpp")
+file(GLOB TCP_SOURCES "*.cpp")
 
-add_library(tcp_transport OBJECT ${CXL_SOURCES})
+add_library(tcp_transport OBJECT ${TCP_SOURCES})
