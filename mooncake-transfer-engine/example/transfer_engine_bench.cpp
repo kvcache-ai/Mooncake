@@ -16,10 +16,13 @@
 #include <glog/logging.h>
 #include <sys/time.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <sstream>
+#include <unordered_map>
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -68,6 +71,8 @@ DEFINE_uint64(block_size, 4096, "Block size for each transfer request");
 DEFINE_int32(duration, 10, "Test duration in seconds");
 DEFINE_int32(threads, 4, "Task submission threads");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
+DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
+DEFINE_uint32(report_precision, 2, "Report precision");
 
 #ifdef USE_CUDA
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
@@ -118,6 +123,35 @@ static void freeMemoryPool(void *addr, size_t size) {
 #else
     numa_free(addr, size);
 #endif
+}
+
+const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
+    {"GB", 1000ull * 1000ull * 1000ull},
+    {"GiB", 1ull << 30},
+    {"Gb", 1000ull * 1000ull * 1000ull / 8},
+    {"MB", 1000ull * 1000ull},
+    {"MiB", 1ull << 20},
+    {"Mb", 1000ull * 1000ull / 8},
+    {"KB", 1000ull},
+    {"KiB", 1ull << 10},
+    {"Kb", 1000ull / 8}};
+
+static inline std::string calculateRate(uint64_t data_bytes, double duration) {
+    if (std::fabs(duration) < 1e-10) {
+        LOG(ERROR) << "Invalid args: duration shouldn't be 0";
+        return "";
+    }
+    if (!RATE_UNIT_MP.count(FLAGS_report_unit)) {
+        LOG(WARNING) << "Invalid flag: report_unit only support "
+                        "GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb, not support "
+                     << FLAGS_report_unit
+                     << " . Now use GB(default) as report_unit";
+        FLAGS_report_unit = "GB";
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(FLAGS_report_precision)
+        << 1.0 * data_bytes / duration / RATE_UNIT_MP.at(FLAGS_report_unit) << " " << FLAGS_report_unit << "/s";
+    return oss.str();
 }
 
 volatile bool running = true;
@@ -300,9 +334,9 @@ int initiator() {
     LOG(INFO) << "Test completed: duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "
               << batch_count << ", throughput "
-              << (batch_count * FLAGS_batch_size * FLAGS_block_size) /
-                     duration / 1000000000.0
-              << " GB/s";
+              << calculateRate(
+                     batch_count * FLAGS_batch_size * FLAGS_block_size,
+                     duration);
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
