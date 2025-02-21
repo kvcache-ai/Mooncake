@@ -32,7 +32,7 @@ TEST(ToplogyTest, TestHcaList) {
         ": [[\"erdma_0\"],[\"erdma_0\"]]}";
     topology.clear();
     topology.parse(json_str);
-    ASSERT_EQ(topology.getHcaList().size(), 1);
+    ASSERT_EQ(topology.getHcaList().size(), static_cast<size_t>(1));
     std::set<std::string> HcaList = {"erdma_0"};
     for (auto &hca : topology.getHcaList()) {
         ASSERT_TRUE(HcaList.count(hca));
@@ -46,7 +46,7 @@ TEST(ToplogyTest, TestHcaListSize) {
         ": [[\"erdma_2\"],[\"erdma_3\"]]}";
     topology.clear();
     topology.parse(json_str);
-    ASSERT_EQ(topology.getHcaList().size(), 4);
+    ASSERT_EQ(topology.getHcaList().size(), static_cast<size_t>(4));
 }
 
 TEST(ToplogyTest, TestHcaList2) {
@@ -56,7 +56,7 @@ TEST(ToplogyTest, TestHcaList2) {
         ": [[\"erdma_1\"],[\"erdma_0\"]]}";
     topology.clear();
     topology.parse(json_str);
-    ASSERT_EQ(topology.getHcaList().size(), 2);
+    ASSERT_EQ(topology.getHcaList().size(), static_cast<size_t>(2));
     std::set<std::string> HcaList = {"erdma_0", "erdma_1"};
     for (auto &hca : topology.getHcaList()) {
         ASSERT_TRUE(HcaList.count(hca));
