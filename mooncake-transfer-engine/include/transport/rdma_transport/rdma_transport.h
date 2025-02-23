@@ -113,7 +113,6 @@ class RdmaTransport : public Transport {
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
-    std::atomic<SegmentID> next_segment_id_;
     std::shared_ptr<Topology> local_topology_;
 };
 

@@ -84,7 +84,7 @@ TEST_F(TransportTest, WriteSuccess) {
     size_t testDataLen = strlen(testData);
 
     ssize_t result = writeFully(fd, testData, testDataLen);
-    EXPECT_EQ(result, testDataLen);
+    EXPECT_EQ(result, static_cast<ssize_t>(testDataLen));
 
     char buffer[256] = {0};
     ssize_t nbytes = lseek(fd, 0, SEEK_SET);
@@ -114,7 +114,7 @@ TEST_F(TransportTest, PartialWrite) {
 
     ssize_t result = writeFully(fd, testData, testDataLen / 2);
 
-    ASSERT_EQ(result, testDataLen / 2);
+    ASSERT_EQ(result, static_cast<ssize_t>(testDataLen / 2));
 
     char buffer[256] = {0};
     lseek(fd, 0, SEEK_SET);
@@ -132,7 +132,7 @@ TEST_F(TransportTest, ReadSuccess) {
     char buffer[256] = {0};
     ssize_t bytesRead = readFully(fd, buffer, sizeof(buffer));
 
-    EXPECT_EQ(bytesRead, strlen(testData));
+    EXPECT_EQ(bytesRead, static_cast<ssize_t>(strlen(testData)));
     EXPECT_STREQ(buffer, testData);
 
     close(fd);
@@ -154,7 +154,7 @@ TEST_F(TransportTest, PartialRead) {
     size_t half_len = strlen(testData) / 2;
     ssize_t bytesRead = readFully(fd, buffer, half_len);
 
-    EXPECT_EQ(bytesRead, half_len);
+    EXPECT_EQ(bytesRead, static_cast<ssize_t>(half_len));
     EXPECT_EQ(strncmp(buffer, testData, half_len), 0);
 
     close(fd);
@@ -167,7 +167,7 @@ TEST_F(TransportTest, ReadEmptyFile) {
     char buffer[256] = {0};
     ssize_t bytesRead = readFully(fd, buffer, sizeof(buffer));
 
-    EXPECT_EQ(bytesRead, 0);
+    EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
 }
