@@ -31,7 +31,7 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 namespace mooncake {
-RdmaTransport::RdmaTransport() : next_segment_id_(1) {}
+RdmaTransport::RdmaTransport() {}
 
 RdmaTransport::~RdmaTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
