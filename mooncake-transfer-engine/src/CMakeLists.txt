@@ -1,4 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+add_subdirectory(common)
 add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
