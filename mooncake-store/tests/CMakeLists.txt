@@ -1,0 +1,32 @@
+add_executable(buffer_allocator_test buffer_allocator_test.cpp)
+target_link_libraries(buffer_allocator_test PUBLIC cache_allocator cachelib_memory_allocator gtest gtest_main pthread)
+
+
+add_executable(master_service_test master_service_test.cpp)
+target_link_libraries(master_service_test PUBLIC cache_allocator cachelib_memory_allocator glog gtest gtest_main pthread)
+
+add_executable(client_integration_test client_integration_test.cpp)
+target_link_libraries(client_integration_test PUBLIC 
+    cache_allocator 
+    cachelib_memory_allocator 
+    glog 
+    gtest 
+    grpc 
+    grpc++ 
+    protobuf 
+    gtest_main 
+    pthread
+)
+
+add_executable(stress_workload_test stress_workload_test.cpp)
+target_link_libraries(stress_workload_test PUBLIC 
+    cache_allocator 
+    cachelib_memory_allocator 
+    glog 
+    gtest 
+    grpc 
+    grpc++ 
+    protobuf 
+    gtest_main 
+    pthread
+)

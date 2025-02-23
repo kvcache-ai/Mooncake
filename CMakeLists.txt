@@ -33,8 +33,21 @@ option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" OFF)
 
+option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
+
+find_package(Python3 REQUIRED Interpreter Development)
+find_package(pybind11 REQUIRED)
+set(PYTHON_EXECUTABLE "python3")
+execute_process(
+    COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
+    OUTPUT_VARIABLE PYTHON_SYS_PATH
+)
+string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
+
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 CONFIG REQUIRED) 
 
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
@@ -83,4 +96,9 @@ endif()
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be build")
+endif()
+
+if (WITH_STORE)
+  add_subdirectory(mooncake-store)
+  message(STATUS "Mooncake Store will be build")
 endif()
