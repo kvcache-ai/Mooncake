@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 
+#include "common/base/status.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -158,13 +159,14 @@ class Transport {
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
-    virtual int submitTransfer(BatchID batch_id,
+    virtual Status submitTransfer(BatchID batch_id,
                                const std::vector<TransferRequest> &entries) = 0;
 
-    virtual int submitTransferTask(
+    virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
-        return ERR_NOT_IMPLEMENTED;
+        return Status::NotImplmented(
+            "Transport::submitTransferTask is not implemented");
     }
 
     /// @brief Get the status of a submitted transfer. This function shall not

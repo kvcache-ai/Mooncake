@@ -33,29 +33,24 @@ class Status final {
   // The code of the status.
   enum class Code : uint16_t {
     kOk = 0,
-    kNotFound = 1,
-    kCorruption = 2,
-    kNotSupported = 3,
-    kInvalidArgument = 4,
-    kIOError = 5,
-    kUnknown = 6,
-    kInternalError = 7,
-    kAlreadyExists = 8,
-    kFailedPrecondition = 9,
-    kBusy = 10,
-    kTimedOut = 11,
-    kUnavailable = 12,
-    kShutdown = 13,
+    kInvalidArgument = 1,
+    kTooManyRequests = 2,
+    kAddressNotRegistered = 3,
+    kBatchBusy = 4,
+    kDeviceNotFound = 6,
+    kAddressOverlapped = 7,
+    kDns = 101,
+    kSocket = 102,
+    kMalformedJson = 103,
+    kRejectHandshake = 104,
+    kMetadata = 200,
+    kEndpoint = 201,
+    kContext = 202,
+    kNuma = 300,
+    kClock = 301,
+    kMemory = 302,
+    kNotImplmented = 999,
     kMaxCode
-  };
-
-  // The sub code of the status.
-  enum class SubCode : uint16_t {
-    kNone = 0,
-    kMetaStoreFailure = 1,
-    kRpcConnTimedOut = 2,
-    kSegmentIdMismatch = 3,
-    kMaxSubCode
   };
 
   // Builds an OK Status.
@@ -67,10 +62,6 @@ class Status final {
   // If 'code == Code::kOk', 'msg' is ignored and an object identical to an OK
   // status is constructed.
   Status(Code code, absl::string_view message);
-  // Constructs a Status object containing a status code, a subcode and a
-  // message. If 'code == Code::kOk', 'subcode' and 'message' are ignored and
-  // an object identical to an OK status is constructed.
-  Status(Code code, SubCode subcode, absl::string_view message);
 
   Status(const Status& s);
   Status& operator=(const Status& s);
@@ -79,9 +70,6 @@ class Status final {
 
   // Returns the stored status code.
   Code code() const { return code_; }
-
-  // Returns the stored status sub code.
-  SubCode subcode() const { return subcode_; }
 
   // Return the error message (if any).
   absl::string_view message() const {
@@ -95,87 +83,89 @@ class Status final {
   // Returns true if the Status is OK.
   ABSL_MUST_USE_RESULT bool ok() const { return Code::kOk == code_; }
 
-  // Returns true if the subcode of the status is set.
-  ABSL_MUST_USE_RESULT bool HasSubCode() const {
-    return SubCode::kNone != subcode_;
-  }
-
-  // Returns true iff the status indicates a NotFound error.
-  ABSL_MUST_USE_RESULT bool IsNotFound() const {
-    return Code::kNotFound == code_;
-  }
-
-  // Returns true iff the status indicates a Corruption error.
-  ABSL_MUST_USE_RESULT bool IsCorruption() const {
-    return Code::kCorruption == code_;
-  }
-
-  // Returns true iff the status indicates a NotSupported error.
-  ABSL_MUST_USE_RESULT bool IsNotSupported() const {
-    return Code::kNotSupported == code_;
-  }
-
   // Returns true iff the status indicates an InvalidArgument error.
   ABSL_MUST_USE_RESULT bool IsInvalidArgument() const {
     return Code::kInvalidArgument == code_;
   }
 
-  // Returns true iff the status indicates an IOError.
-  ABSL_MUST_USE_RESULT bool IsIOError() const {
-    return Code::kIOError == code_;
+  // Returns true iff the status indicates a TooManyRequests error.
+  ABSL_MUST_USE_RESULT bool IsTooManyRequests() const {
+    return Code::kTooManyRequests == code_;
   }
 
-  // Returns true iff the status indicates an Unknown error.
-  ABSL_MUST_USE_RESULT bool IsUnknown() const {
-    return Code::kUnknown == code_;
+  // Returns true iff the status indicates an AddressNotRegistered error.
+  ABSL_MUST_USE_RESULT bool IsAddressNotRegistered() const {
+    return Code::kAddressNotRegistered == code_;
   }
 
-  // Returns true iff the status indicates an internal error.
-  ABSL_MUST_USE_RESULT bool IsInternalError() const {
-    return Code::kInternalError == code_;
+  // Returns true iff the status indicates a BatchBusy error.
+  ABSL_MUST_USE_RESULT bool IsBatchBusy() const {
+    return Code::kBatchBusy == code_;
   }
 
-  // Returns true iff the status indicates an AlreadyExists error.
-  ABSL_MUST_USE_RESULT bool IsAlreadyExists() const {
-    return Code::kAlreadyExists == code_;
+  // Returns true iff the status indicates an DeviceNotFound error.
+  ABSL_MUST_USE_RESULT bool IsDeviceNotFound() const {
+    return Code::kDeviceNotFound == code_;
   }
 
-  // Returns true iff the status indicates a FailedPrecondition error.
-  ABSL_MUST_USE_RESULT bool IsFailedPrecondition() const {
-    return Code::kFailedPrecondition == code_;
+  // Returns true iff the status indicates an AddressOverlapped error.
+  ABSL_MUST_USE_RESULT bool IsAddressOverlapped() const {
+    return Code::kAddressOverlapped == code_;
   }
 
-  // Returns true iff the status indicates a Busy error.
-  ABSL_MUST_USE_RESULT bool IsBusy() const { return Code::kBusy == code_; }
-
-  // Returns true iff the status indicates a TimedOut error.
-  ABSL_MUST_USE_RESULT bool IsTimedOut() const {
-    return Code::kTimedOut == code_;
+  // Returns true iff the status indicates a dns error.
+  ABSL_MUST_USE_RESULT bool IsDns() const {
+    return Code::kDns == code_;
   }
 
-  // Returns true iff the status indicates a Unavailable error.
-  ABSL_MUST_USE_RESULT bool IsUnavailable() const {
-    return Code::kUnavailable == code_;
+  // Returns true iff the status indicates an Socket error.
+  ABSL_MUST_USE_RESULT bool IsSocket() const {
+    return Code::kSocket == code_;
   }
 
-  // Returns true iff the status indicates a Shutdown error.
-  ABSL_MUST_USE_RESULT bool IsShutdown() const {
-    return Code::kShutdown == code_;
+  // Returns true iff the status indicates a MalformedJson error.
+  ABSL_MUST_USE_RESULT bool IsMalformedJson() const {
+    return Code::kMalformedJson == code_;
   }
 
-  // Returns true iff the status indicates a MetaStoreFailure error.
-  ABSL_MUST_USE_RESULT bool IsMetaStoreFailure() const {
-    return IsInternalError() && SubCode::kMetaStoreFailure == subcode_;
+  // Returns true iff the status indicates a RejectHandshake error.
+  ABSL_MUST_USE_RESULT bool IsRejectHandshake() const {
+    return Code::kRejectHandshake == code_;
   }
 
-  // Returns true iff the status indicates a RpcConnTimedOut error.
-  ABSL_MUST_USE_RESULT bool IsRpcConnTimedOut() const {
-    return IsInternalError() && SubCode::kRpcConnTimedOut == subcode_;
+  // Returns true iff the status indicates a Metadata error.
+  ABSL_MUST_USE_RESULT bool IsMetadata() const {
+    return Code::kMetadata == code_;
   }
 
-  // Returns true iff the status indicates a SegmentIdMismatch error.
-  ABSL_MUST_USE_RESULT bool IsSegmentIdMismatch() const {
-    return IsFailedPrecondition() && SubCode::kSegmentIdMismatch == subcode_;
+  // Returns true iff the status indicates an Endpoint error.
+  ABSL_MUST_USE_RESULT bool IsEndpoint() const {
+    return Code::kEndpoint == code_;
+  }
+
+  // Returns true iff the status indicates a Context error.
+  ABSL_MUST_USE_RESULT bool IsContext() const {
+    return Code::kContext == code_;
+  }
+
+  // Returns true iff the status indicates a Numa error.
+  ABSL_MUST_USE_RESULT bool IsNuma() const {
+    return Code::kNuma == code_;
+  }
+
+  // Returns true iff the status indicates a Clock error.
+  ABSL_MUST_USE_RESULT bool IsClock() const {
+    return Code::kClock == code_;
+  }
+
+  // Returns true iff the status indicates a Memory error.
+  ABSL_MUST_USE_RESULT bool IsMemory() const {
+    return Code::kMemory == code_;
+  }
+
+  // Returns true iff the status indicates a NotImplmented error.
+  ABSL_MUST_USE_RESULT bool IsNotImplmented() const {
+    return Code::kNotImplmented == code_;
   }
 
   // Return a combination of the error code name and message.
@@ -186,58 +176,60 @@ class Status final {
 
   // Return a status of an appropriate type.
   static Status OK() { return Status(); }
-  static Status NotFound(absl::string_view msg) {
-    return Status(Code::kNotFound, msg);
-  }
-  static Status Corruption(absl::string_view msg) {
-    return Status(Code::kCorruption, msg);
-  }
-  static Status NotSupported(absl::string_view msg) {
-    return Status(Code::kNotSupported, msg);
-  }
   static Status InvalidArgument(absl::string_view msg) {
     return Status(Code::kInvalidArgument, msg);
   }
-  static Status IOError(absl::string_view msg) {
-    return Status(Code::kIOError, msg);
+  static Status TooManyRequests(absl::string_view msg) {
+    return Status(Code::kTooManyRequests, msg);
   }
-  static Status Unknown(absl::string_view msg) {
-    return Status(Code::kUnknown, msg);
+  static Status AddressNotRegistered(absl::string_view msg) {
+    return Status(Code::kAddressNotRegistered, msg);
   }
-  static Status InternalError(absl::string_view msg) {
-    return Status(Code::kInternalError, msg);
+  static Status BatchBusy(absl::string_view msg) {
+    return Status(Code::kBatchBusy, msg);
   }
-  static Status AlreadyExists(absl::string_view msg) {
-    return Status(Code::kAlreadyExists, msg);
+  static Status DeviceNotFound(absl::string_view msg) {
+    return Status(Code::kDeviceNotFound, msg);
   }
-  static Status FailedPrecondition(absl::string_view msg) {
-    return Status(Code::kFailedPrecondition, msg);
+  static Status AddressOverlapped(absl::string_view msg) {
+    return Status(Code::kAddressOverlapped, msg);
   }
-  static Status Busy(absl::string_view msg) { return Status(Code::kBusy, msg); }
-  static Status TimedOut(absl::string_view msg) {
-    return Status(Code::kTimedOut, msg);
+  static Status Dns(absl::string_view msg) {
+    return Status(Code::kDns, msg);
   }
-  static Status Unavailable(absl::string_view msg) {
-    return Status(Code::kUnavailable, msg);
+  static Status Socket(absl::string_view msg) {
+    return Status(Code::kSocket, msg);
   }
-  static Status Shutdown(absl::string_view msg) {
-    return Status(Code::kShutdown, msg);
+  static Status MalformedJson(absl::string_view msg) {
+    return Status(Code::kMalformedJson, msg);
   }
-  // Sub status.
-  static Status MetaStoreFailure(absl::string_view msg) {
-    return Status(Code::kInternalError, SubCode::kMetaStoreFailure, msg);
+  static Status RejectHandshake(absl::string_view msg) {
+    return Status(Code::kRejectHandshake, msg);
   }
-  static Status RpcConnTimedOut(absl::string_view msg) {
-    return Status(Code::kInternalError, SubCode::kRpcConnTimedOut, msg);
+  static Status Metadata(absl::string_view msg) {
+    return Status(Code::kMetadata, msg);
   }
-  static Status SegmentIdMismatch(absl::string_view msg) {
-    return Status(Code::kFailedPrecondition, SubCode::kSegmentIdMismatch, msg);
+  static Status Endpoint(absl::string_view msg) {
+    return Status(Code::kEndpoint, msg);
+  }
+  static Status Context(absl::string_view msg) {
+    return Status(Code::kContext, msg);
+  }
+  static Status Numa(absl::string_view msg) {
+    return Status(Code::kNuma, msg);
+  }
+  static Status Clock(absl::string_view msg) {
+    return Status(Code::kClock, msg);
+  }
+  static Status Memory(absl::string_view msg) {
+    return Status(Code::kMemory, msg);
+  }
+  static Status NotImplmented(absl::string_view msg) {
+    return Status(Code::kNotImplmented, msg);
   }
 
   // Return a human-readable name of the 'code'.
   static std::string_view CodeToString(Code code);
-  // Return a human-readable name of the 'subcode'.
-  static std::string_view SubCodeToString(SubCode subcode);
 
  private:
   // Return a copy of the message 'msg'.
@@ -245,8 +237,6 @@ class Status final {
 
   // The code of the status.
   Code code_ = Code::kOk;
-  // The sub code of the status.
-  SubCode subcode_ = SubCode::kNone;
   // The error message of the status. Refer to the Status definition in RocksDB,
   // we don't use 'std::string' type message but 'const char*' type one for the
   // performance considerations. A memory allocation in the std::string
@@ -257,14 +247,13 @@ class Status final {
   const char* message_ = nullptr;
 };
 
-inline Status::Status(const Status& s) : code_(s.code_), subcode_(s.subcode_) {
+inline Status::Status(const Status& s) : code_(s.code_) {
   message_ = (s.message_ == nullptr) ? nullptr : CopyMessage(s.message_);
 }
 
 inline Status& Status::operator=(const Status& s) {
   if (this != &s) {
     code_ = s.code_;
-    subcode_ = s.subcode_;
     delete[] message_;
     message_ = (s.message_ == nullptr) ? nullptr : CopyMessage(s.message_);
   }
@@ -277,8 +266,6 @@ inline Status& Status::operator=(Status&& s) {
   if (this != &s) {
     code_ = std::move(s.code_);
     s.code_ = Code::kOk;
-    subcode_ = std::move(s.subcode_);
-    s.subcode_ = SubCode::kNone;
     delete[] message_;
     message_ = nullptr;
     std::swap(message_, s.message_);
@@ -288,9 +275,6 @@ inline Status& Status::operator=(Status&& s) {
 
 // Prints a human-readable representation name of the 'code' to 'os'.
 std::ostream& operator<<(std::ostream& os, Status::Code code);
-
-// Prints a human-readable representation name of the 'subcode' to 'os'.
-std::ostream& operator<<(std::ostream& os, Status::SubCode subcode);
 
 // Prints a human-readable representation of 's' to 'os'.
 std::ostream& operator<<(std::ostream& os, const Status& s);

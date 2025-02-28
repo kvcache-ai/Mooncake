@@ -4,6 +4,24 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+# Find Abseil's CMake targets
+find_package(absl REQUIRED)
+include_directories(${absl_INCLUDE_DIR})
+# Add all libs from absl into third party libs.
+list(APPEND ABSL_LIBS absl::algorithm)
+list(APPEND ABSL_LIBS absl::base)
+list(APPEND ABSL_LIBS absl::debugging)
+list(APPEND ABSL_LIBS absl::flat_hash_map)
+list(APPEND ABSL_LIBS absl::flags)
+list(APPEND ABSL_LIBS absl::memory)
+list(APPEND ABSL_LIBS absl::meta)
+list(APPEND ABSL_LIBS absl::numeric)
+list(APPEND ABSL_LIBS absl::random_random)
+list(APPEND ABSL_LIBS absl::strings)
+list(APPEND ABSL_LIBS absl::synchronization)
+list(APPEND ABSL_LIBS absl::time)
+list(APPEND ABSL_LIBS absl::utility)
+
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
@@ -24,7 +42,12 @@ if (USE_HTTP)
   find_package(CURL REQUIRED)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
-target_link_libraries(transfer_engine PUBLIC transport rdma_transport ibverbs glog gflags pthread jsoncpp numa)
+target_link_libraries(
+    transfer_engine
+    PUBLIC
+    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
+    ${ABSL_LIBS}
+    )
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)

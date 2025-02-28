@@ -26,12 +26,8 @@
 namespace mooncake {
 
 Status::Status(Status::Code code, absl::string_view message)
-    : Status(code, /*subcode=*/SubCode::kNone, message) {}
-
-Status::Status(Status::Code code, SubCode subcode, absl::string_view message)
     : code_(code) {
   if (code != Code::kOk) {
-    subcode_ = subcode;
     // Only store the message when it is not empty.
     if (!message.empty()) {
       const size_t len = message.size();
@@ -47,9 +43,6 @@ Status::Status(Status::Code code, SubCode subcode, absl::string_view message)
 std::string Status::ToString() const {
   if (ok()) {
     return "OK";
-  } else if (HasSubCode()) {
-    return absl::StrCat(CodeToString(code()), "/", SubCodeToString(subcode()),
-                        ": ", message());
   } else {
     return absl::StrCat(CodeToString(code()), ": ", message());
   }
@@ -59,51 +52,43 @@ std::string_view Status::CodeToString(Status::Code code) {
   switch (code) {
     case Code::kOk:
       return "OK";
-    case Code::kNotFound:
-      return "NotFound";
-    case Code::kCorruption:
-      return "Corruption";
-    case Code::kNotSupported:
-      return "NotSupported";
     case Code::kInvalidArgument:
       return "InvalidArgument";
-    case Code::kIOError:
-      return "IOError";
-    case Code::kUnknown:
-      return "Unknown";
-    case Code::kInternalError:
-      return "InternalError";
-    case Code::kAlreadyExists:
-      return "AlreadyExists";
-    case Code::kFailedPrecondition:
-      return "FailedPrecondition";
-    case Code::kBusy:
-      return "Busy";
-    case Code::kTimedOut:
-      return "TimedOut";
-    case Code::kUnavailable:
-      return "Unavailable";
-    case Code::kShutdown:
-      return "Shutdown";
+    case Code::kTooManyRequests:
+      return "TooManyRequests";
+    case Code::kAddressNotRegistered:
+      return "AddressNotRegistered";
+    case Code::kBatchBusy:
+      return "BatchBusy";
+    case Code::kDeviceNotFound:
+      return "DeviceNotFound";
+    case Code::kAddressOverlapped:
+      return "AddressOverlapped";
+    case Code::kDns:
+      return "Dns";
+    case Code::kSocket:
+      return "Socket";
+    case Code::kMalformedJson:
+      return "MalformedJson";
+    case Code::kRejectHandshake:
+      return "RejectHandshake";
+    case Code::kMetadata:
+      return "Metadata";
+    case Code::kEndpoint:
+      return "Endpoint";
+    case Code::kContext:
+      return "Context";
+    case Code::kNuma:
+      return "Numa";
+    case Code::kClock:
+      return "Clock";
+    case Code::kMemory:
+      return "Memory";
+    case Code::kNotImplmented:
+      return "NotImplmented";
     default:
       LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
       return absl::StrCat(code);
-  }
-}
-
-std::string_view Status::SubCodeToString(Status::SubCode subcode) {
-  switch (subcode) {
-    case SubCode::kNone:
-      return "None";
-    case SubCode::kMetaStoreFailure:
-      return "DataStoreFailure";
-    case SubCode::kRpcConnTimedOut:
-      return "RpcConnTimedOut";
-    case SubCode::kSegmentIdMismatch:
-      return "SegmentIdMismatch";
-    default:
-      LOG(ERROR) << "Unknown subcode: " << static_cast<uint16_t>(subcode);
-      return absl::StrCat(subcode);
   }
 }
 
@@ -116,10 +101,6 @@ const char* Status::CopyMessage(const char* msg) {
 bool Status::operator==(const Status& s) const {
   // Compare the code.
   if (code_ != s.code_) {
-    return false;
-  }
-  // Compare the subcode.
-  if (subcode_ != s.subcode_) {
     return false;
   }
   // Compare the message content.
@@ -136,10 +117,6 @@ bool Status::operator!=(const Status& s) const { return !(*this == s); }
 
 std::ostream& operator<<(std::ostream& os, Status::Code code) {
   return os << Status::CodeToString(code);
-}
-
-std::ostream& operator<<(std::ostream& os, Status::SubCode subcode) {
-  return os << Status::SubCodeToString(subcode);
 }
 
 std::ostream& operator<<(std::ostream& os, const Status& s) {
