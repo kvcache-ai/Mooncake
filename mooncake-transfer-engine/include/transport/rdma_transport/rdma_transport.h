@@ -73,10 +73,10 @@ class RdmaTransport : public Transport {
 
     // TRANSFER
 
-    int submitTransfer(BatchID batch_id,
+    Status submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries) override;
 
-    int submitTransferTask(
+    Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 

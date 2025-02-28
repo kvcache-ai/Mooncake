@@ -289,13 +289,15 @@ int TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return 0;
 }
 
-int TcpTransport::submitTransfer(BatchID batch_id,
+Status TcpTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return ERR_TOO_MANY_REQUESTS;
+        return Status::InvalidArgument(absl::StrCat(
+            "TcpTransport: Exceed the limitation of capacity, batch id: ",
+            batch_id));
     }
 
     size_t task_id = batch_desc.task_list.size();
@@ -317,10 +319,10 @@ int TcpTransport::submitTransfer(BatchID batch_id,
         startTransfer(slice);
     }
 
-    return 0;
+    return Status::OK();
 }
 
-int TcpTransport::submitTransferTask(
+Status TcpTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     for (size_t index = 0; index < request_list.size(); ++index) {
@@ -338,7 +340,7 @@ int TcpTransport::submitTransferTask(
         task.slice_count += 1;
         startTransfer(slice);
     }
-    return 0;
+    return Status::OK();
 }
 
 void TcpTransport::worker() {

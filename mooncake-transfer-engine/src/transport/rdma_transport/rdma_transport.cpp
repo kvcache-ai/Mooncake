@@ -193,13 +193,15 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-int RdmaTransport::submitTransfer(BatchID batch_id,
+Status RdmaTransport::submitTransfer(BatchID batch_id,
                                   const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return ERR_TOO_MANY_REQUESTS;
+        return Status::InvalidArgument(absl::StrCat(
+            "RdmaTransport: Exceed the limitation of capacity, batch id: ",
+            batch_id));
     }
 
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
@@ -245,16 +247,18 @@ int RdmaTransport::submitTransfer(BatchID batch_id,
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << slice->source_addr;
-                return ERR_ADDRESS_NOT_REGISTERED;
+                return Status::AddressNotRegistered(absl::StrCat(
+                    "RdmaTransport: not registered by any device(s), address:",
+                    absl::StrFormat("%p", slice->source_addr)));
             }
         }
     }
     for (auto &entry : slices_to_post)
         entry.first->submitPostSend(entry.second);
-    return 0;
+    return Status::OK();
 }
 
-int RdmaTransport::submitTransferTask(
+Status RdmaTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
@@ -298,13 +302,15 @@ int RdmaTransport::submitTransferTask(
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << slice->source_addr;
-                return ERR_ADDRESS_NOT_REGISTERED;
+                return Status::AddressNotRegistered(absl::StrCat(
+                    "RdmaTransport: not registered by any device(s), address:",
+                    absl::StrFormat("%p", slice->source_addr)));
             }
         }
     }
     for (auto &entry : slices_to_post)
         entry.first->submitPostSend(entry.second);
-    return 0;
+    return Status::OK();
 }
 
 int RdmaTransport::getTransferStatus(BatchID batch_id,

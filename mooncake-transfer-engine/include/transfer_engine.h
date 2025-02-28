@@ -88,14 +88,10 @@ class TransferEngine {
     }
 
     int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) {
-        return multi_transports_->submitTransfer(batch_id, entries);
-    }
+                       const std::vector<TransferRequest> &entries);
 
     int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) {
-        return multi_transports_->getTransferStatus(batch_id, task_id, status);
-    }
+                          TransferStatus &status);
 
     int syncSegmentCache(const std::string &segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);

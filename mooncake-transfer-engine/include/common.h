@@ -26,6 +26,8 @@
 #include <ctime>
 #include <thread>
 
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "error.h"
 
 #if defined(__x86_64__)

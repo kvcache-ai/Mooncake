@@ -64,7 +64,7 @@ git clone ${GITHUB_PROXY}/abseil/abseil-cpp.git
 cd abseil-cpp
 mkdir -p build
 cd build
-cmake ..
+CXXFLAGS="-fPIC" CFLAGS="-fPIC" cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 make -j$(nproc) && sudo make install
 
 echo "*** Dependencies Installed! ***"
