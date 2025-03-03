@@ -12,23 +12,23 @@ TEST(MemoryLocationTest, MallocSimpleNode0) {
     ASSERT_NE(addr, nullptr);
 
     auto entries = mooncake::getMemoryLocation(addr, size);
-    ASSERT_EQ(entries.size(), 1);
+    ASSERT_EQ(entries.size(), static_cast<size_t>(1));
 
     // check the memory location, no node before page fault
-    EXPECT_EQ(entries[0].start, (uint64_t)addr);
+    EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(addr));
     EXPECT_EQ(entries[0].location, "*");
-    EXPECT_EQ(entries[0].len, size);
+    EXPECT_EQ(entries[0].len, static_cast<size_t>(size));
 
     // trigger page fault
     memset(addr, 0, size);
 
     entries = mooncake::getMemoryLocation(addr, size);
-    ASSERT_EQ(entries.size(), 1);
+    ASSERT_EQ(entries.size(), static_cast<size_t>(1));
 
     // check the memory location, node 0 after page fault
-    EXPECT_EQ(entries[0].start, (uint64_t)addr);
+    EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(addr));
     EXPECT_EQ(entries[0].location, "cpu:0");
-    EXPECT_EQ(entries[0].len, size);
+    EXPECT_EQ(entries[0].len, static_cast<size_t>(size));
 
     numa_free(addr, size);
 }
@@ -47,12 +47,12 @@ TEST(MemoryLocationTest, MallocSimpleNodeLargest) {
     memset(addr, 0, size);
 
     auto entries = mooncake::getMemoryLocation(addr, size);
-    ASSERT_EQ(entries.size(), 1);
+    ASSERT_EQ(entries.size(), static_cast<size_t>(1));
 
     // check the memory location
-    EXPECT_EQ(entries[0].start, (uint64_t)addr);
+    EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(addr));
     EXPECT_EQ(entries[0].location, location);
-    EXPECT_EQ(entries[0].len, size);
+    EXPECT_EQ(entries[0].len, static_cast<size_t>(size));
 
     numa_free(addr, size);
 }
@@ -68,7 +68,7 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     int size = 4096 * 10;
     void *addr = numa_alloc_onnode(size, nodea);
     ASSERT_NE(addr, nullptr);
-    ASSERT_EQ((uint64_t)addr % 4096, 0);  // page aligned
+    ASSERT_EQ((uint64_t)addr % 4096, static_cast<uint64_t>(0));  // page aligned
 
     // trigger page fault
     memset(addr, 0, size);
@@ -93,30 +93,32 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
 
     if (nodea == nodeb) {
         // only one numa node
-        ASSERT_EQ(entries.size(), 1);
+        ASSERT_EQ(entries.size(), static_cast<size_t>(1));
 
         // check the first memory location
-        EXPECT_EQ(entries[0].start, (uint64_t)start);
+        EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(start));
         EXPECT_EQ(entries[0].location, locationa);
-        EXPECT_EQ(entries[0].len, size - 1024 * 4);
+        EXPECT_EQ(entries[0].len, static_cast<size_t>(size - 1024 * 4));
 
     } else {
-        ASSERT_EQ(entries.size(), 3);
+        ASSERT_EQ(entries.size(), static_cast<size_t>(3));
 
         // check the first memory location
-        EXPECT_EQ(entries[0].start, (uint64_t)start);
+        EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(start));
         EXPECT_EQ(entries[0].location, locationb);
-        EXPECT_EQ(entries[0].len, 4096 * 2 - 1024 * 2);
+        EXPECT_EQ(entries[0].len, static_cast<size_t>(4096 * 2 - 1024 * 2));
 
         // check the second memory location
-        EXPECT_EQ(entries[1].start, (uint64_t)addr + 4096 * 2);
+        EXPECT_EQ(entries[1].start,
+            reinterpret_cast<uint64_t>(addr) + 4096 * 2);
         EXPECT_EQ(entries[1].location, locationa);
-        EXPECT_EQ(entries[1].len, 4096 * 7);
+        EXPECT_EQ(entries[1].len, static_cast<size_t>(4096 * 7));
 
         // check the third memory location
-        EXPECT_EQ(entries[2].start, (uint64_t)addr + 4096 * 9);
+        EXPECT_EQ(entries[2].start,
+            reinterpret_cast<uint64_t>(addr) + 4096 * 9);
         EXPECT_EQ(entries[2].location, locationb);
-        EXPECT_EQ(entries[2].len, 4096 - 1024 * 2);
+        EXPECT_EQ(entries[2].len, static_cast<size_t>(4096 - 1024 * 2));
     }
 
     numa_free(addr, size);

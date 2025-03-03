@@ -166,8 +166,10 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommand
 ```
 The above presents two samples from our trace dataset. The trace includes the timing of request arrivals, the number of input tokens, the number of output tokens, and the remapped block hash. To protect our customers' privacy, we applied several mechanisms to remove user-related information while preserving the dataset's utility for simulated evaluation. More descriptions of the trace (e.g., up to 50% cache hit ratio) can be found in Section 4 of the paper's Version 3.
 
+**_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
+
 <h2 id="citation">📑 Citation</h2>
-Please kindly cite our paper if you find the paper or the trace is useful:
+Please kindly cite our paper if you find the paper or the traces are useful:
 
 ```bibtex
 @article{qin2024mooncake,
@@ -175,5 +177,18 @@ Please kindly cite our paper if you find the paper or the trace is useful:
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},
   year         = {2024},
   url          = {https://arxiv.org/abs/2407.00079}
+}
+
+@inproceedings {qin2025mooncake,
+author = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+title = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
+booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+year = {2025},
+isbn = {978-1-939133-45-8},
+address = {Santa Clara, CA},
+pages = {155--170},
+url = {https://www.usenix.org/conference/fast25/presentation/qin},
+publisher = {USENIX Association},
+month = feb
 }
 ```
