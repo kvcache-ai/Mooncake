@@ -358,6 +358,152 @@ virtual std::shared_ptr<BufHandle> Allocate(
 - Load-based allocation strategy: Prioritizes low-load segments based on current load information of storage segments.
 - Topology-aware strategy: Prioritizes data segments that are physically closer to reduce network overhead.
 
+## Mooncake Store Python API
+
+### setup
+```python
+def setup(
+    self,
+    local_hostname: str,
+    metadata_server: str,
+    global_segment_size: int = 16777216,  # 16MB
+    local_buffer_size: int = 16777216,    # 16MB
+    protocol: str = "tcp",
+    rdma_devices: str = "",
+    master_server_addr: str = "127.0.0.1:50051"
+) -> int
+```
+Initializes storage configuration and network parameters.
+
+**Parameters**  
+- `local_hostname`: Hostname/IP of local node
+- `metadata_server`: Address of metadata coordination server
+- `global_segment_size`: Shared memory segment size (default 16MB)
+- `local_buffer_size`: Local buffer allocation size (default 16MB)
+- `protocol`: Communication protocol ("tcp" or "rdma")
+- `rdma_devices`: RDMA device spec (format depends on implementation)
+- `master_server_addr`: Master server address (host:port format)
+
+**Returns**  
+- `int`: Status code (0 = success, non-zero = error)
+
+---
+
+### initAll
+```python
+def initAll(
+    self,
+    protocol: str,
+    device_name: str,
+    mount_segment_size: int = 16777216  # 16MB
+) -> int
+```
+Initializes distributed resources and establishes connections.
+
+**Parameters**  
+- `protocol`: Network protocol to use ("tcp"/"rdma")
+- `device_name`: Hardware device identifier
+- `mount_segment_size`: Memory segment size for mounting (default 16MB)
+
+**Returns**  
+- `int`: Status code (0 = success, non-zero = error)
+
+---
+
+### put
+```python
+def put(self, key: str, value: bytes) -> int
+```
+Stores a binary object in the distributed storage.
+
+**Parameters**  
+- `key`: Unique object identifier (string)
+- `value`: Binary data to store (bytes-like object)
+
+**Returns**  
+- `int`: Status code (0 = success, non-zero = error)
+
+---
+
+### get
+```python
+def get(self, key: str) -> bytes
+```
+Retrieves an object from distributed storage.
+
+**Parameters**  
+- `key`: Object identifier to retrieve
+
+**Returns**  
+- `bytes`: Retrieved binary data
+
+**Raises**  
+- `KeyError`: If specified key doesn't exist
+
+---
+
+### remove
+```python
+def remove(self, key: str) -> int
+```
+Deletes an object from the storage system.
+
+**Parameters**  
+- `key`: Object identifier to remove
+
+**Returns**  
+- `int`: Status code (0 = success, non-zero = error)
+
+---
+
+### isExist
+```python
+def isExist(self, key: str) -> int
+```
+Checks object existence in the storage system.
+
+**Parameters**  
+- `key`: Object identifier to check
+
+**Returns**  
+- `int`: 
+  - `1`: Object exists
+  - `0`: Object doesn't exist
+  - `-1`: Error occurred
+
+---
+
+### close
+```python
+def close(self) -> int
+```
+Cleans up all resources and terminates connections. Corresponds to `tearDownAll()`.
+
+**Returns**  
+- `int`: Status code (0 = success, non-zero = error)
+
+### Usage Example
+```python
+
+import mooncake_vllm_adaptor as mva
+store = mva.MooncakeDistributedStore()
+store.setup(
+    local_hostname="IP:port",
+    metadata_server="etcd://metadata server IP:port",
+    protocol="rdma",
+    ...
+)
+store.initAll(protocol="rdma", device_name="mlx5_0")
+
+# Store configuration
+store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
+
+# Retrieve data
+value = store.get("kvcache1")
+
+store.close()
+```
+
 ## Compilation and Usage
 Mooncake Store is compiled together with other related components (such as the Transfer Engine).
 ```

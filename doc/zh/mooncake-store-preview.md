@@ -370,6 +370,150 @@ virtual std::shared_ptr<BufHandle> Allocate(
 * 基于负载的分配策略：根据存储段的当前负载信息优先选择低负载段。
 * 拓扑感知策略：优先选择物理上更接近的数据段以减少网络开销。
 
+### setup
+```python
+def setup(
+    self,
+    local_hostname: str,
+    metadata_server: str,
+    global_segment_size: int = 16777216,  # 默认 16MB
+    local_buffer_size: int = 16777216,    # 默认 16MB
+    protocol: str = "tcp",
+    rdma_devices: str = "",
+    master_server_addr: str = "127.0.0.1:50051"
+) -> int
+```
+初始化存储配置和网络参数。
+
+**参数**  
+- `local_hostname`: 本地节点的主机名/IP
+- `metadata_server`: 元数据协调服务器地址
+- `global_segment_size`: 共享内存段大小（默认 16MB）
+- `local_buffer_size`: 本地缓冲区分配大小（默认 16MB）
+- `protocol`: 通信协议 ("tcp" 或 "rdma")
+- `rdma_devices`: RDMA 设备规格（格式取决于具体实现）
+- `master_server_addr`: 主服务器地址 (host:port 格式)
+
+**返回值**  
+- `int`: 状态码 (0 = 成功，非零 = 错误)
+
+---
+
+### initAll
+```python
+def initAll(
+    self,
+    protocol: str,
+    device_name: str,
+    mount_segment_size: int = 16777216  # 默认 16MB
+) -> int
+```
+初始化分布式资源并建立连接。
+
+**参数**  
+- `protocol`: 使用的网络协议 ("tcp"/"rdma")
+- `device_name`: 硬件设备标识符
+- `mount_segment_size`: 挂载内存段大小（默认 16MB）
+
+**返回值**  
+- `int`: 状态码 (0 = 成功，非零 = 错误)
+
+---
+
+### put
+```python
+def put(self, key: str, value: bytes) -> int
+```
+存储二进制对象到分布式存储。
+
+**参数**  
+- `key`: 唯一对象标识符 (字符串)
+- `value`: 要存储的二进制数据 (bytes 类型对象)
+
+**返回值**  
+- `int`: 状态码 (0 = 成功，非零 = 错误)
+
+---
+
+### get
+```python
+def get(self, key: str) -> bytes
+```
+从分布式存储检索对象。
+
+**参数**  
+- `key`: 要检索的对象标识符
+
+**返回值**  
+- `bytes`: 检索到的二进制数据
+
+**异常**  
+- `KeyError`: 当指定键不存在时抛出
+
+## Mooncake Store Python API
+
+### remove
+```python
+def remove(self, key: str) -> int
+```
+从存储系统中删除对象。
+
+**参数**  
+- `key`: 要删除的对象标识符
+
+**返回值**  
+- `int`: 状态码 (0 = 成功，非零 = 错误)
+
+---
+
+### isExist
+```python
+def isExist(self, key: str) -> int
+```
+检查对象是否存在。
+
+**参数**  
+- `key`: 要检查的对象标识符
+
+**返回值**  
+- `int`: 
+  - `1`: 对象存在
+  - `0`: 对象不存在
+  - `-1`: 发生错误
+
+---
+
+### close
+```python
+def close(self) -> int
+```
+清理所有资源并终止连接。对应 `tearDownAll()` 方法。
+
+**返回值**  
+- `int`: 状态码 (0 = 成功，非零 = 错误)
+
+### 代码使用样例
+```python
+
+import mooncake_vllm_adaptor as mva
+store = mva.MooncakeDistributedStore()
+store.setup(
+    local_hostname="IP:port",
+    metadata_server="etcd://metadata server IP:port",
+    protocol="rdma",
+    ...
+)
+store.initAll(protocol="rdma", device_name="mlx5_0")
+
+# Store configuration
+store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
+
+# Retrieve data
+value = store.get("kvcache1")
+
+store.close()
+```
+
 ## 编译及使用方法
 Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
 ```
