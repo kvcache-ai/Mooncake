@@ -73,6 +73,16 @@ message PutEndResponse {
   required int32 status_code = 1; // Status.
 }
 
+// Request to revoke a Put operation.
+message PutRevokeRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to revoke a Put operation.
+message PutRevokeResponse {
+  required int32 status_code = 1; // Status.
+}
+
 // Request to remove an object.
 message RemoveRequest {
   required string key = 1; // Object key.
@@ -115,6 +125,9 @@ service MasterService {
 
   // End Put operation.
   rpc PutEnd(PutEndRequest) returns (PutEndResponse);
+
+  // Revoke Put operation.
+  rpc PutRevoke(PutRevokeRequest) returns (PutRevokeResponse);
 
   // Remove object.
   rpc Remove(RemoveRequest) returns (RemoveResponse);

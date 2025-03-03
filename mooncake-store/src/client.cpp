@@ -26,19 +26,13 @@ ErrorCode LogAndCheckRpcStatus(grpc::Status status,
     VLOG(1) << rpc_name << ": rpc_request=" << request.ShortDebugString();
 
     if (!status.ok()) {
-        LOG(ERROR) << rpc_name << ": rpc_error_code=" << status.error_code()
-                   << " error_message=\"" << status.error_message() << "\"";
+        LOG(ERROR) << rpc_name << ": rpc error, code: " << status.error_code()
+                   << ", message: " << status.error_message();
         return ErrorCode::RPC_FAIL;
     }
 
-    if (response.status_code() != 0) {
-        LOG(ERROR) << rpc_name
-                   << ": server_status_code=" << response.status_code();
-        return fromInt(response.status_code());
-    }
-
     VLOG(1) << rpc_name << ": status_code=" << response.status_code();
-    return ErrorCode::OK;
+    return fromInt(response.status_code());
 }
 
 Client::Client() : transfer_engine_(nullptr), master_stub_(nullptr) {}
@@ -91,9 +85,11 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 
 ErrorCode Client::Init(const std::string& local_hostname,
                        const std::string& metadata_connstring,
-                       const std::string& protocol, 
-                       void** protocol_args, 
+                       const std::string& protocol, void** protocol_args,
                        const std::string& master_addr) {
+    if (transfer_engine_)
+        return ErrorCode::INTERNAL_ERROR;
+
     // Store configuration
     local_hostname_ = local_hostname;
     metadata_connstring_ = metadata_connstring;
@@ -111,6 +107,16 @@ ErrorCode Client::Init(const std::string& local_hostname,
                               protocol_args);
 }
 
+ErrorCode Client::UnInit() {
+    // Unmount all Segment
+    auto mounted_segments = mounted_segments_;
+    for (auto &entry : mounted_segments) {
+        UnmountSegment(entry.first, entry.second);
+    }
+    transfer_engine_.reset();
+    return ErrorCode::OK;
+}
+
 ErrorCode Client::Get(const std::string& object_key,
                       std::vector<Slice>& slices) {
     ObjectInfo object_info;
@@ -120,7 +126,7 @@ ErrorCode Client::Get(const std::string& object_key,
 }
 
 ErrorCode Client::Query(const std::string& object_key,
-                        ObjectInfo& object_info) {
+                        ObjectInfo& object_info) const {
     // Get replica list from master
     mooncake_store::GetReplicaListRequest request;
     request.set_key(object_key);
@@ -128,9 +134,10 @@ ErrorCode Client::Query(const std::string& object_key,
 
     grpc::Status status =
         master_stub_->GetReplicaList(&context, request, &object_info);
-    if (LogAndCheckRpcStatus(status, object_info, "GetReplicaList", request) !=
-        ErrorCode::OK) {
-        return ErrorCode::RPC_FAIL;
+    ErrorCode err =
+        LogAndCheckRpcStatus(status, object_info, "GetReplicaList", request);
+    if (err != ErrorCode::OK) {
+        return err;
     }
 
     VLOG(1) << "GetReplicaList: replica_count="
@@ -223,9 +230,15 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         }
         // Write just ignore the transfer size
         ErrorCode transfer_err = TransferWrite(handles, slices);
-        if (transfer_err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            return ErrorCode::OK;
-        } else if (transfer_err != ErrorCode::OK) {
+        if (transfer_err != ErrorCode::OK) {
+            // Revoke put operation
+            mooncake_store::PutRevokeRequest revoke_request;
+            revoke_request.set_key(key);
+            mooncake_store::PutRevokeResponse revoke_response;
+            grpc::ClientContext revoke_context;
+            status = master_stub_->PutRevoke(&revoke_context, revoke_request, &revoke_response);
+            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke", revoke_request);
+            VLOG(1) << "PutRevoke: status_code=" << revoke_response.status_code();
             return transfer_err;
         }
     }
@@ -263,7 +276,7 @@ ErrorCode Client::Remove(const ObjectKey& key) const {
 }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
-                               const void* buffer, size_t size) const {
+                               const void* buffer, size_t size) {
     mooncake_store::MountSegmentRequest request;
     request.set_segment_name(segment_name);
     request.set_buffer(reinterpret_cast<uint64_t>(buffer));
@@ -271,7 +284,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     mooncake_store::MountSegmentResponse response;
     grpc::ClientContext context;
 
-    int rc = transfer_engine_->registerLocalMemory((void *) buffer, size, "cpu:0",
+    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size, "cpu:0",
                                                    true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed segment_name="
@@ -286,11 +299,12 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     if (err != ErrorCode::OK) {
         return err;
     }
+    mounted_segments_[segment_name] = (void *) buffer;
     return ErrorCode::OK;
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name,
-                                 void* addr) const {
+                                 void* addr) {
     mooncake_store::UnmountSegmentRequest request;
     request.set_segment_name(segment_name);
     mooncake_store::UnmountSegmentResponse response;
@@ -309,6 +323,7 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name,
                    << rc;
         return ErrorCode::INVALID_PARAMS;
     }
+    mounted_segments_.erase(segment_name);
     return ErrorCode::OK;
 }
 
@@ -329,6 +344,11 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
+}
+
+ErrorCode Client::IsExist(const std::string& key) const {
+    ObjectInfo object_info;
+    return Query(key, object_info);
 }
 
 ErrorCode Client::TransferData(
@@ -403,8 +423,7 @@ ErrorCode Client::TransferData(
                 transfer_engine_->freeBatchID(batch_id);
                 return ErrorCode::TRANSFER_FAIL;
             }
-            if (status.s != TransferStatusEnum::COMPLETED)
-                all_ready = false;
+            if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
             if (status.s == TransferStatusEnum::FAILED) {
                 LOG(ERROR) << "Transfer failed for task" << i;
                 has_err = true;

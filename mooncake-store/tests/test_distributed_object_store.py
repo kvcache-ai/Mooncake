@@ -3,36 +3,66 @@ import os
 import time
 import threading
 import random
-from distributed_object_store import DistributedObjectStore
+from mooncake_vllm_adaptor import MooncakeDistributedStore
+
+
+def get_client(store):
+    """Initialize and setup the distributed store client."""
+    protocol = os.getenv("PROTOCOL", "tcp")
+    device_name = os.getenv("DEVICE_NAME", "ibp6s0")
+    local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
+    metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
+    global_segment_size = 3200 * 1024 * 1024  # 3200 MB
+    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
+    
+    retcode = store.setup(
+        local_hostname, 
+        metadata_server, 
+        global_segment_size,
+        local_buffer_size, 
+        protocol, 
+        device_name,
+        master_server_address
+    )
+    
+    if retcode:
+        raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
 
 class TestDistributedObjectStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Initialize the store
-        cls.store = DistributedObjectStore()
-        # Use TCP protocol by default for testing
-        protocol = os.getenv("PROTOCOL", "tcp")
-        device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-        local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost:12345")
-        metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
-        global_segment_size = 3200 * 1024 * 1024
-        local_buffer_size = 512 * 1024 * 1024
-        master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-        retcode = cls.store.setup(local_hostname, 
-                                  metadata_server, 
-                                  global_segment_size,
-                                  local_buffer_size, 
-                                  protocol, 
-                                  device_name,
-                                  master_server_address)
-        if retcode:
-            exit(1)
-        time.sleep(1)  # Give some time for initialization
-
-    def test_basic_put_get_operations(self):
-        """Test basic Put/Get operations through the Python interface."""
+        """Initialize the store once for all tests."""
+        cls.store = MooncakeDistributedStore()
+        get_client(cls.store)
+    
+    def test_client_tear_down(self):
+        """Test client tear down and re-initialization."""
         test_data = b"Hello, World!"
-        key = "test_key"
+        key = "test_teardown_key"
+        
+        # Put data and verify teardown clears it
+        self.assertEqual(self.store.put(key, test_data), 0)
+        self.assertEqual(self.store.tearDownAll(), 0)
+        time.sleep(1)  # Allow time for teardown to complete
+        
+        # Re-initialize the store
+        get_client(self.store)
+        
+        # Verify data is gone after teardown
+        retrieved_data = self.store.get(key)
+        self.assertEqual(retrieved_data, b"")
+        
+        # Verify store is functional after re-initialization
+        self.assertEqual(self.store.put(key, test_data), 0)
+        retrieved_data = self.store.get(key)
+        self.assertEqual(retrieved_data, test_data)
+
+    def test_basic_put_get_exist_operations(self):
+        """Test basic Put/Get/Exist operations through the Python interface."""
+        test_data = b"Hello, World!"
+        key = "test_basic_key"
 
         # Test Put operation
         self.assertEqual(self.store.put(key, test_data), 0)
@@ -51,6 +81,21 @@ class TestDistributedObjectStore(unittest.TestCase):
         empty_data = self.store.get(key)
         self.assertEqual(empty_data, b"")
 
+        # Test isExist functionality
+        test_data_2 = b"Testing exists!"
+        key_2 = "test_exist_key"
+        
+        # Should not exist initially
+        self.assertEqual(self.store.isExist(key_2), 0)
+        
+        # Should exist after put
+        self.assertEqual(self.store.put(key_2, test_data_2), 0)
+        self.assertEqual(self.store.isExist(key_2), 1)
+        
+        # Should not exist after remove
+        self.assertEqual(self.store.remove(key_2), 0)
+        self.assertEqual(self.store.isExist(key_2), 0)
+
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
         NUM_THREADS = 8
@@ -61,7 +106,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         start_barrier = threading.Barrier(NUM_THREADS + 1)  # +1 for main thread
         put_barrier = threading.Barrier(NUM_THREADS + 1)    # Barrier after put operations
         get_barrier = threading.Barrier(NUM_THREADS + 1)    # Barrier after get operations
-        end_barrier = threading.Barrier(NUM_THREADS + 1)
         
         # Statistics for system-wide timing
         system_stats = {
@@ -83,7 +127,8 @@ class TestDistributedObjectStore(unittest.TestCase):
                 
                 # Put operations
                 for key in thread_keys:
-                    self.store.put(key, test_data)
+                    result = self.store.put(key, test_data)
+                    self.assertEqual(result, 0, f"Put operation failed for key {key}")
                 
                 # Wait for all threads to complete put operations
                 put_barrier.wait()
@@ -91,17 +136,14 @@ class TestDistributedObjectStore(unittest.TestCase):
                 # Get operations
                 for key in thread_keys:
                     retrieved_data = self.store.get(key)
-                    self.assertEqual(len(retrieved_data), VALUE_SIZE)
-                    self.assertEqual(retrieved_data, test_data)
+                    self.assertEqual(len(retrieved_data), VALUE_SIZE, 
+                                    f"Retrieved data size mismatch for key {key}")
+                    self.assertEqual(retrieved_data, test_data, 
+                                    f"Retrieved data content mismatch for key {key}")
                 
                 # Wait for all threads to complete get operations
                 get_barrier.wait()
                 
-                # Clean up
-                for key in thread_keys:
-                    self.store.remove(key)
-                
-                end_barrier.wait()
                 
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
@@ -109,7 +151,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Create and start threads
         threads = []
         for i in range(NUM_THREADS):
-            t = threading.Thread(target=worker, args=(i,))
+            t = threading.Thread(target=worker, args=(i,), name=f"Worker-{i}")
             threads.append(t)
             t.start()
         
@@ -130,8 +172,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         get_barrier.wait()
         system_stats['get_end'] = time.time()
         
-        # Wait for final cleanup
-        end_barrier.wait()
         
         # Join all threads
         for t in threads:
@@ -159,55 +199,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         print(f"System Put bandwidth: {total_data_size_gb/put_duration:.2f} GB/sec")
         print(f"System Get bandwidth: {total_data_size_gb/get_duration:.2f} GB/sec")
 
-    def test_dict_fuzz_e2e(self):
-        """End-to-end fuzz test comparing distributed store behavior with dict.
-        Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
-        After testing, all keys are removed.
-        """
-        import random
-        # Local reference dict to simulate expected dict behavior
-        reference = {}
-        operations = 1000
-        # Use a pool of keys to limit memory consumption
-        keys_pool = [f"key_{i}" for i in range(100)]
-        # Value dict to ensure same key has same value
-        value_dict = {}
-        # Fuzz record for debugging in case of errors
-        fuzz_record = []
-        try:
-            for i in range(operations):
-                op = random.choice(["put", "get", "remove"])
-                key = random.choice(keys_pool)
-                if op == "put":
-                    if key not in value_dict:
-                        size = random.randint(1 * 1024 , 32 * 1024 * 1024)
-                        value = os.urandom(size)
-                        value_dict[key] = value
-                    else:
-                        value = value_dict[key]
-                    size = len(value)
-                    fuzz_record.append(f"{i}: put {key} [size: {size}]")
-                    self.assertEqual(self.store.put(key, value), 0)
-                    reference[key] = value
-                elif op == "get":
-                    fuzz_record.append(f"{i}: get {key}")
-                    retrieved = self.store.get(key)
-                    expected = reference.get(key, b"")
-                    self.assertEqual(retrieved, expected)
-                elif op == "remove":
-                    fuzz_record.append(f"{i}: remove {key}")
-                    self.store.remove(key)
-                    reference.pop(key, None)
-                    value_dict.pop(key, None)
-        except Exception as e:
-            print(f"Error: {e}")
-            print('\nFuzz record (operations so far):')
-            for record in fuzz_record:
-                print(record)
-            raise e
-        # Cleanup: ensure all remaining keys are removed
-        for key in list(reference.keys()):
-            self.store.remove(key)
 
 if __name__ == '__main__':
     unittest.main()

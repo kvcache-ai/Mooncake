@@ -35,6 +35,8 @@ class Client {
                    const std::string& protocol, void** protocol_args,
                    const std::string& master_addr = kDefaultMasterAddress);
 
+    ErrorCode UnInit();
+
     /**
      * @brief Retrieves data for a given key
      * @param object_key Key to retrieve
@@ -56,7 +58,8 @@ class Client {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode Query(const std::string& object_key, ObjectInfo& object_info);
+    ErrorCode Query(const std::string& object_key,
+                    ObjectInfo& object_info) const;
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -93,7 +96,7 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
-                           size_t size) const;
+                           size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
@@ -101,7 +104,7 @@ class Client {
      * @param addr Memory address to unregister
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode UnmountSegment(const std::string& segment_name, void* addr) const;
+    ErrorCode UnmountSegment(const std::string& segment_name, void* addr);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -125,6 +128,14 @@ class Client {
      */
     ErrorCode unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    /**
+     * @brief Checks if an object exists
+     * @param key Key to check
+     * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
+     * exists, other ErrorCode for errors
+     */
+    ErrorCode IsExist(const std::string& key) const;
+
    private:
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -147,6 +158,8 @@ class Client {
     // Core components
     std::unique_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<mooncake_store::MasterService::Stub> master_stub_;
+
+    std::unordered_map<std::string, void*> mounted_segments_;
 
     // Configuration
     std::string local_hostname_;

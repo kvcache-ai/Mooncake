@@ -87,6 +87,13 @@ add_subdirectory(mooncake-transfer-engine)
 
 include_directories(mooncake-transfer-engine/include)
 
+if (WITH_STORE)
+  message(STATUS "Mooncake Store will be build")
+  find_package(pybind11 CONFIG REQUIRED)
+  add_subdirectory(mooncake-store)
+  include_directories(mooncake-store/include)
+endif()
+
 add_subdirectory(mooncake-integration)
 
 if (WITH_P2P_STORE AND USE_CUDA)
@@ -96,9 +103,4 @@ endif()
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be build")
-endif()
-
-if (WITH_STORE)
-  add_subdirectory(mooncake-store)
-  message(STATUS "Mooncake Store will be build")
 endif()

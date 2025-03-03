@@ -1,6 +1,9 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <grpcpp/grpcpp.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <memory>
@@ -16,6 +19,32 @@ DEFINE_int32(port, 50051, "Port for master service to listen on");
 DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
 
 namespace mooncake {
+
+// Helper function to check if a port is available
+bool isPortAvailable(int port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        LOG(ERROR) << "Failed to create socket for port check";
+        return false;
+    }
+
+    // Allow reuse of local addresses
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOG(WARNING) << "Failed to set socket options";
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    int result = bind(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+    close(sockfd);
+
+    return result == 0;
+}
 
 // Convert internal ReplicaInfo to proto ReplicaInfo
 void ConvertToProtoReplicaInfo(const ReplicaInfo& internal_info,
@@ -166,6 +195,15 @@ class MasterServiceImpl final : public mooncake_store::MasterService::Service {
         return grpc::Status::OK;
     }
 
+    grpc::Status PutRevoke(
+        grpc::ServerContext* context,
+        const mooncake_store::PutRevokeRequest* request,
+        mooncake_store::PutRevokeResponse* response) override {
+        ErrorCode error_code = master_service_->PutRevoke(request->key());
+        response->set_status_code(toInt(error_code));
+        return grpc::Status::OK;
+    }
+
     grpc::Status Remove(grpc::ServerContext* context,
                         const mooncake_store::RemoveRequest* request,
                         mooncake_store::RemoveResponse* response) override {
@@ -213,6 +251,13 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "Max threads: " << FLAGS_max_threads;
 
     try {
+        // Check if the port is available before starting server
+        if (!mooncake::isPortAvailable(FLAGS_port)) {
+            LOG(ERROR) << "Port " << FLAGS_port << " is already in use. "
+                       << "Please specify a different port using --port flag.";
+            return 1;
+        }
+
         // Create master service instance
         auto master_service = std::make_shared<mooncake::MasterService>();
 
@@ -234,6 +279,11 @@ int main(int argc, char* argv[]) {
 
         // Build and start server
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+        if (!server) {
+            LOG(ERROR) << "Failed to start server on port " << FLAGS_port;
+            return 1;
+        }
+
         LOG(INFO) << "Master service listening on " << server_address;
 
         // Wait for server to shutdown

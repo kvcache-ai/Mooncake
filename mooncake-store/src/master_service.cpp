@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <queue>
 #include <shared_mutex>
 
 #include "types.h"
@@ -67,9 +68,28 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 
 MasterService::MasterService()
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {}
+      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
+    // Start the GC thread
+    gc_running_ = true;
+    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+    VLOG(1) << "action=start_gc_thread";
+}
 
-MasterService::~MasterService() = default;
+MasterService::~MasterService() {
+    // Stop and join the GC thread
+    gc_running_ = false;
+    if (gc_thread_.joinable()) {
+        gc_thread_.join();
+    }
+
+    // Clean up any remaining GC tasks
+    GCTask* task = nullptr;
+    while (gc_queue_.pop(task)) {
+        if (task) {
+            delete task;
+        }
+    }
+}
 
 ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
                                       const std::string& segment_name) {
@@ -91,29 +111,29 @@ ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
 
 ErrorCode MasterService::GetReplicaList(
     const std::string& key, std::vector<ReplicaInfo>& replica_list) {
-    size_t shard_idx = getShardIndex(key);
-    std::shared_lock<std::shared_mutex> lock(metadata_shards_[shard_idx].mutex);
-
     VLOG(1) << "key=" << key << ", action=get_replica_list_start";
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it == metadata_shards_[shard_idx].metadata.end()) {
+
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
         LOG(WARNING) << "key=" << key << ", error=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    // Check if the object is still in the process of being put
-    for (const auto& replica : it->second.replicas) {
+    auto& metadata = accessor.Get();
+    for (const auto& replica : metadata.replicas) {
         if (replica.status != ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "key=" << key << ", status=" << replica.status
                          << ", error=replica_not_ready";
             return ErrorCode::REPLICA_IS_NOT_READY;
         }
     }
-    replica_list = it->second.replicas;
+
+    replica_list = metadata.replicas;
     if (VLOG_IS_ON(1)) {
         VLOG(1) << "key=" << key
                 << ", replica_list=" << VectorToString(replica_list);
     }
+    MarkForGC(key, 1000);  // After 1 second, the object will be removed
     return ErrorCode::OK;
 }
 
@@ -121,9 +141,6 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
                                   const std::vector<uint64_t>& slice_lengths,
                                   const ReplicateConfig& config,
                                   std::vector<ReplicaInfo>& replica_list) {
-    size_t shard_idx = getShardIndex(key);
-    std::unique_lock<std::shared_mutex> lock(metadata_shards_[shard_idx].mutex);
-
     if (config.replica_num == 0 || value_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", value_length=" << value_length
@@ -155,9 +172,13 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
             << ", slice_count=" << slice_lengths.size() << ", config=" << config
             << ", action=put_start_begin";
 
-    // Check if object already exists
+    // Lock the shard and check if object already exists
+    size_t shard_idx = getShardIndex(key);
+    std::unique_lock<std::mutex> lock(metadata_shards_[shard_idx].mutex);
+
     auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it != metadata_shards_[shard_idx].metadata.end()) {
+    if (it != metadata_shards_[shard_idx].metadata.end() &&
+        !CleanupStaleHandles(it->second)) {
         LOG(WARNING) << "key=" << key << ", error=object_already_exists";
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
@@ -214,18 +235,16 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
 }
 
 ErrorCode MasterService::PutEnd(const std::string& key) {
-    size_t shard_idx = getShardIndex(key);
-    std::unique_lock<std::shared_mutex> lock(metadata_shards_[shard_idx].mutex);
-
     VLOG(1) << "key=" << key << ", action=put_end_start";
 
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it == metadata_shards_[shard_idx].metadata.end()) {
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    for (auto& replica : it->second.replicas) {
+    auto& metadata = accessor.Get();
+    for (auto& replica : metadata.replicas) {
         if (replica.status != ReplicaStatus::PROCESSING) {
             LOG(ERROR) << "key=" << key << ", status=" << replica.status
                        << ", error=invalid_replica_status";
@@ -242,18 +261,40 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::Remove(const std::string& key) {
-    size_t shard_idx = getShardIndex(key);
-    std::unique_lock<std::shared_mutex> lock(metadata_shards_[shard_idx].mutex);
+ErrorCode MasterService::PutRevoke(const std::string& key) {
+    VLOG(1) << "key=" << key << ", action=put_revoke_start";
 
-    VLOG(1) << "key=" << key << ", action=remove_start";
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it == metadata_shards_[shard_idx].metadata.end()) {
-        LOG(WARNING) << "key=" << key << ", error=object_not_found";
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    for (auto& replica : it->second.replicas) {
+    auto& metadata = accessor.Get();
+    for (auto& replica : metadata.replicas) {
+        if (replica.status != ReplicaStatus::PROCESSING) {
+            LOG(ERROR) << "key=" << key << ", status=" << replica.status
+                       << ", error=invalid_replica_status";
+            return ErrorCode::INVALID_WRITE;
+        }
+    }
+
+    accessor.Erase();
+    VLOG(1) << "key=" << key << ", action=put_revoke_complete";
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::Remove(const std::string& key) {
+    VLOG(1) << "key=" << key << ", action=remove_start";
+
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", error=object_not_found";
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+
+    auto& metadata = accessor.Get();
+    for (auto& replica : metadata.replicas) {
         if (replica.status != ReplicaStatus::COMPLETE) {
             LOG(ERROR) << "key=" << key << ", status=" << replica.status
                        << ", error=invalid_replica_status";
@@ -262,9 +303,101 @@ ErrorCode MasterService::Remove(const std::string& key) {
     }
 
     // Remove object metadata
-    metadata_shards_[shard_idx].metadata.erase(it);
+    accessor.Erase();
     VLOG(1) << "key=" << key << ", action=remove_complete";
     return ErrorCode::OK;
+}
+
+ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
+    VLOG(1) << "key=" << key << ", delay_ms=" << delay_ms
+            << ", action=mark_for_gc";
+
+    // Create a new GC task and add it to the queue
+    GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
+    if (!gc_queue_.push(task)) {
+        // Queue is full, delete the task to avoid memory leak
+        delete task;
+        LOG(ERROR) << "key=" << key << ", error=gc_queue_full";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    VLOG(1) << "key=" << key << ", action=scheduled_for_gc";
+    return ErrorCode::OK;
+}
+
+bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
+    // Iterate through replicas and remove those with invalid allocators
+    auto replica_it = metadata.replicas.begin();
+    while (replica_it != metadata.replicas.end()) {
+        // Use any_of algorithm to check if any handle has an invalid allocator
+        bool has_invalid_handle = std::any_of(
+            replica_it->handles.begin(), replica_it->handles.end(),
+            [](const std::shared_ptr<BufHandle>& handle) {
+                if (!handle->isAllocatorValid()) {
+                    VLOG(1) << "key=" << handle->replica_meta.object_name
+                            << ", segment=" << handle->segment_name
+                            << ", action=found_invalid_handle";
+                    return true;
+                }
+                return false;
+            });
+
+        // Remove replicas with invalid handles using erase-remove idiom
+        if (has_invalid_handle) {
+            VLOG(1) << "replica_id=" << replica_it->replica_id
+                    << ", action=removing_replica_with_invalid_handle";
+            replica_it = metadata.replicas.erase(replica_it);
+        } else {
+            ++replica_it;
+        }
+    }
+
+    // Return true if no valid replicas remain after cleanup
+    return metadata.replicas.empty();
+}
+
+void MasterService::GCThreadFunc() {
+    VLOG(1) << "action=gc_thread_started";
+
+    std::priority_queue<GCTask*, std::vector<GCTask*>, GCTaskComparator>
+        local_pq;
+
+    while (gc_running_) {
+        GCTask* task = nullptr;
+        while (gc_queue_.pop(task)) {
+            if (task) {
+                local_pq.push(task);
+            }
+        }
+
+        while (!local_pq.empty()) {
+            task = local_pq.top();
+            if (!task->is_ready()) {
+                break;
+            }
+
+            local_pq.pop();
+            VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
+            ErrorCode result = Remove(task->key);
+            if (result != ErrorCode::OK &&
+                result != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(WARNING)
+                    << "key=" << task->key
+                    << ", error=gc_remove_failed, error_code=" << result;
+            }
+            delete task;
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kGCThreadSleepMs));
+    }
+
+    while (!local_pq.empty()) {
+        delete local_pq.top();
+        local_pq.pop();
+    }
+
+    VLOG(1) << "action=gc_thread_stopped";
 }
 
 }  // namespace mooncake

@@ -213,8 +213,8 @@ TEST_F(ClientIntegrationTest, AllocateTest) {
               ErrorCode::OK);
     client_buffer_allocator_->deallocate(failed_buffer, data_size);
 
-    std::string key = "heavy_test_key_0";
-    ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
+    // sleep for 2 seconds to ensure the object is marked for GC
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
     // After removing all keys, we should be able to allocate the failed key
     void* success_buffer = client_buffer_allocator_->allocate(data_size);
@@ -225,12 +225,6 @@ TEST_F(ClientIntegrationTest, AllocateTest) {
               ErrorCode::OK);
     client_buffer_allocator_->deallocate(success_buffer, data_size);
     ASSERT_EQ(client_->Remove(allocate_failed_key), ErrorCode::OK);
-
-    // Remove previous key, key 0 was removed in the previous test
-    for (int i = 1; i < num_operations; i++) {
-        std::string key = "heavy_test_key_" + std::to_string(i);
-        ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
-    }
 }
 
 // Test large allocation operations

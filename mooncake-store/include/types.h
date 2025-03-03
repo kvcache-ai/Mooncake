@@ -147,6 +147,9 @@ class BufHandle {
     BufHandle(const BufHandle&) = delete;
     BufHandle& operator=(const BufHandle&) = delete;
 
+    // Check if the allocator is still valid
+    bool isAllocatorValid() const;
+
     friend std::ostream& operator<<(std::ostream& os,
                                     const BufHandle& handle) noexcept {
         return os << "BufHandle: { "
@@ -158,7 +161,7 @@ class BufHandle {
     }
 
    private:
-    std::shared_ptr<BufferAllocator> allocator_;
+    std::weak_ptr<BufferAllocator> allocator_;
 };
 
 /**

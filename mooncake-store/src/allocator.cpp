@@ -17,13 +17,16 @@ BufHandle::BufHandle(std::shared_ptr<BufferAllocator> allocator,
             << " size=" << size << " buffer_address=" << buffer;
 }
 
+bool BufHandle::isAllocatorValid() const { return !allocator_.expired(); }
+
 BufHandle::~BufHandle() {
-    if (allocator_) {
-        allocator_->deallocate(this);
+    auto alloc = allocator_.lock();
+    if (alloc) {
+        alloc->deallocate(this);
         VLOG(1) << "buf_handle_deallocated segment_id=" << segment_id
                 << " size=" << size;
     } else {
-        LOG(WARNING) << "allocator=null in buf_handle_destructor";
+        LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
 
@@ -56,7 +59,8 @@ BufferAllocator::BufferAllocator(std::string segmetn_name, size_t base,
 
     // Add the main pool to the allocator.
     pool_id_ = memory_allocator_->addPool("main", size);
-    VLOG(1) << "buffer_allocator_initialized pool_id=" << static_cast<int>(pool_id_);
+    VLOG(1) << "buffer_allocator_initialized pool_id="
+            << static_cast<int>(pool_id_);
 }
 
 BufferAllocator::~BufferAllocator() = default;
@@ -69,8 +73,8 @@ std::shared_ptr<BufHandle> BufferAllocator::allocate(size_t size) {
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
             LOG(WARNING) << "allocation_failed size=" << size
-                        << " segment=" << segment_name_ 
-                        << " current_size=" << cur_size_;
+                         << " segment=" << segment_name_
+                         << " current_size=" << cur_size_;
             return nullptr;
         }
     } catch (const std::exception& e) {
@@ -80,9 +84,8 @@ std::shared_ptr<BufHandle> BufferAllocator::allocate(size_t size) {
         LOG(ERROR) << "allocation_unknown_exception";
         return nullptr;
     }
-    VLOG(1) << "allocation_succeeded size=" << size 
-            << " segment=" << segment_name_
-            << " address=" << buffer;
+    VLOG(1) << "allocation_succeeded size=" << size
+            << " segment=" << segment_name_ << " address=" << buffer;
     // Create and return a new BufHandle.
     cur_size_.fetch_add(size);
     return std::make_shared<BufHandle>(shared_from_this(), segment_name_, size,
@@ -96,8 +99,7 @@ void BufferAllocator::deallocate(BufHandle* handle) {
         handle->status = BufStatus::UNREGISTERED;
         cur_size_.fetch_sub(handle->size);
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer
-                << " size=" << handle->size 
-                << " segment=" << segment_name_;
+                << " size=" << handle->size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "deallocation_exception error=" << e.what();
     } catch (...) {
@@ -125,7 +127,8 @@ SimpleAllocator::SimpleAllocator(size_t size) {
         header_region_start_ = std::make_unique<char[]>(header_region_size_);
         if (!header_region_start_) {
             std::free(base_);
-            LOG(ERROR) << "header_region_allocation_failed size=" << header_region_size_;
+            LOG(ERROR) << "header_region_allocation_failed size="
+                       << header_region_size_;
             throw std::bad_alloc();
         }
 
@@ -144,7 +147,8 @@ SimpleAllocator::SimpleAllocator(size_t size) {
 
         // Add main memory pool
         pool_id_ = memory_allocator_->addPool("main", size);
-        LOG(INFO) << "simple_allocator_initialized pool_id=" << static_cast<int>(pool_id_);
+        LOG(INFO) << "simple_allocator_initialized pool_id="
+                  << static_cast<int>(pool_id_);
 
     } catch (const std::exception& e) {
         if (base_) {
@@ -167,7 +171,8 @@ SimpleAllocator::~SimpleAllocator() {
         }
         LOG(INFO) << "simple_allocator_destroyed status=success";
     } catch (const std::exception& e) {
-        LOG(ERROR) << "simple_allocator_destruction_exception error=" << e.what();
+        LOG(ERROR) << "simple_allocator_destruction_exception error="
+                   << e.what();
     }
 }
 
@@ -197,9 +202,9 @@ void* SimpleAllocator::allocate(size_t size) {
 
 void SimpleAllocator::deallocate(void* ptr, size_t size) {
     if (!memory_allocator_ || !ptr) {
-        LOG(WARNING) << "invalid_deallocation_request allocator=" 
-                    << (memory_allocator_ ? "valid" : "null")
-                    << " ptr=" << (ptr ? "valid" : "null");
+        LOG(WARNING) << "invalid_deallocation_request allocator="
+                     << (memory_allocator_ ? "valid" : "null")
+                     << " ptr=" << (ptr ? "valid" : "null");
         return;
     }
 

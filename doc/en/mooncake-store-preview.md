@@ -56,6 +56,8 @@ ErrorCode Get(const std::string& object_key,
 
 Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.
 
+> In the current implementation, the Get interface has an optional TTL feature. When the value corresponding to `object_key` is fetched for the first time, the corresponding entry is automatically deleted after a certain period of time (1s by default).
+
 ### Put
 
 ```C++
@@ -356,33 +358,21 @@ virtual std::shared_ptr<BufHandle> Allocate(
 - Load-based allocation strategy: Prioritizes low-load segments based on current load information of storage segments.
 - Topology-aware strategy: Prioritizes data segments that are physically closer to reduce network overhead.
 
-## Use Cases
-
-After installing dependencies via `dependencies.sh`, compile as a regular CMake project:
+## Compilation and Usage
+Mooncake Store is compiled together with other related components (such as the Transfer Engine).
 ```
 mkdir build
 cd build
 cmake ..
 make
-sudo make install # python binding
+sudo make install # Install Python interface support package
 ```
 
 ### Starting the Transfer Engine's Metadata Service
-The example below demonstrates how to use Mooncake Store in a real environment. Mooncake Store uses the Transfer Engine as the transport engine, which relies on its metadata service (etcd/Redis/HTTP). For starting and configuring the metadata service, refer to [Transfer Engine](./transfer-engine.md).
+Mooncake Store uses the Transfer Engine as its core transfer engine, so it is necessary to start the metadata service (etcd/redis/http). The startup and configuration of the `metadata` service can be referred to in the relevant sections of [Transfer Engine](./transfer-engine.md). **Special Note**: For the etcd service, by default, it only provides services for local processes. You need to modify the listening options (IP to 0.0.0.0 instead of the default 127.0.0.1). You can use commands like curl to verify correctness.
 
 ### Starting the Master Service
-
-The Master Service runs as an independent process, providing gRPC interfaces, and is responsible for metadata management of Mooncake Store (note that the Master Service does not reuse the metadata service of the Transfer Engine). The default listening port is `50051`. After compilation, it can be run directly:
-
-```bash
-./master_service
-```
-For debugging, enable the `-v` option to output more log information:
-```bash
-./master_service -v
-```
-
-After starting, the Master Service will output in the logs:
+The Master Service runs as an independent process, provides gRPC interfaces externally, and is responsible for the metadata management of Mooncake Store (note that the Master Service does not reuse the metadata service of the Transfer Engine). The default listening port is `50051`. After compilation, you can directly run `mooncake_master` located in the `build/mooncake-store/src/` directory. After starting, the Master Service will output the following content in the log:
 ```
 Starting Mooncake Master Service
 Port: 50051
@@ -390,35 +380,36 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
-### 3. Starting the Application with Mooncake Store Client
+### Starting the Sample Program
+Mooncake Store provides various sample programs, including interface forms based on C++ and Python. Below is an example of how to run using `stress_cluster_benchmark`.
 
-The Mooncake Store Client provides libraries in both C++ and Python and cannot be run directly. It needs to be embedded into an upper-layer application (e.g., vLLM).
-
-#### Python Usage Example
-Before running the Python script, ensure that the corresponding Python binding library is installed (make install).
-
+1. Open `stress_cluster_benchmark.py` and modify the initialization code according to the network situation, focusing on `local_hostname` (corresponding to the local machine IP address), `metadata_server` (corresponding to the Transfer Engine metadata service), `master_server_address` (corresponding to the Master Service address and port), etc.:
 ```python
 import os
 import time
 
-from distributed_object_store import distributed_object_store
+from distributed_object_store import DistributedObjectStore
 
-store = distributed_object_store()
-# Protocol used by the Transfer Engine, options are "rdma" or "tcp"
+store = DistributedObjectStore()
+# Protocol used by the transfer engine, optional values are "rdma" or "tcp"
 protocol = os.getenv("PROTOCOL", "tcp")
-# Device name used by the Transfer Engine
+# Device name used by the transfer engine
 device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-# Hostname of this node in the cluster
-local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost:12355")
-# Address of the Transfer Engine's metadata service, using etcd as the metadata service here
+# Hostname of this node in the cluster, port number is randomly selected from (12300-14300)
+local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
+# Metadata service address of the Transfer Engine, here etcd is used as the metadata service
 metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
-# Size of the Segment mounted by each node to the cluster, allocated by the Master Service afterward, in bytes
+# The size of the Segment mounted by each node to the cluster, allocated by the Master Service after mounting, in bytes
 global_segment_size = 3200 * 1024 * 1024
-# Size of the local buffer registered with the Transfer Engine, in bytes
+# Local buffer size registered with the Transfer Engine, in bytes
 local_buffer_size = 512 * 1024 * 1024
-# Address of the Mooncake Store's Master Service
+# Address of the Master Service of Mooncake Store
 master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-# Initialize the Mooncake Store Client
+# Data length for each put()
+value_length = 1 * 1024 * 1024
+# Total number of requests sent
+max_requests = 1000
+# Initialize Mooncake Store Client
 retcode = store.setup(
     local_hostname,
     metadata_server,
@@ -428,126 +419,16 @@ retcode = store.setup(
     device_name,
     master_server_address,
 )
-
-# The segment will be automatically unmounted when the store is destroyed
 ```
 
-The interface is similar to a hash table, providing `get`/`put`/`remove` interfaces. Note that the `update` interface is not supported.
+2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
+3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
+No error messages indicate successful data transfer.
 
-```python
-test_data = b"Hello, World!"
-key = "test_key"
+## Example Code
 
-store.put(key, test_data)
-store.get(key)  # Returns test_data
-store.remove(key)
-store.get(key)  # Returns empty bytes after deletion
-```
+#### Python Usage Example
+We provide a reference example `distributed_object_store_provider.py`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) in the background on the same server, and then execute this Python program in the foreground. It should output a successful test result.
 
-#### C++ C++ Usage Example
-
-The C++ API of Mooncake Store provides more low-level control.
-
-First, create and initialize a client instance:
-
-```cpp
-#include "client.h"
-#include "types.h"
-
-auto client = std::make_unique<Client>();
-
-// Configure connection parameters
-const std::string local_hostname = "localhost:12345";    // Local machine address
-const std::string metadata_server = "127.0.0.1:2379";   // Address of the Transfer Engine metadata service
-const std::string protocol = "tcp";                      // Transport protocol (tcp/rdma)
-const std::string master_addr = "127.0.0.1:50051";      // Address of the Master Service
-void** protocol_args = nullptr;                          // Protocol parameters, required for RDMA
-
-// Initialize the client
-ErrorCode rc = client->Init(local_hostname, 
-                          metadata_server,
-                          protocol, 
-                          protocol_args,
-                          master_addr);
-```
-
-Mounting a Segment to the Cluster (Optional)
-
-```cpp
-// Create and mount a storage segment
-const size_t segment_size = 32 * 1024 * 1024;  // 32MB
-void* segment_ptr = allocate_buffer_allocator_memory(segment_size);
-rc = client->MountSegment(local_hostname, segment_ptr, segment_size);
-```
-
-Registering the Local Buffer for the Transfer Engine
-```cpp
-// Create a local memory allocator (for transfer buffers)
-const size_t buffer_size = 128 * 1024 * 1024;  // 128MB
-auto buffer_allocator = std::make_unique<SimpleAllocator>(buffer_size); // For buffer memory management
-
-// Register the transfer buffer with the Transfer Engine
-rc = client->RegisterLocalMemory(
-    buffer_allocator->getBase(),
-    buffer_size,
-    "cpu:0",    // Device identifier
-    false,      // Whether memory is remotely accessible
-    false       // Whether to update metadata
-);
-```
-##### Put Operation
-Writing data to the Mooncake Store cluster:
-
-```cpp
-const std::string test_data = "Hello, Mooncake Store!";
-const std::string key = "test_key";
-
-// Allocate space in the registered buffer
-void* write_buffer = buffer_allocator->allocate(test_data.size());
-// Write data to this space, note that test_data.size() should not exceed kMaxSliceSize
-// If greater than kMaxSliceSize, write in slices (refer to DistributedObjectStore::allocateSlices)
-memcpy(write_buffer, test_data.data(), test_data.size());
-std::vector<Slice> write_slices{{write_buffer, test_data.size()}};
-
-// Configure replica strategy
-ReplicateConfig config;
-config.replica_num = 1;  // Set the number of replicas
-
-// Perform the Put operation
-rc = client->Put(key, write_slices, config);
-// Release the allocated buffer
-buffer_allocator->deallocate(write_buffer, test_data.size());
-```
-
-##### Get Operation
-Reading data from the Mooncake Store cluster:
-
-```cpp
-// Prepare the read buffer, slices need to match those used during writing, metadata information can be obtained via `Client::Query`
-// Code can be referenced from the `get` function in `distributed_object_store.cpp`
-mooncake::Client::ObjectInfo object_info;
-rc = client->Query(key, object_info);
-
-std::vector<Slice> slices;
-int ret = allocateSlices(slices, object_info, str_length); // Allocate space of corresponding size based on metadata information
-
-client_->Get(key, object_info, slices); // Perform the Get operation
-
-// Release the allocated buffer
-freeSlices(slices);
-```
-
-##### Remove Operation
-Deleting the metadata for the specified key in the Mooncake Master Service.
-```cpp
-rc = client->Remove(key);
-```
-
-##### Resource Cleanup
-After use, resources need to be cleaned up, and previously mounted segments should be unmounted to avoid failures in subsequent operations
-
-```cpp
-// Unmount the segment
-rc = client->UnmountSegment(local_hostname, segment_ptr);
-```
-
+#### C++ Usage Example
+The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.

@@ -59,6 +59,8 @@ ErrorCode Get(const std::string& object_key,
 
 用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。
 
+> 在目前的实现中，Get 接口可选 TTL 功能。当首次获取 `object_key` 对应的值后一段时间（默认为 1s），相应的条目会被自动删除。
+
 ### Put 接口
 
 ```C++
@@ -368,33 +370,22 @@ virtual std::shared_ptr<BufHandle> Allocate(
 * 基于负载的分配策略：根据存储段的当前负载信息优先选择低负载段。
 * 拓扑感知策略：优先选择物理上更接近的数据段以减少网络开销。
 
-## 使用案例
-
-在根据`dependencies.sh` 安装依赖后，可按照常规CMake 项目编译
+## 编译及使用方法
+Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
 ```
 mkdir build
 cd build
 cmake ..
 make
-sudo make install # 安装python binding
+sudo make install # 安装 Python 接口支持包
 ```
 
 ### 启动 Transfer Engine 的 Metadata 服务
-以下示例展示了如何在实际环境中将 Mooncake Store 的使用，Mooncake store 使用 Transfer Engine 作为传输引擎，而Transfer Engine 依赖其元数据服务（etcd/redis/http），`metadata` 服务的启动与配置可以参考[Transfer Engine](./transfer-engine.md)。
+Mooncake Store 使用 Transfer Engine 作为核心传输引擎，因此需要启动元数据服务（etcd/redis/http），`metadata` 服务的启动与配置可以参考[Transfer Engine](./transfer-engine.md)的有关章节。特别注意：对于 etcd 服务，默认仅为本地进程提供服务，需要修改监听选项（IP 为 0.0.0.0，而不是默认的 127.0.0.1）。可使用 curl 等指令验证正确性。
 
 ### 启动 Master Service
 
-Master Service 独立作为一个进程，对外提供 gRPC 接口，负责Mooncake Store 的元数据管理（注意Master Service 并不复用Transfer Engine 的Metadata服务），默认监听端口为 `50051`。在编译完成后，可直接运行：
-
-```bash
-./master_service
-```
-如果需要调试，可开启 `-v` 选项，输出更多日志信息：
-```bash
-./master_service -v
-```
-
-启动后，Master Service 会在日志中输出
+Master Service 独立作为一个进程，对外提供 gRPC 接口，负责Mooncake Store 的元数据管理（注意Master Service 并不复用Transfer Engine 的Metadata服务），默认监听端口为 `50051`。在编译完成后，可直接运行位于 `build/mooncake-store/src/` 目录下的 `mooncake_master`。启动后，Master Service 会在日志中输出下列内容：
 ```
 Starting Mooncake Master Service
 Port: 50051
@@ -402,28 +393,23 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
-### 3. 启动嵌入了Mooncake Store Client的上层应用
+### 启动验证程序
+Mooncake Store 提供了多种验证程序，包括基于 C++ 和 Python 等接口形态。下面以 `stress_cluster_benchmark` 为例介绍一下如何运行。
 
-Mooncake Store Client 提供了C++ 和 Python 两种绑定的库，并不能直接运行，需要嵌入到上层应用中（例如vLLM。
-
-#### Python 使用示例
-
-在运行python 脚本只之前，注意对应python binding库已经安装（`make install`）
-
-初始化部分
+1. 打开 `stress_cluster_benchmar.py`，结合网络情况修改初始化代码，重点是 local_hostname（对应本机 IP 地址）、metadata_server（对应 Transfer Engine 元数据服务）、master_server_address（对应 Master Service 地址及端口）等：
 ```python
 import os
 import time
 
-from distributed_object_store import distributed_object_store
+from distributed_object_store import DistributedObjectStore
 
-store = distributed_object_store()
+store = DistributedObjectStore()
 # Transfer engine 使用的协议，可选值为 "rdma" 或 "tcp"
 protocol = os.getenv("PROTOCOL", "tcp")
 # Transfer engine 使用的设备名称
 device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-# 本节点在集群中的 hostname
-local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost:12355")
+# 本节点在集群中的 hostname,端口号从（12300-14300）中随机选择
+local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
 # Transfer Engine 的 Metadata 服务地址，这里使用 etcd 作为元数据服务
 metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
 # 每个节点向集群中挂载的 Segment 大小，挂载之后由Master Service 进行分配，单位为字节
@@ -432,6 +418,10 @@ global_segment_size = 3200 * 1024 * 1024
 local_buffer_size = 512 * 1024 * 1024
 # Mooncake Store 的 Master Service 地址
 master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
+# 每次 put() 的数据长度
+value_length = 1 * 1024 * 1024
+# 总共发送请求数量
+max_requests = 1000
 # 初始化 Mooncake Store Client
 retcode = store.setup(
     local_hostname,
@@ -442,128 +432,17 @@ retcode = store.setup(
     device_name,
     master_server_address,
 )
-
-# store 销毁时会自动卸载挂载的segment
 ```
-接口上类似哈希表，提供`get/put/remove`接口，注意不支持`update`接口。
-```python
-test_data = b"Hello, World!"
-key = "test_key"
 
-store.put(key, test_data)
-store.get(key)  # 返回 test_data
-store.remove(key)
-store.get(key)  # 删除后返回空 bytes
-```
+2. 在一台机器上运行 `ROLE=prefill python3 ./stress_cluster_benchmark.py`，启动 Prefill 节点。
+3. 在另一台机器上运行 `ROLE=decode python3 ./stress_cluster_benchmark.py`，启动 Decode 节点。
+无报错信息表示数据传输成功。
+
+## 范例代码
+
+#### Python 使用示例
+我们提供一个参考样例 `distributed_object_store_provider.py`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上后台运行 etcd、Master Service（`mooncake_master`）等两个服务，然后在前台执行该 Python 程序，此时应输出测试成功的结果。
 
 #### C++ 使用示例
 
-Mooncake Store的C++ API提供了更底层的控制
-
-
-首先需要创建并初始化客户端实例：
-
-```cpp
-#include "client.h"
-#include "types.h"
-
-auto client = std::make_unique<Client>();
-
-// 配置连接参数
-const std::string local_hostname = "localhost:12345";    // 本机地址
-const std::string metadata_server = "127.0.0.1:2379";   // Transfer Engine元数据服务地址
-const std::string protocol = "tcp";                      // 传输协议(tcp/rdma)
-const std::string master_addr = "127.0.0.1:50051";      // Master Service地址
-void** protocol_args = nullptr;                          // 协议参数，rdma时需要设置
-
-// 初始化客户端
-ErrorCode rc = client->Init(local_hostname, 
-                          metadata_server,
-                          protocol, 
-                          protocol_args,
-                          master_addr);
-```
-
-挂载Segment到集群（可选）
-
-
-```cpp
-// 创建并挂载存储段
-const size_t segment_size = 32 * 1024 * 1024;  // 32MB
-void* segment_ptr = allocate_buffer_allocator_memory(segment_size);
-rc = client->MountSegment(local_hostname, segment_ptr, segment_size);
-```
-
-注册Transfer Engine 的本地缓冲区
-
-```cpp
-// 创建本地内存分配器（用于传输缓冲区）
-const size_t buffer_size = 128 * 1024 * 1024;  // 128MB
-auto buffer_allocator = std::make_unique<SimpleAllocator>(buffer_size); // 用于缓冲区内存管理
-
-// 注册传输缓冲区到Transfer Engine
-rc = client->RegisterLocalMemory(
-    buffer_allocator->getBase(),
-    buffer_size,
-    "cpu:0",    // 设备标识
-    false,      // 内存是否可以远程访问
-    false       // 是否更新元数据
-);
-```
-##### Put操作
-将数据写入到Mooncake Store集群中
-
-```cpp
-const std::string test_data = "Hello, Mooncake Store!";
-const std::string key = "test_key";
-
-// 在已注册的缓冲区中分配一片空间
-void* write_buffer = buffer_allocator->allocate(test_data.size());
-// 将数据写入到这片空间，需要注意test_data.size() 不能大于 kMaxSliceSize
-// 如果大于 kMaxSliceSize，需要分片写入（参考DistributedObjectStore::allocateSlices）
-memcpy(write_buffer, test_data.data(), test_data.size());
-std::vector<Slice> write_slices{{write_buffer, test_data.size()}};
-
-// 配置副本策略
-ReplicateConfig config;
-config.replica_num = 1;  // 设置副本数量
-
-// 执行Put操作
-rc = client->Put(key, write_slices, config);
-// 释放写入的缓冲区
-buffer_allocator->deallocate(write_buffer, test_data.size());
-```
-
-##### Get操作
-从Mooncake Store集群中读取数据：
-
-```cpp
-// 准备读取缓冲区，slices 需要与写入时一致，可以通过`Client::Query` 获取元数据信息
-/// 代码可以参考`distributed_object_store.cpp` 中的`get` 函数
-mooncake::Client::ObjectInfo object_info;
-rc = client->Query(key, object_info);
-
-std::vector<Slice> slices;
-int ret = allocateSlices(slices, object_info, str_length); // 根据元数据信息，分配对应大小的空间
-
-client_->Get(key, object_info, slices); // 执行Get操作
-
-// 释放读取的缓冲区
-freeSlices(slices);
-```
-
-##### Remove操作
-在Mooncake Master Service 中删除指定key的元数据
-```cpp
-rc = client->Remove(key);
-```
-
-##### 资源清理
-
-使用完毕后，需要清理资源，卸载之前已挂载的segment，避免造成后续操作失败
-
-```cpp
-// 卸载segment
-rc = client->UnmountSegment(local_hostname, segment_ptr);
-```
-
+Mooncake Store 的 C++ API 提供了更底层的控制能力。我们提供一个参考样例 `client_integration_test`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上运行 etcd、Master Service（`mooncake_master`），并执行该 C++ 程序（位于 `build/mooncake-store/tests` 目录下），应输出测试成功的结果。
