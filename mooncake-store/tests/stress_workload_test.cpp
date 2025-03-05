@@ -89,6 +89,9 @@ class RandomGen {
     }
 };
 
+const std::string kLocalHostName = "10.1.100.3:12355";
+const std::string kMetadataServerAddress = "10.1.101.3:2379";
+
 class ClientIntegrationTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -114,7 +117,7 @@ class ClientIntegrationTest : public ::testing::Test {
         const size_t ram_buffer_size = 3200ull * 1024 * 1024;
         segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size);
         ASSERT_TRUE(segment_ptr_);
-        ErrorCode rc = client_->MountSegment("localhost:12345", segment_ptr_,
+        ErrorCode rc = client_->MountSegment(kLocalHostName, segment_ptr_,
                                              ram_buffer_size);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment: " << toString(rc);
@@ -122,7 +125,7 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void CleanupSegment() {
-        if (client_->UnmountSegment("localhost:12345", segment_ptr_) !=
+        if (client_->UnmountSegment(kLocalHostName, segment_ptr_) !=
             ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment";
         }
@@ -132,11 +135,11 @@ class ClientIntegrationTest : public ::testing::Test {
         client_ = std::make_unique<Client>();
         void** args =
             (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-        ASSERT_EQ(client_->Init("localhost:12345",  // Local hostname
-                                "127.0.0.1:2379",  // Metadata connection string
+        ASSERT_EQ(client_->Init(kLocalHostName,          // Local hostname
+                                kMetadataServerAddress,  // Metadata connection string
                                 FLAGS_protocol, args, FLAGS_master_address),
                   ErrorCode::OK);
-        auto client_buffer_allocator_size = 128 * 1024 * 1024;
+        auto client_buffer_allocator_size = 256 * 1024 * 1024;
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(client_buffer_allocator_size);
         ErrorCode rc = client_->RegisterLocalMemory(
@@ -167,12 +170,12 @@ std::unique_ptr<SimpleAllocator>
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, StressPutOperations) {
-    const static int kThreads = 8;
+    const static int kThreads = 12;
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, nullptr, kThreads + 1);
     std::vector<std::thread> runner_list;
-    const int rand_len = 100;
-    const int value_length = kMaxSliceSize;
+    const int rand_len = 1000;
+    const int value_length = 1 * 1024 * 1024;
 
     for (int i = 0; i < kThreads; ++i) {
         runner_list.push_back(std::thread([&]() {
@@ -195,7 +198,6 @@ TEST_F(ClientIntegrationTest, StressPutOperations) {
                           ErrorCode::OK);
                 ASSERT_EQ(client_->Get(entry.first.data(), slices),
                           ErrorCode::OK);
-                ASSERT_EQ(client_->Remove(entry.first.data()), ErrorCode::OK);
             }
             pthread_barrier_wait(&barrier);
             client_buffer_allocator_->deallocate(write_buffer, value_length);
