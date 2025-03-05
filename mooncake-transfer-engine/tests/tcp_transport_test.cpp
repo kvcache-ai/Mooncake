@@ -32,6 +32,8 @@
 
 #include <cassert>
 
+#include "common/base/status.h"
+
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -121,7 +123,7 @@ TEST_F(TCPTransportTest, Writetest) {
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
     auto batch_id = engine->allocateBatchID(1);
-    int ret = 0;
+    Status s;
     auto segment_id = engine->openSegment(local_server_name);
     TransferRequest entry;
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
@@ -131,18 +133,18 @@ TEST_F(TCPTransportTest, Writetest) {
     entry.source = (uint8_t *)(addr);
     entry.target_id = segment_id;
     entry.target_offset = remote_base;
-    ret = engine->submitTransfer(batch_id, {entry});
-    LOG_ASSERT(!ret);
+    s = engine->submitTransfer(batch_id, {entry});
+    LOG_ASSERT(s.ok());
     bool completed = false;
     TransferStatus status;
     while (!completed) {
-        int ret = engine->getTransferStatus(batch_id, 0, status);
-        ASSERT_EQ(ret, 0);
+        Status s = engine->getTransferStatus(batch_id, 0, status);
+        ASSERT_EQ(s, Status::OK());
         LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         if (status.s == TransferStatusEnum::COMPLETED) completed = true;
     }
-    ret = engine->freeBatchID(batch_id);
-    ASSERT_EQ(ret, 0);
+    s = engine->freeBatchID(batch_id);
+    ASSERT_EQ(s, Status::OK());
 }
 
 TEST_F(TCPTransportTest, WriteAndReadtest) {
@@ -169,30 +171,30 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
     }
 
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
 
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
@@ -200,18 +202,18 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(!ret);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -242,48 +244,48 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
 
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
     }
 
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(!ret);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -292,48 +294,48 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
     }
 
     {
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(!ret);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));

@@ -313,8 +313,8 @@ Status RdmaTransport::submitTransferTask(
     return Status::OK();
 }
 
-int RdmaTransport::getTransferStatus(BatchID batch_id,
-                                     std::vector<TransferStatus> &status) {
+Status RdmaTransport::getTransferStatus(BatchID batch_id,
+                                        std::vector<TransferStatus> &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.resize(task_count);
@@ -334,14 +334,18 @@ int RdmaTransport::getTransferStatus(BatchID batch_id,
             status[task_id].s = TransferStatusEnum::WAITING;
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) {
+Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+                                        TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
-    if (task_id >= task_count) return ERR_INVALID_ARGUMENT;
+    if (task_id >= task_count) {
+        return Status::InvalidArgument(absl::StrCat(
+            "RdmaTransport::getTransportStatus invalid argument, batch id:",
+            batch_id));
+    }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
@@ -356,7 +360,7 @@ int RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
-    return 0;
+    return Status::OK();
 }
 
 RdmaTransport::SegmentID RdmaTransport::getSegmentID(

@@ -110,8 +110,9 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
     return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
-int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries, size_t count) {
+Status submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
+                                struct transfer_request *entries,
+                                size_t count) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -126,20 +127,21 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
     return native->submitTransfer((Transport::BatchID)batch_id, native_entries);
 }
 
-int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
-                      size_t task_id, struct transfer_status *status) {
+Status getTransferStatus(transfer_engine_t engine,
+                                   batch_id_t batch_id, size_t task_id,
+                                   struct transfer_status *status) {
     TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
-    int rc = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
-                                       native_status);
-    if (rc == 0) {
+    Status s = native->getTransferStatus((Transport::BatchID)batch_id,
+                                                    task_id, native_status);
+    if (s.ok()) {
         status->status = (int)native_status.s;
         status->transferred_bytes = native_status.transferred_bytes;
     }
-    return rc;
+    return s;
 }
 
-int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
+Status freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->freeBatchID(batch_id);
 }
