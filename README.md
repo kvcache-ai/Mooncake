@@ -1,12 +1,10 @@
 <div align="center">
   <img src=image/mooncake-icon.png width=44% />
-  <h3 align="center">
+  <h2 align="center">
       A KVCache-centric Disaggregated Architecture for LLM Serving
-  </h3>
+  </h2>
 </div>
 <br/>
-
---------------------------------------------------------------------------------
 
 | [**Paper**](https://www.usenix.org/system/files/fast25-qin.pdf)
 | [**Slides**](https://www.usenix.org/system/files/fast25_slides-qin.pdf)
