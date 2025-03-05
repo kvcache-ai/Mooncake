@@ -80,11 +80,11 @@ class RdmaTransport : public Transport {
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
-    int getTransferStatus(BatchID batch_id,
-                          std::vector<TransferStatus> &status);
+    Status getTransferStatus(BatchID batch_id,
+                             std::vector<TransferStatus> &status);
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override;
 
     SegmentID getSegmentID(const std::string &segment_name);
 

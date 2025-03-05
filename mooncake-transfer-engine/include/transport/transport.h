@@ -154,7 +154,7 @@ class Transport {
     virtual BatchID allocateBatchID(size_t batch_size);
 
     /// @brief Free an allocated batch.
-    virtual int freeBatchID(BatchID batch_id);
+    virtual Status freeBatchID(BatchID batch_id);
 
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If
@@ -173,8 +173,8 @@ class Transport {
     /// be called again after completion.
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
-    virtual int getTransferStatus(BatchID batch_id, size_t task_id,
-                                  TransferStatus &status) = 0;
+    virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
+                                     TransferStatus &status) = 0;
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 

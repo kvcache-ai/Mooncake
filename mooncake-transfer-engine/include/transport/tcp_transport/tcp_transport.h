@@ -53,7 +53,7 @@ class TcpTransport : public Transport {
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
                           TransferStatus &status) override;
 
    private:

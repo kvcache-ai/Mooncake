@@ -57,31 +57,6 @@ int TransferEngine::freeEngine() {
     return 0;
 }
 
-int TransferEngine::submitTransfer(BatchID batch_id,
-                                   const std::vector<TransferRequest> &entries) {
-    // TODO: return Status in public function.
-    int ret;
-    Status status = multi_transports_->submitTransfer(batch_id, entries);
-    if (!status.ok()) {
-        ret = -static_cast<int>(status.code());
-        return ret;
-    }
-    return 0;
-}
-
-int TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
-                                      TransferStatus &status) {
-    // TODO: return Status in public function.
-    int ret;
-    Status s =
-        multi_transports_->getTransferStatus(batch_id, task_id, status);
-    if (!s.ok()) {
-        ret = -static_cast<int>(s.code());
-        return ret;
-    }
-    return 0;
-}
-
 // Only for testing
 Transport *TransferEngine::installTransport(const std::string &proto,
                                             void **args) {

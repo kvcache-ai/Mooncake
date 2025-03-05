@@ -36,7 +36,7 @@ class MultiTransport {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    int freeBatchID(BatchID batch_id);
+    Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries);
