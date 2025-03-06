@@ -345,9 +345,9 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
                         << device_name << "/" << port;
             continue; // if gid is invalid ibv_query_gid_ex() will return !0
         }
-        if (ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
-            (gid_entry.gid_type == IBV_GID_TYPE_IB ||
-             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2)) {
+        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
+            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2)
+            || gid_entry.gid_type == IBV_GID_TYPE_IB) {
             gid_index = i;
             break;
         }
