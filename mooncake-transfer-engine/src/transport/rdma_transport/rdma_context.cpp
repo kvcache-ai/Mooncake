@@ -337,25 +337,17 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
                                  struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
     int gid_index = 0, i;
-    union ibv_gid temp_gid, temp_gid_rival;
-    int is_ipv4, is_ipv4_rival;
+    struct ibv_gid_entry gid_entry;
 
-    if (ibv_query_gid(context, port, gid_index, &temp_gid)) {
-        PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                    << device_name << "/" << port;
-        return -1;
-    }
-    is_ipv4 = ipv6_addr_v4mapped((struct in6_addr *)temp_gid.raw);
-
-    for (i = 1; i < port_attr.gid_tbl_len; i++) {
-        if (ibv_query_gid(context, port, i, &temp_gid_rival)) {
-            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
-                        << "/" << port;
-            return -1;
+    for (i = 0; i < port_attr.gid_tbl_len; i++) {
+        if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
+            PLOG(ERROR) << "Failed to query GID " << i << " on "
+                        << device_name << "/" << port;
+            continue; // if gid is invalid ibv_query_gid_ex() will return !0
         }
-        is_ipv4_rival =
-            ipv6_addr_v4mapped((struct in6_addr *)temp_gid_rival.raw);
-        if (is_ipv4_rival && !is_ipv4) {
+        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
+            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2)
+            || gid_entry.gid_type == IBV_GID_TYPE_IB) {
             gid_index = i;
             break;
         }
