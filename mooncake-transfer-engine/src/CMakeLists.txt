@@ -23,7 +23,7 @@ if (USE_HTTP)
   find_package(CURL REQUIRED)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
-target_link_libraries(transfer_engine PUBLIC transport rdma_transport ibverbs glog gflags pthread jsoncpp numa)
+target_link_libraries(transfer_engine PUBLIC transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread)
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)

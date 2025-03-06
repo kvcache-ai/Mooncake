@@ -16,6 +16,7 @@
 
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/tcp_transport/tcp_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
@@ -129,6 +130,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new RdmaTransport();
     } else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
+    } else if (std::string(proto) == "shm") {
+        transport = new ShmTransport();
     }
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
@@ -151,8 +154,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 }
 
 Transport *MultiTransport::selectTransport(const TransferRequest &entry) {
-    if (entry.target_id == LOCAL_SEGMENT_ID && transport_map_.count("local"))
-        return transport_map_["local"].get();
+    if (entry.target_id == LOCAL_SEGMENT_ID && transport_map_.count("shm"))
+        return transport_map_["shm"].get();
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         LOG(ERROR) << "MultiTransport: Incorrect target segment id "

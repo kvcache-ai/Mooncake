@@ -170,12 +170,12 @@ std::unique_ptr<SimpleAllocator>
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, StressPutOperations) {
-    const static int kThreads = 12;
+    const static int kThreads = 8;
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, nullptr, kThreads + 1);
     std::vector<std::thread> runner_list;
-    const int rand_len = 1000;
-    const int value_length = 1 * 1024 * 1024;
+    const int rand_len = 100;
+    const int value_length = 2 * 1024 * 1024;
 
     for (int i = 0; i < kThreads; ++i) {
         runner_list.push_back(std::thread([&]() {

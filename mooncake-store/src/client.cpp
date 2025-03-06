@@ -80,6 +80,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     }
     CHECK(transport) << "Failed to install transport";
 
+    LOG(INFO) << "transport_type=shm";
+    transport = transfer_engine_->installTransport("shm", protocol_args);
+    CHECK(transport) << "Failed to install transport";
+
     return ErrorCode::OK;
 }
 
