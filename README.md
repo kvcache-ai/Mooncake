@@ -3,17 +3,12 @@
   <h2 align="center">
       A KVCache-centric Disaggregated Architecture for LLM Serving
   </h2>
+  <a href="https://www.usenix.org/system/files/fast25-qin.pdf" target="_blank"><strong>Paper</strong></a>
+  | <a href="https://www.usenix.org/system/files/fast25_slides-qin.pdf" target="_blank"><strong>Slides</strong></a>
+  | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
+  | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
 </div>
 <br/>
-
-<center>
-| [**Paper**](https://www.usenix.org/system/files/fast25-qin.pdf)
-| [**Slides**](https://www.usenix.org/system/files/fast25_slides-qin.pdf)
-| [**Traces**](FAST25-release/traces)
-| [**Technical Report**](https://arxiv.org/abs/2407.00079)
-|
-</center>
-
 
 Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image/kimi.png" alt="icon" style="height: 16px; vertical-align: middle;"> Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/"><img src="image/moonshot.jpg" alt="icon" style="height: 16px; vertical-align: middle;"> Moonshot AI</a>.
 Now both the Transfer Engine and Mooncake Store are open-sourced!
