@@ -1,0 +1,140 @@
+syntax = "proto2";
+
+package mooncake_store;
+
+// Represents a handle to a buffer.
+message BufHandle {
+  required string segment_name = 1; // Segment name.
+  required uint64 size = 2;         // Buffer size.
+  required uint64 buffer = 3;       // Buffer pointer.
+
+  enum BufStatus {
+    INIT = 0;        // Initial.
+    COMPLETE = 1;    // Data is valid.
+    FAILED = 2;      // Operation failed.
+    UNREGISTERED = 3;// Metadata deleted
+  }
+  required BufStatus status = 4 [default = INIT]; // Buffer status.
+}
+
+// Information about a replica.
+message ReplicaInfo {
+  repeated BufHandle handles = 1; // Locations of data.
+
+  enum ReplicaStatus {
+    UNDEFINED = 0;  // Not initialized.
+    INITIALIZED = 1;// Space allocated.
+    PROCESSING = 2; // Writing data.
+    COMPLETE = 3;   // Write finished.
+    REMOVED = 4;    // Replica removed.
+    FAILED = 5;     // Write error.
+  }
+  required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status.
+}
+
+// Request to get replica list.
+message GetReplicaListRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to get replica list.
+message GetReplicaListResponse {
+  required int32 status_code = 1; // Status.
+  repeated ReplicaInfo replica_list = 2; // Replicas.
+}
+
+// Replication configuration.
+message ReplicateConfig {
+  required int32 replica_num = 1;
+  // Future replication settings.
+}
+
+// Request to start a Put operation.
+message PutStartRequest {
+  required string key = 1;         // Object key.
+  required uint64 value_length = 2; // Total data length.
+  required ReplicateConfig config = 3; // Replication config.
+  repeated uint64 slice_lengths = 4; // Length of each slice.
+}
+
+// Response to start a Put operation.
+message PutStartResponse {
+  required int32 status_code = 1; // Status.
+  repeated ReplicaInfo replica_list = 2; // Allocated replicas for each slice.
+}
+
+// Request to end a Put operation.
+message PutEndRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to end a Put operation.
+message PutEndResponse {
+  required int32 status_code = 1; // Status.
+}
+
+// Request to revoke a Put operation.
+message PutRevokeRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to revoke a Put operation.
+message PutRevokeResponse {
+  required int32 status_code = 1; // Status.
+}
+
+// Request to remove an object.
+message RemoveRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to remove an object.
+message RemoveResponse {
+  required int32 status_code = 1; // Status.
+}
+
+// Request to mount a segment
+message MountSegmentRequest {
+    required uint64 buffer = 1; // Memory address.
+    required uint64 size = 2;   // Memory size.
+    required string segment_name = 3; // Segment name.
+}
+
+// Response to mount a segment
+message MountSegmentResponse {
+    required int32 status_code = 1; // Status.
+}
+
+// Request to unmount a segment
+message UnmountSegmentRequest {
+    required string segment_name = 1; // Segment name.
+}
+
+// Response to unmount a segment
+message UnmountSegmentResponse {
+    required int32 status_code = 1;// Status
+}
+
+// Master service definition.
+service MasterService {
+  // Get replica list.
+  rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
+
+  // Start Put operation.
+  rpc PutStart(PutStartRequest) returns (PutStartResponse);
+
+  // End Put operation.
+  rpc PutEnd(PutEndRequest) returns (PutEndResponse);
+
+  // Revoke Put operation.
+  rpc PutRevoke(PutRevokeRequest) returns (PutRevokeResponse);
+
+  // Remove object.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Mount a segment.
+  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
+
+  // Unmount a segment.
+  rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
+}
