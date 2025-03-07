@@ -3,7 +3,7 @@
 ## Overview
 This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated Prefill/Decode scenario. Benchmark results will be released soon.
 
-Main changes from v0.x to V1:
+Main changes from v0.x to v1:
 - XpYd support and orchestration
   - instance role adjustment
   - dynamic changing the population of p group and d group
@@ -82,7 +82,7 @@ etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://loc
 mooncake_master --port 50001
 # If some vllm instances exit unexpectedly, some connection metadata will be corrupted since they are not properly cleaned. In that case, we recommend you restart the mooncake_master before running another test.
 
-# 3. Run multiple vllm instance
+# 3. Run multiple vllm instances
 # kv_producer role
 MOONCAKE_CONFIG_PATH=./mooncake.json python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8100 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
 
@@ -138,6 +138,10 @@ ADMIN_API_KEY="xxxxxxxx" python3 vllm/examples/online_serving/disagg_examples/di
 curl -X POST "http://localhost:8000/instances/add" -H "Content-Type: application/json" -H "X-API-Key: $ADMIN_API_KEY" -d '{"type": "prefill", "instance": "localhost:8300"}'
 
 curl -X POST "http://localhost:8000/instances/add" -H "Content-Type: application/json" -H "X-API-Key: $ADMIN_API_KEY" -d '{"type": "decode", "instance": "localhost:8301"}'
+
+curl -X POST "http://localhost:8000/instances/add" -H "Content-Type: application/json" -H "X-API-Key: $ADMIN_API_KEY" -d '{"type": "prefill", "instance": "localhost:8302"}'
+
+curl -X POST "http://localhost:8000/instances/add" -H "Content-Type: application/json" -H "X-API-Key: $ADMIN_API_KEY" -d '{"type": "decode", "instance": "localhost:8303"}'
 
 # Use this command to get the proxy status
 curl localhost:8000/status | jq
