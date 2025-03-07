@@ -23,6 +23,7 @@
 #include <future>
 #include <set>
 
+#include "absl/functional/bind_front.h"
 #include "common.h"
 #include "config.h"
 #include "memory_location.h"
@@ -408,9 +409,10 @@ int RdmaTransport::initializeRdmaResources() {
 }
 
 int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
+    // Using absl::bind_front instead of std::bind.
+    // https://abseil.io/tips/108
     return metadata_->startHandshakeDaemon(
-        std::bind(&RdmaTransport::onSetupRdmaConnections, this,
-                  std::placeholders::_1, std::placeholders::_2),
+        absl::bind_front(&RdmaTransport::onSetupRdmaConnections, this),
         metadata_->localRpcMeta().rpc_port);
 }
 
