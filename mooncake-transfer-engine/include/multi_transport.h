@@ -36,12 +36,12 @@ class MultiTransport {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    int freeBatchID(BatchID batch_id);
+    Status freeBatchID(BatchID batch_id);
 
-    int submitTransfer(BatchID batch_id,
+    Status submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries);
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
                           TransferStatus &status);
 
     Transport *installTransport(const std::string &proto,

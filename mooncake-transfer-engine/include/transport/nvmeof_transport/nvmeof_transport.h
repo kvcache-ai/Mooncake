@@ -37,13 +37,13 @@ class NVMeoFTransport : public Transport {
 
     BatchID allocateBatchID(size_t batch_size) override;
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) override;
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override;
 
-    int freeBatchID(BatchID batch_id) override;
+    Status freeBatchID(BatchID batch_id) override;
 
    private:
     struct NVMeoFBatchDesc {
