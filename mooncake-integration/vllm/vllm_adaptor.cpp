@@ -16,6 +16,8 @@
 
 #include <cassert>
 
+#include "distributed_object_store.h"
+
 VLLMAdaptor::VLLMAdaptor() {}
 
 VLLMAdaptor::~VLLMAdaptor() {
@@ -240,4 +242,13 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("readBytesFromBuffer", &VLLMAdaptor::readBytesFromBuffer)
         .def("expRegisterMemory", &VLLMAdaptor::expRegisterMemory)
         .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory);
+    py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
+        .def(py::init<>())
+        .def("setup", &DistributedObjectStore::setup)
+        .def("initAll", &DistributedObjectStore::initAll)
+        .def("get", &DistributedObjectStore::get)
+        .def("put", &DistributedObjectStore::put)
+        .def("remove", &DistributedObjectStore::remove)
+        .def("isExist", &DistributedObjectStore::isExist)
+        .def("close", &DistributedObjectStore::tearDownAll);
 }
