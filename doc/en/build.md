@@ -142,6 +142,18 @@ This document describes how to build Mooncake.
    make -j
    ```
 
+## Use Mooncake in Docker Containers
+Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
+In order for the container to use the host's network resources, you need to add the option when starting the container. The following is an example.
+
+```
+# In host
+sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
+# In container
+root@vm-5-3-3:/# cd /Mooncake-main/build/mooncake-transfer-engine/example
+root@vm-5-3-3:/Mooncake-main/build/mooncake-transfer-engine/example# ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
+```
+
 ## Advanced Compile Options
 Mooncake supports the following advanced compile options:
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA & NVMe-of support. 
