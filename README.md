@@ -144,7 +144,7 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommand
    make -j
    ```
 
-
+Mooncake also supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
 
 <h2 id="milestones"> 🛣️ Incoming Milestones</h2>
 
