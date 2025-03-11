@@ -184,15 +184,15 @@ Please kindly cite our paper if you find the paper or the traces are useful:
 }
 
 @inproceedings {qin2025mooncake,
-author = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
-title = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
-booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
-year = {2025},
-isbn = {978-1-939133-45-8},
-address = {Santa Clara, CA},
-pages = {155--170},
-url = {https://www.usenix.org/conference/fast25/presentation/qin},
-publisher = {USENIX Association},
-month = feb
+  author       = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+  title        = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
+  booktitle    = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+  year         = {2025},
+  isbn         = {978-1-939133-45-8},
+  address      = {Santa Clara, CA},
+  pages        = {155--170},
+  url          = {https://www.usenix.org/conference/fast25/presentation/qin},
+  publisher    = {USENIX Association},
+  month        = feb
 }
 ```

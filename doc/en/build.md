@@ -144,7 +144,7 @@ This document describes how to build Mooncake.
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
-In order for the container to use the host's network resources, you need to add the option when starting the container. The following is an example.
+For the the container to use the host's network resources, you need to add the option when starting the container. The following is an example.
 
 ```
 # In host
