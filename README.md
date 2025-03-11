@@ -1,9 +1,12 @@
 <div align="center">
   <img src=image/mooncake-icon.png width=44% />
-  <h3 align="center">
-      A KVCache-centric Disaggregated<br/> Architecture for LLM Serving
-  </h3>
-  <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>📃 Technical Report</strong></a>
+  <h2 align="center">
+      A KVCache-centric Disaggregated Architecture for LLM Serving
+  </h2>
+  <a href="https://www.usenix.org/system/files/fast25-qin.pdf" target="_blank"><strong>Paper</strong></a>
+  | <a href="https://www.usenix.org/system/files/fast25_slides-qin.pdf" target="_blank"><strong>Slides</strong></a>
+  | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
+  | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
 </div>
 <br/>
 
@@ -13,11 +16,12 @@ This repository also hosts its technical report and the open sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
- - **Feb 21, 2025**: We open sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
-
+ - **Mar 7, 2025**: We open sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
+ - **Feb 25, 2025**: Mooncake receives the **Best Paper Award** at **FAST 2025**!
+ - **Feb 21, 2025**: The updated <a href="FAST25-release/traces" target="_blank">traces</a> used in our FAST'25 paper have been released.
  - **Dec 16, 2024**: vLLM officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
  - **Nov 28, 2024**: We open sourced the Transfer Engine, the central component of Mooncake. We also provide two demonstrations of Transfer Engine: a P2P Store and vLLM integration.
- - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/mooncake_trace.jsonl" target="_blank">jsonl file</a>!.
+ - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/mooncake_trace.jsonl" target="_blank">jsonl file</a>.
  - **June 27, 2024**: We present a series of Chinese blogs with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/705910725">2</a>, <a href="https://zhuanlan.zhihu.com/p/706204757">3</a>, <a href="https://zhuanlan.zhihu.com/p/707997501">4</a>.
  - **June 26, 2024**: Initial technical report release.
 
@@ -75,6 +79,9 @@ Mooncake Store is a distributed KVCache storage engine specialized for LLM infer
 Thanks to the high performance of Transfer Engine, P2P Stores can also distribute objects with full utilization of *hardware incoming bandwidth* (e.g., A 25Gbps NIC was used in the following figure, and the throughput of get replica is about 3.1 GB/s).
 
 ![p2p-store.gif](image/p2p-store.gif)
+
+### Mooncake Store ([Guide](doc/en/mooncake-store-preview.md))
+Mooncake Store is a distributed KVCache storage engine specialized for LLM inference. It offers object-level APIs (`Put`, `Get` and `Remove`), and we will soon release an new vLLM integration to demonstrate xPyD disaggregation. Mooncake Store is the central component of the KVCache-centric disaggregated architecture.
 
 ### vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md))
 To optimize LLM inference, the vLLM community is working on supporting [disaggregated prefilling (PR 10502)](https://github.com/vllm-project/vllm/pull/10502). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
@@ -140,7 +147,7 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommand
    make -j
    ```
 
-
+Mooncake also supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
 
 <h2 id="milestones"> 🛣️ Incoming Milestones</h2>
 
@@ -164,7 +171,7 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommand
     "hash_ids": [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 2366]
 }
 ```
-The above presents two samples from our trace dataset. The trace includes the timing of request arrivals, the number of input tokens, the number of output tokens, and the remapped block hash. To protect our customers' privacy, we applied several mechanisms to remove user-related information while preserving the dataset's utility for simulated evaluation. More descriptions of the trace (e.g., up to 50% cache hit ratio) can be found in Section 4 of the paper's Version 3.
+The above presents two samples from our trace dataset. The trace includes the timing of request arrivals, the number of input tokens, the number of output tokens, and the remapped block hash. To protect our customers' privacy, we applied several mechanisms to remove user-related information while preserving the dataset's utility for simulated evaluation. More descriptions of the trace (e.g., up to 50% cache hit ratio) can be found in Section 4 of the technical report.
 
 **_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
 
@@ -180,15 +187,15 @@ Please kindly cite our paper if you find the paper or the traces are useful:
 }
 
 @inproceedings {qin2025mooncake,
-author = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
-title = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
-booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
-year = {2025},
-isbn = {978-1-939133-45-8},
-address = {Santa Clara, CA},
-pages = {155--170},
-url = {https://www.usenix.org/conference/fast25/presentation/qin},
-publisher = {USENIX Association},
-month = feb
+  author       = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+  title        = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
+  booktitle    = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+  year         = {2025},
+  isbn         = {978-1-939133-45-8},
+  address      = {Santa Clara, CA},
+  pages        = {155--170},
+  url          = {https://www.usenix.org/conference/fast25/presentation/qin},
+  publisher    = {USENIX Association},
+  month        = feb
 }
 ```
