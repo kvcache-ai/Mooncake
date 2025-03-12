@@ -62,7 +62,11 @@ class DistributedObjectStore {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
+    int put_tensor(const std::string &key, uint64_t tensor_ptr, size_t tensor_size);
+
     int put(const std::string &key, const std::string &value);
+
+    int get_tensor(const std::string &key, uint64_t tensor_ptr);
 
     pybind11::bytes get(const std::string &key);
 

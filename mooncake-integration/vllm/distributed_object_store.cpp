@@ -301,6 +301,26 @@ int DistributedObjectStore::put(const std::string &key,
     return 0;
 }
 
+int DistributedObjectStore::put_tensor(const std::string &key,
+    uint64_t tensor_ptr, size_t tensor_size) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;  // TODO
+
+    std::vector<Slice> slices;
+    std::string value((char *)tensor_ptr, tensor_size);
+    int ret = allocateSlices(slices, value);
+    if (ret) return ret;
+
+    ErrorCode error_code = client_->Put(std::string(key), slices, config);
+    freeSlices(slices);
+    if (error_code != ErrorCode::OK) return 1;
+    return 0;
+}
+
 pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -336,6 +356,36 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     pybind11::bytes result(str, str_length);
     delete[] str;
     return result;
+}
+
+int DistributedObjectStore::get_tensor(const std::string &key, 
+    uint64_t tensor_ptr) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+    }
+    mooncake::Client::ObjectInfo object_info;
+    std::vector<Slice> slices;
+
+    ErrorCode error_code = client_->Query(key, object_info);
+    if (error_code != ErrorCode::OK) return 1;
+
+    uint64_t str_length = 0;
+    int ret = allocateSlices(slices, object_info, str_length);
+    if (ret) return 1;
+
+    error_code = client_->Get(key, object_info, slices);
+    if (error_code != ErrorCode::OK) {
+        freeSlices(slices);
+        return 1;
+    }
+
+    const char *str = exportSlices(slices, str_length);
+    freeSlices(slices);
+    if (!str) return 1;
+
+    memcpy((void *)tensor_ptr, str, str_length);
+    delete[] str;
+    return 0;
 }
 
 int DistributedObjectStore::remove(const std::string &key) {

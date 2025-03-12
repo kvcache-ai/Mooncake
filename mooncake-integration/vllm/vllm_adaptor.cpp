@@ -313,6 +313,8 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("initAll", &DistributedObjectStore::initAll)
         .def("get", &DistributedObjectStore::get)
         .def("put", &DistributedObjectStore::put)
+        .def("get_tensor", &DistributedObjectStore::get_tensor)
+        .def("put_tensor", &DistributedObjectStore::put_tensor)
         .def("remove", &DistributedObjectStore::remove)
         .def("isExist", &DistributedObjectStore::isExist)
         .def("close", &DistributedObjectStore::tearDownAll)
