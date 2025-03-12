@@ -22,9 +22,8 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <utility>
-
-#include "absl/strings/string_view.h"
 
 namespace mooncake {
 
@@ -61,7 +60,7 @@ class Status final {
   // Constructs a Status object containing a status code and message.
   // If 'code == Code::kOk', 'msg' is ignored and an object identical to an OK
   // status is constructed.
-  Status(Code code, absl::string_view message);
+  Status(Code code, std::string_view message);
 
   Status(const Status& s);
   Status& operator=(const Status& s);
@@ -72,99 +71,99 @@ class Status final {
   Code code() const { return code_; }
 
   // Return the error message (if any).
-  absl::string_view message() const {
+  std::string_view message() const {
     if (message_) {
       return message_;
     } else {
-      return absl::string_view();
+      return std::string_view();
     }
   }
 
   // Returns true if the Status is OK.
-  ABSL_MUST_USE_RESULT bool ok() const { return Code::kOk == code_; }
+  [[nodiscard]] bool ok() const { return Code::kOk == code_; }
 
   // Returns true iff the status indicates an InvalidArgument error.
-  ABSL_MUST_USE_RESULT bool IsInvalidArgument() const {
+  [[nodiscard]] bool IsInvalidArgument() const {
     return Code::kInvalidArgument == code_;
   }
 
   // Returns true iff the status indicates a TooManyRequests error.
-  ABSL_MUST_USE_RESULT bool IsTooManyRequests() const {
+  [[nodiscard]] bool IsTooManyRequests() const {
     return Code::kTooManyRequests == code_;
   }
 
   // Returns true iff the status indicates an AddressNotRegistered error.
-  ABSL_MUST_USE_RESULT bool IsAddressNotRegistered() const {
+  [[nodiscard]] bool IsAddressNotRegistered() const {
     return Code::kAddressNotRegistered == code_;
   }
 
   // Returns true iff the status indicates a BatchBusy error.
-  ABSL_MUST_USE_RESULT bool IsBatchBusy() const {
+  [[nodiscard]] bool IsBatchBusy() const {
     return Code::kBatchBusy == code_;
   }
 
   // Returns true iff the status indicates an DeviceNotFound error.
-  ABSL_MUST_USE_RESULT bool IsDeviceNotFound() const {
+  [[nodiscard]] bool IsDeviceNotFound() const {
     return Code::kDeviceNotFound == code_;
   }
 
   // Returns true iff the status indicates an AddressOverlapped error.
-  ABSL_MUST_USE_RESULT bool IsAddressOverlapped() const {
+  [[nodiscard]] bool IsAddressOverlapped() const {
     return Code::kAddressOverlapped == code_;
   }
 
   // Returns true iff the status indicates a dns error.
-  ABSL_MUST_USE_RESULT bool IsDns() const {
+  [[nodiscard]] bool IsDns() const {
     return Code::kDns == code_;
   }
 
   // Returns true iff the status indicates an Socket error.
-  ABSL_MUST_USE_RESULT bool IsSocket() const {
+  [[nodiscard]] bool IsSocket() const {
     return Code::kSocket == code_;
   }
 
   // Returns true iff the status indicates a MalformedJson error.
-  ABSL_MUST_USE_RESULT bool IsMalformedJson() const {
+  [[nodiscard]] bool IsMalformedJson() const {
     return Code::kMalformedJson == code_;
   }
 
   // Returns true iff the status indicates a RejectHandshake error.
-  ABSL_MUST_USE_RESULT bool IsRejectHandshake() const {
+  [[nodiscard]] bool IsRejectHandshake() const {
     return Code::kRejectHandshake == code_;
   }
 
   // Returns true iff the status indicates a Metadata error.
-  ABSL_MUST_USE_RESULT bool IsMetadata() const {
+  [[nodiscard]] bool IsMetadata() const {
     return Code::kMetadata == code_;
   }
 
   // Returns true iff the status indicates an Endpoint error.
-  ABSL_MUST_USE_RESULT bool IsEndpoint() const {
+  [[nodiscard]] bool IsEndpoint() const {
     return Code::kEndpoint == code_;
   }
 
   // Returns true iff the status indicates a Context error.
-  ABSL_MUST_USE_RESULT bool IsContext() const {
+  [[nodiscard]] bool IsContext() const {
     return Code::kContext == code_;
   }
 
   // Returns true iff the status indicates a Numa error.
-  ABSL_MUST_USE_RESULT bool IsNuma() const {
+  [[nodiscard]] bool IsNuma() const {
     return Code::kNuma == code_;
   }
 
   // Returns true iff the status indicates a Clock error.
-  ABSL_MUST_USE_RESULT bool IsClock() const {
+  [[nodiscard]] bool IsClock() const {
     return Code::kClock == code_;
   }
 
   // Returns true iff the status indicates a Memory error.
-  ABSL_MUST_USE_RESULT bool IsMemory() const {
+  [[nodiscard]] bool IsMemory() const {
     return Code::kMemory == code_;
   }
 
   // Returns true iff the status indicates a NotImplmented error.
-  ABSL_MUST_USE_RESULT bool IsNotImplmented() const {
+  [[nodiscard]] bool IsNotImplmented() const {
     return Code::kNotImplmented == code_;
   }
 
@@ -176,55 +175,55 @@ class Status final {
 
   // Return a status of an appropriate type.
   static Status OK() { return Status(); }
-  static Status InvalidArgument(absl::string_view msg) {
+  static Status InvalidArgument(std::string_view msg) {
     return Status(Code::kInvalidArgument, msg);
   }
-  static Status TooManyRequests(absl::string_view msg) {
+  static Status TooManyRequests(std::string_view msg) {
     return Status(Code::kTooManyRequests, msg);
   }
-  static Status AddressNotRegistered(absl::string_view msg) {
+  static Status AddressNotRegistered(std::string_view msg) {
     return Status(Code::kAddressNotRegistered, msg);
   }
-  static Status BatchBusy(absl::string_view msg) {
+  static Status BatchBusy(std::string_view msg) {
     return Status(Code::kBatchBusy, msg);
   }
-  static Status DeviceNotFound(absl::string_view msg) {
+  static Status DeviceNotFound(std::string_view msg) {
     return Status(Code::kDeviceNotFound, msg);
   }
-  static Status AddressOverlapped(absl::string_view msg) {
+  static Status AddressOverlapped(std::string_view msg) {
     return Status(Code::kAddressOverlapped, msg);
   }
-  static Status Dns(absl::string_view msg) {
+  static Status Dns(std::string_view msg) {
     return Status(Code::kDns, msg);
   }
-  static Status Socket(absl::string_view msg) {
+  static Status Socket(std::string_view msg) {
     return Status(Code::kSocket, msg);
   }
-  static Status MalformedJson(absl::string_view msg) {
+  static Status MalformedJson(std::string_view msg) {
     return Status(Code::kMalformedJson, msg);
   }
-  static Status RejectHandshake(absl::string_view msg) {
+  static Status RejectHandshake(std::string_view msg) {
     return Status(Code::kRejectHandshake, msg);
   }
-  static Status Metadata(absl::string_view msg) {
+  static Status Metadata(std::string_view msg) {
     return Status(Code::kMetadata, msg);
   }
-  static Status Endpoint(absl::string_view msg) {
+  static Status Endpoint(std::string_view msg) {
     return Status(Code::kEndpoint, msg);
   }
-  static Status Context(absl::string_view msg) {
+  static Status Context(std::string_view msg) {
     return Status(Code::kContext, msg);
   }
-  static Status Numa(absl::string_view msg) {
+  static Status Numa(std::string_view msg) {
     return Status(Code::kNuma, msg);
   }
-  static Status Clock(absl::string_view msg) {
+  static Status Clock(std::string_view msg) {
     return Status(Code::kClock, msg);
   }
-  static Status Memory(absl::string_view msg) {
+  static Status Memory(std::string_view msg) {
     return Status(Code::kMemory, msg);
   }
-  static Status NotImplmented(absl::string_view msg) {
+  static Status NotImplmented(std::string_view msg) {
     return Status(Code::kNotImplmented, msg);
   }
 

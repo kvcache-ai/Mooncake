@@ -271,9 +271,9 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
-        return Status::InvalidArgument(absl::StrCat(
-            "TcpTransport::getTransportStatus invalid argument, batch id:",
-            batch_id));
+        return Status::InvalidArgument(
+            "TcpTransport::getTransportStatus invalid argument, batch id: " +
+            std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
@@ -299,9 +299,9 @@ Status TcpTransport::submitTransfer(BatchID batch_id,
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return Status::InvalidArgument(absl::StrCat(
-            "TcpTransport: Exceed the limitation of capacity, batch id: ",
-            batch_id));
+        return Status::InvalidArgument(
+            "TcpTransport: Exceed the limitation of capacity, batch id: " +
+            std::to_string(batch_id));
     }
 
     size_t task_id = batch_desc.task_list.size();

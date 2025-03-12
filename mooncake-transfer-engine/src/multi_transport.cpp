@@ -83,8 +83,9 @@ Status MultiTransport::submitTransfer(
     for (auto &request : entries) {
         auto transport = selectTransport(request);
         if (!transport) {
-            return Status::InvalidArgument(absl::StrCat(
-                "SelectTransport failed for SegmentID: ", request.target_id));
+            return Status::InvalidArgument(
+                "SelectTransport failed for SegmentID: " +
+                std::to_string(request.target_id));
         }
         auto &task = batch_desc.task_list[task_id];
         ++task_id;

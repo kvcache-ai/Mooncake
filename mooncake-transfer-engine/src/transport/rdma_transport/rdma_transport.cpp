@@ -199,9 +199,9 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return Status::InvalidArgument(absl::StrCat(
-            "RdmaTransport: Exceed the limitation of capacity, batch id: ",
-            batch_id));
+        return Status::InvalidArgument(
+            "RdmaTransport: Exceed the limitation of capacity, batch id: " +
+            std::to_string(batch_id));
     }
 
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
@@ -247,9 +247,10 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << slice->source_addr;
-                return Status::AddressNotRegistered(absl::StrCat(
-                    "RdmaTransport: not registered by any device(s), address:",
-                    absl::StrFormat("%p", slice->source_addr)));
+                return Status::AddressNotRegistered(
+                    "RdmaTransport: not registered by any device(s), address: "
+                    + std::to_string(
+                        reinterpret_cast<uintptr_t>(slice->source_addr)));
             }
         }
     }
@@ -302,9 +303,10 @@ Status RdmaTransport::submitTransferTask(
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << slice->source_addr;
-                return Status::AddressNotRegistered(absl::StrCat(
-                    "RdmaTransport: not registered by any device(s), address:",
-                    absl::StrFormat("%p", slice->source_addr)));
+                return Status::AddressNotRegistered(
+                    "RdmaTransport: not registered by any device(s), address: "
+                    + std::to_string(
+                        reinterpret_cast<uintptr_t>(slice->source_addr)));
             }
         }
     }
@@ -342,9 +344,9 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
-        return Status::InvalidArgument(absl::StrCat(
-            "RdmaTransport::getTransportStatus invalid argument, batch id:",
-            batch_id));
+        return Status::InvalidArgument(
+            "RdmaTransport::getTransportStatus invalid argument, batch id: " +
+            std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;

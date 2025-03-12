@@ -58,13 +58,4 @@ echo "*** Download and installing [golang-1.22] ***"
 wget https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
 sudo tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
 
-echo "*** Download and installing [abseil-cpp] ***"
-cd ${REPO_ROOT}/thirdparties
-git clone ${GITHUB_PROXY}/abseil/abseil-cpp.git
-cd abseil-cpp
-mkdir -p build
-cd build
-CXXFLAGS="-fPIC" CFLAGS="-fPIC" cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-make -j$(nproc) && sudo make install
-
 echo "*** Dependencies Installed! ***"

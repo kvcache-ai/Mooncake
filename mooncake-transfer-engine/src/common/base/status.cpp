@@ -20,12 +20,11 @@
 
 #include <cstring>
 
-#include "absl/strings/str_cat.h"
 #include "glog/logging.h"
 
 namespace mooncake {
 
-Status::Status(Status::Code code, absl::string_view message)
+Status::Status(Status::Code code, std::string_view message)
     : code_(code) {
   if (code != Code::kOk) {
     // Only store the message when it is not empty.
@@ -44,7 +43,7 @@ std::string Status::ToString() const {
   if (ok()) {
     return "OK";
   } else {
-    return absl::StrCat(CodeToString(code()), ": ", message());
+    return std::string(CodeToString(code())) + ": " + std::string(message());
   }
 }
 
@@ -88,7 +87,7 @@ std::string_view Status::CodeToString(Status::Code code) {
       return "NotImplmented";
     default:
       LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
-      return absl::StrCat(code);
+      return "UnknownCode";
   }
 }
 
