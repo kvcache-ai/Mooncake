@@ -152,7 +152,8 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
     }
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(FLAGS_report_precision)
-        << 1.0 * data_bytes / duration / RATE_UNIT_MP.at(FLAGS_report_unit) << " " << FLAGS_report_unit << "/s";
+        << 1.0 * data_bytes / duration / RATE_UNIT_MP.at(FLAGS_report_unit)
+        << " " << FLAGS_report_unit << "/s";
     return oss.str();
 }
 
@@ -288,7 +289,7 @@ int initiator() {
         LOG_ASSERT(xport);
     }
 
-    void *addr[NR_SOCKETS] = {nullptr};
+    std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
@@ -370,7 +371,7 @@ int target() {
         }
     }
 
-    void *addr[NR_SOCKETS] = {nullptr};
+    std::vector<void *> addr(NR_SOCKETS, nullptr);
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
         memset(addr[i], 'x', FLAGS_buffer_size);
