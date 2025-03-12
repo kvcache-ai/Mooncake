@@ -77,6 +77,14 @@ class DistributedObjectStore {
      */
     int isExist(const std::string &key);
 
+    /**
+     * @brief Get the size of an object
+     * @param key Key of the object
+     * @return Size of the object in bytes, or -1 if error or object doesn't
+     * exist
+     */
+    int64_t getSize(const std::string &key);
+
    private:
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);
