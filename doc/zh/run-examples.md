@@ -99,7 +99,7 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
    - `--mode=target` 表示启动目标节点。目标节点不发起读写请求，只是被动按发起节点的要求供给或写入数据。
       > 注意：实际应用中可不区分目标节点和发起节点，每个节点可以向集群内其他节点自由发起读写请求。
    - `--metadata_server` 为元数据服务器地址（etcd 服务的完整地址）。
-      > 如果使用 `http` 作为 `metadata` 服务，需要将 `--metadata_server` 参数改为 `--metadata_server=http://10.0.0.1:8080/metadata`，并且指定 `--metadata_type=http`。
+      > 如果使用 `http` 作为 `metadata` 服务，需要将 `--metadata_server` 参数改为 `--metadata_server=http://10.0.0.1:8080/metadata`。
    - `--local_server_name` 表示本机器地址，大多数情况下无需设置。如果不设置该选项，则该值等同于本机的主机名（即 `hostname(2)` ）。集群内的其它节点会使用此地址尝试与该节点进行带外通信，从而建立 RDMA 连接。
       > 注意：若带外通信失败则连接无法建立。因此，若有必要需修改集群所有节点的 `/etc/hosts` 文件，使得可以通过主机名定位到正确的节点。
    - `--device_name` 表示传输过程使用的 RDMA 网卡名称。
