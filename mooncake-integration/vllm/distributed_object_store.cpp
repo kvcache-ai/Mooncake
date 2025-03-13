@@ -301,8 +301,8 @@ int DistributedObjectStore::put(const std::string &key,
     return 0;
 }
 
-int DistributedObjectStore::put_tensor(const std::string &key,
-    uint64_t tensor_ptr, size_t tensor_size) {
+int DistributedObjectStore::put_mem(const std::string &key,
+    uint64_t mem_ptr, size_t mem_size) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
@@ -311,13 +311,18 @@ int DistributedObjectStore::put_tensor(const std::string &key,
     config.replica_num = 1;  // TODO
 
     std::vector<Slice> slices;
-    std::string value((char *)tensor_ptr, tensor_size);
+    std::string value((char *)mem_ptr, mem_size);
     int ret = allocateSlices(slices, value);
     if (ret) return ret;
 
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return 1;
+    return 0;
+}
+
+int DistributedObjectStore::put_numpy(const std::string &key, 
+    pybind11::array_t<double> &value) {
     return 0;
 }
 
@@ -358,8 +363,8 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     return result;
 }
 
-int DistributedObjectStore::get_tensor(const std::string &key, 
-    uint64_t tensor_ptr) {
+int DistributedObjectStore::get_mem(const std::string &key, 
+    uint64_t mem_ptr) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
     }
@@ -383,7 +388,7 @@ int DistributedObjectStore::get_tensor(const std::string &key,
     freeSlices(slices);
     if (!str) return 1;
 
-    memcpy((void *)tensor_ptr, str, str_length);
+    memcpy((void *)mem_ptr, str, str_length);
     delete[] str;
     return 0;
 }
