@@ -18,6 +18,7 @@
 
 #include <cassert>
 
+#include "absl/functional/bind_front.h"
 #include "config.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -46,11 +47,15 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
+
+    // Using absl::bind_front instead of std::bind.
+    // https://abseil.io/tips/108
     for (int i = 0; i < kTransferWorkerCount; ++i)
         worker_thread_.emplace_back(
-            std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
+            std::thread(absl::bind_front(
+                &WorkerPool::transferWorker, this, i)));
     worker_thread_.emplace_back(
-        std::thread(std::bind(&WorkerPool::monitorWorker, this)));
+        std::thread(absl::bind_front(&WorkerPool::monitorWorker, this)));
 }
 
 WorkerPool::~WorkerPool() {
