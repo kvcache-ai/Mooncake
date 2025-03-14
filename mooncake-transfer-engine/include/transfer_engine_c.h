@@ -18,8 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "common/base/status.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -128,14 +126,14 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 
-mooncake::Status submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                                struct transfer_request *entries, size_t count);
+int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
+                   struct transfer_request *entries, size_t count);
 
-mooncake::Status getTransferStatus(transfer_engine_t engine,
-                                   batch_id_t batch_id, size_t task_id,
-                                   struct transfer_status *status);
+int getTransferStatus(transfer_engine_t engine,
+                      batch_id_t batch_id, size_t task_id,
+                      struct transfer_status *status);
 
-mooncake::Status freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
+int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
 int syncSegmentCache(transfer_engine_t engine);
 

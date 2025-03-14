@@ -110,9 +110,9 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
     return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
-Status submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                                struct transfer_request *entries,
-                                size_t count) {
+int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
+                   struct transfer_request *entries,
+                   size_t count) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -124,12 +124,14 @@ Status submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
     }
-    return native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+    Status s =
+        native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+    return (int)s.code();
 }
 
-Status getTransferStatus(transfer_engine_t engine,
-                                   batch_id_t batch_id, size_t task_id,
-                                   struct transfer_status *status) {
+int getTransferStatus(transfer_engine_t engine,
+                      batch_id_t batch_id, size_t task_id,
+                      struct transfer_status *status) {
     TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
     Status s = native->getTransferStatus((Transport::BatchID)batch_id,
@@ -138,12 +140,13 @@ Status getTransferStatus(transfer_engine_t engine,
         status->status = (int)native_status.s;
         status->transferred_bytes = native_status.transferred_bytes;
     }
-    return s;
+    return (int)s.code();
 }
 
-Status freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
+int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->freeBatchID(batch_id);
+    Status s = native->freeBatchID(batch_id);
+    return (int)s.code();
 }
 
 int syncSegmentCache(transfer_engine_t engine) {

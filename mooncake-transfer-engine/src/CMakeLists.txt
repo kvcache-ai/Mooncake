@@ -28,7 +28,6 @@ target_link_libraries(
     transfer_engine
     PUBLIC
     base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
-    ${ABSL_LIBS}
     )
 
 if (USE_CUDA)
