@@ -43,7 +43,7 @@ func NewTransferEngine(metadataConnString string,
 	defer C.free(unsafe.Pointer(metadataConnStringCStr))
 	defer C.free(unsafe.Pointer(localServerNameCStr))
 	defer C.free(unsafe.Pointer(localIpAddressCStr))
-	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort))
+	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort), 0)
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
