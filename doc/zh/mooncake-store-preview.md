@@ -370,6 +370,8 @@ virtual std::shared_ptr<BufHandle> Allocate(
 * 基于负载的分配策略：根据存储段的当前负载信息优先选择低负载段。
 * 拓扑感知策略：优先选择物理上更接近的数据段以减少网络开销。
 
+## Mooncake Store Python API
+
 ### setup
 ```python
 def setup(
@@ -450,7 +452,7 @@ def get(self, key: str) -> bytes
 **异常**  
 - `KeyError`: 当指定键不存在时抛出
 
-## Mooncake Store Python API
+---
 
 ### remove
 ```python
