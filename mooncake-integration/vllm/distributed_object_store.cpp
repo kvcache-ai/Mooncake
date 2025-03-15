@@ -322,6 +322,12 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
         return kNullString;
     }
 
+    if (slices.size() == 1 && slices[0].size == str_length) {
+        auto result = pybind11::bytes((char *)slices[0].ptr, str_length);
+        freeSlices(slices);
+        return result;
+    }
+
     const char *str = exportSlices(slices, str_length);
     freeSlices(slices);
     if (!str) return kNullString;
