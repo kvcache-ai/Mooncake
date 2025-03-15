@@ -49,10 +49,10 @@ class CxlTransport : public Transport {
     int submitTransfer(BatchID batch_id,
                        const std::vector<TransferRequest> &entries) override;
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override;
 
-    int freeBatchID(BatchID batch_id) override;
+    Status freeBatchID(BatchID batch_id) override;
 
    private:
     int install(std::string &local_server_name,

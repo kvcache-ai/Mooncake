@@ -129,8 +129,9 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count);
 
-int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
-                      size_t task_id, struct transfer_status *status);
+int getTransferStatus(transfer_engine_t engine,
+                      batch_id_t batch_id, size_t task_id,
+                      struct transfer_status *status);
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
