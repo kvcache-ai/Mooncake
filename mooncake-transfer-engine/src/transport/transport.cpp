@@ -33,13 +33,14 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
-int Transport::freeBatchID(BatchID batch_id) {
+Status Transport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
             LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
-            return ERR_BATCH_BUSY;
+            return Status::BatchBusy(
+                "BatchID cannot be freed until all tasks are done");
         }
     }
     delete &batch_desc;
@@ -47,7 +48,7 @@ int Transport::freeBatchID(BatchID batch_id) {
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
-    return 0;
+    return Status::OK();
 }
 
 int Transport::install(std::string &local_server_name,

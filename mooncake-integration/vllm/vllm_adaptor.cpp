@@ -201,13 +201,13 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
 
-    int ret = engine_->submitTransfer(batch_id, {entry});
-    if (ret < 0) return -1;
+    Status s = engine_->submitTransfer(batch_id, {entry});
+    if (!s.ok()) return -1;
 
     TransferStatus status;
     while (true) {
-        int ret = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(!ret);
+        Status s = engine_->getTransferStatus(batch_id, 0, status);
+        LOG_ASSERT(s.ok());
         if (status.s == TransferStatusEnum::COMPLETED) {
             engine_->freeBatchID(batch_id);
             return 0;
