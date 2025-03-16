@@ -16,13 +16,14 @@ include_directories(${Python3_INCLUDE_DIRS})
 add_library(cache_allocator ${CACHE_ALLOCATOR_SOURCES})
 target_link_libraries(cache_allocator PUBLIC transfer_engine glog gflags)
 
+find_package(gRPC CONFIG REQUIRED)
 # Master binary
 add_executable(mooncake_master master.cpp)
 target_link_libraries(mooncake_master PRIVATE
     cache_allocator
     cachelib_memory_allocator
-    grpc 
-    grpc++
+    gRPC::grpc
+    gRPC::grpc++
     protobuf
     pthread
 )

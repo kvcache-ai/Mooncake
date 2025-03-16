@@ -9,10 +9,12 @@ if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
+find_package(gRPC CONFIG REQUIRED)
+
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
 if (USE_ETCD)
   if (USE_STATIC_ETCD_CPP_API)
-    target_link_libraries(transfer_engine PUBLIC etcd-cpp-api-core protobuf grpc++ grpc)
+    target_link_libraries(transfer_engine PUBLIC etcd-cpp-api-core protobuf gRPC::grpc gRPC::grpc++)
   else()
     target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
   endif()
