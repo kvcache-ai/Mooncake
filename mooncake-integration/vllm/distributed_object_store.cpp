@@ -322,6 +322,12 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
         return kNullString;
     }
 
+    if (slices.size() == 1 && slices[0].size == str_length) {
+        auto result = pybind11::bytes((char *)slices[0].ptr, str_length);
+        freeSlices(slices);
+        return result;
+    }
+
     const char *str = exportSlices(slices, str_length);
     freeSlices(slices);
     if (!str) return kNullString;
@@ -350,4 +356,32 @@ int DistributedObjectStore::isExist(const std::string &key) {
     if (err == ErrorCode::OK) return 1;                // Yes
     if (err == ErrorCode::OBJECT_NOT_FOUND) return 0;  // No
     return -1;                                         // Error
+}
+
+int64_t DistributedObjectStore::getSize(const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    mooncake::Client::ObjectInfo object_info;
+    ErrorCode error_code = client_->Query(key, object_info);
+
+    if (error_code != ErrorCode::OK) {
+        return -1;  // Error or object doesn't exist
+    }
+
+    // Calculate total size from all replicas' handles
+    int64_t total_size = 0;
+    if (object_info.replica_list_size() > 0) {
+        auto &replica = object_info.replica_list(0);
+        for (auto &handle : replica.handles()) {
+            total_size += handle.size();
+        }
+    } else {
+        LOG(ERROR) << "Internal error: object_info.replica_list_size() is 0";
+        return -1;  // Internal error
+    }
+
+    return total_size;
 }

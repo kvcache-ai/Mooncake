@@ -137,7 +137,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         LOG(INFO) << "Write Data: " << std::string((char *)(addr), 16) << "...";
 
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
 
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
@@ -145,13 +145,13 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(!ret);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
             else if (status.s == TransferStatusEnum::FAILED) {
@@ -159,14 +159,14 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                 completed = true;
             }
         }
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
     }
 
     {
         LOG(INFO) << "Stage 2: Read Data";
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
 
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
@@ -174,13 +174,13 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(!ret);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
             else if (status.s == TransferStatusEnum::FAILED) {
@@ -188,8 +188,8 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                 completed = true;
             }
         }
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
     }
 
     int ret =

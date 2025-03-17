@@ -39,6 +39,7 @@ EXT_LDFLAGS+=" -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -let
 # EXT_LDFLAGS+=" -lhiredis"     // if USE_REDIS is enabled
 # EXT_LDFLAGS+=" -lcurl"        // if USE_HTTP is enabled
 
+go get
 go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
 if [ $? -ne 0 ]; then
     echo "Error: Failed to build the example."

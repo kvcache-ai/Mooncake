@@ -24,6 +24,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -152,14 +153,15 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
     }
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(FLAGS_report_precision)
-        << 1.0 * data_bytes / duration / RATE_UNIT_MP.at(FLAGS_report_unit) << " " << FLAGS_report_unit << "/s";
+        << 1.0 * data_bytes / duration / RATE_UNIT_MP.at(FLAGS_report_unit)
+        << " " << FLAGS_report_unit << "/s";
     return oss.str();
 }
 
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
@@ -183,7 +185,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
     size_t batch_count = 0;
     while (running) {
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
-        int ret = 0;
+        Status s;
         std::vector<TransferRequest> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
             TransferRequest entry;
@@ -198,14 +200,14 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             requests.emplace_back(entry);
         }
 
-        ret = engine->submitTransfer(batch_id, requests);
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, requests);
+        LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
-                int ret = engine->getTransferStatus(batch_id, task_id, status);
-                LOG_ASSERT(!ret);
+                Status s = engine->getTransferStatus(batch_id, task_id, status);
+                LOG_ASSERT(s.ok());
                 if (status.s == TransferStatusEnum::COMPLETED)
                     completed = true;
                 else if (status.s == TransferStatusEnum::FAILED) {
@@ -216,13 +218,13 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             }
         }
 
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
-    return 0;
+    return Status::OK();
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
@@ -288,7 +290,7 @@ int initiator() {
         LOG_ASSERT(xport);
     }
 
-    void *addr[NR_SOCKETS] = {nullptr};
+    std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
@@ -370,7 +372,7 @@ int target() {
         }
     }
 
-    void *addr[NR_SOCKETS] = {nullptr};
+    std::vector<void *> addr(NR_SOCKETS, nullptr);
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
         memset(addr[i], 'x', FLAGS_buffer_size);

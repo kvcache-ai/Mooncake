@@ -83,17 +83,17 @@ class TransferEngine {
         return multi_transports_->allocateBatchID(batch_size);
     }
 
-    int freeBatchID(BatchID batch_id) {
+    Status freeBatchID(BatchID batch_id) {
         return multi_transports_->freeBatchID(batch_id);
     }
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) {
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) {
         return multi_transports_->submitTransfer(batch_id, entries);
     }
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) {
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) {
         return multi_transports_->getTransferStatus(batch_id, task_id, status);
     }
 

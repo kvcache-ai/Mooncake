@@ -395,10 +395,10 @@ ErrorCode Client::TransferData(
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    int error_code = transfer_engine_->submitTransfer(batch_id, transfer_tasks);
-    if (error_code != 0) {
+    Status s = transfer_engine_->submitTransfer(batch_id, transfer_tasks);
+    if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << error_code;
+                   << s.code();
         transfer_engine_->freeBatchID(batch_id);
         return ErrorCode::TRANSFER_FAIL;
     }
@@ -419,11 +419,10 @@ ErrorCode Client::TransferData(
         }
         for (size_t i = 0; i < batch_size; ++i) {
             TransferStatus status;
-            error_code =
-                transfer_engine_->getTransferStatus(batch_id, i, status);
-            if (error_code != 0) {
+            s = transfer_engine_->getTransferStatus(batch_id, i, status);
+            if (!s.ok()) {
                 LOG(ERROR) << "Transfer " << i
-                           << " error, error_code=" << error_code;
+                           << " error, error_code=" << s.code();
                 transfer_engine_->freeBatchID(batch_id);
                 return ErrorCode::TRANSFER_FAIL;
             }

@@ -24,6 +24,7 @@
 #include <stack>
 #include <vector>
 
+#include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"

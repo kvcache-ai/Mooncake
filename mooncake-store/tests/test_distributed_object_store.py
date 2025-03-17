@@ -44,7 +44,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Put data and verify teardown clears it
         self.assertEqual(self.store.put(key, test_data), 0)
-        self.assertEqual(self.store.tearDownAll(), 0)
+        self.assertEqual(self.store.close(), 0)
         time.sleep(1)  # Allow time for teardown to complete
         
         # Re-initialize the store
@@ -68,6 +68,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(key, test_data), 0)
 
         # Verify data through Get operation
+        self.assertEqual(self.store.getSize(key), len(test_data))
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
 
@@ -78,6 +79,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key), 0)
 
         # Get after remove should return empty bytes
+        self.assertLess(self.store.getSize(key), 0)
         empty_data = self.store.get(key)
         self.assertEqual(empty_data, b"")
 
@@ -86,14 +88,17 @@ class TestDistributedObjectStore(unittest.TestCase):
         key_2 = "test_exist_key"
         
         # Should not exist initially
+        self.assertLess(self.store.getSize(key_2), 0)
         self.assertEqual(self.store.isExist(key_2), 0)
         
         # Should exist after put
         self.assertEqual(self.store.put(key_2, test_data_2), 0)
         self.assertEqual(self.store.isExist(key_2), 1)
+        self.assertEqual(self.store.getSize(key_2), len(test_data_2))
         
         # Should not exist after remove
         self.assertEqual(self.store.remove(key_2), 0)
+        self.assertLess(self.store.getSize(key_2), 0)
         self.assertEqual(self.store.isExist(key_2), 0)
 
     def test_concurrent_stress_with_barrier(self):

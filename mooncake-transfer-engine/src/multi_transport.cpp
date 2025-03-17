@@ -48,29 +48,30 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
-int MultiTransport::freeBatchID(BatchID batch_id) {
+Status MultiTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
             LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
-            return ERR_BATCH_BUSY;
-        }
+            return Status::BatchBusy(
+                "BatchID cannot be freed until all tasks are done");        }
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
-    return 0;
+    return Status::OK();
 }
 
-int MultiTransport::submitTransfer(
+Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "MultiTransport: Exceed the limitation of batch capacity";
-        return ERR_TOO_MANY_REQUESTS;
+        return Status::TooManyRequests(
+            "Exceed the limitation of batch capacity");
     }
 
     size_t task_id = batch_desc.task_list.size();
@@ -82,7 +83,11 @@ int MultiTransport::submitTransfer(
     std::unordered_map<Transport *, SubmitTasks> submit_tasks;
     for (auto &request : entries) {
         auto transport = selectTransport(request);
-        if (!transport) return ERR_INVALID_ARGUMENT;
+        if (!transport) {
+            return Status::InvalidArgument(
+                "SelectTransport failed for SegmentID: " +
+                std::to_string(request.target_id));
+        }
         auto &task = batch_desc.task_list[task_id];
         ++task_id;
         submit_tasks[transport].request_list.push_back(
@@ -90,22 +95,25 @@ int MultiTransport::submitTransfer(
         submit_tasks[transport].task_list.push_back(&task);
     }
     for (auto &entry : submit_tasks) {
-        int ret = entry.first->submitTransferTask(entry.second.request_list,
+        auto status = entry.first->submitTransferTask(entry.second.request_list,
                                                   entry.second.task_list);
-        if (ret) {
+        if (!status.ok()) {
             LOG(ERROR) << "MultiTransport: Failed to submit transfer task to "
                        << entry.first->getName();
-            return ret;
+            return status;
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                       TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
-    if (task_id >= task_count) return ERR_INVALID_ARGUMENT;
+    if (task_id >= task_count) {
+        return Status::InvalidArgument(
+            "MultiTransport: task id is equal to or larger than task_count");
+    }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
@@ -120,7 +128,7 @@ int MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         status.s = Transport::TransferStatusEnum::WAITING;
     }
-    return 0;
+    return Status::OK();
 }
 
 Transport *MultiTransport::installTransport(const std::string &proto,
