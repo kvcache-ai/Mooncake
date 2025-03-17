@@ -48,11 +48,11 @@ int ShmTransport::install(std::string &local_server_name,
     return 0;
 }
 
-int ShmTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+Status ShmTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                     TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
-    if (task_id >= task_count) return ERR_INVALID_ARGUMENT;
+    if (task_id >= task_count) return Status::InvalidArgument("too many tasks");
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
@@ -67,16 +67,16 @@ int ShmTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
-    return 0;
+    return Status::OK();
 }
 
-int ShmTransport::submitTransfer(BatchID batch_id,
+Status ShmTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "ShmTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return ERR_TOO_MANY_REQUESTS;
+        return Status::InvalidArgument("exceed the limitation of current batch's capacity");
     }
 
     size_t task_id = batch_desc.task_list.size();
@@ -84,7 +84,7 @@ int ShmTransport::submitTransfer(BatchID batch_id,
     for (auto &request : entries) {
         if (request.target_id != LOCAL_SEGMENT_ID) {
             LOG(ERROR) << "ShmTransport: Not local segment";
-            return ERR_NOT_LOCAL_SEGMENT;
+            return Status::InvalidArgument("Not local segment");
         }
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
@@ -101,10 +101,10 @@ int ShmTransport::submitTransfer(BatchID batch_id,
         startTransfer(slice);
     }
 
-    return 0;
+    return Status::OK();
 }
 
-int ShmTransport::submitTransferTask(
+Status ShmTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     for (size_t index = 0; index < request_list.size(); ++index) {
@@ -112,7 +112,7 @@ int ShmTransport::submitTransferTask(
         auto &task = *task_list[index];
         if (request.target_id != LOCAL_SEGMENT_ID) {
             LOG(ERROR) << "ShmTransport: Not local segment";
-            return ERR_NOT_LOCAL_SEGMENT;
+            return Status::InvalidArgument("Not local segment");
         }
         task.total_bytes = request.length;
         auto slice = new Slice();
@@ -126,7 +126,7 @@ int ShmTransport::submitTransferTask(
         task.slice_count += 1;
         startTransfer(slice);
     }
-    return 0;
+    return Status::OK();
 }
 
 void ShmTransport::startTransfer(Slice *slice) {

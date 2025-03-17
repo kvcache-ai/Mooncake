@@ -71,15 +71,15 @@ class ShmTransport : public Transport {
 
     ~ShmTransport();
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) override;
 
-    int submitTransferTask(
+    Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override;
 
    private:
     int install(std::string &local_server_name,
