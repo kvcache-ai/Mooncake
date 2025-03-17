@@ -5,11 +5,10 @@ This is the latest version of the MooncakeStore integration doc with the vLLM pr
 
 Main changes from v0.x to v1:
 - XpYd support and orchestration
-  - instance role adjustment
-  - dynamic changing the population of p group and d group
+  - dynamic changing the population of prefill group and decode group
 - More stable and more fault-tolerant
-  - The sudden crash of a single vllm instance will not affect the availability of the entire service
-  - Each instance works as a vanilla vllm instance, which means it can serve the requests that are not from the proxy and finish them normally
+  - The sudden crash of a single vllm instance is tolerable
+  - Since instance-to-instance connections are removed, each instance works as a vanilla vllm instance, which means it can serve the requests that are not from the proxy and finish them normally
 
 
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
@@ -119,14 +118,13 @@ CUDA_VISIBLE_DEVICES=7 MOONCAKE_CONFIG_PATH=./mooncake.json python3 -m vllm.entr
 ```bash
 # 4. Start the proxy server
 cd vllm
-python3 examples/online_serving/disagg_examples/disagg_demo.py --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --prefill localhost:8100 localhost:8101  --decode localhost:8200 localhost:8201  --port 8000 --scheduling round_robin
+python3 examples/online_serving/disagg_examples/disagg_proxy_demo.py --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --prefill localhost:8100 localhost:8101  --decode localhost:8200 localhost:8201  --port 8000
 ```
 
 - The `--model` parameter specifies the model to use, also specifies the tokenizer used by the proxy server.
 - The `--port` parameter specifies the vllm service port on which to listen.
 - The `--prefill` or `-p` specifies the ip and port of the vllm prefill instances.
 - The `--decode` or `-d` specifies the ip and port of the vllm decode instances.
-- The `--scheduling` or `-S` specifies the scheduling policy of the proxy server.
 
 ```bash
 # If you want to dynamically adjust the instances of p-nodes and d-nodes during runtime, you need to configure this environment variables.
