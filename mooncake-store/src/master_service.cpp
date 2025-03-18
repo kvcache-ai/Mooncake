@@ -28,9 +28,12 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
                                              uint64_t base, uint64_t size) {
     std::unique_lock<std::shared_mutex> lock(allocator_mutex_);
 
+    // Create composite key
+    AllocatorKey key(segment_name, base);
+
     // Check if segment already exists
-    if (buf_allocators_.find(segment_name) != buf_allocators_.end()) {
-        LOG(WARNING) << "segment_name=" << segment_name
+    if (buf_allocators_.find(key) != buf_allocators_.end()) {
+        LOG(WARNING) << "segment_name=" << segment_name << ", buffer=" << base
                      << ", error=segment_already_exists";
         return ErrorCode::INVALID_PARAMS;
     }
@@ -45,22 +48,26 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
     VLOG(1) << "segment_name=" << segment_name << ", base=" << base
             << ", size=" << size << ", allocator_ptr=" << allocator.get()
             << ", action=register_buffer";
-    buf_allocators_[segment_name] = std::move(allocator);
+    buf_allocators_[key] = std::move(allocator);
     return ErrorCode::OK;
 }
 
-ErrorCode BufferAllocatorManager::RemoveSegment(
-    const std::string& segment_name) {
+ErrorCode BufferAllocatorManager::RemoveSegment(const std::string& segment_name,
+                                                uint64_t buffer) {
     std::unique_lock<std::shared_mutex> lock(allocator_mutex_);
 
-    auto it = buf_allocators_.find(segment_name);
+    // Create composite key
+    AllocatorKey key(segment_name, buffer);
+
+    auto it = buf_allocators_.find(key);
     if (it == buf_allocators_.end()) {
-        LOG(WARNING) << "segment_name=" << segment_name
+        LOG(WARNING) << "segment_name=" << segment_name << ", buffer=" << buffer
                      << ", error=segment_not_found";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    VLOG(1) << "segment_name=" << segment_name << ", action=unregister_buffer";
+    VLOG(1) << "segment_name=" << segment_name << ", buffer=" << buffer
+            << ", action=unregister_buffer";
     // Remove buffer allocator
     buf_allocators_.erase(it);
     return ErrorCode::OK;
@@ -109,9 +116,11 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
     return buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
 }
 
-ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
-    VLOG(1) << "segment_name=" << segment_name << ", action=unmount_segment";
-    return buffer_allocator_manager_->RemoveSegment(segment_name);
+ErrorCode MasterService::UnmountSegment(const std::string& segment_name,
+                                        uint64_t buffer) {
+    VLOG(1) << "segment_name=" << segment_name << ", buffer=" << buffer
+            << ", action=unmount_segment";
+    return buffer_allocator_manager_->RemoveSegment(segment_name, buffer);
 }
 
 ErrorCode MasterService::GetReplicaList(

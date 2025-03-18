@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 
 #include "transfer_engine.h"
@@ -87,8 +88,7 @@ ErrorCode Client::Init(const std::string& local_hostname,
                        const std::string& metadata_connstring,
                        const std::string& protocol, void** protocol_args,
                        const std::string& master_addr) {
-    if (transfer_engine_)
-        return ErrorCode::INTERNAL_ERROR;
+    if (transfer_engine_) return ErrorCode::INTERNAL_ERROR;
 
     // Store configuration
     local_hostname_ = local_hostname;
@@ -109,9 +109,12 @@ ErrorCode Client::Init(const std::string& local_hostname,
 
 ErrorCode Client::UnInit() {
     // Unmount all Segment
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto mounted_segments = mounted_segments_;
-    for (auto &entry : mounted_segments) {
-        UnmountSegment(entry.first, entry.second);
+    for (const auto& [segment_name, buffers] : mounted_segments) {
+        for (const auto& buffer : buffers) {
+            UnmountSegment(segment_name, reinterpret_cast<void*>(buffer));
+        }
     }
     transfer_engine_.reset();
     return ErrorCode::OK;
@@ -236,9 +239,12 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             revoke_request.set_key(key);
             mooncake_store::PutRevokeResponse revoke_response;
             grpc::ClientContext revoke_context;
-            status = master_stub_->PutRevoke(&revoke_context, revoke_request, &revoke_response);
-            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke", revoke_request);
-            VLOG(1) << "PutRevoke: status_code=" << revoke_response.status_code();
+            status = master_stub_->PutRevoke(&revoke_context, revoke_request,
+                                             &revoke_response);
+            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke",
+                                 revoke_request);
+            VLOG(1) << "PutRevoke: status_code="
+                    << revoke_response.status_code();
             return transfer_err;
         }
     }
@@ -299,14 +305,15 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     if (err != ErrorCode::OK) {
         return err;
     }
-    mounted_segments_[segment_name] = (void *) buffer;
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    mounted_segments_[segment_name].insert(reinterpret_cast<uint64_t>(buffer));
     return ErrorCode::OK;
 }
 
-ErrorCode Client::UnmountSegment(const std::string& segment_name,
-                                 void* addr) {
+ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     mooncake_store::UnmountSegmentRequest request;
     request.set_segment_name(segment_name);
+    request.set_buffer(reinterpret_cast<uintptr_t>(addr));
     mooncake_store::UnmountSegmentResponse response;
     grpc::ClientContext context;
     grpc::Status status =

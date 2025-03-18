@@ -252,6 +252,7 @@ message MountSegmentResponse {
 ```protobuf
 message UnmountSegmentRequest {
   required string segment_name = 1;  // 挂载时的存储段名称
+  required uint64 buffer = 2;        // 挂载时的起始地址
 }
 
 message UnMountSegmentResponse {
@@ -278,7 +279,8 @@ ErrorCode MountSegment(uint64_t buffer,
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+ErrorCode UnmountSegment(const std::string& segment_name,
+                         uint64_t buffer);
 ```
 
 存储节点(Client)向`Master Service`注销存储段空间。
@@ -356,11 +358,12 @@ AllocationStrategy 与`Master Service`和底层模块 `BufferAllocator` 配合�
 
 ```C++
 virtual std::shared_ptr<BufHandle> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<AllocatorKey, std::shared_ptr<BufferAllocator>,
+                                 AllocatorKeyHash>& allocators,
         size_t objectSize) = 0;
 ```
 
-输入：当前可用的存储段列表，以及所需分配的空间大小。
+输入：当前可用的存储段列表(AllocatorKey是存储段名称和起始地址的组合)，以及所需分配的空间大小。
 输出：返回分配成功的存储空间句柄`BufHandle`。
 
 #### 具体实现策略

@@ -227,8 +227,8 @@ class MasterServiceImpl final : public mooncake_store::MasterService::Service {
         grpc::ServerContext* context,
         const mooncake_store::UnmountSegmentRequest* request,
         mooncake_store::UnmountSegmentResponse* response) override {
-        ErrorCode error_code =
-            master_service_->UnmountSegment(request->segment_name());
+        ErrorCode error_code = master_service_->UnmountSegment(
+            request->segment_name(), request->buffer());
         response->set_status_code(toInt(error_code));
         return grpc::Status::OK;
     }

@@ -52,13 +52,14 @@ class BufferAllocatorManager {
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * not found
      */
-    ErrorCode RemoveSegment(const std::string& segment_name);
+    ErrorCode RemoveSegment(const std::string& segment_name, uint64_t buffer);
 
     /**
      * @brief Get the map of buffer allocators
      * @note Caller must hold the mutex while accessing the map
      */
-    const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
+    const std::unordered_map<AllocatorKey, std::shared_ptr<BufferAllocator>,
+                             AllocatorKeyHash>&
     GetAllocators() const {
         return buf_allocators_;
     }
@@ -72,7 +73,8 @@ class BufferAllocatorManager {
     // Protects the buffer allocator map (BufferAllocator is thread-safe by
     // itself)
     mutable std::shared_mutex allocator_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>
+    std::unordered_map<AllocatorKey, std::shared_ptr<BufferAllocator>,
+                       AllocatorKeyHash>
         buf_allocators_;
 };
 
@@ -99,10 +101,12 @@ class MasterService {
 
     /**
      * @brief Unmount a memory segment
+     * @param segment_name Name of the segment to unmount
+     * @param buffer Memory address of the buffer to unmount
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * not found
      */
-    ErrorCode UnmountSegment(const std::string& segment_name);
+    ErrorCode UnmountSegment(const std::string& segment_name, uint64_t buffer);
 
     /**
      * @brief Get list of replicas for an object
