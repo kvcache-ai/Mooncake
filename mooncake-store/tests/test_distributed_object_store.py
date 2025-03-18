@@ -11,7 +11,7 @@ def get_client(store):
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-    metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
+    metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
@@ -149,6 +149,10 @@ class TestDistributedObjectStore(unittest.TestCase):
                 # Wait for all threads to complete get operations
                 get_barrier.wait()
                 
+                # Remove all keys
+                for key in thread_keys:
+                    self.assertEqual(self.store.remove(key), 0)
+                
                 
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
@@ -204,6 +208,64 @@ class TestDistributedObjectStore(unittest.TestCase):
         print(f"System Put bandwidth: {total_data_size_gb/put_duration:.2f} GB/sec")
         print(f"System Get bandwidth: {total_data_size_gb/get_duration:.2f} GB/sec")
 
-
+    def test_dict_fuzz_e2e(self):
+         """End-to-end fuzz test comparing distributed store behavior with dict.
+         Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
+         After testing, all keys are removed.
+         """
+         import random
+         # Local reference dict to simulate expected dict behavior
+         reference = {}
+         operations = 1000
+         # Use a pool of keys to limit memory consumption
+         keys_pool = [f"key_{i}" for i in range(100)]
+         # Track which keys have values assigned to ensure consistency
+         key_values = {}
+         # Fuzz record for debugging in case of errors
+         fuzz_record = []
+         try:
+             for i in range(operations):
+                 op = random.choice(["put", "get", "remove"])
+                 key = random.choice(keys_pool)
+                 if op == "put":
+                     # If key already exists, use the same value to ensure consistency
+                     if key in key_values:
+                         value = key_values[key]
+                         size = len(value)
+                     else:
+                         size = random.randint(1, 64 * 1024 * 1024)
+                         value = os.urandom(size)
+                         key_values[key] = value
+                     
+                     fuzz_record.append(f"{i}: put {key} [size: {size}]")
+                     error_code = self.store.put(key, value)
+                     if error_code == -200: 
+                         # The space is not enough, continue to next operation
+                         continue
+                     elif error_code == 0:
+                         reference[key] = value
+                     else:
+                         raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
+                 elif op == "get":
+                     fuzz_record.append(f"{i}: get {key}")
+                     retrieved = self.store.get(key)
+                     expected = reference.get(key, b"")
+                     self.assertEqual(retrieved, expected)
+                 elif op == "remove":
+                     fuzz_record.append(f"{i}: remove {key}")
+                     self.store.remove(key)
+                     reference.pop(key, None)
+                     # Also remove from key_values to allow new value if key is reused
+                     key_values.pop(key, None)
+         except Exception as e:
+             print(f"Error: {e}")
+             print('\nFuzz record (operations so far):')
+             for record in fuzz_record:
+                 print(record)
+             raise e
+         # Cleanup: ensure all remaining keys are removed
+         for key in list(reference.keys()):
+             self.store.remove(key)
+             
 if __name__ == '__main__':
     unittest.main()
