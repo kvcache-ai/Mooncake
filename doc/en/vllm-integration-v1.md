@@ -27,8 +27,7 @@ git clone git@github.com:kvcache-ai/vllm.git
 ```bash
 cd vllm
 git checkout xpyd_preview
-pip3 install vllm --upgrade
-VLLM_USE_PRECOMPILED=1 pip3 install -e .
+pip3 install -e .
 ```
  - If you encounter any problems that you cannot solve, please refer to the [vLLM official compilation guide](https://docs.vllm.ai/en/latest/getting_started/installation/index.html).
 
