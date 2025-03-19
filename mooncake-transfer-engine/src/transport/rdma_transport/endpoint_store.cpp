@@ -28,7 +28,7 @@
 
 namespace mooncake {
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
-    std::string peer_nic_path) {
+    const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) return iter->second;
@@ -36,7 +36,7 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
 }
 
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
-    std::string peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
@@ -64,7 +64,7 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
     return endpoint;
 }
 
-int FIFOEndpointStore::deleteEndpoint(std::string peer_nic_path) {
+int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) {
@@ -114,7 +114,7 @@ int FIFOEndpointStore::disconnectQPs() {
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
-    std::string peer_nic_path) {
+    const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) {
@@ -129,7 +129,7 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
-    std::string peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
@@ -156,7 +156,7 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
     return endpoint;
 }
 
-int SIEVEEndpointStore::deleteEndpoint(std::string peer_nic_path) {
+int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) {
