@@ -16,7 +16,7 @@
 #include <glog/logging.h>
 #include <sys/time.h>
 
-#include<signal.h>
+#include <signal.h>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
