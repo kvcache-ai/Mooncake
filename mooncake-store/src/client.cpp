@@ -144,7 +144,7 @@ ErrorCode Client::Query(const std::string& object_key,
             << object_info.replica_list_size();
 
     if (object_info.replica_list().empty()) {
-        LOG(ERROR) << "object_not_found key=" << object_key;
+        LOG(INFO) << "object_not_found key=" << object_key;
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
@@ -209,7 +209,11 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     ErrorCode err =
         LogAndCheckRpcStatus(status, start_response, "PutStart", start_request);
     if (err != ErrorCode::OK) {
-        return (err == ErrorCode::OBJECT_ALREADY_EXISTS) ? ErrorCode::OK : err;
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            LOG(INFO) << "object_alredy_exists key=" << key;
+            return ErrorCode::OK;
+        }
+        return err;
     }
 
     VLOG(1) << "PutStart: replica_count=" << start_response.replica_list_size();
