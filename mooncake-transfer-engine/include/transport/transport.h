@@ -31,23 +31,16 @@
 
 namespace mooncake {
 class TransferMetadata;
-/// By default, these functions return 0 (or non-null pointer) on success and
-/// return -1 (or null pointer) on failure. The errno is set accordingly on
-/// failure.
+
 class Transport {
     friend class TransferEngine;
     friend class MultiTransport;
 
    public:
     using SegmentID = uint64_t;
-    using SegmentHandle = SegmentID;
 
     using BatchID = uint64_t;
     const static BatchID INVALID_BATCH_ID = UINT64_MAX;
-
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
@@ -109,11 +102,6 @@ class Transport {
                 uint64_t length;
                 uint64_t buffer_id;
             } nvmeof;
-            struct {
-                void *remote_filename;
-                void *remote_addr;
-                size_t remote_offset;
-            } cxl;
         };
 
        public:
@@ -130,9 +118,7 @@ class Transport {
     };
 
     struct TransferTask {
-
-
-        volatile uint64_t slice_count   = 0;
+        volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
@@ -150,31 +136,15 @@ class Transport {
    public:
     virtual ~Transport() {}
 
-    /// @brief Create a batch with specified maximum outstanding transfers.
-    virtual BatchID allocateBatchID(size_t batch_size);
-
-    /// @brief Free an allocated batch.
-    virtual Status freeBatchID(BatchID batch_id);
-
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
-    virtual Status submitTransfer(BatchID batch_id,
-                               const std::vector<TransferRequest> &entries) = 0;
-
     virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplmented(
             "Transport::submitTransferTask is not implemented");
     }
-
-    /// @brief Get the status of a submitted transfer. This function shall not
-    /// be called again after completion.
-    /// @return Return 1 on completed (either success or failure); 0 if still in
-    /// progress.
-    virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) = 0;
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
@@ -205,10 +175,23 @@ class Transport {
 
     virtual int registerLocalMemoryBatch(
         const std::vector<BufferEntry> &buffer_list,
-        const std::string &location) = 0;
+        const std::string &location) {
+        for (auto &entry : buffer_list) {
+            int rc =
+                registerLocalMemory(entry.addr, entry.length, location, true);
+            if (rc) return rc;
+        }
+        return 0;
+    }
 
     virtual int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) = 0;
+        const std::vector<void *> &addr_list) {
+        for (auto &entry : addr_list) {
+            int rc = unregisterLocalMemory(entry);
+            if (rc) return rc;
+        }
+        return 0;
+    }
 
     virtual const char *getName() const = 0;
 };

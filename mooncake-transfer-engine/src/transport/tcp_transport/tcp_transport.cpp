@@ -197,14 +197,12 @@ TcpTransport::~TcpTransport() {
         delete context_;
         context_ = nullptr;
     }
-
-    metadata_->removeSegmentDesc(local_server_name_);
 }
 
 int TcpTransport::install(std::string &local_server_name,
-                          std::shared_ptr<TransferMetadata> meta,
-                          std::shared_ptr<Topology> topo) {
-    metadata_ = meta;
+                          std::shared_ptr<TransferMetadata> metadata,
+                          std::shared_ptr<Topology> topology) {
+    metadata_ = metadata;
     local_server_name_ = local_server_name;
 
     int ret = allocateLocalSegmentID();
@@ -220,20 +218,26 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    context_ = new TcpContext(meta->localRpcMeta().rpc_port);
+    context_ = new TcpContext(tcp_attr_.port);
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
 }
 
 int TcpTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
-    desc->name = local_server_name_;
-    desc->protocol = "tcp";
-    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
-                               std::move(desc));
-    return 0;
+    std::shared_ptr<SegmentDesc> desc;
+    desc = metadata_->getLocalSegment();
+    if (!desc) {
+        desc = std::make_shared<SegmentDesc>();
+        if (!desc) return ERR_MEMORY;
+        desc->name = local_server_name_;
+        desc->type = MemoryKind;
+    }
+    if (!desc->memory.tcp.ip_or_hostname.empty()) return ERR_INVALID_ARGUMENT;
+    tcp_attr_.ip_or_hostname = metadata_->localRpcMeta().ip_or_host_name;
+    tcp_attr_.port = metadata_->localRpcMeta().rpc_port;
+    desc->memory.tcp = tcp_attr_;
+    return metadata_->setLocalSegment(std::move(desc));
 }
 
 int TcpTransport::registerLocalMemory(void *addr, size_t length,
@@ -241,8 +245,8 @@ int TcpTransport::registerLocalMemory(void *addr, size_t length,
                                       bool remote_accessible,
                                       bool update_metadata) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
-    buffer_desc.name = local_server_name_;
+    BufferAttr buffer_desc;
+    buffer_desc.location = "*";  // unspecified
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
     return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -264,66 +268,6 @@ int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
     return metadata_->updateLocalSegmentDesc();
-}
-
-Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
-    if (task_id >= task_count) {
-        return Status::InvalidArgument(
-            "TcpTransport::getTransportStatus invalid argument, batch id: " +
-            std::to_string(batch_id));
-    }
-    auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
-    if (success_slice_count + failed_slice_count ==
-        task.slice_count) {
-        if (failed_slice_count) {
-            status.s = TransferStatusEnum::FAILED;
-        } else {
-            status.s = TransferStatusEnum::COMPLETED;
-        }
-        task.is_finished = true;
-    } else {
-        status.s = TransferStatusEnum::WAITING;
-    }
-    return Status::OK();
-}
-
-Status TcpTransport::submitTransfer(BatchID batch_id,
-                                 const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
-                      "capacity";
-        return Status::InvalidArgument(
-            "TcpTransport: Exceed the limitation of capacity, batch id: " +
-            std::to_string(batch_id));
-    }
-
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
-        task.total_bytes = request.length;
-        auto slice = new Slice();
-        slice->source_addr = (char *)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->tcp.dest_addr = request.target_offset;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        task.slice_count += 1;
-        startTransfer(slice);
-    }
-
-    return Status::OK();
 }
 
 Status TcpTransport::submitTransferTask(

@@ -95,7 +95,7 @@ class NVMeoFTransport : public Transport {
 
     const char *getName() const override { return "nvmeof"; }
 
-    std::unordered_map<std::pair<SegmentHandle, uint64_t>,
+    std::unordered_map<std::pair<SegmentID, uint64_t>,
                        std::shared_ptr<CuFileContext>, pair_hash>
         segment_to_context_;
     std::vector<std::thread> workers_;

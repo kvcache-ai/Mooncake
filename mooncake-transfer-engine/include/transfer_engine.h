@@ -38,7 +38,6 @@ namespace mooncake {
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
-using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
@@ -63,9 +62,9 @@ class TransferEngine {
 
     int uninstallTransport(const std::string &proto);
 
-    SegmentHandle openSegment(const std::string &segment_name);
+    SegmentID openSegment(const std::string &segment_name);
 
-    int closeSegment(SegmentHandle handle);
+    int closeSegment(SegmentID handle);
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location,

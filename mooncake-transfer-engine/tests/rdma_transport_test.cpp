@@ -127,7 +127,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(0);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    uint64_t remote_base = (uint64_t)segment_desc->memory.buffers[0].addr;
     const size_t kDataLength = 4096000;
     {
         LOG(INFO) << "Stage 1: Write Data";

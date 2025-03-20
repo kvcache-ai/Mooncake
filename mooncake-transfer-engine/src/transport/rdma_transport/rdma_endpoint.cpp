@@ -133,7 +133,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        for (auto &nic : segment_desc->memory.rdma)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
     }
@@ -172,7 +172,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        for (auto &nic : segment_desc->memory.rdma)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
                                          &local_desc.reply_msg);

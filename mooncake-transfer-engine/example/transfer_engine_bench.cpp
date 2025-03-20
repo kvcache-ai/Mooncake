@@ -181,7 +181,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         exit(EXIT_FAILURE);
     }
     uint64_t remote_base =
-        (uint64_t)segment_desc->buffers[thread_id % NR_SOCKETS].addr;
+        (uint64_t)segment_desc->memory.buffers[thread_id % NR_SOCKETS].addr;
 
     size_t batch_count = 0;
     while (running) {

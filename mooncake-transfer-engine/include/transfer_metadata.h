@@ -29,6 +29,7 @@
 
 #include "common.h"
 #include "topology.h"
+#include "segment_cache.h"
 
 namespace mooncake {
 struct MetadataStoragePlugin;
@@ -36,39 +37,7 @@ struct HandShakePlugin;
 
 class TransferMetadata {
    public:
-    struct DeviceDesc {
-        std::string name;
-        uint16_t lid;
-        std::string gid;
-    };
-
-    struct BufferDesc {
-        std::string name;
-        uint64_t addr;
-        uint64_t length;
-        std::vector<uint32_t> lkey;
-        std::vector<uint32_t> rkey;
-    };
-
-    struct NVMeoFBufferDesc {
-        std::string file_path;
-        uint64_t length;
-        std::unordered_map<std::string, std::string> local_path_map;
-    };
-
     using SegmentID = uint64_t;
-
-    struct SegmentDesc {
-        std::string name;
-        std::string protocol;
-        // this is for rdma
-        std::vector<DeviceDesc> devices;
-        Topology topology;
-        std::vector<BufferDesc> buffers;
-        // this is for nvmeof.
-        std::vector<NVMeoFBufferDesc> nvmeof_buffers;
-        // TODO : make these two a union or a std::variant
-    };
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
@@ -82,8 +51,14 @@ class TransferMetadata {
         std::string reply_msg;  // on error
     };
 
+    SegmentCache::SegmentDescRef getSegmentDesc(const std::string &segment_name);
+
+    Status putSegmentDesc(SegmentCache::SegmentDescRef segment);
+
+    Status deleteSegmentDesc(const std::string &segment_name);
+
    public:
-    TransferMetadata(const std::string &conn_string);
+    TransferMetadata(const std::string &conn_string, const std::string &local_segment_name = "");
 
     ~TransferMetadata();
 
@@ -93,27 +68,20 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
-    int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
-
-    int updateSegmentDesc(const std::string &segment_name,
-                          const SegmentDesc &desc);
-
-    std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string &segment_name);
+    int updateLocalSegmentDesc();
 
     SegmentID getSegmentID(const std::string &segment_name);
 
     int syncSegmentCache(const std::string &segment_name);
 
-    int removeSegmentDesc(const std::string &segment_name);
-
-    int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
+    int addLocalMemoryBuffer(const BufferAttr &buffer_desc,
                              bool update_metadata);
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
-    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
-                        std::shared_ptr<SegmentDesc> &&desc);
+    std::shared_ptr<SegmentDesc> getLocalSegment();
+
+    int setLocalSegment(std::shared_ptr<SegmentDesc> &&desc);
 
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
@@ -133,18 +101,12 @@ class TransferMetadata {
                       HandShakeDesc &peer_desc);
 
    private:
-    // local cache
-    RWSpinlock segment_lock_;
-    std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
-        segment_id_to_desc_map_;
-    std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
 
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;
 
-    std::atomic<SegmentID> next_segment_id_;
-
+    std::shared_ptr<SegmentCache> cache_;
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
 };

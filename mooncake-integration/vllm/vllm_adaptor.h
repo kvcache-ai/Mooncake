@@ -93,5 +93,5 @@ class VLLMAdaptor {
     std::vector<std::stack<char *>> free_list_;
     std::vector<char *> buffer_list_;
     std::unordered_set<char *> large_buffer_list_;
-    std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
+    std::unordered_map<std::string, Transport::SegmentID> handle_map_;
 };
