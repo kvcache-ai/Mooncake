@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <sys/time.h>
 
+#include <signal.h>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -350,7 +351,17 @@ int initiator() {
     return 0;
 }
 
+volatile bool target_running = true;
+
+void signalHandler(int signum) {
+    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
+    target_running = false;  
+}
+
 int target() {
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
@@ -383,8 +394,7 @@ int target() {
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
-    while (true) sleep(1);
-
+    while (target_running) sleep(1);
     for (int i = 0; i < NR_SOCKETS; ++i) {
         engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
