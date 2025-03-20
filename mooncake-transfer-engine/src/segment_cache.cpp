@@ -25,6 +25,7 @@ SegmentCache::SegmentCache(Callbacks callbacks,
     entry.ref->type = MemoryKind;
     entry.ref_cnt = 1;
     entry.dirty = true;
+    flushLocal();
 }
 
 SegmentCache::~SegmentCache() { destroyLocal(); }
@@ -75,6 +76,7 @@ Status SegmentCache::setAndFlushLocal(SegmentDescRef &&segment) {
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
         auto &entry = segment_entry_map_[LocalSegmentID];
+        segment_name_to_id_map_[segment->name] = LocalSegmentID;
         entry.dirty = true;
         entry.ref = std::move(segment);
     }

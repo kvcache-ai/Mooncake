@@ -152,9 +152,9 @@ Status SegmentDesc::removeBuffer(void *addr) {
     for (auto iter = memory.buffers.begin(); iter != memory.buffers.end(); ++iter) {
         if (iter->addr == (uint64_t)addr) {
             memory.buffers.erase(iter);
-            break;
+            return Status::OK();
         }
     }
-    return Status::OK();
+    return Status::AddressNotRegistered("address not registered");
 }
 }  // namespace mooncake

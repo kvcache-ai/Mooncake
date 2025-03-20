@@ -62,15 +62,15 @@ class TransferMetadataTest : public ::testing::Test {
 // add and search LocalSegmentMeta
 TEST_F(TransferMetadataTest, LocalSegmentTest) {
     auto segment_des = std::make_shared<SegmentDesc>();
-    std::string segment_name = "test_segment";
+    std::string segment_name = local_server_name;
     segment_des->type = MemoryKind;
     segment_des->name = segment_name;
     int re = metadata_client->setLocalSegment(std::move(segment_des));
     ASSERT_EQ(re, 0);
     auto des = metadata_client->getSegmentDescByName(segment_name);
-    ASSERT_EQ(des, segment_des);
+    ASSERT_EQ(des->name, segment_name);
     des = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
-    ASSERT_EQ(des, segment_des);
+    ASSERT_EQ(des->name, segment_name);
     auto id = metadata_client->getSegmentID(segment_name);
     ASSERT_EQ(id, LOCAL_SEGMENT_ID);
 }
@@ -78,7 +78,7 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
 // add and remove LocalMemoryBufferMeta
 TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     auto segment_des = std::make_shared<SegmentDesc>();
-    segment_des->name = "test_localMemery";
+    segment_des->name = local_server_name;
     segment_des->type = MemoryKind;
     int re = metadata_client->setLocalSegment(std::move(segment_des));
     ASSERT_EQ(re, 0);
@@ -92,7 +92,7 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     }
     addr = 1000;
     re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
-    ASSERT_EQ(re, ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(re, -ERR_ADDRESS_NOT_REGISTERED);
     for (int i = 9; i > 0; --i) {
         addr = i * 2048;
         re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
