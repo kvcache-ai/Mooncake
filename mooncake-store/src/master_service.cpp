@@ -66,13 +66,18 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
     return ErrorCode::OK;
 }
 
-MasterService::MasterService()
+MasterService::MasterService(bool enable_gc)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
-    // Start the GC thread
-    gc_running_ = true;
-    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-    VLOG(1) << "action=start_gc_thread";
+      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      enable_gc_(enable_gc) {
+    // Start the GC thread if enabled
+    if (enable_gc_) {
+        gc_running_ = true;
+        gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+        VLOG(1) << "action=start_gc_thread";
+    } else {
+        VLOG(1) << "action=gc_disabled";
+    }
 }
 
 MasterService::~MasterService() {
@@ -133,7 +138,12 @@ ErrorCode MasterService::GetReplicaList(
         VLOG(1) << "key=" << key
                 << ", replica_list=" << VectorToString(replica_list);
     }
-    MarkForGC(key, 1000);  // After 1 second, the object will be removed
+
+    // Only mark for GC if enabled
+    if (enable_gc_) {
+        MarkForGC(key, 1000);  // After 1 second, the object will be removed
+    }
+
     return ErrorCode::OK;
 }
 

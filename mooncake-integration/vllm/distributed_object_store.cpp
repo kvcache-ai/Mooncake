@@ -296,7 +296,7 @@ int DistributedObjectStore::put(const std::string &key,
     if (ret) return ret;
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
-    if (error_code != ErrorCode::OK) return 1;
+    if (error_code != ErrorCode::OK) return toInt(error_code);
     return 0;
 }
 
@@ -343,7 +343,7 @@ int DistributedObjectStore::remove(const std::string &key) {
         return 1;
     }
     ErrorCode error_code = client_->Remove(key);
-    if (error_code != ErrorCode::OK) return 1;
+    if (error_code != ErrorCode::OK) return toInt(error_code);
     return 0;
 }
 
@@ -355,7 +355,7 @@ int DistributedObjectStore::isExist(const std::string &key) {
     ErrorCode err = client_->IsExist(key);
     if (err == ErrorCode::OK) return 1;                // Yes
     if (err == ErrorCode::OBJECT_NOT_FOUND) return 0;  // No
-    return -1;                                         // Error
+    return toInt(err);                                 // Error
 }
 
 int64_t DistributedObjectStore::getSize(const std::string &key) {
@@ -368,7 +368,7 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     ErrorCode error_code = client_->Query(key, object_info);
 
     if (error_code != ErrorCode::OK) {
-        return -1;  // Error or object doesn't exist
+        return toInt(error_code);
     }
 
     // Calculate total size from all replicas' handles

@@ -22,7 +22,7 @@ jobs:
     - name: make
       run: |
         cd build
-        make -j
+        sudo make install -j
       shell: bash
     - name: start-metadata-server
       run: |
@@ -31,10 +31,21 @@ jobs:
         go mod tidy && go build -o http-metadata-server .
         ./http-metadata-server --addr=:8090 &
       shell: bash
+    - name: start-mooncake-master
+      run: |
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        mooncake_master --enable_gc=false &
+      shell: bash
     - name: test
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
+      shell: bash
+    - name: mooncake store python test
+      run: |
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        cd mooncake-store/tests
+        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
       shell: bash
