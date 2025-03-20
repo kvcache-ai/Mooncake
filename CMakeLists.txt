@@ -47,7 +47,7 @@ execute_process(
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
 set(PYBIND11_FINDPYTHON ON)
-find_package(pybind11 CONFIG REQUIRED) 
+find_package(pybind11 CONFIG REQUIRED)
 
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)

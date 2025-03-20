@@ -115,7 +115,7 @@ ErrorCode MasterService::GetReplicaList(
 
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(WARNING) << "key=" << key << ", error=object_not_found";
+        LOG(INFO) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
@@ -179,7 +179,7 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
     auto it = metadata_shards_[shard_idx].metadata.find(key);
     if (it != metadata_shards_[shard_idx].metadata.end() &&
         !CleanupStaleHandles(it->second)) {
-        LOG(WARNING) << "key=" << key << ", error=object_already_exists";
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
 
@@ -266,7 +266,7 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
 
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        LOG(INFO) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 

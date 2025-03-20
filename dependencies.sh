@@ -33,7 +33,8 @@ sudo apt-get install -y build-essential \
                         protobuf-compiler-grpc \
                         pybind11-dev \
                         libcurl4-openssl-dev \
-                        libhiredis-dev
+                        libhiredis-dev \
+                        pkg-config
 
 echo "*** Download and installing [cpprest sdk] ***"
 mkdir ${REPO_ROOT}/thirdparties

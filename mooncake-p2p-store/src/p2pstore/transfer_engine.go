@@ -43,7 +43,7 @@ func NewTransferEngine(metadataConnString string,
 	defer C.free(unsafe.Pointer(metadataConnStringCStr))
 	defer C.free(unsafe.Pointer(localServerNameCStr))
 	defer C.free(unsafe.Pointer(localIpAddressCStr))
-	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort))
+	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort), 0)
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}
@@ -140,7 +140,7 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 	}
 
 	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)))
-	if ret < 0 {
+	if ret != 0 {
 		return ErrTransferEngine
 	}
 	return nil
@@ -149,7 +149,7 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 func (engine *TransferEngine) getTransferStatus(batchID BatchID, taskID int) (int, uint64, error) {
 	var status C.transfer_status_t
 	ret := C.getTransferStatus(engine.engine, C.batch_id_t(batchID), C.size_t(taskID), &status)
-	if ret < 0 {
+	if ret != 0 {
 		return -1, 0, ErrTransferEngine
 	}
 	return int(status.status), uint64(status.transferred_bytes), nil
@@ -157,7 +157,7 @@ func (engine *TransferEngine) getTransferStatus(batchID BatchID, taskID int) (in
 
 func (engine *TransferEngine) freeBatchID(batchID BatchID) error {
 	ret := C.freeBatchID(engine.engine, C.batch_id_t(batchID))
-	if ret < 0 {
+	if ret != 0 {
 		return ErrTransferEngine
 	}
 	return nil

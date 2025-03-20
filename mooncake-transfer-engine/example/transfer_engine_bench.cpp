@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <sys/time.h>
 
+#include <signal.h>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -160,7 +162,7 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
@@ -184,7 +186,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
     size_t batch_count = 0;
     while (running) {
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
-        int ret = 0;
+        Status s;
         std::vector<TransferRequest> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
             TransferRequest entry;
@@ -199,14 +201,14 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             requests.emplace_back(entry);
         }
 
-        ret = engine->submitTransfer(batch_id, requests);
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, requests);
+        LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
-                int ret = engine->getTransferStatus(batch_id, task_id, status);
-                LOG_ASSERT(!ret);
+                Status s = engine->getTransferStatus(batch_id, task_id, status);
+                LOG_ASSERT(s.ok());
                 if (status.s == TransferStatusEnum::COMPLETED)
                     completed = true;
                 else if (status.s == TransferStatusEnum::FAILED) {
@@ -217,13 +219,13 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
             }
         }
 
-        ret = engine->freeBatchID(batch_id);
-        LOG_ASSERT(!ret);
+        s = engine->freeBatchID(batch_id);
+        LOG_ASSERT(s.ok());
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
-    return 0;
+    return Status::OK();
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
@@ -349,7 +351,17 @@ int initiator() {
     return 0;
 }
 
+volatile bool target_running = true;
+
+void signalHandler(int signum) {
+    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
+    target_running = false;  
+}
+
 int target() {
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
@@ -382,8 +394,7 @@ int target() {
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
-    while (true) sleep(1);
-
+    while (target_running) sleep(1);
     for (int i = 0; i < NR_SOCKETS; ++i) {
         engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);

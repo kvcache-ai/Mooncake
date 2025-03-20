@@ -37,10 +37,10 @@ different eviction policy may need different data structure
 class EndpointStore {
    public:
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
-        std::string peer_nic_path) = 0;
+        const std::string &peer_nic_path) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        std::string peer_nic_path, RdmaContext *context) = 0;
-    virtual int deleteEndpoint(std::string peer_nic_path) = 0;
+        const std::string &peer_nic_path, RdmaContext *context) = 0;
+    virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
@@ -53,16 +53,17 @@ class EndpointStore {
 class FIFOEndpointStore : public EndpointStore {
    public:
     FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
-    std::shared_ptr<RdmaEndPoint> getEndpoint(std::string peer_nic_path);
-    std::shared_ptr<RdmaEndPoint> insertEndpoint(std::string peer_nic_path,
-                                                 RdmaContext *context);
-    int deleteEndpoint(std::string peer_nic_path);
-    void evictEndpoint();
-    void reclaimEndpoint();
-    size_t getSize();
+    std::shared_ptr<RdmaEndPoint> getEndpoint(
+        const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> insertEndpoint(
+        const std::string &peer_nic_path, RdmaContext *context) override;
+    int deleteEndpoint(const std::string &peer_nic_path) override;
+    void evictEndpoint() override;
+    void reclaimEndpoint() override;
+    size_t getSize() override;
 
-    int destroyQPs();
-    int disconnectQPs();
+    int destroyQPs() override;
+    int disconnectQPs() override;
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -80,17 +81,18 @@ class FIFOEndpointStore : public EndpointStore {
 class SIEVEEndpointStore : public EndpointStore {
    public:
     SIEVEEndpointStore(size_t max_size)
-        : waiting_list_len_(0), max_size_(max_size){};
-    std::shared_ptr<RdmaEndPoint> getEndpoint(std::string peer_nic_path);
-    std::shared_ptr<RdmaEndPoint> insertEndpoint(std::string peer_nic_path,
-                                                 RdmaContext *context);
-    int deleteEndpoint(std::string peer_nic_path);
-    void evictEndpoint();
-    void reclaimEndpoint();
-    size_t getSize();
+        : waiting_list_len_(0), max_size_(max_size) {}
+    std::shared_ptr<RdmaEndPoint> getEndpoint(
+        const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> insertEndpoint(
+        const std::string &peer_nic_path, RdmaContext *context) override;
+    int deleteEndpoint(const std::string &peer_nic_path) override;
+    void evictEndpoint() override;
+    void reclaimEndpoint() override;
+    size_t getSize() override;
 
-    int destroyQPs();
-    int disconnectQPs();
+    int destroyQPs() override;
+    int disconnectQPs() override;
 
    private:
     RWSpinlock endpoint_map_lock_;

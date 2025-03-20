@@ -266,11 +266,15 @@ int TcpTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-int TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                    TransferStatus &status) {
+Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+                                       TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
-    if (task_id >= task_count) return ERR_INVALID_ARGUMENT;
+    if (task_id >= task_count) {
+        return Status::InvalidArgument(
+            "TcpTransport::getTransportStatus invalid argument, batch id: " +
+            std::to_string(batch_id));
+    }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
@@ -286,16 +290,18 @@ int TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
-    return 0;
+    return Status::OK();
 }
 
-int TcpTransport::submitTransfer(BatchID batch_id,
+Status TcpTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
                       "capacity";
-        return ERR_TOO_MANY_REQUESTS;
+        return Status::InvalidArgument(
+            "TcpTransport: Exceed the limitation of capacity, batch id: " +
+            std::to_string(batch_id));
     }
 
     size_t task_id = batch_desc.task_list.size();
@@ -317,10 +323,10 @@ int TcpTransport::submitTransfer(BatchID batch_id,
         startTransfer(slice);
     }
 
-    return 0;
+    return Status::OK();
 }
 
-int TcpTransport::submitTransferTask(
+Status TcpTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     for (size_t index = 0; index < request_list.size(); ++index) {
@@ -338,7 +344,7 @@ int TcpTransport::submitTransferTask(
         task.slice_count += 1;
         startTransfer(slice);
     }
-    return 0;
+    return Status::OK();
 }
 
 void TcpTransport::worker() {

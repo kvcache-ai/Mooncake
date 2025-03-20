@@ -5,14 +5,18 @@ target_link_libraries(buffer_allocator_test PUBLIC cache_allocator cachelib_memo
 add_executable(master_service_test master_service_test.cpp)
 target_link_libraries(master_service_test PUBLIC cache_allocator cachelib_memory_allocator glog gtest gtest_main pthread)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GRPCPP REQUIRED grpc++)
+pkg_check_modules(GRPC REQUIRED grpc)
+
 add_executable(client_integration_test client_integration_test.cpp)
 target_link_libraries(client_integration_test PUBLIC 
     cache_allocator 
     cachelib_memory_allocator 
     glog 
     gtest 
-    grpc 
-    grpc++ 
+    ${GRPC_LDFLAGS}
+    ${GRPCPP_LDFLAGS}
     protobuf 
     gtest_main 
     pthread
@@ -24,8 +28,8 @@ target_link_libraries(stress_workload_test PUBLIC
     cachelib_memory_allocator 
     glog 
     gtest 
-    grpc 
-    grpc++ 
+    ${GRPC_LDFLAGS}
+    ${GRPCPP_LDFLAGS}
     protobuf 
     gtest_main 
     pthread

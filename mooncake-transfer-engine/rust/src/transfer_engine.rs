@@ -193,7 +193,7 @@ impl TransferEngine {
         let ret = unsafe {
             bindings::submitTransfer(self.engine, batch_id, requests_c.as_mut_ptr(), requests.len())
         };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to submit transfer")
         } else {
             Ok(())
@@ -207,7 +207,7 @@ impl TransferEngine {
         };
         let ret =
             unsafe { bindings::getTransferStatus(self.engine, batch_id, task_id as usize, &mut status) };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to get transfer status")
         } else {
             Ok((status.status, status.transferred_bytes))
@@ -216,7 +216,7 @@ impl TransferEngine {
 
     pub fn free_batch_id(&self, batch_id: BatchID) -> Result<()> {
         let ret = unsafe { bindings::freeBatchID(self.engine, batch_id) };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to free batch ID")
         } else {
             Ok(())
