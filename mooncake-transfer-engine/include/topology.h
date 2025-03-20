@@ -74,7 +74,7 @@ class Topology {
 
     Json::Value toJson() const;
 
-    int selectDevice(const std::string storage_type, int retry_count = 0);
+    int selectDevice(const std::string &location_hint, int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 

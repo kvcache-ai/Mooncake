@@ -43,9 +43,6 @@ class RdmaTransport : public Transport {
     friend class RdmaEndPoint;
     friend class WorkerPool;
 
-   public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
    public:
@@ -71,20 +68,9 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
-    // TRANSFER
-
-    Status submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
-
     Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
-
-    Status getTransferStatus(BatchID batch_id,
-                             std::vector<TransferStatus> &status);
-
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
 
     SegmentID getSegmentID(const std::string &segment_name);
 

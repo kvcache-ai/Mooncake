@@ -80,6 +80,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     }
     CHECK(transport) << "Failed to install transport";
 
+    LOG(INFO) << "transport_type=shm";
+    transport = transfer_engine_->installTransport("shm", protocol_args);
+    CHECK(transport) << "Failed to install transport";
+
     return ErrorCode::OK;
 }
 
@@ -373,7 +377,7 @@ ErrorCode Client::TransferData(
                 << "Size of replica partition more than provided buffers";
             return ErrorCode::TRANSFER_FAIL;
         }
-        Transport::SegmentHandle seg =
+        Transport::SegmentID seg =
             transfer_engine_->openSegment(handle.segment_name().c_str());
         if (seg == (uint64_t)ERR_INVALID_ARGUMENT) {
             LOG(ERROR) << "Failed to open segment " << handle.segment_name();

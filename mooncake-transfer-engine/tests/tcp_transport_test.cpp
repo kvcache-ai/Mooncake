@@ -127,7 +127,7 @@ TEST_F(TCPTransportTest, Writetest) {
     auto segment_id = engine->openSegment(local_server_name);
     TransferRequest entry;
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    uint64_t remote_base = (uint64_t)segment_desc->memory.buffers[0].addr;
     entry.opcode = TransferRequest::WRITE;
     entry.length = kDataLength;
     entry.source = (uint8_t *)(addr);
@@ -168,7 +168,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
 
     auto segment_id = engine->openSegment(local_server_name);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    uint64_t remote_base = (uint64_t)segment_desc->memory.buffers[0].addr;
     {
         auto batch_id = engine->allocateBatchID(1);
         Status s;
@@ -240,7 +240,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
 
     auto segment_id = engine->openSegment(local_server_name);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    uint64_t remote_base = (uint64_t)segment_desc->memory.buffers[0].addr;
 
     {
         auto batch_id = engine->allocateBatchID(1);

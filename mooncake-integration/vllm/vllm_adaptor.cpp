@@ -184,12 +184,12 @@ int VLLMAdaptor::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
 
 int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
                               uintptr_t peer_buffer_address, size_t length) {
-    Transport::SegmentHandle handle;
+    Transport::SegmentID handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
     } else {
         handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
+        if (handle == (Transport::SegmentID)-1) return -1;
         handle_map_[target_hostname] = handle;
     }
 

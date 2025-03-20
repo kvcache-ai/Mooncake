@@ -48,7 +48,7 @@ class TransferMetadataTest : public ::testing::Test {
             local_server_name = "127.0.0.2:12345";
         LOG(INFO) << "local_server_name: " << local_server_name;
 
-        metadata_client = std::make_unique<TransferMetadata>(metadata_server);
+        metadata_client = std::make_unique<TransferMetadata>(metadata_server, local_server_name);
     }
     void TearDown() override {
         // clean up glog
@@ -61,33 +61,30 @@ class TransferMetadataTest : public ::testing::Test {
 
 // add and search LocalSegmentMeta
 TEST_F(TransferMetadataTest, LocalSegmentTest) {
-    auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
-    segment_des->name = "test_server";
-    segment_des->protocol = "rdma";
-    TransferMetadata::SegmentID segment_id = 1111111;
+    auto segment_des = std::make_shared<SegmentDesc>();
     std::string segment_name = "test_segment";
-    int re = metadata_client->addLocalSegment(segment_id, segment_name,
-                                              std::move(segment_des));
+    segment_des->type = MemoryKind;
+    segment_des->name = segment_name;
+    int re = metadata_client->setLocalSegment(std::move(segment_des));
     ASSERT_EQ(re, 0);
     auto des = metadata_client->getSegmentDescByName(segment_name);
     ASSERT_EQ(des, segment_des);
-    des = metadata_client->getSegmentDescByID(segment_id, false);
+    des = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
     ASSERT_EQ(des, segment_des);
     auto id = metadata_client->getSegmentID(segment_name);
-    ASSERT_EQ(id, segment_id);
+    ASSERT_EQ(id, LOCAL_SEGMENT_ID);
 }
 
 // add and remove LocalMemoryBufferMeta
 TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
-    auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
+    auto segment_des = std::make_shared<SegmentDesc>();
     segment_des->name = "test_localMemery";
-    segment_des->protocol = "rdma";
-    int re = metadata_client->addLocalSegment(
-        LOCAL_SEGMENT_ID, "test_local_segment", std::move(segment_des));
+    segment_des->type = MemoryKind;
+    int re = metadata_client->setLocalSegment(std::move(segment_des));
     ASSERT_EQ(re, 0);
     uint64_t addr = 0;
     for (int i = 0; i < 10; ++i) {
-        TransferMetadata::BufferDesc buffer_des;
+        BufferAttr buffer_des;
         buffer_des.addr = addr + i * 2048;
         buffer_des.length = 1024;
         re = metadata_client->addLocalMemoryBuffer(buffer_des, false);

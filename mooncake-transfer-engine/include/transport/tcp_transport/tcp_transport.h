@@ -37,24 +37,13 @@ class TcpContext;
 
 class TcpTransport : public Transport {
    public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
-   public:
     TcpTransport();
 
     ~TcpTransport();
 
-    Status submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
-
     Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
-
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
 
    private:
     int install(std::string &local_server_name,
@@ -83,6 +72,7 @@ class TcpTransport : public Transport {
     const char *getName() const override { return "tcp"; }
 
    private:
+    TcpAttr tcp_attr_;
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;

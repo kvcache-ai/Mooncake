@@ -260,10 +260,11 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
-    if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
-
-    auto &entry = resolved_matrix_[storage_type];
+int Topology::selectDevice(const std::string &location_hint, int retry_count) {
+    std::string location = location_hint;
+    if (resolved_matrix_.count(location_hint) == 0) location = "*";
+    if (resolved_matrix_.count(location) == 0) return ERR_DEVICE_NOT_FOUND;
+    auto &entry = resolved_matrix_[location];
     if (retry_count == 0) {
         int rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())

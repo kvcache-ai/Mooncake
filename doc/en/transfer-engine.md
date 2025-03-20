@@ -300,16 +300,16 @@ Unregisters the region.
 
 ### Segment Management and Metadata Format
 
-TransferEngine provides the `openSegment` function, which obtains a `SegmentHandle` for subsequent `Transport` transfers.
+TransferEngine provides the `openSegment` function, which obtains a `SegmentID` for subsequent `Transport` transfers.
 ```cpp
-SegmentHandle openSegment(const std::string& segment_name);
+SegmentID openSegment(const std::string& segment_name);
 ```
 
 - `segment_name`: The unique identifier of the segment. For RAM Segment, this needs to be consistent with the `server_name` filled in by the peer process when initializing the TransferEngine object.
-- Return value: If successful, returns the corresponding `SegmentHandle`; otherwise, returns a negative value.
+- Return value: If successful, returns the corresponding `SegmentID`; otherwise, returns a negative value.
 
 ```cpp
-int closeSegment(SegmentHandle segment_id);
+int closeSegment(SegmentID segment_id);
 ```
 
 - `segment_id`: The unique identifier of the segment.

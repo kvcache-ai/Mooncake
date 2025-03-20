@@ -4,7 +4,7 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:transport>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
@@ -29,10 +29,9 @@ if (USE_HTTP)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
 target_link_libraries(
-    transfer_engine
-    PUBLIC
-    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
-    )
+  transfer_engine PUBLIC
+  common transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread
+)
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)

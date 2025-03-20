@@ -1,9 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+file(GLOB COMMON_SOURCES "*.cpp")
 
-# Add base sub directory.
 add_subdirectory(base)
-list(APPEND SUB_STATIC_LIBS base)
-
-set(SUB_STATIC_LIBS
-    ${SUB_STATIC_LIBS}
-    PARENT_SCOPE)
+add_library(common ${XPORT_SOURCES} $<TARGET_OBJECTS:common_base>)

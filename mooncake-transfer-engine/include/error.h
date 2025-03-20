@@ -21,6 +21,7 @@
 #define ERR_BATCH_BUSY (-4)
 #define ERR_DEVICE_NOT_FOUND (-6)
 #define ERR_ADDRESS_OVERLAPPED (-7)
+#define ERR_NOT_LOCAL_SEGMENT_OR_SHM (-8)
 
 #define ERR_DNS (-101)
 #define ERR_SOCKET (-102)

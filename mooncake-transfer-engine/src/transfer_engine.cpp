@@ -23,7 +23,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
     local_server_name_ = local_server_name;
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string, local_server_name_);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
 
@@ -93,7 +93,7 @@ Transport *TransferEngine::installTransport(const std::string &proto,
 
 int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
 
-Transport::SegmentHandle TransferEngine::openSegment(
+Transport::SegmentID TransferEngine::openSegment(
     const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
@@ -103,7 +103,7 @@ Transport::SegmentHandle TransferEngine::openSegment(
     return metadata_->getSegmentID(trimmed_segment_name);
 }
 
-int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
+int TransferEngine::closeSegment(Transport::SegmentID handle) { return 0; }
 
 bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
