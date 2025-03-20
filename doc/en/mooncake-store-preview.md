@@ -246,6 +246,7 @@ The storage node (Client) allocates a segment of memory and, after calling `Tran
 ```protobuf
 message UnmountSegmentRequest {
   required string segment_name = 1;  // Storage segment name used during mounting
+  required uint64 buffer = 2;        // Starting address of the space
 }
 
 message UnMountSegmentResponse {
@@ -271,7 +272,8 @@ The storage node (Client) registers the storage segment space with the Master Se
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+ErrorCode UnmountSegment(const std::string& segment_name,
+                         uint64_t buffer);
 ```
 
 The storage node (Client) unregisters the storage segment space with the Master Service.
@@ -345,11 +347,12 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 ```C++
 virtual std::shared_ptr<BufHandle> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<AllocatorKey, std::shared_ptr<BufferAllocator>,
+                                 AllocatorKeyHash>& allocators,
         size_t objectSize) = 0;
 ```
 
-- Input: The list of available storage segments and the size of the space to be allocated.
+- Input: The list of available storage segments (AllocatorKey is the combination of segment name and starting address), and the size of the space to be allocated.
 - Output: Returns a successful allocation handle BufHandle.
 
 #### Implementation Strategies

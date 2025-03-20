@@ -53,16 +53,18 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
         service_->MountSegment(kBufferAddress, kSegmentSize, segment_name));
 
     // Test unmounting the segment.
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(segment_name, kBufferAddress));
 
     // Test unmounting a non-existent segment (should fail).
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->UnmountSegment("non_existent"));
+              service_->UnmountSegment("non_existent", kBufferAddress));
 
     // Test remounting after unmount.
     EXPECT_EQ(ErrorCode::OK, service_->MountSegment(
                                  kBufferAddress, kSegmentSize, segment_name));
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(segment_name, kBufferAddress));
 }
 
 TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
@@ -84,7 +86,8 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         EXPECT_EQ(
             ErrorCode::OK,
             service_->MountSegment(kBufferAddress, kSegmentSize, segment_name));
-        EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+        EXPECT_EQ(ErrorCode::OK,
+                  service_->UnmountSegment(segment_name, kBufferAddress));
     }
 }
 
@@ -106,7 +109,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
                 if (service_->MountSegment(buffer, size, segment_name) ==
                     ErrorCode::OK) {
                     EXPECT_EQ(ErrorCode::OK,
-                              service_->UnmountSegment(segment_name));
+                              service_->UnmountSegment(segment_name, buffer));
                     success_count++;
                 }
             }
@@ -514,7 +517,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     ASSERT_EQ(1, retrieved_replicas.size());
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name, buffer));
 
     // Try to get the object - it should be automatically removed since the
     // replica is invalid
@@ -540,10 +543,15 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
               service_->GetReplicaList(key2, retrieved_replicas));
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name, buffer));
 
     // Try to remove the object that should already be cleaned up
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key2));
 }
 
 }  // namespace mooncake::test
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

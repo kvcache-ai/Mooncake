@@ -159,7 +159,9 @@ class Client {
     std::unique_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<mooncake_store::MasterService::Stub> master_stub_;
 
-    std::unordered_map<std::string, void*> mounted_segments_;
+    std::mutex mounted_segments_mutex_;  // Protects the following map
+    std::unordered_map<std::string, std::unordered_set<uint64_t>>
+        mounted_segments_;  // Segment name -> set of starting addresses
 
     // Configuration
     std::string local_hostname_;

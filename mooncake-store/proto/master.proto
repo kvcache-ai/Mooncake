@@ -108,6 +108,7 @@ message MountSegmentResponse {
 // Request to unmount a segment
 message UnmountSegmentRequest {
     required string segment_name = 1; // Segment name.
+    required uint64 buffer = 2;       // Memory address.
 }
 
 // Response to unmount a segment
