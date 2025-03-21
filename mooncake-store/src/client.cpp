@@ -87,8 +87,7 @@ ErrorCode Client::Init(const std::string& local_hostname,
                        const std::string& metadata_connstring,
                        const std::string& protocol, void** protocol_args,
                        const std::string& master_addr) {
-    if (transfer_engine_)
-        return ErrorCode::INTERNAL_ERROR;
+    if (transfer_engine_) return ErrorCode::INTERNAL_ERROR;
 
     // Store configuration
     local_hostname_ = local_hostname;
@@ -110,7 +109,7 @@ ErrorCode Client::Init(const std::string& local_hostname,
 ErrorCode Client::UnInit() {
     // Unmount all Segment
     auto mounted_segments = mounted_segments_;
-    for (auto &entry : mounted_segments) {
+    for (auto& entry : mounted_segments) {
         UnmountSegment(entry.first, entry.second);
     }
     transfer_engine_.reset();
@@ -240,9 +239,12 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             revoke_request.set_key(key);
             mooncake_store::PutRevokeResponse revoke_response;
             grpc::ClientContext revoke_context;
-            status = master_stub_->PutRevoke(&revoke_context, revoke_request, &revoke_response);
-            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke", revoke_request);
-            VLOG(1) << "PutRevoke: status_code=" << revoke_response.status_code();
+            status = master_stub_->PutRevoke(&revoke_context, revoke_request,
+                                             &revoke_response);
+            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke",
+                                 revoke_request);
+            VLOG(1) << "PutRevoke: status_code="
+                    << revoke_response.status_code();
             return transfer_err;
         }
     }
@@ -281,6 +283,13 @@ ErrorCode Client::Remove(const ObjectKey& key) const {
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
+    if (reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
+        size % facebook::cachelib::Slab::kSize) {
+        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
+                   << " is not aligned to " << facebook::cachelib::Slab::kSize;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     mooncake_store::MountSegmentRequest request;
     request.set_segment_name(segment_name);
     request.set_buffer(reinterpret_cast<uint64_t>(buffer));
@@ -303,12 +312,11 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     if (err != ErrorCode::OK) {
         return err;
     }
-    mounted_segments_[segment_name] = (void *) buffer;
+    mounted_segments_[segment_name] = (void*)buffer;
     return ErrorCode::OK;
 }
 
-ErrorCode Client::UnmountSegment(const std::string& segment_name,
-                                 void* addr) {
+ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     mooncake_store::UnmountSegmentRequest request;
     request.set_segment_name(segment_name);
     mooncake_store::UnmountSegmentResponse response;
