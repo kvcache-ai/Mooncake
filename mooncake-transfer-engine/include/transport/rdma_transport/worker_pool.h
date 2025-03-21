@@ -28,7 +28,7 @@ class WorkerPool {
     ~WorkerPool();
 
     // Add slices to queue, called by Transport
-    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    Status submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
    private:
     void performPostSend(int thread_id);

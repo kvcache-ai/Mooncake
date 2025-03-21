@@ -41,15 +41,15 @@ struct HandShakePlugin {
     // The first param represents peer endpoint's attributes, while
     // the second param represents local endpoint's attributes
     using OnReceiveCallBack =
-        std::function<int(const Json::Value &, Json::Value &)>;
+        std::function<Status(const Json::Value &, Json::Value &)>;
 
-    virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port) = 0;
+    virtual Status startDaemon(OnReceiveCallBack on_recv_callback,
+                               uint16_t listen_port) = 0;
 
     // Connect to peer endpoint, and wait for receiving
     // peer endpoint's attributes
-    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
-                     const Json::Value &local, Json::Value &peer) = 0;
+    virtual Status send(std::string ip_or_host_name, uint16_t rpc_port,
+                        const Json::Value &local, Json::Value &peer) = 0;
 };
 
 }  // namespace mooncake
