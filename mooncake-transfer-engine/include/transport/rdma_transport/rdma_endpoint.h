@@ -38,7 +38,7 @@ namespace mooncake {
 // The handshake can be restarted at this point.
 class RdmaEndPoint {
    public:
-    enum Status {
+    enum EndPointStatus {
         INITIALIZING,
         UNCONNECTED,
         CONNECTED,
@@ -49,8 +49,8 @@ class RdmaEndPoint {
 
     ~RdmaEndPoint();
 
-    int construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
-                  size_t max_wr = 256, size_t max_inline = 64);
+    Status construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
+                     size_t max_wr = 256, size_t max_inline = 64);
 
    private:
     int deconstruct();
@@ -58,16 +58,16 @@ class RdmaEndPoint {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
 
-    int setupConnectionsByActive();
+    Status setupConnectionsByActive();
 
-    int setupConnectionsByActive(const std::string &peer_nic_path) {
+    Status setupConnectionsByActive(const std::string &peer_nic_path) {
         setPeerNicPath(peer_nic_path);
         return setupConnectionsByActive();
     }
 
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
-    int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                  HandShakeDesc &local_desc);
+    Status setupConnectionsByPassive(const HandShakeDesc &peer_desc,
+                                     HandShakeDesc &local_desc);
 
     bool hasOutstandingSlice() const;
 
@@ -98,23 +98,23 @@ class RdmaEndPoint {
     // Submit some work requests to HW
     // Submitted tasks (success/failed) are removed in slice_list
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
-    int submitPostSend(std::vector<Transport::Slice *> &slice_list,
-                       std::vector<Transport::Slice *> &failed_slice_list);
+    Status submitPostSend(std::vector<Transport::Slice *> &slice_list,
+                          std::vector<Transport::Slice *> &failed_slice_list);
 
    private:
     std::vector<uint32_t> qpNum() const;
 
-    int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
-                          std::vector<uint32_t> peer_qp_num_list,
-                          std::string *reply_msg = nullptr);
+    Status doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
+                             std::vector<uint32_t> peer_qp_num_list,
+                             std::string *reply_msg = nullptr);
 
-    int doSetupConnection(int qp_index, const std::string &peer_gid,
-                          uint16_t peer_lid, uint32_t peer_qp_num,
-                          std::string *reply_msg = nullptr);
+    Status doSetupConnection(int qp_index, const std::string &peer_gid,
+                             uint16_t peer_lid, uint32_t peer_qp_num,
+                             std::string *reply_msg = nullptr);
 
    private:
     RdmaContext &context_;
-    std::atomic<Status> status_;
+    std::atomic<EndPointStatus> status_;
 
     RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;

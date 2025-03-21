@@ -53,28 +53,30 @@ class RdmaTransport : public Transport {
 
     ~RdmaTransport();
 
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo) override;
+    Status install(std::string &local_server_name,
+                   std::shared_ptr<TransferMetadata> meta,
+                   std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata) override;
+    Status registerLocalMemory(void *addr, size_t length,
+                               const std::string &location,
+                               bool remote_accessible,
+                               bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
+    Status unregisterLocalMemory(void *addr,
+                                 bool update_metadata = true) override;
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location) override;
+    Status registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
+                                    const std::string &location) override;
 
-    int unregisterLocalMemoryBatch(
+    Status unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
     // TRANSFER
 
     Status submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
+                          const std::vector<TransferRequest> &entries) override;
 
     Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
@@ -89,27 +91,28 @@ class RdmaTransport : public Transport {
     SegmentID getSegmentID(const std::string &segment_name);
 
    private:
-    int allocateLocalSegmentID();
+    Status allocateLocalSegmentID();
 
    public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+    Status onSetupRdmaConnections(const HandShakeDesc &peer_desc,
+                                  HandShakeDesc &local_desc);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
+    Status sendHandshake(const std::string &peer_server_name,
+                         const HandShakeDesc &local_desc,
+                         HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
     }
 
    private:
-    int initializeRdmaResources();
+    Status initializeRdmaResources();
 
-    int startHandshakeDaemon(std::string &local_server_name);
+    Status startHandshakeDaemon(std::string &local_server_name);
 
    public:
-    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            int &buffer_id, int &device_id, int retry_cnt = 0);
+    static Status selectDevice(SegmentDesc *desc, uint64_t offset,
+                               size_t length, int &buffer_id, int &device_id,
+                               int retry_cnt = 0);
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;

@@ -108,7 +108,7 @@ impl TransferEngine {
         let ret = unsafe {
             bindings::registerLocalMemory(self.engine, addr, length, location_c.as_ptr(), 1)
         };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to register local memory")
         } else {
             Ok(())
@@ -117,7 +117,7 @@ impl TransferEngine {
 
     pub fn unregister_local_memory(&self, addr: *mut c_void) -> Result<()> {
         let ret = unsafe { bindings::unregisterLocalMemory(self.engine, addr) };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to unregister local memory")
         } else {
             Ok(())
@@ -146,7 +146,7 @@ impl TransferEngine {
                 location_c.as_ptr(),
             )
         };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to register local memory")
         } else {
             Ok(())
@@ -159,7 +159,7 @@ impl TransferEngine {
         let ret = unsafe {
             bindings::unregisterLocalMemoryBatch(self.engine, addr_list.as_mut_ptr(), addr_len)
         };
-        if ret < 0 {
+        if ret != 0 {
             bail!("Failed to unregister local memory")
         } else {
             Ok(())

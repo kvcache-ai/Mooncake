@@ -61,7 +61,7 @@ WorkerPool::~WorkerPool() {
     }
 }
 
-int WorkerPool::submitPostSend(
+Status WorkerPool::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
 #ifdef CONFIG_CACHE_SEGMENT_DESC
     thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
@@ -84,7 +84,9 @@ int WorkerPool::submitPostSend(
                 segment_desc_map.clear();
                 LOG(ERROR) << "Cannot get target segment description #"
                            << target_id;
-                return ERR_INVALID_ARGUMENT;
+                return Status::InvalidArgument(
+                    "WorkerPool submitPostSend config cache can't get target "
+                    "segment description #" + std::to_string(target_id));
             }
         }
     }
@@ -98,7 +100,9 @@ int WorkerPool::submitPostSend(
                 context_.engine().meta()->getSegmentDescByID(target_id);
         if (!segment_desc_map[target_id]) {
             LOG(ERROR) << "Cannot get target segment #" << target_id;
-            return ERR_INVALID_ARGUMENT;
+            return Status::InvalidArgument(
+                "WorkerPool submitPostSend can't get target segment "
+                "description #" + std::to_string(target_id));
         }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
@@ -108,9 +112,11 @@ int WorkerPool::submitPostSend(
     for (auto &slice : slice_list) {
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        buffer_id, device_id)) {
+        auto status = RdmaTransport::selectDevice(peer_segment_desc.get(),
+                                                  slice->rdma.dest_addr,
+                                                  slice->length, buffer_id,
+                                                  device_id);
+        if (!status.ok()) {
             LOG(WARNING) << "Reselect remote NIC for address "
                          << (void *)slice->rdma.dest_addr << " on segment #"
                          << slice->target_id;
@@ -121,9 +127,11 @@ int WorkerPool::submitPostSend(
                 slice->markFailed();
                 continue;
             }
-            if (RdmaTransport::selectDevice(
-                    peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, buffer_id, device_id)) {
+            status = RdmaTransport::selectDevice(peer_segment_desc.get(),
+                                                 slice->rdma.dest_addr,
+                                                 slice->length, buffer_id,
+                                                 device_id);
+            if (!status.ok()) {
                 LOG(ERROR) << "Failed to select remote NIC for address "
                            << (void *)slice->rdma.dest_addr << " on segment #"
                            << slice->target_id;
@@ -156,7 +164,7 @@ int WorkerPool::submitPostSend(
                                      std::memory_order_relaxed);
     if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
 
-    return 0;
+    return Status::OK();
 }
 
 void WorkerPool::performPostSend(int thread_id) {
@@ -249,7 +257,8 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
+        if (!endpoint->connected() &&
+            !(endpoint->setupConnectionsByActive()).ok()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
                        << entry.first;
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
@@ -347,10 +356,11 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
             if (!peer_segment_desc ||
-                RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, buffer_id, device_id,
-                                            slice->rdma.retry_cnt)) {
+                !(RdmaTransport::selectDevice(peer_segment_desc.get(),
+                                              slice->rdma.dest_addr,
+                                              slice->length, buffer_id,
+                                              device_id,
+                                              slice->rdma.retry_cnt)).ok()) {
                 slice->markFailed();
                 processed_slice_count_++;
                 continue;

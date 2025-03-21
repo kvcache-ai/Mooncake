@@ -260,27 +260,36 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
-    if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
+Status Topology::selectDevice(const std::string storage_type, int *device_id,
+                              int retry_count) {
+    if (resolved_matrix_.count(storage_type) == 0) {
+        return Status::DeviceNotFound(
+            "Topoloy select device, invalid storage type: " + storage_type);
+    }
 
     auto &entry = resolved_matrix_[storage_type];
     if (retry_count == 0) {
         int rand_value = SimpleRandom::Get().next();
-        if (!entry.preferred_hca.empty())
-            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
-        else
-            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+        if (!entry.preferred_hca.empty()) {
+            *device_id =
+                entry.preferred_hca[rand_value % entry.preferred_hca.size()];
+        }
+        else {
+            *device_id =
+                entry.avail_hca[rand_value % entry.avail_hca.size()];
+        }
     } else {
         size_t index = (retry_count - 1) %
                        (entry.preferred_hca.size() + entry.avail_hca.size());
-        if (index < entry.preferred_hca.size())
-            return entry.preferred_hca[index];
+        if (index < entry.preferred_hca.size()) {
+            *device_id = entry.preferred_hca[index];
+        }
         else {
             index -= entry.preferred_hca.size();
-            return entry.avail_hca[index];
+            *device_id = entry.avail_hca[index];
         }
     }
-    return 0;
+    return Status::OK();
 }
 
 int Topology::resolve() {
