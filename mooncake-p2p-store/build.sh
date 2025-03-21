@@ -34,8 +34,9 @@ fi
 # fi
 
 EXT_LDFLAGS="-L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src"
+EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/thirdparties/lib"
-EXT_LDFLAGS+=" -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
+EXT_LDFLAGS+=" -ltransfer_engine -lbase -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc -lboost_thread"
 # EXT_LDFLAGS+=" -lhiredis"     // if USE_REDIS is enabled
 # EXT_LDFLAGS+=" -lcurl"        // if USE_HTTP is enabled
 
