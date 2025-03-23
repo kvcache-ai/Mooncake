@@ -42,6 +42,14 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     // Invalid segment size (0).
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
               service_->MountSegment(kBufferAddress, 0, segment_name));
+    // Base is not aligned
+    EXPECT_EQ(
+        ErrorCode::INVALID_PARAMS,
+        service_->MountSegment(kBufferAddress + 1, kSegmentSize, segment_name));
+    // Size is not aligned
+    EXPECT_EQ(
+        ErrorCode::INVALID_PARAMS,
+        service_->MountSegment(kBufferAddress, kSegmentSize + 1, segment_name));
 
     // Test normal mount operation.
     EXPECT_EQ(ErrorCode::OK, service_->MountSegment(
