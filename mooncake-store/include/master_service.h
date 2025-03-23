@@ -81,13 +81,12 @@ class MasterService {
     // Comparator for GC tasks priority queue
     struct GCTaskComparator {
         bool operator()(GCTask* a, GCTask* b) const {
-            return a->deletion_time >
-                   b->deletion_time;  // 最小堆，最早过期的优先级最高
+            return a->deletion_time > b->deletion_time;
         }
     };
 
    public:
-    MasterService();
+    MasterService(bool enable_gc = true);
     ~MasterService();
 
     /**
@@ -191,6 +190,7 @@ class MasterService {
     boost::lockfree::queue<GCTask*> gc_queue_{kGCQueueSize};
     std::thread gc_thread_;
     std::atomic<bool> gc_running_{false};
+    bool enable_gc_{true};  // Flag to enable/disable garbage collection
     static constexpr uint64_t kGCThreadSleepMs =
         10;  // 10 ms sleep between GC checks
 

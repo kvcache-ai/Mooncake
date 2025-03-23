@@ -17,6 +17,7 @@
 // Define command line flags
 DEFINE_int32(port, 50051, "Port for master service to listen on");
 DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
+DEFINE_bool(enable_gc, true, "Enable garbage collection");
 
 namespace mooncake {
 
@@ -258,8 +259,12 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Create master service instance
-        auto master_service = std::make_shared<mooncake::MasterService>();
+        // Create master service instance with GC flag
+        auto master_service =
+            std::make_shared<mooncake::MasterService>(FLAGS_enable_gc);
+
+        LOG(INFO) << "Garbage collection: "
+                  << (FLAGS_enable_gc ? "enabled" : "disabled");
 
         // Initialize gRPC server
         std::string server_address = "0.0.0.0:" + std::to_string(FLAGS_port);
