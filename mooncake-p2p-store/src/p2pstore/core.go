@@ -22,7 +22,7 @@ import (
 	"sync"
 )
 
-// When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered seperately.
+// When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered separately.
 // Warning: Memory registration is a SLOW operation.
 // MAX_CHUNK_SIZE must be an integer power of 2.
 // maxShardSize must be an integer power of 2, divisible by MAX_CHUNK_SIZE.

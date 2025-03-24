@@ -48,7 +48,7 @@ namespace cachelib {
  * The info about which memory pool and allocation class a slab is being used
  * for is stored in the slab header. The slab header is not located within the
  * slab, but is managed and the mapping of Slab to its header is maintained
- * independantly by the SlabAllocator.
+ * independently by the SlabAllocator.
  */
 
 // identifier for the memory tier
@@ -123,7 +123,7 @@ struct CACHELIB_PACKED_ATTR SlabHeader {
     SlabHeader(PoolId pid, ClassId cid, uint32_t size)
         : poolId(pid), classId(cid), allocSize(size) {}
 
-    // This doesn't reset the flags. That's done explcitly by calling
+    // This doesn't reset the flags. That's done explicitly by calling
     // setFlag/unsetFlag above.
     void resetAllocInfo() {
         poolId = Slab::kInvalidPoolId;

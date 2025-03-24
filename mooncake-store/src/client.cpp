@@ -209,7 +209,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LogAndCheckRpcStatus(status, start_response, "PutStart", start_request);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            LOG(INFO) << "object_alredy_exists key=" << key;
+            LOG(INFO) << "object_already_exists key=" << key;
             return ErrorCode::OK;
         }
         return err;
