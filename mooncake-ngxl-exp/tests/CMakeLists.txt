@@ -1,0 +1,27 @@
+add_executable(ngxl_rdma_transport_test rdma_transport_test.cpp)
+target_link_libraries(ngxl_rdma_transport_test PUBLIC ngxl)
+# add_test(NAME ngxl_rdma_transport_test COMMAND ngxl_rdma_transport_test)
+
+add_executable(ngxl_transport_uint_test transport_uint_test.cpp)
+target_link_libraries(ngxl_transport_uint_test PUBLIC ngxl gtest gtest_main )
+add_test(NAME ngxl_transport_uint_test COMMAND ngxl_transport_uint_test)
+
+add_executable(ngxl_rdma_transport_test2 rdma_transport_test2.cpp)
+target_link_libraries(ngxl_rdma_transport_test2 PUBLIC ngxl gtest gtest_main )
+# add_test(NAME ngxl_rdma_transport_test2 COMMAND ngxl_rdma_transport_test2)
+
+add_executable(ngxl_tcp_transport_test tcp_transport_test.cpp)
+target_link_libraries(ngxl_tcp_transport_test PUBLIC ngxl gtest gtest_main )
+add_test(NAME ngxl_tcp_transport_test COMMAND ngxl_tcp_transport_test)
+
+add_executable(ngxl_transfer_metadata_test transfer_metadata_test.cpp)
+target_link_libraries(ngxl_transfer_metadata_test PUBLIC ngxl gtest gtest_main)
+add_test(NAME ngxl_transfer_metadata_test COMMAND ngxl_transfer_metadata_test)
+
+add_executable(ngxl_topology_test topology_test.cpp)
+target_link_libraries(ngxl_topology_test PUBLIC ngxl gtest gtest_main)
+add_test(NAME ngxl_topology_test COMMAND ngxl_topology_test)
+
+add_executable(ngxl_memory_location_test memory_location_test.cpp)
+target_link_libraries(ngxl_memory_location_test PUBLIC ngxl gtest gtest_main)
+add_test(NAME ngxl_memory_location_test COMMAND ngxl_memory_location_test)
