@@ -205,7 +205,7 @@ enum TaskStatus
   WAITING,   // 正在处于传输阶段
   PENDING,   // 暂不支持
   INVALID,   // 参数不合法
-  CANNELED,  // 暂不支持
+  CANCELED,  // 暂不支持
   COMPLETED, // 传输完毕
   TIMEOUT,   // 暂不支持
   FAILED     // 即使经过重试仍传输失败
