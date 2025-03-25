@@ -110,7 +110,7 @@ In order to install and use Mooncake, some preparation is required.
 - Linux-x86_64 with gcc, g++ (9.4+) and cmake (3.16+).
 - Python (3.10 or above)
 
-In addition, to support more features of Mooncake Transfer Engine, we *recommand* you to install the following components:
+In addition, to support more features of Mooncake Transfer Engine, we *recommend* you to install the following components:
 
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if you want to build with `-DUSE_CUDA`. You may install them from [here](https://developer.nvidia.com/cuda-downloads). 
   ```bash

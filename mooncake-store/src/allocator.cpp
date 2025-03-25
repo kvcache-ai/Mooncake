@@ -30,10 +30,10 @@ BufHandle::~BufHandle() {
     }
 }
 
-BufferAllocator::BufferAllocator(std::string segmetn_name, size_t base,
+BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
                                  size_t size)
-    : segment_name_(segmetn_name), base_(base), total_size_(size) {
-    VLOG(1) << "initializing_buffer_allocator segment_name=" << segmetn_name
+    : segment_name_(segment_name), base_(base), total_size_(size) {
+    VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
 

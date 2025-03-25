@@ -68,7 +68,7 @@ class AllocationClass {
     }
 
     // Whether the pool is full or free to allocate more in the current state.
-    // This is only a hint and not a gurantee that subsequent allocate will
+    // This is only a hint and not a guarantee that subsequent allocate will
     // fail/succeed.
     bool isFull() const noexcept { return !canAllocate_; }
 
@@ -228,7 +228,7 @@ class AllocationClass {
     // @return  SlabReleaseContext
     //          isReleased == true means the slab is already released
     //          as there was no active allocation to be freed. If not, the
-    //          caller is responsible for ensuring that all active alocations
+    //          caller is responsible for ensuring that all active allocations
     //          returned by getActiveAllocs are freed back and
     //
     // @throw std::invalid_argument if the hint is invalid.
@@ -320,7 +320,7 @@ class AllocationClass {
     void waitUntilAllFreed(const Slab* slab);
 
     // return the allocation's index into the slab. It is the caller's
-    // reponsibility to ensure that the alloc belongs to the slab and is valid.
+    // responsibility to ensure that the alloc belongs to the slab and is valid.
     size_t getAllocIdx(const Slab* slab, void* alloc) const noexcept;
 
     // return the allocation pointer into the slab for a given index.
@@ -425,7 +425,7 @@ class AllocationClass {
 
     // stores the list of outstanding allocations for a given slab. This is
     // created when we start a slab release process and if there are any active
-    // allocaitons need to be marked as free.
+    // allocations need to be marked as free.
     std::unordered_map<uintptr_t, std::vector<bool>> slabReleaseAllocMap_;
 
     // Starting releasing a slab is serialized across threads.
@@ -441,7 +441,7 @@ class AllocationClass {
     // This is needed to avoid other threads from starving for lock.
     static constexpr unsigned int kFreeAllocsPruneSleepMicroSecs = 1000;
 
-    // Numer of allocations ahead to prefetch when iterating over each
+    // Number of allocations ahead to prefetch when iterating over each
     // allocation in a slab.
     static constexpr unsigned int kForEachAllocPrefetchOffset = 16;
 };

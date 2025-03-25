@@ -5,7 +5,7 @@ Mooncake aims to enhance the inference efficiency of large language models (LLMs
 Mooncake:
 - provides object-level data storage services
 - supports data replication in the cache layer, with a lightweight design due to not guaranteeing high availability
-- ensures the atomicity of object write operations, meaning a `Get` oepration will always read one consistent version, but not necessarily the latest one
+- ensures the atomicity of object write operations, meaning a `Get` operation will always read one consistent version, but not necessarily the latest one
 - supports striping and parallel I/O transfer for larger objects to utilize the aggregated bandwidth of multiple network cards
 - supports multiple modes for flushing slow object storage
 - supports dynamic addition and removal of cache resources

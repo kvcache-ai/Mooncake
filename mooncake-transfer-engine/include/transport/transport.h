@@ -165,7 +165,7 @@ class Transport {
     virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
-        return Status::NotImplmented(
+        return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
     }
 

@@ -207,7 +207,7 @@ class MemoryAllocator {
     // Check if the slab has all its active allocations freed.
     //
     // @param ctx context returned by startSlabRelease.
-    // @return    true if all allocs have been freed back to the allcoator
+    // @return    true if all allocs have been freed back to the allocator
     //            false otherwise
     //
     // @throw std::invalid_argument if the pool id or allocation class id

@@ -80,7 +80,7 @@ Mooncake Store 采用分层架构设计，架构自顶向下分为：`Distribute
 TaskID DistributedObjectStore::put(ObjectKey key,std::vector<void *> ptrs,std::vector<void *> sizes,ReplicateConfig config)
 ```
 
-用于将指定对象放入到 objectstore 中, 根据`config`中的`replica_num`，调用`ReplicaAlloctor::addOneReplica` 创建对应副本，并通过`TransferEngine` 将数据写入对应节点
+用于将指定对象放入到 objectstore 中, 根据`config`中的`replica_num`，调用`ReplicaAllocator::addOneReplica` 创建对应副本，并通过`TransferEngine` 将数据写入对应节点
 
 2. get 操作
 ```C++
