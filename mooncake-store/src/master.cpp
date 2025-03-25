@@ -17,7 +17,7 @@
 // Define command line flags
 DEFINE_int32(port, 50051, "Port for master service to listen on");
 DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
-DEFINE_bool(enable_gc, true, "Enable garbage collection");
+DEFINE_bool(enable_gc, false, "Enable garbage collection");
 
 namespace mooncake {
 
