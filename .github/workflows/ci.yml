@@ -34,7 +34,7 @@ jobs:
     - name: start-mooncake-master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mooncake_master --enable_gc=false &
+        mooncake_master &
       shell: bash
     - name: test
       run: |
