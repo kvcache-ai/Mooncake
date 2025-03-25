@@ -232,7 +232,7 @@ enum TaskStatus
   WAITING,   // In the transfer phase
   PENDING,   // Not supported
   INVALID,   // Ilvalid parameters
-  CANNELED,  // Not supported
+  CANCELED,  // Not supported
   COMPLETED, // Transfer completed
   TIMEOUT,   // Not supported
   FAILED     // Transfer failed even after retries

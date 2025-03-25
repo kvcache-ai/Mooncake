@@ -44,7 +44,7 @@ typedef struct transfer_request transfer_request_t;
 #define STATUS_WAITING (0)
 #define STATUS_PENDING (1)
 #define STATUS_INVALID (2)
-#define STATUS_CANNELED (3)
+#define STATUS_CANCELED (3)
 #define STATUS_COMPLETED (4)
 #define STATUS_TIMEOUT (5)
 #define STATUS_FAILED (6)
