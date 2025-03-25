@@ -48,7 +48,7 @@ class Status final {
     kNuma = 300,
     kClock = 301,
     kMemory = 302,
-    kNotImplmented = 999,
+    kNotImplemented = 999,
     kMaxCode
   };
 
@@ -162,9 +162,9 @@ class Status final {
     return Code::kMemory == code_;
   }
 
-  // Returns true iff the status indicates a NotImplmented error.
-  [[nodiscard]] bool IsNotImplmented() const {
-    return Code::kNotImplmented == code_;
+  // Returns true iff the status indicates a NotImplemented error.
+  [[nodiscard]] bool IsNotImplemented() const {
+    return Code::kNotImplemented == code_;
   }
 
   // Return a combination of the error code name and message.
@@ -223,8 +223,8 @@ class Status final {
   static Status Memory(std::string_view msg) {
     return Status(Code::kMemory, msg);
   }
-  static Status NotImplmented(std::string_view msg) {
-    return Status(Code::kNotImplmented, msg);
+  static Status NotImplemented(std::string_view msg) {
+    return Status(Code::kNotImplemented, msg);
   }
 
   // Return a human-readable name of the 'code'.

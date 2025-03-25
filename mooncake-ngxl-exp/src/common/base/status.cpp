@@ -83,8 +83,8 @@ std::string_view Status::CodeToString(Status::Code code) {
       return "Clock";
     case Code::kMemory:
       return "Memory";
-    case Code::kNotImplmented:
-      return "NotImplmented";
+    case Code::kNotImplemented:
+      return "NotImplemented";
     default:
       LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
       return "UnknownCode";
