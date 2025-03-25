@@ -63,7 +63,7 @@ class Transport {
         WAITING,
         PENDING,
         INVALID,
-        CANNELED,
+        CANCELED,
         COMPLETED,
         TIMEOUT,
         FAILED
