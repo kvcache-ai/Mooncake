@@ -40,7 +40,7 @@ MemoryPool::MemoryPool(PoolId id,
 void MemoryPool::checkState() const {
   if (id_ < 0) {
     throw std::invalid_argument(
-        fmt::format("Invaild MemoryPool id {}", id_));
+        fmt::format("Invalid MemoryPool id {}", id_));
   }
 
   const size_t currAlloc = currAllocSize_;

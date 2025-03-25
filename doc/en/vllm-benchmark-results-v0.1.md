@@ -204,7 +204,7 @@ P99 ITL (ms):                            2536.78
 ==================================================
 ```
 
-## Short prefill length with varing request rates: input_len=256, qps = 2, 4, 6, 8
+## Short prefill length with varying request rates: input_len=256, qps = 2, 4, 6, 8
 
 ### Non-disaggregated
 ```

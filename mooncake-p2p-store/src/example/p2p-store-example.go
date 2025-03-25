@@ -164,20 +164,20 @@ func doInferencer(ctx context.Context, store *p2pstore.P2PStore, name string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("Object retrival started: name", name)
+	fmt.Println("Object retrieval started: name", name)
 	startTimestamp := time.Now()
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
 	sizeList := []uint64{uint64(fileSize)}
 	err = store.GetReplica(ctx, name, addrList, sizeList)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Object retrival failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Object retrieval failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	phaseOneTimestamp := time.Now()
 	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
 
-	fmt.Printf("Object retrival done: duration (ms) %d throughput (GB/s) %.2f\n",
+	fmt.Printf("Object retrieval done: duration (ms) %d throughput (GB/s) %.2f\n",
 		duration,
 		float64(fileSizeMB)/float64(duration))
 

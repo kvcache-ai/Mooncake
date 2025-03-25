@@ -53,7 +53,7 @@ pip3 install -e .
   - Use `http` as backend: `"http://192.168.0.137:8080/metadata"`
 - "protocol": The protocol to be used for data transmission. ("rdma/tcp")
 - "device_name": The device to be used for data transmission, it is required when "protocol" is set to "rdma". If multiple NIC devices are used, they can be separated by commas such as "erdma_0,erdma_1". Please note that there are no spaces between them.
-- "master_server_address": The IP address and the port of the master deamon process of MooncakeStore.
+- "master_server_address": The IP address and the port of the master daemon process of MooncakeStore.
 ### Prepare configuration file to Run Example over TCP
 
 - Prepare a _**mooncake.json**_ file for both Prefill and Decode instances

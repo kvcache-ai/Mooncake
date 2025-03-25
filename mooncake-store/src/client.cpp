@@ -158,7 +158,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                                              config, start_response);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            LOG(INFO) << "object_alredy_exists key=" << key;
+            LOG(INFO) << "object_already_exists key=" << key;
             return ErrorCode::OK;
         }
         return err;

@@ -407,7 +407,7 @@ void check_total_buffer_size() {
     uint64_t require_size = FLAGS_block_size * FLAGS_batch_size * FLAGS_threads;
     if (FLAGS_buffer_size < require_size) {
         FLAGS_buffer_size = require_size;
-        LOG(WARNING) << "Invalid flag: buffer size is samller than "
+        LOG(WARNING) << "Invalid flag: buffer size is smaller than "
                         "require_size, adjust to "
                      << require_size;
     }

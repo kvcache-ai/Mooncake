@@ -248,7 +248,7 @@
 
 /**
  * Similar to XLOG(...) except it logs a message if the condition predicate
- * evalutes to true or approximately every @param n invocations
+ * evaluates to true or approximately every @param n invocations
  *
  * The internal counter is process-global and threadsafe but, to
  * to avoid the performance degradation of atomic-rmw operations,
@@ -421,7 +421,7 @@
  * - We want to make sure this macro is safe to use even from inside static
  *   initialization code that runs before main.  We also want to make the log
  *   admittance check as cheap as possible, so that disabled debug logs have
- *   minimal overhead, and can be left in place even in performance senstive
+ *   minimal overhead, and can be left in place even in performance sensitive
  *   code.
  *
  *   In order to do this, we rely on zero-initialization of variables with
@@ -645,7 +645,7 @@
 #ifdef __INCLUDE_LEVEL__
 #define XLOG_IS_IN_HEADER_FILE bool(__INCLUDE_LEVEL__ > 0)
 #else
-// Without __INCLUDE_LEVEL__ we canot tell if we are in a header file or not,
+// Without __INCLUDE_LEVEL__ we cannot tell if we are in a header file or not,
 // and must pessimstically assume we are always in a header file.
 #define XLOG_IS_IN_HEADER_FILE true
 #endif
