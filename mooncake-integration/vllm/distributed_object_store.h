@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 
 #include <csignal>
 #include <mutex>
@@ -62,7 +63,15 @@ class DistributedObjectStore {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
+    int put_mem(const std::string &key, uint64_t mem_ptr, size_t mem_size);
+
+    int put_numpy(const std::string &key, pybind11::array_t<double> &value);
+
     int put(const std::string &key, const std::string &value);
+
+    int get_mem(const std::string &key, uint64_t mem_ptr);
+
+    int get_numpy(const std::string &key, pybind11::array_t<double> &value);
 
     pybind11::bytes get(const std::string &key);
 
