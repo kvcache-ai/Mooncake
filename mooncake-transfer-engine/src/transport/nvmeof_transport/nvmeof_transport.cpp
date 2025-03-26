@@ -50,7 +50,7 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
         case CUFILE_INVALID:
             return Transport::INVALID;
         case CUFILE_CANCELED:
-            return Transport::CANNELED;
+            return Transport::CANCELED;
         case CUFILE_COMPLETE:
             return Transport::COMPLETED;
         case CUFILE_TIMEOUT:
