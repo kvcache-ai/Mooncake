@@ -41,7 +41,7 @@ struct GlobalConfig {
     bool verbose = false;
     size_t slice_size = 65536;
     int retry_cnt = 8;
-    bool metacache = false;
+    bool metacache = true;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
