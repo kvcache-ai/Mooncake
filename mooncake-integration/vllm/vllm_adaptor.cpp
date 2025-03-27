@@ -218,6 +218,46 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     }
 }
 
+int VLLMAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer,
+                                 uintptr_t peer_buffer_address, size_t length, TransferOpcode opcode) {
+    Transport::SegmentHandle handle;
+    if (handle_map_.count(target_hostname)) {
+        handle = handle_map_[target_hostname];
+    } else {
+        handle = engine_->openSegment(target_hostname);
+        if (handle == (Transport::SegmentHandle)-1) return -1;
+        handle_map_[target_hostname] = handle;
+    }
+
+    auto batch_id = engine_->allocateBatchID(1);
+    TransferRequest entry;
+    if (opcode == TransferOpcode::WRITE) {
+        entry.opcode = TransferRequest::WRITE;
+    } else {
+        entry.opcode = TransferRequest::READ;
+    }
+    entry.length = length;
+    entry.source = (void *)buffer;
+    entry.target_id = handle;
+    entry.target_offset = peer_buffer_address;
+
+    Status s = engine_->submitTransfer(batch_id, {entry});
+    if (!s.ok()) return -1;
+
+    TransferStatus status;
+    while (true) {
+        Status s = engine_->getTransferStatus(batch_id, 0, status);
+        LOG_ASSERT(s.ok());
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            engine_->freeBatchID(batch_id);
+            return 0;
+        } else if (status.s == TransferStatusEnum::FAILED) {
+            engine_->freeBatchID(batch_id);
+            return -1;
+        }
+    }
+}
+
 int VLLMAdaptor::expRegisterMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, "cpu:0");
@@ -228,20 +268,36 @@ int VLLMAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
     return engine_->unregisterLocalMemory(buffer);
 }
 
+uintptr_t VLLMAdaptor::getFirstBufferAddress(const std::string &segment_name) {
+    Transport::SegmentHandle segment_id = engine_->openSegment(segment_name.c_str());
+    auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
+    return segment_desc->buffers[0].addr;
+}
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
-    py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
+    py::enum_<VLLMAdaptor::TransferOpcode> transfer_opcode(
+        m, "TransferOpcode", py::arithmetic());
+    transfer_opcode
+        .value("READ", VLLMAdaptor::TransferOpcode::READ)
+        .value("WRITE", VLLMAdaptor::TransferOpcode::WRITE)
+        .export_values();
+
+    auto adaptor_cls = py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
         .def(py::init<>())
         .def("initialize", &VLLMAdaptor::initialize)
         .def("initializeExt", &VLLMAdaptor::initializeExt)
         .def("allocateManagedBuffer", &VLLMAdaptor::allocateManagedBuffer)
         .def("freeManagedBuffer", &VLLMAdaptor::freeManagedBuffer)
+        .def("transferSyncExt", &VLLMAdaptor::transferSyncExt)
         .def("transferSync", &VLLMAdaptor::transferSync)
         .def("writeBytesToBuffer", &VLLMAdaptor::writeBytesToBuffer)
         .def("readBytesFromBuffer", &VLLMAdaptor::readBytesFromBuffer)
         .def("expRegisterMemory", &VLLMAdaptor::expRegisterMemory)
-        .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory);
+        .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory)
+        .def("getFirstBufferAddress", &VLLMAdaptor::getFirstBufferAddress);
+
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def("setup", &DistributedObjectStore::setup)
@@ -252,4 +308,6 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("isExist", &DistributedObjectStore::isExist)
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("getSize", &DistributedObjectStore::getSize);
+    
+    adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 }
