@@ -250,7 +250,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByName(const std::string &segment_name,
                                        bool force_update) {
-    if (!force_update) {
+    if (globalConfig().metacache && !force_update) {
         RWSpinlock::ReadGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end())
@@ -273,7 +273,7 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
 
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
-    if (force_update) {
+    if (!globalConfig().metacache || force_update) {
         RWSpinlock::WriteGuard guard(segment_lock_);
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         auto segment_desc =
