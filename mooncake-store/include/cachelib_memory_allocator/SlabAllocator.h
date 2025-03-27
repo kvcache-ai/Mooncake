@@ -44,7 +44,7 @@ class SlabAllocator {
                 void* slabMemoryStart,
                 size_t slabMemorySize);
 
-  // free up and unmap the mmaped memory if the allocator was created with
+  // free up and unmap the mapped memory if the allocator was created with
   // one.
   ~SlabAllocator();
 
@@ -90,7 +90,7 @@ class SlabAllocator {
   // invalid
   SlabHeader* getSlabHeader(const Slab* const slab) const noexcept;
 
-  // returns ture if ptr points to memory in the slab and the slab is a valid
+  // returns true if ptr points to memory in the slab and the slab is a valid
   // slab, false otherwise.
   bool isMemoryInSlab(const void* ptr, const Slab* slab) const noexcept;
 

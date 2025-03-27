@@ -1,18 +1,14 @@
 #pragma once
 
-#include <grpcpp/grpcpp.h>
-
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "master.grpc.pb.h"
+#include "master_client.h"
 #include "transfer_engine.h"
 #include "types.h"
 
 namespace mooncake {
-
-static const std::string kDefaultMasterAddress = "localhost:50051";
 
 /**
  * @brief Client for interacting with the mooncake distributed object store
@@ -157,7 +153,7 @@ class Client {
 
     // Core components
     std::unique_ptr<TransferEngine> transfer_engine_;
-    std::unique_ptr<mooncake_store::MasterService::Stub> master_stub_;
+    std::unique_ptr<MasterClient> master_client_;
 
     std::unordered_map<std::string, void*> mounted_segments_;
 

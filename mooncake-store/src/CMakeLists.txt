@@ -4,6 +4,7 @@ add_subdirectory(cachelib_memory_allocator)
 set(CACHE_ALLOCATOR_SOURCES
     allocator.cpp
     client.cpp
+    master_client.cpp
     master.pb.cpp
     master.grpc.pb.cpp
     master_service.cpp

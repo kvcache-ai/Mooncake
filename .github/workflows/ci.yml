@@ -34,7 +34,7 @@ jobs:
     - name: start-mooncake-master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mooncake_master --enable_gc=false &
+        mooncake_master &
       shell: bash
     - name: test
       run: |
@@ -49,3 +49,11 @@ jobs:
         cd mooncake-store/tests
         MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
       shell: bash
+  spell-check:
+    name: Spell Check with Typos
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Actions Repository
+      uses: actions/checkout@v4
+    - name: Spell Check Repo
+      uses: crate-ci/typos@v1.30.2

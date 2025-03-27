@@ -80,7 +80,7 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
 // add and remove LocalMemoryBufferMeta
 TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
-    segment_des->name = "test_localMemery";
+    segment_des->name = "test_localMemory";
     segment_des->protocol = "rdma";
     int re = metadata_client->addLocalSegment(
         LOCAL_SEGMENT_ID, "test_local_segment", std::move(segment_des));

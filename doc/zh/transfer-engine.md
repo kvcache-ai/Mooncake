@@ -270,7 +270,7 @@ int unregisterLocalMemory(void *addr);
 
 ### Segment 管理与元数据格式
 
-TranferEngine 提供 `openSegment` 函数，该函数获取一个 `SegmentHandle`，用于后续 `Transport` 的传输。
+TransferEngine 提供 `openSegment` 函数，该函数获取一个 `SegmentHandle`，用于后续 `Transport` 的传输。
 ```cpp
 SegmentHandle openSegment(const std::string& segment_name);
 ```

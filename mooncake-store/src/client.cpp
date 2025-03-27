@@ -18,34 +18,13 @@ namespace mooncake {
     return slice_size;
 }
 
-template <typename RequestType, typename ResponseType>
-ErrorCode LogAndCheckRpcStatus(grpc::Status status,
-                               const ResponseType& response,
-                               const std::string& rpc_name,
-                               const RequestType& request) {
-    VLOG(1) << rpc_name << ": rpc_request=" << request.ShortDebugString();
-
-    if (!status.ok()) {
-        LOG(ERROR) << rpc_name << ": rpc error, code: " << status.error_code()
-                   << ", message: " << status.error_message();
-        return ErrorCode::RPC_FAIL;
-    }
-
-    VLOG(1) << rpc_name << ": status_code=" << response.status_code();
-    return fromInt(response.status_code());
-}
-
-Client::Client() : transfer_engine_(nullptr), master_stub_(nullptr) {}
+Client::Client() : transfer_engine_(nullptr), master_client_(nullptr) {}
 
 Client::~Client() = default;
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
-    auto channel =
-        grpc::CreateChannel(master_addr, grpc::InsecureChannelCredentials());
-    master_stub_ = mooncake_store::MasterService::NewStub(channel);
-    CHECK(master_stub_) << "Failed to create master service stub";
-    LOG(INFO) << "master_service_stub_created=true master_addr=" << master_addr;
-    return ErrorCode::OK;
+    master_client_ = std::make_unique<MasterClient>();
+    return master_client_->Connect(master_addr);
 }
 
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
@@ -126,28 +105,7 @@ ErrorCode Client::Get(const std::string& object_key,
 
 ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) const {
-    // Get replica list from master
-    mooncake_store::GetReplicaListRequest request;
-    request.set_key(object_key);
-    grpc::ClientContext context;
-
-    grpc::Status status =
-        master_stub_->GetReplicaList(&context, request, &object_info);
-    ErrorCode err =
-        LogAndCheckRpcStatus(status, object_info, "GetReplicaList", request);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    VLOG(1) << "GetReplicaList: replica_count="
-            << object_info.replica_list_size();
-
-    if (object_info.replica_list().empty()) {
-        LOG(INFO) << "object_not_found key=" << object_key;
-        return ErrorCode::OBJECT_NOT_FOUND;
-    }
-
-    return ErrorCode::OK;
+    return master_client_->GetReplicaList(object_key, object_info);
 }
 
 ErrorCode Client::Get(const std::string& object_key,
@@ -186,43 +144,24 @@ ErrorCode Client::Get(const std::string& object_key,
 
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                       const ReplicateConfig& config) {
-    // Start put operation
-    mooncake_store::PutStartRequest start_request;
-    start_request.set_key(key);
-
+    // Prepare slice lengths
+    std::vector<size_t> slice_lengths;
     size_t slice_size = 0;
     for (size_t i = 0; i < slices.size(); ++i) {
-        start_request.add_slice_lengths(slices[i].size);
+        slice_lengths.push_back(slices[i].size);
         slice_size += slices[i].size;
     }
-    start_request.set_value_length(slice_size);
 
-    auto* replica_config = start_request.mutable_config();
-    replica_config->set_replica_num(config.replica_num);
-
+    // Start put operation
     mooncake_store::PutStartResponse start_response;
-    grpc::ClientContext start_context;
-
-    grpc::Status status =
-        master_stub_->PutStart(&start_context, start_request, &start_response);
-    ErrorCode err =
-        LogAndCheckRpcStatus(status, start_response, "PutStart", start_request);
+    ErrorCode err = master_client_->PutStart(key, slice_lengths, slice_size,
+                                             config, start_response);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            LOG(INFO) << "object_alredy_exists key=" << key;
+            LOG(INFO) << "object_already_exists key=" << key;
             return ErrorCode::OK;
         }
         return err;
-    }
-
-    VLOG(1) << "PutStart: replica_count=" << start_response.replica_list_size();
-
-    for (const auto& replica : start_response.replica_list()) {
-        for (const auto& handle : replica.handles()) {
-            VLOG(1) << "handle: buffer=" << handle.buffer()
-                    << " size=" << handle.size()
-                    << " segment_name=" << handle.segment_name();
-        }
     }
 
     // Transfer data using allocated handles from all replicas
@@ -235,50 +174,21 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         ErrorCode transfer_err = TransferWrite(handles, slices);
         if (transfer_err != ErrorCode::OK) {
             // Revoke put operation
-            mooncake_store::PutRevokeRequest revoke_request;
-            revoke_request.set_key(key);
-            mooncake_store::PutRevokeResponse revoke_response;
-            grpc::ClientContext revoke_context;
-            status = master_stub_->PutRevoke(&revoke_context, revoke_request,
-                                             &revoke_response);
-            LogAndCheckRpcStatus(status, revoke_response, "PutRevoke",
-                                 revoke_request);
-            VLOG(1) << "PutRevoke: status_code="
-                    << revoke_response.status_code();
+            auto revoke_err = master_client_->PutRevoke(key);
+            if (revoke_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err;
+            }
             return transfer_err;
         }
     }
 
     // End put operation
-    mooncake_store::PutEndRequest end_request;
-    end_request.set_key(key);
-
-    mooncake_store::PutEndResponse end_response;
-    grpc::ClientContext end_context;
-
-    status = master_stub_->PutEnd(&end_context, end_request, &end_response);
-    err = LogAndCheckRpcStatus(status, end_response, "PutEnd", end_request);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    VLOG(1) << "PutEnd: status_code=" << end_response.status_code();
-
-    return ErrorCode::OK;
+    return master_client_->PutEnd(key);
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) const {
-    mooncake_store::RemoveRequest request;
-    request.set_key(key);
-
-    mooncake_store::RemoveResponse response;
-    grpc::ClientContext context;
-
-    grpc::Status status = master_stub_->Remove(&context, request, &response);
-    ErrorCode err = LogAndCheckRpcStatus(status, response, "Remove", request);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return ErrorCode::OK;
+    return master_client_->Remove(key);
 }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
@@ -290,13 +200,6 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    mooncake_store::MountSegmentRequest request;
-    request.set_segment_name(segment_name);
-    request.set_buffer(reinterpret_cast<uint64_t>(buffer));
-    request.set_size(size);
-    mooncake_store::MountSegmentResponse response;
-    grpc::ClientContext context;
-
     int rc = transfer_engine_->registerLocalMemory((void*)buffer, size, "cpu:0",
                                                    true, true);
     if (rc != 0) {
@@ -305,10 +208,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    grpc::Status status =
-        master_stub_->MountSegment(&context, request, &response);
-    ErrorCode err =
-        LogAndCheckRpcStatus(status, response, "MountSegment", request);
+    ErrorCode err = master_client_->MountSegment(segment_name, buffer, size);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -317,14 +217,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
-    mooncake_store::UnmountSegmentRequest request;
-    request.set_segment_name(segment_name);
-    mooncake_store::UnmountSegmentResponse response;
-    grpc::ClientContext context;
-    grpc::Status status =
-        master_stub_->UnmountSegment(&context, request, &response);
-    ErrorCode err =
-        LogAndCheckRpcStatus(status, response, "UnmountSegment", request);
+    ErrorCode err = master_client_->UnmountSegment(segment_name);
     if (err != ErrorCode::OK) {
         return err;
     }

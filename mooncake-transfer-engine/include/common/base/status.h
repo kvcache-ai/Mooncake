@@ -162,8 +162,8 @@ class Status final {
     return Code::kMemory == code_;
   }
 
-  // Returns true iff the status indicates a NotImplmented error.
-  [[nodiscard]] bool IsNotImplmented() const {
+  // Returns true iff the status indicates a NotImplemented error.
+  [[nodiscard]] bool IsNotImplemented() const {
     return Code::kNotImplemented == code_;
   }
 
