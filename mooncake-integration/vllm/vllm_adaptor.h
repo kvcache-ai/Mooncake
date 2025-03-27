@@ -41,6 +41,11 @@ const static size_t kSlabSizeKB[] = {
 
 class VLLMAdaptor {
    public:
+    enum class TransferOpcode {
+        READ = 0,
+        WRITE = 1
+    };
+   public:
     VLLMAdaptor();
 
     ~VLLMAdaptor();
@@ -59,6 +64,11 @@ class VLLMAdaptor {
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length);
 
+    int transferSyncExt(const char *target_hostname, uintptr_t buffer,
+                        uintptr_t peer_buffer_address, size_t length, TransferOpcode opcode);
+
+    uintptr_t getFirstBufferAddress(const std::string &segment_name);
+    
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);
@@ -77,7 +87,6 @@ class VLLMAdaptor {
 
     // must be called before VLLMAdaptor::~VLLMAdaptor()
     int expUnregisterMemory(uintptr_t buffer_addr);
-
    private:
     char *allocateRawBuffer(size_t capacity);
 
