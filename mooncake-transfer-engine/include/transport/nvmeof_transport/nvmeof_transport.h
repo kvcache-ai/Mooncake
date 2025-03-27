@@ -37,6 +37,10 @@ class NVMeoFTransport : public Transport {
 
     BatchID allocateBatchID(size_t batch_size) override;
 
+    Status submitTransferTask(
+        const std::vector<TransferRequest *> &request_list,
+        const std::vector<TransferTask *> &task_list) override;
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries) override;
 
@@ -44,16 +48,11 @@ class NVMeoFTransport : public Transport {
                              TransferStatus &status) override;
 
     Status freeBatchID(BatchID batch_id) override;
+   
+   private:
+    void startTransfer(Slice *slice);
 
    private:
-    struct NVMeoFBatchDesc {
-        size_t desc_idx_;
-        std::vector<TransferStatus> transfer_status;
-        std::vector<std::pair<uint64_t, uint64_t>>
-            task_to_slices;  // task id -> (slice_begin, slice_num)
-        // unsigned nr_completed;
-    };
-
     struct pair_hash {
         template <class T1, class T2>
         std::size_t operator()(const std::pair<T1, T2> &pair) const {
@@ -85,16 +84,13 @@ class NVMeoFTransport : public Transport {
         return 0;
     }
 
-    void addSliceToTask(void *source_addr, uint64_t slice_len,
-                        uint64_t target_start, TransferRequest::OpCode op,
-                        TransferTask &task, const char *file_path);
-
     void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
                                uint64_t slice_len, uint64_t desc_id,
                                TransferRequest::OpCode op, CUfileHandle_t fh);
 
     const char *getName() const override { return "nvmeof"; }
 
+    std::unordered_map<BatchID, int> batch_to_cufile_desc_;
     std::unordered_map<std::pair<SegmentHandle, uint64_t>,
                        std::shared_ptr<CuFileContext>, pair_hash>
         segment_to_context_;

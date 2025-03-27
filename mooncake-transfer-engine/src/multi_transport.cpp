@@ -54,7 +54,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
         if (!batch_desc.task_list[task_id].is_finished) {
             LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
             return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");        }
+                "BatchID cannot be freed until all tasks are done");
+        }
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -88,6 +89,7 @@ Status MultiTransport::submitTransfer(
                 std::to_string(request.target_id));
         }
         auto &task = batch_desc.task_list[task_id];
+        task.batch_id = batch_id;
         ++task_id;
         submit_tasks[transport].request_list.push_back(
             (TransferRequest *)&request);
@@ -95,7 +97,7 @@ Status MultiTransport::submitTransfer(
     }
     for (auto &entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second.request_list,
-                                                  entry.second.task_list);
+                                                      entry.second.task_list);
         if (!status.ok()) {
             LOG(ERROR) << "MultiTransport: Failed to submit transfer task to "
                        << entry.first->getName();
@@ -106,7 +108,7 @@ Status MultiTransport::submitTransfer(
 }
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                      TransferStatus &status) {
+                                         TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {

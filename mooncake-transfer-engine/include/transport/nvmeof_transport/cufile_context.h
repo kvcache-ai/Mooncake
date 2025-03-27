@@ -66,8 +66,7 @@ class CuFileContext {
 
     /// Create a GDS segment from file name. Return NULL on error.
     explicit CuFileContext(const char *filename) {
-        int fd = open(filename, O_RDWR | O_DIRECT, 0664);
-        LOG(INFO) << "open " << filename << " get " << fd;
+        int fd = open(filename, O_RDWR | O_DIRECT);
         memset(&desc, 0, sizeof(desc));
         desc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         desc.handle.fd = fd;
