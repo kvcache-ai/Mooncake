@@ -6,17 +6,19 @@ from mooncake import mooncake_vllm_adaptor
 class TestVLLMAdaptorTransfer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.target_server_name = os.getenv("TARGET_SERVER_NAME", "127.0.0.1:12345")
-        cls.initiator_server_name = os.getenv("INITIATOR_SERVER_NAME", "127.0.0.1:12347")
-        cls.metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
-        cls.protocol = os.getenv("PROTOCOL", "tcp")        # "rdma" or "tcp"
-        cls.circle = int(os.getenv("CIRCLE", 1000))
+        cls.FLAGS = {
+            "target_server_name": "127.0.0.1:12345",
+            "initiator_server_name": "127.0.0.2:12347",
+            "metadata_server": "127.0.0.1:2379",
+            "protocol": "tcp",   # Protocol type: "rdma" or "tcp"
+            "circle": 1000,
+        }
 
         cls.adaptor = mooncake_vllm_adaptor()
         ret = cls.adaptor.initialize(
-            cls.initiator_server_name,
-            cls.metadata_server,
-            cls.protocol,
+            cls.FLAGS["initiator_server_name"],
+            cls.FLAGS["metadata_server"],
+            cls.FLAGS["protocol"],
             ""
         )
         if ret != 0:
@@ -30,39 +32,40 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             chars = string.ascii_letters + string.digits + string.punctuation
             return ''.join(random.choices(chars, k=length))
 
+        FLAGS = self.FLAGS
         adaptor = self.adaptor
-        circles = self.circle
+        circles = FLAGS["circle"]
 
-        src_addr = adaptor.getFirstBufferAddress(self.initiator_server_name)
-        dst_addr = adaptor.getFirstBufferAddress(self.target_server_name)
+        src_addr = adaptor.getFirstBufferAddress(FLAGS["initiator_server_name"])
+        dst_addr = adaptor.getFirstBufferAddress(FLAGS["target_server_name"])
 
         for i in range(circles):
             str_len = random.randint(16, 256)
             src_data = generate_random_string(str_len).encode('utf-8')
             data_len = len(src_data)
 
-            #Write to local buffer
+            #Step 1: Write to local buffer
             result = adaptor.writeBytesToBuffer(src_addr, src_data, data_len)
             self.assertEqual(result, 0, f"[{i}] writeBytesToBuffer failed")
 
-            #Write to the remote end
+            #Step 2: Write to the remote end
             result = adaptor.transferSyncExt(
-                self.target_server_name, src_addr, dst_addr, data_len, adaptor.TransferOpcode.WRITE
+                FLAGS["target_server_name"], src_addr, dst_addr, data_len, adaptor.TransferOpcode.WRITE
             )
             self.assertEqual(result, 0, f"[{i}] WRITE transferSyncExt failed")
 
-            #Clear the local buffer
+            #Step 3: Clear the local buffer
             clear_data = bytes([0] * data_len)
             result = adaptor.writeBytesToBuffer(src_addr, clear_data, data_len)
             self.assertEqual(result, 0, f"[{i}] Clear buffer failed")
 
-            #Read it back from the remote end
+            #Step 4: Read it back from the remote end
             result = adaptor.transferSyncExt(
-                self.target_server_name, src_addr, dst_addr, data_len, adaptor.TransferOpcode.READ
+                FLAGS["target_server_name"], src_addr, dst_addr, data_len, adaptor.TransferOpcode.READ
             )
             self.assertEqual(result, 0, f"[{i}] READ transferSyncExt failed")
 
-            #Verify data consistency
+            #Step 5: Verify data consistency
             read_back = adaptor.readBytesFromBuffer(src_addr, data_len)
             self.assertEqual(read_back, src_data, f"[{i}] Data mismatch")
 
