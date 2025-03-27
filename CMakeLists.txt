@@ -84,6 +84,7 @@ if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
 endif()
 
 add_subdirectory(mooncake-transfer-engine)
+add_subdirectory(mooncake-ngxl-exp)
 
 include_directories(mooncake-transfer-engine/include)
 
