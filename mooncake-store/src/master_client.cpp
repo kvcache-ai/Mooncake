@@ -10,6 +10,7 @@
 
 #include "rpc_service.h"
 #include "types.h"
+#include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
 
@@ -20,16 +21,23 @@ MasterClient::MasterClient() = default;
 MasterClient::~MasterClient() = default;
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
+    ScopedVLogTimer timer(1, "MasterClient::Connect");
+    timer.LogRequest("master_addr=", master_addr);
+
     auto result = coro::syncAwait(client_.connect(master_addr));
     if (result.val() != 0) {
         LOG(ERROR) << "Failed to connect to master: " << result.message();
         return ErrorCode::INTERNAL_ERROR;
     }
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
 
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
+    timer.LogRequest("object_key=", object_key);
+
     auto request_result =
         client_.send_request<&WrappedMasterService::GetReplicaList>(object_key);
     std::optional<GetReplicaListResponse> result = coro::syncAwait(
@@ -43,14 +51,21 @@ GetReplicaListResponse MasterClient::GetReplicaList(
             co_return result->result();
         }());
     if (!result) {
-        return GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+        auto response = GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 PutStartResponse MasterClient::PutStart(
     const std::string& key, const std::vector<size_t>& slice_lengths,
     size_t value_length, const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::PutStart");
+    timer.LogRequest("key=", key, ", value_length=", value_length,
+                     ", slice_count=", slice_lengths.size());
+
     // Convert size_t to uint64_t for RPC
     std::vector<uint64_t> rpc_slice_lengths;
     rpc_slice_lengths.reserve(slice_lengths.size());
@@ -71,12 +86,18 @@ PutStartResponse MasterClient::PutStart(
             co_return result->result();
         }());
     if (!result) {
-        return PutStartResponse{{}, ErrorCode::RPC_FAIL};
+        auto response = PutStartResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 PutEndResponse MasterClient::PutEnd(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::PutEnd");
+    timer.LogRequest("key=", key);
+
     auto request_result =
         client_.send_request<&WrappedMasterService::PutEnd>(key);
     std::optional<PutEndResponse> result =
@@ -90,12 +111,18 @@ PutEndResponse MasterClient::PutEnd(const std::string& key) {
             co_return result->result();
         }());
     if (!result) {
-        return PutEndResponse{ErrorCode::RPC_FAIL};
+        auto response = PutEndResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
+    timer.LogRequest("key=", key);
+
     auto request_result =
         client_.send_request<&WrappedMasterService::PutRevoke>(key);
     std::optional<PutRevokeResponse> result =
@@ -109,12 +136,18 @@ PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
             co_return result->result();
         }());
     if (!result) {
-        return PutRevokeResponse{ErrorCode::RPC_FAIL};
+        auto response = PutRevokeResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 RemoveResponse MasterClient::Remove(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::Remove");
+    timer.LogRequest("key=", key);
+
     auto request_result =
         client_.send_request<&WrappedMasterService::Remove>(key);
     std::optional<RemoveResponse> result =
@@ -127,14 +160,21 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
             co_return result->result();
         }());
     if (!result) {
-        return RemoveResponse{ErrorCode::RPC_FAIL};
+        auto response = RemoveResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {
+    ScopedVLogTimer timer(1, "MasterClient::MountSegment");
+    timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
+                     ", size=", size);
+
     std::optional<MountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
             Lazy<async_rpc_result<MountSegmentResponse>> handler =
@@ -150,13 +190,19 @@ MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
         }());
     if (!result) {
         LOG(ERROR) << "Failed to mount segment due to rpc error";
-        return MountSegmentResponse{ErrorCode::RPC_FAIL};
+        auto response = MountSegmentResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 
 UnmountSegmentResponse MasterClient::UnmountSegment(
     const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
+    timer.LogRequest("segment_name=", segment_name);
+
     auto request_result =
         client_.send_request<&WrappedMasterService::UnmountSegment>(
             segment_name);
@@ -171,8 +217,11 @@ UnmountSegmentResponse MasterClient::UnmountSegment(
             co_return result->result();
         }());
     if (!result) {
-        return UnmountSegmentResponse{ErrorCode::RPC_FAIL};
+        auto response = UnmountSegmentResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
     }
+    timer.LogResponseJson(result.value());
     return result.value();
 }
 

@@ -29,7 +29,7 @@ class ClientIntegrationTest : public ::testing::Test {
         google::InitGoogleLogging("ClientIntegrationTest");
 
         // Set VLOG level to 1 for detailed logs
-        // google::SetVLOGLevel("*", 1);
+        google::SetVLOGLevel("*", 1);
         FLAGS_logtostderr = 1;
 
         // Override flags from environment variables if present
