@@ -58,7 +58,7 @@ jobs:
         python -m build
         pip install dist/*.whl
       shell: bash
-    - name: mooncake transfer_engine pyhton test
+    - name: mooncake transfer_engine python test
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         cd mooncake-wheel/tests
