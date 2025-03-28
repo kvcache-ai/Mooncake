@@ -1,13 +1,20 @@
 #include "master_client.h"
 
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
 #include <string>
 #include <vector>
+#include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
+#include "types.h"
 
 namespace mooncake {
+
+using namespace coro_rpc;
+using namespace async_simple::coro;
 
 MasterClient::MasterClient() = default;
 MasterClient::~MasterClient() = default;
@@ -23,8 +30,21 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
 
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
-    auto result = coro::syncAwait(
-        client_.call<&WrappedMasterService::GetReplicaList>(object_key));
+    auto request_result =
+        client_.send_request<&WrappedMasterService::GetReplicaList>(object_key);
+    std::optional<GetReplicaListResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<GetReplicaListResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to get replica list: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
@@ -38,43 +58,121 @@ PutStartResponse MasterClient::PutStart(
         rpc_slice_lengths.push_back(static_cast<uint64_t>(length));
     }
 
-    auto result = coro::syncAwait(client_.call<&WrappedMasterService::PutStart>(
-        key, static_cast<uint64_t>(value_length), rpc_slice_lengths, config));
+    auto request_result = client_.send_request<&WrappedMasterService::PutStart>(
+        key, static_cast<uint64_t>(value_length), rpc_slice_lengths, config);
+    std::optional<PutStartResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutStartResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to start put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return PutStartResponse{{}, ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
 PutEndResponse MasterClient::PutEnd(const std::string& key) {
-    auto result =
-        coro::syncAwait(client_.call<&WrappedMasterService::PutEnd>(key));
+    auto request_result =
+        client_.send_request<&WrappedMasterService::PutEnd>(key);
+    std::optional<PutEndResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutEndResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to end put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return PutEndResponse{ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
 PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
-    auto result =
-        coro::syncAwait(client_.call<&WrappedMasterService::PutRevoke>(key));
+    auto request_result =
+        client_.send_request<&WrappedMasterService::PutRevoke>(key);
+    std::optional<PutRevokeResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutRevokeResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to revoke put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return PutRevokeResponse{ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
 RemoveResponse MasterClient::Remove(const std::string& key) {
-    auto result =
-        coro::syncAwait(client_.call<&WrappedMasterService::Remove>(key));
+    auto request_result =
+        client_.send_request<&WrappedMasterService::Remove>(key);
+    std::optional<RemoveResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<RemoveResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to remove object: " << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return RemoveResponse{ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
 MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {
-    auto result =
-        coro::syncAwait(client_.call<&WrappedMasterService::MountSegment>(
-            reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(size),
-            segment_name));
+    std::optional<MountSegmentResponse> result =
+        syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
+            Lazy<async_rpc_result<MountSegmentResponse>> handler =
+                co_await client_
+                    .send_request<&WrappedMasterService::MountSegment>(
+                        reinterpret_cast<uint64_t>(buffer),
+                        static_cast<uint64_t>(size), segment_name);
+            async_rpc_result<MountSegmentResponse> result = co_await handler;
+            if (!result) {
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        LOG(ERROR) << "Failed to mount segment due to rpc error";
+        return MountSegmentResponse{ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
 UnmountSegmentResponse MasterClient::UnmountSegment(
     const std::string& segment_name) {
-    auto result = coro::syncAwait(
-        client_.call<&WrappedMasterService::UnmountSegment>(segment_name));
+    auto request_result =
+        client_.send_request<&WrappedMasterService::UnmountSegment>(
+            segment_name);
+    std::optional<UnmountSegmentResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<UnmountSegmentResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to unmount segment: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        return UnmountSegmentResponse{ErrorCode::RPC_FAIL};
+    }
     return result.value();
 }
 
