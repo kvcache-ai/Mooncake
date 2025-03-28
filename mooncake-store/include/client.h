@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "master_client.h"
+#include "rpc_service.h"
 #include "transfer_engine.h"
 #include "types.h"
 
@@ -46,7 +47,7 @@ class Client {
      * 1. Query object information
      * 2. Transfer data based on the information
      */
-    using ObjectInfo = mooncake_store::GetReplicaListResponse;
+    using ObjectInfo = GetReplicaListResponse;
 
     /**
      * @brief Gets object metadata without transferring data
@@ -142,13 +143,13 @@ class Client {
                                  const std::string& protocol,
                                  void** protocol_args);
     ErrorCode TransferData(
-        const std::vector<mooncake_store::BufHandle>& handles,
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code) const;
     ErrorCode TransferWrite(
-        const std::vector<mooncake_store::BufHandle>& handles,
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices) const;
     ErrorCode TransferRead(
-        const std::vector<mooncake_store::BufHandle>& handles,
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices) const;
 
     // Core components

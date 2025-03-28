@@ -3,28 +3,16 @@
 
 #include <glog/logging.h>
 
+#include <memory>
+
 namespace mooncake {
 
-BufHandle::BufHandle(std::shared_ptr<BufferAllocator> allocator,
-                     std::string segment_name, uint64_t size, void* buffer)
-    : segment_id(0),
-      segment_name(segment_name),
-      size(size),
-      status(BufStatus::INIT),
-      buffer(buffer),
-      allocator_(allocator) {
-    VLOG(1) << "buf_handle_created segment_id=" << segment_id
-            << " size=" << size << " buffer_address=" << buffer;
-}
-
-bool BufHandle::isAllocatorValid() const { return !allocator_.expired(); }
-
-BufHandle::~BufHandle() {
+AllocatedBuffer::~AllocatedBuffer() {
     auto alloc = allocator_.lock();
     if (alloc) {
         alloc->deallocate(this);
-        VLOG(1) << "buf_handle_deallocated segment_id=" << segment_id
-                << " size=" << size;
+        VLOG(1) << "buf_handle_deallocated segment_name=" << segment_name_
+                << " size=" << size_;
     } else {
         LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
     }
@@ -65,7 +53,7 @@ BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
 
 BufferAllocator::~BufferAllocator() = default;
 
-std::shared_ptr<BufHandle> BufferAllocator::allocate(size_t size) {
+std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
@@ -88,18 +76,18 @@ std::shared_ptr<BufHandle> BufferAllocator::allocate(size_t size) {
             << " segment=" << segment_name_ << " address=" << buffer;
     // Create and return a new BufHandle.
     cur_size_.fetch_add(size);
-    return std::make_shared<BufHandle>(shared_from_this(), segment_name_, size,
-                                       buffer);
+    return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
+                                             buffer, size);
 }
 
-void BufferAllocator::deallocate(BufHandle* handle) {
+void BufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(handle->buffer);
+        memory_allocator_->free(handle->buffer_ptr_);
         handle->status = BufStatus::UNREGISTERED;
-        cur_size_.fetch_sub(handle->size);
-        VLOG(1) << "deallocation_succeeded address=" << handle->buffer
-                << " size=" << handle->size << " segment=" << segment_name_;
+        cur_size_.fetch_sub(handle->size_);
+        VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
+                << " size=" << handle->size_ << " segment=" << segment_name_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "deallocation_exception error=" << e.what();
     } catch (...) {

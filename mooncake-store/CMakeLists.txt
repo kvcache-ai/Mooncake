@@ -1,9 +1,5 @@
 project(MooncakeStore)
 
-execute_process(
-    COMMAND make -f ${CMAKE_CURRENT_SOURCE_DIR}/Makefile
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
 
 # Add include directories
 include_directories(
