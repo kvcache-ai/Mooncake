@@ -106,13 +106,13 @@ ErrorCode Client::Get(const std::string& object_key,
 
 ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) const {
-    auto reponse = master_client_->GetReplicaList(object_key);
+    auto response = master_client_->GetReplicaList(object_key);
     // copy vec
-    object_info.replica_list.resize(reponse.replica_list.size());
-    for (size_t i = 0; i < reponse.replica_list.size(); ++i) {
-        object_info.replica_list[i] = reponse.replica_list[i];
+    object_info.replica_list.resize(response.replica_list.size());
+    for (size_t i = 0; i < response.replica_list.size(); ++i) {
+        object_info.replica_list[i] = response.replica_list[i];
     }
-    return reponse.error_code;
+    return response.error_code;
 }
 
 ErrorCode Client::Get(const std::string& object_key,
