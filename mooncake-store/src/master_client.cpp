@@ -70,11 +70,11 @@ PutStartResponse MasterClient::PutStart(
     std::vector<uint64_t> rpc_slice_lengths;
     rpc_slice_lengths.reserve(slice_lengths.size());
     for (const auto& length : slice_lengths) {
-        rpc_slice_lengths.push_back(static_cast<uint64_t>(length));
+        rpc_slice_lengths.push_back(length);
     }
 
     auto request_result = client_.send_request<&WrappedMasterService::PutStart>(
-        key, static_cast<uint64_t>(value_length), rpc_slice_lengths, config);
+        key, value_length, rpc_slice_lengths, config);
     std::optional<PutStartResponse> result =
         coro::syncAwait([&]() -> coro::Lazy<std::optional<PutStartResponse>> {
             auto result = co_await co_await request_result;
