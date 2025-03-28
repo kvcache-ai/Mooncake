@@ -13,7 +13,7 @@ setup(
     version="0.1.0",
     packages=find_packages(),
     package_data={"mooncake": [
-        "mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so",
+        "*.so",
         "mooncake_master",
         "lib_so/libetcd-cpp-api.so",
     ]},
