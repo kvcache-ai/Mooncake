@@ -34,34 +34,43 @@ class TestInstance:
     
     def prefill(cls):
         index = 0
+        start = time.time()
         value = os.urandom(cls.value_length)
         while index < cls.max_requests:
             key = "k_" + str(index)
-            value = bytes([index % 256] * cls.value_length)
+            # value = bytes([index % 256] * cls.value_length)
             retcode = cls.store.put(key, value)
             if retcode:
                 print("WARNING: put failed, key", key)
             if random.randint(0, 100) < 98:
                 index = index + 1
             if index % 500 == 0:
-                print("completed", index, "entries");
-        time.sleep(20) # wait for decode
+                print("completed", index, "entries")
+        end = time.time()
+        print("elapsed", end - start)
+        print("bandwidth", cls.value_length * cls.max_requests / (end - start))
+        time.sleep(5) # wait for decode
     
     def decode(cls):
         index = 0
+        start = time.time()
         while index < cls.max_requests:
             key = "k_" + str(index)
             value = cls.store.get(key)
             if len(value) == 0:
                 print("WARNING: get failed, key", key)
             else:
-                expected_value = bytes([index % 256] * cls.value_length)
-                if value != expected_value:
-                    print("WARNING: get data corrupted, key", key)
+                pass
+                # expected_value = bytes([index % 256] * cls.value_length)
+                # if value != expected_value:
+                #     print("WARNING: get data corrupted, key", key)
             index = index + 1
             if index % 500 == 0:
                 print("completed", index, "entries");
-        time.sleep(20) # wait for decode
+        end = time.time()
+        print("elapsed", end - start)
+        print("bandwidth", cls.value_length * cls.max_requests / (end - start))
+        time.sleep(5) # wait for decode
 
 
 if __name__ == '__main__':

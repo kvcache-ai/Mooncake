@@ -29,10 +29,10 @@ if (USE_HTTP)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
 target_link_libraries(
-    transfer_engine
-    PUBLIC
-    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
-    )
+  transfer_engine
+  PUBLIC
+  base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread
+)
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
