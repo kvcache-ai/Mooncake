@@ -115,6 +115,7 @@ static int getRandomAvailablePort(int min_port = 12300, int max_port = 14300) {
 
 DistributedObjectStore::DistributedObjectStore() {
     // Register this instance with the global tracker
+    easylog::set_min_severity(easylog::Severity::WARN);
     ResourceTracker::getInstance().registerInstance(this);
 }
 
