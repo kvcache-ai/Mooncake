@@ -115,6 +115,7 @@ static int getRandomAvailablePort(int min_port = 12300, int max_port = 14300) {
 
 DistributedObjectStore::DistributedObjectStore() {
     // Register this instance with the global tracker
+    easylog::set_min_severity(easylog::Severity::WARN);
     ResourceTracker::getInstance().registerInstance(this);
 }
 
@@ -230,10 +231,10 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (!object_info.replica_list_size()) return -1;
-    auto &replica = object_info.replica_list(0);
-    for (auto &handle : replica.handles()) {
-        auto chunk_size = handle.size();
+    if (object_info.replica_list.empty()) return -1;
+    auto &replica = object_info.replica_list[0];
+    for (auto &handle : replica.buffer_descriptors) {
+        auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
         if (!ptr) return 1;
@@ -373,10 +374,10 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (object_info.replica_list_size() > 0) {
-        auto &replica = object_info.replica_list(0);
-        for (auto &handle : replica.handles()) {
-            total_size += handle.size();
+    if (!object_info.replica_list.empty()) {
+        auto &replica = object_info.replica_list[0];
+        for (auto &handle : replica.buffer_descriptors) {
+            total_size += handle.size_;
         }
     } else {
         LOG(ERROR) << "Internal error: object_info.replica_list_size() is 0";
