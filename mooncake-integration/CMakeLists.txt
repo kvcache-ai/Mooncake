@@ -28,3 +28,14 @@ target_link_libraries(mooncake_vllm_adaptor PUBLIC
 )
 message("${PYTHON_SYS_PATH}")
 install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
+
+pybind11_add_module(mooncake_sglang_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+    sglang/sglang_adaptor.cpp 
+)
+target_link_libraries(mooncake_sglang_adaptor PUBLIC 
+    transfer_engine 
+    glog 
+    gflags 
+)
+message("${PYTHON_SYS_PATH}")
+install(TARGETS mooncake_sglang_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
