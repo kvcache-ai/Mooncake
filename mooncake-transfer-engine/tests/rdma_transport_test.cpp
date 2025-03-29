@@ -269,13 +269,14 @@ int initiator() {
     void *addr = nullptr;
 #ifdef USE_CUDA
     addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size,
-                                         FLAGS_use_vram ? "cuda:0" : "cpu:0");
-    LOG_ASSERT(!rc);
+    auto status = engine->registerLocalMemory(addr, ram_buffer_size,
+                                              FLAGS_use_vram ?
+                                                "cuda:0" : "cpu:0");
+    LOG_ASSERT(status.ok());
 #else
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "*");
-    LOG_ASSERT(!rc);
+    auto status = engine->registerLocalMemory(addr, ram_buffer_size, "*");
+    LOG_ASSERT(status.ok());
 #endif
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
@@ -311,8 +312,8 @@ int target() {
 
     void *addr = nullptr;
     addr = allocateMemoryPool(ram_buffer_size, 0);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
-    LOG_ASSERT(!rc);
+    auto status = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+    LOG_ASSERT(status.ok());
 
     while (true) sleep(1);
 

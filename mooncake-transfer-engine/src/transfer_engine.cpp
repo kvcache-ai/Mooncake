@@ -18,10 +18,10 @@
 
 namespace mooncake {
 
-int TransferEngine::init(const std::string &metadata_conn_string,
-                         const std::string &local_server_name,
-                         const std::string &ip_or_host_name,
-                         uint64_t rpc_port) {
+Status TransferEngine::init(const std::string &metadata_conn_string,
+                            const std::string &local_server_name,
+                            const std::string &ip_or_host_name,
+                            uint64_t rpc_port) {
     local_server_name_ = local_server_name;
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
@@ -30,8 +30,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = ip_or_host_name;
     desc.rpc_port = rpc_port;
-    int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
-    if (ret) return ret;
+    auto status = metadata_->addRpcMetaEntry(local_server_name_, desc);
+    if (!status.ok()) return status;
 
     if (auto_discover_) {
         // discover topology automatically
@@ -46,15 +46,14 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         // TODO: install other transports automatically
     }
 
-    return 0;
+    return Status::OK();
 }
 
-int TransferEngine::freeEngine() {
+void TransferEngine::freeEngine() {
     if (metadata_) {
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();
     }
-    return 0;
 }
 
 // Only for testing
@@ -84,9 +83,9 @@ Transport *TransferEngine::installTransport(const std::string &proto,
     // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
     // added to ensure thread safety.
     for (auto &entry : local_memory_regions_) {
-        int ret = transport->registerLocalMemory(
+        auto status = transport->registerLocalMemory(
             entry.addr, entry.length, entry.location, entry.remote_accessible);
-        if (ret < 0) return nullptr;
+        if (!status.ok()) return nullptr;
     }
     return transport;
 }
@@ -116,31 +115,32 @@ bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
     return false;
 }
 
-int TransferEngine::registerLocalMemory(void *addr, size_t length,
+Status TransferEngine::registerLocalMemory(void *addr, size_t length,
                                         const std::string &location,
                                         bool remote_accessible,
                                         bool update_metadata) {
     if (checkOverlap(addr, length)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
-        return ERR_ADDRESS_OVERLAPPED;
+        return Status::AddressOverlapped(
+            "Transfer Engine does not support overlapped memory region");
     }
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemory(
+        auto status = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
-        if (ret < 0) return ret;
+        if (!status.ok()) return status;
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     local_memory_regions_.push_back(
         {addr, length, location, remote_accessible});
-    return 0;
+    return Status::OK();
 }
 
-int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
+Status TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
     for (auto &transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret) return ret;
+        auto status = transport->unregisterLocalMemory(addr, update_metadata);
+        if (!status.ok()) return status;
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -151,21 +151,22 @@ int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
             break;
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int TransferEngine::registerLocalMemoryBatch(
+Status TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list, const std::string &location) {
     for (auto &buffer : buffer_list) {
         if (checkOverlap(buffer.addr, buffer.length)) {
             LOG(ERROR)
                 << "Transfer Engine does not support overlapped memory region";
-            return ERR_ADDRESS_OVERLAPPED;
+            return Status::AddressOverlapped(
+                "Transfer Engine does not support overlapped memory region");
         }
     }
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret < 0) return ret;
+        auto status = transport->registerLocalMemoryBatch(buffer_list, location);
+        if (!status.ok()) return status;
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -173,14 +174,14 @@ int TransferEngine::registerLocalMemoryBatch(
         local_memory_regions_.push_back(
             {buffer.addr, buffer.length, location, true});
     }
-    return 0;
+    return Status::OK();
 }
 
-int TransferEngine::unregisterLocalMemoryBatch(
+Status TransferEngine::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret < 0) return ret;
+        auto status = transport->unregisterLocalMemoryBatch(addr_list);
+        if (!status.ok()) return status;
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -193,6 +194,6 @@ int TransferEngine::unregisterLocalMemoryBatch(
             }
         }
     }
-    return 0;
+    return Status::OK();
 }
 }  // namespace mooncake

@@ -28,6 +28,7 @@
 #include <unordered_map>
 
 #include "common.h"
+#include "common/base/status.h"
 #include "topology.h"
 
 namespace mooncake {
@@ -93,9 +94,9 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
-    int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
+    Status updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
-    int updateSegmentDesc(const std::string &segment_name,
+    Status updateSegmentDesc(const std::string &segment_name,
                           const SegmentDesc &desc);
 
     std::shared_ptr<SegmentDesc> getSegmentDesc(
@@ -105,30 +106,32 @@ class TransferMetadata {
 
     int syncSegmentCache(const std::string &segment_name);
 
-    int removeSegmentDesc(const std::string &segment_name);
+    Status removeSegmentDesc(const std::string &segment_name);
 
-    int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
-                             bool update_metadata);
+    Status addLocalMemoryBuffer(const BufferDesc &buffer_desc,
+                                bool update_metadata);
 
-    int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+    Status removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
-    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
-                        std::shared_ptr<SegmentDesc> &&desc);
+    Status addLocalSegment(SegmentID segment_id,
+                           const std::string &segment_name,
+                           std::shared_ptr<SegmentDesc> &&desc);
 
-    int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    Status addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
-    int removeRpcMetaEntry(const std::string &server_name);
+    Status removeRpcMetaEntry(const std::string &server_name);
 
-    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    Status getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
-    using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
-                                                 HandShakeDesc &local_desc)>;
-    int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                             uint16_t listen_port);
+    using OnReceiveHandShake =
+        std::function<Status(const HandShakeDesc &peer_desc,
+                             HandShakeDesc &local_desc)>;
+    Status startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
+                                uint16_t listen_port);
 
-    int sendHandshake(const std::string &peer_server_name,
+    Status sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 

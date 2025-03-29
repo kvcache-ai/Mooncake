@@ -51,11 +51,11 @@ Status Transport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
-int Transport::install(std::string &local_server_name,
-                       std::shared_ptr<TransferMetadata> meta,
-                       std::shared_ptr<Topology> topo) {
+Status Transport::install(std::string &local_server_name,
+                          std::shared_ptr<TransferMetadata> meta,
+                          std::shared_ptr<Topology> topo) {
     local_server_name_ = local_server_name;
     metadata_ = meta;
-    return 0;
+    return Status::OK();
 }
 }  // namespace mooncake

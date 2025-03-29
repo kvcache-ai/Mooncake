@@ -401,8 +401,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
-    virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port) {
+    virtual Status startDaemon(OnReceiveCallBack on_recv_callback,
+                               uint16_t listen_port) {
         sockaddr_in bind_address;
         int on = 1;
         memset(&bind_address, 0, sizeof(sockaddr_in));
@@ -413,7 +413,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin socket() create failed");
         }
 
         struct timeval timeout;
@@ -423,13 +424,15 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                        sizeof(timeout))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
             closeListen();
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO) failed");
         }
 
         if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
             closeListen();
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: setsockopt(SO_REUSEADDR) failed");
         }
 
         if (bind(listen_fd_, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
@@ -437,13 +440,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             PLOG(ERROR) << "SocketHandShakePlugin: bind (port " << listen_port
                         << ")";
             closeListen();
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: bind port " +
+                std::to_string(listen_port) + " failed");
         }
 
         if (listen(listen_fd_, 5)) {
             PLOG(ERROR) << "SocketHandShakePlugin: listen()";
             closeListen();
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: listen() failed");
         }
 
         listener_running_ = true;
@@ -507,11 +513,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return;
         });
 
-        return 0;
+        return Status::OK();
     }
 
-    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
-                     const Json::Value &local, Json::Value &peer) {
+    virtual Status send(std::string ip_or_host_name, uint16_t rpc_port,
+                        const Json::Value &local, Json::Value &peer) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -526,27 +532,30 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                    "server "
                 << ip_or_host_name << ":" << rpc_port
                 << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
+            return Status::Dns(
+                "SocketHandShakePlugin: failed to get IP address of peer "
+                "server " + ip_or_host_name + " : " + std::to_string(rpc_port) +
+                " ,check DNS and /etc/hosts, or use IPv4 address instead");
         }
 
-        int ret = 0;
+        Status status;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSend(rp, local, peer);
-            if (ret == 0) {
+            status = doSend(rp, local, peer);
+            if (status.ok()) {
                 freeaddrinfo(result);
-                return 0;
+                return status;
             }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
+            if (status.IsMalformedJson()) {
+                return status;
             }
         }
 
         freeaddrinfo(result);
-        return ret;
+        return status;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local,
-               Json::Value &peer) {
+    Status doSend(struct addrinfo *addr, const Json::Value &local,
+                  Json::Value &peer) {
         if (globalConfig().verbose)
             LOG(INFO) << "SocketHandShakePlugin: connecting "
                       << getNetworkAddress(addr->ai_addr);
@@ -556,12 +565,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (conn_fd == -1) {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin socket() create failed");
         }
         if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
             close(conn_fd);
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: setsockopt(SO_REUSEADDR) failed");
         }
 
         struct timeval timeout;
@@ -571,14 +582,15 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                        sizeof(timeout))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
             close(conn_fd);
-            return ERR_SOCKET;
+            return Status::Socket(
+                "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO) failed");
         }
 
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
             PLOG(ERROR) << "SocketHandShakePlugin: connect()"
                         << getNetworkAddress(addr->ai_addr);
             close(conn_fd);
-            return ERR_SOCKET;
+            return Status::Socket("SocketHandShakePlugin: connect() failed");
         }
 
         int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
@@ -587,7 +599,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 << "SocketHandShakePlugin: failed to send handshake message: "
                    "malformed json format, check tcp connection";
             close(conn_fd);
-            return ret;
+            return Status::MalformedJson(
+                "SocketHandShakePlugin: ailed to send handshake message: "
+                "malformed json format, check tcp connection");
         }
 
         Json::Reader reader;
@@ -596,11 +610,13 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                           "message: "
                           "malformed json format, check tcp connection";
             close(conn_fd);
-            return ERR_MALFORMED_JSON;
+            return Status::MalformedJson(
+                "SocketHandShakePlugin: ailed to receive handshake message: "
+                "malformed json format, check tcp connection");
         }
 
         close(conn_fd);
-        return 0;
+        return Status::OK();
     }
 
     std::atomic<bool> listener_running_;

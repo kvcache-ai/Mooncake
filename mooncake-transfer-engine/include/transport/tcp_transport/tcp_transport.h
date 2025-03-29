@@ -57,23 +57,24 @@ class TcpTransport : public Transport {
                              TransferStatus &status) override;
 
    private:
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo);
+    Status install(std::string &local_server_name,
+                   std::shared_ptr<TransferMetadata> meta,
+                   std::shared_ptr<Topology> topo);
 
-    int allocateLocalSegmentID();
+    Status allocateLocalSegmentID();
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata);
+    Status registerLocalMemory(void *addr, size_t length,
+                               const std::string &location,
+                               bool remote_accessible,
+                               bool update_metadata);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = false);
+    Status unregisterLocalMemory(void *addr, bool update_metadata = false);
 
-    int registerLocalMemoryBatch(
+    Status registerLocalMemoryBatch(
         const std::vector<Transport::BufferEntry> &buffer_list,
         const std::string &location);
 
-    int unregisterLocalMemoryBatch(
+    Status unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
     void worker();

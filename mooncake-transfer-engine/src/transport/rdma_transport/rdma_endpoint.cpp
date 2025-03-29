@@ -36,12 +36,13 @@ RdmaEndPoint::~RdmaEndPoint() {
     if (!qp_list_.empty()) deconstruct();
 }
 
-int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
+Status RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
                             size_t max_inline_bytes) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "Endpoint has already been constructed";
-        return ERR_ENDPOINT;
+        return Status::Endpoint(
+            "RdmaEndPoint Endpoint has already been constructed");
     }
 
     qp_list_.resize(num_qp_list);
@@ -51,7 +52,9 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     wr_depth_list_ = new volatile int[num_qp_list];
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
-        return ERR_MEMORY;
+        return Status::Memory(
+            "RdmaEndPoint failed to allocate memory for work request depth "
+            "list");
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
         wr_depth_list_[i] = 0;
@@ -67,12 +70,13 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         qp_list_[i] = ibv_create_qp(context_.pd(), &attr);
         if (!qp_list_[i]) {
             PLOG(ERROR) << "Failed to create QP";
-            return ERR_ENDPOINT;
+            return Status::Endpoint(
+                "RdmaEndPoint failed to create QP");
         }
     }
 
     status_.store(UNCONNECTED, std::memory_order_relaxed);
-    return 0;
+    return Status::OK();
 }
 
 int RdmaEndPoint::deconstruct() {
@@ -102,11 +106,11 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     peer_nic_path_ = peer_nic_path;
 }
 
-int RdmaEndPoint::setupConnectionsByActive() {
+Status RdmaEndPoint::setupConnectionsByActive() {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(INFO) << "Connection has been established";
-        return 0;
+        return Status::OK();
     }
     HandShakeDesc local_desc, peer_desc;
     local_desc.local_nic_path = context_.nicPath();
@@ -117,17 +121,19 @@ int RdmaEndPoint::setupConnectionsByActive() {
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
         LOG(ERROR) << "Parse peer nic path failed: " << peer_nic_path_;
-        return ERR_INVALID_ARGUMENT;
+        return Status::InvalidArgument(
+            "RdmaEndPoint parse peer nic path failed: " + peer_nic_path_);
     }
 
-    int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
+    auto status = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
-    if (rc) return rc;
+    if (!status.ok()) return status;
 
     if (peer_desc.local_nic_path != peer_nic_path_ ||
         peer_desc.peer_nic_path != local_desc.local_nic_path) {
         LOG(ERROR) << "Invalid argument: received packet mismatch";
-        return ERR_REJECT_HANDSHAKE;
+        return Status::RejectHandshake("RdmaEndPoint invalid argument: "
+            " received packet mismatch");
     }
 
     auto segment_desc =
@@ -139,11 +145,12 @@ int RdmaEndPoint::setupConnectionsByActive() {
     }
     LOG(ERROR) << "Peer NIC " << peer_nic_name << " not found in "
                << peer_server_name;
-    return ERR_DEVICE_NOT_FOUND;
+    return Status::DeviceNotFound("RdmaEndPoint peer nic " + peer_nic_name +
+        " not found in " + peer_server_name);
 }
 
-int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                            HandShakeDesc &local_desc) {
+Status RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
+                                               HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(WARNING) << "Re-establish connection: " << toString();
@@ -154,7 +161,9 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     if (peer_desc.peer_nic_path != context_.nicPath()) {
         local_desc.reply_msg = "Invalid argument: peer nic path inconsistency";
         LOG(ERROR) << local_desc.reply_msg;
-        return ERR_REJECT_HANDSHAKE;
+        return Status::RejectHandshake("RdmaEndPoint setup connection by"
+            " passive: peer_nic_path " + peer_desc.peer_nic_path +
+            " context nic_path " + context_.nicPath());
     }
 
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
@@ -162,7 +171,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     if (peer_server_name.empty() || peer_nic_name.empty()) {
         local_desc.reply_msg = "Parse peer nic path failed: " + peer_nic_path_;
         LOG(ERROR) << local_desc.reply_msg;
-        return ERR_INVALID_ARGUMENT;
+        return Status::InvalidArgument(
+            "RdmaEndPoint parse peer nic path failed: " + peer_nic_path_);
     }
 
     local_desc.local_nic_path = context_.nicPath();
@@ -180,7 +190,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     local_desc.reply_msg =
         "Peer nic not found in that server: " + peer_nic_path_;
     LOG(ERROR) << local_desc.reply_msg;
-    return ERR_DEVICE_NOT_FOUND;
+    return Status::DeviceNotFound(
+        "RdmaEndPoint peer nic not found in server: " + peer_nic_path_);
 }
 
 void RdmaEndPoint::disconnect() {
@@ -221,7 +232,7 @@ bool RdmaEndPoint::hasOutstandingSlice() const {
     return false;
 }
 
-int RdmaEndPoint::submitPostSend(
+Status RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
@@ -230,7 +241,7 @@ int RdmaEndPoint::submitPostSend(
                             (int)slice_list.size());
     wr_count =
         std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
-    if (wr_count <= 0) return 0;
+    if (wr_count <= 0) return Status::OK();
 
     ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
     ibv_sge sge_list[wr_count];
@@ -277,7 +288,7 @@ int RdmaEndPoint::submitPostSend(
         }
     }
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);
-    return 0;
+    return Status::OK();
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() const {
@@ -287,7 +298,7 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     return ret;
 }
 
-int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
+Status RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
                                     std::string *reply_msg) {
@@ -297,24 +308,27 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
             "MC_MAX_EP_PER_CTX";
         LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
-        return ERR_INVALID_ARGUMENT;
+        return Status::InvalidArgument(
+            "RdmaEndPoint QP count mismatch in peer and local endpoints, check "
+            "MC_MAX_EP_PER_CTX");
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = doSetupConnection(qp_index, peer_gid, peer_lid,
-                                    peer_qp_num_list[qp_index], reply_msg);
-        if (ret) return ret;
+        auto status = doSetupConnection(qp_index, peer_gid, peer_lid,
+                                        peer_qp_num_list[qp_index], reply_msg);
+        if (!status.ok()) return status;
     }
 
     status_.store(CONNECTED, std::memory_order_relaxed);
-    return 0;
+    return Status::OK();
 }
 
-int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
-                                    uint16_t peer_lid, uint32_t peer_qp_num,
-                                    std::string *reply_msg) {
+Status RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
+                                       uint16_t peer_lid, uint32_t peer_qp_num,
+                                       std::string *reply_msg) {
     if (qp_index < 0 || qp_index > (int)qp_list_.size())
-        return ERR_INVALID_ARGUMENT;
+        return Status::InvalidArgument(
+            "RdmaEndPoint QP index is not valid");
     auto &qp = qp_list_[qp_index];
 
     // Any state -> RESET
@@ -326,7 +340,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         std::string message = "Failed to modify QP to RESET";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+        return Status::Endpoint("RdmaEndPoint failed to modify QP to RESET");
     }
 
     // RESET -> INIT
@@ -344,7 +358,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
             "Failed to modify QP to INIT, check local context port num";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+        return Status::Endpoint(
+            "RdmaEndPoint failed to modify QP to INIT, check local context "
+            "port num");
     }
 
     // INIT -> RTR
@@ -384,7 +400,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+        return Status::Endpoint(
+            "RdmaEndPoint failed to modify QP to RTR, check mtu, gid, "
+            "peer lid, peer qp num");
     }
 
     // RTR -> RTS
@@ -403,9 +421,9 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         std::string message = "Failed to modify QP to RTS";
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+        return Status::Endpoint("RdmaEndPoint failed to modify QP to RTS");
     }
 
-    return 0;
+    return Status::OK();
 }
 }  // namespace mooncake

@@ -28,6 +28,7 @@
 #include <unordered_map>
 
 #include "common.h"
+#include "common/base/status.h"
 
 namespace mooncake {
 struct TopologyEntry {
@@ -74,7 +75,8 @@ class Topology {
 
     Json::Value toJson() const;
 
-    int selectDevice(const std::string storage_type, int retry_count = 0);
+    Status selectDevice(const std::string storage_type, int *device_id,
+                        int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 

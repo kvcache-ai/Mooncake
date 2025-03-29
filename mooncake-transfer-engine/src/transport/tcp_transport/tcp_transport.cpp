@@ -201,42 +201,44 @@ TcpTransport::~TcpTransport() {
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
-int TcpTransport::install(std::string &local_server_name,
-                          std::shared_ptr<TransferMetadata> meta,
-                          std::shared_ptr<Topology> topo) {
+Status TcpTransport::install(std::string &local_server_name,
+                             std::shared_ptr<TransferMetadata> meta,
+                             std::shared_ptr<Topology> topo) {
     metadata_ = meta;
     local_server_name_ = local_server_name;
 
-    int ret = allocateLocalSegmentID();
-    if (ret) {
+    Status status = allocateLocalSegmentID();
+    if (!status.ok()) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
-        return -1;
+        return status;
     }
 
-    ret = metadata_->updateLocalSegmentDesc();
-    if (ret) {
+    status = metadata_->updateLocalSegmentDesc();
+    if (!status.ok()) {
         LOG(ERROR) << "TcpTransport: cannot publish segments, "
                       "check the availability of metadata storage";
-        return -1;
+        return status;
     }
 
     context_ = new TcpContext(meta->localRpcMeta().rpc_port);
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
-    return 0;
+    return Status::OK();
 }
 
-int TcpTransport::allocateLocalSegmentID() {
+Status TcpTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    if (!desc) {
+        return Status::Memory("TcpTransport failed to allocate SegmentDesc");
+    }
     desc->name = local_server_name_;
     desc->protocol = "tcp";
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
-    return 0;
+    return Status::OK();
 }
 
-int TcpTransport::registerLocalMemory(void *addr, size_t length,
+Status TcpTransport::registerLocalMemory(void *addr, size_t length,
                                       const std::string &location,
                                       bool remote_accessible,
                                       bool update_metadata) {
@@ -248,11 +250,11 @@ int TcpTransport::registerLocalMemory(void *addr, size_t length,
     return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
 }
 
-int TcpTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+Status TcpTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
-int TcpTransport::registerLocalMemoryBatch(
+Status TcpTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
     for (auto &buffer : buffer_list)
@@ -260,7 +262,7 @@ int TcpTransport::registerLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-int TcpTransport::unregisterLocalMemoryBatch(
+Status TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
     return metadata_->updateLocalSegmentDesc();
@@ -369,7 +371,8 @@ void TcpTransport::startTransfer(Slice *slice) {
         }
 
         TransferMetadata::RpcMetaDesc meta_entry;
-        if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
+        auto status = metadata_->getRpcMetaEntry(desc->name, meta_entry);
+        if (!status.ok()) {
             slice->markFailed();
             return;
         }

@@ -87,9 +87,9 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
     // TODO: remove `false` in the feature, it's for keep same API in vllm.
     engine_ = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_hostname);
-    int ret = engine_->init(conn_string, local_hostname,
-                            hostname_port.first.c_str(), hostname_port.second);
-    if (ret) return -1;
+    auto s = engine_->init(conn_string, local_hostname,
+                           hostname_port.first.c_str(), hostname_port.second);
+    if (!s.ok()) return -1;
 
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {
@@ -116,8 +116,8 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
 char *VLLMAdaptor::allocateRawBuffer(size_t capacity) {
     auto buffer = malloc(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
-    if (ret) {
+    auto s = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    if (!s.ok()) {
         free(buffer);
         return nullptr;
     }
@@ -201,12 +201,12 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
 
-    Status s = engine_->submitTransfer(batch_id, {entry});
+    auto s = engine_->submitTransfer(batch_id, {entry});
     if (!s.ok()) return -1;
 
     TransferStatus status;
     while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
+        auto s = engine_->getTransferStatus(batch_id, 0, status);
         LOG_ASSERT(s.ok());
         if (status.s == TransferStatusEnum::COMPLETED) {
             engine_->freeBatchID(batch_id);
@@ -260,12 +260,16 @@ int VLLMAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer,
 
 int VLLMAdaptor::expRegisterMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    auto s = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    if (!s.ok()) return -1;
+    return 0;
 }
 
 int VLLMAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    return engine_->unregisterLocalMemory(buffer);
+    auto s = engine_->unregisterLocalMemory(buffer);
+    if (!s.ok()) return -1;
+    return 0;
 }
 
 uintptr_t VLLMAdaptor::getFirstBufferAddress(const std::string &segment_name) {

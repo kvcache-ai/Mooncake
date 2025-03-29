@@ -79,8 +79,8 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
 
 TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
 
-int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
-                                        const SegmentDesc &desc) {
+Status TransferMetadata::updateSegmentDesc(const std::string &segment_name,
+                                           const SegmentDesc &desc) {
     Json::Value segmentJSON;
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
@@ -125,25 +125,33 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata: Unsupported segment descriptor for register, "
+            " name " + desc.name + " protocol " + desc.protocol +
+            " segment_name " + segment_name);
     }
 
     if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to register segment descriptor, name "
                    << desc.name << " protocol " << desc.protocol;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata: Failed to register segment descriptor, name "
+            + desc.name + " protocol " + desc.protocol + " segment_name "
+            + segment_name);
     }
 
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
+Status TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
         LOG(ERROR) << "Failed to unregister segment descriptor, name "
                    << segment_name;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata: Failed to unregister segment descriptor, name "
+            + segment_name);
     }
-    return 0;
+    return Status::OK();
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
@@ -307,22 +315,22 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     return id;
 }
 
-int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
+Status TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
     RWSpinlock::ReadGuard guard(segment_lock_);
     auto desc = segment_id_to_desc_map_[segment_id];
     return this->updateSegmentDesc(desc->name, *desc);
 }
 
-int TransferMetadata::addLocalSegment(SegmentID segment_id,
+Status TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
+Status TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -333,10 +341,10 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         segment_desc->buffers.push_back(buffer_desc);
     }
     if (update_metadata) return updateLocalSegmentDesc();
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::removeLocalMemoryBuffer(void *addr,
+Status TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
     bool addr_exist = false;
     {
@@ -356,87 +364,102 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     }
     if (addr_exist) {
         if (update_metadata) return updateLocalSegmentDesc();
-        return 0;
+        return Status::OK();
     }
-    return ERR_ADDRESS_NOT_REGISTERED;
+    return Status::AddressNotRegistered(
+        "TransferMetadata address not registered");
 }
 
-int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
+Status TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
     if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to set location of " << server_name;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata failed to set location of " + server_name);
     }
     local_rpc_meta_ = desc;
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
+Status TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
         LOG(ERROR) << "Failed to remove location of " << server_name;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata failed to remove location of " + server_name);
     }
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
-                                      RpcMetaDesc &desc) {
+Status TransferMetadata::getRpcMetaEntry(const std::string &server_name,
+                                         RpcMetaDesc &desc) {
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
             desc = rpc_meta_map_[server_name];
-            return 0;
+            return Status::OK();
         }
     }
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     Json::Value rpcMetaJSON;
     if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to find location of " << server_name;
-        return ERR_METADATA;
+        return Status::Metadata("TransferMetadata failed to find location of " +
+                                server_name);
     }
     desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
     desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
     rpc_meta_map_[server_name] = desc;
-    return 0;
+    return Status::OK();
 }
 
-int TransferMetadata::startHandshakeDaemon(
+Status TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port) {
     return handshake_plugin_->startDaemon(
         [on_receive_handshake](const Json::Value &peer,
-                               Json::Value &local) -> int {
+                               Json::Value &local) -> Status {
             HandShakeDesc local_desc, peer_desc;
             TransferHandshakeUtil::decode(peer, peer_desc);
-            int ret = on_receive_handshake(peer_desc, local_desc);
-            if (ret) return ret;
+            Status status = on_receive_handshake(peer_desc, local_desc);
+            if (!status.ok()) return status;
             local = TransferHandshakeUtil::encode(local_desc);
-            return 0;
+            return Status::OK();
         },
         listen_port);
 }
 
-int TransferMetadata::sendHandshake(const std::string &peer_server_name,
-                                    const HandShakeDesc &local_desc,
-                                    HandShakeDesc &peer_desc) {
+Status TransferMetadata::sendHandshake(const std::string &peer_server_name,
+                                       const HandShakeDesc &local_desc,
+                                       HandShakeDesc &peer_desc) {
     RpcMetaDesc peer_location;
-    if (getRpcMetaEntry(peer_server_name, peer_location)) {
-        return ERR_METADATA;
+    Status status = getRpcMetaEntry(peer_server_name, peer_location);
+    if (!status.ok()) {
+        LOG(ERROR) << "TransferMetadata handshake failed to get rpc meta entry "
+                   << " peer_server_name: "
+                   << peer_server_name;
+        return status;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
+    status = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
-    if (ret) return ret;
+    if (!status.ok()) {
+        LOG(ERROR) << "TransferMetadata handshake failed to send handshake "
+                   << " peer_server_name: "
+                   << peer_server_name;
+        return status;
+    }
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;
-        return ERR_METADATA;
+        return Status::Metadata(
+            "TransferMetadata handshake rejected by " + peer_server_name +
+            " : " + peer_desc.reply_msg);
     }
-    return 0;
+    return Status::OK();
 }
 
 }  // namespace mooncake

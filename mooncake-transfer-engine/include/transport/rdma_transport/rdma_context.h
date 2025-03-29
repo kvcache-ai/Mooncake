@@ -53,18 +53,18 @@ class RdmaContext {
 
     ~RdmaContext();
 
-    int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
-                  uint8_t port = 1, int gid_index = 0, size_t max_cqe = 4096,
-                  int max_endpoints = 256);
+    Status construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
+                     uint8_t port = 1, int gid_index = 0, size_t max_cqe = 4096,
+                     int max_endpoints = 256);
 
    private:
     int deconstruct();
 
    public:
     // Memory Region Management
-    int registerMemoryRegion(void *addr, size_t length, int access);
+    Status registerMemoryRegion(void *addr, size_t length, int access);
 
-    int unregisterMemoryRegion(void *addr);
+    Status unregisterMemoryRegion(void *addr);
 
     uint32_t rkey(void *addr);
 
@@ -128,17 +128,17 @@ class RdmaContext {
     int socketId();
 
    private:
-    int openRdmaDevice(const std::string &device_name, uint8_t port,
-                       int gid_index);
+    Status openRdmaDevice(const std::string &device_name, uint8_t port,
+                          int gid_index);
 
-    int joinNonblockingPollList(int event_fd, int data_fd);
+    Status joinNonblockingPollList(int event_fd, int data_fd);
 
     int getBestGidIndex(const std::string &device_name,
                         struct ibv_context *context, ibv_port_attr &port_attr,
                         uint8_t port);
 
    public:
-    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    Status submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
    private:
     const std::string device_name_;

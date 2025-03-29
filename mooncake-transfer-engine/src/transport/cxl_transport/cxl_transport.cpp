@@ -43,30 +43,30 @@ CxlTransport::BatchID CxlTransport::allocateBatchID(size_t batch_size) {
 
 Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                     TransferStatus &status) {
-    return 0;
+    return Status::OK();
 }
 
 Status CxlTransport::submitTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest> &entries) {
-    return 0;
+    return Status::OK();
 }
 
-int CxlTransport::freeBatchID(BatchID batch_id) { return 0; }
+Status CxlTransport::freeBatchID(BatchID batch_id) { return Status::OK(); }
 
-int CxlTransport::install(std::string &local_server_name,
-                          std::shared_ptr<TransferMetadata> meta,
-                          std::shared_ptr<Topology> topo) {
-    return 0;
+Status CxlTransport::install(std::string &local_server_name,
+                             std::shared_ptr<TransferMetadata> meta,
+                             std::shared_ptr<Topology> topo) {
+    return Status::OK();
 }
 
-int CxlTransport::registerLocalMemory(void *addr, size_t length,
-                                      const string &location,
-                                      bool remote_accessible,
-                                      bool update_metadata) {
-    return 0;
+Status CxlTransport::registerLocalMemory(void *addr, size_t length,
+                                         const string &location,
+                                         bool remote_accessible,
+                                         bool update_metadata) {
+    return Status::OK();
 }
 
-int CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return 0;
+Status CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+    return Status::OK();
 }
 }  // namespace mooncake
