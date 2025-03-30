@@ -178,6 +178,11 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (verbose_env) {
         config.verbose = true;
     }
+
+    const char *disable_metacache = std::getenv("MC_DISABLE_METACACHE");
+    if (disable_metacache) {
+        config.metacache = false;
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
