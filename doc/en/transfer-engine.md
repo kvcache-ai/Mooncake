@@ -460,4 +460,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
 - `MC_VERBOSE` If this option is set, more detailed logs will be output during runtime
+- `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
 
