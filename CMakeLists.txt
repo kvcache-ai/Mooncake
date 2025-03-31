@@ -17,10 +17,6 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0")
 
 set(CMAKE_BUILD_TYPE "Release")
 
-#set(CMAKE_C_FLAGS "-O0 -g -Wall")
-#set(CMAKE_CXX_FLAGS "-O0 -g -Wall")
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
-
 # Necessary if you are using Alibaba Cloud eRDMA
 add_definitions(-DCONFIG_ERDMA)
 
@@ -83,8 +79,10 @@ if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
   message(FATAL_ERROR "Please enable at least one metadata type: USE_ETCD, USE_REDIS, or USE_HTTP")
 endif()
 
-add_subdirectory(mooncake-transfer-engine)
+add_subdirectory(mooncake-common)
+include_directories(mooncake-common/etcd)
 
+add_subdirectory(mooncake-transfer-engine)
 include_directories(mooncake-transfer-engine/include)
 
 if (WITH_STORE)
@@ -93,7 +91,6 @@ if (WITH_STORE)
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()
-
 
 add_subdirectory(mooncake-integration)
 

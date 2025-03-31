@@ -27,10 +27,6 @@ sudo apt-get install -y build-essential \
                         libpython3-dev \
                         libboost-all-dev \
                         libssl-dev \
-                        libgrpc-dev \
-                        libgrpc++-dev \
-                        libprotobuf-dev \
-                        protobuf-compiler-grpc \
                         pybind11-dev \
                         libcurl4-openssl-dev \
                         libhiredis-dev \
