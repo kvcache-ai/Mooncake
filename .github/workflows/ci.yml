@@ -54,6 +54,7 @@ jobs:
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         cp build/mooncake-integration/*.so mooncake-wheel/mooncake
         cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
+        cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
         cd mooncake-wheel
         python -m build
         pip install dist/*.whl
