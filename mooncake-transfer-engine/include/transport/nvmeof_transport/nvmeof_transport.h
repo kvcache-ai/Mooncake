@@ -62,26 +62,27 @@ class NVMeoFTransport : public Transport {
         }
     };
 
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo) override;
+    Status install(std::string &local_server_name,
+                   std::shared_ptr<TransferMetadata> meta,
+                   std::shared_ptr<Topology> topo) override;
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata) override;
+    Status registerLocalMemory(void *addr, size_t length,
+                               const std::string &location,
+                               bool remote_accessible,
+                               bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr,
-                              bool update_metadata = false) override;
+    Status unregisterLocalMemory(void *addr,
+                                 bool update_metadata = false) override;
 
-    int registerLocalMemoryBatch(
+    Status registerLocalMemoryBatch(
         const std::vector<Transport::BufferEntry> &buffer_list,
         const std::string &location) override {
-        return 0;
+        return Status::OK();
     }
 
-    int unregisterLocalMemoryBatch(
+    Status unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override {
-        return 0;
+        return Status::OK();
     }
 
     void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,

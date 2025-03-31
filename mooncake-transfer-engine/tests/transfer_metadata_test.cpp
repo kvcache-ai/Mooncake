@@ -66,9 +66,9 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
     segment_des->protocol = "rdma";
     TransferMetadata::SegmentID segment_id = 1111111;
     std::string segment_name = "test_segment";
-    int re = metadata_client->addLocalSegment(segment_id, segment_name,
-                                              std::move(segment_des));
-    ASSERT_EQ(re, 0);
+    auto status = metadata_client->addLocalSegment(segment_id, segment_name,
+                                                   std::move(segment_des));
+    ASSERT_TRUE(status.ok());
     auto des = metadata_client->getSegmentDescByName(segment_name);
     ASSERT_EQ(des, segment_des);
     des = metadata_client->getSegmentDescByID(segment_id, false);
@@ -82,24 +82,24 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_des->name = "test_localMemory";
     segment_des->protocol = "rdma";
-    int re = metadata_client->addLocalSegment(
+    auto s = metadata_client->addLocalSegment(
         LOCAL_SEGMENT_ID, "test_local_segment", std::move(segment_des));
-    ASSERT_EQ(re, 0);
+    ASSERT_TRUE(s.ok());
     uint64_t addr = 0;
     for (int i = 0; i < 10; ++i) {
         TransferMetadata::BufferDesc buffer_des;
         buffer_des.addr = addr + i * 2048;
         buffer_des.length = 1024;
-        re = metadata_client->addLocalMemoryBuffer(buffer_des, false);
-        ASSERT_EQ(re, 0);
+        auto s = metadata_client->addLocalMemoryBuffer(buffer_des, false);
+        ASSERT_TRUE(s.ok());
     }
     addr = 1000;
-    re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
-    ASSERT_EQ(re, ERR_ADDRESS_NOT_REGISTERED);
+    s = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+    ASSERT_TRUE(s.IsAddressNotRegistered());
     for (int i = 9; i > 0; --i) {
         addr = i * 2048;
-        re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
-        ASSERT_EQ(re, 0);
+        auto s = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+        ASSERT_TRUE(s.ok());
     }
 }
 
@@ -109,14 +109,14 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = hostname_port.first.c_str();
     desc.rpc_port = hostname_port.second;
-    int re = metadata_client->addRpcMetaEntry("test_server", desc);
-    ASSERT_EQ(re, 0);
+    auto s = metadata_client->addRpcMetaEntry("test_server", desc);
+    ASSERT_TRUE(s.ok());
     TransferMetadata::RpcMetaDesc desc1;
-    re = metadata_client->getRpcMetaEntry("test_server", desc1);
+    s = metadata_client->getRpcMetaEntry("test_server", desc1);
     ASSERT_EQ(desc.ip_or_host_name, desc1.ip_or_host_name);
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
-    re = metadata_client->removeRpcMetaEntry("test_server");
-    ASSERT_EQ(re, 0);
+    s = metadata_client->removeRpcMetaEntry("test_server");
+    ASSERT_TRUE(s.ok());
 }
 
 }  // namespace mooncake

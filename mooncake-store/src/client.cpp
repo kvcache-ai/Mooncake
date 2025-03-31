@@ -37,9 +37,9 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     CHECK(transfer_engine_) << "Failed to create transfer engine";
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_->init(metadata_connstring, local_hostname,
+    auto s = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
-    CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
+    CHECK_EQ(s, Status::OK()) << "Failed to initialize transfer engine";
     Transport* transport = nullptr;
     if (protocol == "rdma") {
         LOG(INFO) << "transport_type=rdma";
@@ -213,11 +213,13 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size, "cpu:0",
-                                                   true, true);
-    if (rc != 0) {
+    auto s = transfer_engine_->registerLocalMemory((void*)buffer,
+                                                        size, "cpu:0",
+                                                        true, true);
+    if (!s.ok()) {
         LOG(ERROR) << "register_local_memory_failed segment_name="
-                   << segment_name;
+                   << segment_name << " : "
+                   << s.message();
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -235,11 +237,11 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     if (err != ErrorCode::OK) {
         return err;
     }
-    int rc = transfer_engine_->unregisterLocalMemory(addr);
-    if (rc != 0) {
+    auto s = transfer_engine_->unregisterLocalMemory(addr);
+    if (!s.ok()) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
-                   << rc;
+                   << s.message();
         return ErrorCode::INVALID_PARAMS;
     }
     mounted_segments_.erase(segment_name);
@@ -250,16 +252,16 @@ ErrorCode Client::RegisterLocalMemory(void* addr, size_t length,
                                       const std::string& location,
                                       bool remote_accessible,
                                       bool update_metadata) {
-    if (this->transfer_engine_->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata) != 0) {
+    if (!(this->transfer_engine_->registerLocalMemory(
+            addr, length, location, remote_accessible, update_metadata)).ok()) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
 }
 
 ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
+    if (!(this->transfer_engine_->unregisterLocalMemory(
+            addr, update_metadata)).ok()) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;

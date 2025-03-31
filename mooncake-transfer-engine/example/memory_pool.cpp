@@ -93,9 +93,9 @@ int target() {
     void *addr[2] = {nullptr};
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(dram_buffer_size, i);
-        int rc = engine->registerLocalMemory(addr[i], dram_buffer_size,
+        auto s = engine->registerLocalMemory(addr[i], dram_buffer_size,
                                              "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        LOG_ASSERT(s.ok());
     }
 
     while (true) sleep(1);

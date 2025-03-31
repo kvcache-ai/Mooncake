@@ -307,9 +307,9 @@ int initiator() {
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+        auto s = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        LOG_ASSERT(s.ok());
     }
 #endif
 
@@ -387,9 +387,9 @@ int target() {
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
         memset(addr[i], 'x', FLAGS_buffer_size);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+        auto s = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        LOG_ASSERT(s.ok());
     }
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;

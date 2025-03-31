@@ -28,9 +28,9 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        uint64_t rpc_port,
                                        int auto_discover) {
     TransferEngine *native = new TransferEngine(auto_discover);
-    int ret = native->init(metadata_conn_string, local_server_name,
+    Status s = native->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
-    if (ret) {
+    if (!s.ok()) {
         delete native;
         return nullptr;
     }
@@ -73,13 +73,16 @@ int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
                         const char *location, int remote_accessible) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->registerLocalMemory(addr, length, location,
-                                       remote_accessible, true);
+    Status s =
+        native->registerLocalMemory(addr, length, location,
+                                    remote_accessible, true);
+    return (int)s.code();
 }
 
 int unregisterLocalMemory(transfer_engine_t engine, void *addr) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->unregisterLocalMemory(addr);
+    Status s = native->unregisterLocalMemory(addr);
+    return (int)s.code();
 }
 
 int registerLocalMemoryBatch(transfer_engine_t engine,
@@ -93,7 +96,8 @@ int registerLocalMemoryBatch(transfer_engine_t engine,
         entry.length = buffer_list[i].length;
         native_buffer_list.push_back(entry);
     }
-    return native->registerLocalMemoryBatch(native_buffer_list, location);
+    Status s = native->registerLocalMemoryBatch(native_buffer_list, location);
+    return (int)s.code();
 }
 
 int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
@@ -102,7 +106,8 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
     std::vector<void *> native_addr_list;
     for (size_t i = 0; i < addr_len; ++i)
         native_addr_list.push_back(addr_list[i]);
-    return native->unregisterLocalMemoryBatch(native_addr_list);
+    Status s = native->unregisterLocalMemoryBatch(native_addr_list);
+    return (int)s.code();
 }
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {

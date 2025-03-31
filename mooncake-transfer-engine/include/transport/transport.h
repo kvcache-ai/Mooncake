@@ -181,9 +181,9 @@ class Transport {
     };
 
    protected:
-    virtual int install(std::string &local_server_name,
-                        std::shared_ptr<TransferMetadata> meta,
-                        std::shared_ptr<Topology> topo);
+    virtual Status install(std::string &local_server_name,
+                           std::shared_ptr<TransferMetadata> meta,
+                           std::shared_ptr<Topology> topo);
 
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
@@ -192,19 +192,19 @@ class Transport {
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
    private:
-    virtual int registerLocalMemory(void *addr, size_t length,
-                                    const std::string &location,
-                                    bool remote_accessible,
-                                    bool update_metadata = true) = 0;
+    virtual Status registerLocalMemory(void *addr, size_t length,
+                                       const std::string &location,
+                                       bool remote_accessible,
+                                       bool update_metadata = true) = 0;
 
-    virtual int unregisterLocalMemory(void *addr,
-                                      bool update_metadata = true) = 0;
+    virtual Status unregisterLocalMemory(void *addr,
+                                         bool update_metadata = true) = 0;
 
-    virtual int registerLocalMemoryBatch(
+    virtual Status registerLocalMemoryBatch(
         const std::vector<BufferEntry> &buffer_list,
         const std::string &location) = 0;
 
-    virtual int unregisterLocalMemoryBatch(
+    virtual Status unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) = 0;
 
     virtual const char *getName() const = 0;

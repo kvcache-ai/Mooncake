@@ -135,8 +135,8 @@ class RDMATransportTest : public ::testing::Test {
         xport = engine->installTransport("rdma", args);
         ASSERT_NE(xport, nullptr);
         addr = allocateMemoryPool(ram_buffer_size, 0, false);
-        int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
-        ASSERT_EQ(rc, 0);
+        auto status = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+        ASSERT_TRUE(status.ok());
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);

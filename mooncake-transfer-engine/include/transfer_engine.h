@@ -52,11 +52,11 @@ class TransferEngine {
 
     ~TransferEngine() { freeEngine(); }
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name,
-             const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
+    Status init(const std::string &metadata_conn_string,
+                const std::string &local_server_name,
+                const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
 
-    int freeEngine();
+    void freeEngine();
 
     // Only for testing.
     Transport *installTransport(const std::string &proto, void **args);
@@ -67,17 +67,17 @@ class TransferEngine {
 
     int closeSegment(SegmentHandle handle);
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
-                            bool remote_accessible = true,
-                            bool update_metadata = true);
+    Status registerLocalMemory(void *addr, size_t length,
+                               const std::string &location,
+                               bool remote_accessible = true,
+                               bool update_metadata = true);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true);
+    Status unregisterLocalMemory(void *addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location);
+    Status registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
+                                    const std::string &location);
 
-    int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+    Status unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
 
     BatchID allocateBatchID(size_t batch_size) {
         return multi_transports_->allocateBatchID(batch_size);

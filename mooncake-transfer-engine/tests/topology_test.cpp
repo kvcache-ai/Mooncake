@@ -80,11 +80,11 @@ TEST(ToplogyTest, TestSelectDevice) {
     topology.parse(json_str);
     std::set<int> items = {0, 1};
     int device;
-    device = topology.selectDevice("cpu:0", 2);
-    ASSERT_TRUE(items.count(device));
+    auto s = topology.selectDevice("cpu:0", &device, 2);
+    ASSERT_TRUE(s.ok());
     items.erase(device);
-    device = topology.selectDevice("cpu:0", 1);
-    ASSERT_TRUE(items.count(device));
+    s = topology.selectDevice("cpu:0", &device, 1);
+    ASSERT_TRUE(s.ok());
     items.erase(device);
     ASSERT_TRUE(items.empty());
 }
@@ -96,10 +96,10 @@ TEST(ToplogyTest, TestSelectDeviceAny) {
     topology.parse(json_str);
     std::set<int> items = {0, 1};
     int device;
-    device = topology.selectDevice("*", 2);
-    ASSERT_TRUE(items.count(device));
+    auto s = topology.selectDevice("*", &device, 2);
+    ASSERT_TRUE(s.ok());
     items.erase(device);
-    device = topology.selectDevice("*", 1);
+    s = topology.selectDevice("*", &device, 1);
     ASSERT_TRUE(items.count(device));
     items.erase(device);
     ASSERT_TRUE(items.empty());

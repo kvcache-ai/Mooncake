@@ -152,7 +152,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    if (transport->install(local_server_name_, metadata_, topo)) {
+    Status status = transport->install(local_server_name_, metadata_, topo);
+    if (!status.ok()) {
         return nullptr;
     }
 
