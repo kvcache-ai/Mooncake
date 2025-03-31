@@ -178,7 +178,6 @@ class AllocatedBuffer {
 
     ~AllocatedBuffer();
 
-    // Rule of 5/6: No copy, define move
     AllocatedBuffer(const AllocatedBuffer&) = delete;
     AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
     AllocatedBuffer(AllocatedBuffer&&) noexcept;
