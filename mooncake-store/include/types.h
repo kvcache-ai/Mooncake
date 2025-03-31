@@ -8,7 +8,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 #include "Slab.h"
+#include "ylt/struct_json/json_reader.h"
+#include "ylt/struct_json/json_writer.h"
 
 namespace mooncake {
 
@@ -19,17 +22,17 @@ static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
 
 // Forward declarations
 class BufferAllocator;
-class BufHandle;
-class ReplicaInfo;
+class AllocatedBuffer;
+class Replica;
 
 // Type aliases for improved readability and type safety
 using ObjectKey = std::string;
 using Version = uint64_t;
 using SegmentId = int64_t;
 using TaskID = int64_t;
-using BufHandleList = std::vector<std::shared_ptr<BufHandle>>;
+using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 // using ReplicaList = std::vector<ReplicaInfo>;
-using ReplicaList = std::unordered_map<uint32_t, ReplicaInfo>;
+using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
 
@@ -91,11 +94,11 @@ inline std::ostream& operator<<(std::ostream& os,
  * @brief Status of a buffer in the system
  */
 enum class BufStatus {
-    INIT,      // Initial state
-    COMPLETE,  // Complete state (buffer has been used)
-    FAILED,    // Failed state (allocation failed, upstream should set handle to
-               // this state)
-    UNREGISTERED,  // Buffer metadata has been deleted
+    INIT = 0,      // Initial state
+    COMPLETE = 1,  // Complete state (buffer has been used)
+    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
+                 // to this state)
+    UNREGISTERED = 3,  // Buffer metadata has been deleted
 };
 
 /**
@@ -115,54 +118,6 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 class BufferAllocator;
-
-/**
- * @brief Metadata for a replica in the system
- */
-struct MetaForReplica {
-    ObjectKey object_name{};
-    Version version{0};
-    uint64_t replica_id{0};
-    uint64_t shard_id{0};
-};
-
-/**
- * @brief Handle for managing buffer allocations
- */
-class BufHandle {
-   public:
-    SegmentId segment_id{0};
-    std::string segment_name;
-    uint64_t size{0};
-    BufStatus status{BufStatus::INIT};
-    MetaForReplica replica_meta;
-    void* buffer{nullptr};
-
-   public:
-    BufHandle(std::shared_ptr<BufferAllocator> allocator,
-              std::string segment_name, uint64_t size, void* buffer);
-    ~BufHandle();
-
-    // Prevent copying to avoid double-free issues
-    BufHandle(const BufHandle&) = delete;
-    BufHandle& operator=(const BufHandle&) = delete;
-
-    // Check if the allocator is still valid
-    bool isAllocatorValid() const;
-
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const BufHandle& handle) noexcept {
-        return os << "BufHandle: { "
-                  << "segment_id: " << handle.segment_id << ", "
-                  << "segment_name: " << handle.segment_name << ", "
-                  << "size: " << handle.size << ", "
-                  << "status: " << handle.status << ", "
-                  << "buffer: " << handle.buffer << " }";
-    }
-
-   private:
-    std::weak_ptr<BufferAllocator> allocator_;
-};
 
 /**
  * @brief Status of a replica in the system
@@ -207,31 +162,142 @@ struct ReplicateConfig {
     }
 };
 
-/**
- * @brief Information about a replica
- */
-class ReplicaInfo {
+class AllocatedBuffer {
    public:
-    ReplicaInfo() = default;
-    std::vector<std::shared_ptr<BufHandle>> handles;
-    ReplicaStatus status{ReplicaStatus::UNDEFINED};
-    uint32_t replica_id{0};
+    friend class BufferAllocator;
+    // Forward declaration of the descriptor struct
+    struct Descriptor;
 
-    void reset() noexcept {
-        handles.clear();
-        status = ReplicaStatus::UNDEFINED;
+    AllocatedBuffer(std::shared_ptr<BufferAllocator> allocator,
+                    std::string segment_name, void* buffer_ptr,
+                    std::size_t size)
+        : allocator_(std::move(allocator)),
+          segment_name_(std::move(segment_name)),
+          buffer_ptr_(buffer_ptr),
+          size_(size) {}
+
+    ~AllocatedBuffer();
+
+    AllocatedBuffer(const AllocatedBuffer&) = delete;
+    AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
+    AllocatedBuffer(AllocatedBuffer&&) noexcept;
+    AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
+
+    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+
+    [[nodiscard]] bool isAllocatorValid() const {
+        return !allocator_.expired();
     }
+
+    // Serialize the buffer into a descriptor for transfer
+    [[nodiscard]] Descriptor get_descriptor() const;
+
+    // Friend declaration for operator<<
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const AllocatedBuffer& buffer);
+
+    // Represents the serializable state
+    struct Descriptor {
+        std::string segment_name_;
+        uint64_t size_;
+        uintptr_t buffer_address_;
+        BufStatus status_;
+    };
+    YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+
+    void mark_complete() { status = BufStatus::COMPLETE; }
+
+   private:
+    std::weak_ptr<BufferAllocator> allocator_;
+    std::string segment_name_;
+    BufStatus status{BufStatus::INIT};
+    void* buffer_ptr_{nullptr};
+    std::size_t size_{0};
 };
 
-inline std::ostream& operator<<(std::ostream& os, const ReplicaInfo& info) {
-    os << "ReplicaInfo: { "
-       << "replica_id: " << info.replica_id << ", "
-       << "status: " << info.status << ", "
-       << "handles: [";
-    for (size_t i = 0; i < info.handles.size(); ++i) {
-        os << *info.handles[i];
-        if (i < info.handles.size() - 1) {
-            os << ", ";
+// Implementation of get_descriptor
+inline AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+    return {segment_name_, static_cast<uint64_t>(size()),
+            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
+}
+
+// Define operator<< using public accessors or get_descriptor if appropriate
+inline std::ostream& operator<<(std::ostream& os,
+                                const AllocatedBuffer& buffer) {
+    return os << "AllocatedBuffer: { "
+              << "segment_name: " << buffer.segment_name_ << ", "
+              << "size: " << buffer.size() << ", "
+              << "status: " << buffer.status << ", "
+              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
+}
+
+class Replica {
+   public:
+    struct Descriptor;
+
+    Replica() = default;
+    Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
+            ReplicaStatus status)
+        : buffers_(std::move(buffers)), status_(status) {}
+
+    void reset() noexcept {
+        buffers_.clear();
+        status_ = ReplicaStatus::UNDEFINED;
+    }
+
+    [[nodiscard]] Descriptor get_descriptor() const;
+
+    [[nodiscard]] ReplicaStatus status() const { return status_; }
+
+    [[nodiscard]] bool has_invalid_handle() const {
+        return std::any_of(buffers_.begin(), buffers_.end(),
+                           [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
+                               return !buf_ptr->isAllocatorValid();
+                           });
+    }
+
+    void mark_complete() {
+        // prev status should be PROCESSING
+        CHECK_EQ(status_, ReplicaStatus::PROCESSING);
+        status_ = ReplicaStatus::COMPLETE;
+        for (const auto& buf_ptr : buffers_) {
+            buf_ptr->mark_complete();
+        }
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
+
+    struct Descriptor {
+        std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
+        ReplicaStatus status;
+    };
+    YLT_REFL(Descriptor, buffer_descriptors, status);
+
+   private:
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers_;
+    ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+};
+
+inline Replica::Descriptor Replica::get_descriptor() const {
+    Replica::Descriptor desc;
+    desc.status = status_;
+    desc.buffer_descriptors.reserve(buffers_.size());
+    for (const auto& buf_ptr : buffers_) {
+        if (buf_ptr) {
+            desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
+        }
+    }
+    return desc;
+}
+
+inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
+    os << "Replica: { " << "status: " << replica.status_ << ", "
+       << "buffers: [";
+    for (const auto& buf_ptr : replica.buffers_) {
+        if (buf_ptr) {
+            os << *buf_ptr;
         }
     }
     os << "] }";

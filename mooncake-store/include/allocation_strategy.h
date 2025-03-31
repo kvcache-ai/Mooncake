@@ -27,7 +27,7 @@ class AllocationStrategy {
      * @return Selected allocator; returns nullptr if allocation is not possible
      *         or no suitable allocator is found
      */
-    virtual std::shared_ptr<BufHandle> Allocate(
+    virtual std::unique_ptr<AllocatedBuffer> Allocate(
         const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
             allocators,
         size_t objectSize) = 0;
@@ -37,7 +37,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
-    std::shared_ptr<BufHandle> Allocate(
+    std::unique_ptr<AllocatedBuffer> Allocate(
         const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
             allocators,
         size_t objectSize) override {

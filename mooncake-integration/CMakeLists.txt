@@ -34,7 +34,7 @@ target_link_libraries(mooncake_vllm_adaptor PUBLIC
     transfer_engine 
     glog 
     gflags 
-    cache_allocator 
+    mooncake_store 
     cachelib_memory_allocator
 )
 message("${PYTHON_SYS_PATH}")
