@@ -56,6 +56,16 @@ cd build
 cmake ..
 make -j$(nproc) && sudo make install
 
+echo "*** Download and installing [yalantinglibs] ***"
+cd ${REPO_ROOT}/thirdparties
+git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
+cd yalantinglibs
+mkdir -p build
+cd build
+cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+cmake --build . -j$(nproc)
+sudo cmake --install .
+
 echo "*** Download and installing [golang-1.22] ***"
 wget https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
 sudo tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
