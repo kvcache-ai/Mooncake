@@ -127,6 +127,7 @@ ErrorCode MasterService::GetReplicaList(
         }
     }
 
+    replica_list.clear();
     replica_list.reserve(metadata.replicas.size());
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
@@ -228,6 +229,7 @@ ErrorCode MasterService::PutStart(
 
     metadata.replicas = std::move(replicas);
 
+    replica_list.clear();
     replica_list.reserve(metadata.replicas.size());
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
