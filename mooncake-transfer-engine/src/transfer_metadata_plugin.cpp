@@ -29,7 +29,7 @@
 #endif
 
 #ifdef USE_ETCD
-#include <etcd/SyncClient.hpp>
+#include <../../build/mooncake-common/etcd/libetcd_wrapper.h>
 #endif  // USE_ETCD
 
 #include <cassert>
@@ -264,19 +264,23 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 #ifdef USE_ETCD
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
-        : client_(metadata_uri), metadata_uri_(metadata_uri) {}
+        : client_(0), metadata_uri_(metadata_uri) {
+        client_ = NewEtcdClient((char *) metadata_uri_.c_str());
+    }
 
-    virtual ~EtcdStoragePlugin() {}
+    virtual ~EtcdStoragePlugin() { Close(client_); }
 
     virtual bool get(const std::string &key, Json::Value &value) {
         Json::Reader reader;
-        auto resp = client_.get(key);
-        if (!resp.is_ok()) {
+        char *json_data = nullptr;
+        auto ret = Get(client_, (char *) key.c_str(), &json_data);
+        if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
-                       << metadata_uri_ << ": " << resp.error_message();
+                       << metadata_uri_;
             return false;
         }
-        auto json_file = resp.value().as_string();
+        auto json_file = std::string(json_data);
+        free(json_data);
         if (!reader.parse(json_file, value)) return false;
         if (globalConfig().verbose)
             LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
@@ -290,27 +294,26 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         if (globalConfig().verbose)
             LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
                       << ", value=" << json_file;
-        auto resp = client_.put(key, json_file);
-        if (!resp.is_ok()) {
+        auto ret = Put(client_, (char *) key.c_str(), (char *) json_file.c_str());
+        if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " from "
-                       << metadata_uri_ << ": " << resp.error_message();
+                       << metadata_uri_;
             return false;
         }
         return true;
     }
 
     virtual bool remove(const std::string &key) {
-        auto resp = client_.rm(key);
-        if (!resp.is_ok()) {
+        auto ret = Delete(client_, (char *) key.c_str());
+        if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to delete " << key
-                       << " from " << metadata_uri_ << ": "
-                       << resp.error_message();
+                       << " from " << metadata_uri_;
             return false;
         }
         return true;
     }
 
-    etcd::SyncClient client_;
+    uintptr_t client_;
     const std::string metadata_uri_;
 };
 #endif  // USE_ETCD
