@@ -111,7 +111,7 @@ class MasterService {
      * ready
      */
     ErrorCode GetReplicaList(const std::string& key,
-                             std::vector<ReplicaInfo>& replica_list);
+                             std::vector<Replica::Descriptor>& replica_list);
 
     /**
      * @brief Mark a key for garbage collection after specified delay
@@ -131,7 +131,7 @@ class MasterService {
     ErrorCode PutStart(const std::string& key, uint64_t value_length,
                        const std::vector<uint64_t>& slice_lengths,
                        const ReplicateConfig& config,
-                       std::vector<ReplicaInfo>& replica_list);
+                       std::vector<Replica::Descriptor>& replica_list);
 
     /**
      * @brief Complete a put operation
@@ -160,7 +160,7 @@ class MasterService {
 
     // Internal data structures
     struct ObjectMetadata {
-        std::vector<ReplicaInfo> replicas;
+        std::vector<Replica> replicas;
         size_t size;
     };
 

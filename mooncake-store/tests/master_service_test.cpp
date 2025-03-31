@@ -20,7 +20,7 @@ class MasterServiceTest : public ::testing::Test {
         FLAGS_logtostderr = true;
     }
 
-    std::vector<ReplicaInfo> replica_list;
+    std::vector<Replica::Descriptor> replica_list;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
@@ -235,7 +235,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
 TEST_F(MasterServiceTest, GetReplicaList) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Test getting non-existent key
-    std::vector<ReplicaInfo> replica_list_local;
+    std::vector<Replica::Descriptor> replica_list_local;
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
               service_->GetReplicaList("non_existent", replica_list_local));
     EXPECT_TRUE(replica_list_local.empty());
@@ -251,7 +251,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<ReplicaInfo> replica_list;
+    std::vector<Replica::Descriptor> replica_list;
     ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
                                                 config, replica_list));
     ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
@@ -274,7 +274,7 @@ TEST_F(MasterServiceTest, RemoveObject) {
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<ReplicaInfo> replica_list;
+    std::vector<Replica::Descriptor> replica_list;
     ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
                                                 config, replica_list));
     ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
@@ -283,7 +283,7 @@ TEST_F(MasterServiceTest, RemoveObject) {
     EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
 
     // Verify object is removed
-    std::vector<ReplicaInfo> replica_list_local;
+    std::vector<Replica::Descriptor> replica_list_local;
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
               service_->GetReplicaList(key, replica_list_local));
 
@@ -308,7 +308,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<ReplicaInfo> replica_list;
+        std::vector<Replica::Descriptor> replica_list;
         ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
                                                     config, replica_list));
         ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
@@ -317,7 +317,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
 
         // Verify object is removed
-        std::vector<ReplicaInfo> replica_list_local;
+        std::vector<Replica::Descriptor> replica_list_local;
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
                   service_->GetReplicaList(key, replica_list_local));
     }
@@ -357,7 +357,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Configure replication
     ReplicateConfig config;
     config.replica_num = num_replicas;
-    std::vector<ReplicaInfo> replica_list;
+    std::vector<Replica::Descriptor> replica_list;
 
     // Test PutStart with multiple slices and replicas
     ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, total_size, slice_lengths,
@@ -370,19 +370,19 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         EXPECT_EQ(ReplicaStatus::PROCESSING, replica.status);
 
         // Verify number of handles matches number of slices
-        ASSERT_EQ(slice_lengths.size(), replica.handles.size());
+        ASSERT_EQ(slice_lengths.size(), replica.buffer_descriptors.size());
 
         // Verify each handle's properties
-        for (size_t i = 0; i < replica.handles.size(); i++) {
-            const auto& handle = replica.handles[i];
-            EXPECT_EQ(BufStatus::INIT, handle->status);
-            EXPECT_EQ(key, handle->replica_meta.object_name);
-            EXPECT_EQ(slice_lengths[i], handle->size);
+        for (size_t i = 0; i < replica.buffer_descriptors.size(); i++) {
+            const auto& handle = replica.buffer_descriptors[i];
+            EXPECT_EQ(BufStatus::INIT, handle.status_);
+
+            EXPECT_EQ(slice_lengths[i], handle.size_);
         }
     }
 
     // Test GetReplicaList during processing (should fail)
-    std::vector<ReplicaInfo> retrieved_replicas;
+    std::vector<Replica::Descriptor> retrieved_replicas;
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY,
               service_->GetReplicaList(key, retrieved_replicas));
 
@@ -396,10 +396,9 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Verify final state of all replicas
     for (const auto& replica : retrieved_replicas) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica.status);
-        ASSERT_EQ(slice_lengths.size(), replica.handles.size());
-        for (const auto& handle : replica.handles) {
-            EXPECT_EQ(BufStatus::COMPLETE, handle->status);
-            EXPECT_EQ(key, handle->replica_meta.object_name);
+        ASSERT_EQ(slice_lengths.size(), replica.buffer_descriptors.size());
+        for (const auto& handle : replica.buffer_descriptors) {
+            EXPECT_EQ(BufStatus::COMPLETE, handle.status_);
         }
     }
 
@@ -444,7 +443,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
                     std::vector<uint64_t> slice_lengths = {1024};
                     ReplicateConfig config;
                     config.replica_num = 1;
-                    std::vector<ReplicaInfo> replica_list;
+                    std::vector<Replica::Descriptor> replica_list;
 
                     // Create the object
                     ASSERT_EQ(ErrorCode::OK,
@@ -471,7 +470,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
 
     // Check that all objects exist
     for (const auto& key : all_keys) {
-        std::vector<ReplicaInfo> retrieved_replicas;
+        std::vector<Replica::Descriptor> retrieved_replicas;
         EXPECT_EQ(ErrorCode::OK,
                   service_->GetReplicaList(key, retrieved_replicas));
     }
@@ -482,7 +481,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     // Verify all objects are gone after GC
     size_t found_count = 0;
     for (const auto& key : all_keys) {
-        std::vector<ReplicaInfo> retrieved_replicas;
+        std::vector<Replica::Descriptor> retrieved_replicas;
         if (service_->GetReplicaList(key, retrieved_replicas) ==
             ErrorCode::OK) {
             found_count++;
@@ -511,13 +510,13 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     config.replica_num = 1;  // One replica
 
     // Create the object
-    std::vector<ReplicaInfo> replica_list;
+    std::vector<Replica::Descriptor> replica_list;
     ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024 * 1024, slice_lengths,
                                                 config, replica_list));
     ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
 
     // Verify object exists
-    std::vector<ReplicaInfo> retrieved_replicas;
+    std::vector<Replica::Descriptor> retrieved_replicas;
     ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, retrieved_replicas));
     ASSERT_EQ(1, retrieved_replicas.size());
 

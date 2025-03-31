@@ -9,21 +9,6 @@
 
 namespace mooncake {
 
-// Helper function to convert a vector to a string using the << operator
-template <typename T>
-std::string VectorToString(const std::vector<T>& vec) {
-    std::stringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < vec.size(); ++i) {
-        ss << vec[i];
-        if (i < vec.size() - 1) {
-            ss << ", ";
-        }
-    }
-    ss << "]";
-    return ss.str();
-}
-
 ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
                                              uint64_t base, uint64_t size) {
     // Check if parameters are valid before allocating memory.
@@ -60,9 +45,6 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    VLOG(1) << "segment_name=" << segment_name << ", base=" << base
-            << ", size=" << size << ", allocator_ptr=" << allocator.get()
-            << ", action=register_buffer";
     buf_allocators_[segment_name] = std::move(allocator);
     return ErrorCode::OK;
 }
@@ -78,8 +60,6 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    VLOG(1) << "segment_name=" << segment_name << ", action=unregister_buffer";
-    // Remove buffer allocator
     buf_allocators_.erase(it);
     return ErrorCode::OK;
 }
@@ -122,39 +102,35 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    VLOG(1) << "segment_name=" << segment_name << ", buffer=" << buffer
-            << ", size=" << size << ", action=mount_segment";
     return buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
-    VLOG(1) << "segment_name=" << segment_name << ", action=unmount_segment";
     return buffer_allocator_manager_->RemoveSegment(segment_name);
 }
 
 ErrorCode MasterService::GetReplicaList(
-    const std::string& key, std::vector<ReplicaInfo>& replica_list) {
-    VLOG(1) << "key=" << key << ", action=get_replica_list_start";
-
+    const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key << ", info=object_not_found";
+        VLOG(1) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
     auto& metadata = accessor.Get();
     for (const auto& replica : metadata.replicas) {
-        if (replica.status != ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "key=" << key << ", status=" << replica.status
+        auto status = replica.status();
+        if (status != ReplicaStatus::COMPLETE) {
+            LOG(WARNING) << "key=" << key << ", status=" << status
                          << ", error=replica_not_ready";
             return ErrorCode::REPLICA_IS_NOT_READY;
         }
     }
 
-    replica_list = metadata.replicas;
-    if (VLOG_IS_ON(1)) {
-        VLOG(1) << "key=" << key
-                << ", replica_list=" << VectorToString(replica_list);
+    replica_list.clear();
+    replica_list.reserve(metadata.replicas.size());
+    for (const auto& replica : metadata.replicas) {
+        replica_list.emplace_back(replica.get_descriptor());
     }
 
     // Only mark for GC if enabled
@@ -165,10 +141,10 @@ ErrorCode MasterService::GetReplicaList(
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
-                                  const std::vector<uint64_t>& slice_lengths,
-                                  const ReplicateConfig& config,
-                                  std::vector<ReplicaInfo>& replica_list) {
+ErrorCode MasterService::PutStart(
+    const std::string& key, uint64_t value_length,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    std::vector<Replica::Descriptor>& replica_list) {
     if (config.replica_num == 0 || value_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", value_length=" << value_length
@@ -216,10 +192,11 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
     metadata.size = value_length;
 
     // Allocate replicas
+    std::vector<Replica> replicas;
+    replicas.reserve(config.replica_num);
     for (size_t i = 0; i < config.replica_num; ++i) {
-        ReplicaInfo replica;
-        replica.status = ReplicaStatus::PROCESSING;
-        replica.replica_id = i;
+        std::vector<std::unique_ptr<AllocatedBuffer>> handles;
+        handles.reserve(slice_lengths.size());
 
         // Allocate space for each slice
         for (size_t j = 0; j < slice_lengths.size(); ++j) {
@@ -241,30 +218,28 @@ ErrorCode MasterService::PutStart(const std::string& key, uint64_t value_length,
                 return ErrorCode::NO_AVAILABLE_HANDLE;
             }
 
-            CHECK_EQ(handle->status, BufStatus::INIT);
-            handle->replica_meta.object_name = key;
-            handle->replica_meta.replica_id = i;
-            replica.handles.emplace_back(handle);
-
             VLOG(1) << "key=" << key << ", replica_id=" << i
                     << ", slice_index=" << j << ", handle=" << *handle
                     << ", action=slice_allocated";
+            handles.emplace_back(std::move(handle));
         }
 
-        metadata.replicas.emplace_back(replica);
-        replica_list.emplace_back(std::move(replica));
+        replicas.emplace_back(std::move(handles), ReplicaStatus::PROCESSING);
+    }
+
+    metadata.replicas = std::move(replicas);
+
+    replica_list.clear();
+    replica_list.reserve(metadata.replicas.size());
+    for (const auto& replica : metadata.replicas) {
+        replica_list.emplace_back(replica.get_descriptor());
     }
 
     metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
-    VLOG(1) << "key=" << key << ", replica_count=" << config.replica_num
-            << ", slice_count=" << slice_lengths.size()
-            << ", action=put_start_complete";
     return ErrorCode::OK;
 }
 
 ErrorCode MasterService::PutEnd(const std::string& key) {
-    VLOG(1) << "key=" << key << ", action=put_end_start";
-
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -273,25 +248,12 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
 
     auto& metadata = accessor.Get();
     for (auto& replica : metadata.replicas) {
-        if (replica.status != ReplicaStatus::PROCESSING) {
-            LOG(ERROR) << "key=" << key << ", status=" << replica.status
-                       << ", error=invalid_replica_status";
-            return ErrorCode::INVALID_WRITE;
-        }
-        replica.status = ReplicaStatus::COMPLETE;
-        for (const auto& handle : replica.handles) {
-            CHECK_EQ(handle->status, BufStatus::INIT)
-                << "key=" << key << ", error=invalid_handle_status";
-            handle->status = BufStatus::COMPLETE;
-        }
+        replica.mark_complete();
     }
-    VLOG(1) << "key=" << key << ", action=put_end_complete";
     return ErrorCode::OK;
 }
 
 ErrorCode MasterService::PutRevoke(const std::string& key) {
-    VLOG(1) << "key=" << key << ", action=put_revoke_start";
-
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
@@ -300,21 +262,19 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
 
     auto& metadata = accessor.Get();
     for (auto& replica : metadata.replicas) {
-        if (replica.status != ReplicaStatus::PROCESSING) {
-            LOG(ERROR) << "key=" << key << ", status=" << replica.status
+        auto status = replica.status();
+        if (status != ReplicaStatus::PROCESSING) {
+            LOG(ERROR) << "key=" << key << ", status=" << status
                        << ", error=invalid_replica_status";
             return ErrorCode::INVALID_WRITE;
         }
     }
 
     accessor.Erase();
-    VLOG(1) << "key=" << key << ", action=put_revoke_complete";
     return ErrorCode::OK;
 }
 
 ErrorCode MasterService::Remove(const std::string& key) {
-    VLOG(1) << "key=" << key << ", action=remove_start";
-
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -323,8 +283,9 @@ ErrorCode MasterService::Remove(const std::string& key) {
 
     auto& metadata = accessor.Get();
     for (auto& replica : metadata.replicas) {
-        if (replica.status != ReplicaStatus::COMPLETE) {
-            LOG(ERROR) << "key=" << key << ", status=" << replica.status
+        auto status = replica.status();
+        if (status != ReplicaStatus::COMPLETE) {
+            LOG(ERROR) << "key=" << key << ", status=" << status
                        << ", error=invalid_replica_status";
             return ErrorCode::REPLICA_IS_NOT_READY;
         }
@@ -332,14 +293,10 @@ ErrorCode MasterService::Remove(const std::string& key) {
 
     // Remove object metadata
     accessor.Erase();
-    VLOG(1) << "key=" << key << ", action=remove_complete";
     return ErrorCode::OK;
 }
 
 ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
-    VLOG(1) << "key=" << key << ", delay_ms=" << delay_ms
-            << ", action=mark_for_gc";
-
     // Create a new GC task and add it to the queue
     GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
     if (!gc_queue_.push(task)) {
@@ -349,7 +306,6 @@ ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    VLOG(1) << "key=" << key << ", action=scheduled_for_gc";
     return ErrorCode::OK;
 }
 
@@ -358,22 +314,10 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     auto replica_it = metadata.replicas.begin();
     while (replica_it != metadata.replicas.end()) {
         // Use any_of algorithm to check if any handle has an invalid allocator
-        bool has_invalid_handle = std::any_of(
-            replica_it->handles.begin(), replica_it->handles.end(),
-            [](const std::shared_ptr<BufHandle>& handle) {
-                if (!handle->isAllocatorValid()) {
-                    VLOG(1) << "key=" << handle->replica_meta.object_name
-                            << ", segment=" << handle->segment_name
-                            << ", action=found_invalid_handle";
-                    return true;
-                }
-                return false;
-            });
+        bool has_invalid_handle = replica_it->has_invalid_handle();
 
         // Remove replicas with invalid handles using erase-remove idiom
         if (has_invalid_handle) {
-            VLOG(1) << "replica_id=" << replica_it->replica_id
-                    << ", action=removing_replica_with_invalid_handle";
             replica_it = metadata.replicas.erase(replica_it);
         } else {
             ++replica_it;

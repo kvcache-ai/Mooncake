@@ -16,7 +16,7 @@
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
+DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8090/metadata",
               "Metadata connection string for transfer engine");
 
 namespace mooncake {
@@ -29,7 +29,7 @@ class ClientIntegrationTest : public ::testing::Test {
         google::InitGoogleLogging("ClientIntegrationTest");
 
         // Set VLOG level to 1 for detailed logs
-        // google::SetVLOGLevel("*", 1);
+        google::SetVLOGLevel("*", 1);
         FLAGS_logtostderr = 1;
 
         // Override flags from environment variables if present
@@ -139,6 +139,7 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ASSERT_EQ(error_code, ErrorCode::OK);
     ASSERT_EQ(slices.size(), 1);
     ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(slices[0].ptr, buffer);
     ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
@@ -282,7 +283,8 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
         std::string retrieved_data(static_cast<const char*>(slices[i].ptr),
                                    slices[i].size);
         std::string expected_data(data_size, 'A' + i);
-        EXPECT_EQ(retrieved_data, expected_data);
+        EXPECT_EQ(
+            memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
         client_buffer_allocator_->deallocate(buffers[i], data_size);
     }
 
