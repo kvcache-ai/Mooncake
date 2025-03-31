@@ -104,10 +104,8 @@ class Transport {
                 uint64_t dest_addr;
             } tcp;
             struct {
-                const char *file_path;
-                uint64_t start;
-                uint64_t length;
-                uint64_t buffer_id;
+                uint64_t offset;
+                int cufile_desc;
             } nvmeof;
             struct {
                 void *remote_filename;
@@ -130,14 +128,13 @@ class Transport {
     };
 
     struct TransferTask {
-
-
         volatile uint64_t slice_count   = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
+        BatchID batch_id = 0;
     };
 
     struct BatchDesc {

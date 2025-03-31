@@ -1,3 +1,4 @@
+# /usr/bin/python
 # Copyright 2024 KVCache.AI
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,21 +28,13 @@ if __name__ == "__main__":
     os.environ.pop("HTTPS_PROXY", None)
     os.environ.pop("http_proxy", None)
     os.environ.pop("https_proxy", None)
-    etcd_server = sys.argv[1]
-    segment_name = "nvmeof/" + sys.argv[2]
+    etcd_host = sys.argv[1]
+    segment_name = "mooncake/nvmeof/" + sys.argv[2]
     files = sys.argv[3:]
     local_server_name = socket.gethostname()
 
-    etcd_host = sys.argv[1]
-    files = sys.argv[2:]
-
     server_name = socket.gethostname()
-    print(server_name)
-    segment_name = "mooncake/nvmeof/" + server_name
-    print(segment_name)
-
     etcd = etcd3.client(host=etcd_host, port=2379)
-
     value = {}
     value['server_name'] = server_name
     value['protocol'] = "nvmeof"
@@ -51,7 +44,9 @@ if __name__ == "__main__":
       buffer = {}
       buffer['length'] = os.path.getsize(file)
       buffer['file_path'] = file
-      buffer['local_path_map'] = {}
+      local_path_map = {}
+      local_path_map[server_name] = file
+      buffer['local_path_map'] = local_path_map
       value['buffers'].append(buffer)
     
     print(json.dumps(value))
