@@ -231,7 +231,7 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (!object_info.replica_list.empty()) return -1;
+    if (object_info.replica_list.empty()) return -1;
     auto &replica = object_info.replica_list[0];
     for (auto &handle : replica.buffer_descriptors) {
         auto chunk_size = handle.size_;

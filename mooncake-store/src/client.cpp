@@ -167,6 +167,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             LOG(INFO) << "object_already_exists key=" << key;
             return ErrorCode::OK;
         }
+        LOG(ERROR) << "Failed to start put operation: " << err;
         return err;
     }
 
@@ -191,7 +192,12 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // End put operation
-    return master_client_->PutEnd(key).error_code;
+    err = master_client_->PutEnd(key).error_code;
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to end put operation: " << err;
+        return err;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) const {

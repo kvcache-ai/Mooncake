@@ -133,7 +133,8 @@ class TestDistributedObjectStore(unittest.TestCase):
                 # Put operations
                 for key in thread_keys:
                     result = self.store.put(key, test_data)
-                    self.assertEqual(result, 0, f"Put operation failed for key {key}")
+                    if result != 0:
+                        thread_exceptions.append(f"Put operation failed for key {key} with result {result}")
                 
                 # Wait for all threads to complete put operations
                 put_barrier.wait()
@@ -141,18 +142,19 @@ class TestDistributedObjectStore(unittest.TestCase):
                 # Get operations
                 for key in thread_keys:
                     retrieved_data = self.store.get(key)
-                    self.assertEqual(len(retrieved_data), VALUE_SIZE, 
-                                    f"Retrieved data size mismatch for key {key}")
-                    self.assertEqual(retrieved_data, test_data, 
-                                    f"Retrieved data content mismatch for key {key}")
+                    if len(retrieved_data) != VALUE_SIZE:
+                        thread_exceptions.append(f"Retrieved data size mismatch for key {key}: expected {VALUE_SIZE}, got {len(retrieved_data)}")
+                    if retrieved_data != test_data:
+                        thread_exceptions.append(f"Retrieved data content mismatch for key {key}")
                 
                 # Wait for all threads to complete get operations
                 get_barrier.wait()
                 
                 # Remove all keys
                 for key in thread_keys:
-                    self.assertEqual(self.store.remove(key), 0)
-                
+                    result = self.store.remove(key)
+                    if result != 0:
+                        thread_exceptions.append(f"Remove operation failed for key {key} with result {result}")
                 
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
@@ -181,13 +183,13 @@ class TestDistributedObjectStore(unittest.TestCase):
         get_barrier.wait()
         system_stats['get_end'] = time.time()
         
-        
         # Join all threads
         for t in threads:
             t.join()
         
-        # Check for any exceptions
-        self.assertEqual(len(thread_exceptions), 0, "\n".join(thread_exceptions))
+        # Check for any exceptions in the main thread
+        if thread_exceptions:
+            self.fail(f"Test failed with the following errors:\n" + "\n".join(thread_exceptions))
         
         # Calculate system-wide statistics
         total_operations = NUM_THREADS * OPERATIONS_PER_THREAD
