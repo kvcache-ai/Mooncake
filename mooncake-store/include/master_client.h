@@ -2,12 +2,15 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include <memory>
 #include <string>
 #include <vector>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
 
-#include "master.grpc.pb.h"
+#include "rpc_service.h"
 #include "types.h"
+
+using namespace async_simple;
+using namespace coro_rpc;
 
 namespace mooncake {
 
@@ -38,9 +41,8 @@ class MasterClient {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode GetReplicaList(
-        const std::string& object_key,
-        mooncake_store::GetReplicaListResponse& object_info) const;
+    [[nodiscard]] GetReplicaListResponse GetReplicaList(
+        const std::string& object_key);
 
     /**
      * @brief Starts a put operation
@@ -51,31 +53,30 @@ class MasterClient {
      * @param start_response Output parameter for put start response
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode PutStart(
+    [[nodiscard]] PutStartResponse PutStart(
         const std::string& key, const std::vector<size_t>& slice_lengths,
-        size_t value_length, const ReplicateConfig& config,
-        mooncake_store::PutStartResponse& start_response) const;
+        size_t value_length, const ReplicateConfig& config);
 
     /**
      * @brief Ends a put operation
      * @param key Object key
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode PutEnd(const std::string& key) const;
+    [[nodiscard]] PutEndResponse PutEnd(const std::string& key);
 
     /**
      * @brief Revokes a put operation
      * @param key Object key
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode PutRevoke(const std::string& key) const;
+    [[nodiscard]] PutRevokeResponse PutRevoke(const std::string& key);
 
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode Remove(const std::string& key) const;
+    [[nodiscard]] RemoveResponse Remove(const std::string& key);
 
     /**
      * @brief Registers a segment to master for allocation
@@ -84,35 +85,19 @@ class MasterClient {
      * @param size Size of the segment in bytes
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode MountSegment(const std::string& segment_name,
-                                         const void* buffer, size_t size) const;
+    [[nodiscard]] MountSegmentResponse MountSegment(
+        const std::string& segment_name, const void* buffer, size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
      * @param segment_name Name which is used to register the segment
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] ErrorCode UnmountSegment(
-        const std::string& segment_name) const;
-
-    /**
-     * @brief Checks if an object exists
-     * @param key Key to check
-     * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
-     * exists, other ErrorCode for errors
-     */
-    [[nodiscard]] ErrorCode IsExist(const std::string& key) const;
+    [[nodiscard]] UnmountSegmentResponse UnmountSegment(
+        const std::string& segment_name);
 
    private:
-    // Template method: Execute RPC call and handle results
-    template <typename Req, typename Res, typename... Builders>
-    [[nodiscard]] ErrorCode ExecuteRpc(
-        const std::string& rpc_name,
-        grpc::Status (mooncake_store::MasterService::Stub::*method)(
-            grpc::ClientContext*, const Req&, Res*),
-        Res& response, Builders&&... builders) const;
-
-    std::unique_ptr<mooncake_store::MasterService::Stub> master_stub_{nullptr};
+    coro_rpc_client client_;
 };
 
 }  // namespace mooncake

@@ -40,9 +40,9 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
 
     ~BufferAllocator();
 
-    std::shared_ptr<BufHandle> allocate(size_t size);
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size);
 
-    void deallocate(BufHandle* handle);
+    void deallocate(AllocatedBuffer* handle);
 
     size_t capacity() const { return total_size_; }
     size_t size() const { return cur_size_.load(); }

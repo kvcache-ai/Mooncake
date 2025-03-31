@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 
+#include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "types.h"
@@ -105,26 +106,31 @@ ErrorCode Client::Get(const std::string& object_key,
 
 ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) const {
-    return master_client_->GetReplicaList(object_key, object_info);
+    auto reponse = master_client_->GetReplicaList(object_key);
+    // copy vec
+    object_info.replica_list.resize(reponse.replica_list.size());
+    for (size_t i = 0; i < reponse.replica_list.size(); ++i) {
+        object_info.replica_list[i] = reponse.replica_list[i];
+    }
+    return reponse.error_code;
 }
 
 ErrorCode Client::Get(const std::string& object_key,
                       const ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
     // Get the first complete replica
-    for (int i = 0; i < object_info.replica_list_size(); ++i) {
-        if (object_info.replica_list(i).status() ==
-            mooncake_store::ReplicaInfo::COMPLETE) {
-            const auto& replica = object_info.replica_list(i);
+    for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
+        if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
+            const auto& replica = object_info.replica_list[i];
 
-            std::vector<mooncake_store::BufHandle> handles;
-            for (const auto& handle : replica.handles()) {
-                VLOG(1) << "handle: segment_name=" << handle.segment_name()
-                        << " buffer=" << handle.buffer()
-                        << " size=" << handle.size();
-                if (handle.status() != mooncake_store::BufHandle::COMPLETE) {
+            std::vector<AllocatedBuffer::Descriptor> handles;
+            for (const auto& handle : replica.buffer_descriptors) {
+                VLOG(1) << "handle: segment_name=" << handle.segment_name_
+                        << " buffer=" << handle.buffer_address_
+                        << " size=" << handle.size_;
+                if (handle.status_ != BufStatus::COMPLETE) {
                     LOG(ERROR) << "incomplete_handle_found segment_name="
-                               << handle.segment_name();
+                               << handle.segment_name_;
                     return ErrorCode::INVALID_PARAMS;
                 }
                 handles.push_back(handle);
@@ -153,9 +159,9 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // Start put operation
-    mooncake_store::PutStartResponse start_response;
-    ErrorCode err = master_client_->PutStart(key, slice_lengths, slice_size,
-                                             config, start_response);
+    PutStartResponse start_response =
+        master_client_->PutStart(key, slice_lengths, slice_size, config);
+    ErrorCode err = start_response.error_code;
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             LOG(INFO) << "object_already_exists key=" << key;
@@ -165,9 +171,10 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // Transfer data using allocated handles from all replicas
-    for (const auto& replica : start_response.replica_list()) {
-        std::vector<mooncake_store::BufHandle> handles;
-        for (const auto& handle : replica.handles()) {
+    for (const auto& replica : start_response.replica_list) {
+        std::vector<AllocatedBuffer::Descriptor> handles;
+        for (const auto& handle : replica.buffer_descriptors) {
+            CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);
         }
         // Write just ignore the transfer size
@@ -175,20 +182,20 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         if (transfer_err != ErrorCode::OK) {
             // Revoke put operation
             auto revoke_err = master_client_->PutRevoke(key);
-            if (revoke_err != ErrorCode::OK) {
+            if (revoke_err.error_code != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to revoke put operation";
-                return revoke_err;
+                return revoke_err.error_code;
             }
             return transfer_err;
         }
     }
 
     // End put operation
-    return master_client_->PutEnd(key);
+    return master_client_->PutEnd(key).error_code;
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) const {
-    return master_client_->Remove(key);
+    return master_client_->Remove(key).error_code;
 }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
@@ -208,7 +215,8 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    ErrorCode err = master_client_->MountSegment(segment_name, buffer, size);
+    ErrorCode err =
+        master_client_->MountSegment(segment_name, buffer, size).error_code;
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -217,7 +225,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
-    ErrorCode err = master_client_->UnmountSegment(segment_name);
+    ErrorCode err = master_client_->UnmountSegment(segment_name).error_code;
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -257,8 +265,15 @@ ErrorCode Client::IsExist(const std::string& key) const {
 }
 
 ErrorCode Client::TransferData(
-    const std::vector<mooncake_store::BufHandle>& handles,
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) const {
+    CHECK(!handles.empty()) << "handles is empty";
+
+    for (const auto& handle : handles) {
+        LOG(INFO) << "segment_name=" << handle.segment_name_
+                  << " buffer=" << handle.buffer_address_
+                  << " size=" << handle.size_;
+    }
     std::vector<TransferRequest> transfer_tasks;
     if (handles.size() > slices.size()) {
         LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
@@ -269,24 +284,29 @@ ErrorCode Client::TransferData(
     for (uint64_t idx = 0; idx < handles.size(); ++idx) {
         auto& handle = handles[idx];
         auto& slice = slices[idx];
-        if (handle.size() > slice.size) {
+        if (handle.size_ > slice.size) {
             LOG(ERROR)
                 << "Size of replica partition more than provided buffers";
             return ErrorCode::TRANSFER_FAIL;
         }
         Transport::SegmentHandle seg =
-            transfer_engine_->openSegment(handle.segment_name().c_str());
+            transfer_engine_->openSegment(handle.segment_name_);
         if (seg == (uint64_t)ERR_INVALID_ARGUMENT) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name();
+            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
             return ErrorCode::TRANSFER_FAIL;
         }
         TransferRequest request;
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
         request.target_id = seg;
-        request.target_offset = handle.buffer();
-        request.length = handle.size();
+        request.target_offset = handle.buffer_address_;
+        request.length = handle.size_;
         transfer_tasks.push_back(request);
+        LOG(INFO) << "transfer_tasks:";
+        LOG(INFO) << "opcode=" << request.opcode << " source=" << request.source
+                  << " target_id=" << request.target_id
+                  << " target_offset=" << request.target_offset
+                  << " length=" << request.length;
     }
 
     const size_t batch_size = transfer_tasks.size();
@@ -350,22 +370,22 @@ ErrorCode Client::TransferData(
     }
 
     transfer_engine_->freeBatchID(batch_id);
-
+    LOG(INFO) << "Transfer data success";
     return ErrorCode::OK;
 }
 
 ErrorCode Client::TransferWrite(
-    const std::vector<mooncake_store::BufHandle>& handles,
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices) const {
     return TransferData(handles, slices, TransferRequest::WRITE);
 }
 
 ErrorCode Client::TransferRead(
-    const std::vector<mooncake_store::BufHandle>& handles,
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices) const {
     size_t total_size = 0;
     for (const auto& handle : handles) {
-        total_size += handle.size();
+        total_size += handle.size_;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
