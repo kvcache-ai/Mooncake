@@ -268,12 +268,6 @@ ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) const {
     CHECK(!handles.empty()) << "handles is empty";
-
-    for (const auto& handle : handles) {
-        LOG(INFO) << "segment_name=" << handle.segment_name_
-                  << " buffer=" << handle.buffer_address_
-                  << " size=" << handle.size_;
-    }
     std::vector<TransferRequest> transfer_tasks;
     if (handles.size() > slices.size()) {
         LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
@@ -302,11 +296,6 @@ ErrorCode Client::TransferData(
         request.target_offset = handle.buffer_address_;
         request.length = handle.size_;
         transfer_tasks.push_back(request);
-        LOG(INFO) << "transfer_tasks:";
-        LOG(INFO) << "opcode=" << request.opcode << " source=" << request.source
-                  << " target_id=" << request.target_id
-                  << " target_offset=" << request.target_offset
-                  << " length=" << request.length;
     }
 
     const size_t batch_size = transfer_tasks.size();
@@ -370,7 +359,6 @@ ErrorCode Client::TransferData(
     }
 
     transfer_engine_->freeBatchID(batch_id);
-    LOG(INFO) << "Transfer data success";
     return ErrorCode::OK;
 }
 
