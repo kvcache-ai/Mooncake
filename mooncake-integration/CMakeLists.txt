@@ -19,6 +19,17 @@ pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     vllm/vllm_adaptor.cpp 
     vllm/distributed_object_store.cpp
 )
+
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+ 
+ set_target_properties(mooncake_vllm_adaptor PROPERTIES
+     INSTALL_RPATH "$ORIGIN/lib_so"
+     BUILD_RPATH "$ORIGIN/lib_so"
+     SKIP_BUILD_RPATH FALSE
+ )
+ 
+
 target_link_libraries(mooncake_vllm_adaptor PUBLIC 
     transfer_engine 
     glog 
