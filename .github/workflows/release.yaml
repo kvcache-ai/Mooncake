@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel
+
+      - name: Extract version from tag
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      - name: Install system dependencies and build project
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh
+          mkdir build
+          cd build
+          cmake .. -DUSE_HTTP=ON
+          sudo make install -j
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          mkdir -p mooncake-wheel/mooncake/lib_so/
+          cp build/mooncake-integration/*.so mooncake-wheel/mooncake
+          cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
+          cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
+          python -m build mooncake-wheel/
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Upload wheel to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mooncake-wheel/dist/*.whl

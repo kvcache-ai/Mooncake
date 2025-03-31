@@ -1,4 +1,5 @@
 import sys
+import os
 from setuptools import setup, find_packages
 from setuptools.dist import Distribution
 
@@ -8,9 +9,11 @@ class BinaryDistribution(Distribution):
 
 python_version = f">={sys.version_info.major}.{sys.version_info.minor}"
 
+VERSION = os.environ.get("VERSION", "0.1.0")
+
 setup(
     name="mooncake",
-    version="0.1.0",
+    version=VERSION,
     packages=find_packages(),
     package_data={"mooncake": [
         "*.so",
