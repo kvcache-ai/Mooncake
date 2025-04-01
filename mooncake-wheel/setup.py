@@ -36,8 +36,6 @@ setup(
     },
     author="Mooncake Authors",
     description="Python binding of a Mooncake library using pybind11",
-    long_description=open("README.md", encoding="utf-8").read(),
-    long_description_content_type="text/markdown",
     url="https://github.com/kvcache-ai/Mooncake",
     project_urls={
         "Documentation": "https://github.com/kvcache-ai/Mooncake/tree/main/doc",
