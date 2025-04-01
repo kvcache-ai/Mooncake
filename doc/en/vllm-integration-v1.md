@@ -1,36 +1,52 @@
 # vLLM Disaggregated Prefill with MooncakeStore
 
 ## Overview
+
 This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated Prefill/Decode scenario. Benchmark results will be released soon.
 
 Main changes from v0.x to v1:
+
 - XpYd support and orchestration
   - dynamic changing the population of prefill group and decode group
 - More stable and more fault-tolerant
   - The sudden crash of a single vllm instance is tolerable
   - Since instance-to-instance connections are removed, each instance works as a vanilla vllm instance, which means it can serve the requests that are not from the proxy and finish them normally
 
-
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
 
 ## Installation
+
 ### Prerequisite
+
 Please install the MooncakeStore according to the [instructions](build.md) first.
 
-### Install the latest version of vLLM
+### Install the latest version of vLLM and vLLM-adaptor
+
 #### 1. Clone vLLM from official repo
+
 ```bash
 git clone git@github.com:vllm-project/vllm.git
 ```
-#### 2. Build
-##### 2.1 Build from source
+
+#### 2.Install the Mooncake package
+
+```bash
+pip install mooncake-transfer-engine
+```
+
+#### 3. Build
+
+##### 3.1 Build from source
+
 ```bash
 cd vllm
 pip3 install -e .
 ```
- - If you encounter any problems that you cannot solve, please refer to the [vLLM official compilation guide](https://docs.vllm.ai/en/latest/getting_started/installation/index.html).
+
+- If you encounter any problems that you cannot solve, please refer to the [vLLM official compilation guide](https://docs.vllm.ai/en/latest/getting_started/installation/index.html).
 
 ## Configuration
+
 ### Prepare configuration file to Run Example over RDMA
 
 - Prepare a _**mooncake.json**_ file for both Prefill and Decode instances
@@ -44,6 +60,7 @@ pip3 install -e .
     "master_server_address": "192.168.0.137:50001"
 }
 ```
+
 - "local_hostname": The IP address of the current node used to communicate with the etcd server for metadata.
   - **_All prefill instances and decode instances can share this config file on the same node._**
 - "metadata_server": The etcd server of the mooncake transfer engine. For example,
@@ -53,9 +70,11 @@ pip3 install -e .
 - "protocol": The protocol to be used for data transmission. ("rdma/tcp")
 - "device_name": The device to be used for data transmission, it is required when "protocol" is set to "rdma". If multiple NIC devices are used, they can be separated by commas such as "erdma_0,erdma_1". Please note that there are no spaces between them.
 - "master_server_address": The IP address and the port of the master daemon process of MooncakeStore.
+
 ### Prepare configuration file to Run Example over TCP
 
 - Prepare a _**mooncake.json**_ file for both Prefill and Decode instances
+
 ```json
 {
     "local_hostname": "192.168.0.137",
@@ -66,8 +85,38 @@ pip3 install -e .
 }
 ```
 
+### Create a master startup script
+
+```bash
+touch master.py
+```
+
+Copy the following content into master.py
+
+```python
+import os
+import subprocess
+import argparse
+from importlib.resources import files
+from mooncake import *
+
+parser = argparse.ArgumentParser(description="Start Mooncake Master")
+parser.add_argument("--port", type=int, help="The port number to use", default=50051)
+
+args = parser.parse_args()
+
+bin_path = files("mooncake") / "mooncake_master"
+print("bin path:", bin_path)
+
+os.chmod(bin_path, 0o755)
+
+result = subprocess.run([bin_path, "--port", str(args.port)])
+```
+
 ## Run Example
- - Please change the IP addresses and ports in the following guide according to your env.
+
+- Please change the IP addresses and ports in the following guide according to your env.
+
 ```bash
 # Begin from `root` of your cloned repo!
 
@@ -76,7 +125,7 @@ etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://loc
 # You may need to terminate other etcd processes before running the above command
 
 # 2. Start the mooncake_master server
-mooncake_master --port 50001
+python master.py --port 50001
 # If some vllm instances exit unexpectedly, some connection metadata will be corrupted since they are not properly cleaned. In that case, we recommend you restart the mooncake_master before running another test.
 
 # 3. Run multiple vllm instances
@@ -102,15 +151,17 @@ CUDA_VISIBLE_DEVICES=7 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python
 - `MOONCAKE_CONFIG_PATH` is the path to the mooncake.json configuration file.
 - `VLLM_USE_MODELSCOPE` is optional, if you have access to huggingface, please remove it.
 - `VLLM_USE_V1=0` is required since the disaggregated feature is currently only supported on V0 vLLM.
+
   - You can also `export` this configuration to the env, instead of putting it in front of every single command.
 - The `--model` parameter specifies the model to use.
 - The `--port` parameter specifies the vllm service port on which to listen.
 - The `--max-model-len` parameter specifies the maximum length of the model.
 - Option `--tensor_parallel_size` \ `-tp` is supported. Example: append `-tp 2` to the run command to run vllm with multiple GPUs.
+
   - Note: All instances should have the same tensor_parallel_size.
   - If you want to run the prefill instance and decode instance on the same node, please set up different `CUDA_VISIBLE_DEVICES`. For example, `CUDA_VISIBLE_DEVICES=0,1` for the prefill instance and `CUDA_VISIBLE_DEVICES=2,3` for the decode instance.
-
 - The `--kv-transfer-config` parameter specifies the connector and its config to be used.
+
   - Please set up `kv_connector` to `MooncakeStoreConnector`.
   - `kv_role` is the node's role, either 'kv_producer', 'kv_consumer' or 'kv_both'.
 
@@ -148,8 +199,8 @@ Mooncake team implements this simple disagg_proxy based on round-robin as a demo
 
 **_Be sure to change the IP address in the commands._**
 
-
 ## Test with openai compatible request
+
 ```
 curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
   "model": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
@@ -157,4 +208,5 @@ curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json"
   "max_tokens": 1000
 }'
 ```
+
 - If you are not testing on the proxy server, please change the `localhost` to the IP address of the proxy server.
