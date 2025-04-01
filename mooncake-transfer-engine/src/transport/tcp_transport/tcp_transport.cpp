@@ -368,7 +368,7 @@ void TcpTransport::startTransfer(Slice *slice) {
             return;
         }
 
-        TransferMetadata::RpcMetaDesc meta_entry;
+        RpcMetaDesc meta_entry;
         if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
             slice->markFailed();
             return;

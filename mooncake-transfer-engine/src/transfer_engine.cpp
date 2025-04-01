@@ -27,7 +27,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
 
-    TransferMetadata::RpcMetaDesc desc;
+    RpcMetaDesc desc;
     desc.ip_or_host_name = ip_or_host_name;
     desc.rpc_port = rpc_port;
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);

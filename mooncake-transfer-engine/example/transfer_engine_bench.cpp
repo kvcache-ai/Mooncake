@@ -180,8 +180,9 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
     }
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
     uint64_t remote_base =
-        (uint64_t)segment_desc->buffers[thread_id % NR_SOCKETS].addr;
+        (uint64_t)detail.buffers[thread_id % NR_SOCKETS].addr;
 
     size_t batch_count = 0;
     while (running) {

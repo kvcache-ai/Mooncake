@@ -45,10 +45,6 @@ class Transport {
     using BatchID = uint64_t;
     const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
