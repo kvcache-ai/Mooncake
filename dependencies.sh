@@ -18,7 +18,6 @@ GITHUB_PROXY="https://github.com"
 
 sudo apt-get install -y build-essential \
                         cmake \
-                        libibverbs-dev \
                         libunwind-dev \
                         libgoogle-glog-dev \
                         libgtest-dev \
@@ -31,26 +30,9 @@ sudo apt-get install -y build-essential \
                         libcurl4-openssl-dev \
                         libhiredis-dev \
                         pkg-config
-                        
-pip install build setuptools wheel
-echo "*** Download and installing [cpprest sdk] ***"
-mkdir ${REPO_ROOT}/thirdparties
-cd ${REPO_ROOT}/thirdparties
-git clone ${GITHUB_PROXY}/microsoft/cpprestsdk.git
-cd cpprestsdk
-mkdir -p build
-cd build
-cmake .. -DCPPREST_EXCLUDE_WEBSOCKETS=ON
-make -j$(nproc) && sudo make install
 
-echo "*** Download and installing [etcd-cpp-apiv3] ***"
-cd ${REPO_ROOT}/thirdparties
-git clone ${GITHUB_PROXY}/etcd-cpp-apiv3/etcd-cpp-apiv3.git
-cd etcd-cpp-apiv3
-mkdir -p build
-cd build
-cmake ..
-make -j$(nproc) && sudo make install
+echo "*** Download and installing [setuptools & wheel] ***"            
+pip install build setuptools wheel
 
 echo "*** Download and installing [yalantinglibs] ***"
 cd ${REPO_ROOT}/thirdparties
