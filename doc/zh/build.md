@@ -2,26 +2,33 @@
 
 本文档叙述了 Mooncake 框架的编译方法。
 
-## 标准安装流程
+## 自动安装
 
 ### 建议版本
 - OS: Ubuntu 22.04 LTS+
 - cmake: 3.16.x
 - gcc: 9.4+
 
-### 安装vLLM
+### 步骤
+1. 安装依赖项（需要稳定的网络连接）：
+   ```bash
+   bash dependencies.sh
+   ```
 
-1. 从指定rep中克隆vLLM
-```bash
-$ git clone git@github.com:alogfans/vllm.git
-```
-2. 从源码安装vLLM
-```bash
-$ cd vllm
-$ pip install -e .
-```
+2. 在项目根目录下运行以下命令：
+   ```bash
+   mkdir build
+   cd build
+   cmake ..
+   make -j
+   ```
 
-## 高级安装流程
+3. 安装 Mooncake python 包和 mooncake_master 可执行文件：
+   ```bash
+   make install
+   ```
+
+## 手动安装
 
 ### 建议版本
 - cmake: 3.22.x
@@ -139,12 +146,27 @@ $ pip install -e .
     export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
     ```
 
-5. 进入项目根目录，运行下列命令进行编译
+5. 安装 yalantinglibs
+    ```bash
+    git clone https://github.com/alibaba/yalantinglibs.git
+    cd yalantinglibs
+    mkdir build && cd build
+    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+    make -j$(nproc)
+    make install
+    ```
+
+6. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
    cmake ..
    make -j
+   ```
+
+7. 安装 Mooncake python 包和 mooncake_master 可执行文件
+   ```bash
+   make install
    ```
 
 ## 高级编译选项
