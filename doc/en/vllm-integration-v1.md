@@ -20,7 +20,7 @@ Main changes from v0.x to v1:
 
 Please install the MooncakeStore according to the [instructions](build.md) first.
 
-### Install the latest version of vLLM and vLLM-adaptor
+### Install the latest version of vLLM and Mooncake package
 
 #### 1. Clone vLLM from official repo
 
