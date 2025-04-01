@@ -65,25 +65,37 @@ class KVBootstrapServer:
     def _run_server(self):
         try:
             # Event Loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
             
-            runner = web.AppRunner(self.app)
-            loop.run_until_complete(runner.setup())
+            self._runner = web.AppRunner(self.app)
+            self._loop.run_until_complete(self._runner.setup())
             
-            site = web.TCPSite(runner, port=self.port)
-            loop.run_until_complete(site.start())
-            loop.run_forever()
+            site = web.TCPSite(self._runner, port=self.port)
+            self._loop.run_until_complete(site.start())
+            self._loop.run_forever()
         except Exception as e:
             print(f"Server error: {str(e)}")
         finally:
             # Cleanup
-            loop.run_until_complete(runner.cleanup())
-            loop.close()
+            self._loop.run_until_complete(self._runner.cleanup())
+            self._loop.close()
 
+    def close(self):
+        """Shuttedown"""
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            print("Stopping server loop...")
+        
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+            print("Server thread stopped")
     def poll(self) -> KVPoll: ...
 
 if __name__ == '__main__':
     server = KVBootstrapServer(port=8080)
     server.run()
-    sleep(100)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        server.close()
