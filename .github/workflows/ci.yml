@@ -55,7 +55,7 @@ jobs:
         mkdir mooncake-wheel/mooncake/lib_so/
         cp build/mooncake-integration/*.so mooncake-wheel/mooncake
         cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
-        cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
+        cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/libetcd_wrapper.so
         cd mooncake-wheel
         python -m build
         pip install dist/*.whl
