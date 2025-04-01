@@ -7,12 +7,13 @@ import "C"
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"unsafe"
 )
+
+var globalClient *CClient
 
 type CClient struct {
 	client *clientv3.Client
@@ -20,21 +21,29 @@ type CClient struct {
 
 //export NewEtcdClient
 func NewEtcdClient(endpoints *C.char) C.uintptr_t {
+	if globalClient != nil {
+		return C.uintptr_t(uintptr(unsafe.Pointer(globalClient)))
+	}
+
 	endpoint := C.GoString(endpoints)
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{endpoint},
 		DialTimeout: 5 * time.Second,
 	})
+
 	if err != nil {
-		panic(fmt.Sprintf("failed to connect to etcd: %v", err))
+		return 0
 	}
-	client := &CClient{client: cli}
-	fmt.Println("connect to etcd server", uintptr(unsafe.Pointer(client)), client)
-	return C.uintptr_t(uintptr(unsafe.Pointer(client)))
+
+	globalClient = &CClient{client: cli}
+	return C.uintptr_t(uintptr(unsafe.Pointer(globalClient)))
 }
 
-//export Put
-func Put(clientPtr C.uintptr_t, key *C.char, value *C.char) int {
+//export EtcdPutWrapper
+func EtcdPutWrapper(clientPtr C.uintptr_t, key *C.char, value *C.char) int {
+	if clientPtr == 0 {
+		return -1
+	}
 	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
 	v := C.GoString(value)
@@ -45,8 +54,11 @@ func Put(clientPtr C.uintptr_t, key *C.char, value *C.char) int {
 	return 0
 }
 
-//export Get
-func Get(clientPtr C.uintptr_t, key *C.char, value **C.char) int {
+//export EtcdGetWrapper
+func EtcdGetWrapper(clientPtr C.uintptr_t, key *C.char, value **C.char) int {
+	if clientPtr == 0 {
+		return -1
+	}
 	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
 	resp, err := client.client.Get(context.Background(), k)
@@ -61,8 +73,11 @@ func Get(clientPtr C.uintptr_t, key *C.char, value **C.char) int {
 	return 0
 }
 
-//export Delete
-func Delete(clientPtr C.uintptr_t, key *C.char) int {
+//export EtcdDeleteWrapper
+func EtcdDeleteWrapper(clientPtr C.uintptr_t, key *C.char) int {
+	if clientPtr == 0 {
+		return -1
+	}
 	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
 	_, err := client.client.Delete(context.Background(), k)
@@ -72,10 +87,16 @@ func Delete(clientPtr C.uintptr_t, key *C.char) int {
 	return 0
 }
 
-//export Close
-func Close(clientPtr C.uintptr_t) {
+//export EtcdCloseWrapper
+func EtcdCloseWrapper(clientPtr C.uintptr_t) {
+	if clientPtr == 0 {
+		return
+	}
 	client := *(**CClient)(unsafe.Pointer(&clientPtr))
-	client.client.Close()
+	if client == globalClient {
+		client.client.Close()
+		globalClient = nil
+	}
 }
 
 func main() {}

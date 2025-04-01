@@ -268,13 +268,18 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         client_ = NewEtcdClient((char *) metadata_uri_.c_str());
     }
 
-    virtual ~EtcdStoragePlugin() { Close(client_); }
+    virtual ~EtcdStoragePlugin() { 
+        if (client_) {
+            EtcdCloseWrapper(client_);
+            client_ = 0;
+        }
+    }
 
     virtual bool get(const std::string &key, Json::Value &value) {
         Json::Reader reader;
         char *json_data = nullptr;
-        auto ret = Get(client_, (char *) key.c_str(), &json_data);
-        if (ret) {
+        auto ret = EtcdGetWrapper(client_, (char *) key.c_str(), &json_data);
+        if (ret || !json_data) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
                        << metadata_uri_;
             return false;
@@ -294,7 +299,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         if (globalConfig().verbose)
             LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
                       << ", value=" << json_file;
-        auto ret = Put(client_, (char *) key.c_str(), (char *) json_file.c_str());
+        auto ret = EtcdPutWrapper(client_, (char *) key.c_str(), (char *) json_file.c_str());
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " from "
                        << metadata_uri_;
@@ -304,7 +309,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     }
 
     virtual bool remove(const std::string &key) {
-        auto ret = Delete(client_, (char *) key.c_str());
+        auto ret = EtcdDeleteWrapper(client_, (char *) key.c_str());
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to delete " << key
                        << " from " << metadata_uri_;
