@@ -43,7 +43,9 @@ jobs:
           mkdir -p mooncake-wheel/mooncake/lib_so/
           cp build/mooncake-integration/*.so mooncake-wheel/mooncake
           cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
-          cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/libetcd_wrapper.so
+          cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/lib_so/
+          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/mooncake_master
+          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/*.so
           python -m build mooncake-wheel/
         env:
           VERSION: ${{ env.VERSION }}
@@ -52,3 +54,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: mooncake-wheel/dist/*.whl
+          
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}

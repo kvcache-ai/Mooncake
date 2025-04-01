@@ -29,7 +29,9 @@ sudo apt-get install -y build-essential \
                         pybind11-dev \
                         libcurl4-openssl-dev \
                         libhiredis-dev \
-                        pkg-config
+                        pkg-config \
+                        patchelf
+
 
 echo "*** Download and installing [setuptools & wheel] ***"            
 pip install build setuptools wheel
