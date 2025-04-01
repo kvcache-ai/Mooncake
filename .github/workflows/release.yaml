@@ -44,6 +44,8 @@ jobs:
           cp build/mooncake-integration/*.so mooncake-wheel/mooncake
           cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
           cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
+          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/mooncake_master
+          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/*.so
           python -m build mooncake-wheel/
         env:
           VERSION: ${{ env.VERSION }}
