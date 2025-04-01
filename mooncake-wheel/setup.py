@@ -48,5 +48,6 @@ setup(
         "Programming Language :: C++",
         "Operating System :: POSIX :: Linux",
         "License :: OSI Approved :: Apache Software License",
-    ]
+    ],
+    python_requires=python_version,
 )
