@@ -24,67 +24,91 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
-std::shared_ptr<SegmentDesc>
-TransferMetadata::praseSegmentDesc(const Json::Value &segmentJSON) {
+static inline std::string getItem(const Json::Value &parent,
+                                  const std::string &key) {
+    const static Json::Value kEmpty;
+    auto data = parent.get(key, kEmpty);
+    return (data == kEmpty) ? "" : data.asString();
+}
+
+static inline uint64_t getItemUInt64(const Json::Value &parent,
+                                     const std::string &key) {
+    const static Json::Value kEmpty;
+    auto data = parent.get(key, kEmpty);
+    return (data == kEmpty) ? 0 : data.asUInt64();
+}
+
+std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
+    const Json::Value &segmentJSON) {
     auto desc = std::make_shared<SegmentDesc>();
-    desc->name = segmentJSON["name"].asString();
-    desc->protocol = segmentJSON["protocol"].asString();
+    desc->name = getItem(segmentJSON, "name");
+    desc->protocol = getItem(segmentJSON, "protocol");
+    if (desc->name.empty() || desc->protocol.empty()) return nullptr;
 
     if (desc->protocol == "rdma") {
         auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-        for (const auto &deviceJSON : segmentJSON["devices"]) {
-            DeviceDesc device;
-            device.name = deviceJSON["name"].asString();
-            device.lid = deviceJSON["lid"].asUInt();
-            device.gid = deviceJSON["gid"].asString();
-            if (device.name.empty() || device.gid.empty()) {
-                return nullptr;
+        if (segmentJSON.isMember("device"))
+            for (const auto &deviceJSON : segmentJSON["devices"]) {
+                DeviceDesc device;
+                device.name = getItem(deviceJSON, "name");
+                device.lid = getItemUInt64(deviceJSON, "lid");
+                device.gid = getItem(deviceJSON, "gid");
+                if (device.name.empty() || device.gid.empty()) {
+                    return nullptr;
+                }
+                detail.devices.push_back(device);
             }
-            detail.devices.push_back(device);
-        }
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
-            for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
-            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
-                return nullptr;
-            }
-            detail.buffers.push_back(buffer);
-        }
 
-        int ret = detail.topology.parse(
-            segmentJSON["priority_matrix"].toStyledString());
+        if (segmentJSON.isMember("buffers"))
+            for (const auto &bufferJSON : segmentJSON["buffers"]) {
+                BufferDesc buffer;
+                buffer.location = getItem(bufferJSON, "name");
+                buffer.addr = getItemUInt64(bufferJSON, "addr");
+                buffer.length = getItemUInt64(bufferJSON, "length");
+                for (const auto &rkeyJSON : bufferJSON["rkey"])
+                    buffer.rkey.push_back(rkeyJSON.asUInt());
+                for (const auto &lkeyJSON : bufferJSON["lkey"])
+                    buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.shm_path = getItem(bufferJSON, "shm_path");
+                if (buffer.location.empty() || !buffer.addr || !buffer.length ||
+                    detail.devices.size() != buffer.rkey.size() ||
+                    buffer.rkey.size() != buffer.lkey.size()) {
+                    return nullptr;
+                }
+                detail.buffers.push_back(buffer);
+            }
+
+        auto topo_string = getItem(segmentJSON, "priority_matrix");
+        if (!topo_string.empty()) detail.topology.parse(topo_string);
     } else if (desc->protocol == "tcp") {
         auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
-                return nullptr;
+        if (segmentJSON.isMember("buffers"))
+            for (const auto &bufferJSON : segmentJSON["buffers"]) {
+                BufferDesc buffer;
+                buffer.location = getItem(bufferJSON, "name");
+                buffer.addr = getItemUInt64(bufferJSON, "addr");
+                buffer.length = getItemUInt64(bufferJSON, "length");
+                if (buffer.location.empty() || !buffer.addr || !buffer.length) {
+                    return nullptr;
+                }
+                detail.buffers.push_back(buffer);
             }
-            detail.buffers.push_back(buffer);
-        }
     } else if (desc->protocol == "nvmeof") {
         auto &detail = std::get<FileSegmentDesc>(desc->detail);
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            FileBufferDesc buffer;
-            buffer.original_path = bufferJSON["file_path"].asString();
-            buffer.length = bufferJSON["length"].asUInt64();
-            const Json::Value &mounted_path_map = bufferJSON["local_path_map"];
-            for (const auto &key : mounted_path_map.getMemberNames()) {
-                buffer.mounted_path_map[key] = mounted_path_map[key].asString();
+        if (segmentJSON.isMember("buffers"))
+            for (const auto &bufferJSON : segmentJSON["buffers"]) {
+                FileBufferDesc buffer;
+                buffer.original_path = getItem(bufferJSON, "file_path");
+                buffer.length = getItemUInt64(bufferJSON, "length");
+                const Json::Value &mounted_path_map =
+                    bufferJSON["local_path_map"];
+                for (const auto &key : mounted_path_map.getMemberNames()) {
+                    buffer.mounted_path_map[key] =
+                        mounted_path_map[key].asString();
+                }
+                if (buffer.original_path.empty()) return nullptr;
+                detail.buffers.push_back(buffer);
             }
-            detail.buffers.push_back(buffer);
-        }
     } else {
         return nullptr;
     }
@@ -94,48 +118,53 @@ TransferMetadata::praseSegmentDesc(const Json::Value &segmentJSON) {
 
 Json::Value TransferMetadata::exportSegmentDesc(const SegmentDesc &desc) {
     Json::Value segmentJSON;
+    if (desc.name.empty() || desc.protocol.empty()) return Json::Value();
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
-
-    if (segmentJSON["protocol"] == "rdma") {
+    if (desc.protocol == "rdma") {
         auto &detail = std::get<MemorySegmentDesc>(desc.detail);
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : detail.devices) {
             Json::Value deviceJSON;
+            if (device.name.empty() || device.gid.empty()) return Json::Value();
             deviceJSON["name"] = device.name;
             deviceJSON["lid"] = device.lid;
             deviceJSON["gid"] = device.gid;
             devicesJSON.append(deviceJSON);
         }
-        segmentJSON["devices"] = devicesJSON;
+        if (!detail.devices.empty()) segmentJSON["devices"] = devicesJSON;
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : detail.buffers) {
             Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
+            if (buffer.location.empty()) return Json::Value();
+            bufferJSON["name"] = buffer.location;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             Json::Value rkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
-            bufferJSON["rkey"] = rkeyJSON;
+            if (!buffer.rkey.empty()) bufferJSON["rkey"] = rkeyJSON;
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
-            bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.lkey.empty()) bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.shm_path.empty())
+                bufferJSON["shm_path"] = buffer.shm_path;
             buffersJSON.append(bufferJSON);
         }
-        segmentJSON["buffers"] = buffersJSON;
+        if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
         segmentJSON["priority_matrix"] = detail.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp") {
+    } else if (desc.protocol == "tcp") {
         Json::Value buffersJSON(Json::arrayValue);
         auto &detail = std::get<MemorySegmentDesc>(desc.detail);
         for (const auto &buffer : detail.buffers) {
             Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
+            if (buffer.location.empty()) return Json::Value();
+            bufferJSON["name"] = buffer.location;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             buffersJSON.append(bufferJSON);
         }
-        segmentJSON["buffers"] = buffersJSON;
-    } else if (segmentJSON["protocol"] == "nvmeof") {
+        if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
+    } else if (desc.protocol == "nvmeof") {
         Json::Value buffersJSON(Json::arrayValue);
         auto &detail = std::get<FileSegmentDesc>(desc.detail);
         for (const auto &buffer : detail.buffers) {
@@ -146,11 +175,12 @@ Json::Value TransferMetadata::exportSegmentDesc(const SegmentDesc &desc) {
             for (const auto &entry : buffer.mounted_path_map) {
                 localPathMapJSON[entry.first] = entry.second;
             }
-            bufferJSON["local_path_map"] = localPathMapJSON;
+            if (!buffer.mounted_path_map.empty())
+                bufferJSON["local_path_map"] = localPathMapJSON;
             buffersJSON.append(bufferJSON);
         }
-        segmentJSON["buffers"] = buffersJSON;
-    } 
+        if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
+    }
     return segmentJSON;
 }
 }  // namespace mooncake

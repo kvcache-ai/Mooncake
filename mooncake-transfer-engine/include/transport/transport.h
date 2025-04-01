@@ -153,7 +153,10 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(BatchID batch_id,
-                               const std::vector<TransferRequest> &entries) = 0;
+                               const std::vector<TransferRequest> &entries) {
+        return Status::NotImplemented(
+            "Transport::submitTransfer is not implemented");
+    }
 
     virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
@@ -167,7 +170,10 @@ class Transport {
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) = 0;
+                                     TransferStatus &status) {
+        return Status::NotImplemented(
+            "Transport::getTransferStatus is not implemented");
+    }
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 

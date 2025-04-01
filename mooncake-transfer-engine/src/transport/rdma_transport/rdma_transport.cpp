@@ -84,7 +84,7 @@ int RdmaTransport::install(std::string &local_server_name,
 }
 
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
-                                       const std::string &name,
+                                       const std::string &location,
                                        bool remote_accessible,
                                        bool update_metadata) {
     (void)remote_accessible;
@@ -101,11 +101,11 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
     // Get the memory location automatically after registered MR(pinned),
     // when the name is "*".
-    if (name == "*") {
+    if (location == "*") {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         for (auto &entry : entries) {
-            buffer_desc.name = entry.location;
+            buffer_desc.location = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
             int rc =
@@ -113,7 +113,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
             if (rc) return rc;
         }
     } else {
-        buffer_desc.name = name;
+        buffer_desc.location = location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -443,7 +443,7 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-        device_id = detail.topology.selectDevice(buffer_desc.name, retry_count);
+        device_id = detail.topology.selectDevice(buffer_desc.location, retry_count);
         if (device_id >= 0) return 0;
     }
 

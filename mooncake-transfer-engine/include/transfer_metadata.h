@@ -42,11 +42,12 @@ struct DeviceDesc {
 };
 
 struct BufferDesc {
-    std::string name;  // location hint, not need to be unique
+    std::string location;
     uint64_t addr;
     uint64_t length;
     std::vector<uint32_t> lkey;  // follow the order of `devices`
     std::vector<uint32_t> rkey;  // follow the order of `devices`
+    std::string shm_path;
 };
 
 struct FileBufferDesc {
