@@ -119,15 +119,17 @@ bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
 int TransferEngine::registerLocalMemory(void *addr, size_t length,
                                         const std::string &location,
                                         bool remote_accessible,
-                                        bool update_metadata) {
+                                        bool update_metadata,
+                                        const std::string &shm_path) {
     if (checkOverlap(addr, length)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
     }
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata);
+        int ret = transport->registerLocalMemory(addr, length, location,
+                                                 remote_accessible,
+                                                 update_metadata, shm_path);
         if (ret < 0) return ret;
     }
 

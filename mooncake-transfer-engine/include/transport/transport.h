@@ -124,7 +124,7 @@ class Transport {
     };
 
     struct TransferTask {
-        volatile uint64_t slice_count   = 0;
+        volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
@@ -153,7 +153,7 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(BatchID batch_id,
-                               const std::vector<TransferRequest> &entries) {
+                                  const std::vector<TransferRequest> &entries) {
         return Status::NotImplemented(
             "Transport::submitTransfer is not implemented");
     }
@@ -180,6 +180,7 @@ class Transport {
     struct BufferEntry {
         void *addr;
         size_t length;
+        std::string shm_path;
     };
 
    protected:
@@ -197,7 +198,25 @@ class Transport {
     virtual int registerLocalMemory(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,
-                                    bool update_metadata = true) = 0;
+                                    bool update_metadata) {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    virtual int registerLocalMemory(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible) {
+        return registerLocalMemory(addr, length, location, remote_accessible,
+                                   true);
+    }
+
+    virtual int registerLocalMemory(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible,
+                                    bool update_metadata,
+                                    const std::string &shm_path) {
+        return registerLocalMemory(addr, length, location, remote_accessible,
+                                   update_metadata);
+    }
 
     virtual int unregisterLocalMemory(void *addr,
                                       bool update_metadata = true) = 0;

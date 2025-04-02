@@ -53,7 +53,7 @@ std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
         desc->protocol = getItem(segmentJSON, "protocol");
         if (desc->name.empty() || desc->protocol.empty()) return nullptr;
 
-        if (desc->protocol == "rdma") {
+        if (desc->protocol == "rdma" || desc->protocol == "shm") {
             auto &detail = std::get<MemorySegmentDesc>(desc->detail);
             if (segmentJSON.isMember("devices"))
                 for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -135,7 +135,7 @@ Json::Value TransferMetadata::exportSegmentDesc(const SegmentDesc &desc) {
         if (desc.name.empty() || desc.protocol.empty()) return Json::Value();
         segmentJSON["name"] = desc.name;
         segmentJSON["protocol"] = desc.protocol;
-        if (desc.protocol == "rdma") {
+        if (desc.protocol == "rdma" || desc.protocol == "shm") {
             auto &detail = std::get<MemorySegmentDesc>(desc.detail);
             Json::Value devicesJSON(Json::arrayValue);
             for (const auto &device : detail.devices) {

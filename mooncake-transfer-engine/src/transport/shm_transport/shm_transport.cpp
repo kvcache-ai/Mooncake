@@ -24,6 +24,11 @@
 #include <iomanip>
 #include <memory>
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#endif
+
 #include "common.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
@@ -31,13 +36,6 @@
 
 namespace mooncake {
 const static size_t kDefaultThreadPoolSize = 4;
-const static std::string kShmPathPrefix = "/dev/shm/mooncake/";
-
-static inline std::string generateShmPath(const std::string &segment_name) {
-    static std::atomic<int> buffer_index(0);
-    auto path_prefix = kShmPathPrefix + segment_name;
-    return path_prefix + "/" + std::to_string(buffer_index.fetch_add(1));
-}
 
 ShmTransport::ShmTransport() : thread_pool_(kDefaultThreadPoolSize) {}
 
@@ -46,7 +44,6 @@ ShmTransport::~ShmTransport() {
         munmap(entry.second.shm_addr, entry.second.length);
         close(entry.second.shm_fd);
     }
-    for (auto &entry : created_entries_) deallocateLocalMemory(entry.first);
     remap_entries_.clear();
 }
 
@@ -55,6 +52,13 @@ int ShmTransport::install(std::string &local_server_name,
                           std::shared_ptr<Topology> topology) {
     metadata_ = metadata;
     local_server_name_ = local_server_name;
+
+    auto desc = std::make_shared<SegmentDesc>();
+    if (!desc) return ERR_MEMORY;
+    desc->name = local_server_name_;
+    desc->protocol = "shm";
+    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                               std::move(desc));
     return 0;
 }
 
@@ -88,12 +92,14 @@ Status ShmTransport::submitTransferTask(
 void ShmTransport::startTransfer(Slice *slice) {
     thread_pool_.submit([slice]() {
 #ifdef USE_CUDA
-        if (slice->opcode == TransferRequest::READ)
-            cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                       slice->length, cudaMemcpyDefault);
-        else
-            cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                       slice->length, cudaMemcpyDefault);
+        if (slice->target_id == LOCAL_SEGMENT_ID) {
+            if (slice->opcode == TransferRequest::READ)
+                cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+                           slice->length, cudaMemcpyDefault);
+            else
+                cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+                           slice->length, cudaMemcpyDefault);
+        }
 #else
         if (slice->opcode == TransferRequest::READ)
             memcpy(slice->source_addr, (void *)slice->local.dest_addr,
@@ -109,44 +115,19 @@ void ShmTransport::startTransfer(Slice *slice) {
 int ShmTransport::registerLocalMemory(void *addr, size_t length,
                                       const std::string &location,
                                       bool remote_accessible,
-                                      bool update_metadata) {
-    LOG(WARNING) << "Not supported to register an existing memory region";
-    return ERR_NOT_IMPLEMENTED;
-}
-
-int ShmTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-}
-
-void *ShmTransport::allocateLocalMemory(size_t length,
-                                        const std::string &location) {
-    auto shm_path = generateShmPath(local_server_name_);
-    auto addr = createSharedMemory(shm_path, length);
-    if (!addr) return nullptr;
+                                      bool update_metadata,
+                                      const std::string &shm_path) {
+    (void)remote_accessible;
     BufferDesc desc;
     desc.addr = (uint64_t)addr;
     desc.length = length;
     desc.location = location;
     desc.shm_path = shm_path;
-    int rc = metadata_->addLocalMemoryBuffer(desc, true);
-    return rc ? nullptr : addr;
+    return metadata_->addLocalMemoryBuffer(desc, true);
 }
 
-int ShmTransport::deallocateLocalMemory(void *addr) {
-    if (!created_entries_.count(addr)) {
-        LOG(ERROR) << "requested address not found";
-        return ERR_INVALID_ARGUMENT;
-    }
-    auto shm_path = created_entries_[addr].c_str();
-    created_entries_.erase(addr);
-    int rc = unregisterLocalMemory(addr);
-    if (rc) return rc;
-    rc = unlink(shm_path);
-    if (rc) {
-        PLOG(ERROR) << "unlink failed";
-        return ERR_MEMORY;
-    }
-    return 0;
+int ShmTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
 void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
@@ -217,7 +198,8 @@ int ShmTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
     for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+        registerLocalMemory(buffer.addr, buffer.length, location, true, false,
+                            buffer.shm_path);
     return metadata_->updateLocalSegmentDesc();
 }
 

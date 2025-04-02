@@ -81,7 +81,7 @@ class ShmTransport : public Transport {
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
-                            bool update_metadata);
+                            bool update_metadata, const std::string &shm_path);
 
     int unregisterLocalMemory(void *addr, bool update_metadata = false);
 
@@ -91,10 +91,6 @@ class ShmTransport : public Transport {
 
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
-
-    void *allocateLocalMemory(size_t length, const std::string &location);
-
-    int deallocateLocalMemory(void *addr);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
@@ -113,7 +109,6 @@ class ShmTransport : public Transport {
         uint64_t length;
     };
 
-    std::unordered_map<void *, std::string> created_entries_;
     std::unordered_map<uint64_t, OpenedShmEntry> remap_entries_;
 };
 }  // namespace mooncake
