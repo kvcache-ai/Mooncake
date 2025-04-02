@@ -55,9 +55,9 @@ BufferAllocator::~BufferAllocator() = default;
 
 std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     void* buffer = nullptr;
+    // Allocate memory using CacheLib.
+    size_t padding_size = std::max(size, kMinSliceSize);
     try {
-        // Allocate memory using CacheLib.
-        size_t padding_size = std::max(size, kMinSliceSize);
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
             LOG(WARNING) << "allocation_failed size=" << size
@@ -75,9 +75,9 @@ std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
     // Create and return a new BufHandle.
-    cur_size_.fetch_add(size);
+    cur_size_.fetch_add(padding_size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                             buffer, size);
+                                             buffer, padding_size);
 }
 
 void BufferAllocator::deallocate(AllocatedBuffer* handle) {
