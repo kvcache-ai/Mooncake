@@ -77,7 +77,7 @@ std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     // Create and return a new BufHandle.
     cur_size_.fetch_add(padding_size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                             buffer, padding_size);
+                                             buffer, size);
 }
 
 void BufferAllocator::deallocate(AllocatedBuffer* handle) {
