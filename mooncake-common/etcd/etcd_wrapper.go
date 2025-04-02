@@ -50,7 +50,9 @@ func EtcdPutWrapper(key *C.char, value *C.char, errMsg *C.char) int {
 	}
 	k := C.GoString(key)
 	v := C.GoString(value)
-	_, err := globalClient.Put(context.Background(), k, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+	_, err := globalClient.Put(ctx, k, v)
 	if err != nil {
 		errMsg = C.CString(err.Error())
 		return -1
@@ -65,7 +67,9 @@ func EtcdGetWrapper(key *C.char, value **C.char, errMsg *C.char) int {
 		return -1
 	}
 	k := C.GoString(key)
-	resp, err := globalClient.Get(context.Background(), k)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+	resp, err := globalClient.Get(ctx, k)
 	if err != nil {
 		errMsg = C.CString(err.Error())
 		return -1
@@ -86,7 +90,9 @@ func EtcdDeleteWrapper(key *C.char, errMsg *C.char) int {
 		return -1
 	}
 	k := C.GoString(key)
-	_, err := globalClient.Delete(context.Background(), k)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+	_, err := globalClient.Delete(ctx, k)
 	if err != nil {
 		errMsg = C.CString(err.Error())
 		return -1
