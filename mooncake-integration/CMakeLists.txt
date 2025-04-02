@@ -1,10 +1,14 @@
 file(GLOB SOURCES "*.cpp")
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
+    COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print([s for s in sys.path if 'packages' in s][0])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
+
+if("${PYTHON_SYS_PATH}" STREQUAL "")
+    message(FATAL_ERROR "Python path is empty! Please check the python env.")
+endif()
 
 include_directories("../mooncake-store/include")
 include_directories("../mooncake-store/include/cachelib_memory_allocator")
