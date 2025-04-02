@@ -16,6 +16,11 @@
 
 #include <cassert>
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#endif
+
 SGLangAdaptor::SGLangAdaptor() {}
 
 SGLangAdaptor::~SGLangAdaptor() {
@@ -93,7 +98,8 @@ int SGLangAdaptor::initializeExt(const char *local_hostname,
     if (strcmp(protocol, "rdma") == 0) {
         auto device_names = formatDeviceNames(device_name);
         std::string nic_priority_matrix =
-            "{\"cpu:0\": [[" + device_names + "], []]}";
+            "{\"cpu:0\": [[" + device_names + "], []],"
+            "\"cuda:0\": [[" + device_names + "], []]}";
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
@@ -258,7 +264,16 @@ int SGLangAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer
 
 int SGLangAdaptor::expRegisterMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    std::string location = "cpu:0";
+#ifdef USE_CUDA
+    // check pointer on GPU
+    cudaPointerAttributes attributes;
+    cudaPointerGetAttributes(&attributes, buffer);
+    if (attributes.type == cudaMemoryTypeDevice) {
+        location = "cuda:0";
+    }
+#endif
+    return engine_->registerLocalMemory(buffer, capacity, location);
 }
 
 int SGLangAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
