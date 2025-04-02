@@ -23,7 +23,7 @@ func NewEtcdClient(endpoints *C.char, errMsg *C.char) int {
 	mutex.Lock()
 	defer mutex.Unlock()
 	if globalClient != nil {
-		errMsg = C.CString("etcd client can be initalized only once")
+		errMsg = C.CString("etcd client can be initialized only once")
 		return -1
 	}
 
@@ -45,7 +45,7 @@ func NewEtcdClient(endpoints *C.char, errMsg *C.char) int {
 //export EtcdPutWrapper
 func EtcdPutWrapper(key *C.char, value *C.char, errMsg *C.char) int {
 	if globalClient == nil {
-		errMsg = C.CString("etcd client not initalized")
+		errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
 	k := C.GoString(key)
@@ -61,7 +61,7 @@ func EtcdPutWrapper(key *C.char, value *C.char, errMsg *C.char) int {
 //export EtcdGetWrapper
 func EtcdGetWrapper(key *C.char, value **C.char, errMsg *C.char) int {
 	if globalClient == nil {
-		errMsg = C.CString("etcd client not initalized")
+		errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
 	k := C.GoString(key)
@@ -82,7 +82,7 @@ func EtcdGetWrapper(key *C.char, value **C.char, errMsg *C.char) int {
 //export EtcdDeleteWrapper
 func EtcdDeleteWrapper(key *C.char, errMsg *C.char) int {
 	if globalClient == nil {
-		errMsg = C.CString("etcd client not initalized")
+		errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
 	k := C.GoString(key)
