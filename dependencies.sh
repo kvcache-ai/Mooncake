@@ -54,7 +54,7 @@ git clone ${GITHUB_PROXY}/etcd-cpp-apiv3/etcd-cpp-apiv3.git
 cd etcd-cpp-apiv3
 mkdir -p build
 cd build
-cmake ..
+cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j$(nproc) && sudo make install
 
 echo "*** Download and installing [yalantinglibs] ***"
