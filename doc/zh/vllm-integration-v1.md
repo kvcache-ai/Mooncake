@@ -216,4 +216,4 @@ curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json"
 }'
 ```
 
-* 如果您没有在代理服务器上进行测试，请将 `localhost` 更改为代理服务器的 IP 地址。
+* 如果您没有在代理服务器上进行测试，请将 `localhost` 改为代理服务器的 IP 地址。
