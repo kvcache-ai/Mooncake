@@ -8,21 +8,23 @@ import "C"
 import (
 	"context"
 	"time"
+	"sync"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"unsafe"
 )
 
-var globalClient *CClient
-
-type CClient struct {
-	client *clientv3.Client
-}
+var (
+	globalClient *clientv3.Client
+	mutex        sync.Mutex
+)
 
 //export NewEtcdClient
-func NewEtcdClient(endpoints *C.char) C.uintptr_t {
+func NewEtcdClient(endpoints *C.char, errMsg *C.char) int {
+	mutex.Lock()
+	defer mutex.Unlock()
 	if globalClient != nil {
-		return C.uintptr_t(uintptr(unsafe.Pointer(globalClient)))
+		errMsg = C.CString("etcd client can be initalized only once")
+		return -1
 	}
 
 	endpoint := C.GoString(endpoints)
@@ -32,69 +34,72 @@ func NewEtcdClient(endpoints *C.char) C.uintptr_t {
 	})
 
 	if err != nil {
-		return 0
+		errMsg = C.CString(err.Error())
+		return -1
 	}
 
-	globalClient = &CClient{client: cli}
-	return C.uintptr_t(uintptr(unsafe.Pointer(globalClient)))
+	globalClient = cli
+	return 0
 }
 
 //export EtcdPutWrapper
-func EtcdPutWrapper(clientPtr C.uintptr_t, key *C.char, value *C.char) int {
-	if clientPtr == 0 {
+func EtcdPutWrapper(key *C.char, value *C.char, errMsg *C.char) int {
+	if globalClient == nil {
+		errMsg = C.CString("etcd client not initalized")
 		return -1
 	}
-	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
 	v := C.GoString(value)
-	_, err := client.client.Put(context.Background(), k, v)
+	_, err := globalClient.Put(context.Background(), k, v)
 	if err != nil {
+		errMsg = C.CString(err.Error())
 		return -1
 	}
 	return 0
 }
 
 //export EtcdGetWrapper
-func EtcdGetWrapper(clientPtr C.uintptr_t, key *C.char, value **C.char) int {
-	if clientPtr == 0 {
+func EtcdGetWrapper(key *C.char, value **C.char, errMsg *C.char) int {
+	if globalClient == nil {
+		errMsg = C.CString("etcd client not initalized")
 		return -1
 	}
-	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
-	resp, err := client.client.Get(context.Background(), k)
+	resp, err := globalClient.Get(context.Background(), k)
 	if err != nil {
+		errMsg = C.CString(err.Error())
 		return -1
 	}
 	if len(resp.Kvs) == 0 {
-		return -2
+		*value = nil
+	} else {
+		kv := resp.Kvs[0]
+		*value = C.CString(string(kv.Value))
 	}
-	kv := resp.Kvs[0]
-	*value = C.CString(string(kv.Value))
 	return 0
 }
 
 //export EtcdDeleteWrapper
-func EtcdDeleteWrapper(clientPtr C.uintptr_t, key *C.char) int {
-	if clientPtr == 0 {
+func EtcdDeleteWrapper(key *C.char, errMsg *C.char) int {
+	if globalClient == nil {
+		errMsg = C.CString("etcd client not initalized")
 		return -1
 	}
-	client := *(**CClient)(unsafe.Pointer(&clientPtr))
 	k := C.GoString(key)
-	_, err := client.client.Delete(context.Background(), k)
+	_, err := globalClient.Delete(context.Background(), k)
 	if err != nil {
+		errMsg = C.CString(err.Error())
 		return -1
 	}
 	return 0
 }
 
 //export EtcdCloseWrapper
-func EtcdCloseWrapper(clientPtr C.uintptr_t) {
-	if clientPtr == 0 {
-		return
-	}
-	client := *(**CClient)(unsafe.Pointer(&clientPtr))
-	if client == globalClient {
-		client.client.Close()
+func EtcdCloseWrapper() {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if globalClient != nil {
+		globalClient.Close()
 		globalClient = nil
 	}
 }
