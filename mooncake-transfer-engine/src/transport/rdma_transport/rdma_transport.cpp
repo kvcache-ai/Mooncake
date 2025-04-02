@@ -243,7 +243,7 @@ Status RdmaTransport::submitTransfer(
                     detail.buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task.slice_count++;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {
@@ -302,7 +302,7 @@ Status RdmaTransport::submitTransferTask(
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
-                task.slice_count += 1;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {

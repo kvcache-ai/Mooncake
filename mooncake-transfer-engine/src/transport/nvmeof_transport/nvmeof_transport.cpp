@@ -243,7 +243,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     slice->task = &task;
     slice->status = Slice::PENDING;
     task.total_bytes += slice->length;
-    task.slice_count += 1;
+    __sync_fetch_and_add(&task.slice_count, 1);
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(
