@@ -52,6 +52,8 @@ struct HandShakePlugin {
                      const Json::Value &local, Json::Value &peer) = 0;
 };
 
+uint16_t findAvailableTcpPort();
+
 }  // namespace mooncake
 
 #endif  // TRANSFER_METADATA_PLUGIN
