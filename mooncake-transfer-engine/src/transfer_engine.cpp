@@ -49,7 +49,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         // In the new rpc port mapping, it is randomly selected to prevent
         // port conflict
         (void)(rpc_port);
-        desc.rpc_port = findAvailableTcpPort();
+        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
         if (desc.rpc_port == 0) {
             LOG(ERROR) << "not valid port for serving local TCP service";
             return -1;
