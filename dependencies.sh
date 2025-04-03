@@ -32,7 +32,6 @@ sudo apt-get install -y build-essential \
                         pkg-config \
                         patchelf
 
-
 echo "*** Download and installing [setuptools & wheel] ***"            
 pip install build setuptools wheel
 
