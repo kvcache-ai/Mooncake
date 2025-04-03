@@ -648,7 +648,7 @@ std::vector<std::string> findLocalIpAddresses() {
 }
 
 uint16_t findAvailableTcpPort() {
-    static std::mt19937 rand_gen(std::time(nullptr));
+    static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     const int min_port = 15000;
     const int max_port = 16000;
