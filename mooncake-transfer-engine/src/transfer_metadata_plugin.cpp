@@ -21,6 +21,7 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <random>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
@@ -647,13 +648,14 @@ std::vector<std::string> findLocalIpAddresses() {
 }
 
 uint16_t findAvailableTcpPort() {
-    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+    static std::mt19937 rand_gen(std::time(nullptr));
+    std::uniform_int_distribution rand_dist;
     const int min_port = 15000;
     const int max_port = 16000;
     const int max_attempts = 100;
     int available_port = 0;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = min_port + std::rand() % (max_port - min_port + 1);
+        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
