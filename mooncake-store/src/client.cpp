@@ -26,13 +26,21 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring) {}
 
 Client::~Client() {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-    for (auto& entry : mounted_segments_) {
+    // No need for mutex here since the client is being destroyed(protected by
+    // shared_ptr)
+    // Make a copy of mounted_segments_ to avoid modifying while iterating
+    std::unordered_map<std::string, void*> segments_to_unmount =
+        mounted_segments_;
+
+    for (auto& entry : segments_to_unmount) {
         auto err_code = UnmountSegment(entry.first, entry.second);
         if (err_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
     }
+
+    // Clear any remaining segments
+    mounted_segments_.clear();
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
@@ -207,11 +215,21 @@ ErrorCode Client::Remove(const ObjectKey& key) {
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
-    if (reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
+    if (buffer == nullptr || size == 0 ||
+        reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
                    << " is not aligned to " << facebook::cachelib::Slab::kSize;
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        if (mounted_segments_.find(segment_name) != mounted_segments_.end()) {
+            LOG(ERROR) << "segment_already_exists segment_name="
+                       << segment_name;
+            return ErrorCode::INVALID_PARAMS;
+        }
     }
 
     int rc = transfer_engine_.registerLocalMemory((void*)buffer, size, "cpu:0",
@@ -230,16 +248,30 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        CHECK(mounted_segments_.find(segment_name) == mounted_segments_.end())
-            << "Segment already mounted";
         mounted_segments_[segment_name] = (void*)buffer;
     }
     return ErrorCode::OK;
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
+    void* segment_addr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        auto it = mounted_segments_.find(segment_name);
+        if (it == mounted_segments_.end()) {
+            LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        segment_addr = it->second;
+
+        // Remove from map first to prevent any further access to this segment
+        mounted_segments_.erase(it);
+    }
+
     ErrorCode err = master_client_.UnmountSegment(segment_name).error_code;
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to unmount segment from master: "
+                   << toString(err);
         return err;
     }
     int rc = transfer_engine_.unregisterLocalMemory(addr);
@@ -248,13 +280,6 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
                       "engine ret is "
                    << rc;
         return ErrorCode::INVALID_PARAMS;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        CHECK(mounted_segments_.find(segment_name) != mounted_segments_.end())
-            << "Segment not mounted";
-        mounted_segments_.erase(segment_name);
     }
     return ErrorCode::OK;
 }
