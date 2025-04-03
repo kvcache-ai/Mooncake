@@ -613,4 +613,37 @@ std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
     return std::make_shared<SocketHandShakePlugin>();
 }
 
+uint16_t findAvailableTcpPort() {
+    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+    const int min_port = 15000;
+    const int max_port = 16000;
+    const int max_attempts = 100;
+    int available_port = 0;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        int port = min_port + std::rand() % (max_port - min_port + 1);
+        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd == -1) {
+            continue;
+        }
+
+        int opt = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(sockfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) ==
+            0) {
+            available_port = port;
+            close(sockfd);
+            break;
+        }
+
+        close(sockfd);
+    }
+    return available_port;
+}
+
 }  // namespace mooncake

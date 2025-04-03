@@ -14,6 +14,7 @@
 
 #include "transfer_engine.h"
 
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -29,7 +30,21 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = ip_or_host_name;
-    desc.rpc_port = rpc_port;
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING"))
+        desc.rpc_port = rpc_port;
+    else {
+        // In the new rpc port mapping, it is randomly selected to prevent
+        // port conflict
+        (void)(rpc_port);
+        desc.rpc_port = findAvailableTcpPort();
+        if (desc.rpc_port == 0) {
+            LOG(ERROR) << "not valid port for serving local TCP service";
+            return -1;
+        } else {
+            LOG(INFO) << "Transfer Engine uses port " << desc.rpc_port
+                      << " for serving local TCP service";
+        }
+    }
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
