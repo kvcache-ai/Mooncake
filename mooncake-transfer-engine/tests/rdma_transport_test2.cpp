@@ -112,7 +112,7 @@ class RDMATransportTest : public ::testing::Test {
     std::string nic_priority_matrix;
     void **args;
     mooncake::Transport::SegmentID segment_id;
-    std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
+    std::shared_ptr<SegmentDesc> segment_desc;
     uint64_t remote_base;
 
    protected:
@@ -140,7 +140,8 @@ class RDMATransportTest : public ::testing::Test {
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-        remote_base = (uint64_t)segment_desc->buffers[0].addr;
+        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+        remote_base = (uint64_t)detail.buffers[0].addr;
     }
 
     void TearDown() override {

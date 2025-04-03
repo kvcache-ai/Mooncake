@@ -39,7 +39,7 @@ static inline std::string getFullMetadataKey(const std::string &segment_name) {
 }
 
 struct TransferHandshakeUtil {
-    static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
+    static Json::Value encode(const HandShakeDesc &desc) {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
         root["peer_nic_path"] = desc.peer_nic_path;
@@ -50,7 +50,7 @@ struct TransferHandshakeUtil {
         return root;
     }
 
-    static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
+    static int decode(Json::Value root, HandShakeDesc &desc) {
         Json::Reader reader;
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
@@ -81,59 +81,13 @@ TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
 
 int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
                                         const SegmentDesc &desc) {
-    Json::Value segmentJSON;
-    segmentJSON["name"] = desc.name;
-    segmentJSON["protocol"] = desc.protocol;
-
-    if (segmentJSON["protocol"] == "rdma") {
-        Json::Value devicesJSON(Json::arrayValue);
-        for (const auto &device : desc.devices) {
-            Json::Value deviceJSON;
-            deviceJSON["name"] = device.name;
-            deviceJSON["lid"] = device.lid;
-            deviceJSON["gid"] = device.gid;
-            devicesJSON.append(deviceJSON);
-        }
-        segmentJSON["devices"] = devicesJSON;
-
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
-            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
-            Json::Value rkeyJSON(Json::arrayValue);
-            for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
-            bufferJSON["rkey"] = rkeyJSON;
-            Json::Value lkeyJSON(Json::arrayValue);
-            for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
-            bufferJSON["lkey"] = lkeyJSON;
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-        segmentJSON["priority_matrix"] = desc.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp") {
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
-            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-    } else {
-        LOG(ERROR) << "Unsupported segment descriptor for register, name "
-                   << desc.name << " protocol " << desc.protocol;
-        return ERR_METADATA;
-    }
-
-    if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
+    auto segmentJSON = exportSegmentDesc(desc);
+    if (segmentJSON.empty() ||
+        !storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to register segment descriptor, name "
                    << desc.name << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
-
     return 0;
 }
 
@@ -146,7 +100,7 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     return 0;
 }
 
-std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
+std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value segmentJSON;
     if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
@@ -154,80 +108,10 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
                      << segment_name;
         return nullptr;
     }
-
-    auto desc = std::make_shared<SegmentDesc>();
-    desc->name = segmentJSON["name"].asString();
-    desc->protocol = segmentJSON["protocol"].asString();
-
-    if (desc->protocol == "rdma") {
-        for (const auto &deviceJSON : segmentJSON["devices"]) {
-            DeviceDesc device;
-            device.name = deviceJSON["name"].asString();
-            device.lid = deviceJSON["lid"].asUInt();
-            device.gid = deviceJSON["gid"].asString();
-            if (device.name.empty() || device.gid.empty()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->devices.push_back(device);
-        }
-
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
-            for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
-            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->buffers.push_back(buffer);
-        }
-
-        int ret = desc->topology.parse(
-            segmentJSON["priority_matrix"].toStyledString());
-        if (ret) {
-            LOG(WARNING) << "Corrupted segment descriptor, name "
-                         << segment_name << " protocol " << desc->protocol;
-        }
-    } else if (desc->protocol == "tcp") {
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->buffers.push_back(buffer);
-        }
-    } else if (desc->protocol == "nvmeof") {
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            NVMeoFBufferDesc buffer;
-            buffer.file_path = bufferJSON["file_path"].asString();
-            buffer.length = bufferJSON["length"].asUInt64();
-            const Json::Value &local_path_map = bufferJSON["local_path_map"];
-            for (const auto &key : local_path_map.getMemberNames()) {
-                buffer.local_path_map[key] = local_path_map[key].asString();
-            }
-            desc->nvmeof_buffers.push_back(buffer);
-        }
-    } else {
-        LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
-                   << " protocol " << desc->protocol;
-        return nullptr;
+    auto desc = praseSegmentDesc(segmentJSON);
+    if (!desc) {
+        LOG(WARNING) << "Corrupted segment descriptor, name " << segment_name;
     }
-
     return desc;
 }
 
@@ -247,7 +131,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     return 0;
 }
 
-std::shared_ptr<TransferMetadata::SegmentDesc>
+std::shared_ptr<SegmentDesc>
 TransferMetadata::getSegmentDescByName(const std::string &segment_name,
                                        bool force_update) {
     if (globalConfig().metacache && !force_update) {
@@ -273,9 +157,10 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
     return segment_desc;
 }
 
-std::shared_ptr<TransferMetadata::SegmentDesc>
+std::shared_ptr<SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
-    if (segment_id != LOCAL_SEGMENT_ID && (!globalConfig().metacache || force_update)) {
+    if (segment_id != LOCAL_SEGMENT_ID &&
+        (!globalConfig().metacache || force_update)) {
         RWSpinlock::WriteGuard guard(segment_lock_);
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         auto segment_desc =
@@ -290,7 +175,7 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     }
 }
 
-TransferMetadata::SegmentID TransferMetadata::getSegmentID(
+SegmentID TransferMetadata::getSegmentID(
     const std::string &segment_name) {
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
@@ -332,7 +217,8 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
-        segment_desc->buffers.push_back(buffer_desc);
+        std::get<MemorySegmentDesc>(segment_desc->detail)
+            .buffers.push_back(buffer_desc);
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -347,10 +233,11 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
-        for (auto iter = segment_desc->buffers.begin();
-             iter != segment_desc->buffers.end(); ++iter) {
+        auto &buffers =
+            std::get<MemorySegmentDesc>(segment_desc->detail).buffers;
+        for (auto iter = buffers.begin(); iter != buffers.end(); ++iter) {
             if (iter->addr == (uint64_t)addr) {
-                segment_desc->buffers.erase(iter);
+                buffers.erase(iter);
                 addr_exist = true;
                 break;
             }
