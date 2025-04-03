@@ -373,7 +373,10 @@ void TcpTransport::startTransfer(Slice *slice) {
             slice->markFailed();
             return;
         }
-
+        if (meta_entry.sockfd) {
+            close(meta_entry.rpc_port);
+            meta_entry.rpc_port = -1;
+        }
         auto endpoint_iterator = resolver.resolve(
             boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
             std::to_string(meta_entry.rpc_port));
