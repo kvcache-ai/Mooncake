@@ -86,10 +86,17 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
 
     // TODO: remove `false` in the feature, it's for keep same API in vllm.
     engine_ = std::make_unique<TransferEngine>(false);
-    auto hostname_port = parseHostNameWithPort(local_hostname);
-    int ret = engine_->init(conn_string, local_hostname,
-                            hostname_port.first.c_str(), hostname_port.second);
-    if (ret) return -1;
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+        auto hostname_port = parseHostNameWithPort(local_hostname);
+        int ret =
+            engine_->init(conn_string, local_hostname,
+                          hostname_port.first.c_str(), hostname_port.second);
+        if (ret) return -1;
+    } else {
+        // the last two params are unused
+        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        if (ret) return -1;
+    }
 
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {
@@ -219,7 +226,8 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
 }
 
 int VLLMAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer,
-                                 uintptr_t peer_buffer_address, size_t length, TransferOpcode opcode) {
+                                 uintptr_t peer_buffer_address, size_t length,
+                                 TransferOpcode opcode) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -269,7 +277,8 @@ int VLLMAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
 }
 
 uintptr_t VLLMAdaptor::getFirstBufferAddress(const std::string &segment_name) {
-    Transport::SegmentHandle segment_id = engine_->openSegment(segment_name.c_str());
+    Transport::SegmentHandle segment_id =
+        engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
     return segment_desc->buffers[0].addr;
 }
@@ -277,26 +286,26 @@ uintptr_t VLLMAdaptor::getFirstBufferAddress(const std::string &segment_name) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
-    py::enum_<VLLMAdaptor::TransferOpcode> transfer_opcode(
-        m, "TransferOpcode", py::arithmetic());
-    transfer_opcode
-        .value("READ", VLLMAdaptor::TransferOpcode::READ)
+    py::enum_<VLLMAdaptor::TransferOpcode> transfer_opcode(m, "TransferOpcode",
+                                                           py::arithmetic());
+    transfer_opcode.value("READ", VLLMAdaptor::TransferOpcode::READ)
         .value("WRITE", VLLMAdaptor::TransferOpcode::WRITE)
         .export_values();
 
-    auto adaptor_cls = py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
-        .def(py::init<>())
-        .def("initialize", &VLLMAdaptor::initialize)
-        .def("initializeExt", &VLLMAdaptor::initializeExt)
-        .def("allocateManagedBuffer", &VLLMAdaptor::allocateManagedBuffer)
-        .def("freeManagedBuffer", &VLLMAdaptor::freeManagedBuffer)
-        .def("transferSyncExt", &VLLMAdaptor::transferSyncExt)
-        .def("transferSync", &VLLMAdaptor::transferSync)
-        .def("writeBytesToBuffer", &VLLMAdaptor::writeBytesToBuffer)
-        .def("readBytesFromBuffer", &VLLMAdaptor::readBytesFromBuffer)
-        .def("expRegisterMemory", &VLLMAdaptor::expRegisterMemory)
-        .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory)
-        .def("getFirstBufferAddress", &VLLMAdaptor::getFirstBufferAddress);
+    auto adaptor_cls =
+        py::class_<VLLMAdaptor>(m, "mooncake_vllm_adaptor")
+            .def(py::init<>())
+            .def("initialize", &VLLMAdaptor::initialize)
+            .def("initializeExt", &VLLMAdaptor::initializeExt)
+            .def("allocateManagedBuffer", &VLLMAdaptor::allocateManagedBuffer)
+            .def("freeManagedBuffer", &VLLMAdaptor::freeManagedBuffer)
+            .def("transferSyncExt", &VLLMAdaptor::transferSyncExt)
+            .def("transferSync", &VLLMAdaptor::transferSync)
+            .def("writeBytesToBuffer", &VLLMAdaptor::writeBytesToBuffer)
+            .def("readBytesFromBuffer", &VLLMAdaptor::readBytesFromBuffer)
+            .def("expRegisterMemory", &VLLMAdaptor::expRegisterMemory)
+            .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory)
+            .def("getFirstBufferAddress", &VLLMAdaptor::getFirstBufferAddress);
 
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
@@ -308,6 +317,6 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("isExist", &DistributedObjectStore::isExist)
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("getSize", &DistributedObjectStore::getSize);
-    
+
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 }

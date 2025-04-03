@@ -16,6 +16,11 @@
 
 #include <cassert>
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#endif
+
 SGLangAdaptor::SGLangAdaptor() {}
 
 SGLangAdaptor::~SGLangAdaptor() {
@@ -66,17 +71,17 @@ std::pair<std::string, std::string> parseConnectionString(
 }
 
 int SGLangAdaptor::initialize(const char *local_hostname,
-                            const char *metadata_server, const char *protocol,
-                            const char *device_name) {
+                              const char *metadata_server, const char *protocol,
+                              const char *device_name) {
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
 }
 
 int SGLangAdaptor::initializeExt(const char *local_hostname,
-                               const char *metadata_server,
-                               const char *protocol, const char *device_name,
-                               const char *metadata_type) {
+                                 const char *metadata_server,
+                                 const char *protocol, const char *device_name,
+                                 const char *metadata_type) {
     std::string conn_string = metadata_server;
     if (conn_string.find("://") == std::string::npos)
         conn_string =
@@ -84,16 +89,25 @@ int SGLangAdaptor::initializeExt(const char *local_hostname,
 
     // TODO: remove `false` in the feature, it's for keep same API in SGLang.
     engine_ = std::make_unique<TransferEngine>(false);
-    auto hostname_port = parseHostNameWithPort(local_hostname);
-    int ret = engine_->init(conn_string, local_hostname,
-                            hostname_port.first.c_str(), hostname_port.second);
-    if (ret) return -1;
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+        auto hostname_port = parseHostNameWithPort(local_hostname);
+        int ret =
+            engine_->init(conn_string, local_hostname,
+                          hostname_port.first.c_str(), hostname_port.second);
+        if (ret) return -1;
+    } else {
+        // the last two params are unused
+        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        if (ret) return -1;
+    }
 
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {
         auto device_names = formatDeviceNames(device_name);
-        std::string nic_priority_matrix =
-            "{\"cpu:0\": [[" + device_names + "], []]}";
+        std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
+                                          "], []],"
+                                          "\"cuda:0\": [[" +
+                                          device_names + "], []]}";
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
@@ -181,7 +195,7 @@ int SGLangAdaptor::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
 }
 
 int SGLangAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
-                              uintptr_t peer_buffer_address, size_t length) {
+                                uintptr_t peer_buffer_address, size_t length) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -216,8 +230,10 @@ int SGLangAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     }
 }
 
-int SGLangAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer,
-                                 uintptr_t peer_buffer_address, size_t length, TransferOpcode opcode) {
+int SGLangAdaptor::transferSyncExt(const char *target_hostname,
+                                   uintptr_t buffer,
+                                   uintptr_t peer_buffer_address, size_t length,
+                                   TransferOpcode opcode) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -258,7 +274,16 @@ int SGLangAdaptor::transferSyncExt(const char *target_hostname, uintptr_t buffer
 
 int SGLangAdaptor::expRegisterMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    std::string location = "cpu:0";
+#ifdef USE_CUDA
+    // check pointer on GPU
+    cudaPointerAttributes attributes;
+    cudaPointerGetAttributes(&attributes, buffer);
+    if (attributes.type == cudaMemoryTypeDevice) {
+        location = "cuda:0";
+    }
+#endif
+    return engine_->registerLocalMemory(buffer, capacity, location);
 }
 
 int SGLangAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
@@ -266,8 +291,10 @@ int SGLangAdaptor::expUnregisterMemory(uintptr_t buffer_addr) {
     return engine_->unregisterLocalMemory(buffer);
 }
 
-uintptr_t SGLangAdaptor::getFirstBufferAddress(const std::string &segment_name) {
-    Transport::SegmentHandle segment_id = engine_->openSegment(segment_name.c_str());
+uintptr_t SGLangAdaptor::getFirstBufferAddress(
+    const std::string &segment_name) {
+    Transport::SegmentHandle segment_id =
+        engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
     return segment_desc->buffers[0].addr;
 }
@@ -277,24 +304,25 @@ namespace py = pybind11;
 PYBIND11_MODULE(mooncake_sglang_adaptor, m) {
     py::enum_<SGLangAdaptor::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
-    transfer_opcode
-        .value("READ", SGLangAdaptor::TransferOpcode::READ)
+    transfer_opcode.value("READ", SGLangAdaptor::TransferOpcode::READ)
         .value("WRITE", SGLangAdaptor::TransferOpcode::WRITE)
         .export_values();
 
-    auto adaptor_cls = py::class_<SGLangAdaptor>(m, "TransferEngine")
-        .def(py::init<>())
-        .def("initialize", &SGLangAdaptor::initialize)
-        .def("initializeExt", &SGLangAdaptor::initializeExt)
-        .def("allocateManagedBuffer", &SGLangAdaptor::allocateManagedBuffer)
-        .def("freeManagedBuffer", &SGLangAdaptor::freeManagedBuffer)
-        .def("transferSyncExt", &SGLangAdaptor::transferSyncExt)
-        .def("transferSync", &SGLangAdaptor::transferSync)
-        .def("writeBytesToBuffer", &SGLangAdaptor::writeBytesToBuffer)
-        .def("readBytesFromBuffer", &SGLangAdaptor::readBytesFromBuffer)
-        .def("expRegisterMemory", &SGLangAdaptor::expRegisterMemory)
-        .def("expUnregisterMemory", &SGLangAdaptor::expUnregisterMemory)
-        .def("getFirstBufferAddress", &SGLangAdaptor::getFirstBufferAddress);
-    
+    auto adaptor_cls =
+        py::class_<SGLangAdaptor>(m, "TransferEngine")
+            .def(py::init<>())
+            .def("initialize", &SGLangAdaptor::initialize)
+            .def("initializeExt", &SGLangAdaptor::initializeExt)
+            .def("allocateManagedBuffer", &SGLangAdaptor::allocateManagedBuffer)
+            .def("freeManagedBuffer", &SGLangAdaptor::freeManagedBuffer)
+            .def("transferSyncExt", &SGLangAdaptor::transferSyncExt)
+            .def("transferSync", &SGLangAdaptor::transferSync)
+            .def("writeBytesToBuffer", &SGLangAdaptor::writeBytesToBuffer)
+            .def("readBytesFromBuffer", &SGLangAdaptor::readBytesFromBuffer)
+            .def("expRegisterMemory", &SGLangAdaptor::expRegisterMemory)
+            .def("expUnregisterMemory", &SGLangAdaptor::expUnregisterMemory)
+            .def("getFirstBufferAddress",
+                 &SGLangAdaptor::getFirstBufferAddress);
+
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 }
