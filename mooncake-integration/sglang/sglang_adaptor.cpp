@@ -104,10 +104,9 @@ int SGLangAdaptor::initializeExt(const char *local_hostname,
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {
         auto device_names = formatDeviceNames(device_name);
-        std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
-                                          "], []],"
-                                          "\"cuda:0\": [[" +
-                                          device_names + "], []]}";
+        std::string nic_priority_matrix =
+            "{\"cpu:0\": [[" + device_names + "], []],"
+            "\"cuda:0\": [[" + device_names + "], []]}";
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;

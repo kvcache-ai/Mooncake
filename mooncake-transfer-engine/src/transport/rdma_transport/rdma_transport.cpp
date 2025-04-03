@@ -423,7 +423,8 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
-        metadata_->localRpcMeta().rpc_port);
+        metadata_->localRpcMeta().rpc_port,
+        metadata_->localRpcMeta().sockfd);
 }
 
 // According to the request desc, offset and length information, find proper

@@ -22,6 +22,8 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <random>
+
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -404,7 +406,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port) {
+                            uint16_t listen_port, int sockfd) {
         sockaddr_in bind_address;
         int on = 1;
         memset(&bind_address, 0, sizeof(sockaddr_in));
@@ -412,34 +414,40 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         bind_address.sin_port = htons(listen_port);
         bind_address.sin_addr.s_addr = INADDR_ANY;
 
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) {
-            PLOG(ERROR) << "SocketHandShakePlugin: socket()";
-            return ERR_SOCKET;
-        }
+        if (sockfd >= 0) {
+            listen_fd_ = sockfd;
+        } else {
+            listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+            if (listen_fd_ < 0) {
+                PLOG(ERROR) << "SocketHandShakePlugin: socket()";
+                return ERR_SOCKET;
+            }
 
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-            closeListen();
-            return ERR_SOCKET;
-        }
+            struct timeval timeout;
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout))) {
+                PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+                closeListen();
+                return ERR_SOCKET;
+            }
 
-        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-            closeListen();
-            return ERR_SOCKET;
-        }
+            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
+                           sizeof(on))) {
+                PLOG(ERROR)
+                    << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+                closeListen();
+                return ERR_SOCKET;
+            }
 
-        if (bind(listen_fd_, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
-            0) {
-            PLOG(ERROR) << "SocketHandShakePlugin: bind (port " << listen_port
-                        << ")";
-            closeListen();
-            return ERR_SOCKET;
+            if (bind(listen_fd_, (sockaddr *)&bind_address,
+                     sizeof(sockaddr_in)) < 0) {
+                PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
+                            << listen_port << ")";
+                closeListen();
+                return ERR_SOCKET;
+            }
         }
 
         if (listen(listen_fd_, 5)) {
@@ -646,37 +654,50 @@ std::vector<std::string> findLocalIpAddresses() {
     return ips;
 }
 
-uint16_t findAvailableTcpPort() {
-    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+uint16_t findAvailableTcpPort(int &sockfd) {
+    static std::random_device rand_gen;
+    std::uniform_int_distribution rand_dist;
     const int min_port = 15000;
-    const int max_port = 16000;
-    const int max_attempts = 100;
-    int available_port = 0;
+    const int max_port = 17000;
+    const int max_attempts = 500;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = min_port + std::rand() % (max_port - min_port + 1);
-        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
         }
 
-        int opt = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-
-        if (bind(sockfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) ==
-            0) {
-            available_port = port;
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                       sizeof(timeout))) {
             close(sockfd);
-            break;
+            sockfd = -1;
+            continue;
         }
 
-        close(sockfd);
+        int on = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        sockaddr_in bind_address;
+        memset(&bind_address, 0, sizeof(sockaddr_in));
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_port = htons(port);
+        bind_address.sin_addr.s_addr = INADDR_ANY;
+        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        return port;
     }
-    return available_port;
+    return 0;
 }
 
 }  // namespace mooncake

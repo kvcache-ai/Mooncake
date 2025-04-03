@@ -73,6 +73,7 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+        int sockfd;             // local cache
     };
 
     struct HandShakeDesc {
@@ -126,7 +127,7 @@ class TransferMetadata {
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
                                                  HandShakeDesc &local_desc)>;
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                             uint16_t listen_port);
+                             uint16_t listen_port, int sockfd);
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
