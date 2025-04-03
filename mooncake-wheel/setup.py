@@ -26,7 +26,6 @@ setup(
     package_data={"mooncake": [
         "*.so",
         "mooncake_master",
-        "lib_so/libetcd-cpp-api.so",
     ]},
     include_package_data=True,
     zip_safe=False,

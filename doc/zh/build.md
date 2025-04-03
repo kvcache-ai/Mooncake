@@ -82,64 +82,7 @@ $ pip install -e .
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
 
-
-2. 安装 grpc（v1.27.x）
-注意：编译时需要加上`-DgRPC_SSL_PROVIDER=package`
-    ```bash
-    git clone https://github.com/grpc/grpc.git --depth 1 --branch v1.27.x
-    cd grpc/
-    git submodule update --init
-    mkdir cmake-build
-    cd cmake-build/
-    cmake .. -DBUILD_SHARED_LIBS=ON \
-            -DgRPC_INSTALL=ON \
-            -DgRPC_BUILD_TESTS=OFF \
-            -DgRPC_BUILD_CSHARP_EXT=OFF \
-            -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
-            -DgRPC_BACKWARDS_COMPATIBILITY_MODE=ON \
-            -DgRPC_ZLIB_PROVIDER=package \
-            -DgRPC_SSL_PROVIDER=package
-    make -j`nproc`
-    make install
-    ```
-    若`git submodule update --init`失败，请检查网络。
-
-
-3. 安装 `cpprestsdk`
-    ```bash
-    git clone https://github.com/microsoft/cpprestsdk.git
-    cd cpprestsdk
-    mkdir build && cd build
-    cmake .. -DCPPREST_EXCLUDE_WEBSOCKETS=ON
-    make -j$(nproc) && make install
-    ```
-
-4. 安装 etcd-cpp-apiv3
-    ```bash
-    git clone https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git
-    cd etcd-cpp-apiv3
-    mkdir build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    ```
-    注意：如若遇到以下类似的报错: 
-    ```
-    /usr/local/bin/grpc_cpp_plugin error while loading shared libraries: libprotoc.so.3.11.2.0: cannot open shared object file: No such file or directory
-    ```
-
-    则首先需要找到`libprotoc.so.3.11.2.0`的位置，比如: `/usr/local/lib64`, 再将该目录加入到`LD_LIBRARY_PATH`，如下: 
-    ```bash
-    echo $LD_LIBRARY_PATH
-    export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
-    ```
-
-5. 进入项目根目录，运行下列命令进行编译
+2. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
