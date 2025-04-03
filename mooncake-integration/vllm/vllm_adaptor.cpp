@@ -16,7 +16,9 @@
 
 #include <cassert>
 
+#ifdef WITH_MOONCAKE_STORE
 #include "distributed_object_store.h"
+#endif
 
 VLLMAdaptor::VLLMAdaptor() {}
 
@@ -307,6 +309,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
             .def("expUnregisterMemory", &VLLMAdaptor::expUnregisterMemory)
             .def("getFirstBufferAddress", &VLLMAdaptor::getFirstBufferAddress);
 
+#ifdef WITH_MOONCAKE_STORE
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def("setup", &DistributedObjectStore::setup)
@@ -317,6 +320,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("isExist", &DistributedObjectStore::isExist)
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("getSize", &DistributedObjectStore::getSize);
+#endif
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 }

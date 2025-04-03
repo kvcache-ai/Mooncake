@@ -16,7 +16,7 @@
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8090/metadata",
+DEFINE_string(transfer_engine_metadata_url, "etcd://127.0.0.1:2379",
               "Metadata connection string for transfer engine");
 
 namespace mooncake {
@@ -65,17 +65,19 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeClient() {
-        client_ = std::make_unique<Client>();
         void** args =
             (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-        ASSERT_EQ(client_->Init(
-                      "localhost:17812",                   // Local hostname
-                      FLAGS_transfer_engine_metadata_url,  // Metadata
-                                                           // connection string
-                      FLAGS_protocol, args,
-                      "localhost:50051"  // Master server address
-                      ),
-                  ErrorCode::OK);
+
+        auto client_opt = Client::Create(
+            "localhost:17812",                   // Local hostname
+            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
+            FLAGS_protocol, args,
+            "localhost:50051"  // Master server address
+        );
+
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = std::move(client_opt.value());
+
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
         ErrorCode rc = client_->RegisterLocalMemory(
@@ -94,13 +96,15 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void CleanupSegment() {
-        if (client_->UnmountSegment("localhost:17812", segment_ptr_) !=
-            ErrorCode::OK) {
-            LOG(ERROR) << "Failed to unmount segment";
+        if (client_ && segment_ptr_) {
+            if (client_->UnmountSegment("localhost:17812", segment_ptr_) !=
+                ErrorCode::OK) {
+                LOG(ERROR) << "Failed to unmount segment";
+            }
         }
     }
 
-    static std::unique_ptr<Client> client_;
+    static std::shared_ptr<Client> client_;
     // Here we use a simple allocator for the client buffer. In a real
     // application, user should manage the memory allocation and deallocation
     // themselves.
@@ -109,7 +113,7 @@ class ClientIntegrationTest : public ::testing::Test {
 };
 
 // Static members initialization
-std::unique_ptr<Client> ClientIntegrationTest::client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::client_ = nullptr;
 void* ClientIntegrationTest::segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;
