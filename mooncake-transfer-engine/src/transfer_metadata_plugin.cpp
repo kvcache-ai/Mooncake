@@ -16,7 +16,9 @@
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
+#include <ifaddrs.h>
 #include <jsoncpp/json/value.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
 
@@ -611,6 +613,37 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
     const std::string &conn_string) {
     return std::make_shared<SocketHandShakePlugin>();
+}
+
+std::vector<std::string> findLocalIpAddresses() {
+    std::vector<std::string> ips;
+    struct ifaddrs *ifaddr, *ifa;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        PLOG(ERROR) << "getifaddrs failed";
+        return ips;
+    }
+
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) {
+            continue;
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            if (strcmp(ifa->ifa_name, "lo") == 0) {
+                continue;
+            }
+
+            char host[NI_MAXHOST];
+            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
+                            NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+                ips.push_back(host);
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return ips;
 }
 
 uint16_t findAvailableTcpPort() {

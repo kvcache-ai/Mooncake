@@ -29,10 +29,23 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
 
     TransferMetadata::RpcMetaDesc desc;
-    desc.ip_or_host_name = ip_or_host_name;
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING"))
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+        desc.ip_or_host_name = ip_or_host_name;
         desc.rpc_port = rpc_port;
-    else {
+    } else {
+        (void)(ip_or_host_name);
+        // TODO: only support the first NIC, connectively problem existed in
+        // complex networks
+        auto ip_list = findLocalIpAddresses();
+        if (ip_list.empty()) {
+            LOG(ERROR) << "not valid LAN address found";
+            return -1;
+        } else {
+            desc.ip_or_host_name = ip_list[0];
+            LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
+                      << " for serving local TCP service";
+        }
+
         // In the new rpc port mapping, it is randomly selected to prevent
         // port conflict
         (void)(rpc_port);
