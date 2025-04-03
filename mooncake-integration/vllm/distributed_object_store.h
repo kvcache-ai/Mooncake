@@ -99,7 +99,7 @@ class DistributedObjectStore {
     int freeSlices(const std::vector<mooncake::Slice> &slices);
 
    public:
-    std::unique_ptr<mooncake::Client> client_ = nullptr;
+    std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::unique_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
         nullptr;
     struct SegmentDeleter {
