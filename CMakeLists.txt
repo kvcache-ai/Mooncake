@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake CXX C)
 
+option(ENABLE_CCACHE "Whether to open ccache" OFF)
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND AND ENABLE_CCACHE)
+  message(STATUS "Building with CCACHE enabled")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+endif()
+
 enable_testing()
 
 set(CMAKE_C_STANDARD 99)
