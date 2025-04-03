@@ -31,7 +31,7 @@ option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
-option(USE_HTTP "option for enable http as metadata server" OFF)
+option(USE_HTTP "option for enable http as metadata server" ON)
 
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
