@@ -244,13 +244,18 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
                 break;
             }
             if (device_id < 0) {
+                auto source_addr = slice->source_addr;
+                delete slice;
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
-                    << slice->source_addr;
+                    << source_addr;
                 return Status::AddressNotRegistered(
                     "RdmaTransport: not registered by any device(s), address: "
                     + std::to_string(
-                        reinterpret_cast<uintptr_t>(slice->source_addr)));
+                        reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
@@ -300,13 +305,18 @@ Status RdmaTransport::submitTransferTask(
                 break;
             }
             if (device_id < 0) {
+                auto source_addr = slice->source_addr;
+                delete slice;
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
-                    << slice->source_addr;
+                    << source_addr;
                 return Status::AddressNotRegistered(
                     "RdmaTransport: not registered by any device(s), address: "
                     + std::to_string(
-                        reinterpret_cast<uintptr_t>(slice->source_addr)));
+                        reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
