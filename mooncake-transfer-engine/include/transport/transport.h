@@ -76,6 +76,8 @@ class Transport {
 
     struct TransferTask;
 
+    // Slice must be allocated on heap, as it will delete self on markSuccess
+    // or markFailed.
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
@@ -119,11 +121,13 @@ class Transport {
             status = Slice::SUCCESS;
             __sync_fetch_and_add(&task->transferred_bytes, length);
             __sync_fetch_and_add(&task->success_slice_count, 1);
+            delete this;
         }
 
         void markFailed() {
             status = Slice::FAILED;
             __sync_fetch_and_add(&task->failed_slice_count, 1);
+            delete this;
         }
     };
 
