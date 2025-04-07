@@ -54,3 +54,14 @@ target_link_libraries(mooncake_sglang_adaptor PUBLIC
 )
 message("${PYTHON_SYS_PATH}")
 install(TARGETS mooncake_sglang_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
+
+pybind11_add_module(transfer_engine_py ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+    transfer_engine/transfer_engine_py.cpp 
+)
+target_link_libraries(transfer_engine_py PUBLIC 
+    transfer_engine 
+    glog 
+    gflags 
+)
+message("${PYTHON_SYS_PATH}")
+install(TARGETS transfer_engine_py DESTINATION ${PYTHON_SYS_PATH}/)
