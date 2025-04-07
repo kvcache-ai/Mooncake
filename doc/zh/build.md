@@ -82,7 +82,6 @@ $ pip install -e .
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
 
-
 2. 安装 grpc（v1.27.x）
 注意：编译时需要加上`-DgRPC_SSL_PROVIDER=package`
     ```bash
@@ -132,13 +131,11 @@ $ pip install -e .
     ```
     /usr/local/bin/grpc_cpp_plugin error while loading shared libraries: libprotoc.so.3.11.2.0: cannot open shared object file: No such file or directory
     ```
-
     则首先需要找到`libprotoc.so.3.11.2.0`的位置，比如: `/usr/local/lib64`, 再将该目录加入到`LD_LIBRARY_PATH`，如下: 
     ```bash
     echo $LD_LIBRARY_PATH
     export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
     ```
-
 5. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build

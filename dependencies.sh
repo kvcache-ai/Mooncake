@@ -41,6 +41,7 @@ sudo apt-get install -y build-essential \
 export CCACHE_DIR=~/.cache/ccache
 
 pip install build setuptools wheel
+
 echo "*** Download and installing [cpprest sdk] ***"
 mkdir ${REPO_ROOT}/thirdparties
 cd ${REPO_ROOT}/thirdparties

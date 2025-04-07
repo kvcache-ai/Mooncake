@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 TARGET"
+if [ "$#" -ne 6 ]; then
+    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR"
     exit 1
 fi
 
 TARGET=$1
-PROJECT_ROOT_DIRECTORY="`pwd`/../"
+USE_ETCD=$2
+USE_REDIS=$3
+USE_HTTP=$4
+USE_ETCD_LEGACY=$5
+BUILD_DIR=$6
 
 cd "src/p2pstore"
 if [ $? -ne 0 ]; then
@@ -27,17 +31,25 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# go get
-# if [ $? -ne 0 ]; then
-#     echo "Error: Failed to get dependencies."
-#     exit 1
-# fi
+EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
+EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
+EXT_LDFLAGS+=" -ltransfer_engine -lbase -lstdc++ -lnuma -lglog -libverbs -ljsoncpp"
 
-EXT_LDFLAGS="-L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src"
-EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/thirdparties/lib"
-EXT_LDFLAGS+=" -ltransfer_engine -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
-# EXT_LDFLAGS+=" -lhiredis"     // if USE_REDIS is enabled
-# EXT_LDFLAGS+=" -lcurl"        // if USE_HTTP is enabled
+if [ "$USE_ETCD" = "ON" ]; then
+    if [ "$USE_ETCD_LEGACY" = "ON" ]; then
+        EXT_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
+    else
+        EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/etcd -letcd_wrapper"
+    fi
+fi
+
+if [ "$USE_REDIS" = "ON" ]; then
+    EXT_LDFLAGS+=" -lhiredis"
+fi
+
+if [ "$USE_HTTP" = "ON" ]; then
+    EXT_LDFLAGS+=" -lcurl"
+fi
 
 go get
 go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
@@ -46,4 +58,4 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "Build completed successfully."
+echo "P2P Store: build successfully"
