@@ -12,12 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <signal.h>
 #include <sys/time.h>
 
-#include <signal.h>
+#include <algorithm>
+#include <cassert>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -67,6 +72,7 @@ DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
 DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
+DEFINE_string(shm_path, "mooncake", "Path of shared memory file");
 
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
 DEFINE_uint64(buffer_size, 1ull << 30, "total size of data buffer");
@@ -92,6 +98,31 @@ static std::string getHostname() {
         return "";
     }
     return hostname;
+}
+
+static void *allocateMemoryPool(size_t size, const std::string &shm_path) {
+    int shm_fd = shm_open(shm_path.c_str(), O_CREAT | O_RDWR, 0644);
+    if (shm_fd == -1) {
+        PLOG(ERROR) << "Failed to open shared memory file";
+        return nullptr;
+    }
+
+    if (ftruncate64(shm_fd, size) == -1) {
+        PLOG(ERROR) << "Failed to truncate shared memory file";
+        close(shm_fd);
+        return nullptr;
+    }
+
+    void *mapped_addr =
+        mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (mapped_addr == MAP_FAILED) {
+        PLOG(ERROR) << "Failed to map shared memory file";
+        close(shm_fd);
+        return nullptr;
+    }
+
+    close(shm_fd);
+    return mapped_addr;
 }
 
 static void *allocateMemoryPool(size_t size, int socket_id,
@@ -162,8 +193,8 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
-                    void *addr) {
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
+                       int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
@@ -180,8 +211,9 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
     }
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
     uint64_t remote_base =
-        (uint64_t)segment_desc->buffers[thread_id % NR_SOCKETS].addr;
+        (uint64_t)detail.buffers[thread_id % NR_SOCKETS].addr;
 
     size_t batch_count = 0;
     while (running) {
@@ -285,6 +317,8 @@ int initiator() {
             xport = engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "shm") {
+            xport = engine->installTransport("shm", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -355,7 +389,7 @@ volatile bool target_running = true;
 
 void signalHandler(int signum) {
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    target_running = false;  
+    target_running = false;
 }
 
 int target() {
@@ -378,6 +412,8 @@ int target() {
             engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "shm") {
+            engine->installTransport("shm", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -385,11 +421,20 @@ int target() {
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     for (int i = 0; i < NR_SOCKETS; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
-        memset(addr[i], 'x', FLAGS_buffer_size);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        if (FLAGS_protocol == "shm") {
+            addr[i] = allocateMemoryPool(FLAGS_buffer_size, FLAGS_shm_path);
+            memset(addr[i], 'x', FLAGS_buffer_size);
+            int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+                                                 "cpu:" + std::to_string(i),
+                                                 true, true, FLAGS_shm_path);
+            LOG_ASSERT(!rc);
+        } else {
+            addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
+            memset(addr[i], 'x', FLAGS_buffer_size);
+            int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+                                                 "cpu:" + std::to_string(i));
+            LOG_ASSERT(!rc);
+        }
     }
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
@@ -397,7 +442,12 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < NR_SOCKETS; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-        freeMemoryPool(addr[i], FLAGS_buffer_size);
+        if (FLAGS_protocol == "shm") {
+            munmap(addr[i], FLAGS_buffer_size);
+            shm_unlink(FLAGS_shm_path.c_str());
+        } else {
+            freeMemoryPool(addr[i], FLAGS_buffer_size);
+        }
     }
 
     return 0;

@@ -70,7 +70,8 @@ class TransferEngine {
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location,
                             bool remote_accessible = true,
-                            bool update_metadata = true);
+                            bool update_metadata = true,
+                            const std::string &shm_path = "");
 
     int unregisterLocalMemory(void *addr, bool update_metadata = true);
 

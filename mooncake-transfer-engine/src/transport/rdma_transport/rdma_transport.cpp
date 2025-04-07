@@ -84,7 +84,7 @@ int RdmaTransport::install(std::string &local_server_name,
 }
 
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
-                                       const std::string &name,
+                                       const std::string &location,
                                        bool remote_accessible,
                                        bool update_metadata) {
     (void)remote_accessible;
@@ -101,11 +101,11 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
     // Get the memory location automatically after registered MR(pinned),
     // when the name is "*".
-    if (name == "*") {
+    if (location == "*") {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         for (auto &entry : entries) {
-            buffer_desc.name = entry.location;
+            buffer_desc.location = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
             int rc =
@@ -113,7 +113,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
             if (rc) return rc;
         }
     } else {
-        buffer_desc.name = name;
+        buffer_desc.location = location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -138,14 +138,15 @@ int RdmaTransport::allocateLocalSegmentID() {
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
     desc->protocol = "rdma";
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : context_list_) {
-        TransferMetadata::DeviceDesc device_desc;
+        DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
         device_desc.lid = entry->lid();
         device_desc.gid = entry->gid();
-        desc->devices.push_back(device_desc);
+        detail.devices.push_back(device_desc);
     }
-    desc->topology = *(local_topology_.get());
+    detail.topology = *(local_topology_.get());
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -193,8 +194,8 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-Status RdmaTransport::submitTransfer(BatchID batch_id,
-                                  const std::vector<TransferRequest> &entries) {
+Status RdmaTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
@@ -236,11 +237,13 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
                     continue;
                 auto &context = context_list_[device_id];
                 if (!context->active()) continue;
+                auto &detail =
+                    std::get<MemorySegmentDesc>(local_segment_desc->detail);
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                    detail.buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task.slice_count++;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {
@@ -296,12 +299,14 @@ Status RdmaTransport::submitTransferTask(
                     continue;
                 auto &context = context_list_[device_id];
                 if (!context->active()) continue;
+                auto &detail =
+                    std::get<MemorySegmentDesc>(local_segment_desc->detail);
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                    detail.buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
-                task.slice_count += 1;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {
@@ -335,8 +340,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
         status[task_id].transferred_bytes = task.transferred_bytes;
         uint64_t success_slice_count = task.success_slice_count;
         uint64_t failed_slice_count = task.failed_slice_count;
-        if (success_slice_count + failed_slice_count ==
-            task.slice_count) {
+        if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
@@ -362,8 +366,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    if (success_slice_count + failed_slice_count ==
-        task.slice_count) {
+    if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
         else
@@ -443,12 +446,13 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {
-    for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
-        auto &buffer_desc = desc->buffers[buffer_id];
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    for (buffer_id = 0; buffer_id < (int)detail.buffers.size(); ++buffer_id) {
+        auto &buffer_desc = detail.buffers[buffer_id];
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-        device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        device_id = detail.topology.selectDevice(buffer_desc.location, retry_count);
         if (device_id >= 0) return 0;
     }
 

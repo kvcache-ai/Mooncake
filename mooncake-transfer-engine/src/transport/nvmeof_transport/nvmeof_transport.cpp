@@ -137,7 +137,8 @@ int NVMeoFTransport::submitTransfer(
         uint64_t segment_start = request.target_offset;
         uint64_t segment_end = request.target_offset + request.length;
         uint64_t current_offset = 0;
-        for (auto &buffer_desc : desc->nvmeof_buffers) {
+        auto &detail = std::get<FileSegmentDesc>(desc->detail);
+        for (auto &buffer_desc : detail.buffers) {
             bool is_overlap = overlap(
                 (void *)segment_start, request.length, (void *)current_offset,
                 buffer_desc
@@ -242,7 +243,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     slice->task = &task;
     slice->status = Slice::PENDING;
     task.total_bytes += slice->length;
-    task.slice_count += 1;
+    __sync_fetch_and_add(&task.slice_count, 1);
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(

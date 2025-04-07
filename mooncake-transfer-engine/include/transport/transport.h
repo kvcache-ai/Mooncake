@@ -45,10 +45,6 @@ class Transport {
     using BatchID = uint64_t;
     const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
@@ -132,7 +128,7 @@ class Transport {
     };
 
     struct TransferTask {
-        volatile uint64_t slice_count   = 0;
+        volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
@@ -161,7 +157,10 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(BatchID batch_id,
-                               const std::vector<TransferRequest> &entries) = 0;
+                                  const std::vector<TransferRequest> &entries) {
+        return Status::NotImplemented(
+            "Transport::submitTransfer is not implemented");
+    }
 
     virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
@@ -175,13 +174,17 @@ class Transport {
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) = 0;
+                                     TransferStatus &status) {
+        return Status::NotImplemented(
+            "Transport::getTransferStatus is not implemented");
+    }
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
     struct BufferEntry {
         void *addr;
         size_t length;
+        std::string shm_path;
     };
 
    protected:
@@ -199,7 +202,25 @@ class Transport {
     virtual int registerLocalMemory(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,
-                                    bool update_metadata = true) = 0;
+                                    bool update_metadata) {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    virtual int registerLocalMemory(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible) {
+        return registerLocalMemory(addr, length, location, remote_accessible,
+                                   true);
+    }
+
+    virtual int registerLocalMemory(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible,
+                                    bool update_metadata,
+                                    const std::string &shm_path) {
+        return registerLocalMemory(addr, length, location, remote_accessible,
+                                   update_metadata);
+    }
 
     virtual int unregisterLocalMemory(void *addr,
                                       bool update_metadata = true) = 0;

@@ -65,8 +65,7 @@ int WorkerPool::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
 #ifdef CONFIG_CACHE_SEGMENT_DESC
     thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
-    thread_local std::unordered_map<SegmentID,
-                                    std::shared_ptr<RdmaTransport::SegmentDesc>>
+    thread_local std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     uint64_t current_ts = getCurrentTimeInNano();
 
@@ -89,7 +88,7 @@ int WorkerPool::submitPostSend(
         }
     }
 #else
-    std::unordered_map<SegmentID, std::shared_ptr<RdmaTransport::SegmentDesc>>
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
@@ -131,11 +130,10 @@ int WorkerPool::submitPostSend(
                 continue;
             }
         }
-        slice->rdma.dest_rkey =
-            peer_segment_desc->buffers[buffer_id].rkey[device_id];
-        auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->name,
-                        peer_segment_desc->devices[device_id].name);
+        auto &detail = std::get<MemorySegmentDesc>(peer_segment_desc->detail);
+        slice->rdma.dest_rkey = detail.buffers[buffer_id].rkey[device_id];
+        auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
+                                         detail.devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
         slice_list_map[shard_id].push_back(slice);
@@ -329,7 +327,7 @@ void WorkerPool::performPollCq(int thread_id) {
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             int thread_id) {
-    std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
@@ -355,11 +353,11 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 processed_slice_count_++;
                 continue;
             }
-            slice->rdma.dest_rkey =
-                peer_segment_desc->buffers[buffer_id].rkey[device_id];
-            auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->name,
-                            peer_segment_desc->devices[device_id].name);
+            auto &detail =
+                std::get<MemorySegmentDesc>(peer_segment_desc->detail);
+            slice->rdma.dest_rkey = detail.buffers[buffer_id].rkey[device_id];
+            auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
+                                             detail.devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
         }

@@ -245,7 +245,7 @@ int TcpTransport::registerLocalMemory(void *addr, size_t length,
                                       bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    buffer_desc.name = local_server_name_;
+    buffer_desc.location = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
     return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -321,7 +321,7 @@ Status TcpTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task.slice_count += 1;
+        __sync_fetch_and_add(&task.slice_count, 1);
         startTransfer(slice);
     }
 
@@ -343,7 +343,7 @@ Status TcpTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task.slice_count += 1;
+        __sync_fetch_and_add(&task.slice_count, 1);
         startTransfer(slice);
     }
     return Status::OK();
@@ -370,7 +370,7 @@ void TcpTransport::startTransfer(Slice *slice) {
             return;
         }
 
-        TransferMetadata::RpcMetaDesc meta_entry;
+        RpcMetaDesc meta_entry;
         if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
             slice->markFailed();
             return;

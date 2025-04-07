@@ -65,7 +65,6 @@ class RdmaEndPoint {
         return setupConnectionsByActive();
     }
 
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
 

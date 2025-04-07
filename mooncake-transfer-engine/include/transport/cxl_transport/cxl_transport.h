@@ -35,11 +35,6 @@ class TransferMetadata;
 
 class CxlTransport : public Transport {
    public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
-   public:
     CxlTransport();
 
     ~CxlTransport();

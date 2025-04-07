@@ -44,11 +44,6 @@ class RdmaTransport : public Transport {
     friend class WorkerPool;
 
    public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
-   public:
     RdmaTransport();
 
     ~RdmaTransport();

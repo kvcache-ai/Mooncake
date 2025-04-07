@@ -280,7 +280,8 @@ uintptr_t VLLMAdaptor::getFirstBufferAddress(const std::string &segment_name) {
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
-    return segment_desc->buffers[0].addr;
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+    return detail.buffers[0].addr;
 }
 
 namespace py = pybind11;

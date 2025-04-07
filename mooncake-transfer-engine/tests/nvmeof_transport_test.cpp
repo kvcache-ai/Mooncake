@@ -74,7 +74,7 @@ class NVMeofTransportTest : public ::testing::Test {
     std::string nic_priority_matrix;
     void **args;
     mooncake::Transport::SegmentID segment_id;
-    std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
+    std::shared_ptr<SegmentDesc> segment_desc;
     uint64_t remote_base;
 
    protected:
