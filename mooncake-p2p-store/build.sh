@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 5 ]; then
-    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP"
+if [ "$#" -ne 6 ]; then
+    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR"
     exit 1
 fi
 
@@ -23,7 +23,7 @@ USE_ETCD=$2
 USE_REDIS=$3
 USE_HTTP=$4
 USE_ETCD_LEGACY=$5
-PROJECT_ROOT_DIRECTORY="`pwd`/../"
+BUILD_DIR=$6
 
 cd "src/p2pstore"
 if [ $? -ne 0 ]; then
@@ -31,15 +31,15 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-EXT_LDFLAGS="-L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src"
-EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src/common/base"
+EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
+EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lstdc++ -lnuma -lglog -libverbs -ljsoncpp"
 
 if [ "$USE_ETCD" = "ON" ]; then
     if [ "$USE_ETCD_LEGACY" = "ON" ]; then
         EXT_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
     else
-        EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-common/etcd -letcd_wrapper"
+        EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/etcd -letcd_wrapper"
     fi
 fi
 

@@ -189,3 +189,5 @@ cmake-build-release
 cmake-build-relwithdebinfo
 cmake-build-minsizerel
 cmake-build
+
+libetcd_wrapper.h

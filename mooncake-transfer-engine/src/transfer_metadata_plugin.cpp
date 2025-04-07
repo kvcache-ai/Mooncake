@@ -32,7 +32,7 @@
 #include <etcd/SyncClient.hpp>
 #ifdef USE_ETCD_LEGACY
 #else
-#include <../../build/mooncake-common/etcd/libetcd_wrapper.h>
+#include <libetcd_wrapper.h>
 #endif
 #endif  // USE_ETCD
 
