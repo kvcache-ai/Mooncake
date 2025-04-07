@@ -336,7 +336,7 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(transfer_engine, m) {
+PYBIND11_MODULE(engine, m) {
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
