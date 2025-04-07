@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 4 ]; then
+if [ "$#" -ne 5 ]; then
     echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP"
     exit 1
 fi
@@ -22,6 +22,7 @@ TARGET=$1
 USE_ETCD=$2
 USE_REDIS=$3
 USE_HTTP=$4
+USE_ETCD_LEGACY=$5
 PROJECT_ROOT_DIRECTORY="`pwd`/../"
 
 cd "src/p2pstore"
@@ -35,7 +36,11 @@ EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-transfer-engine/src/comm
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lstdc++ -lnuma -lglog -libverbs -ljsoncpp"
 
 if [ "$USE_ETCD" = "ON" ]; then
-    EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-common/etcd -letcd_wrapper"
+    if [ "$USE_ETCD_LEGACY" = "ON" ]; then
+        EXT_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
+    else
+        EXT_LDFLAGS+=" -L$PROJECT_ROOT_DIRECTORY/build/mooncake-common/etcd -letcd_wrapper"
+    fi
 fi
 
 if [ "$USE_REDIS" = "ON" ]; then
