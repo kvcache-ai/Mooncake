@@ -34,6 +34,10 @@
 
 #ifdef USE_ETCD
 #include <etcd/SyncClient.hpp>
+#ifdef USE_ETCD_LEGACY
+#else
+#include <libetcd_wrapper.h>
+#endif
 #endif  // USE_ETCD
 
 #include <cassert>
@@ -266,6 +270,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 #endif  // USE_HTTP
 
 #ifdef USE_ETCD
+#ifdef USE_ETCD_LEGACY
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
@@ -317,6 +322,85 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     etcd::SyncClient client_;
     const std::string metadata_uri_;
 };
+#else
+struct EtcdStoragePlugin : public MetadataStoragePlugin {
+    EtcdStoragePlugin(const std::string &metadata_uri)
+        : metadata_uri_(metadata_uri) {
+        auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+        }
+    }
+
+    virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
+
+    virtual bool get(const std::string &key, Json::Value &value) {
+        Json::Reader reader;
+        char *json_data = nullptr;
+        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key
+                       << " in " << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        if (!json_data && globalConfig().verbose) {
+            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
+                      << ", value=<n/a>";
+            return false;
+        }
+        auto json_file = std::string(json_data);
+        // free the memory allocated by EtcdGetWrapper
+        free(json_data);
+        if (!reader.parse(json_file, value)) return false;
+        if (globalConfig().verbose)
+            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
+                      << ", value=" << json_file;
+        return true;
+    }
+
+    virtual bool set(const std::string &key, const Json::Value &value) {
+        Json::FastWriter writer;
+        const std::string json_file = writer.write(value);
+        auto ret = EtcdPutWrapper((char *)key.c_str(),
+                                  (char *)json_file.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key
+                       << " in " << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        if (globalConfig().verbose)
+            LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
+                      << ", value=" << json_file;
+        return true;
+    }
+
+    virtual bool remove(const std::string &key) {
+        auto ret = EtcdDeleteWrapper((char *)key.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to remove " << key
+                       << " in " << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    const std::string metadata_uri_;
+    char *err_msg_;
+};
+#endif
 #endif  // USE_ETCD
 
 std::pair<std::string, std::string> parseConnectionString(

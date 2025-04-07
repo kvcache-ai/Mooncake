@@ -28,7 +28,6 @@ This document describes how to build Mooncake.
 ### Recommended Version
 - cmake: 3.22.x
 - boost-devel: 1.66.x
-- grpc: 1.27.x
 - googletest: 1.12.x
 - gcc: 10.2.1
 - go: 1.19+
@@ -133,7 +132,6 @@ This document describes how to build Mooncake.
     echo $LD_LIBRARY_PATH
     export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
     ```
-
 5. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
