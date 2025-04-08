@@ -28,5 +28,8 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python test_distributed_object_store.py
 kill $MASTER_PID || true
 
+echo "Running CLI entry point tests..."
+python test_cli.py
+
 echo "All tests completed successfully!"
 cd ../..
