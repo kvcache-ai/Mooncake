@@ -28,6 +28,12 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cd test_env
 python tests/test_import_structure.py
+
+echo "Verifying mooncake_master entry point..."
+# Check if the mooncake_master entry point is installed and executable
+which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
+echo "Success: mooncake_master entry point found"
+
 cd ..
 
 echo "Installation test completed successfully!"
