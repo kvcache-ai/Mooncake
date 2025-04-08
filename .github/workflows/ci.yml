@@ -52,11 +52,23 @@ jobs:
     - name: Build Python wheel
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mkdir mooncake-wheel/mooncake/lib_so/
-        cp build/mooncake-integration/*.so mooncake-wheel/mooncake
-        cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
+        # Create directory structure
+        mkdir -p mooncake-wheel/mooncake/lib_so/
+        mkdir -p mooncake-wheel/mooncake/transfer/
+
+        # Copy mooncake_vllm_adaptor to root level for backward compatibility
+        cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake/mooncake_vllm_adaptor.so
+        cp build/mooncake-integration/mooncake_sglang_adaptor.*.so mooncake-wheel/mooncake/mooncake_sglang_adaptor.so
+
+        # Copy engine.so to mooncake directory (will be imported by transfer module)
+        cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+
+        # Copy master binary and shared libraries
+        cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
         cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
         cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/lib_so/
+
+        # Build and install the wheel package
         cd mooncake-wheel
         python -m build
         pip install dist/*.whl
@@ -75,6 +87,12 @@ jobs:
         python3 master.py &
         sleep 1
         MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
+
+    - name: test import structure
+      run: |
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        cd mooncake-wheel/tests
+        python3 test_import_structure.py
 
 
   spell-check:
