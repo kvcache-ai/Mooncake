@@ -23,10 +23,16 @@ setup(
     name="mooncake-transfer-engine",
     version=VERSION,
     packages=find_packages(),
-    package_data={"mooncake": [
-        "*.so",
-        "mooncake_master",
-    ]},
+    package_data={
+        "mooncake": [
+            "*.so",
+            "mooncake_master",
+            "lib_so/*.so",
+        ],
+        "mooncake.transfer": [
+            "*.so",
+        ],
+    },
     include_package_data=True,
     zip_safe=False,
     distclass=BinaryDistribution,
