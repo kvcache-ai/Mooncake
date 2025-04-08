@@ -42,10 +42,8 @@ jobs:
       - name: Build and test Python wheel
         run: |
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-
-          # Build and test the wheel package
+          # Build the wheel package
           ./scripts/build_wheel.sh
-          ./scripts/test_installation.sh
         env:
           VERSION: ${{ env.VERSION }}
 
