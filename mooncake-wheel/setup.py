@@ -55,4 +55,9 @@ setup(
         "License :: OSI Approved :: Apache Software License",
     ],
     python_requires=python_version,
+    entry_points={
+        'console_scripts': [
+            'mooncake_master=mooncake.cli:main',
+        ],
+    },
 )

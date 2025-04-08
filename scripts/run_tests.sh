@@ -16,8 +16,13 @@ MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python transfer_engine_initiat
 kill $TARGET_PID || true
 
 echo "Running master tests..."
-pkill -f mooncake_master || true
-python master.py &
+echo "Checking if mooncake_master is installed..."
+if [ ! -f ~/.local/bin/mooncake_master ]; then
+    echo "mooncake_master not found"
+    exit 1
+fi
+echo "mooncake_master found, running tests..."
+mooncake_master &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python test_distributed_object_store.py
