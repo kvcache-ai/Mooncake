@@ -38,6 +38,10 @@ if ldd mooncake-wheel/mooncake/engine.so | grep -q "libetcd-cpp-api.so"; then
   fi
 fi
 
+patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/mooncake_master
+patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/*.so
+
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
