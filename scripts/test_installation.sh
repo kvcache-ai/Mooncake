@@ -1,0 +1,36 @@
+#!/bin/bash
+# Script to test the installation of the mooncake wheel package
+# Usage: ./scripts/test_installation.sh
+
+set -e  # Exit immediately if a command exits with a non-zero status
+
+# Ensure LD_LIBRARY_PATH includes /usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+echo "Creating a clean Python environment for testing..."
+python -m venv test_env
+source test_env/bin/activate
+
+echo "Verifying that import fails before installation..."
+# Verify that importing mooncake.transfer fails before installation
+python -c "import mooncake.transfer" 2>/dev/null && { echo "ERROR: Import succeeded when it should have failed!"; exit 1; } || echo "Good: Import failed as expected before installation"
+
+echo "Installing the wheel package..."
+# Install the wheel package
+pip install mooncake-wheel/dist/*.whl
+
+echo "Verifying that import succeeds after installation..."
+# Verify that importing mooncake.transfer succeeds after installation
+python -c "import mooncake.transfer; print('Success: Import worked after installation')" || exit 1
+
+echo "Running import structure test..."
+# Run the import structure test
+cp -r mooncake-wheel/tests test_env/
+cd test_env
+python tests/test_import_structure.py
+cd ..
+
+echo "Installation test completed successfully!"
+
+# Note: We don't deactivate the virtual environment here
+# so that subsequent scripts can use it

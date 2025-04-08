@@ -50,31 +50,19 @@ jobs:
         MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
       shell: bash
     - name: Build Python wheel
-      run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mkdir mooncake-wheel/mooncake/lib_so/
-        cp build/mooncake-integration/*.so mooncake-wheel/mooncake
-        cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
-        cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
-        cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/lib_so/
-        cd mooncake-wheel
-        python -m build
-        pip install dist/*.whl
+      run: ./scripts/build_wheel.sh
       shell: bash
-    - name: mooncake transfer_engine python test
+
+    - name: Test installation
+      run: ./scripts/test_installation.sh
+      shell: bash
+
+    - name: Run tests
       run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        cd mooncake-wheel/tests
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python transfer_engine_target.py &
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python transfer_engine_initiator_test.py
-    - name: mooncake master python test
-      run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        pkill -f mooncake_master
-        cd mooncake-wheel/tests
-        python3 master.py &
-        sleep 1
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
+        source test_env/bin/activate
+        ./scripts/run_tests.sh
+        deactivate
+      shell: bash
 
 
   spell-check:
