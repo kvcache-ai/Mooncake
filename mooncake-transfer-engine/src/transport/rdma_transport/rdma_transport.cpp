@@ -399,7 +399,6 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 #ifdef CONFIG_ERDMA
     if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
 #endif
-
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
