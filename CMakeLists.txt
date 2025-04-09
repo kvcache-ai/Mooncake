@@ -101,6 +101,8 @@ include_directories(mooncake-transfer-engine/include)
 
 if (WITH_STORE)
   message(STATUS "Mooncake Store will be build")
+  # Define WITH_MOONCAKE_STORE when WITH_STORE is enabled
+  add_compile_definitions(WITH_MOONCAKE_STORE)
   find_package(pybind11 CONFIG REQUIRED)
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)

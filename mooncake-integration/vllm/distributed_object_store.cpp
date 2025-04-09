@@ -125,11 +125,7 @@ DistributedObjectStore::~DistributedObjectStore() {
 
     if (client_ && segment_ptr_) {
         // Try to unmount the segment using saved local_hostname
-        ErrorCode rc = client_->UnInit();
-        if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to unmount segment in destructor: "
-                       << toString(rc);
-        }
+        // Client destructor will handle cleanup
         // The unique_ptr will automatically free the memory when reset
         segment_ptr_.reset();
         client_.reset();
@@ -161,20 +157,22 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         this->local_hostname = local_hostname;
     }
 
-    client_ = std::make_unique<mooncake::Client>();
-
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
-    ErrorCode rc = client_->Init(this->local_hostname, metadata_server,
+    auto client_opt =
+        mooncake::Client::Create(this->local_hostname, metadata_server,
                                  protocol, args, master_server_addr);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to initialize client: " << toString(rc);
+    if (!client_opt.has_value()) {
+        LOG(ERROR) << "Failed to create client";
         return 1;
     }
 
+    client_ = std::move(client_opt.value());
+
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    rc = client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
-                                      local_buffer_size, "cpu:0", false, false);
+    ErrorCode rc =
+        client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
+                                     local_buffer_size, "cpu:0", false, false);
     if (rc != ErrorCode::OK) {
         LOG(ERROR) << "Failed to register local memory: " << toString(rc);
         return 1;
@@ -269,11 +267,8 @@ int DistributedObjectStore::tearDownAll() {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ErrorCode rc = client_->UnInit();
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to unmount segment: " << toString(rc);
-        return 1;
-    }
+
+    // Reset the client which will trigger its destructor to clean up resources
     client_.reset();
     client_buffer_allocator_.reset();
     segment_ptr_.reset();

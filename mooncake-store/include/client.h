@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,23 +18,23 @@ namespace mooncake {
  */
 class Client {
    public:
-    Client();
     ~Client();
 
     /**
-     * @brief Initializes the client with connection and transfer settings
+     * @brief Creates and initializes a new Client instance
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
      * @param protocol_args Protocol-specific arguments
-     * @return ErrorCode indicating success/failure
+     * @param master_addr Master server address
+     * @return std::optional containing a shared_ptr to Client if successful,
+     * std::nullopt otherwise
      */
-    ErrorCode Init(const std::string& local_hostname,
-                   const std::string& metadata_connstring,
-                   const std::string& protocol, void** protocol_args,
-                   const std::string& master_addr = kDefaultMasterAddress);
-
-    ErrorCode UnInit();
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        void** protocol_args,
+        const std::string& master_addr = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key
@@ -55,8 +57,7 @@ class Client {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode Query(const std::string& object_key,
-                    ObjectInfo& object_info) const;
+    ErrorCode Query(const std::string& object_key, ObjectInfo& object_info);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -83,7 +84,7 @@ class Client {
      * @param key Key to remove
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode Remove(const ObjectKey& key) const;
+    ErrorCode Remove(const ObjectKey& key);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -131,9 +132,15 @@ class Client {
      * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
      * exists, other ErrorCode for errors
      */
-    ErrorCode IsExist(const std::string& key) const;
+    ErrorCode IsExist(const std::string& key);
 
    private:
+    /**
+     * @brief Private constructor to enforce creation through Create() method
+     */
+    Client(const std::string& local_hostname,
+           const std::string& metadata_connstring);
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -144,23 +151,25 @@ class Client {
                                  void** protocol_args);
     ErrorCode TransferData(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code) const;
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
     ErrorCode TransferWrite(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices) const;
+        std::vector<Slice>& slices);
     ErrorCode TransferRead(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices) const;
+        std::vector<Slice>& slices);
 
     // Core components
-    std::unique_ptr<TransferEngine> transfer_engine_;
-    std::unique_ptr<MasterClient> master_client_;
+    TransferEngine transfer_engine_;
+    MasterClient master_client_;
 
+    // Mutex to protect mounted_segments_
+    std::mutex mounted_segments_mutex_;
     std::unordered_map<std::string, void*> mounted_segments_;
 
     // Configuration
-    std::string local_hostname_;
-    std::string metadata_connstring_;
+    const std::string local_hostname_;
+    const std::string metadata_connstring_;
 };
 
 }  // namespace mooncake
