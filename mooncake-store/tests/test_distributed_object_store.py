@@ -3,8 +3,15 @@ import os
 import time
 import threading
 import random
+import logging
 from mooncake_vllm_adaptor import MooncakeDistributedStore
 
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper()) # Default to INFO, changeable via env var
+log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(threadName)s - %(message)s")
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
 
 def get_client(store):
     """Initialize and setup the distributed store client."""
@@ -34,20 +41,26 @@ class TestDistributedObjectStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Initialize the store once for all tests."""
+        logger.info("Initializing distributed store for test suite")
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
+        logger.info("Store initialization completed successfully")
     
     def test_client_tear_down(self):
         """Test client tear down and re-initialization."""
+        logger.info("Starting client teardown test")
         test_data = b"Hello, World!"
         key = "test_teardown_key"
         
         # Put data and verify teardown clears it
+        logger.debug(f"Putting test data with key: {key}")
         self.assertEqual(self.store.put(key, test_data), 0)
+        logger.info("Closing store connection")
         self.assertEqual(self.store.close(), 0)
         time.sleep(1)  # Allow time for teardown to complete
         
         # Re-initialize the store
+        logger.info("Re-initializing store connection")
         get_client(self.store)
         
         # Verify data is gone after teardown
@@ -61,6 +74,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
     def test_basic_put_get_exist_operations(self):
         """Test basic Put/Get/Exist operations through the Python interface."""
+        logger.info("Starting basic operations test")
         test_data = b"Hello, World!"
         key = "test_basic_key"
 
@@ -160,6 +174,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
         
         # Create and start threads
+        logger.info(f"Starting concurrent stress test with {NUM_THREADS} threads")
         threads = []
         for i in range(NUM_THREADS):
             t = threading.Thread(target=worker, args=(i,), name=f"Worker-{i}")
@@ -189,6 +204,9 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Check for any exceptions in the main thread
         if thread_exceptions:
+            logger.error("Concurrent stress test failed with exceptions")
+            for exc in thread_exceptions:
+                logger.error(f"Thread exception: {exc}")
             self.fail(f"Test failed with the following errors:\n" + "\n".join(thread_exceptions))
         
         # Calculate system-wide statistics
@@ -197,24 +215,25 @@ class TestDistributedObjectStore(unittest.TestCase):
         get_duration = system_stats['get_end'] - system_stats['get_start']
         total_data_size_gb = (VALUE_SIZE * total_operations) / (1024**3)
         
-        print(f"\nConcurrent Stress Test Results:")
-        print(f"Total threads: {NUM_THREADS}")
-        print(f"Operations per thread: {OPERATIONS_PER_THREAD}")
-        print(f"Total operations: {total_operations}")
-        print(f"Data block size: {VALUE_SIZE/1024/1024:.2f}MB")
-        print(f"Total data processed: {total_data_size_gb:.2f}GB")
-        print(f"Put duration: {put_duration:.2f} seconds")
-        print(f"Get duration: {get_duration:.2f} seconds")
-        print(f"System Put throughput: {total_operations/put_duration:.2f} ops/sec")
-        print(f"System Get throughput: {total_operations/get_duration:.2f} ops/sec")
-        print(f"System Put bandwidth: {total_data_size_gb/put_duration:.2f} GB/sec")
-        print(f"System Get bandwidth: {total_data_size_gb/get_duration:.2f} GB/sec")
+        logging.info(f"\nConcurrent Stress Test Results:")
+        logging.info(f"Total threads: {NUM_THREADS}")
+        logging.info(f"Operations per thread: {OPERATIONS_PER_THREAD}")
+        logging.info(f"Total operations: {total_operations}")
+        logging.info(f"Data block size: {VALUE_SIZE/1024/1024:.2f}MB")
+        logging.info(f"Total data processed: {total_data_size_gb:.2f}GB")
+        logging.info(f"Put duration: {put_duration:.2f} seconds")
+        logging.info(f"Get duration: {get_duration:.2f} seconds")
+        logging.info(f"System Put throughput: {total_operations/put_duration:.2f} ops/sec")
+        logging.info(f"System Get throughput: {total_operations/get_duration:.2f} ops/sec")
+        logging.info(f"System Put bandwidth: {total_data_size_gb/put_duration:.2f} GB/sec")
+        logging.info(f"System Get bandwidth: {total_data_size_gb/get_duration:.2f} GB/sec")
 
     def test_dict_fuzz_e2e(self):
          """End-to-end fuzz test comparing distributed store behavior with dict.
          Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
          After testing, all keys are removed.
          """
+         logger.info("Starting end-to-end fuzz test")
          import random
          # Local reference dict to simulate expected dict behavior
          reference = {}
@@ -226,6 +245,7 @@ class TestDistributedObjectStore(unittest.TestCase):
          # Fuzz record for debugging in case of errors
          fuzz_record = []
          try:
+             logger.info(f"Beginning fuzz test with {operations} operations")
              for i in range(operations):
                  op = random.choice(["put", "get", "remove"])
                  key = random.choice(keys_pool)
@@ -260,10 +280,10 @@ class TestDistributedObjectStore(unittest.TestCase):
                      # Also remove from key_values to allow new value if key is reused
                      key_values.pop(key, None)
          except Exception as e:
-             print(f"Error: {e}")
-             print('\nFuzz record (operations so far):')
+             logger.error(f"Fuzz test failed with error: {e}")
+             logger.error("Fuzz operation record:")
              for record in fuzz_record:
-                 print(record)
+                 logger.error(record)
              raise e
          # Cleanup: ensure all remaining keys are removed
          for key in list(reference.keys()):
