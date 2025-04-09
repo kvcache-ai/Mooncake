@@ -22,6 +22,10 @@ This document describes how to build Mooncake.
    cmake ..
    make -j
    ```
+3. Install Mooncake python package and mooncake_master executable
+   ```bash
+   make install
+   ```
 
 ## Manual
 
@@ -132,12 +136,27 @@ This document describes how to build Mooncake.
     echo $LD_LIBRARY_PATH
     export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
     ```
-5. In the root directory of this project, run the following commands:
+5. Install yalantinglibs
+    ```bash
+    git clone https://github.com/alibaba/yalantinglibs.git
+    cd yalantinglibs
+    mkdir build && cd build
+    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+    make -j$(nproc)
+    make install
+    ```
+
+6. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
    cmake ..
    make -j
+   ```
+
+7. Install Mooncake python package and mooncake_master executable
+   ```bash
+   make install
    ```
 
 ## Use Mooncake in Docker Containers
