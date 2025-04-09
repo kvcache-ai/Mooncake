@@ -258,7 +258,7 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         auto it = mounted_segments_.find(segment_name);
-        if (it == mounted_segments_.end()) {
+        if (it == mounted_segments_.end() || it->second != addr) {
             LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
             return ErrorCode::INVALID_PARAMS;
         }
@@ -274,7 +274,7 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
                    << toString(err);
         return err;
     }
-    int rc = transfer_engine_.unregisterLocalMemory(addr);
+    int rc = transfer_engine_.unregisterLocalMemory(segment_addr);
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
