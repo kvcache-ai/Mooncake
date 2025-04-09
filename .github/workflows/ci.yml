@@ -47,7 +47,7 @@ jobs:
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         cd mooncake-store/tests
-        timeout 3m MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
+        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata timeout 3m python3 test_distributed_object_store.py
       shell: bash
 
     - name: Stop mooncake master
