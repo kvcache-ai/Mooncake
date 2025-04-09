@@ -34,7 +34,7 @@ This document describes how to build Mooncake.
 - boost-devel: 1.66.x
 - googletest: 1.12.x
 - gcc: 10.2.1
-- go: 1.19+
+- go: 1.22+
 - hiredis
 - curl
 
@@ -63,11 +63,10 @@ This document describes how to build Mooncake.
                 gtest-devel \
                 boost-devel \
                 openssl-devel \
-                protobuf-devel \
                 hiredis-devel \
                 libcurl-devel \
-                protobuf-compiler 
     ```
+
     NOTE: You may need to install gtest, glog, gflags from source code:
     ```bash
     git clone https://github.com/gflags/gflags
@@ -75,68 +74,15 @@ This document describes how to build Mooncake.
     git clone https://github.com/abseil/googletest.git
     ```
 
-1. (optional). if you want to use GPU,
-    First, follow the instructions in https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ to install CUDA (ensure to select the `nvidia-fs` option to enable proper `cuFile` functionality). After that:
-    1) Refer to Section 3.7 in https://docs.nvidia.com/cuda/gpudirect-rdma/ to install `nvidia-peermem` for enabling GPU-Direct RDMA:
-    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` for compile-time and runtime linking of `cuFile`, `cudart`, and other libraries:
+2. If you want to compile the GPUDirect support module, first follow the instructions in https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ to install CUDA (ensure to enable `nvidia-fs` for proper `cuFile` module compilation). After that:
+    1) Follow Section 3.7 in https://docs.nvidia.com/cuda/gpudirect-rdma/ to install `nvidia-peermem` for enabling GPU-Direct RDMA
+    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cuFile`, `cudart`, and other libraries during compilation:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
 
-2. Install grpc (v1.27.x)
-    ```bash
-    git clone https://github.com/grpc/grpc.git --depth 1 --branch v1.27.x
-    cd grpc/
-    git submodule update --init
-    mkdir cmake-build
-    cd cmake-build/
-    cmake .. -DBUILD_SHARED_LIBS=ON \
-            -DgRPC_INSTALL=ON \
-            -DgRPC_BUILD_TESTS=OFF \
-            -DgRPC_BUILD_CSHARP_EXT=OFF \
-            -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
-            -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
-            -DgRPC_BACKWARDS_COMPATIBILITY_MODE=ON \
-            -DgRPC_ZLIB_PROVIDER=package \
-            -DgRPC_SSL_PROVIDER=package
-    make -j`nproc`
-    make install
-    ```
-    If `git submodule update --init` fails, please check Internet connection.
-
-3. Install `cpprestsdk`
-    ```bash
-    git clone https://github.com/microsoft/cpprestsdk.git
-    cd cpprestsdk
-    mkdir build && cd build
-    cmake .. -DCPPREST_EXCLUDE_WEBSOCKETS=ON
-    make -j$(nproc) && make install
-    ```
-
-4. Install etcd-cpp-apiv3
-    ```bash
-    git clone https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git
-    cd etcd-cpp-apiv3
-    mkdir build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    ```
-    NOTE: If you meet the following outputs:
-    ```
-    /usr/local/bin/grpc_cpp_plugin error while loading shared libraries: libprotoc.so.3.11.2.0: cannot open shared object file: No such file or directory
-    ```
-    You should first find the location of `libprotoc.so.3.11.2.0`, e.g., `/usr/local/lib64`, and append this directory to the `LD_LIBRARY_PATH` environment variable as like:
-    ```bash
-    echo $LD_LIBRARY_PATH
-    export LD_LIBRARY_PATH=/usr/local/lib/:/usr/local/lib64/
-    ```
-5. Install yalantinglibs
+3. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -146,7 +92,7 @@ This document describes how to build Mooncake.
     make install
     ```
 
-6. In the root directory of this project, run the following commands:
+4. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -154,7 +100,7 @@ This document describes how to build Mooncake.
    make -j
    ```
 
-7. Install Mooncake python package and mooncake_master executable
+5. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -172,12 +118,12 @@ root@vm-5-3-3:/Mooncake-main/build/mooncake-transfer-engine/example# ./transfer_
 ```
 
 ## Advanced Compile Options
-Mooncake supports the following advanced compile options:
-- `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA & NVMe-of support. 
-- `-DUSE_CXL=[ON|OFF]`: Enable CXL protocols. 
-- `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store.
-- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store. 
-- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust language support.
-- `-DUSE_REDIS=[ON|OFF]`: Enable Redis as metadata server in Mooncake (`hiredis` required).
-- `-DUSE_HTTP=[ON|OFF]`: Enable Http as metadata server in Mooncake (`curl` required).
-- `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build transfer engine as shared library (default is OFF).
+The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
+- `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
+- `-DUSE_CXL=[ON|OFF]`: Enable CXL support
+- `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
+- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.22+
+- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
+- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
+- `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
+- `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
