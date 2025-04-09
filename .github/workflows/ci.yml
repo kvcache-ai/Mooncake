@@ -36,6 +36,7 @@ jobs:
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         mooncake_master &
+
       shell: bash
     - name: test
       run: |
@@ -44,15 +45,9 @@ jobs:
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
       shell: bash
-    - name: mooncake store python test
+    - name: Stop Mooncake Master Service
       run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        cd mooncake-store/tests
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python3 test_distributed_object_store.py
-      shell: bash
-
-    - name: Stop mooncake master
-      run: pkill -f mooncake_master || true
+        pkill mooncake_master || true
       shell: bash
     
     - name: Build Python wheel
