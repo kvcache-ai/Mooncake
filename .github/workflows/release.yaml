@@ -32,7 +32,7 @@ jobs:
       - name: Install system dependencies and build project
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh
+          sudo bash -x dependencies.sh -y
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON

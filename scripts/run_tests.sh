@@ -17,8 +17,6 @@ kill $TARGET_PID || true
 
 echo "Running master tests..."
 
-
-
 which mooncake_master 2>/dev/null | grep -q '/usr/local/bin/mooncake_master' && \
   { echo "ERROR: mooncake_master found in /usr/local/bin, not installed by python"; exit 1; } || \
   echo "mooncake_master not found in /usr/local/bin, installed by python"
