@@ -33,8 +33,8 @@
 #endif
 
 #ifdef USE_ETCD
-#include <etcd/SyncClient.hpp>
 #ifdef USE_ETCD_LEGACY
+#include <etcd/SyncClient.hpp>
 #else
 #include <libetcd_wrapper.h>
 #endif
@@ -343,8 +343,8 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         char *json_data = nullptr;
         auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, err_msg_);
         if (ret) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key
-                       << " in " << metadata_uri_ << ": " << err_msg_;
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
             // free the memory for storing error message
             free(err_msg_);
             err_msg_ = nullptr;
@@ -371,8 +371,8 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         auto ret = EtcdPutWrapper((char *)key.c_str(),
                                   (char *)json_file.c_str(), err_msg_);
         if (ret) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key
-                       << " in " << metadata_uri_ << ": " << err_msg_;
+            LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
             // free the memory for storing error message
             free(err_msg_);
             err_msg_ = nullptr;
