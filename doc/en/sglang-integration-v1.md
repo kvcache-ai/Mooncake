@@ -23,7 +23,8 @@ git clone git@github.com:sgl-project/sglang.git
 ##### 2.1 Build from source
 ```bash
 cd sglang
-pip3 install -e "python[all]"
+pip install --upgrade pip
+pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
  - If you encounter any problems that you cannot solve, please refer to the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html).
 
