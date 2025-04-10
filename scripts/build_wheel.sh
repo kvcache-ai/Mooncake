@@ -24,20 +24,6 @@ cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
 cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/
 
 
-if ldd mooncake-wheel/mooncake/engine.so | grep -q "libetcd-cpp-api.so"; then
-  echo "Legacy etcd-cpp-api-v3 is enabled, adding dependent libraries..."
-
-  # Copy libetcd-cpp-api.so and its dependencies
-  if [ -f /usr/local/lib/libetcd-cpp-api.so ]; then
-    cp /usr/local/lib/libetcd-cpp-api.so mooncake-wheel/mooncake/
-    echo "Copied etcd-cpp-api dependencies to wheel package"
-  else
-    echo "Warning: libetcd-cpp-api.so not found, skipping dependencies"
-    exit 1
-  fi
-fi
-
-
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
@@ -46,7 +32,7 @@ echo "Cleaning up previous build artifacts..."
 rm -rf dist/ 
 
 echo "Building wheel with default version"
-python3 -m build
+python -m build
 
 # Create directory for repaired wheels
 mkdir -p repaired_wheels
