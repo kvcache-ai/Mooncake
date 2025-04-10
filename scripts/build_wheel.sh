@@ -8,7 +8,6 @@ set -e  # Exit immediately if a command exits with a non-zero status
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
 echo "Creating directory structure..."
-mkdir -p mooncake-wheel/mooncake/lib_so/
 mkdir -p mooncake-wheel/mooncake/transfer/
 
 echo "Copying Python modules..."
@@ -22,7 +21,7 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
-cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/lib_so/
+cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/
 
 
 if ldd mooncake-wheel/mooncake/engine.so | grep -q "libetcd-cpp-api.so"; then
@@ -30,7 +29,7 @@ if ldd mooncake-wheel/mooncake/engine.so | grep -q "libetcd-cpp-api.so"; then
 
   # Copy libetcd-cpp-api.so and its dependencies
   if [ -f /usr/local/lib/libetcd-cpp-api.so ]; then
-    cp /usr/local/lib/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
+    cp /usr/local/lib/libetcd-cpp-api.so mooncake-wheel/mooncake/
     echo "Copied etcd-cpp-api dependencies to wheel package"
   else
     echo "Warning: libetcd-cpp-api.so not found, skipping dependencies"
@@ -38,18 +37,28 @@ if ldd mooncake-wheel/mooncake/engine.so | grep -q "libetcd-cpp-api.so"; then
   fi
 fi
 
-patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/mooncake_master
-patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/*.so
-
 
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
-echo "Building wheel with default version"
-python -m build
+echo "Cleaning up previous build artifacts..."
+rm -rf dist/ 
 
+echo "Building wheel with default version"
+python3 -m build
+
+# Create directory for repaired wheels
+mkdir -p repaired_wheels
+
+echo "Repairing wheel with auditwheel..."
+# Use auditwheel to repair the wheel and include missing .so files
+auditwheel repair dist/*.whl -w repaired_wheels/ --plat manylinux_2_35_x86_64
+
+# Replace original wheel with repaired wheel
+rm -f dist/*.whl
+mv repaired_wheels/*.whl dist/
 
 cd ..
 
-echo "Wheel package built successfully!"
+echo "Wheel package built and repaired successfully!"
