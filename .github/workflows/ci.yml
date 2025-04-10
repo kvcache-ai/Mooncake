@@ -62,8 +62,11 @@ jobs:
         path: mooncake-wheel/dist/*.whl
 
   test-wheel-ubuntu:
-    runs-on: ubuntu-22.04
     needs: build-ubuntu # Ensure build job completes first
+    strategy:
+      matrix:
+        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4 
 
