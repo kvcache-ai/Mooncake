@@ -73,6 +73,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
+        if (!resp->str) return false;
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
         if (!reader.parse(json_file, value)) return false;
@@ -350,9 +351,10 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             err_msg_ = nullptr;
             return false;
         }
-        if (!json_data && globalConfig().verbose) {
-            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
-                      << ", value=<n/a>";
+        if (!json_data) {
+            if (globalConfig().verbose)
+                LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
+                          << ", value=<n/a>";
             return false;
         }
         auto json_file = std::string(json_data);

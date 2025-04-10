@@ -233,7 +233,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
         LOG(ERROR) << "Invalid source_addr or file_path";
         return;
     }
-    Slice *slice = new Slice();
+    Slice *slice = getSliceCache().allocate();
     slice->source_addr = (char *)source_addr;
     slice->length = slice_len;
     slice->opcode = op;
@@ -241,8 +241,9 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     slice->nvmeof.start = target_start;
     slice->task = &task;
     slice->status = Slice::PENDING;
+    task.slice_list.push_back(slice);
     task.total_bytes += slice->length;
-    task.slice_count += 1;
+    __sync_fetch_and_add(&task.slice_count, 1);
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(
