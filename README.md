@@ -118,6 +118,8 @@ The most simple way to use Mooncake Transfer Engine is using `pip`:
 ```python
 pip install mooncake-transfer-engine
 ```
+> [!IMPORTANT]
+> If users encounter problems such as missing `lib*.so`, they should uninstall this package by `pip uninstall mooncake-transfer-engine`, and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
