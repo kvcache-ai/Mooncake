@@ -104,28 +104,37 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 
 <h2 id="quick-start">🚀 Quick Start</h2>
 
-### Preparation
-In order to install and use Mooncake, some preparation is required.
-- RDMA Driver & SDK (e.g., Mellanox OFED).
-- Linux-x86_64 with gcc, g++ (9.4+) and cmake (3.16+).
-- Python (3.10 or above)
+### Before using Mooncake
 
-In addition, to support more features of Mooncake Transfer Engine, we *recommend* you to install the following components:
+Mooncake is designed and optimized for high-speed RDMA networks. Though Mooncake supports TCP-only data transfer, we **strongly** recommend users to evaluate the functionality and performance of Mooncake with RDMA network support.
 
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if you want to build with `-DUSE_CUDA`. You may install them from [here](https://developer.nvidia.com/cuda-downloads). 
-  ```bash
-  # Adding CUDA to PATH
-  export PATH=/usr/local/cuda/bin:$PATH
-  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-  export CUDA_PATH=/usr/local/cuda
-  ```
-- Go 1.20+, if you want to build with `-DWITH_P2P_STORE`. You may download it from [here](https://go.dev/dl/).
-- Rust Toolclain, if you want to build with `-DWITH_RUST_EXAMPLE`.
-- `hiredis`, if you want to build with `-DUSE_REDIS`, so that you use Redis instead of etcd as metadata servers.
-- `curl`, if you want to build with `-DUSE_HTTP`, so that you use HTTP instead of etcd as metadata servers.
+The following needs to be installed before running any component of Mooncake:
+- RDMA Driver & SDK, such as Mellanox OFED. 
+- Python 3.10, virtual environment is recommended.
+- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is build with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 
-### Installation
-1. Init source code
+### Use Python package
+The most simple way to use Mooncake Transfer Engine is using `pip`:
+```python
+pip install mooncake-transfer-engine
+```
+> [!IMPORTANT]
+> If users encounter problems such as missing `lib*.so`, they should uninstall this package by `pip uninstall mooncake-transfer-engine`, and build the binaries manually.
+
+### Use Docker image
+Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
+
+### Build and use binaries
+The following are additional dependencies of building Mooncake:
+- Build essentials, including gcc, g++ (9.4+) and cmake (3.16+).
+- Go 1.20+, if you want to build with `-DWITH_P2P_STORE` or `-DUSE_ETCD` (enabled by default). 
+- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is build with `-DUSE_CUDA` . *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+- [Optional] Rust Toolclain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS`, so that you use Redis instead of etcd as metadata servers.
+- [Optional] `curl`, if you want to build with `-DUSE_HTTP`, so that you use HTTP instead of etcd as metadata servers.
+
+The building and installation steps are the following:
+1. Retrieve source code from GitHub repo
    ```bash
    git clone https://github.com/kvcache-ai/Mooncake.git
    cd Mooncake
@@ -140,11 +149,11 @@ In addition, to support more features of Mooncake Transfer Engine, we *recommend
    ```bash
    mkdir build
    cd build
-   cmake .. # (optional) Specify build options like -D
+   cmake ..
    make -j
+   sudo make install # optional, make it ready to be used by vLLM/SGLang
    ```
 
-Mooncake also supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
 
 <h2 id="milestones"> 🛣️ Incoming Milestones</h2>
 
