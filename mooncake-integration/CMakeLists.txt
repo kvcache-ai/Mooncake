@@ -15,11 +15,12 @@ include_directories("../mooncake-store/include/cachelib_memory_allocator")
 
 include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
 include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
+include_directories("vllm")
 
 
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED) 
-pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+pybind11_add_module(mooncake_vllm_adaptor_raw ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     vllm/vllm_adaptor.cpp 
     vllm/distributed_object_store.cpp
 )
@@ -27,14 +28,14 @@ pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
  set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
  
- set_target_properties(mooncake_vllm_adaptor PROPERTIES
+ set_target_properties(mooncake_vllm_adaptor_raw PROPERTIES
      INSTALL_RPATH "$ORIGIN/lib_so"
      BUILD_RPATH "$ORIGIN/lib_so"
      SKIP_BUILD_RPATH FALSE
  )
  
 
-target_link_libraries(mooncake_vllm_adaptor PUBLIC 
+target_link_libraries(mooncake_vllm_adaptor_raw PUBLIC 
     transfer_engine 
     glog 
     gflags 
@@ -42,7 +43,8 @@ target_link_libraries(mooncake_vllm_adaptor PUBLIC
     cachelib_memory_allocator
 )
 message("${PYTHON_SYS_PATH}")
-install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
+install(TARGETS mooncake_vllm_adaptor_raw DESTINATION ${PYTHON_SYS_PATH}/)
+install(FILES vllm/mooncake_vllm_adaptor.py DESTINATION ${PYTHON_SYS_PATH}/)
 
 pybind11_add_module(mooncake_sglang_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     sglang/sglang_adaptor.cpp 
