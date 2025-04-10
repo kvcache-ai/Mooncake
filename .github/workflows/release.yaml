@@ -6,53 +6,163 @@ on:
       - 'v*'
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-22.04
+  build-and-release-manylinux:
+    name: Build & Release manylinux_2_28_x86_64 wheel (Python 3.10)
+    runs-on: ubuntu-latest # Runner OS, the build happens in the container
+    container: quay.io/pypa/manylinux_2_28_x86_64
     permissions:
-      contents: write
+      contents: write # Needed for softprops/action-gh-release
 
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          submodules: 'recursive'
 
-      - name: Install build tools
+      - name: Install System Dependencies & Devtoolset
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install build setuptools wheel auditwheel
+          set -e
+          set -x
+
+          # Update and install basic tools + CentOS SCL utils
+          yum update -y
+          yum install -y yum-utils centos-release-scl-rh
+
+          # Install required system libraries
+          yum install -y \
+              libibverbs-devel \
+              glog-devel \
+              jsoncpp-devel \
+              libunwind-devel \
+              numactl-devel \
+              boost-devel \
+              openssl-devel \
+              libcurl-devel \
+              hiredis-devel \
+              pkgconfig \
+              patchelf \
+              wget \
+              git \
+              which
+
+          # Install CMake 3
+          yum install -y cmake3 || echo "cmake3 not found, assuming container cmake is sufficient"
+          if command -v cmake3 &> /dev/null && ! command -v cmake &> /dev/null; then
+              ln -s /usr/bin/cmake3 /usr/bin/cmake || echo "Failed to link cmake"
+          fi
+          cmake --version
+
+          # Install Devtoolset-10 for GCC 10 (C++20 support)
+          yum install -y devtoolset-10-gcc-c++ devtoolset-10-binutils
+
+          # Clean up yum cache
+          yum clean all
+          rm -rf /var/cache/yum
+
+      - name: Build and Install yalantinglibs
+        shell: bash
+        run: |
+          set -e
+          set -x
+          # Activate GCC 10 for this step
+          scl enable devtoolset-10 -- bash -c '
+            REPO_ROOT=$(pwd)
+            GITHUB_PROXY="https://github.com"
+
+            if [ ! -d "${REPO_ROOT}/thirdparties" ]; then mkdir -p "${REPO_ROOT}/thirdparties"; fi
+            cd "${REPO_ROOT}/thirdparties"
+
+            if [ -d "yalantinglibs" ]; then rm -rf yalantinglibs; fi
+            git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
+            cd yalantinglibs
+            mkdir -p build && cd build
+
+            cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+            cmake --build . -j$(nproc)
+            cmake --install .
+          '
+
+      - name: Install Go
+        shell: bash
+        run: |
+          set -e
+          set -x
+          if ! command -v go &> /dev/null || ! (go version | grep -q 'go1.22.10'); then
+            echo "Downloading Go 1.22.10..."
+            wget -q --show-progress https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
+            echo "Installing Go 1.22.10..."
+            tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
+            rm -f go1.22.10.linux-amd64.tar.gz
+          else
+             echo "Go 1.22.10 already installed or found."
+          fi
+          export PATH=$PATH:/usr/local/go/bin
+          go version
 
       - name: Extract version from tag
+        # This step runs on the runner host but GITHUB_ENV is accessible in container steps
+        shell: bash
         run: |
           echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
 
-      - name: Install system dependencies and build project
-        run: |
-          sudo apt update -y
-          sudo bash -x dependencies.sh -y
-          mkdir build
-          cd build
-          cmake .. -DUSE_HTTP=ON
-          sudo make install -j
+      - name: Build Mooncake C++ Project (Python 3.10)
         shell: bash
-
-      - name: Build and test Python wheel
         run: |
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          # Build the wheel package
-          ./scripts/build_wheel.sh
+          set -e
+          set -x
+          # Activate GCC 10 and ensure Go is in PATH
+          export PATH=$PATH:/usr/local/go/bin
+          scl enable devtoolset-10 -- bash -c '
+            mkdir build
+            cd build
+
+            # Point to Python 3.10 within the container
+            PYTHON_EXECUTABLE=/opt/python/cp310-cp310/bin/python
+            PYTHON_INCLUDE_DIR=/opt/python/cp310-cp310/include/python3.10
+            PYTHON_LIBRARY=/opt/python/cp310-cp310/lib/libpython3.10.so # Adjust if static lib needed
+
+            cmake .. -DUSE_HTTP=ON \
+                     -DPYTHON_EXECUTABLE=${PYTHON_EXECUTABLE} \
+                     -DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIR} \
+                     -DPYTHON_LIBRARY=${PYTHON_LIBRARY}
+
+            make install -j$(nproc)
+          '
+
+      - name: Build Python wheel (Python 3.10)
+        shell: bash
         env:
+          # Pass the extracted version to the build script environment
           VERSION: ${{ env.VERSION }}
+        run: |
+          set -e
+          set -x
+          # Use Python 3.10 from the container
+          PYTHON_BIN=/opt/python/cp310-cp310/bin
+          ${PYTHON_BIN}/pip install --upgrade pip
+          ${PYTHON_BIN}/pip install auditwheel build wheel setuptools
+
+          # Ensure python3 points to the correct interpreter
+          ln -s ${PYTHON_BIN}/python /usr/local/bin/python3 || echo "python3 link failed or exists"
+          export PATH=/usr/local/bin:$PATH
+          python3 --version
+
+          # Run the build script with GCC 10 activated
+          # The script reads the VERSION env var
+          scl enable devtoolset-10 -- bash ./scripts/build_wheel.sh
+
+          # List the built wheel
+          ls -l mooncake-wheel/dist/
 
       - name: Upload wheel to GitHub Release
+        # This action runs on the host runner but accesses the workspace
         uses: softprops/action-gh-release@v1
         with:
           files: mooncake-wheel/dist/*.whl
 
       - name: Publish package to PyPI
+        # This action runs on the host runner but accesses the workspace
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist/

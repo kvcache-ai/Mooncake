@@ -53,7 +53,7 @@ mkdir -p repaired_wheels
 
 echo "Repairing wheel with auditwheel..."
 # Use auditwheel to repair the wheel and include missing .so files
-auditwheel repair dist/*.whl -w repaired_wheels/ --plat manylinux_2_35_x86_64
+auditwheel repair dist/*.whl -w repaired_wheels/ --plat manylinux_2_28_x86_64
 
 # Replace original wheel with repaired wheel
 rm -f dist/*.whl

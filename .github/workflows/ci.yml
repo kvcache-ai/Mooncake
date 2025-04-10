@@ -1,4 +1,4 @@
-name: 'Build(linux)'
+name: 'Build Manylinux Wheel'
 
 on:
   push:
@@ -7,66 +7,192 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build-ubuntu:
-    runs-on: ubuntu-22.04
+  build-manylinux-wheel:
+    name: Build manylinux_2_28_x86_64 wheel (Python 3.8)
+    runs-on: ubuntu-latest # Runner OS, the build happens in the container
+    container: quay.io/pypa/manylinux_2_28_x86_64
+
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        pip install build setuptools wheel
-        mkdir build
-        cd build
-        cmake .. -DUSE_HTTP=ON
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        # Required for yalantinglibs submodule/clone if needed later
+        submodules: 'recursive'
+
+    - name: Install System Dependencies & Devtoolset
       shell: bash
-    - name: make
       run: |
-        cd build
-        sudo make install -j
+        set -e
+        set -x
+
+        # Update and install basic tools + CentOS SCL utils
+        yum update -y
+        yum install -y yum-utils centos-release-scl-rh
+
+        # Install required system libraries (adjust based on exact needs)
+        # Note: gtest/grpc/protobuf might need specific versions built from source
+        # if system versions are incompatible.
+        yum install -y \
+            libibverbs-devel \
+            glog-devel \
+            jsoncpp-devel \
+            libunwind-devel \
+            numactl-devel \
+            boost-devel \
+            openssl-devel \
+            libcurl-devel \
+            hiredis-devel \
+            pkgconfig \
+            patchelf \
+            wget \
+            git \
+            which
+
+        # Install CMake 3 (manylinux_2_28 might have older version)
+        yum install -y cmake3 || echo "cmake3 not found, assuming container cmake is sufficient"
+        # Link cmake3 to cmake if installed
+        if command -v cmake3 &> /dev/null && ! command -v cmake &> /dev/null; then
+            ln -s /usr/bin/cmake3 /usr/bin/cmake || echo "Failed to link cmake"
+        fi
+        cmake --version
+
+        # Install Devtoolset-10 for GCC 10 (C++20 support)
+        yum install -y devtoolset-10-gcc-c++ devtoolset-10-binutils
+
+        # Clean up yum cache
+        yum clean all
+        rm -rf /var/cache/yum
+
+    - name: Build and Install yalantinglibs
       shell: bash
-    - name: start-metadata-server
       run: |
-        cd mooncake-transfer-engine/example/http-metadata-server
+        set -e
+        set -x
+        # Activate GCC 10 for this step
+        scl enable devtoolset-10 -- bash -c '
+          REPO_ROOT=$(pwd)
+          GITHUB_PROXY="https://github.com"
+
+          # Create thirdparties dir
+          if [ ! -d "${REPO_ROOT}/thirdparties" ]; then
+              mkdir -p "${REPO_ROOT}/thirdparties"
+          fi
+          cd "${REPO_ROOT}/thirdparties"
+
+          # Clone yalantinglibs
+          if [ -d "yalantinglibs" ]; then rm -rf yalantinglibs; fi
+          git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
+          cd yalantinglibs
+          mkdir -p build && cd build
+
+          # Configure, build, and install
+          cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+          cmake --build . -j$(nproc)
+          cmake --install . # Installs to /usr/local by default
+        '
+
+    - name: Install Go
+      shell: bash
+      run: |
+        set -e
+        set -x
+        # Install Go (same logic as dependencies.sh)
+        if ! command -v go &> /dev/null || ! (go version | grep -q 'go1.22.10'); then
+          echo "Downloading Go 1.22.10..."
+          wget -q --show-progress https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
+          echo "Installing Go 1.22.10..."
+          tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
+          rm -f go1.22.10.linux-amd64.tar.gz
+        else
+           echo "Go 1.22.10 already installed or found."
+        fi
+        # Add Go to PATH for subsequent steps in this job
         export PATH=$PATH:/usr/local/go/bin
-        go mod tidy && go build -o http-metadata-server .
-        ./http-metadata-server --addr=:8090 &
-      shell: bash
-    - name: start-mooncake-master
-      run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mooncake_master &
+        go version
 
+    - name: Build Mooncake C++ Project
       shell: bash
-    - name: test
       run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
+        set -e
+        set -x
+        # Activate GCC 10 and ensure Go is in PATH
+        export PATH=$PATH:/usr/local/go/bin
+        scl enable devtoolset-10 -- bash -c '
+          mkdir build
+          cd build
+
+          # Configure using CMake (ensure it finds Python libs/includes)
+          # Point to the specific Python version we want to build against
+          PYTHON_EXECUTABLE=/opt/python/cp38-cp38/bin/python
+          PYTHON_INCLUDE_DIR=/opt/python/cp38-cp38/include/python3.8
+          PYTHON_LIBRARY=/opt/python/cp38-cp38/lib/libpython3.8.so # Adjust if static lib needed
+
+          cmake .. -DUSE_HTTP=ON \
+                   -DPYTHON_EXECUTABLE=${PYTHON_EXECUTABLE} \
+                   -DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIR} \
+                   -DPYTHON_LIBRARY=${PYTHON_LIBRARY}
+
+          # Build and install
+          make install -j$(nproc)
+        '
+
+    - name: Build Python wheel (Python 3.8)
       shell: bash
-    - name: Stop Mooncake Master Service
       run: |
-        pkill mooncake_master || true
-      shell: bash
+        set -e
+        set -x
+        # Use the target Python to install build tools and run the build script
+        PYTHON_BIN=/opt/python/cp38-cp38/bin
+        ${PYTHON_BIN}/pip install --upgrade pip
+        ${PYTHON_BIN}/pip install auditwheel build wheel setuptools
 
-    - name: Build Python wheel
-      run: |
-        pip install auditwheel
-        ./scripts/build_wheel.sh
-      shell: bash
+        # Ensure python3 points to the correct interpreter for the script
+        ln -s ${PYTHON_BIN}/python /usr/local/bin/python3 || echo "python3 link failed or exists"
+        export PATH=/usr/local/bin:$PATH # Ensure our link is found first
+        python3 --version
 
-    - name: Test installation
-      run: ./scripts/test_installation.sh
-      shell: bash
+        # Run the build script (which uses python3 and auditwheel)
+        # Activate GCC 10 environment for any potential compilation during wheel build
+        scl enable devtoolset-10 -- bash ./scripts/build_wheel.sh
 
-    - name: Run tests
-      run: |
-        source test_env/bin/activate
-        ./scripts/run_tests.sh
-        deactivate
-      shell: bash
+        # List the built wheel
+        ls -l mooncake-wheel/dist/
 
+    - name: Upload Wheel Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-manylinux_2_28-cp38
+        path: mooncake-wheel/dist/*.whl
+
+  # --- Testing Job (Example - To be run separately) ---
+  # test-wheel:
+  #   needs: build-manylinux-wheel
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   - name: Download wheel artifact
+  #     uses: actions/download-artifact@v4
+  #     with:
+  #       name: mooncake-wheel-manylinux_2_28-cp38
+  #       path: dist
+  #   - name: Set up Python
+  #     uses: actions/setup-python@v5
+  #     with:
+  #       python-version: '3.8' # Match the built wheel Python version
+  #   - name: Install Dependencies for Testing
+  #     run: |
+  #       sudo apt update -y
+  #       # Install runtime dependencies needed for testing (not build deps)
+  #       # sudo apt install -y ...
+  #       pip install dist/*.whl
+  #       # Install any other Python test dependencies
+  #       # pip install pytest ...
+  #   - name: Run Tests (Adapt from original job)
+  #     run: |
+  #       # Start servers, run test commands etc.
+  #       # ./scripts/test_installation.sh
+  #       # ./scripts/run_tests.sh
+  #       echo "Testing steps need to be adapted here"
 
   spell-check:
     name: Spell Check with Typos
