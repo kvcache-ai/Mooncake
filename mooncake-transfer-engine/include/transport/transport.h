@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <queue>
 #include <string>
 
 #include "common/base/status.h"
@@ -121,24 +122,73 @@ class Transport {
             status = Slice::SUCCESS;
             __sync_fetch_and_add(&task->transferred_bytes, length);
             __sync_fetch_and_add(&task->success_slice_count, 1);
-            delete this;
         }
 
         void markFailed() {
             status = Slice::FAILED;
             __sync_fetch_and_add(&task->failed_slice_count, 1);
-            delete this;
         }
     };
 
+    struct ThreadLocalSliceCache {
+        ThreadLocalSliceCache() : head_(0), tail_(0) {
+            lazy_delete_slices_.resize(kLazyDeleteSliceCapacity);
+        }
+
+        ~ThreadLocalSliceCache() {
+            for (uint64_t i = tail_; i != head_; i++) {
+                auto slice = lazy_delete_slices_[i % kLazyDeleteSliceCapacity];
+                delete slice;
+                freed_++;
+            }
+            if (allocated_ != freed_) {
+                LOG(WARNING) << "detected slice leak: allocated "
+                             << allocated_ << " freed " << freed_;
+            }
+        }
+
+        Slice *allocate() {
+            if (head_ - tail_ == 0) {
+                allocated_++;
+                return new Slice();
+            }
+            auto slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
+            tail_++;
+            new (slice) Slice();
+            return slice;
+        }
+
+        void deallocate(Slice *slice) {
+            if (head_ - tail_ == kLazyDeleteSliceCapacity) {
+                delete slice;
+                freed_++;
+                return;
+            }
+            lazy_delete_slices_[head_ % kLazyDeleteSliceCapacity] = slice;
+            head_++;
+        }
+
+        const static size_t kLazyDeleteSliceCapacity = 4096;
+        std::vector<Slice *> lazy_delete_slices_;
+        uint64_t head_, tail_;
+        uint64_t allocated_ = 0, freed_ = 0;
+    };
+
     struct TransferTask {
-        volatile uint64_t slice_count   = 0;
+        volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+        // record the slice list for freeing objects
+        std::vector<Slice *> slice_list;
+        ~TransferTask() {
+            for (auto &slice : slice_list)
+                Transport::getSliceCache().deallocate(slice);
+        }
     };
 
     struct BatchDesc {
@@ -160,8 +210,8 @@ class Transport {
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
-    virtual Status submitTransfer(BatchID batch_id,
-                               const std::vector<TransferRequest> &entries) = 0;
+    virtual Status submitTransfer(
+        BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
     virtual Status submitTransferTask(
         const std::vector<TransferRequest *> &request_list,
@@ -194,6 +244,8 @@ class Transport {
 
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+
+    static ThreadLocalSliceCache &getSliceCache();
 
    private:
     virtual int registerLocalMemory(void *addr, size_t length,
