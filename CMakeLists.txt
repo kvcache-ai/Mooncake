@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake CXX C)
 
+option(ENABLE_CCACHE "Whether to open ccache" OFF)
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND AND ENABLE_CCACHE)
+  message(STATUS "Building with CCACHE enabled")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+endif()
+
 enable_testing()
 
 set(CMAKE_C_STANDARD 99)
@@ -17,10 +25,6 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0")
 
 set(CMAKE_BUILD_TYPE "Release")
 
-#set(CMAKE_C_FLAGS "-O0 -g -Wall")
-#set(CMAKE_CXX_FLAGS "-O0 -g -Wall")
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
-
 # Necessary if you are using Alibaba Cloud eRDMA
 add_definitions(-DCONFIG_ERDMA)
 
@@ -30,8 +34,9 @@ option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" ON)
+option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
-option(USE_HTTP "option for enable http as metadata server" OFF)
+option(USE_HTTP "option for enable http as metadata server" ON)
 
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
@@ -59,7 +64,7 @@ if (USE_CUDA)
   endif()
 
   include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib)
+  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
 elseif(USE_NVMEOF)
   message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
 endif()
@@ -76,15 +81,22 @@ endif()
 
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
-  message(STATUS "etcd as metadata server support is enabled")
+  if (USE_ETCD_LEGACY)
+    add_compile_definitions(USE_ETCD_LEGACY)
+    message(STATUS "etcd as metadata server support is enabled (etcd-cpp-api-v3)")
+  else()
+    message(STATUS "etcd as metadata server support is enabled (go package)")
+  endif()
 endif()
 
 if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
   message(FATAL_ERROR "Please enable at least one metadata type: USE_ETCD, USE_REDIS, or USE_HTTP")
 endif()
 
-add_subdirectory(mooncake-transfer-engine)
+add_subdirectory(mooncake-common)
+include_directories(mooncake-common/etcd)
 
+add_subdirectory(mooncake-transfer-engine)
 include_directories(mooncake-transfer-engine/include)
 
 if (WITH_STORE)
@@ -93,7 +105,6 @@ if (WITH_STORE)
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()
-
 
 add_subdirectory(mooncake-integration)
 

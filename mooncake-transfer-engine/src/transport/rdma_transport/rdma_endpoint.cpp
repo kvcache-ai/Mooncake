@@ -108,6 +108,21 @@ int RdmaEndPoint::setupConnectionsByActive() {
         LOG(INFO) << "Connection has been established";
         return 0;
     }
+
+    // loopback mode
+    if (context_.nicPath() == peer_nic_path_) {
+        auto segment_desc =
+            context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (segment_desc) {
+            for (auto &nic : segment_desc->devices)
+                if (nic.name == context_.deviceName())
+                    return doSetupConnection(nic.gid, nic.lid, qpNum());
+        }
+        LOG(ERROR) << "Peer NIC " << context_.deviceName()
+                   << " not found in localhost";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
     HandShakeDesc local_desc, peer_desc;
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;

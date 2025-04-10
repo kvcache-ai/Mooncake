@@ -8,6 +8,8 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout source
@@ -30,21 +32,18 @@ jobs:
       - name: Install system dependencies and build project
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh
+          sudo bash -x dependencies.sh -y
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON
           sudo make install -j
         shell: bash
 
-      - name: Build Python wheel
+      - name: Build and test Python wheel
         run: |
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          mkdir -p mooncake-wheel/mooncake/lib_so/
-          cp build/mooncake-integration/*.so mooncake-wheel/mooncake
-          cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
-          cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
-          python -m build mooncake-wheel/
+          # Build the wheel package
+          ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
@@ -52,3 +51,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: mooncake-wheel/dist/*.whl
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -44,13 +44,17 @@ struct HandShakePlugin {
         std::function<int(const Json::Value &, Json::Value &)>;
 
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port) = 0;
+                            uint16_t listen_port, int sockfd) = 0;
 
     // Connect to peer endpoint, and wait for receiving
     // peer endpoint's attributes
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
 };
+
+std::vector<std::string> findLocalIpAddresses();
+
+uint16_t findAvailableTcpPort(int &sockfd);
 
 }  // namespace mooncake
 

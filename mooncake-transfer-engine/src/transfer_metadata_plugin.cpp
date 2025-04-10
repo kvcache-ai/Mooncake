@@ -16,9 +16,13 @@
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
+#include <ifaddrs.h>
 #include <jsoncpp/json/value.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
+
+#include <random>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
@@ -29,7 +33,11 @@
 #endif
 
 #ifdef USE_ETCD
+#ifdef USE_ETCD_LEGACY
 #include <etcd/SyncClient.hpp>
+#else
+#include <libetcd_wrapper.h>
+#endif
 #endif  // USE_ETCD
 
 #include <cassert>
@@ -65,6 +73,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
+        if (!resp->str) return false;
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
         if (!reader.parse(json_file, value)) return false;
@@ -262,6 +271,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 #endif  // USE_HTTP
 
 #ifdef USE_ETCD
+#ifdef USE_ETCD_LEGACY
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
@@ -313,6 +323,86 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     etcd::SyncClient client_;
     const std::string metadata_uri_;
 };
+#else
+struct EtcdStoragePlugin : public MetadataStoragePlugin {
+    EtcdStoragePlugin(const std::string &metadata_uri)
+        : metadata_uri_(metadata_uri) {
+        auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+        }
+    }
+
+    virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
+
+    virtual bool get(const std::string &key, Json::Value &value) {
+        Json::Reader reader;
+        char *json_data = nullptr;
+        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        if (!json_data) {
+            if (globalConfig().verbose)
+                LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
+                          << ", value=<n/a>";
+            return false;
+        }
+        auto json_file = std::string(json_data);
+        // free the memory allocated by EtcdGetWrapper
+        free(json_data);
+        if (!reader.parse(json_file, value)) return false;
+        if (globalConfig().verbose)
+            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
+                      << ", value=" << json_file;
+        return true;
+    }
+
+    virtual bool set(const std::string &key, const Json::Value &value) {
+        Json::FastWriter writer;
+        const std::string json_file = writer.write(value);
+        auto ret = EtcdPutWrapper((char *)key.c_str(),
+                                  (char *)json_file.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        if (globalConfig().verbose)
+            LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
+                      << ", value=" << json_file;
+        return true;
+    }
+
+    virtual bool remove(const std::string &key) {
+        auto ret = EtcdDeleteWrapper((char *)key.c_str(), err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to remove " << key
+                       << " in " << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    const std::string metadata_uri_;
+    char *err_msg_;
+};
+#endif
 #endif  // USE_ETCD
 
 std::pair<std::string, std::string> parseConnectionString(
@@ -402,7 +492,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port) {
+                            uint16_t listen_port, int sockfd) {
         sockaddr_in bind_address;
         int on = 1;
         memset(&bind_address, 0, sizeof(sockaddr_in));
@@ -410,34 +500,40 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         bind_address.sin_port = htons(listen_port);
         bind_address.sin_addr.s_addr = INADDR_ANY;
 
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) {
-            PLOG(ERROR) << "SocketHandShakePlugin: socket()";
-            return ERR_SOCKET;
-        }
+        if (sockfd >= 0) {
+            listen_fd_ = sockfd;
+        } else {
+            listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+            if (listen_fd_ < 0) {
+                PLOG(ERROR) << "SocketHandShakePlugin: socket()";
+                return ERR_SOCKET;
+            }
 
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-            closeListen();
-            return ERR_SOCKET;
-        }
+            struct timeval timeout;
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout))) {
+                PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+                closeListen();
+                return ERR_SOCKET;
+            }
 
-        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-            closeListen();
-            return ERR_SOCKET;
-        }
+            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
+                           sizeof(on))) {
+                PLOG(ERROR)
+                    << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+                closeListen();
+                return ERR_SOCKET;
+            }
 
-        if (bind(listen_fd_, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
-            0) {
-            PLOG(ERROR) << "SocketHandShakePlugin: bind (port " << listen_port
-                        << ")";
-            closeListen();
-            return ERR_SOCKET;
+            if (bind(listen_fd_, (sockaddr *)&bind_address,
+                     sizeof(sockaddr_in)) < 0) {
+                PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
+                            << listen_port << ")";
+                closeListen();
+                return ERR_SOCKET;
+            }
         }
 
         if (listen(listen_fd_, 5)) {
@@ -611,6 +707,83 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
     const std::string &conn_string) {
     return std::make_shared<SocketHandShakePlugin>();
+}
+
+std::vector<std::string> findLocalIpAddresses() {
+    std::vector<std::string> ips;
+    struct ifaddrs *ifaddr, *ifa;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        PLOG(ERROR) << "getifaddrs failed";
+        return ips;
+    }
+
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) {
+            continue;
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            if (strcmp(ifa->ifa_name, "lo") == 0) {
+                continue;
+            }
+
+            char host[NI_MAXHOST];
+            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
+                            NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+                ips.push_back(host);
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return ips;
+}
+
+uint16_t findAvailableTcpPort(int &sockfd) {
+    static std::random_device rand_gen;
+    std::uniform_int_distribution rand_dist;
+    const int min_port = 15000;
+    const int max_port = 17000;
+    const int max_attempts = 500;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd == -1) {
+            continue;
+        }
+
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                       sizeof(timeout))) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        int on = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        sockaddr_in bind_address;
+        memset(&bind_address, 0, sizeof(sockaddr_in));
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_port = htons(port);
+        bind_address.sin_addr.s_addr = INADDR_ANY;
+        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        return port;
+    }
+    return 0;
 }
 
 }  // namespace mooncake

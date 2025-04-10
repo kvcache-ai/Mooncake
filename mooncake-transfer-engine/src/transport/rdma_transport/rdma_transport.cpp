@@ -217,7 +217,7 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
         ++task_id;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            Slice *slice = getSliceCache().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -227,6 +227,7 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1, retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
@@ -240,17 +241,22 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                task.slice_count++;
+                __sync_fetch_and_add(&task.slice_count, 1);;
                 break;
             }
             if (device_id < 0) {
+                auto source_addr = slice->source_addr;
+                delete slice;
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
-                    << slice->source_addr;
+                    << source_addr;
                 return Status::AddressNotRegistered(
                     "RdmaTransport: not registered by any device(s), address: "
                     + std::to_string(
-                        reinterpret_cast<uintptr_t>(slice->source_addr)));
+                        reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
@@ -272,7 +278,7 @@ Status RdmaTransport::submitTransferTask(
         auto &task = *task_list[index];
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            Slice *slice = getSliceCache().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -282,6 +288,7 @@ Status RdmaTransport::submitTransferTask(
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1, retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
@@ -296,17 +303,22 @@ Status RdmaTransport::submitTransferTask(
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
-                task.slice_count += 1;
+                __sync_fetch_and_add(&task.slice_count, 1);;
                 break;
             }
             if (device_id < 0) {
+                auto source_addr = slice->source_addr;
+                delete slice;
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
-                    << slice->source_addr;
+                    << source_addr;
                 return Status::AddressNotRegistered(
                     "RdmaTransport: not registered by any device(s), address: "
                     + std::to_string(
-                        reinterpret_cast<uintptr_t>(slice->source_addr)));
+                        reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
@@ -389,7 +401,6 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 #ifdef CONFIG_ERDMA
     if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
 #endif
-
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
@@ -423,7 +434,8 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
-        metadata_->localRpcMeta().rpc_port);
+        metadata_->localRpcMeta().rpc_port,
+        metadata_->localRpcMeta().sockfd);
 }
 
 // According to the request desc, offset and length information, find proper

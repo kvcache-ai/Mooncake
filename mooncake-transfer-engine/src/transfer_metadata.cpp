@@ -406,7 +406,7 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 }
 
 int TransferMetadata::startHandshakeDaemon(
-    OnReceiveHandShake on_receive_handshake, uint16_t listen_port) {
+    OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
     return handshake_plugin_->startDaemon(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
@@ -417,7 +417,7 @@ int TransferMetadata::startHandshakeDaemon(
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         },
-        listen_port);
+        listen_port, sockfd);
 }
 
 int TransferMetadata::sendHandshake(const std::string &peer_server_name,

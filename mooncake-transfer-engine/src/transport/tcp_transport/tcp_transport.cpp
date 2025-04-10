@@ -220,6 +220,9 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
+    if (meta->localRpcMeta().sockfd) {
+        close(meta->localRpcMeta().rpc_port);
+    }
     context_ = new TcpContext(meta->localRpcMeta().rpc_port);
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
@@ -279,8 +282,7 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    if (success_slice_count + failed_slice_count ==
-        task.slice_count) {
+    if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
@@ -293,8 +295,8 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-Status TcpTransport::submitTransfer(BatchID batch_id,
-                                 const std::vector<TransferRequest> &entries) {
+Status TcpTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
@@ -311,7 +313,7 @@ Status TcpTransport::submitTransfer(BatchID batch_id,
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -319,7 +321,8 @@ Status TcpTransport::submitTransfer(BatchID batch_id,
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task.slice_count += 1;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);;
         startTransfer(slice);
     }
 
@@ -333,7 +336,7 @@ Status TcpTransport::submitTransferTask(
         auto &request = *request_list[index];
         auto &task = *task_list[index];
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -341,7 +344,8 @@ Status TcpTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task.slice_count += 1;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);;
         startTransfer(slice);
     }
     return Status::OK();
@@ -373,7 +377,6 @@ void TcpTransport::startTransfer(Slice *slice) {
             slice->markFailed();
             return;
         }
-
         auto endpoint_iterator = resolver.resolve(
             boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
             std::to_string(meta_entry.rpc_port));
