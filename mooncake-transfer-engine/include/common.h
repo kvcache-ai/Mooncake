@@ -25,6 +25,10 @@
 #include <cstdint>
 #include <ctime>
 #include <thread>
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 #include "error.h"
 
@@ -78,6 +82,16 @@ static inline int64_t getCurrentTimeInNano() {
         return ERR_CLOCK;
     }
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
+}
+
+static inline std::string getCurrentDateTime() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto local_time = *std::localtime(&time_t_now);
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
+    return oss.str();
 }
 
 uint16_t getDefaultHandshakePort();

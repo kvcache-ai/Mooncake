@@ -271,12 +271,6 @@ int RdmaEndPoint::submitPostSend(
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
         slice->status = Transport::Slice::POSTED;
         slice->rdma.qp_depth = &wr_depth_list_[qp_index];
-        // if (globalConfig().verbose)
-        // {
-        //     LOG(INFO) << "WR: local addr " << slice->source_addr
-        //               << " remote addr " << slice->rdma.dest_addr
-        //               << " rkey " << slice->rdma.dest_rkey;
-        // }
     }
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     __sync_fetch_and_add(cq_outstanding_, wr_count);

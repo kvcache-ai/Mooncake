@@ -107,22 +107,24 @@ int WorkerPool::submitPostSend(
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
                                         slice->rdma.dest_addr, slice->length,
                                         buffer_id, device_id)) {
-            LOG(WARNING) << "Reselect remote NIC for address "
-                         << (void *)slice->rdma.dest_addr << " on segment #"
-                         << slice->target_id;
+            LOG(WARNING)
+                << "Unable to select NIC first time, try to reload metadata";
+
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
-                LOG(ERROR) << "Cannot get target segment #" << slice->target_id;
+                LOG(ERROR) << "Cannot reload target segment #" << slice->target_id;
                 slice->markFailed();
                 continue;
             }
+
+            context_.engine().meta()->dumpMetadataContent();
+
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
-                LOG(ERROR) << "Failed to select remote NIC for address "
-                           << (void *)slice->rdma.dest_addr << " on segment #"
-                           << slice->target_id;
+                LOG(WARNING)
+                    << "Unable to select NIC second time, mark transfer failed";
                 slice->markFailed();
                 continue;
             }

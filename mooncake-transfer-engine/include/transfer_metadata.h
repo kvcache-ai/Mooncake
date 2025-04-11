@@ -68,6 +68,9 @@ class TransferMetadata {
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // TODO : make these two a union or a std::variant
+        std::string timestamp;
+
+        void dump() const;
     };
 
     struct RpcMetaDesc {
@@ -132,6 +135,10 @@ class TransferMetadata {
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
+
+    void dumpMetadataContent();
+
+    void dumpMetadataContentUnlocked();
 
    private:
     // local cache

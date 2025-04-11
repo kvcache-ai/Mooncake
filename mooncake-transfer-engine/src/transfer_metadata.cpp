@@ -57,12 +57,6 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
-        if (globalConfig().verbose) {
-            LOG(INFO) << "TransferHandshakeUtil::decode: local_nic_path "
-                      << desc.local_nic_path << " peer_nic_path "
-                      << desc.peer_nic_path << " qp_num count "
-                      << desc.qp_num.size();
-        }
         return 0;
     }
 };
@@ -84,6 +78,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
     Json::Value segmentJSON;
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
+    segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma") {
         Json::Value devicesJSON(Json::arrayValue);
@@ -158,6 +153,8 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
+    if (segmentJSON.isMember("timestamp"))
+        desc->timestamp = segmentJSON["timestamp"].asString();
 
     if (desc->protocol == "rdma") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -275,7 +272,8 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
 
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
-    if (segment_id != LOCAL_SEGMENT_ID && (!globalConfig().metacache || force_update)) {
+    if (segment_id != LOCAL_SEGMENT_ID &&
+        (!globalConfig().metacache || force_update)) {
         RWSpinlock::WriteGuard guard(segment_lock_);
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         auto segment_desc =

@@ -193,8 +193,8 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-Status RdmaTransport::submitTransfer(BatchID batch_id,
-                                  const std::vector<TransferRequest> &entries) {
+Status RdmaTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "RdmaTransport: Exceed the limitation of current batch's "
@@ -241,22 +241,20 @@ Status RdmaTransport::submitTransfer(BatchID batch_id,
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
-                    for (auto s : entry.second)
-                        delete s;
+                    for (auto s : entry.second) delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << source_addr;
                 return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), address: "
-                    + std::to_string(
-                        reinterpret_cast<uintptr_t>(source_addr)));
+                    "RdmaTransport: not registered by any device(s), "
+                    "address: " +
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
@@ -302,23 +300,20 @@ Status RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                // task.slices.push_back(slice);
-                __sync_fetch_and_add(&task.slice_count, 1);;
+                __sync_fetch_and_add(&task.slice_count, 1);
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
-                    for (auto s : entry.second)
-                        delete s;
+                    for (auto s : entry.second) delete s;
                 LOG(ERROR)
                     << "RdmaTransport: Address not registered by any device(s) "
                     << source_addr;
                 return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), address: "
-                    + std::to_string(
-                        reinterpret_cast<uintptr_t>(source_addr)));
+                    "RdmaTransport: not registered by any device(s), "
+                    "address: " +
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
@@ -337,8 +332,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
         status[task_id].transferred_bytes = task.transferred_bytes;
         uint64_t success_slice_count = task.success_slice_count;
         uint64_t failed_slice_count = task.failed_slice_count;
-        if (success_slice_count + failed_slice_count ==
-            task.slice_count) {
+        if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
@@ -364,8 +358,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    if (success_slice_count + failed_slice_count ==
-        task.slice_count) {
+    if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
         else
@@ -434,8 +427,7 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
-        metadata_->localRpcMeta().rpc_port,
-        metadata_->localRpcMeta().sockfd);
+        metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
 }
 
 // According to the request desc, offset and length information, find proper
@@ -452,7 +444,9 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
         if (device_id >= 0) return 0;
     }
-
+    LOG(ERROR) << "RdmaTransport: select device failed. Requested offset"
+               << (void *)offset << ", length" << length;
+    desc->dump();
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 }  // namespace mooncake
