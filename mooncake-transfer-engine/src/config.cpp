@@ -174,11 +174,6 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
-    const char *verbose_env = std::getenv("MC_VERBOSE");
-    if (verbose_env) {
-        config.verbose = true;
-    }
-
     const char *disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
@@ -228,7 +223,6 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
-    LOG(INFO) << "verbose = " << (config.verbose ? "true" : "false");
 }
 
 GlobalConfig &globalConfig() {

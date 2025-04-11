@@ -77,18 +77,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
         if (!reader.parse(json_file, value)) return false;
-        if (globalConfig().verbose)
-            LOG(INFO) << "RedisStoragePlugin: get: key=" << key
-                      << ", value=" << json_file;
         return true;
     }
 
     virtual bool set(const std::string &key, const Json::Value &value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        if (globalConfig().verbose)
-            LOG(INFO) << "RedisStoragePlugin: set: key=" << key
-                      << ", value=" << json_file;
         redisReply *resp = (redisReply *)redisCommand(
             client_, "SET %s %s", key.c_str(), json_file.c_str());
         if (!resp) {
@@ -176,10 +170,6 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
 
-        if (globalConfig().verbose)
-            LOG(INFO) << "Get segment desc, key=" << key
-                      << ", value=" << readBuffer;
-
         Json::Reader reader;
         if (!reader.parse(readBuffer, value)) return false;
         return true;
@@ -191,9 +181,6 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        if (globalConfig().verbose)
-            LOG(INFO) << "Put segment desc, key=" << key
-                      << ", value=" << json_file;
 
         std::string url = encodeUrl(key);
         curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
@@ -234,9 +221,6 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     virtual bool remove(const std::string &key) {
         curl_easy_reset(client_);
         curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
-
-        if (globalConfig().verbose)
-            LOG(INFO) << "Remove segment desc, key=" << key;
 
         std::string url = encodeUrl(key);
         curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
@@ -288,18 +272,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         }
         auto json_file = resp.value().as_string();
         if (!reader.parse(json_file, value)) return false;
-        if (globalConfig().verbose)
-            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
-                      << ", value=" << json_file;
         return true;
     }
 
     virtual bool set(const std::string &key, const Json::Value &value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        if (globalConfig().verbose)
-            LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
-                      << ", value=" << json_file;
         auto resp = client_.put(key, json_file);
         if (!resp.is_ok()) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " from "
@@ -352,18 +330,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         if (!json_data) {
-            if (globalConfig().verbose)
-                LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
-                          << ", value=<n/a>";
             return false;
         }
         auto json_file = std::string(json_data);
         // free the memory allocated by EtcdGetWrapper
         free(json_data);
         if (!reader.parse(json_file, value)) return false;
-        if (globalConfig().verbose)
-            LOG(INFO) << "EtcdStoragePlugin: get: key=" << key
-                      << ", value=" << json_file;
         return true;
     }
 
@@ -380,9 +352,6 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             err_msg_ = nullptr;
             return false;
         }
-        if (globalConfig().verbose)
-            LOG(INFO) << "EtcdStoragePlugin: set: key=" << key
-                      << ", value=" << json_file;
         return true;
     }
 
@@ -574,9 +543,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
                 auto peer_hostname =
                     getNetworkAddress((struct sockaddr *)&addr);
-                if (globalConfig().verbose)
-                    LOG(INFO) << "SocketHandShakePlugin: new connection: "
-                              << peer_hostname.c_str();
 
                 Json::Value local, peer;
                 Json::Reader reader;
@@ -643,10 +609,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     int doSend(struct addrinfo *addr, const Json::Value &local,
                Json::Value &peer) {
-        if (globalConfig().verbose)
-            LOG(INFO) << "SocketHandShakePlugin: connecting "
-                      << getNetworkAddress(addr->ai_addr);
-
         int on = 1;
         int conn_fd =
             socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
