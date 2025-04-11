@@ -31,8 +31,7 @@ sudo apt-get install -y $SYSTEM_PACKAGES
 
 
 echo "Verifying that import succeeds after installation..."
-# Verify that importing mooncake.engine succeeds after installation
-python -c "import mooncake.engine; print('Success: Import worked after installation')" || exit 1
+python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
 # Run the import structure test
