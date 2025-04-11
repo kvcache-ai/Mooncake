@@ -23,14 +23,9 @@ pip install mooncake-wheel/dist/*.whl
 SYSTEM_PACKAGES="build-essential \
                   cmake \
                   libibverbs-dev \
-                  libgoogle-glog-dev \
-                  libgtest-dev \
                   libnuma-dev \
-                  libboost-all-dev \
                   libssl-dev \
-                  pybind11-dev \
-                  libcurl4-openssl-dev \
-                  libhiredis-dev"
+                  libcurl4-openssl-dev"
 
 sudo apt-get install -y $SYSTEM_PACKAGES
 
