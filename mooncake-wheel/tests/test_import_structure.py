@@ -4,12 +4,12 @@ import unittest
 class TestImportStructure(unittest.TestCase):
     def test_backward_compatibility(self):
         """Test that the old import style still works."""
-        from mooncake import MooncakeDistributedStore
-        from mooncake import mooncake_vllm_adaptor
+        from mooncake_vllm_adaptor import MooncakeDistributedStore
+        import mooncake_vllm_adaptor
 
         # Just verify we can create instances
         store = MooncakeDistributedStore()
-        adaptor = mooncake_vllm_adaptor()
+        adaptor = mooncake_vllm_adaptor.mooncake_vllm_adaptor()
 
         self.assertIsNotNone(store)
         self.assertIsNotNone(adaptor)
@@ -26,6 +26,13 @@ class TestImportStructure(unittest.TestCase):
 
         # Verify direct access to TransferOpcode
         self.assertIsNotNone(mooncake.engine.TransferOpcode)
+
+        from mooncake.store import MooncakeDistributedStore
+
+        # Just verify we can create instances
+        store = MooncakeDistributedStore()
+
+        self.assertIsNotNone(store)
 
     def test_direct_import(self):
         """Test direct import of specific components."""
