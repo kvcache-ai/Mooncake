@@ -9,15 +9,16 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
 echo "Creating directory structure..."
 mkdir -p mooncake-wheel/mooncake/lib_so/
-mkdir -p mooncake-wheel/mooncake/transfer/
 
 echo "Copying Python modules..."
 # Copy mooncake_vllm_adaptor to root level for backward compatibility
 cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake/mooncake_vllm_adaptor.so
-cp build/mooncake-integration/mooncake_sglang_adaptor.*.so mooncake-wheel/mooncake/mooncake_sglang_adaptor.so
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+
+# Copy engine.so to mooncake directory (will be imported by transfer module)
+cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
