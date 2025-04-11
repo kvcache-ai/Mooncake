@@ -19,6 +19,17 @@ echo "Installing the wheel package..."
 # Install the wheel package
 pip install mooncake-wheel/dist/*.whl
 
+# install dependencies
+SYSTEM_PACKAGES="build-essential \
+                  cmake \
+                  libibverbs-dev \
+                  libnuma-dev \
+                  libssl-dev \
+                  libcurl4-openssl-dev"
+
+sudo apt-get install -y $SYSTEM_PACKAGES
+
+
 echo "Verifying that import succeeds after installation..."
 # Verify that importing mooncake.engine succeeds after installation
 python -c "import mooncake.engine; print('Success: Import worked after installation')" || exit 1

@@ -13,7 +13,7 @@ class CustomBdistWheel(bdist_wheel):
         bdist_wheel.finalize_options(self)
         self.root_is_pure = False
         self.plat_name_supplied = True
-        self.plat_name = "manylinux2014_x86_64"
+        self.plat_name = "manylinux_2_35_x86_64"
 
 python_version = f">={sys.version_info.major}.{sys.version_info.minor}"
 
@@ -27,7 +27,6 @@ setup(
         "mooncake": [
             "*.so",
             "mooncake_master",
-            "lib_so/*.so",
         ],
     },
     include_package_data=True,
