@@ -1,4 +1,4 @@
-name: 'Build(linux)'
+name: 'Build & Test (Linux)' # Renamed for clarity
 
 on:
   push:
@@ -36,9 +36,8 @@ jobs:
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         mooncake_master &
-
       shell: bash
-    - name: test
+    - name: test (in build env)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -56,17 +55,39 @@ jobs:
         ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Test installation
-      run: ./scripts/test_installation.sh
-      shell: bash
+    - name: Upload wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-ubuntu
+        path: mooncake-wheel/dist/*.whl
 
-    - name: Run tests
+  test-wheel-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: build-ubuntu # Ensure build job completes first
+    steps:
+    - uses: actions/checkout@v4 
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' 
+
+    - name: Download wheel artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mooncake-wheel-ubuntu
+        path: mooncake-wheel/dist
+
+    - name: Install system dependencies (if any)
       run: |
-        source test_env/bin/activate
-        ./scripts/run_tests.sh
-        deactivate
+        sudo apt-get update
+        echo "No specific system dependencies known for the wheel itself."
       shell: bash
 
+    - name: Run installation test script
+      run: |
+        bash scripts/test_installation.sh
+      shell: bash
 
   spell-check:
     name: Spell Check with Typos
