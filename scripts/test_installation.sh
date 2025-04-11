@@ -19,36 +19,23 @@ echo "Installing the wheel package..."
 # Install the wheel package
 pip install mooncake-wheel/dist/*.whl
 
-echo "Verifying that import succeeds after installation before dependencies..."
-# Verify that importing mooncake.transfer fails after installation
-python -c "import mooncake.transfer" 2>/dev/null && { echo "ERROR: Import succeeded when it should have failed!"; exit 1; } || echo "Good: Import failed as expected before installation"
-
 # install dependencies
 SYSTEM_PACKAGES="build-essential \
                   cmake \
                   libibverbs-dev \
                   libgoogle-glog-dev \
                   libgtest-dev \
-                  libjsoncpp-dev \
-                  libunwind-dev \
                   libnuma-dev \
-                  libpython3-dev \
                   libboost-all-dev \
                   libssl-dev \
-                  libgrpc-dev \
-                  libgrpc++-dev \
-                  libprotobuf-dev \
-                  protobuf-compiler-grpc \
                   pybind11-dev \
                   libcurl4-openssl-dev \
-                  libhiredis-dev \
-                  pkg-config \
-                  patchelf"
+                  libhiredis-dev"
 
 sudo apt-get install -y $SYSTEM_PACKAGES
 
-# expected success now
-echo "Verifying that import succeeds after installation after dependencies..."
+
+echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.transfer" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
