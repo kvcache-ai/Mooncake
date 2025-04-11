@@ -23,6 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY="https://github.com"
+GOVER=1.23.8
 
 # Function to print section headers
 print_section() {
@@ -71,7 +72,7 @@ echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
 echo -e "  - yalantinglibs"
-echo -e "  - Go 1.22.10"
+echo -e "  - Go $GOVER"
 echo
 
 # Ask for confirmation unless -y flag is used
@@ -168,34 +169,33 @@ check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
 
-# Install Go 1.22.10
-print_section "Installing Go 1.22.10"
+print_section "Installing Go $GOVER"
 
 # Check if Go is already installed
 if command -v go &> /dev/null; then
     GO_VERSION=$(go version | awk '{print $3}')
-    if [[ "$GO_VERSION" == "go1.22.10" ]]; then
-        echo -e "${YELLOW}Go 1.22.10 is already installed. Skipping...${NC}"
+    if [[ "$GO_VERSION" == "go$GOVER" ]]; then
+        echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
     else
-        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go 1.22.10...${NC}"
+        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
     fi
 fi
 
 # Download Go
-echo "Downloading Go 1.22.10..."
-wget -q --show-progress https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
-check_success "Failed to download Go 1.22.10"
+echo "Downloading Go $GOVER..."
+wget -q --show-progress https://go.dev/dl/go$GOVER.linux-amd64.tar.gz
+check_success "Failed to download Go $GOVER"
 
 # Install Go
-echo "Installing Go 1.22.10..."
-sudo tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
-check_success "Failed to install Go 1.22.10"
+echo "Installing Go $GOVER..."
+sudo tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
+check_success "Failed to install Go $GOVER"
 
 # Clean up downloaded file
-rm -f go1.22.10.linux-amd64.tar.gz
+rm -f go$GOVER.linux-amd64.tar.gz
 check_success "Failed to clean up Go installation file"
 
-print_success "Go 1.22.10 installed successfully"
+print_success "Go $GOVER installed successfully"
 
 # Add Go to PATH if not already there
 if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
@@ -213,7 +213,7 @@ echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} yalantinglibs"
-echo -e "  ${GREEN}✓${NC} Go 1.22.10"
+echo -e "  ${GREEN}✓${NC} Go $GOVER"
 echo
 echo -e "You can now build and run Mooncake."
 echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
