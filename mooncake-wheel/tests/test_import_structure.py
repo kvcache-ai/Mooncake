@@ -16,20 +16,20 @@ class TestImportStructure(unittest.TestCase):
 
     def test_new_import_structure(self):
         """Test that the new import structure works."""
-        import mooncake.transfer
+        import mooncake.engine
 
         # Verify the module exists
-        self.assertIsNotNone(mooncake.transfer)
+        self.assertIsNotNone(mooncake.engine)
 
         # Verify direct access to TransferEngine
-        self.assertIsNotNone(mooncake.transfer.TransferEngine)
+        self.assertIsNotNone(mooncake.engine.TransferEngine)
 
         # Verify direct access to TransferOpcode
-        self.assertIsNotNone(mooncake.transfer.TransferOpcode)
+        self.assertIsNotNone(mooncake.engine.TransferOpcode)
 
     def test_direct_import(self):
         """Test direct import of specific components."""
-        from mooncake.transfer import TransferEngine, TransferOpcode
+        from mooncake.engine import TransferEngine, TransferOpcode
 
         # Verify direct imports work
         self.assertIsNotNone(TransferEngine)

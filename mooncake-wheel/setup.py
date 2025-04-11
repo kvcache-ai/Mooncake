@@ -29,9 +29,6 @@ setup(
             "mooncake_master",
             "lib_so/*.so",
         ],
-        "mooncake.transfer": [
-            "*.so",
-        ],
     },
     include_package_data=True,
     zip_safe=False,
