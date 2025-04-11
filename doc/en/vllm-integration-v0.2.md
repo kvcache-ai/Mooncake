@@ -1,13 +1,18 @@
-# vLLM Disaggregated Prefill/Decode Demo
+# vLLM Disaggregated Serving Demo
 
 ## Overview
-This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated Prefill/Decode scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
+This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated serving scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
 
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
+ - **Update(Apr 10, 2025)**: We are working on the vLLM v1 integration now. Stay tuned.
 
 ## Installation
 ### Prerequisite
-Please install the Mooncake Transfer Engine according to the [instructions](build.md) first.
+```bash
+pip3 install mooncake-transfer-engine
+```
+
+Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](build.md).
 
 ### Install the latest version of vLLM
 #### 1. Clone vLLM from official repo
@@ -41,11 +46,11 @@ pip3 install -e .
 }
 ```
 - "prefill_url": The IP address and port of the Prefill node.
-  - The port in the URL is used to communicate with etcd server for metadata.
+  - The port in the URL is used to communicate with metadata server.
 - "decode_url": The IP address and port of the Decode node.
-  - The port in the URL is used to communicate with etcd server for metadata.
+  - The port in the URL is used to communicate with metadata server.
   - **_If you want to run the prefill instance and decode instance on the same node, please set up a different port for the `decode_url`. To avoid port conflicts, ensure that the port number differs by at least 50 from the port number in `prefill_url`. For example, "decode_url": "192.168.0.137:13103". Please note that if you set up the same URL for both instances, we will automatically add 100 to the port of the `decode_url`._**
-- "metadata_server": The etcd server of the mooncake transfer engine. For examples,
+- "metadata_server": The metadata server of the mooncake transfer engine. For examples,
   - Use `etcd` as backend: `"192.168.0.137:2379"`, `"etcd://192.168.0.137:2379"` or `"etcd://192.168.0.137:2379,192.168.0.138:2379"`
   - Use `redis` as backend: `"redis://192.168.0.137:6379"`
   - Use `http` as backend: `"http://192.168.0.137:8080/metadata"`

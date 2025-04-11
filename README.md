@@ -15,6 +15,7 @@ Now both the Transfer Engine and Mooncake Store are open-sourced!
 This repository also hosts its technical report and the open sourced traces. 
 
 <h2 id="updates">🔄 Updates</h2>
+
  - **Apr 10, 2025**: SGLang officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
  - **Mar 7, 2025**: We open sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
  - **Feb 25, 2025**: Mooncake receives the **Best Paper Award** at **FAST 2025**!

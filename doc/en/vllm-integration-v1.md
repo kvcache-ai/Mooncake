@@ -1,7 +1,7 @@
-# vLLM Disaggregated Prefill with MooncakeStore
+# vLLM Disaggregated Serving with MooncakeStore
 
 ## Overview
-This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated Prefill/Decode scenario. Benchmark results will be released soon.
+This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated serving scenario. Benchmark results will be released soon.
 
 Main changes from v0.x to v1:
 - XpYd support and orchestration
@@ -12,10 +12,15 @@ Main changes from v0.x to v1:
 
 
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
+ - **Update(Apr 10, 2025)**: We are working on the vLLM v1 integration now. Stay tuned.
 
 ## Installation
 ### Prerequisite
-Please install the MooncakeStore according to the [instructions](build.md) first.
+```bash
+pip3 install mooncake-transfer-engine
+```
+
+Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](build.md).
 
 ### Install the latest version of vLLM
 #### 1. Clone vLLM from official repo
@@ -44,9 +49,9 @@ pip3 install -e .
     "master_server_address": "192.168.0.137:50001"
 }
 ```
-- "local_hostname": The IP address of the current node used to communicate with the etcd server for metadata.
+- "local_hostname": The IP address of the current node used to communicate with the metadata server.
   - **_All prefill instances and decode instances can share this config file on the same node._**
-- "metadata_server": The etcd server of the mooncake transfer engine. For example,
+- "metadata_server": The metadata server of the mooncake transfer engine. For example,
   - Use `etcd` as backend: `"192.168.0.137:2379"`, `"etcd://192.168.0.137:2379"` or `"etcd://192.168.0.137:2379,192.168.0.138:2379"`
   - Use `redis` as backend: `"redis://192.168.0.137:6379"`
   - Use `http` as backend: `"http://192.168.0.137:8080/metadata"`
