@@ -101,6 +101,8 @@ echo -e "${YELLOW}This may take a few minutes...${NC}"
 
 SYSTEM_PACKAGES="build-essential \
                   cmake \
+                  git \
+                  wget \
                   libibverbs-dev \
                   libgoogle-glog-dev \
                   libgtest-dev \
