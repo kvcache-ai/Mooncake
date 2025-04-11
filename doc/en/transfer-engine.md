@@ -129,7 +129,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
       - Use `redis` as metadata storage: `"redis://10.0.0.1:6379"`
       - Use `http` as metadata storage: `"http://10.0.0.1:8080/metadata"`
    - `--local_server_name` represents the segment name of current node, which does not need to be set in most cases. If this option is not set, the value is equivalent to the hostname of this machine (i.e., `hostname(2)`). This should keep unique among the cluster.
-   - `--device_name` indicates the name of the RDMA network card used in the transfer process (seperated by commas without space). You can also specify `--auto_discovery` to enable discovery topology automatically, which generates a network card priority matrix based on the operating system configuration.
+   - `--device_name` indicates the name of the RDMA network card used in the transfer process (separated by commas without space). You can also specify `--auto_discovery` to enable discovery topology automatically, which generates a network card priority matrix based on the operating system configuration.
    - In network environments that only support TCP, the `--protocol=tcp` parameter can be used; in this case, there is no need to specify the `--device_name` parameter.
 
 1. **Start the initiator node.**

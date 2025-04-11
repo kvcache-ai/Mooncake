@@ -377,13 +377,6 @@ int init(const std::string &metadata_conn_string,
 ### 使用 C/C++ 接口二次开发
 在完成 Mooncake Store 编译后，可将编译好的静态库文件 `libtransfer_engine.a` 及 C 头文件 `transfer_engine_c.h`，移入到你自己的项目里。不需要引用 `src/transfer_engine` 下的其他文件。
 
-在项目构建阶段，需要为你的应用配置如下选项：
-```
--I/path/to/include
--L/path/to/lib -ltransfer_engine
--lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc
-```
-
 ### 使用 Golang 接口二次开发
 为了支撑 P2P Store 的运行需求，Transfer Engine 提供了 Golang 接口的封装，详见 `mooncake-p2p-store/src/p2pstore/transfer_engine.go`。
 
