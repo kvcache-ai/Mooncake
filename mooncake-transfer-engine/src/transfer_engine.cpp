@@ -32,18 +32,20 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         desc.ip_or_host_name = ip_or_host_name;
         desc.rpc_port = rpc_port;
+        desc.sockfd = -1;
     } else {
         (void)(ip_or_host_name);
-        // TODO: only support the first NIC, connectively problem existed in
-        // complex networks
-        auto ip_list = findLocalIpAddresses();
-        if (ip_list.empty()) {
-            LOG(ERROR) << "not valid LAN address found";
-            return -1;
-        } else {
-            desc.ip_or_host_name = ip_list[0];
-            LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
-                      << " for serving local TCP service";
+        auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
+        if (ip_address)
+            desc.ip_or_host_name = ip_address;
+        else {
+            auto ip_list = findLocalIpAddresses();
+            if (ip_list.empty()) {
+                LOG(ERROR) << "not valid LAN address found";
+                return -1;
+            } else {
+                desc.ip_or_host_name = ip_list[0];
+            }
         }
 
         // In the new rpc port mapping, it is randomly selected to prevent
@@ -53,11 +55,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         if (desc.rpc_port == 0) {
             LOG(ERROR) << "not valid port for serving local TCP service";
             return -1;
-        } else {
-            LOG(INFO) << "Transfer Engine uses port " << desc.rpc_port
-                      << " for serving local TCP service";
         }
     }
+
+    LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
+              << " and port " << desc.rpc_port
+              << " for serving local TCP service";
+
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 

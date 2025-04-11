@@ -32,24 +32,18 @@ jobs:
       - name: Install system dependencies and build project
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh
+          sudo bash -x dependencies.sh -y
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON
           sudo make install -j
         shell: bash
 
-      - name: Build Python wheel
+      - name: Build and test Python wheel
         run: |
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          mkdir -p mooncake-wheel/mooncake/lib_so/
-          cp build/mooncake-integration/*.so mooncake-wheel/mooncake
-          cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake
-          cp thirdparties/etcd-cpp-apiv3/build/src/libetcd-cpp-api.so mooncake-wheel/mooncake/lib_so/
-          cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/lib_so/
-          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/mooncake_master
-          patchelf --set-rpath '$ORIGIN/lib_so' --force-rpath mooncake-wheel/mooncake/*.so
-          python -m build mooncake-wheel/
+          # Build the wheel package
+          ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
@@ -57,7 +51,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: mooncake-wheel/dist/*.whl
-          
+
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

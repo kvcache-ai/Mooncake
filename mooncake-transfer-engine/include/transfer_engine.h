@@ -54,7 +54,8 @@ class TransferEngine {
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
-             const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
+             const std::string &ip_or_host_name = "", 
+             uint64_t rpc_port = 12345);
 
     int freeEngine();
 

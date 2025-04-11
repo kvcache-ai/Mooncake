@@ -218,7 +218,7 @@ Status RdmaTransport::submitTransfer(
         ++task_id;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            Slice *slice = getSliceCache().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -228,6 +228,7 @@ Status RdmaTransport::submitTransfer(
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1, retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
@@ -280,7 +281,7 @@ Status RdmaTransport::submitTransferTask(
         auto &task = *task_list[index];
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            auto slice = new Slice();
+            Slice *slice = getSliceCache().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -290,6 +291,7 @@ Status RdmaTransport::submitTransferTask(
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1, retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
@@ -402,7 +404,6 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 #ifdef CONFIG_ERDMA
     if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
 #endif
-
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);

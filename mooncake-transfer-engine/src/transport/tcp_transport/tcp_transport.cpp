@@ -313,7 +313,7 @@ Status TcpTransport::submitTransfer(
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -321,7 +321,8 @@ Status TcpTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        __sync_fetch_and_add(&task.slice_count, 1);
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);;
         startTransfer(slice);
     }
 
@@ -335,7 +336,7 @@ Status TcpTransport::submitTransferTask(
         auto &request = *request_list[index];
         auto &task = *task_list[index];
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -343,7 +344,8 @@ Status TcpTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        __sync_fetch_and_add(&task.slice_count, 1);
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);;
         startTransfer(slice);
     }
     return Status::OK();

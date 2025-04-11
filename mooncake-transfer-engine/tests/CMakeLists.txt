@@ -10,6 +10,10 @@ add_executable(rdma_transport_test2 rdma_transport_test2.cpp)
 target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_transport_test2 COMMAND rdma_transport_test2)
 
+add_executable(rdma_loopback_test rdma_loopback_test.cpp)
+target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
+# add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
+
 if (USE_NVMEOF)
     add_executable(nvmeof_transport_test nvmeof_transport_test.cpp)
     target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest gtest_main )
