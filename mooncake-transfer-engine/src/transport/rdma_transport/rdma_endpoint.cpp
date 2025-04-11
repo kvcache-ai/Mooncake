@@ -114,7 +114,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
         auto segment_desc =
             context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
         if (segment_desc) {
-            for (auto &nic : segment_desc->devices)
+            auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+            for (auto &nic : detail.devices)
                 if (nic.name == context_.deviceName())
                     return doSetupConnection(nic.gid, nic.lid, qpNum());
         }
