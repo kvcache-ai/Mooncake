@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import random
-from mooncake import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 
 def get_client(store):
