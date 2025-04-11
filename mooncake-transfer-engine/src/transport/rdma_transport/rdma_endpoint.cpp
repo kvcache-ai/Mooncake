@@ -114,7 +114,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
         auto segment_desc =
             context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
         if (segment_desc) {
-            for (auto &nic : segment_desc->devices)
+            auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+            for (auto &nic : detail.devices)
                 if (nic.name == context_.deviceName())
                     return doSetupConnection(nic.gid, nic.lid, qpNum());
         }
@@ -148,7 +149,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+        for (auto &nic : detail.devices)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
     }
@@ -187,7 +189,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+        for (auto &nic : detail.devices)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
                                          &local_desc.reply_msg);

@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 
 #include "common.h"
 #include "topology.h"
@@ -34,55 +35,60 @@ namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
 
+struct DeviceDesc {
+    std::string name;
+    uint16_t lid;
+    std::string gid;
+};
+
+struct BufferDesc {
+    std::string location;
+    uint64_t addr;
+    uint64_t length;
+    std::vector<uint32_t> lkey;  // follow the order of `devices`
+    std::vector<uint32_t> rkey;  // follow the order of `devices`
+    std::string shm_path;
+};
+
+struct FileBufferDesc {
+    uint64_t length;
+    std::string original_path;  // file path of the original directory
+    std::unordered_map<std::string, std::string> mounted_path_map;
+    // file path of the mounted directory
+};
+
+struct MemorySegmentDesc {
+    Topology topology;
+    std::vector<DeviceDesc> devices;
+    std::vector<BufferDesc> buffers;
+};
+
+struct FileSegmentDesc {
+    std::vector<FileBufferDesc> buffers;
+};
+
+struct SegmentDesc {
+    std::string name;
+    std::string protocol;
+    std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
+};
+
+using SegmentID = uint64_t;
+
+struct RpcMetaDesc {
+    std::string ip_or_host_name;
+    uint16_t rpc_port;
+    int sockfd;
+};
+
+struct HandShakeDesc {
+    std::string local_nic_path;
+    std::string peer_nic_path;
+    std::vector<uint32_t> qp_num;
+    std::string reply_msg;  // on error
+};
+
 class TransferMetadata {
-   public:
-    struct DeviceDesc {
-        std::string name;
-        uint16_t lid;
-        std::string gid;
-    };
-
-    struct BufferDesc {
-        std::string name;
-        uint64_t addr;
-        uint64_t length;
-        std::vector<uint32_t> lkey;
-        std::vector<uint32_t> rkey;
-    };
-
-    struct NVMeoFBufferDesc {
-        std::string file_path;
-        uint64_t length;
-        std::unordered_map<std::string, std::string> local_path_map;
-    };
-
-    using SegmentID = uint64_t;
-
-    struct SegmentDesc {
-        std::string name;
-        std::string protocol;
-        // this is for rdma
-        std::vector<DeviceDesc> devices;
-        Topology topology;
-        std::vector<BufferDesc> buffers;
-        // this is for nvmeof.
-        std::vector<NVMeoFBufferDesc> nvmeof_buffers;
-        // TODO : make these two a union or a std::variant
-    };
-
-    struct RpcMetaDesc {
-        std::string ip_or_host_name;
-        uint16_t rpc_port;
-        int sockfd;             // local cache
-    };
-
-    struct HandShakeDesc {
-        std::string local_nic_path;
-        std::string peer_nic_path;
-        std::vector<uint32_t> qp_num;
-        std::string reply_msg;  // on error
-    };
-
    public:
     TransferMetadata(const std::string &conn_string);
 
@@ -132,6 +138,10 @@ class TransferMetadata {
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
+
+    std::shared_ptr<SegmentDesc> praseSegmentDesc(const Json::Value &value);
+
+    Json::Value exportSegmentDesc(const SegmentDesc &desc);
 
    private:
     // local cache
