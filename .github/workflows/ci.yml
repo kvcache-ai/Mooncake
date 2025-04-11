@@ -1,4 +1,4 @@
-name: 'Build & Test (Linux)' # Renamed for clarity
+name: 'Build & Test (Linux)' 
 
 on:
   push:
@@ -78,15 +78,16 @@ jobs:
         name: mooncake-wheel-ubuntu
         path: mooncake-wheel/dist
 
-    - name: Install system dependencies (if any)
-      run: |
-        sudo apt-get update
-        echo "No specific system dependencies known for the wheel itself."
-      shell: bash
-
     - name: Run installation test script
       run: |
         bash scripts/test_installation.sh
+      shell: bash
+    
+    - name: Run tests
+      run: |
+        source test_env/bin/activate
+        ./scripts/run_tests.sh
+        deactivate
       shell: bash
 
   spell-check:
