@@ -22,10 +22,14 @@ VERSION = os.environ.get("VERSION", "0.1.0")
 setup(
     name="mooncake-transfer-engine",
     version=VERSION,
+    # Add top-level module for direct import
+    py_modules=["mooncake_vllm_adaptor"],
     packages=find_packages(),
     package_data={
         "mooncake": [
-            "*.so",
+            # List specific .so files remaining in the mooncake package
+            "mooncake_sglang_adaptor.so",
+            "engine.so",
             "mooncake_master",
         ],
         "mooncake.transfer": [

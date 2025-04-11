@@ -12,8 +12,9 @@ echo "Creating directory structure..."
 mkdir -p mooncake-wheel/mooncake/transfer/
 
 echo "Copying Python modules..."
-# Copy mooncake_vllm_adaptor to root level for backward compatibility
-cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake/mooncake_vllm_adaptor.so
+# Copy mooncake_vllm_adaptor to wheel root for direct import compatibility
+cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake_vllm_adaptor.so
+# Copy sglang adaptor into the mooncake package
 cp build/mooncake-integration/mooncake_sglang_adaptor.*.so mooncake-wheel/mooncake/mooncake_sglang_adaptor.so
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
@@ -22,8 +23,6 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
-cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/
-
 
 echo "Building wheel package..."
 # Build the wheel package
