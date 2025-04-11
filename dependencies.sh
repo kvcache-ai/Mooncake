@@ -48,6 +48,10 @@ check_success() {
     fi
 }
 
+if [ $(id -u) -ne 0 ]; then
+	print_error "Require root permission, try sudo ./dependencies.sh"
+fi
+
 # Parse command line arguments
 SKIP_CONFIRM=false
 for arg in "$@"; do
@@ -88,7 +92,7 @@ fi
 
 # Update package lists
 print_section "Updating package lists"
-sudo apt-get update
+apt-get update
 check_success "Failed to update package lists"
 
 # Install system packages
@@ -116,7 +120,7 @@ SYSTEM_PACKAGES="build-essential \
                   pkg-config \
                   patchelf"
 
-sudo apt-get install -y $SYSTEM_PACKAGES
+apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"
 print_success "System packages installed successfully"
 
@@ -164,7 +168,7 @@ cmake --build . -j$(nproc)
 check_success "Failed to build yalantinglibs"
 
 echo "Installing yalantinglibs..."
-sudo cmake --install .
+cmake --install .
 check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
@@ -188,7 +192,7 @@ check_success "Failed to download Go $GOVER"
 
 # Install Go
 echo "Installing Go $GOVER..."
-sudo tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
+tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
 check_success "Failed to install Go $GOVER"
 
 # Clean up downloaded file
