@@ -15,7 +15,7 @@ Now both the Transfer Engine and Mooncake Store are open-sourced!
 This repository also hosts its technical report and the open sourced traces. 
 
 <h2 id="updates">🔄 Updates</h2>
-
+ - **Apr 10, 2025**: SGLang officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
  - **Mar 7, 2025**: We open sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
  - **Feb 25, 2025**: Mooncake receives the **Best Paper Award** at **FAST 2025**!
  - **Feb 21, 2025**: The updated <a href="FAST25-release/traces" target="_blank">traces</a> used in our FAST'25 paper have been released.
@@ -36,13 +36,16 @@ The core of Mooncake is its KVCache-centric scheduler, which balances maximizing
 
 <h2 id="components">🧩 Components</h2>
 
-<!-- ![components](image/components.png) -->
-<img src=image/components.png width=75% />
+![components](image/components.png)
 
-- The bottom part of Mooncake is **Transfer Engine**, which supports rapid, reliable and flexible data transfer over TCP, RDMA, NVIDIA GPUDirect-based RDMA and and NVMe over Fabric (NVMe-of) protocols. Comparing with gloo (used by Distributed PyTorch) and TCP, Mooncake Transfer Engine has the lowest I/O latency.
-- Based on **Transfer Engine**, we implemented the **P2P Store** library, supports sharing temporary objects (e.g., checkpoint files) among nodes in a cluster. It avoids bandwidth saturation on a single machine.
-- Additionally, we modified vLLM so that **Transfer Engine** is integrated. It makes prefill-decode disaggregation more efficient by utilizing RDMA devices. 
-- **Mooncake Store** is based on **Transfer Engine**, which supports distributed pooled KVCache for vLLM's xPyD disaggregation. 
+**Mooncake Core Component: Transfer Engine (TE)**  
+The core of Mooncake is the Transfer Engine (TE), which provides a unified interface for batched data transfer across various storage devices and network links. Supporting multiple protocols including TCP, RDMA, CXL/shared-memory, and NVMe over Fabric (NVMe-of), TE is designed to enable fast and reliable data transfer for AI workloads. Compared to Gloo (used by Distributed PyTorch) and traditional TCP, TE achieves significantly lower I/O latency, making it a superior solution for efficient data transmission.
+
+**P2P Store and Mooncake Store**  
+Both P2P Store and Mooncake Store are built on the Transfer Engine and provide key/value caching for different scenarios. P2P Store focuses on sharing temporary objects (e.g., checkpoint files) across nodes in a cluster, preventing bandwidth saturation on a single machine. Mooncake Store, on the other hand, supports distributed pooled KVCache, specifically designed for XpYd disaggregation to enhance resource utilization and system performance.
+
+**Mooncake Integration with Leading LLM Inference Systems**  
+Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
@@ -72,13 +75,18 @@ P2P Store is built on the Transfer Engine and supports sharing temporary objects
 
 - **Efficient data distribution.** Designed to enhance the efficiency of large-scale data distribution, P2P Store *avoids bandwidth saturation* issues by allowing replicated nodes to share data directly. This reduces the CPU/RDMA NIC pressures of data providers (e.g., trainers).
 
-#### Performance
-Thanks to the high performance of Transfer Engine, P2P Stores can also distribute objects with full utilization of *hardware incoming bandwidth* (e.g., A 25Gbps NIC was used in the following figure, and the throughput of get replica is about 3.1 GB/s).
+<!-- #### Performance
+Thanks to the high performance of Transfer Engine, P2P Stores can also distribute objects with full utilization of *hardware incoming bandwidth* (e.g., A 25Gbps NIC was used in the following figure, and the throughput of get replica is about 3.1 GB/s). -->
 
-![p2p-store.gif](image/p2p-store.gif)
+<!-- ![p2p-store.gif](image/p2p-store.gif) -->
 
 ### Mooncake Store ([Guide](doc/en/mooncake-store-preview.md))
-Mooncake Store is a distributed KVCache storage engine specialized for LLM inference. It offers object-level APIs (`Put`, `Get` and `Remove`), and we will soon release an new vLLM integration to demonstrate xPyD disaggregation. Mooncake Store is the central component of the KVCache-centric disaggregated architecture.
+Mooncake Store is a distributed KVCache storage engine specialized for LLM inference based on Transfer Engine. It is the central component of the KVCache-centric disaggregated architecture. The goal of Mooncake Store is to store the reusable KV caches across various locations in an inference cluster. Mooncake Store has been supported in [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html).
+
+#### Highlights
+- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
+
+- **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 
 ### vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md))
 To optimize LLM inference, the vLLM community is working on supporting [disaggregated prefilling (PR 10502)](https://github.com/vllm-project/vllm/pull/10502). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
