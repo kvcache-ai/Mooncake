@@ -35,5 +35,20 @@ class TestImportStructure(unittest.TestCase):
         self.assertIsNotNone(TransferEngine)
         self.assertIsNotNone(TransferOpcode)
 
+    def test_direct_vllm_import(self):
+        """Test direct import of the top-level vLLM adaptor module."""
+        import mooncake_vllm_adaptor
+
+        # Verify the module exists
+        self.assertIsNotNone(mooncake_vllm_adaptor)
+
+        # Verify access to its contents
+        self.assertIsNotNone(mooncake_vllm_adaptor.MooncakeDistributedStore)
+
+        # Just verify we can create instances
+        store = mooncake_vllm_adaptor.MooncakeDistributedStore()
+        self.assertIsNotNone(store)
+
+
 if __name__ == '__main__':
     unittest.main()
