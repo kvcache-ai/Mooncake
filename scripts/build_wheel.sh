@@ -3,6 +3,7 @@
 # Usage: ./scripts/build_wheel.sh
 
 set -e  # Exit immediately if a command exits with a non-zero status
+set -x
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -38,7 +39,6 @@ python -m build
 mkdir -p repaired_wheels
 
 echo "Repairing wheel with auditwheel..."
-# Use auditwheel to repair the wheel and include missing .so files
 auditwheel repair dist/*.whl \
 --exclude libcurl.so* \
 --exclude libibverbs.so* \
@@ -78,7 +78,8 @@ auditwheel repair dist/*.whl \
 --exclude libkeyutils.so* \
 --exclude libresolv.so* \
 --exclude libffi.so* \
--w repaired_wheels/
+-w repaired_wheels/ --plat manylinux_2_35_x86_64
+
 
 # Replace original wheel with repaired wheel
 rm -f dist/*.whl
