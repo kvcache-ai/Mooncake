@@ -44,17 +44,6 @@ target_link_libraries(mooncake_vllm_adaptor PUBLIC
 message("${PYTHON_SYS_PATH}")
 install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
 
-pybind11_add_module(mooncake_sglang_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    sglang/sglang_adaptor.cpp 
-)
-target_link_libraries(mooncake_sglang_adaptor PUBLIC 
-    transfer_engine 
-    glog 
-    gflags 
-)
-message("${PYTHON_SYS_PATH}")
-install(TARGETS mooncake_sglang_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
-
 set(PYTHON_PACKAGE_NAME "mooncake")
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp 
@@ -63,6 +52,16 @@ target_link_libraries(engine PUBLIC
     transfer_engine 
     glog 
     gflags 
+)
+pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+    store/store_py.cpp 
+)
+target_link_libraries(store PUBLIC 
+    transfer_engine 
+    glog 
+    gflags 
+    mooncake_store 
+    cachelib_memory_allocator
 )
 message("${PYTHON_SYS_PATH}")
 
@@ -83,5 +82,5 @@ install(
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
     "
 )
-
+install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
