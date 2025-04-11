@@ -12,8 +12,8 @@ python -m venv test_env
 source test_env/bin/activate
 
 echo "Verifying that import fails before installation..."
-# Verify that importing mooncake.transfer fails before installation
-python -c "import mooncake.transfer" 2>/dev/null && { echo "ERROR: Import succeeded when it should have failed!"; exit 1; } || echo "Good: Import failed as expected before installation"
+# Verify that importing mooncake.engine fails before installation
+python -c "import mooncake.engine" 2>/dev/null && { echo "ERROR: Import succeeded when it should have failed!"; exit 1; } || echo "Good: Import failed as expected before installation"
 
 echo "Installing the wheel package..."
 # Install the wheel package
@@ -31,7 +31,7 @@ sudo apt-get install -y $SYSTEM_PACKAGES
 
 
 echo "Verifying that import succeeds after installation..."
-python -c "import mooncake.transfer" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
+python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
 # Run the import structure test

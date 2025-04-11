@@ -1,6 +1,6 @@
 import unittest
 import os
-from mooncake import mooncake_vllm_adaptor
+from mooncake.engine import TransferEngine
 
 
 class TestVLLMAdaptorTransfer(unittest.TestCase):
@@ -12,7 +12,7 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         cls.protocol = os.getenv("PROTOCOL", "tcp")        # "rdma" or "tcp"
         cls.circle = int(os.getenv("CIRCLE", 1000))
 
-        cls.adaptor = mooncake_vllm_adaptor()
+        cls.adaptor = TransferEngine()
         ret = cls.adaptor.initialize(
             cls.initiator_server_name,
             cls.metadata_server,
@@ -33,8 +33,8 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         adaptor = self.adaptor
         circles = self.circle
 
-        src_addr = adaptor.getFirstBufferAddress(self.initiator_server_name)
-        dst_addr = adaptor.getFirstBufferAddress(self.target_server_name)
+        src_addr = adaptor.get_first_buffer_address(self.initiator_server_name)
+        dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
 
         for i in range(circles):
             str_len = random.randint(16, 256)
@@ -42,28 +42,28 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             data_len = len(src_data)
 
             #Write to local buffer
-            result = adaptor.writeBytesToBuffer(src_addr, src_data, data_len)
+            result = adaptor.write_bytes_to_buffer(src_addr, src_data, data_len)
             self.assertEqual(result, 0, f"[{i}] writeBytesToBuffer failed")
 
             #Write to the remote end
-            result = adaptor.transferSyncExt(
-                self.target_server_name, src_addr, dst_addr, data_len, adaptor.TransferOpcode.WRITE
+            result = adaptor.transfer_sync_write(
+                self.target_server_name, src_addr, dst_addr, data_len
             )
             self.assertEqual(result, 0, f"[{i}] WRITE transferSyncExt failed")
 
             #Clear the local buffer
             clear_data = bytes([0] * data_len)
-            result = adaptor.writeBytesToBuffer(src_addr, clear_data, data_len)
+            result = adaptor.write_bytes_to_buffer(src_addr, clear_data, data_len)
             self.assertEqual(result, 0, f"[{i}] Clear buffer failed")
 
             #Read it back from the remote end
-            result = adaptor.transferSyncExt(
-                self.target_server_name, src_addr, dst_addr, data_len, adaptor.TransferOpcode.READ
+            result = adaptor.transfer_sync_read(
+                self.target_server_name, src_addr, dst_addr, data_len
             )
             self.assertEqual(result, 0, f"[{i}] READ transferSyncExt failed")
 
             #Verify data consistency
-            read_back = adaptor.readBytesFromBuffer(src_addr, data_len)
+            read_back = adaptor.read_bytes_from_buffer(src_addr, data_len)
             self.assertEqual(read_back, src_data, f"[{i}] Data mismatch")
 
         print(f"[✓] {circles} iterations of random write-read passed successfully.")
