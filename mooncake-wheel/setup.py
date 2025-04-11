@@ -1,6 +1,6 @@
 import sys
 import os
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, Extension
 from setuptools.dist import Distribution
 from wheel.bdist_wheel import bdist_wheel
 
@@ -19,13 +19,19 @@ python_version = f">={sys.version_info.major}.{sys.version_info.minor}"
 
 VERSION = os.environ.get("VERSION", "0.1.0")
 
+# Define the extension module, even if pre-compiled.
+# Setuptools should find the .so file copied by build_wheel.sh
+ext_modules = [
+    Extension("mooncake_vllm_adaptor", sources=[]) # No sources needed as it's pre-compiled
+]
+
 setup(
     name="mooncake-transfer-engine",
     version=VERSION,
-    # Add top-level module for direct import
-    py_modules=["mooncake_vllm_adaptor"],
     packages=find_packages(),
+    ext_modules=ext_modules, # Use ext_modules instead of py_modules
     package_data={
+        # Ensure mooncake_vllm_adaptor.so is NOT listed here
         "mooncake": [
             # List specific .so files remaining in the mooncake package
             "mooncake_sglang_adaptor.so",

@@ -29,7 +29,7 @@ echo "Building wheel package..."
 cd mooncake-wheel
 
 echo "Cleaning up previous build artifacts..."
-rm -rf dist/ 
+rm -rf dist/ build/ mooncake.egg-info/ mooncake_transfer_engine.egg-info/
 
 echo "Building wheel with default version"
 python -m build
@@ -83,6 +83,9 @@ auditwheel repair dist/*.whl \
 # Replace original wheel with repaired wheel
 rm -f dist/*.whl
 mv repaired_wheels/*.whl dist/
+
+echo "Listing contents of the final wheel:"
+unzip -l dist/*.whl
 
 cd ..
 
