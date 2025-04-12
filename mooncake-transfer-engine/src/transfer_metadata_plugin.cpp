@@ -26,6 +26,7 @@
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
+#include <mutex>
 #endif
 
 #ifdef USE_HTTP
@@ -62,9 +63,17 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    virtual ~RedisStoragePlugin() {}
+    virtual ~RedisStoragePlugin() {
+        if (client_) {
+            redisFree(client_);
+            client_ = nullptr;
+        }
+    }
 
     virtual bool get(const std::string &key, Json::Value &value) {
+        std::lock_guard<std::mutex> lock(access_client_mutex_);
+        if (!client_) return false;
+
         Json::Reader reader;
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
@@ -73,7 +82,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
-        if (!resp->str) return false;
+        if (!resp->str) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
+                       << " from " << metadata_uri_;
+            freeReplyObject(resp);
+            return false;
+        }
+
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
         if (!reader.parse(json_file, value)) return false;
@@ -84,6 +99,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     }
 
     virtual bool set(const std::string &key, const Json::Value &value) {
+        std::lock_guard<std::mutex> lock(access_client_mutex_);
+        if (!client_) return false;
+
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         if (globalConfig().verbose)
@@ -101,6 +119,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     }
 
     virtual bool remove(const std::string &key) {
+        std::lock_guard<std::mutex> lock(access_client_mutex_);
+        if (!client_) return false;
+
         redisReply *resp =
             (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
         if (!resp) {
@@ -114,6 +135,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     redisContext *client_;
     const std::string metadata_uri_;
+    std::mutex access_client_mutex_;
 };
 #endif  // USE_REDIS
 
