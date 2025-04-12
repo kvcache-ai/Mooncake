@@ -71,17 +71,19 @@ std::pair<std::string, std::string> parseConnectionString(
 }
 
 int TransferEnginePy::initialize(const char *local_hostname,
-                              const char *metadata_server, const char *protocol,
-                              const char *device_name) {
+                                 const char *metadata_server,
+                                 const char *protocol,
+                                 const char *device_name) {
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
 }
 
 int TransferEnginePy::initializeExt(const char *local_hostname,
-                                 const char *metadata_server,
-                                 const char *protocol, const char *device_name,
-                                 const char *metadata_type) {
+                                    const char *metadata_server,
+                                    const char *protocol,
+                                    const char *device_name,
+                                    const char *metadata_type) {
     std::string conn_string = metadata_server;
     if (conn_string.find("://") == std::string::npos)
         conn_string =
@@ -104,9 +106,10 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {
         auto device_names = formatDeviceNames(device_name);
-        std::string nic_priority_matrix =
-            "{\"cpu:0\": [[" + device_names + "], []],"
-            "\"cuda:0\": [[" + device_names + "], []]}";
+        std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
+                                          "], []],"
+                                          "\"cuda:0\": [[" +
+                                          device_names + "], []]}";
         void **args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
@@ -193,8 +196,10 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     return 0;
 }
 
-int TransferEnginePy::transferSyncWrite(const char *target_hostname, uintptr_t buffer,
-                                uintptr_t peer_buffer_address, size_t length) {
+int TransferEnginePy::transferSyncWrite(const char *target_hostname,
+                                        uintptr_t buffer,
+                                        uintptr_t peer_buffer_address,
+                                        size_t length) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -229,8 +234,10 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname, uintptr_t b
     }
 }
 
-int TransferEnginePy::transferSyncRead(const char *target_hostname, uintptr_t buffer,
-                                uintptr_t peer_buffer_address, size_t length) {
+int TransferEnginePy::transferSyncRead(const char *target_hostname,
+                                       uintptr_t buffer,
+                                       uintptr_t peer_buffer_address,
+                                       size_t length) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -348,13 +355,15 @@ PYBIND11_MODULE(engine, m) {
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
-            .def("allocate_managed_buffer", &TransferEnginePy::allocateManagedBuffer)
+            .def("allocate_managed_buffer",
+                 &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite)
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
-            .def("read_bytes_from_buffer", &TransferEnginePy::readBytesFromBuffer)
+            .def("read_bytes_from_buffer",
+                 &TransferEnginePy::readBytesFromBuffer)
             .def("register_memory", &TransferEnginePy::registerMemory)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
             .def("get_first_buffer_address",

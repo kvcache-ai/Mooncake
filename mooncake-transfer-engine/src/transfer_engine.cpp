@@ -125,6 +125,10 @@ Transport *TransferEngine::installTransport(const std::string &proto,
 
 int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
 
+// port: env
+// ip
+
+// ip:port
 Transport::SegmentHandle TransferEngine::openSegment(
     const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;

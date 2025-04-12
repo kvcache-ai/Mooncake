@@ -41,6 +41,11 @@
 namespace mooncake {
 const static int LOCAL_SEGMENT_ID = 0;
 
+enum class HandShakeRequestType {
+    Connection = 0,
+    Metadata = 1,
+};
+
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
         LOG(ERROR) << "The platform does not support NUMA";
@@ -140,27 +145,53 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     return len;
 }
 
-static inline int writeString(int fd, const std::string &str) {
-    uint64_t length = str.size();
+static inline int writeString(int fd, const HandShakeRequestType type,
+                              const std::string &str) {
+    uint8_t byte = static_cast<uint8_t>(type);
+    LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
+              << "): " << str;
+    uint64_t length = str.size() + sizeof(byte);
     if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
+        return ERR_SOCKET;
+    if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
         return ERR_SOCKET;
     if (writeFully(fd, str.data(), length) != (ssize_t)length)
         return ERR_SOCKET;
     return 0;
 }
 
-static inline std::string readString(int fd) {
+static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
+    HandShakeRequestType type = HandShakeRequestType::Connection;
+
     const static size_t kMaxLength = 1ull << 20;
     uint64_t length = 0;
-    if (readFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
-        return "";
-    if (length > kMaxLength) return "";
+    ssize_t n = readFully(fd, &length, sizeof(length));
+    if (n != (ssize_t)sizeof(length)) {
+        LOG(ERROR) << "Failed to read length, got: " << n;
+        return {type, ""};
+    }
+
+    if (length > kMaxLength) {
+        LOG(ERROR) << "Read too large length from socket: " << length;
+        return {type, ""};
+    }
+
     std::string str;
     std::vector<char> buffer(length);
-    if (readFully(fd, buffer.data(), length) != (ssize_t)length) return "";
+    n = readFully(fd, buffer.data(), length);
+    if (n != (ssize_t)length) {
+        LOG(ERROR) << "Failed to read string, got: " << n;
+        return {type, ""};
+    }
 
-    str.assign(buffer.data(), length);
-    return str;
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Metadata)) {
+        type = static_cast<HandShakeRequestType>(buffer[0]);
+        str.assign(buffer.data() + 1, length - 1);
+    } else {
+        str.assign(buffer.data(), length);
+    }
+
+    return {type, str};
 }
 
 const static std::string NIC_PATH_DELIM = "@";
