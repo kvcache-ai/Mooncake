@@ -219,23 +219,26 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    bool has_removed;
-    do {
-        has_removed = false;
-        for (auto iter = memory_region_list_.begin();
-             iter != memory_region_list_.end(); ++iter) {
-            if ((*iter)->addr <= addr &&
-                addr < (char *)((*iter)->addr) + (*iter)->length) {
-                if (ibv_dereg_mr(*iter)) {
-                    LOG(ERROR) << "Failed to unregister memory " << addr;
-                    return ERR_CONTEXT;
-                }
-                memory_region_list_.erase(iter);
-                has_removed = true;
-                break;
-            }
+    bool has_found;
+    has_found = false;
+    auto target_iter = memory_region_list_.begin();
+    uint64_t target_length = UINT64_MAX;
+    for (auto iter = memory_region_list_.begin();
+            iter != memory_region_list_.end(); ++iter) {
+        if ((*iter)->addr != addr) continue;
+        if ((*iter)->length < target_length) {
+            target_length = (*iter)->length;
+            target_iter = iter;
+            has_found = true;
         }
-    } while (has_removed);
+    }
+    if (has_found) {
+        if (ibv_dereg_mr(*target_iter)) {
+            LOG(ERROR) << "Failed to unregister memory " << addr;
+            return ERR_CONTEXT;
+        }
+        memory_region_list_.erase(target_iter);
+    }
     return 0;
 }
 
