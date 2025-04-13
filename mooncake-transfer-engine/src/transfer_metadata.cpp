@@ -347,14 +347,20 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
+
+        size_t to_remove_length = UINT64_MAX;
+        auto to_remove_iter = segment_desc->buffers.begin();
         for (auto iter = segment_desc->buffers.begin();
              iter != segment_desc->buffers.end(); ++iter) {
             if (iter->addr == (uint64_t)addr) {
-                segment_desc->buffers.erase(iter);
+                if (to_remove_length > iter->length) {
+                    to_remove_iter = iter;
+                    to_remove_length = iter->length;
+                }
                 addr_exist = true;
-                break;
             }
-        }
+        }    
+        if (addr_exist) segment_desc->buffers.erase(to_remove_iter);
     }
     if (addr_exist) {
         if (update_metadata) return updateLocalSegmentDesc();

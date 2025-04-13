@@ -138,11 +138,16 @@ Transport::SegmentHandle TransferEngine::openSegment(
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
 
 bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (auto &local_memory_region : local_memory_regions_) {
-        if (overlap(addr, length, local_memory_region.addr,
-                    local_memory_region.length)) {
-            return true;
+    for (auto &entry : local_memory_regions_) {
+        if (overlap(addr, length, entry.addr, entry.length)) {
+            LOG(WARNING) << "Transfer Engine found overlapped memory region" 
+                         << addr << "--" << (char *) addr + length << " with "
+                         << entry.addr << "--" << (char *) entry.addr + entry.length;
+            if (addr == entry.addr && length == entry.length) {
+                // Identical memory region, add ref count
+                entry.ref_count++;
+                return true;
+            }
         }
     }
     return false;
@@ -152,78 +157,97 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
                                         const std::string &location,
                                         bool remote_accessible,
                                         bool update_metadata) {
-    if (checkOverlap(addr, length)) {
-        LOG(ERROR)
-            << "Transfer Engine does not support overlapped memory region";
-        return ERR_ADDRESS_OVERLAPPED;
-    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (checkOverlap(addr, length)) return 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) return ret;
     }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
     local_memory_regions_.push_back(
-        {addr, length, location, remote_accessible});
+        {addr, length, location, remote_accessible, 1});
     return 0;
 }
 
 int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto memory_region_iter = local_memory_regions_.begin();
+    for (auto it = local_memory_regions_.begin();
+         it != local_memory_regions_.end(); ++it) {
+        if (it->addr == addr) {
+            if (it->ref_count > 1) {
+                it->ref_count--;
+                return 0;
+            }
+            if (memory_region_iter->addr != it->addr || memory_region_iter->length > it->length)
+                memory_region_iter = it; // if base address is identical, remove the smallest one
+        }
+    }
+
     for (auto &transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
         if (ret) return ret;
     }
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto it = local_memory_regions_.begin();
-         it != local_memory_regions_.end(); ++it) {
-        if (it->addr == addr) {
-            local_memory_regions_.erase(it);
-            break;
-        }
-    }
+    local_memory_regions_.erase(memory_region_iter);
     return 0;
 }
 
 int TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list, const std::string &location) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::vector<BufferEntry> real_buffer_list;
     for (auto &buffer : buffer_list) {
-        if (checkOverlap(buffer.addr, buffer.length)) {
-            LOG(ERROR)
-                << "Transfer Engine does not support overlapped memory region";
-            return ERR_ADDRESS_OVERLAPPED;
+        if (!checkOverlap(buffer.addr, buffer.length)) {
+            real_buffer_list.push_back(buffer);
         }
     }
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemoryBatch(buffer_list, location);
+        int ret = transport->registerLocalMemoryBatch(real_buffer_list, location);
         if (ret < 0) return ret;
     }
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto &buffer : buffer_list) {
+    for (auto &buffer : real_buffer_list) {
         local_memory_regions_.push_back(
-            {buffer.addr, buffer.length, location, true});
+            {buffer.addr, buffer.length, location, true, 1});
     }
     return 0;
 }
 
 int TransferEngine::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::vector<void *> real_addr_list;
+    std::vector<std::vector<MemoryRegion>::iterator> memory_region_iter_list;
+
+    for (auto &addr : addr_list) {
+        auto memory_region_iter = local_memory_regions_.begin();
+        bool further_process = true;
+        for (auto it = local_memory_regions_.begin();
+            it != local_memory_regions_.end(); ++it) {
+            if (it->addr == addr) {
+                if (it->ref_count > 1) {
+                    it->ref_count--;
+                    further_process = false;
+                    break;
+                }
+                if (memory_region_iter->addr != it->addr || memory_region_iter->length > it->length)
+                    memory_region_iter = it; // if base address is identical, remove the smallest one
+            }
+        }
+        if (further_process) {
+            real_addr_list.push_back(addr);
+            memory_region_iter_list.push_back(memory_region_iter);
+        }
+    }
+
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
+        int ret = transport->unregisterLocalMemoryBatch(real_addr_list);
         if (ret < 0) return ret;
     }
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto &addr : addr_list) {
-        for (auto it = local_memory_regions_.begin();
-             it != local_memory_regions_.end(); ++it) {
-            if (it->addr == addr) {
-                local_memory_regions_.erase(it);
-                break;
-            }
-        }
+    for (auto &memory_region_iter : memory_region_iter_list) {
+        local_memory_regions_.erase(memory_region_iter);
     }
     return 0;
 }

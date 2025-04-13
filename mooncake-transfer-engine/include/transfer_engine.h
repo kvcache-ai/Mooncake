@@ -112,6 +112,7 @@ class TransferEngine {
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        int ref_count;
     };
 
     std::shared_ptr<TransferMetadata> metadata_;
