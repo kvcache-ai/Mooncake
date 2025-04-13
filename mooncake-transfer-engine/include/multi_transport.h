@@ -52,7 +52,7 @@ class MultiTransport {
     std::vector<Transport *> listTransports();
 
    private:
-    Transport *selectTransport(const TransferRequest &entry);
+    Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
    private:
     std::shared_ptr<TransferMetadata> metadata_;

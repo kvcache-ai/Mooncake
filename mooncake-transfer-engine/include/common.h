@@ -47,7 +47,7 @@ const static int LOCAL_SEGMENT_ID = 0;
 
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
-        LOG(ERROR) << "The platform does not support NUMA";
+        LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
     }
     cpu_set_t cpu_set;
@@ -68,7 +68,7 @@ static inline int bindToSocket(int socket_id) {
     numa_free_cpumask(cpu_list);
     if (nr_cpus == 0) return 0;
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set)) {
-        LOG(ERROR) << "Failed to set socket affinity";
+        LOG(ERROR) << "bindToSocket: pthread_setaffinity_np failed";
         return ERR_NUMA;
     }
     return 0;
@@ -78,7 +78,7 @@ static inline int64_t getCurrentTimeInNano() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts)) {
-        PLOG(ERROR) << "Failed to read real-time lock";
+        PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
         return ERR_CLOCK;
     }
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
