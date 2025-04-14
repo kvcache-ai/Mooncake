@@ -14,20 +14,45 @@
 
 #include "memory_location.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
 
 std::string genCpuNodeName(int node) {
     if (node >= 0) return "cpu:" + std::to_string(node);
+    return kWildcardLocation;
+}
 
-    // use "*" when failed to get the numa node.
-    return "*";
+std::string genGpuNodeName(int node) {
+    if (node >= 0) return "cuda:" + std::to_string(node);
+    return kWildcardLocation;
 }
 
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len) {
     std::vector<MemoryLocationEntry> entries;
+
+#ifdef USE_CUDA
+    cudaPointerAttributes attributes;
+    cudaError_t result;
+    result = cudaPointerGetAttributes(&attributes, start);
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << " (Error code: " << result << " - "
+                   << cudaGetErrorString(result) << ")" << std::endl;
+        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+        return entries;
+    }
+
+    if (attributes.type == cudaMemoryTypeDevice) {
+        entries.push_back(
+            {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+        return entries;
+    }
+#endif
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
@@ -43,7 +68,9 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     if (rc != 0) {
         PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
                       << ", len: " << len;
-        entries.push_back({(uint64_t)start, len, "*"});
+        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+        free(pages);
+        free(status);
         return entries;
     }
 
@@ -61,6 +88,8 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     }
     entries.push_back(
         {start_addr, (uint64_t)start + len - start_addr, genCpuNodeName(node)});
+    free(pages);
+    free(status);
     return entries;
 }
 
