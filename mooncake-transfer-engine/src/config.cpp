@@ -178,6 +178,17 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (disable_metacache) {
         config.metacache = false;
     }
+
+    const char *log_level = std::getenv("MC_LOG_LEVEL");
+    if (log_level) {
+        if (strcmp(log_level, "INFO") == 0)
+            config.log_level = google::INFO;
+        else if (strcmp(log_level, "WARNING") == 0)
+            config.log_level = google::WARNING;
+        else if (strcmp(log_level, "ERROR") == 0)
+            config.log_level = google::ERROR;
+    }
+    FLAGS_minloglevel = config.log_level;
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

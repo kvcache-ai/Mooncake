@@ -41,6 +41,7 @@ struct GlobalConfig {
     size_t slice_size = 65536;
     int retry_cnt = 8;
     bool metacache = true;
+    int log_level = google::WARNING;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
