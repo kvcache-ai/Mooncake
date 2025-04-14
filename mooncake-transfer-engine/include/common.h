@@ -44,6 +44,8 @@ const static int LOCAL_SEGMENT_ID = 0;
 enum class HandShakeRequestType {
     Connection = 0,
     Metadata = 1,
+    // placeholder for old protocol without RequestType
+    OldProtocol = 0xff,
 };
 
 static inline int bindToSocket(int socket_id) {
@@ -150,11 +152,15 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     uint8_t byte = static_cast<uint8_t>(type);
     LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
               << "): " << str;
-    uint64_t length = str.size() + sizeof(byte);
+    uint64_t length =
+        str.size() +
+        (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
     if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
         return ERR_SOCKET;
-    if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
-        return ERR_SOCKET;
+    if (type != HandShakeRequestType::OldProtocol) {
+        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+            return ERR_SOCKET;
+    }
     if (writeFully(fd, str.data(), length) != (ssize_t)length)
         return ERR_SOCKET;
     return 0;
@@ -167,12 +173,12 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
-        LOG(ERROR) << "Failed to read length, got: " << n;
+        LOG(ERROR) << "readString: failed to read length, got: " << n;
         return {type, ""};
     }
 
     if (length > kMaxLength) {
-        LOG(ERROR) << "Read too large length from socket: " << length;
+        LOG(ERROR) << "readString: too large length from socket: " << length;
         return {type, ""};
     }
 
@@ -180,14 +186,17 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
     std::vector<char> buffer(length);
     n = readFully(fd, buffer.data(), length);
     if (n != (ssize_t)length) {
-        LOG(ERROR) << "Failed to read string, got: " << n;
+        LOG(ERROR) << "readString: unexpected length, got: " << n
+                   << ", expected: " << length;
         return {type, ""};
     }
 
     if (buffer[0] <= static_cast<char>(HandShakeRequestType::Metadata)) {
         type = static_cast<HandShakeRequestType>(buffer[0]);
-        str.assign(buffer.data() + 1, length - 1);
+        str.assign(buffer.data() + sizeof(char), length - sizeof(char));
     } else {
+        type = HandShakeRequestType::OldProtocol;
+        // Old protocol, no type
         str.assign(buffer.data(), length);
     }
 

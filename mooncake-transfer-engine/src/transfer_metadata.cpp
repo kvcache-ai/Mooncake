@@ -252,6 +252,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
 int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
                                           Json::Value &local_json) {
+    // TODO: save to local cache
     // auto peer_desc = decodeSegmentDesc(peer_json,
     // peer_json["name"].asString());
     auto local_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
@@ -511,11 +512,8 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     const HandShakeDesc &local_desc,
                                     HandShakeDesc &peer_desc) {
     RpcMetaDesc peer_location;
-    if (p2p_handshake_mode_) {
-    } else {
-        if (getRpcMetaEntry(peer_server_name, peer_location)) {
-            return ERR_METADATA;
-        }
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;

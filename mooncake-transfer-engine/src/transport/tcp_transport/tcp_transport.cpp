@@ -325,7 +325,6 @@ Status TcpTransport::submitTransfer(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        ;
         startTransfer(slice);
     }
 
@@ -349,7 +348,6 @@ Status TcpTransport::submitTransferTask(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        ;
         startTransfer(slice);
     }
     return Status::OK();

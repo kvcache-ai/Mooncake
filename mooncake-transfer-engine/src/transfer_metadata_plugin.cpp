@@ -492,11 +492,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
-    virtual void registerOnConnectionCallBack(OnConnectionCallBack callback) {
+    virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
         on_connection_callback_ = callback;
     }
 
-    virtual void registerOnMetadataCallBack(OnMetadataCallBack callback) {
+    virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) {
         on_metadata_callback_ = callback;
     }
 
@@ -606,7 +606,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                if (type == HandShakeRequestType::Connection) {
+                // old protocol equals Connection type
+                if (type == HandShakeRequestType::Connection ||
+                    type == HandShakeRequestType::OldProtocol) {
                     on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
                     on_metadata_callback_(peer, local);
@@ -619,7 +621,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
                 int ret =
                     writeString(conn_fd, type, Json::FastWriter{}.write(local));
-                LOG(INFO) << "writeString return: " << ret;
                 if (ret) {
                     LOG(ERROR) << "SocketHandShakePlugin: failed to send "
                                   "message: "
@@ -779,7 +780,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendMetadta(rp, local_metadata, peer_metadata);
+            ret = doSendMetadata(rp, local_metadata, peer_metadata);
             if (ret == 0) {
                 freeaddrinfo(result);
                 return 0;
@@ -793,8 +794,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSendMetadta(struct addrinfo *addr, const Json::Value &local_metadata,
-                      Json::Value &peer_metadata) {
+    int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
+                       Json::Value &peer_metadata) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
@@ -839,8 +840,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
 
-    OnConnectionCallBack on_connection_callback_;
-    OnMetadataCallBack on_metadata_callback_;
+    OnReceiveCallBack on_connection_callback_;
+    OnReceiveCallBack on_metadata_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
