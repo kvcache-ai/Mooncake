@@ -349,7 +349,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
         : metadata_uri_(metadata_uri) {
-        auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), err_msg_);
+        auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
                        << metadata_uri_ << ": " << err_msg_;
@@ -364,7 +364,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual bool get(const std::string &key, Json::Value &value) {
         Json::Reader reader;
         char *json_data = nullptr;
-        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, err_msg_);
+        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
                        << metadata_uri_ << ": " << err_msg_;
@@ -393,7 +393,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         auto ret = EtcdPutWrapper((char *)key.c_str(),
-                                  (char *)json_file.c_str(), err_msg_);
+                                  (char *)json_file.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " in "
                        << metadata_uri_ << ": " << err_msg_;
@@ -409,7 +409,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     }
 
     virtual bool remove(const std::string &key) {
-        auto ret = EtcdDeleteWrapper((char *)key.c_str(), err_msg_);
+        auto ret = EtcdDeleteWrapper((char *)key.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to remove " << key
                        << " in " << metadata_uri_ << ": " << err_msg_;
