@@ -23,7 +23,6 @@ cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
-cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/
 
 
 echo "Building wheel package..."
