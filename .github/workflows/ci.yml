@@ -1,4 +1,4 @@
-name: 'Build & Test (Linux)' 
+name: 'Build & Test (Linux)'
 
 on:
   push:
@@ -7,11 +7,20 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build-ubuntu:
+  build:
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
     steps:
     - uses: actions/checkout@v4
-    - name: configure
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Configure and build project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
@@ -19,69 +28,49 @@ jobs:
         mkdir build
         cd build
         cmake .. -DUSE_HTTP=ON
-      shell: bash
-    - name: make
-      run: |
-        cd build
         sudo make install -j
       shell: bash
-    - name: start-metadata-server
+      
+    - name: Start Metadata Server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
         python ./bootstrap_server.py &
       shell: bash
-    - name: start-mooncake-master
+      
+    - name: Start Mooncake Master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         mooncake_master &
       shell: bash
-    - name: test (in build env)
+      
+    - name: Test (in build env)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
       shell: bash
+      
     - name: Stop Mooncake Master Service
       run: |
         pkill mooncake_master || true
       shell: bash
-
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-
-    - name: Build Python wheel for Python 3.10
+    
+    - name: Build Python wheel
       run: |
-        PYTHON_VERSION=3.10 OUTPUT_DIR=dist-py3.10 ./scripts/build_wheel.sh
+        # Build wheel with specific Python version
+        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Upload Python 3.10 wheel artifact
+    - name: Upload Python wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py310
-        path: mooncake-wheel/dist-py3.10/*.whl
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Build Python wheel for Python 3.12
-      run: |
-        PYTHON_VERSION=3.12 OUTPUT_DIR=dist-py3.12 ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload Python 3.12 wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py312
-        path: mooncake-wheel/dist-py3.12/*.whl
+        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
+        path: mooncake-wheel/dist-py${{ matrix.python-version == '3.10' && '310' || '312' }}/*.whl
 
   test-wheel-ubuntu:
-    needs: build-ubuntu # Ensure build job completes first
+    needs: build
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
@@ -90,7 +79,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4 
 
-    - name: Set up Python
+    - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
@@ -115,11 +104,12 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
     
-    - name: start-metadata-server
+    - name: Start metadata server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
         python ./bootstrap_server.py &
+      shell: bash
 
     - name: Run tests
       run: |
