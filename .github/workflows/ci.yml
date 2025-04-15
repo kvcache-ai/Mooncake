@@ -16,6 +16,7 @@ jobs:
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         pip install build setuptools wheel
+        git submodule update --init
         mkdir build
         cd build
         cmake .. -DUSE_HTTP=ON

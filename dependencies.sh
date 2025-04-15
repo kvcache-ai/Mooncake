@@ -116,7 +116,6 @@ SYSTEM_PACKAGES="build-essential \
                   libgrpc++-dev \
                   libprotobuf-dev \
                   protobuf-compiler-grpc \
-                  pybind11-dev \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   pkg-config \
