@@ -15,16 +15,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: C++",
     "Operating System :: POSIX :: Linux",
-    "License :: OSI Approved :: Apache Software License"
 ]
 readme = ""
-license = { file = "../LICENSE-APACHE" }
-urls = { 
-    "Homepage" = "https://github.com/kvcache-ai/Mooncake",
-    "Documentation" = "https://github.com/kvcache-ai/Mooncake/tree/main/doc",
-    "Source" = "https://github.com/kvcache-ai/Mooncake",
-    "Issues" = "https://github.com/kvcache-ai/Mooncake/issues"
-}
+license-files = ["LICENSE-APACHE"]
+
+[project.urls]
+Homepage = "https://github.com/kvcache-ai/Mooncake"
+Documentation = "https://github.com/kvcache-ai/Mooncake/tree/main/doc"
+Source = "https://github.com/kvcache-ai/Mooncake"
+Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"

@@ -10,9 +10,9 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
-MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python transfer_engine_target.py &
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_target.py &
 TARGET_PID=$!
-MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python transfer_engine_initiator_test.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_initiator_test.py
 kill $TARGET_PID || true
 
 echo "Running master tests..."
@@ -25,7 +25,7 @@ echo "mooncake_master found, running tests..."
 mooncake_master &
 MASTER_PID=$!
 sleep 1
-MC_METADATA_SERVER=http://127.0.0.1:8090/metadata python test_distributed_object_store.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
 kill $MASTER_PID || true
 
 echo "Running CLI entry point tests..."
