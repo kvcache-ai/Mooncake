@@ -17,7 +17,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 readme = ""
-license-files = ["LICENSE-APACHE"]
+license-files = ["../LICENSE-APACHE"]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
