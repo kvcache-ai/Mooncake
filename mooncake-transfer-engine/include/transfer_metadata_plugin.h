@@ -37,19 +37,29 @@ struct HandShakePlugin {
     HandShakePlugin() {}
     virtual ~HandShakePlugin() {}
 
-    // When accept a new connection, this function will be called.
-    // The first param represents peer endpoint's attributes, while
-    // the second param represents local endpoint's attributes
+    // When accept a new connection/metadata request, this function will be
+    // called. The first param represents peer attributes, while the
+    // second param represents local attributes.
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
 
-    virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port, int sockfd) = 0;
+    virtual int startDaemon(uint16_t listen_port, int sockfd) = 0;
 
     // Connect to peer endpoint, and wait for receiving
     // peer endpoint's attributes
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
+
+    // Exchange metadata with remote peer.
+    virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
+                                 const Json::Value &local_metadata,
+                                 Json::Value &peer_metadata) = 0;
+
+    // Register callback function for receiving a new connection.
+    virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) = 0;
+
+    // Register callback function for receiving metadata exchange request.
+    virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();
