@@ -131,6 +131,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     return 0;
 }
 
+int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = malloc(capacity);
     if (!buffer) return nullptr;
@@ -359,6 +361,7 @@ PYBIND11_MODULE(engine, m) {
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)

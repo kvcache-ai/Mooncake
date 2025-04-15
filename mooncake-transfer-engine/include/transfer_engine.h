@@ -54,7 +54,7 @@ class TransferEngine {
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
-             const std::string &ip_or_host_name = "", 
+             const std::string &ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
     int freeEngine();
@@ -63,6 +63,8 @@ class TransferEngine {
     Transport *installTransport(const std::string &proto, void **args);
 
     int uninstallTransport(const std::string &proto);
+
+    int getRpcPort();
 
     SegmentHandle openSegment(const std::string &segment_name);
 

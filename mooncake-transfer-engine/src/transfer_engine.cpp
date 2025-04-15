@@ -23,6 +23,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &local_server_name,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
+    local_server_name_ = local_server_name;
     TransferMetadata::RpcMetaDesc desc;
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
@@ -30,6 +31,20 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
+
+        if (metadata_conn_string == P2PHANDSHAKE) {
+            // use random port when no port is specified
+            if (port == getDefaultHandshakePort()) {
+                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+                if (desc.rpc_port == 0) {
+                    LOG(ERROR)
+                        << "not valid port for serving local TCP service";
+                    return -1;
+                }
+            }
+            local_server_name_ =
+                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+        }
     } else {
         (void)(ip_or_host_name);
         auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
@@ -58,13 +73,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
               << " and port " << desc.rpc_port
               << " for serving local TCP service";
-
-    if (metadata_conn_string == P2PHANDSHAKE) {
-        local_server_name_ =
-            desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-    } else {
-        local_server_name_ = local_server_name;
-    }
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
@@ -132,6 +140,8 @@ Transport *TransferEngine::installTransport(const std::string &proto,
 }
 
 int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
+
+int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
 
 Transport::SegmentHandle TransferEngine::openSegment(
     const std::string &segment_name) {

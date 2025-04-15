@@ -220,9 +220,6 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    if (meta->localRpcMeta().sockfd) {
-        close(meta->localRpcMeta().sockfd);
-    }
     int tcp_port = meta->localRpcMeta().rpc_port + 1;
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
