@@ -470,7 +470,8 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 #endif  // USE_HTTP
 
     LOG(FATAL) << "Unable to find metadata storage plugin "
-               << parsed_conn_string.first;
+               << parsed_conn_string.first
+               << " with conn string: " << conn_string;
     return nullptr;
 }
 
@@ -513,8 +514,20 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
-    virtual int startDaemon(OnReceiveCallBack on_recv_callback,
-                            uint16_t listen_port, int sockfd) {
+    virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
+        on_connection_callback_ = callback;
+    }
+
+    virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) {
+        on_metadata_callback_ = callback;
+    }
+
+    virtual int startDaemon(uint16_t listen_port, int sockfd) {
+        if (listener_running_) {
+            LOG(INFO) << "SocketHandShakePlugin: listener already running";
+            return 0;
+        }
+
         sockaddr_in bind_address;
         int on = 1;
         memset(&bind_address, 0, sizeof(sockaddr_in));
@@ -565,7 +578,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
 
         listener_running_ = true;
-        listener_ = std::thread([this, on_recv_callback]() {
+        listener_ = std::thread([this]() {
             while (listener_running_) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
@@ -602,23 +615,51 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
                 Json::Value local, peer;
                 Json::Reader reader;
-                if (!reader.parse(readString(conn_fd), peer)) {
+
+                auto [type, json_str] = readString(conn_fd);
+                if (!reader.parse(json_str, peer)) {
                     LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
-                                  "handshake message: "
+                                  "handshake message, "
+                                  "malformed json format:"
+                               << reader.getFormattedErrorMessages()
+                               << ", json string length: " << json_str.size()
+                               << ", json string content: " << json_str;
+                    close(conn_fd);
+                    continue;
+                }
+
+                // old protocol equals Connection type
+                if (type == HandShakeRequestType::Connection ||
+                    type == HandShakeRequestType::OldProtocol) {
+                    on_connection_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Metadata) {
+                    on_metadata_callback_(peer, local);
+                } else {
+                    LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
+                                  "message type";
+                    close(conn_fd);
+                    continue;
+                }
+
+                int ret =
+                    writeString(conn_fd, type, Json::FastWriter{}.write(local));
+                if (ret) {
+                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
+                                  "message: "
                                   "malformed json format, check tcp connection";
                     close(conn_fd);
                     continue;
                 }
 
-                on_recv_callback(peer, local);
-                int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
+                ret = shutdown(conn_fd, SHUT_WR);
                 if (ret) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
-                                  "handshake message: "
-                                  "malformed json format, check tcp connection";
+                    PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
+                                   "connection may be incomplete";
                     close(conn_fd);
                     continue;
                 }
+
+                // TODO: wait for the peer to close the connection
 
                 close(conn_fd);
             }
@@ -663,15 +704,13 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local,
-               Json::Value &peer) {
+    int doConnect(struct addrinfo *addr, int &conn_fd) {
         if (globalConfig().verbose)
             LOG(INFO) << "SocketHandShakePlugin: connecting "
                       << getNetworkAddress(addr->ai_addr);
 
         int on = 1;
-        int conn_fd =
-            socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (conn_fd == -1) {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
             return ERR_SOCKET;
@@ -699,7 +738,19 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
-        int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
+        return 0;
+    }
+
+    int doSend(struct addrinfo *addr, const Json::Value &local,
+               Json::Value &peer) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
+        if (ret) {
+            return ret;
+        }
+
+        ret = writeString(conn_fd, HandShakeRequestType::Connection,
+                          Json::FastWriter{}.write(local));
         if (ret) {
             LOG(ERROR)
                 << "SocketHandShakePlugin: failed to send handshake message: "
@@ -709,7 +760,15 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
 
         Json::Reader reader;
-        if (!reader.parse(readString(conn_fd), peer)) {
+        auto [type, json_str] = readString(conn_fd);
+        if (type != HandShakeRequestType::Connection) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        if (!reader.parse(json_str, peer)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
                           "message: "
                           "malformed json format, check tcp connection";
@@ -721,9 +780,90 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
+    virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
+                                 const Json::Value &local_metadata,
+                                 Json::Value &peer_metadata) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = doSendMetadata(rp, local_metadata, peer_metadata);
+            if (ret == 0) {
+                freeaddrinfo(result);
+                return 0;
+            }
+            if (ret == ERR_MALFORMED_JSON) {
+                return ret;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
+    }
+
+    int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
+                       Json::Value &peer_metadata) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
+        if (ret) {
+            return ret;
+        }
+
+        ret = writeString(conn_fd, HandShakeRequestType::Metadata,
+                          Json::FastWriter{}.write(local_metadata));
+        if (ret) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to send metadata message: "
+                   "malformed json format, check tcp connection";
+            close(conn_fd);
+            return ret;
+        }
+
+        Json::Reader reader;
+        auto [type, json_str] = readString(conn_fd);
+        if (type != HandShakeRequestType::Metadata) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
+                  << json_str;
+
+        if (!reader.parse(json_str, peer_metadata)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
+                          "message, malformed json format: "
+                       << reader.getFormattedErrorMessages();
+            close(conn_fd);
+            return ERR_MALFORMED_JSON;
+        }
+
+        close(conn_fd);
+        return 0;
+    }
+
     std::atomic<bool> listener_running_;
     std::thread listener_;
     int listen_fd_;
+
+    OnReceiveCallBack on_connection_callback_;
+    OnReceiveCallBack on_metadata_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(

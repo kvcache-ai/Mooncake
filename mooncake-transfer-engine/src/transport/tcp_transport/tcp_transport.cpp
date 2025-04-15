@@ -220,10 +220,9 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    if (meta->localRpcMeta().sockfd) {
-        close(meta->localRpcMeta().rpc_port);
-    }
-    context_ = new TcpContext(meta->localRpcMeta().rpc_port);
+    int tcp_port = meta->localRpcMeta().rpc_port + 1;
+    LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
+    context_ = new TcpContext(tcp_port);
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
@@ -322,7 +321,7 @@ Status TcpTransport::submitTransfer(
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);;
+        __sync_fetch_and_add(&task.slice_count, 1);
         startTransfer(slice);
     }
 
@@ -345,7 +344,7 @@ Status TcpTransport::submitTransferTask(
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);;
+        __sync_fetch_and_add(&task.slice_count, 1);
         startTransfer(slice);
     }
     return Status::OK();
@@ -379,7 +378,7 @@ void TcpTransport::startTransfer(Slice *slice) {
         }
         auto endpoint_iterator = resolver.resolve(
             boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
-            std::to_string(meta_entry.rpc_port));
+            std::to_string(meta_entry.rpc_port + 1));
         boost::asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
