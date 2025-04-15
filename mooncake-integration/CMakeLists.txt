@@ -17,8 +17,6 @@ include_directories("../mooncake-store/include/cachelib_memory_allocator/include
 include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
 
 
-set(PYBIND11_FINDPYTHON ON)
-find_package(pybind11 CONFIG REQUIRED) 
 pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     vllm/vllm_adaptor.cpp 
     vllm/distributed_object_store.cpp

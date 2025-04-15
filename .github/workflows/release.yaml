@@ -33,6 +33,7 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          git submodule update --init
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON
