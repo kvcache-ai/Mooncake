@@ -15,7 +15,7 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
-        pip install build setuptools wheel
+        pip install build setuptools wheel aiohttp
         git submodule update --init
         mkdir build
         cd build
@@ -28,10 +28,8 @@ jobs:
       shell: bash
     - name: start-metadata-server
       run: |
-        cd mooncake-transfer-engine/example/http-metadata-server
-        export PATH=$PATH:/usr/local/go/bin
-        go mod tidy && go build -o http-metadata-server .
-        ./http-metadata-server --addr=:8090 &
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        python ./bootstrap_server.py &
       shell: bash
     - name: start-mooncake-master
       run: |
@@ -43,7 +41,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
       shell: bash
     - name: Stop Mooncake Master Service
       run: |
@@ -52,7 +50,7 @@ jobs:
 
     - name: Build Python wheel
       run: |
-        pip install auditwheel
+        pip install auditwheel aiohttp
         ./scripts/build_wheel.sh
       shell: bash
 
@@ -67,6 +65,7 @@ jobs:
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
+        python-version: [3.10, 3.12]
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4 
@@ -74,12 +73,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' 
-
-    - name: Set up Golang 
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22.10' 
+        python-version: ${{ matrix.python-version }}
 
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
@@ -94,10 +88,8 @@ jobs:
     
     - name: start-metadata-server
       run: |
-        cd mooncake-transfer-engine/example/http-metadata-server
-        export PATH=$PATH:/usr/local/go/bin
-        go mod tidy && go build -o http-metadata-server .
-        ./http-metadata-server --addr=:8090 &
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        python ./bootstrap_server.py &
 
     - name: Run tests
       run: |

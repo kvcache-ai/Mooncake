@@ -1,3 +1,41 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61.0.0", "wheel>=0.37.0"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "mooncake-transfer-engine"
+version = "0.3.0b4"
+description = "Python binding of a Mooncake library using pybind11"
+authors = [
+    { name = "Mooncake Authors" }
+]
+requires-python = ">=3.10"
+keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "License :: OSI Approved :: Apache Software License"
+]
+readme = ""
+license = { file = "../LICENSE-APACHE" }
+urls = { 
+    "Homepage" = "https://github.com/kvcache-ai/Mooncake",
+    "Documentation" = "https://github.com/kvcache-ai/Mooncake/tree/main/doc",
+    "Source" = "https://github.com/kvcache-ai/Mooncake",
+    "Issues" = "https://github.com/kvcache-ai/Mooncake/issues"
+}
+
+[project.scripts]
+mooncake_master = "mooncake.cli:main"
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mooncake*"]
+
+[tool.setuptools.package-data]
+mooncake = ["*.so", "mooncake_master"]
