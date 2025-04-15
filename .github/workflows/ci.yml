@@ -15,7 +15,6 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
-        pip install build setuptools wheel aiohttp
         git submodule update --init
         mkdir build
         cd build
@@ -29,6 +28,7 @@ jobs:
     - name: start-metadata-server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
         python ./bootstrap_server.py &
       shell: bash
     - name: start-mooncake-master
@@ -48,17 +48,21 @@ jobs:
         pkill mooncake_master || true
       shell: bash
 
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
     - name: Build Python wheel for Python 3.10
       run: |
-        pip install auditwheel aiohttp
-        PYTHON_VERSION=3.10 ./scripts/build_wheel.sh
+        PYTHON_VERSION=3.10 OUTPUT_DIR=dist-py3.10 ./scripts/build_wheel.sh
       shell: bash
 
     - name: Upload Python 3.10 wheel artifact
       uses: actions/upload-artifact@v4
       with:
         name: mooncake-wheel-ubuntu-py310
-        path: mooncake-wheel/dist/*.whl
+        path: mooncake-wheel/dist-py3.10/*.whl
 
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
@@ -67,15 +71,14 @@ jobs:
 
     - name: Build Python wheel for Python 3.12
       run: |
-        pip install auditwheel aiohttp
-        PYTHON_VERSION=3.12 ./scripts/build_wheel.sh
+        PYTHON_VERSION=3.12 OUTPUT_DIR=dist-py3.12 ./scripts/build_wheel.sh
       shell: bash
 
     - name: Upload Python 3.12 wheel artifact
       uses: actions/upload-artifact@v4
       with:
         name: mooncake-wheel-ubuntu-py312
-        path: mooncake-wheel/dist/*.whl
+        path: mooncake-wheel/dist-py3.12/*.whl
 
   test-wheel-ubuntu:
     needs: build-ubuntu # Ensure build job completes first
@@ -95,8 +98,17 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ matrix.python-version }}
+        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
         path: mooncake-wheel/dist
+        
+    - name: Verify wheel file exists
+      run: |
+        ls -la mooncake-wheel/dist/
+        if [ ! -f mooncake-wheel/dist/*.whl ]; then
+          echo "ERROR: No wheel file found in mooncake-wheel/dist/"
+          exit 1
+        fi
+      shell: bash
 
     - name: Run installation test script
       run: |
@@ -106,6 +118,7 @@ jobs:
     - name: start-metadata-server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
         python ./bootstrap_server.py &
 
     - name: Run tests

@@ -18,7 +18,6 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          pip install build setuptools wheel auditwheel
 
       - name: Extract version from tag
         run: |
@@ -44,7 +43,7 @@ jobs:
         run: |
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           # Build the wheel package for Python 3.10
-          PYTHON_VERSION=3.10 ./scripts/build_wheel.sh
+          PYTHON_VERSION=3.10 OUTPUT_DIR=dist-py3.10 ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
@@ -57,17 +56,40 @@ jobs:
         run: |
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           # Build the wheel package for Python 3.12
-          PYTHON_VERSION=3.12 ./scripts/build_wheel.sh
+          PYTHON_VERSION=3.12 OUTPUT_DIR=dist-py3.12 ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
+
+      - name: Verify and collect all wheels
+        run: |
+          # Verify Python 3.10 wheel exists
+          if [ ! -f mooncake-wheel/dist-py3.10/*.whl ]; then
+            echo "ERROR: No Python 3.10 wheel file found!"
+            exit 1
+          fi
+          
+          # Verify Python 3.12 wheel exists
+          if [ ! -f mooncake-wheel/dist-py3.12/*.whl ]; then
+            echo "ERROR: No Python 3.12 wheel file found!"
+            exit 1
+          fi
+          
+          # Collect all wheels
+          mkdir -p mooncake-wheel/dist-all
+          cp mooncake-wheel/dist-py3.10/*.whl mooncake-wheel/dist-all/
+          cp mooncake-wheel/dist-py3.12/*.whl mooncake-wheel/dist-all/
+          
+          # List all collected wheels
+          echo "Collected wheels:"
+          ls -la mooncake-wheel/dist-all/
 
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: mooncake-wheel/dist/*.whl
+          files: mooncake-wheel/dist-all/*.whl
 
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: mooncake-wheel/dist/
+          packages-dir: mooncake-wheel/dist-all/
           password: ${{ secrets.PYPI_API_TOKEN }}
