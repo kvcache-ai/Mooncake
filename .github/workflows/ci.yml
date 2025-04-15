@@ -48,16 +48,33 @@ jobs:
         pkill mooncake_master || true
       shell: bash
 
-    - name: Build Python wheel
+    - name: Build Python wheel for Python 3.10
       run: |
         pip install auditwheel aiohttp
-        ./scripts/build_wheel.sh
+        PYTHON_VERSION=3.10 ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Upload wheel artifact
+    - name: Upload Python 3.10 wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu
+        name: mooncake-wheel-ubuntu-py310
+        path: mooncake-wheel/dist/*.whl
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Build Python wheel for Python 3.12
+      run: |
+        pip install auditwheel aiohttp
+        PYTHON_VERSION=3.12 ./scripts/build_wheel.sh
+      shell: bash
+
+    - name: Upload Python 3.12 wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-ubuntu-py312
         path: mooncake-wheel/dist/*.whl
 
   test-wheel-ubuntu:
@@ -78,7 +95,7 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu
+        name: mooncake-wheel-ubuntu-py${{ matrix.python-version }}
         path: mooncake-wheel/dist
 
     - name: Run installation test script

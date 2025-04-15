@@ -1,9 +1,14 @@
 #!/bin/bash
 # Script to build the mooncake wheel package
-# Usage: ./scripts/build_wheel.sh
+# Usage: ./scripts/build_wheel.sh [python_version]
+# Example: ./scripts/build_wheel.sh 3.10
 
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
+
+# Get Python version from environment variable or argument
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+echo "Building wheel for Python ${PYTHON_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
