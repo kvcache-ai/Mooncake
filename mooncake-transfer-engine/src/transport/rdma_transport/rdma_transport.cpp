@@ -444,9 +444,7 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
         if (device_id >= 0) return 0;
     }
-    LOG(ERROR) << "RdmaTransport: select device failed. Requested offset"
-               << (void *)offset << ", length" << length << ", desc name "
-               << desc->name << ", timestamp " << desc->timestamp;
+
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 }  // namespace mooncake

@@ -42,6 +42,7 @@ struct GlobalConfig {
     int retry_cnt = 8;
     bool metacache = true;
     int log_level = google::WARNING;
+    bool trace = false;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

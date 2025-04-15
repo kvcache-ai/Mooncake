@@ -180,7 +180,12 @@ void loadGlobalConfig(GlobalConfig &config) {
     }
 
     const char *log_level = std::getenv("MC_LOG_LEVEL");
+    config.trace = false;
     if (log_level) {
+        if (strcmp(log_level, "TRACE") == 0) {
+            config.log_level = google::INFO;
+            config.trace = true;
+        }
         if (strcmp(log_level, "INFO") == 0)
             config.log_level = google::INFO;
         else if (strcmp(log_level, "WARNING") == 0)
@@ -243,7 +248,5 @@ GlobalConfig &globalConfig() {
     return config;
 }
 
-uint16_t getDefaultHandshakePort() {
-    return globalConfig().handshake_port;
-}
+uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
 }  // namespace mooncake

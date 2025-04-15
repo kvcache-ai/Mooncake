@@ -107,24 +107,22 @@ int WorkerPool::submitPostSend(
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
                                         slice->rdma.dest_addr, slice->length,
                                         buffer_id, device_id)) {
-            LOG(WARNING)
-                << "Unable to select NIC first time, try to reload metadata";
-
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
-                LOG(ERROR) << "Cannot reload target segment #" << slice->target_id;
+                LOG(ERROR) << "Cannot reload target segment #"
+                           << slice->target_id;
                 slice->markFailed();
                 continue;
             }
 
-            context_.engine().meta()->dumpMetadataContent();
+            context_.engine().meta()->dumpMetadataContent(
+                peer_segment_desc->name, slice->rdma.dest_addr,
+                slice->length);
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
-                LOG(WARNING)
-                    << "Unable to select NIC second time, mark transfer failed";
                 slice->markFailed();
                 continue;
             }
@@ -259,16 +257,21 @@ void WorkerPool::performPollCq(int thread_id) {
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
-                LOG(ERROR) << "Worker: Process failed for slice (opcode: "
-                           << slice->opcode
-                           << ", source_addr: " << slice->source_addr
-                           << ", length: " << slice->length
-                           << ", dest_addr: " << slice->rdma.dest_addr
-                           << ", local_nic: " << context_.deviceName()
-                           << ", peer_nic: " << slice->peer_nic_path
-                           << ", dest_rkey: " << slice->rdma.dest_rkey
-                           << ", retry_cnt: " << slice->rdma.retry_cnt
-                           << "): " << ibv_wc_status_str(wc[i].status);
+                bool show_work_request_flushed_error = globalConfig().trace;
+                // After detect an error, subsequent work requests will result
+                // in work_request_flushed_error, we hide this by default
+                if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
+                    show_work_request_flushed_error)
+                    LOG(ERROR) << "Worker: Process failed for slice (opcode: "
+                               << slice->opcode
+                               << ", source_addr: " << slice->source_addr
+                               << ", length: " << slice->length
+                               << ", dest_addr: " << slice->rdma.dest_addr
+                               << ", local_nic: " << context_.deviceName()
+                               << ", peer_nic: " << slice->peer_nic_path
+                               << ", dest_rkey: " << slice->rdma.dest_rkey
+                               << ", retry_cnt: " << slice->rdma.retry_cnt
+                               << "): " << ibv_wc_status_str(wc[i].status);
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {

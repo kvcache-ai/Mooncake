@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "config.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -26,22 +27,34 @@ void TransferMetadata::SegmentDesc::dump() const {
     }
     LOG(INFO) << "  buffers: ";
     for (auto &buffer : buffers) {
-        LOG(INFO) << "    buffer type " << buffer.name << ", base address "
-                  << (void *)buffer.addr << ", length " << buffer.length
-                  << ", ...";
+        LOG(INFO) << "    buffer type " << buffer.name << ", address "
+                  << (void *)buffer.addr << "--"
+                  << (void *)(buffer.addr + buffer.length);
     }
-    LOG(INFO) << "  nvmeof buffers: " << nvmeof_buffers.size()
-              << " items";
+    LOG(INFO) << "  nvmeof buffers: " << nvmeof_buffers.size() << " items";
     LOG(INFO) << "  timestamp: " << timestamp;
 }
 
-void TransferMetadata::dumpMetadataContent() {
+void TransferMetadata::dumpMetadataContent(const std::string &segment_name,
+                                           uint64_t offset, uint64_t length) {
+    thread_local uint64_t last_ts = 0;
+    uint64_t current_ts = getCurrentTimeInNano();
+    const static uint64_t kMinDisplayThreshold = 500000000;  // 0.5 sec
+
     auto segment_locked = segment_lock_.tryLockShared();
     auto rpc_meta_locked = rpc_meta_lock_.tryLockShared();
     if (!segment_locked || !rpc_meta_locked) {
         LOG(WARNING) << "Dump without lock protection";
     }
-    dumpMetadataContentUnlocked();
+
+    if (current_ts - last_ts > kMinDisplayThreshold || globalConfig().trace) {
+        LOG(INFO) << "Failed to get segment descriptor for segment "
+                  << segment_name << " address " << (void *)offset << "--"
+                  << (void *)(offset + length);
+        dumpMetadataContentUnlocked();
+        last_ts = current_ts;
+    }
+
     if (rpc_meta_locked) rpc_meta_lock_.unlockShared();
     if (segment_locked) segment_lock_.unlockShared();
 }

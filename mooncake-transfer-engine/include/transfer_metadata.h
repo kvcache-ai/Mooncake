@@ -76,7 +76,7 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
-        int sockfd;             // local cache
+        int sockfd;  // local cache
     };
 
     struct HandShakeDesc {
@@ -136,7 +136,8 @@ class TransferMetadata {
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 
-    void dumpMetadataContent();
+    void dumpMetadataContent(const std::string &segment_name = "",
+                             uint64_t offset = 0, uint64_t length = 0);
 
     void dumpMetadataContentUnlocked();
 
