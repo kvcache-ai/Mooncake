@@ -65,7 +65,7 @@ jobs:
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: [3.10, 3.12]
+        python-version: ["3.10", "3.12"]
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4 
