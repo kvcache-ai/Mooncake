@@ -16,7 +16,7 @@ TEST(MemoryLocationTest, MallocSimpleNode0) {
 
     // check the memory location, no node before page fault
     EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(addr));
-    EXPECT_EQ(entries[0].location, "*");
+    EXPECT_EQ(entries[0].location, mooncake::kWildcardLocation);
     EXPECT_EQ(entries[0].len, static_cast<size_t>(size));
 
     // trigger page fault
