@@ -100,9 +100,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *device_name,
                                     const char *metadata_type) {
     std::string conn_string = buildConnString(metadata_type, metadata_server);
-    if (conn_string.find("://") == std::string::npos)
-        conn_string =
-            std::string(metadata_type) + "://" + std::string(metadata_server);
 
     auto_discovery_ = false;
     if (device_name == nullptr || strlen(device_name) == 0) {
