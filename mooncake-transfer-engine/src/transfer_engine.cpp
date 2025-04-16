@@ -125,6 +125,13 @@ Transport *TransferEngine::installTransport(const std::string &proto,
 
 int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
 
+int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
+
+std::string TransferEngine::getLocalIpAndPort() {
+    return metadata_->localRpcMeta().ip_or_host_name + ":" +
+           std::to_string(metadata_->localRpcMeta().rpc_port);
+}
+
 Transport::SegmentHandle TransferEngine::openSegment(
     const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;

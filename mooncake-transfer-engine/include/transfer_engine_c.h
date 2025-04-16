@@ -99,6 +99,8 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        uint64_t rpc_port,
                                        int auto_discover);
 
+int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len);
+
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args);
 
