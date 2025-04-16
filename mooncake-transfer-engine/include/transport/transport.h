@@ -109,6 +109,8 @@ class Transport {
             struct {
                 uint64_t offset;
                 int cufile_desc;
+                uint64_t start;
+                const char * file_path;
             } nvmeof;
             struct {
                 void *remote_filename;
