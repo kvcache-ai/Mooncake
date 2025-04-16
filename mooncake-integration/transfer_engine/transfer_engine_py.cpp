@@ -61,6 +61,9 @@ std::pair<std::string, std::string> parseConnectionString(
     if (pos != std::string::npos) {
         proto = conn_string.substr(0, pos);
         domain = conn_string.substr(pos + 3);
+    } else if (conn_string == P2PHANDSHAKE) {
+        proto = "";
+        domain = P2PHANDSHAKE;
     } else {
         domain = conn_string;
     }
@@ -68,6 +71,18 @@ std::pair<std::string, std::string> parseConnectionString(
     result.first = proto;
     result.second = domain;
     return result;
+}
+
+std::string buildConnString(const std::string &metadata_type,
+                            const std::string &metadata_server) {
+    if (metadata_server == P2PHANDSHAKE) {
+        return P2PHANDSHAKE;
+    }
+
+    std::string conn_string = metadata_server;
+    if (conn_string.find("://") == std::string::npos)
+        conn_string = metadata_type + "://" + metadata_server;
+    return conn_string;
 }
 
 int TransferEnginePy::initialize(const char *local_hostname,
@@ -84,7 +99,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *protocol,
                                     const char *device_name,
                                     const char *metadata_type) {
-    std::string conn_string = metadata_server;
+    std::string conn_string = buildConnString(metadata_type, metadata_server);
     if (conn_string.find("://") == std::string::npos)
         conn_string =
             std::string(metadata_type) + "://" + std::string(metadata_server);
@@ -133,6 +148,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     doBuddyAllocate(kMaxClassId);
     return 0;
 }
+
+int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = malloc(capacity);
@@ -365,6 +382,7 @@ PYBIND11_MODULE(engine, m) {
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)

@@ -42,17 +42,13 @@ option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 
-find_package(Python3 REQUIRED Interpreter Development)
-find_package(pybind11 REQUIRED)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
-
-set(PYBIND11_FINDPYTHON ON)
-find_package(pybind11 CONFIG REQUIRED)
 
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
@@ -101,7 +97,6 @@ include_directories(mooncake-transfer-engine/include)
 
 if (WITH_STORE)
   message(STATUS "Mooncake Store will be build")
-  find_package(pybind11 CONFIG REQUIRED)
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()

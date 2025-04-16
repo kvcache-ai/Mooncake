@@ -6,28 +6,21 @@ on:
       - 'v*'
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install build setuptools wheel auditwheel
-
-      - name: Extract version from tag
-        run: |
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+          python-version: ${{ matrix.python-version }}
 
       - name: Install system dependencies and build project
         run: |
@@ -39,21 +32,57 @@ jobs:
           sudo make install -j
         shell: bash
 
-      - name: Build and test Python wheel
+      - name: Build Python wheel
         run: |
+          # Set LD_LIBRARY_PATH for wheel building
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          # Build the wheel package
-          ./scripts/build_wheel.sh
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
-      - name: Upload wheel to GitHub Release
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-py${{ matrix.python-version == '3.10' && '310' || '312' }}
+          path: mooncake-wheel/dist-py${{ matrix.python-version == '3.10' && '310' || '312' }}/*.whl
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+
+      - name: Prepare wheels for release
+        run: |
+          # Move all wheels to a single directory
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          
+          # Verify 3.10 and 3.12 wheels are present
+          if [ ! -f "mooncake-wheel/dist-release/mooncake-*.cp310-cp310-linux_x86_64.whl" ] || [ ! -f "mooncake-wheel/dist-release/mooncake-*.cp312-cp312-linux_x86_64.whl" ]; then
+            echo "ERROR: Missing required wheels for release!"
+            exit 1
+          fi
+          
+          # List all collected wheels
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: mooncake-wheel/dist/*.whl
+          files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: mooncake-wheel/dist/
+          packages-dir: mooncake-wheel/dist-release/
           password: ${{ secrets.PYPI_API_TOKEN }}

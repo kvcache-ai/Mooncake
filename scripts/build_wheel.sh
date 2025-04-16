@@ -1,9 +1,16 @@
 #!/bin/bash
 # Script to build the mooncake wheel package
-# Usage: ./scripts/build_wheel.sh
+# Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
+# Example: ./scripts/build_wheel.sh 3.10 dist-3.10
 
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
+
+# Get Python version from environment variable or argument
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+# Get output directory from environment variable or argument
+OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
+echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -23,7 +30,6 @@ cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
-cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/
 
 
 echo "Building wheel package..."
@@ -31,16 +37,20 @@ echo "Building wheel package..."
 cd mooncake-wheel
 
 echo "Cleaning up previous build artifacts..."
-rm -rf dist/ 
+rm -rf ${OUTPUT_DIR}/ 
+mkdir -p ${OUTPUT_DIR}
 
-echo "Building wheel with default version"
-python -m build
+echo "Installing required build packages"
+pip install --upgrade pip
+pip install build setuptools wheel auditwheel
 
 # Create directory for repaired wheels
-mkdir -p repaired_wheels
+REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
+mkdir -p ${REPAIRED_DIR}
 
 echo "Repairing wheel with auditwheel..."
-auditwheel repair dist/*.whl \
+python -m build --wheel --outdir ${OUTPUT_DIR}
+auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
 --exclude libibverbs.so* \
 --exclude libnuma.so* \
@@ -79,12 +89,12 @@ auditwheel repair dist/*.whl \
 --exclude libkeyutils.so* \
 --exclude libresolv.so* \
 --exclude libffi.so* \
--w repaired_wheels/ --plat manylinux_2_35_x86_64
+-w ${REPAIRED_DIR}/ --plat manylinux_2_35_x86_64
 
 
 # Replace original wheel with repaired wheel
-rm -f dist/*.whl
-mv repaired_wheels/*.whl dist/
+rm -f ${OUTPUT_DIR}/*.whl
+mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
 
 cd ..
 

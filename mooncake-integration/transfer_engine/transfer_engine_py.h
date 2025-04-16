@@ -41,10 +41,8 @@ const static size_t kSlabSizeKB[] = {
 
 class TransferEnginePy {
    public:
-    enum class TransferOpcode {
-        READ = 0,
-        WRITE = 1
-    };
+    enum class TransferOpcode { READ = 0, WRITE = 1 };
+
    public:
     TransferEnginePy();
 
@@ -57,6 +55,8 @@ class TransferEnginePy {
                       const char *protocol, const char *device_name,
                       const char *metadata_type);
 
+    int getRpcPort();
+
     uintptr_t allocateManagedBuffer(size_t length);
 
     int freeManagedBuffer(uintptr_t user_tensor, size_t length);
@@ -68,10 +68,11 @@ class TransferEnginePy {
                          uintptr_t peer_buffer_address, size_t length);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
-                     uintptr_t peer_buffer_address, size_t length, TransferOpcode opcode);
+                     uintptr_t peer_buffer_address, size_t length,
+                     TransferOpcode opcode);
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
-    
+
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);
@@ -90,6 +91,7 @@ class TransferEnginePy {
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
+
    private:
     char *allocateRawBuffer(size_t capacity);
 
