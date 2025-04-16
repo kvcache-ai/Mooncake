@@ -100,32 +100,50 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *device_name,
                                     const char *metadata_type) {
     std::string conn_string = buildConnString(metadata_type, metadata_server);
+    if (conn_string.find("://") == std::string::npos)
+        conn_string =
+            std::string(metadata_type) + "://" + std::string(metadata_server);
 
-    // TODO: remove `false` in the feature, it's for keep same API in SGLang.
-    engine_ = std::make_unique<TransferEngine>(false);
-    // the last two params are unused
-    int ret = engine_->init(conn_string, local_hostname, "", 0);
-    if (ret) return -1;
-
-    xport_ = nullptr;
-    if (strcmp(protocol, "rdma") == 0) {
-        auto device_names = formatDeviceNames(device_name);
-        std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
-                                          "], []],"
-                                          "\"cuda:0\": [[" +
-                                          device_names + "], []]}";
-        void **args = (void **)malloc(2 * sizeof(void *));
-        args[0] = (void *)nic_priority_matrix.c_str();
-        args[1] = nullptr;
-        xport_ = engine_->installTransport("rdma", args);
-    } else if (strcmp(protocol, "tcp") == 0) {
-        xport_ = engine_->installTransport("tcp", nullptr);
-    } else {
-        LOG(ERROR) << "Unsupported protocol";
-        return -1;
+    auto_discovery_ = false;
+    if (device_name == nullptr || strlen(device_name) == 0) {
+        auto_discovery_ = true;
     }
 
-    if (!xport_) return -1;
+    engine_ = std::make_unique<TransferEngine>(auto_discovery_);
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+        auto hostname_port = parseHostNameWithPort(local_hostname);
+        int ret =
+            engine_->init(conn_string, local_hostname,
+                          hostname_port.first.c_str(), hostname_port.second);
+        if (ret) return -1;
+    } else {
+        // the last two params are unused
+        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        if (ret) return -1;
+    }
+
+    if (!auto_discovery_) {
+        xport_ = nullptr;
+        if (strcmp(protocol, "rdma") == 0) {
+            auto device_names = formatDeviceNames(device_name);
+            std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
+                                              "], []],"
+                                              "\"cuda:0\": [[" +
+                                              device_names + "], []]}";
+            void **args = (void **)malloc(2 * sizeof(void *));
+            args[0] = (void *)nic_priority_matrix.c_str();
+            args[1] = nullptr;
+            xport_ = engine_->installTransport("rdma", args);
+        } else if (strcmp(protocol, "tcp") == 0) {
+            xport_ = engine_->installTransport("tcp", nullptr);
+        } else {
+            LOG(ERROR) << "Unsupported protocol";
+            return -1;
+        }
+
+        if (!xport_) return -1;
+    }
+
     free_list_.resize(kSlabSizeKBTabLen);
     doBuddyAllocate(kMaxClassId);
     return 0;
@@ -322,16 +340,19 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    std::string location = "cpu:0";
+    if (!auto_discovery_) {
+        std::string location = "cpu:0";
 #ifdef USE_CUDA
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    cudaPointerGetAttributes(&attributes, buffer);
-    if (attributes.type == cudaMemoryTypeDevice) {
-        location = "cuda:0";
-    }
+        // check pointer on GPU
+        cudaPointerAttributes attributes;
+        cudaPointerGetAttributes(&attributes, buffer);
+        if (attributes.type == cudaMemoryTypeDevice) {
+            location = "cuda:0";
+        }
 #endif
-    return engine_->registerLocalMemory(buffer, capacity, location);
+        return engine_->registerLocalMemory(buffer, capacity, location);
+    }
+    return engine_->registerLocalMemory(buffer, capacity);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {

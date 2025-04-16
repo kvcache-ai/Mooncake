@@ -100,8 +100,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     // Get the memory location automatically after registered MR(pinned),
-    // when the name is "*".
-    if (name == "*") {
+    // when the name is kWildcardLocation("*").
+    if (name == kWildcardLocation) {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         for (auto &entry : entries) {
@@ -447,6 +447,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
         device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count);
         if (device_id >= 0) return 0;
     }
 
