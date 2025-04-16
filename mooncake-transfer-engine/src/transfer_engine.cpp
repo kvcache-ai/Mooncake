@@ -24,15 +24,27 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
     local_server_name_ = local_server_name;
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, local_server_name_);
-
     TransferMetadata::RpcMetaDesc desc;
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
-        desc.ip_or_host_name = ip_or_host_name;
-        desc.rpc_port = rpc_port;
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
+        metadata_conn_string == P2PHANDSHAKE) {
+        auto [host_name, port] = parseHostNameWithPort(local_server_name);
+        desc.ip_or_host_name = host_name;
+        desc.rpc_port = port;
         desc.sockfd = -1;
+
+        if (metadata_conn_string == P2PHANDSHAKE) {
+            // use random port when no port is specified
+            if (port == getDefaultHandshakePort()) {
+                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+                if (desc.rpc_port == 0) {
+                    LOG(ERROR)
+                        << "not valid port for serving local TCP service";
+                    return -1;
+                }
+            }
+            local_server_name_ =
+                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+        }
     } else {
         (void)(ip_or_host_name);
         auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
@@ -61,6 +73,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
               << " and port " << desc.rpc_port
               << " for serving local TCP service";
+
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    multi_transports_ =
+        std::make_shared<MultiTransport>(metadata_, local_server_name_);
 
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;

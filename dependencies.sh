@@ -76,6 +76,7 @@ echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
 echo -e "  - yalantinglibs"
+echo -e "  - Git submodules"
 echo -e "  - Go $GOVER"
 echo
 
@@ -116,7 +117,6 @@ SYSTEM_PACKAGES="build-essential \
                   libgrpc++-dev \
                   libprotobuf-dev \
                   protobuf-compiler-grpc \
-                  pybind11-dev \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   pkg-config \
@@ -175,6 +175,32 @@ check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
 
+# Initialize and update git submodules
+print_section "Initializing Git Submodules"
+
+# Check if .gitmodules exists
+if [ -f "${REPO_ROOT}/.gitmodules" ]; then
+    # Check if submodules are already initialized by looking for the .git directory in the first submodule
+    FIRST_SUBMODULE=$(grep "path" ${REPO_ROOT}/.gitmodules | head -1 | awk '{print $3}')
+
+    echo "Enter repository root: ${REPO_ROOT}"
+    cd "${REPO_ROOT}"
+    check_success "Failed to change to repository root directory"
+
+    if [ -d "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ] || [ -f "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ]; then
+        echo -e "${YELLOW}Git submodules already initialized. Skipping...${NC}"
+    else
+        echo "Initializing git submodules..."
+        git submodule update --init
+        check_success "Failed to initialize git submodules"
+
+        print_success "Git submodules initialized and updated successfully"
+    fi
+else
+    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
+    exit 1
+fi
+
 print_section "Installing Go $GOVER"
 
 # Check if Go is already installed
@@ -219,6 +245,7 @@ echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} yalantinglibs"
+echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 echo
 echo -e "You can now build and run Mooncake."
