@@ -18,6 +18,7 @@
 #include <glog/logging.h>
 
 #include <memory>
+#include <string>
 
 #include "common.h"
 
@@ -30,10 +31,10 @@ struct MemoryLocationEntry {
     std::string location;
 };
 
-// Get CPU numa node id
-// TODO: support getting cuda device id from unified address.
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len);
+
+const static std::string kWildcardLocation = "*";
 
 }  // namespace mooncake
 

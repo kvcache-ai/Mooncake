@@ -34,6 +34,8 @@ namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
 
+#define P2PHANDSHAKE "P2PHANDSHAKE"
+
 class TransferMetadata {
    public:
     struct DeviceDesc {
@@ -142,6 +144,13 @@ class TransferMetadata {
     void dumpMetadataContentUnlocked();
 
    private:
+    int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
+    std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
+        Json::Value &segmentJSON, const std::string &segment_name);
+    int receivePeerMetadata(const Json::Value &peer_json,
+                            Json::Value &local_json);
+
+    bool p2p_handshake_mode_{false};
     // local cache
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>

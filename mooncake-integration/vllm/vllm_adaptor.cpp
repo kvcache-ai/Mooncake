@@ -86,17 +86,9 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
 
     // TODO: remove `false` in the feature, it's for keep same API in vllm.
     engine_ = std::make_unique<TransferEngine>(false);
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
-        auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret =
-            engine_->init(conn_string, local_hostname,
-                          hostname_port.first.c_str(), hostname_port.second);
-        if (ret) return -1;
-    } else {
-        // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0);
-        if (ret) return -1;
-    }
+    // the last two params are unused
+    int ret = engine_->init(conn_string, local_hostname, "", 0);
+    if (ret) return -1;
 
     xport_ = nullptr;
     if (strcmp(protocol, "rdma") == 0) {

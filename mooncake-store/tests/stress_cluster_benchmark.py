@@ -1,7 +1,7 @@
 import os
 import time
 import random
-from mooncake_vllm_adaptor import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 # How to test
 # 1. Config the following parameters in `setup`, notice all IP addresses

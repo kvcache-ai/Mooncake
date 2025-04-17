@@ -36,6 +36,7 @@
 #include <sys/types.h>
 
 #include "topology.h"
+#include "memory_location.h"
 
 namespace mooncake {
 struct InfinibandDevice {
@@ -291,8 +292,7 @@ int Topology::resolve() {
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
 
-                // "*" means any device
-                resolved_matrix_["*"].preferred_hca.push_back(hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].preferred_hca.push_back(
                 hca_id_map[hca]);
@@ -303,8 +303,7 @@ int Topology::resolve() {
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
 
-                // "*" means any device
-                resolved_matrix_["*"].preferred_hca.push_back(hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
         }

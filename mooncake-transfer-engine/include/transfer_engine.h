@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "multi_transport.h"
+#include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -54,7 +55,7 @@ class TransferEngine {
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
-             const std::string &ip_or_host_name = "", 
+             const std::string &ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
     int freeEngine();
@@ -64,12 +65,14 @@ class TransferEngine {
 
     int uninstallTransport(const std::string &proto);
 
+    int getRpcPort();
+
     SegmentHandle openSegment(const std::string &segment_name);
 
     int closeSegment(SegmentHandle handle);
 
     int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
+                            const std::string &location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
