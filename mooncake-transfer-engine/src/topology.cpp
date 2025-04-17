@@ -35,8 +35,8 @@
 #include <string.h>
 #include <sys/types.h>
 
-#include "topology.h"
 #include "memory_location.h"
+#include "topology.h"
 
 namespace mooncake {
 struct InfinibandDevice {
@@ -45,7 +45,8 @@ struct InfinibandDevice {
     int numa_node;
 };
 
-static std::vector<InfinibandDevice> listInfiniBandDevices() {
+static std::vector<InfinibandDevice> listInfiniBandDevices(
+    const std::vector<std::string> &filter) {
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
 
@@ -57,7 +58,9 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
 
     for (int i = 0; i < num_devices; ++i) {
         std::string device_name = ibv_get_device_name(device_list[i]);
-
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that
@@ -198,9 +201,9 @@ void Topology::clear() {
     resolved_matrix_.clear();
 }
 
-int Topology::discover() {
+int Topology::discover(const std::vector<std::string> &filter) {
     matrix_.clear();
-    auto all_hca = listInfiniBandDevices();
+    auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
@@ -294,7 +297,8 @@ int Topology::resolve() {
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
 
-                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
+                    hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].preferred_hca.push_back(
                 hca_id_map[hca]);
@@ -305,7 +309,8 @@ int Topology::resolve() {
                 hca_id_map[hca] = next_hca_map_index;
                 next_hca_map_index++;
 
-                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
+                    hca_id_map[hca]);
             }
             resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
         }

@@ -51,6 +51,12 @@ class TransferEngine {
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover) {}
 
+    TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
+        : metadata_(nullptr),
+          local_topology_(std::make_shared<Topology>()),
+          auto_discover_(auto_discover),
+          filter_(filter) {}
+
     ~TransferEngine() { freeEngine(); }
 
     int init(const std::string &metadata_conn_string,
@@ -126,6 +132,7 @@ class TransferEngine {
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;
+    std::vector<std::string> filter_;
 };
 }  // namespace mooncake
 
