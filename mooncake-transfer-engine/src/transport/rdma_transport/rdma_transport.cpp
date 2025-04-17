@@ -405,26 +405,27 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    if (local_topology_->empty()) {
-        LOG(ERROR) << "RdmaTransport: No available RNIC";
-        return ERR_DEVICE_NOT_FOUND;
-    }
-
     std::vector<int> device_speed_list;
-    for (auto &device_name : local_topology_->getHcaList()) {
+    auto hca_list = local_topology_->getHcaList();
+    for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
-        if (!context) return ERR_MEMORY;
-
         auto &config = globalConfig();
         int ret = context->construct(config.num_cq_per_ctx,
                                      config.num_comp_channels_per_ctx,
                                      config.port, config.gid_index,
                                      config.max_cqe, config.max_ep_per_ctx);
-        if (ret) return ret;
-        device_speed_list.push_back(context->activeSpeed());
-        context_list_.push_back(context);
+        if (ret) {
+            local_topology_->disableDevice(device_name);
+            LOG(WARNING) << "Disable device " << device_name;
+        } else {
+            device_speed_list.push_back(context->activeSpeed());
+            context_list_.push_back(context);
+        }
     }
-
+    if (local_topology_->empty()) {
+        LOG(ERROR) << "RdmaTransport: No available RNIC";
+        return ERR_DEVICE_NOT_FOUND;
+    }
     return 0;
 }
 

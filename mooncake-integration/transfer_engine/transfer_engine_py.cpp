@@ -15,11 +15,7 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
-
-#ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
-#include <cuda_runtime.h>
-#endif
+#include <fstream>
 
 TransferEnginePy::TransferEnginePy() {}
 
@@ -33,22 +29,14 @@ TransferEnginePy::~TransferEnginePy() {
     large_buffer_list_.clear();
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
+std::vector<std::string> buildDeviceFilter(const std::string &device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
     while (getline(ss, item, ',')) {
         tokens.push_back(item);
     }
-
-    std::string formatted;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        formatted += "\"" + tokens[i] + "\"";
-        if (i < tokens.size() - 1) {
-            formatted += ",";
-        }
-    }
-    return formatted;
+    return tokens;
 }
 
 std::pair<std::string, std::string> parseConnectionString(
@@ -99,14 +87,12 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *protocol,
                                     const char *device_name,
                                     const char *metadata_type) {
+    (void)(protocol);
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
-    auto_discovery_ = false;
-    if (device_name == nullptr || strlen(device_name) == 0) {
-        auto_discovery_ = true;
-    }
-
-    engine_ = std::make_unique<TransferEngine>(auto_discovery_);
+    auto device_name_safe = device_name ? std::string(device_name) : "";
+    auto device_filter = buildDeviceFilter(device_name_safe);
+    engine_ = std::make_unique<TransferEngine>(true, device_filter);
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -117,28 +103,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         // the last two params are unused
         int ret = engine_->init(conn_string, local_hostname, "", 0);
         if (ret) return -1;
-    }
-
-    if (!auto_discovery_) {
-        xport_ = nullptr;
-        if (strcmp(protocol, "rdma") == 0) {
-            auto device_names = formatDeviceNames(device_name);
-            std::string nic_priority_matrix = "{\"cpu:0\": [[" + device_names +
-                                              "], []],"
-                                              "\"cuda:0\": [[" +
-                                              device_names + "], []]}";
-            void **args = (void **)malloc(2 * sizeof(void *));
-            args[0] = (void *)nic_priority_matrix.c_str();
-            args[1] = nullptr;
-            xport_ = engine_->installTransport("rdma", args);
-        } else if (strcmp(protocol, "tcp") == 0) {
-            xport_ = engine_->installTransport("tcp", nullptr);
-        } else {
-            LOG(ERROR) << "Unsupported protocol";
-            return -1;
-        }
-
-        if (!xport_) return -1;
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
@@ -337,18 +301,6 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
-    if (!auto_discovery_) {
-        std::string location = "cpu:0";
-#ifdef USE_CUDA
-        // check pointer on GPU
-        cudaPointerAttributes attributes;
-        cudaPointerGetAttributes(&attributes, buffer);
-        if (attributes.type == cudaMemoryTypeDevice) {
-            location = "cuda:0";
-        }
-#endif
-        return engine_->registerLocalMemory(buffer, capacity, location);
-    }
     return engine_->registerLocalMemory(buffer, capacity);
 }
 

@@ -17,7 +17,20 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
+#include <fstream>
+
 namespace mooncake {
+static std::string loadTopologyJsonFile(const std::string &path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return "";
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+    file.close();
+    return content;
+}
 
 int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &local_server_name,
@@ -83,7 +96,19 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     if (auto_discover_) {
         // discover topology automatically
-        local_topology_->discover();
+        if (getenv("MC_CUSTOM_TOPO_JSON")) {
+            auto path = getenv("MC_CUSTOM_TOPO_JSON");
+            auto topo_json = loadTopologyJsonFile(path);
+            if (!topo_json.empty())
+                local_topology_->parse(topo_json);
+            else {
+                LOG(WARNING) << "Unable to read custom topology file from "
+                             << path << ", fall back to auto-detect";
+                local_topology_->discover(filter_);
+            }
+        } else {
+            local_topology_->discover(filter_);
+        }
 
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
