@@ -37,6 +37,13 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
     return (transfer_engine_t)native;
 }
 
+int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
+    TransferEngine *native = (TransferEngine *)engine;
+    auto str = native->getLocalIpAndPort();
+    strncpy(buf_out, str.c_str(), buf_len);
+    return 0;
+}
+
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args) {
     TransferEngine *native = (TransferEngine *)engine;
