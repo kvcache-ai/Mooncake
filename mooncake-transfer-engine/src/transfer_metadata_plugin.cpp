@@ -469,7 +469,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     void closeListen() {
         if (listen_fd_ >= 0) {
-            LOG(INFO) << "SocketHandShakePlugin: closing listen socket";
+            // LOG(INFO) << "SocketHandShakePlugin: closing listen socket";
             close(listen_fd_);
             listen_fd_ = -1;
         }
@@ -493,7 +493,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
         if (listener_running_) {
-            LOG(INFO) << "SocketHandShakePlugin: listener already running";
+            // LOG(INFO) << "SocketHandShakePlugin: listener already running";
             return 0;
         }
 
@@ -805,8 +805,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
-        LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
-                  << json_str;
+        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
+        //           << json_str;
 
         if (!reader.parse(json_str, peer_metadata)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "

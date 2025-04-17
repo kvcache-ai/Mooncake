@@ -164,8 +164,8 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
 static inline int writeString(int fd, const HandShakeRequestType type,
                               const std::string &str) {
     uint8_t byte = static_cast<uint8_t>(type);
-    LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
-              << "): " << str;
+    // LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
+    //           << "): " << str;
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
