@@ -109,7 +109,8 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     char *pos = (char *)buf;
     size_t nbytes = len;
     while (nbytes) {
-        ssize_t rc = write(fd, pos, nbytes);
+        size_t per_len = std::min(nbytes, (size_t) 8192);
+        ssize_t rc = write(fd, pos, per_len);
         if (rc < 0 && (errno == EAGAIN || errno == EINTR))
             continue;
         else if (rc < 0) {
@@ -130,7 +131,8 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     char *pos = (char *)buf;
     size_t nbytes = len;
     while (nbytes) {
-        ssize_t rc = read(fd, pos, nbytes);
+        size_t per_len = std::min(nbytes, (size_t) 8192);
+        ssize_t rc = read(fd, pos, per_len);
         if (rc < 0 && (errno == EAGAIN || errno == EINTR))
             continue;
         else if (rc < 0) {
