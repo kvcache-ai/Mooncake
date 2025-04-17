@@ -64,7 +64,12 @@ class Topology {
 
     void clear();
 
-    int discover();
+    int discover() {
+        std::vector<std::string> filter;
+        return discover(filter);
+    }
+
+    int discover(const std::vector<std::string> &filter);
 
     int parse(const std::string &topology_json);
 
