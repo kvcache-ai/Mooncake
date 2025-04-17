@@ -596,15 +596,17 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                struct timeval timeout;
-                timeout.tv_sec = 60;
-                timeout.tv_usec = 0;
-                if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                               sizeof(timeout))) {
-                    PLOG(ERROR)
-                        << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-                    close(conn_fd);
-                    continue;
+                if (!getenv("MC_SAFEMODE")) {
+                    struct timeval timeout;
+                    timeout.tv_sec = 60;
+                    timeout.tv_usec = 0;
+                    if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                                sizeof(timeout))) {
+                        PLOG(ERROR)
+                            << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+                        close(conn_fd);
+                        continue;
+                    }
                 }
 
                 auto peer_hostname =
@@ -690,10 +692,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSend(rp, local, peer);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
+            for (int retry = 0; retry < 2; retry++) {
+                ret = doSend(rp, local, peer);
+                if (ret == 0) {
+                    freeaddrinfo(result);
+                    return 0;
+                }
+                if (retry == 0)
+                    usleep(10000 * (50 + lrand48() % 50)); // idle for 500-1000 ms
             }
             if (ret == ERR_MALFORMED_JSON) {
                 return ret;
@@ -715,20 +721,23 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
             return ERR_SOCKET;
         }
-        if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
+        
+        if (!getenv("MC_SAFEMODE")) {
+            if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+                PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
 
-        struct timeval timeout;
-        timeout.tv_sec = 60;
-        timeout.tv_usec = 0;
-        if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-            close(conn_fd);
-            return ERR_SOCKET;
+            struct timeval timeout;
+            timeout.tv_sec = 60;
+            timeout.tv_usec = 0;
+            if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                        sizeof(timeout))) {
+                PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
         }
 
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
@@ -802,10 +811,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendMetadata(rp, local_metadata, peer_metadata);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
+            for (int retry = 0; retry < 2; retry++) {
+                ret = doSendMetadata(rp, local_metadata, peer_metadata);
+                if (ret == 0) {
+                    freeaddrinfo(result);
+                    return 0;
+                }
+                if (retry == 0)
+                    usleep(10000 * (50 + lrand48() % 50)); // idle for 500-1000 ms
             }
             if (ret == ERR_MALFORMED_JSON) {
                 return ret;
