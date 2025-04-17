@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "multi_transport.h"
+#include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -73,7 +74,7 @@ class TransferEngine {
     int closeSegment(SegmentHandle handle);
 
     int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
+                            const std::string &location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 

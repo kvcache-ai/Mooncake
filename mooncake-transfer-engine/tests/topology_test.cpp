@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include "transfer_metadata.h"
+#include "memory_location.h"
 
 TEST(ToplogyTest, GetTopologyMatrix) {
     mooncake::Topology topology;
@@ -96,10 +97,10 @@ TEST(ToplogyTest, TestSelectDeviceAny) {
     topology.parse(json_str);
     std::set<int> items = {0, 1};
     int device;
-    device = topology.selectDevice("*", 2);
+    device = topology.selectDevice(mooncake::kWildcardLocation, 2);
     ASSERT_TRUE(items.count(device));
     items.erase(device);
-    device = topology.selectDevice("*", 1);
+    device = topology.selectDevice(mooncake::kWildcardLocation, 1);
     ASSERT_TRUE(items.count(device));
     items.erase(device);
     ASSERT_TRUE(items.empty());
