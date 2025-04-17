@@ -288,6 +288,8 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
 }
 
 int Topology::resolve() {
+    resolved_matrix_.clear();
+    hca_list_.clear();
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;
     for (auto &entry : matrix_) {
@@ -316,5 +318,20 @@ int Topology::resolve() {
         }
     }
     return 0;
+}
+
+int Topology::disableDevice(const std::string &device_name) {
+    for (auto &record : matrix_) {
+        auto &preferred_hca = record.second.preferred_hca;
+        auto preferred_hca_iter =
+            std::find(preferred_hca.begin(), preferred_hca.end(), device_name);
+        if (preferred_hca_iter != preferred_hca.end())
+            preferred_hca.erase(preferred_hca_iter);
+        auto &avail_hca = record.second.avail_hca;
+        auto avail_hca_iter =
+            std::find(avail_hca.begin(), avail_hca.end(), device_name);
+        if (avail_hca_iter != avail_hca.end()) avail_hca.erase(avail_hca_iter);
+    }
+    return resolve();
 }
 }  // namespace mooncake
