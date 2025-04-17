@@ -71,6 +71,8 @@ class TransferEngine {
 
     int uninstallTransport(const std::string &proto);
 
+    std::string getLocalIpAndPort();
+
     int getRpcPort();
 
     SegmentHandle openSegment(const std::string &segment_name);
