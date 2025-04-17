@@ -102,7 +102,6 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
    For example, the following command line can be used to start the etcd service:
       ```bash
-      # This is 10.0.0.1
       etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
       ```
 
@@ -110,58 +109,44 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
    For example, you can use the `http` service in the `mooncake-transfer-engine/example/http-metadata-server` example:
       ```bash
-      # This is 10.0.0.1
       # cd mooncake-transfer-engine/example/http-metadata-server
       go run . --addr=:8080
       ```
 
 2. **Start the target node.**
     ```bash
-    # This is 10.0.0.2
-    export MC_GID_INDEX=n
     ./transfer_engine_bench --mode=target \
                             --metadata_server=etcd://10.0.0.1:2379 \
-                            --local_server_name=10.0.0.2:12345 \
-                            --device_name=erdma_0
+                            [--local_server_name=TARGET_NAME] \
+                            [--device_name=erdma_0 | --auto-discovery]
     ```
    The meanings of the various parameters are as follows:
-   - The default value of the parameter corresponding to the environment variable `MC_GID_INDEX` is 0, which means that the Transfer Engine selects a GID that is most likely to be connected. Since this parameter depends on the specific network environment, the user has to set the value of the environment variable manually if the connection is hung. The environment variable `NCCL_IB_GID_INDEX` is equivalent to this function.
    - `--mode=target` indicates the start of the target node. The target node does not initiate read/write requests; it passively supplies or writes data as required by the initiator node.
-      > Note: In actual applications, there is no need to distinguish between target nodes and initiator nodes; each node can freely initiate read/write requests to other nodes in the cluster.
+      > [!NOTE]
+      > In actual applications, there is no need to distinguish between target nodes and initiator nodes; each node can freely initiate read/write requests to other nodes in the cluster.
    - `--metadata_server` is the address of the metadata server. Its form is `[proto]://[hostname:port]`. For example, the following addresses are VALID:
       - Use `etcd` as metadata storage: `"10.0.0.1:2379"`, `"etcd://10.0.0.1:2379"` or `"etcd://10.0.0.1:2379,10.0.0.2:2379"`
       - Use `redis` as metadata storage: `"redis://10.0.0.1:6379"`
       - Use `http` as metadata storage: `"http://10.0.0.1:8080/metadata"`
-   - `--local_server_name` represents the address of this machine, which does not need to be set in most cases. If this option is not set, the value is equivalent to the hostname of this machine (i.e., `hostname(2)`). Other nodes in the cluster will use this address to attempt out-of-band communication with this node to establish RDMA connections.
-      > Note: If out-of-band communication fails, the connection cannot be established. Therefore, if necessary, you need to modify the `/etc/hosts` file on all nodes in the cluster to locate the correct node through the hostname.
-   - `--device_name` indicates the name of the RDMA network card used in the transfer process.
-      > Tip: Advanced users can also pass in a JSON file of the network card priority matrix through `--nic_priority_matrix`, for details, refer to the developer manual of Transfer Engine.
+   - `--local_server_name` represents the segment name of current node, which does not need to be set in most cases. If this option is not set, the value is equivalent to the hostname of this machine (i.e., `hostname(2)`). This should keep unique among the cluster.
+   - `--device_name` indicates the name of the RDMA network card used in the transfer process (separated by commas without space). You can also specify `--auto_discovery` to enable discovery topology automatically, which generates a network card priority matrix based on the operating system configuration.
    - In network environments that only support TCP, the `--protocol=tcp` parameter can be used; in this case, there is no need to specify the `--device_name` parameter.
-
-   You can also specify `--auto_discovery` to enable discovery topology automatically, which generates a network card priority matrix based on the operating system configuration. Then, `--device_name` parameter is not required.
-   ```
-   ./transfer_engine_bench --mode=target \
-                           --metadata_server=10.0.0.1:2379 \
-                           --local_server_name=10.0.0.2:12345 \
-                           --auto_discovery
-   ```
 
 1. **Start the initiator node.**
     ```bash
-    # This is 10.0.0.3
-    export MC_GID_INDEX=n
-    ./transfer_engine_bench --metadata_server=10.0.0.1:2379 \
-                            --segment_id=10.0.0.2:12345 \
-                            --local_server_name=10.0.0.3:12346 \
-                            --device_name=erdma_1
+    ./transfer_engine_bench --metadata_server=etcd://10.0.0.1:2379 \
+                            --segment_id=TARGET_NAME \
+                            [--local_server_name=INITIATOR_NAME] \
+                            [--device_name=erdma_1 | --auto-discovery]
     ```
    The meanings of the various parameters are as follows (the rest are the same as before):
-   - `--segment_id` can be simply understood as the hostname of the target node and needs to be consistent with the value passed to `--local_server_name` when starting the target node (if any).
+   - `--segment_id` is the segment name of target node. It needs to be consistent with the value passed to `--local_server_name` when starting the target node (if any).
    
    Under normal circumstances, the initiator node will start the transfer operation, wait for 10 seconds, and then display the "Test completed" message, indicating that the test is complete.
 
    The initiator node can also configure the following test parameters: `--operation` (can be `"read"` or `"write"`), `batch_size`, `block_size`, `duration`, `threads`, etc.
 
+> [!NOTE]
 > If an exception occurs during execution, it is usually due to incorrect parameter settings. It is recommended to refer to the [troubleshooting document](troubleshooting.md) for preliminary troubleshooting.
 
 ### Sample Run
@@ -402,9 +387,7 @@ TransferEngine needs to initializing by calling the `init` method before further
 TransferEngine();
 
 int init(const std::string &metadata_conn_string,
-         const std::string &local_server_name,
-         const std::string &ip_or_host_name, 
-         uint64_t rpc_port = 12345);
+         const std::string &local_server_name);
 ```
 - `metadata_conn_string`: Connecting string of metadata storage servers, i.e., the IP address/hostname of `etcd`/`redis` or the URI of the http service.
 The general form is `[proto]://[hostname:port]`. For example, the following metadata server addresses are legal:
@@ -413,9 +396,6 @@ The general form is `[proto]://[hostname:port]`. For example, the following meta
     - Using `http` as a metadata storage service: `“http://10.0.0.1:8080/metadata”`
 
 - `local_server_name`: The local server name, ensuring uniqueness within the cluster. It also serves as the name of the RAM Segment that other nodes refer to the current instance (i.e., Segment Name).
-- `ip_or_host_name`: The name used for other clients to connect, which can be a hostname or IP address.
-- `rpc_port`: The rpc port used for interaction with other clients.
-- Return value: If successful, returns 0; if TransferEngine has already been init, returns -1.
 
 ```cpp
   ~TransferEngine();
@@ -426,13 +406,6 @@ Reclaims all allocated resources and also deletes the global meta data server in
 ## Using Transfer Engine to Your Projects
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
-
-During the project build phase, you need to configure the following options for your application:
-```bash
--I/path/to/include
--L/path/to/lib -ltransfer_engine
--lnuma -lglog -libverbs -ljsoncpp -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc
-```
 
 ### Using Golang Interface
 To support the operational needs of P2P Store, Transfer Engine provides a Golang interface wrapper, see `mooncake-p2p-store/src/p2pstore/transfer_engine.go`.
