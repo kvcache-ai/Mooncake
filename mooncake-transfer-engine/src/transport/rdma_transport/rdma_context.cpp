@@ -189,9 +189,6 @@ int RdmaContext::deconstruct() {
         context_ = nullptr;
     }
 
-    if (globalConfig().verbose)
-        LOG(INFO) << "Release resources of RDMA device: " << device_name_;
-
     return 0;
 }
 
@@ -204,16 +201,6 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
 
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
     memory_region_list_.push_back(mr);
-
-    if (globalConfig().verbose) {
-        LOG(INFO) << "Memory region: " << addr << " -- "
-                  << (void *)((uintptr_t)addr + length)
-                  << ", Device name: " << device_name_ << ", Length: " << length
-                  << " (" << length / 1024 / 1024 << " MB)"
-                  << ", Permission: " << access << std::hex
-                  << ", LKey: " << mr->lkey << ", RKey: " << mr->rkey;
-    }
-
     return 0;
 }
 

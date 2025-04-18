@@ -135,7 +135,7 @@ Transport *TransferEngine::installTransport(const std::string &proto,
                                             void **args) {
     Transport *transport = multi_transports_->getTransport(proto);
     if (transport) {
-        LOG(INFO) << "Transport " << proto << " already installed";
+        LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
     }
 

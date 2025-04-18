@@ -85,6 +85,8 @@ std::string_view Status::CodeToString(Status::Code code) {
       return "Memory";
     case Code::kNotImplemented:
       return "NotImplemented";
+    case Code::kNotSupportedTransport:
+      return "NotSupportedTransport";
     default:
       LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
       return "UnknownCode";
