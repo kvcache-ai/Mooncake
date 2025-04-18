@@ -26,6 +26,7 @@
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
+
 #include <mutex>
 #endif
 
@@ -659,7 +660,17 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                // TODO: wait for the peer to close the connection
+                // Wait for the client to close the connection
+                char byte;
+                ssize_t rc = read(conn_fd, &byte, sizeof(byte));
+                if (rc > 0) {
+                    LOG(ERROR) << "Unexpected socket read result: " << rc
+                               << ", byte: " << int(byte);
+                } else if (rc < 0) {
+                    PLOG(ERROR)
+                        << "Socket read failed while waiting client to close";
+                }
+                // else rc == 0, client close the connection, safe to close.
 
                 close(conn_fd);
             }

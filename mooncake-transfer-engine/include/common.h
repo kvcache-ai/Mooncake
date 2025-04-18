@@ -161,7 +161,7 @@ static inline int writeString(int fd, const HandShakeRequestType type,
         if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), length) != (ssize_t)length)
+    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }
