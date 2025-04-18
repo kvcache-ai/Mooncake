@@ -24,13 +24,9 @@
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string &local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {
-    // ...
-}
+    : metadata_(metadata), local_server_name_(local_server_name) {}
 
-MultiTransport::~MultiTransport() {
-    // ...
-}
+MultiTransport::~MultiTransport() {}
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     auto batch_desc = new BatchDesc();
@@ -52,7 +48,6 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
-            LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
@@ -69,7 +64,6 @@ Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "MultiTransport: Exceed the limitation of batch capacity";
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
     }
@@ -82,12 +76,9 @@ Status MultiTransport::submitTransfer(
     };
     std::unordered_map<Transport *, SubmitTasks> submit_tasks;
     for (auto &request : entries) {
-        auto transport = selectTransport(request);
-        if (!transport) {
-            return Status::InvalidArgument(
-                "SelectTransport failed for SegmentID: " +
-                std::to_string(request.target_id));
-        }
+        Transport *transport = nullptr;
+        auto status = selectTransport(request, transport);
+        if (!status.ok()) return status;
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         ++task_id;
@@ -95,16 +86,17 @@ Status MultiTransport::submitTransfer(
             (TransferRequest *)&request);
         submit_tasks[transport].task_list.push_back(&task);
     }
+    Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second.request_list,
                                                       entry.second.task_list);
         if (!status.ok()) {
-            LOG(ERROR) << "MultiTransport: Failed to submit transfer task to "
+            LOG(ERROR) << "Failed to submit transfer task to "
                        << entry.first->getName();
-            return status;
+            overall_status = status;
         }
     }
-    return Status::OK();
+    return overall_status;
 }
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -112,8 +104,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
-        return Status::InvalidArgument(
-            "MultiTransport: task id is equal to or larger than task_count");
+        return Status::InvalidArgument("Task ID out of range");
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
@@ -147,8 +138,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #endif
 
     if (!transport) {
-        LOG(ERROR) << "MultiTransport: Failed to initialize transport "
-                   << proto;
+        LOG(ERROR) << "Unsupported transport " << proto
+                   << ", please rebuild Mooncake";
         return nullptr;
     }
 
@@ -160,21 +151,20 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     return transport;
 }
 
-Transport *MultiTransport::selectTransport(const TransferRequest &entry) {
-    if (entry.target_id == LOCAL_SEGMENT_ID && transport_map_.count("local"))
-        return transport_map_["local"].get();
+Status MultiTransport::selectTransport(const TransferRequest &entry,
+                                       Transport *&transport) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
-        LOG(ERROR) << "MultiTransport: Incorrect target segment id "
-                   << entry.target_id;
-        return nullptr;
+        return Status::InvalidArgument("Invalid target segment ID " +
+                                       entry.target_id);
     }
     auto proto = target_segment_desc->protocol;
     if (!transport_map_.count(proto)) {
-        LOG(ERROR) << "MultiTransport: Transport " << proto << " not installed";
-        return nullptr;
+        return Status::NotSupportedTransport("Transport " + proto +
+                                             " not installed");
     }
-    return transport_map_[proto].get();
+    transport = transport_map_[proto].get();
+    return Status::OK();
 }
 
 Transport *MultiTransport::getTransport(const std::string &proto) {

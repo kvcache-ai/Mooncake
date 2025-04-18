@@ -242,12 +242,10 @@ Status RdmaTransport::submitTransfer(
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
-                ;
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) delete s;
                 LOG(ERROR)
@@ -304,12 +302,10 @@ Status RdmaTransport::submitTransferTask(
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
                 __sync_fetch_and_add(&task.slice_count, 1);
-                ;
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) delete s;
                 LOG(ERROR)
