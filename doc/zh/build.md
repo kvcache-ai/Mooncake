@@ -66,7 +66,7 @@
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel \
+                libcurl-devel
     ```
 
     注意：如果源没有gtest, glog, gflags, 则需要通过源码安装

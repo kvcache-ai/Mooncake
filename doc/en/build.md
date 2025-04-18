@@ -66,7 +66,7 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel \
+                libcurl-devel
     ```
 
     NOTE: You may need to install gtest, glog, gflags from source code:
