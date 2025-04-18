@@ -270,33 +270,38 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         handle_map_[target_hostname] = handle;
     }
 
-    auto batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
-    if (opcode == TransferOpcode::WRITE) {
-        entry.opcode = TransferRequest::WRITE;
-    } else {
-        entry.opcode = TransferRequest::READ;
-    }
-    entry.length = length;
-    entry.source = (void *)buffer;
-    entry.target_id = handle;
-    entry.target_offset = peer_buffer_address;
+    const int max_retry = 8;
+    for (int retry = 0; retry < max_retry; ++retry) {
+        auto batch_id = engine_->allocateBatchID(1);
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = length;
+        entry.source = (void *)buffer;
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_address;
 
-    Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
+        Status s = engine_->submitTransfer(batch_id, {entry});
+        if (!s.ok()) return -1;
 
-    TransferStatus status;
-    while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(s.ok());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(batch_id);
-            return -1;
+        TransferStatus status;
+        bool completed = false;
+        while (!completed) {
+            Status s = engine_->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(batch_id);
+                return 0;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                engine_->freeBatchID(batch_id);
+                completed = true;
+            }
         }
     }
+    return -1;
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {

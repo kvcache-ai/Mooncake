@@ -218,10 +218,16 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        if (!endpoint->active()) {
+            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            entry.second.clear();
+            continue;
+        }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first;
+                       << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            endpoint->set_active(false);
             entry.second.clear();
             continue;
         }
@@ -272,6 +278,11 @@ void WorkerPool::performPollCq(int thread_id) {
                                << ", dest_rkey: " << slice->rdma.dest_rkey
                                << ", retry_cnt: " << slice->rdma.retry_cnt
                                << "): " << ibv_wc_status_str(wc[i].status);
+                context_.traceFailure();
+                if (context_.failedCount() > 64) {
+                    LOG(WARNING) << "Too many errors found in " << context_.nicPath();
+                    context_.set_active(false);
+                }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
