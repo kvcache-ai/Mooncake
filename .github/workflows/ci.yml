@@ -134,6 +134,7 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        sudo apt install -y nvidia-cuda-toolkit
         mkdir build
         cd build
         cmake .. -DUSE_CUDA=ON  -DUSE_NVMEOF=ON -DUSE_ETCD=ON -DUSE_ETCD_LEGACY=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON
