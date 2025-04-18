@@ -141,7 +141,12 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     if (peer_desc.local_nic_path != peer_nic_path_ ||
         peer_desc.peer_nic_path != local_desc.local_nic_path) {
-        LOG(ERROR) << "Invalid argument: received packet mismatch";
+        LOG(ERROR) << "Invalid argument: received packet mismatch, "
+                      "local.local_nic_path: "
+                   << local_desc.local_nic_path
+                   << ", local.peer_nic_path: " << local_desc.peer_nic_path
+                   << ", peer.local_nic_path: " << peer_desc.local_nic_path
+                   << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
     }
 
