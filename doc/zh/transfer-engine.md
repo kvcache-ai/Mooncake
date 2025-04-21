@@ -426,5 +426,5 @@ int init(const std::string &metadata_conn_string,
 - `MC_WORKERS_PER_CTX` 每个设备实例对应的异步工作线程数量
 - `MC_SLICE_SIZE` Transfer Engine 中用户请求的切分粒度
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
-- `MC_VERBOSE` 若设置此选项，则在运行时会输出更详细的日志
+- `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 
