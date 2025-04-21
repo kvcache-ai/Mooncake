@@ -270,7 +270,12 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         handle_map_[target_hostname] = handle;
     }
 
-    const int max_retry = 8;
+    // TODO this is just a workaround
+    // When transfer engine submits one task, it will be dispatch to a worker 
+    // associated with one local RNIC. If the local RNIC fails to connect to any
+    // remote RNIC, it will eventually fail. This allows selecting multiple local 
+    // RNIC in one transferSync call. Will be fixed in the next revision.
+    const int max_retry = 3;
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;

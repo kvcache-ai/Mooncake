@@ -117,8 +117,7 @@ int WorkerPool::submitPostSend(
             }
 
             context_.engine().meta()->dumpMetadataContent(
-                peer_segment_desc->name, slice->rdma.dest_addr,
-                slice->length);
+                peer_segment_desc->name, slice->rdma.dest_addr, slice->length);
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
@@ -279,8 +278,9 @@ void WorkerPool::performPollCq(int thread_id) {
                                << ", retry_cnt: " << slice->rdma.retry_cnt
                                << "): " << ibv_wc_status_str(wc[i].status);
                 context_.traceFailure();
-                if (context_.failedCount() > 64) {
-                    LOG(WARNING) << "Too many errors found in " << context_.nicPath();
+                if (context_.failedCount() > 16) {
+                    LOG(WARNING) << "Too many errors found in local RNIC "
+                                 << context_.nicPath() << ", mark it inactive";
                     context_.set_active(false);
                 }
                 context_.deleteEndpoint(slice->peer_nic_path);
