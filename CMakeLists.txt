@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake CXX C)
 
+# indicates cmake is invoked from top-level dir
+set(GLOBAL_CONFIG "true")
+
 option(ENABLE_CCACHE "Whether to open ccache" OFF)
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND AND ENABLE_CCACHE)
@@ -9,7 +12,13 @@ if(CCACHE_FOUND AND ENABLE_CCACHE)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif()
 
-enable_testing()
+option(BUILD_EXAMPLES "Build examples" ON)
+
+# unit test
+option(BUILD_UNIT_TESTS "Build unit tests" ON)
+if (BUILD_UNIT_TESTS)
+  enable_testing()
+endif()
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
@@ -86,7 +95,7 @@ if (USE_ETCD)
 endif()
 
 if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
-  message(FATAL_ERROR "Please enable at least one metadata type: USE_ETCD, USE_REDIS, or USE_HTTP")
+  message(STATUS "None of USE_ETCD, USE_REDIS, USE_HTTP is selected, only \"P2PHANDSHAKE\" is supported as metadata server")
 endif()
 
 add_subdirectory(mooncake-common)
