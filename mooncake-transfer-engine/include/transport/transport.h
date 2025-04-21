@@ -40,7 +40,6 @@ class Transport {
     friend class MultiTransport;
 
    public:
-    using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
 
     using BatchID = uint64_t;

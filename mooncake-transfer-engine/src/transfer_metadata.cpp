@@ -61,7 +61,7 @@ struct TransferHandshakeUtil {
     }
 };
 
-TransferMetadata::TransferMetadata(const std::string &conn_string) {
+TransferMetadata::TransferMetadata(const std::string &conn_string) { 
     next_segment_id_.store(1);
     handshake_plugin_ = HandShakePlugin::Create(conn_string);
     if (!handshake_plugin_) {
@@ -85,6 +85,7 @@ TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
 
 int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
                                         const SegmentDesc &desc) {
+    if (p2p_handshake_mode_) return 0;
     auto segmentJSON = exportSegmentDesc(desc);
     if (segmentJSON.empty() ||
         !storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
@@ -96,9 +97,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 }
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
-    if (p2p_handshake_mode_) {
-        return 0;
-    }
+    if (p2p_handshake_mode_) return 0;
     if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
         LOG(ERROR) << "Failed to unregister segment descriptor, name "
                    << segment_name;
@@ -107,32 +106,17 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     return 0;
 }
 
-std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDesc(
-    const std::string &segment_name) {
-    Json::Value segmentJSON;
-    if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
-        LOG(WARNING) << "Failed to retrieve segment descriptor, name "
-                     << segment_name;
-        return nullptr;
-    }
-    auto desc = praseSegmentDesc(segmentJSON);
-    if (!desc) {
-        LOG(WARNING) << "Corrupted segment descriptor, name " << segment_name;
-    }
-    return desc;
-}
-
 int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
                                           Json::Value &local_json) {
     // TODO: save to local cache
     // auto peer_desc = decodeSegmentDesc(peer_json,
     // peer_json["name"].asString());
     auto local_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-    int ret = encodeSegmentDesc(*local_desc.get(), local_json);
-    return ret;
+    local_json = exportSegmentDesc(*local_desc.get());
+    return 0;
 }
 
-std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
+std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value peer_json;
 
@@ -140,12 +124,9 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
         auto [ip, port] = parseHostNameWithPort(segment_name);
         Json::Value local_json;
         auto desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-        int ret = encodeSegmentDesc(*desc.get(), local_json);
-        if (ret) {
-            return nullptr;
-        }
-        ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
-                                                  peer_json);
+        local_json = exportSegmentDesc(*desc.get());
+        int ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
+                                                      peer_json);
         if (ret) {
             return nullptr;
         }
@@ -158,7 +139,11 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
         }
     }
 
-    return decodeSegmentDesc(peer_json, segment_name);
+    auto desc = praseSegmentDesc(peer_json);
+    if (!desc) {
+        LOG(WARNING) << "Corrupted segment descriptor, name " << segment_name;
+    }
+    return desc;
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
@@ -177,9 +162,8 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     return 0;
 }
 
-std::shared_ptr<SegmentDesc>
-TransferMetadata::getSegmentDescByName(const std::string &segment_name,
-                                       bool force_update) {
+std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDescByName(
+    const std::string &segment_name, bool force_update) {
     if (globalConfig().metacache && !force_update) {
         RWSpinlock::ReadGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
@@ -203,8 +187,8 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
     return segment_desc;
 }
 
-std::shared_ptr<SegmentDesc>
-TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
+std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDescByID(
+    SegmentID segment_id, bool force_update) {
     if (segment_id != LOCAL_SEGMENT_ID &&
         (!globalConfig().metacache || force_update)) {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -221,8 +205,7 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     }
 }
 
-SegmentID TransferMetadata::getSegmentID(
-    const std::string &segment_name) {
+SegmentID TransferMetadata::getSegmentID(const std::string &segment_name) {
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
         if (segment_name_to_id_map_.count(segment_name))

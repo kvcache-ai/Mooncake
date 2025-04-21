@@ -91,10 +91,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << " and port " << desc.rpc_port
               << " for serving local TCP service";
 
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, local_server_name_);
-
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 

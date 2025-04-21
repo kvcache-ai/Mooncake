@@ -16,22 +16,24 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
-void TransferMetadata::SegmentDesc::dump() const {
+void SegmentDesc::dump() const {
     LOG(INFO) << "  segment name: " << name;
     LOG(INFO) << "  protocol: " << protocol;
-    LOG(INFO) << "  topology: " << topology.toString();
-    LOG(INFO) << "  devices: ";
-    for (auto &device : devices) {
-        LOG(INFO) << "    device name " << device.name << ", lid " << device.lid
-                  << ", " << device.gid;
+    if (protocol == "rdma" || protocol == "shm") {
+        auto &det = std::get<MemorySegmentDesc>(detail);
+        LOG(INFO) << "  topology: " << det.topology.toString();
+        LOG(INFO) << "  devices: ";
+        for (auto &device : det.devices) {
+            LOG(INFO) << "    device name " << device.name << ", lid "
+                      << device.lid << ", " << device.gid;
+        }
+        LOG(INFO) << "  buffers: ";
+        for (auto &buffer : det.buffers) {
+            LOG(INFO) << "    buffer type " << buffer.location << ", address "
+                      << (void *)buffer.addr << "--"
+                      << (void *)(buffer.addr + buffer.length);
+        }
     }
-    LOG(INFO) << "  buffers: ";
-    for (auto &buffer : buffers) {
-        LOG(INFO) << "    buffer type " << buffer.name << ", address "
-                  << (void *)buffer.addr << "--"
-                  << (void *)(buffer.addr + buffer.length);
-    }
-    LOG(INFO) << "  nvmeof buffers: " << nvmeof_buffers.size() << " items";
     LOG(INFO) << "  timestamp: " << timestamp;
 }
 

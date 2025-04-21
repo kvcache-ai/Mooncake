@@ -40,7 +40,6 @@ using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentHandle = Transport::SegmentHandle;
-using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
 

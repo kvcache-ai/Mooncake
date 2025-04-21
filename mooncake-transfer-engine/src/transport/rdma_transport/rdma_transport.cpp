@@ -376,8 +376,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-RdmaTransport::SegmentID RdmaTransport::getSegmentID(
-    const std::string &segment_name) {
+SegmentID RdmaTransport::getSegmentID(const std::string &segment_name) {
     return metadata_->getSegmentID(segment_name);
 }
 
@@ -449,9 +448,11 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-        device_id = detail.topology.selectDevice(buffer_desc.location, retry_count);
+        device_id =
+            detail.topology.selectDevice(buffer_desc.location, retry_count);
         if (device_id >= 0) return 0;
-        device_id = detail.topology.selectDevice(kWildcardLocation, retry_count);
+        device_id =
+            detail.topology.selectDevice(kWildcardLocation, retry_count);
         if (device_id >= 0) return 0;
     }
 

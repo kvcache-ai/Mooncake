@@ -114,7 +114,6 @@ class RdmaTransport : public Transport {
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
-using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 
 }  // namespace mooncake

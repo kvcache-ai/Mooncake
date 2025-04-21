@@ -35,6 +35,8 @@ namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
 
+using SegmentID = uint64_t;
+
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
 struct DeviceDesc {
@@ -69,23 +71,20 @@ struct FileSegmentDesc {
     std::vector<FileBufferDesc> buffers;
 };
 
-    struct SegmentDesc {
-        std::string name;
-        std::string protocol;
-        // this is for rdma
-        std::vector<DeviceDesc> devices;
-        Topology topology;
-        std::vector<BufferDesc> buffers;
-        // this is for nvmeof.
-        std::vector<NVMeoFBufferDesc> nvmeof_buffers;
-        // TODO : make these two a union or a std::variant
-    };
+struct SegmentDesc {
+    std::string name;
+    std::string protocol;
+    std::string timestamp;
+    std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
-    struct RpcMetaDesc {
-        std::string ip_or_host_name;
-        uint16_t rpc_port;
-        int sockfd;             // local cache
-    };
+    void dump() const;
+};
+
+struct RpcMetaDesc {
+    std::string ip_or_host_name;
+    uint16_t rpc_port;
+    int sockfd;  // local cache
+};
 
 struct HandShakeDesc {
     std::string local_nic_path;
@@ -145,10 +144,17 @@ class TransferMetadata {
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 
+    void dumpMetadataContentUnlocked();
+
+    void dumpMetadataContent(const std::string &segment_name, uint64_t offset,
+                             uint64_t length);
+
+    std::shared_ptr<SegmentDesc> praseSegmentDesc(
+        const Json::Value &segmentJSON);
+
+    Json::Value exportSegmentDesc(const SegmentDesc &desc);
+
    private:
-    int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
-    std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
-        Json::Value &segmentJSON, const std::string &segment_name);
     int receivePeerMetadata(const Json::Value &peer_json,
                             Json::Value &local_json);
 

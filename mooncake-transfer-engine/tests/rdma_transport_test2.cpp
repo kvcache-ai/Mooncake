@@ -111,7 +111,7 @@ class RDMATransportTest : public ::testing::Test {
     Transport *xport;
     std::string nic_priority_matrix;
     void **args;
-    mooncake::Transport::SegmentID segment_id;
+    mooncake::SegmentID segment_id;
     std::shared_ptr<SegmentDesc> segment_desc;
     uint64_t remote_base;
 
