@@ -37,12 +37,16 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
     local_server_name_ = local_server_name;
-    TransferMetadata::RpcMetaDesc desc;
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    multi_transports_ =
+        std::make_shared<MultiTransport>(metadata_, local_server_name_);
+
+    RpcMetaDesc desc;
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
         desc.ip_or_host_name = host_name;
-        desc.rpc_port = port;
+        desc.rpc_port = rpc_port;
         desc.sockfd = -1;
 
         if (metadata_conn_string == P2PHANDSHAKE) {
@@ -199,15 +203,17 @@ bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
 int TransferEngine::registerLocalMemory(void *addr, size_t length,
                                         const std::string &location,
                                         bool remote_accessible,
-                                        bool update_metadata) {
+                                        bool update_metadata,
+                                        const std::string &shm_path) {
     if (checkOverlap(addr, length)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
     }
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata);
+        int ret = transport->registerLocalMemory(addr, length, location,
+                                                 remote_accessible,
+                                                 update_metadata, shm_path);
         if (ret < 0) return ret;
     }
 

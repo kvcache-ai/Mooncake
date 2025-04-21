@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 
 #include "common.h"
 #include "topology.h"
@@ -36,29 +37,37 @@ struct HandShakePlugin;
 
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
-class TransferMetadata {
-   public:
-    struct DeviceDesc {
-        std::string name;
-        uint16_t lid;
-        std::string gid;
-    };
+struct DeviceDesc {
+    std::string name;
+    uint16_t lid;
+    std::string gid;
+};
 
-    struct BufferDesc {
-        std::string name;
-        uint64_t addr;
-        uint64_t length;
-        std::vector<uint32_t> lkey;
-        std::vector<uint32_t> rkey;
-    };
+struct BufferDesc {
+    std::string location;
+    uint64_t addr;
+    uint64_t length;
+    std::vector<uint32_t> lkey;  // follow the order of `devices`
+    std::vector<uint32_t> rkey;  // follow the order of `devices`
+    std::string shm_path;
+};
 
-    struct NVMeoFBufferDesc {
-        std::string file_path;
-        uint64_t length;
-        std::unordered_map<std::string, std::string> local_path_map;
-    };
+struct FileBufferDesc {
+    uint64_t length;
+    std::string original_path;  // file path of the original directory
+    std::unordered_map<std::string, std::string> mounted_path_map;
+    // file path of the mounted directory
+};
 
-    using SegmentID = uint64_t;
+struct MemorySegmentDesc {
+    Topology topology;
+    std::vector<DeviceDesc> devices;
+    std::vector<BufferDesc> buffers;
+};
+
+struct FileSegmentDesc {
+    std::vector<FileBufferDesc> buffers;
+};
 
     struct SegmentDesc {
         std::string name;
@@ -70,24 +79,22 @@ class TransferMetadata {
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // TODO : make these two a union or a std::variant
-        std::string timestamp;
-
-        void dump() const;
     };
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
-        int sockfd;  // local cache
+        int sockfd;             // local cache
     };
 
-    struct HandShakeDesc {
-        std::string local_nic_path;
-        std::string peer_nic_path;
-        std::vector<uint32_t> qp_num;
-        std::string reply_msg;  // on error
-    };
+struct HandShakeDesc {
+    std::string local_nic_path;
+    std::string peer_nic_path;
+    std::vector<uint32_t> qp_num;
+    std::string reply_msg;  // on error
+};
 
+class TransferMetadata {
    public:
     TransferMetadata(const std::string &conn_string);
 
@@ -137,11 +144,6 @@ class TransferMetadata {
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
-
-    void dumpMetadataContent(const std::string &segment_name = "",
-                             uint64_t offset = 0, uint64_t length = 0);
-
-    void dumpMetadataContentUnlocked();
 
    private:
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
