@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 
@@ -28,12 +29,69 @@ ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
     return master_client_->Connect(master_addr);
 }
 
+static bool get_auto_discovery() {
+    const char* ev_ad = std::getenv("MC_TE_AUTO_DISC");
+    if (ev_ad) {
+        int iv = atoi(ev_ad);
+        if (iv == 1) {
+            LOG(INFO) << "auto discovery set by env MC_TE_AUTO_DISC";
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), s.end());
+}
+
+static std::vector<std::string> get_auto_discovery_filters(bool auto_discovery) {
+    std::vector<std::string> whitelst_filters;
+    char* ev_ad = std::getenv("MC_TE_FILTERS");
+    if (ev_ad) {
+        if (!auto_discovery) {
+            LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
+            return whitelst_filters;
+        }
+        LOG(INFO) << "whitelist filters: " << ev_ad;
+        char delimiter = ',';
+        char * end = ev_ad + std::strlen(ev_ad);
+        char * start = ev_ad, * pos = ev_ad;
+        while ((pos=std::find(start, end, delimiter)) != end) {
+            std::string str(start, pos);
+            ltrim(str);
+            rtrim(str);
+            whitelst_filters.push_back(std::move(str));
+            start = pos + 1;
+        }
+        if (start != (end + 1)) {
+            std::string str(start, end);
+            ltrim(str);
+            rtrim(str);
+            whitelst_filters.push_back(std::move(str));
+        }
+    }
+    return whitelst_filters;
+}
+
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
                                      const std::string& metadata_connstring,
                                      const std::string& protocol,
                                      void** protocol_args) {
+    bool auto_discovery = get_auto_discovery();
+
+    std::vector<std::string> whitelst_filters = get_auto_discovery_filters(auto_discovery);
+
     // Create transfer engine
-    transfer_engine_ = std::make_unique<TransferEngine>();
+    transfer_engine_ = std::make_unique<TransferEngine>(auto_discovery, whitelst_filters);
     CHECK(transfer_engine_) << "Failed to create transfer engine";
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
