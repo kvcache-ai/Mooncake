@@ -87,6 +87,8 @@ std::string_view Status::CodeToString(Status::Code code) {
       return "NotImplemented";
     case Code::kNotSupportedTransport:
       return "NotSupportedTransport";
+    case Code::kNotSuchKey:
+      return "NotSuchKey";
     default:
       LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
       return "UnknownCode";
