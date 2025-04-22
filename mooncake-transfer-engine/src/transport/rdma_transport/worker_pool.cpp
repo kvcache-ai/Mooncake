@@ -117,8 +117,7 @@ int WorkerPool::submitPostSend(
             }
 
             context_.engine().meta()->dumpMetadataContent(
-                peer_segment_desc->name, slice->rdma.dest_addr,
-                slice->length);
+                peer_segment_desc->name, slice->rdma.dest_addr, slice->length);
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
