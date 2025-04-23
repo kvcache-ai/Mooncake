@@ -30,7 +30,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
 }
 
 static bool get_auto_discovery() {
-    const char* ev_ad = std::getenv("MC_TE_AUTO_DISC");
+    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
         int iv = atoi(ev_ad);
         if (iv == 1) {
@@ -55,7 +55,7 @@ static inline void rtrim(std::string &s) {
 
 static std::vector<std::string> get_auto_discovery_filters(bool auto_discovery) {
     std::vector<std::string> whitelst_filters;
-    char* ev_ad = std::getenv("MC_TE_FILTERS");
+    char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
         if (!auto_discovery) {
             LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
