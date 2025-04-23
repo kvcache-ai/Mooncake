@@ -23,11 +23,13 @@
 namespace mooncake {
 struct MetadataPlugin {
     static std::shared_ptr<MetadataPlugin> Create(
-        const std::string &conn_string);
+        const std::string &connection_string);
 
     MetadataPlugin() {}
 
     virtual ~MetadataPlugin() {}
+
+    virtual Status connect(const std::string &endpoint) = 0;
 
     virtual Status get(const std::string &key, std::string &value) = 0;
 
