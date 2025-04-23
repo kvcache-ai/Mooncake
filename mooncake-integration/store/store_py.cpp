@@ -1,6 +1,7 @@
 #include "store_py.h"
 
 #include <netinet/in.h>
+#include <pybind11/gil.h>  // For GIL management
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -9,7 +10,28 @@
 
 #include "types.h"
 
+namespace py = pybind11;
 using namespace mooncake;
+
+// RAII container that automatically frees slices on destruction
+class SliceGuard {
+   public:
+    explicit SliceGuard(DistributedObjectStore &store) : store_(store) {}
+
+    ~SliceGuard() { store_.freeSlices(slices_); }
+
+    // Prevent copying
+    SliceGuard(const SliceGuard &) = delete;
+    SliceGuard &operator=(const SliceGuard &) = delete;
+
+    // Access the underlying slices
+    std::vector<Slice> &slices() { return slices_; }
+    const std::vector<Slice> &slices() const { return slices_; }
+
+   private:
+    DistributedObjectStore &store_;
+    std::vector<Slice> slices_;
+};
 
 // ResourceTracker implementation using singleton pattern
 ResourceTracker &ResourceTracker::getInstance() {
@@ -122,18 +144,6 @@ DistributedObjectStore::DistributedObjectStore() {
 DistributedObjectStore::~DistributedObjectStore() {
     // Unregister from the tracker before cleanup
     ResourceTracker::getInstance().unregisterInstance(this);
-
-    if (client_ && segment_ptr_) {
-        // Try to unmount the segment using saved local_hostname
-        ErrorCode rc = client_->UnInit();
-        if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to unmount segment in destructor: "
-                       << toString(rc);
-        }
-        // The unique_ptr will automatically free the memory when reset
-        segment_ptr_.reset();
-        client_.reset();
-    }
 }
 
 int DistributedObjectStore::setup(const std::string &local_hostname,
@@ -161,22 +171,24 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         this->local_hostname = local_hostname;
     }
 
-    client_ = std::make_unique<mooncake::Client>();
-
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
-    ErrorCode rc = client_->Init(this->local_hostname, metadata_server,
+    auto client_opt =
+        mooncake::Client::Create(this->local_hostname, metadata_server,
                                  protocol, args, master_server_addr);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to initialize client: " << toString(rc);
+    if (!client_opt) {
+        LOG(ERROR) << "Failed to create client";
         return 1;
     }
+    client_ = *client_opt;
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    rc = client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
-                                      local_buffer_size, "cpu:0", false, false);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to register local memory: " << toString(rc);
+    ErrorCode error_code =
+        client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
+                                     local_buffer_size, "cpu:0", false, false);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to register local memory: "
+                   << toString(error_code);
         return 1;
     }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
@@ -185,10 +197,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    rc = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
-                               global_segment_size);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to mount segment: " << toString(rc);
+    error_code = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
+                                       global_segment_size);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
         return 1;
     }
     return 0;
@@ -269,11 +281,7 @@ int DistributedObjectStore::tearDownAll() {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ErrorCode rc = client_->UnInit();
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to unmount segment: " << toString(rc);
-        return 1;
-    }
+    // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
     segment_ptr_.reset();
@@ -289,15 +297,24 @@ int DistributedObjectStore::put(const std::string &key,
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ReplicateConfig config;
-    config.replica_num = 1;  // TODO
 
-    std::vector<Slice> slices;
-    int ret = allocateSlices(slices, value);
-    if (ret) return ret;
-    ErrorCode error_code = client_->Put(std::string(key), slices, config);
-    freeSlices(slices);
-    if (error_code != ErrorCode::OK) return toInt(error_code);
+    SliceGuard slices(*this);
+    int ret = allocateSlices(slices.slices(), value);
+    if (ret) {
+        LOG(ERROR) << "Failed to allocate slices for put operation";
+        return ret;
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;  // TODO: Make configurable
+
+    ErrorCode error_code = client_->Put(key, slices.slices(), config);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(error_code);
+        return toInt(error_code);
+    }
+
     return 0;
 }
 
@@ -306,35 +323,64 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
         LOG(ERROR) << "Client is not initialized";
         return pybind11::bytes("\0", 0);
     }
+
     mooncake::Client::ObjectInfo object_info;
-    std::vector<Slice> slices;
+    SliceGuard slices(*this);
+    uint64_t str_length = 0;
+    ErrorCode error_code;
+    char *exported_str_ptr = nullptr;
+    bool use_exported_str = false;
 
     const auto kNullString = pybind11::bytes("\0", 0);
-    ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK) return kNullString;
 
-    uint64_t str_length = 0;
-    int ret = allocateSlices(slices, object_info, str_length);
-    if (ret) return kNullString;
+    {
+        py::gil_scoped_release release_gil;
 
-    error_code = client_->Get(key, object_info, slices);
-    if (error_code != ErrorCode::OK) {
-        freeSlices(slices);
-        return kNullString;
+        error_code = client_->Query(key, object_info);
+        if (error_code != ErrorCode::OK) {
+            py::gil_scoped_acquire acquire_gil;
+            return kNullString;
+        }
+
+        int ret = allocateSlices(slices.slices(), object_info, str_length);
+        if (ret) {
+            py::gil_scoped_acquire acquire_gil;
+            return kNullString;
+        }
+
+        error_code = client_->Get(key, object_info, slices.slices());
+        if (error_code != ErrorCode::OK) {
+            py::gil_scoped_acquire acquire_gil;
+            return kNullString;
+        }
+
+        if (slices.slices().size() == 1 &&
+            slices.slices()[0].size == str_length) {
+            LOG(INFO) << "Single slice optimization path";
+        } else {
+            LOG(INFO) << "Exporting multiple slices";
+            exported_str_ptr = exportSlices(slices.slices(), str_length);
+            if (!exported_str_ptr) {
+                py::gil_scoped_acquire acquire_gil;
+                return kNullString;
+            }
+            use_exported_str = true;
+        }
     }
 
-    if (slices.size() == 1 && slices[0].size == str_length) {
-        auto result = pybind11::bytes((char *)slices[0].ptr, str_length);
-        freeSlices(slices);
-        return result;
+    py::gil_scoped_acquire acquire_gil;
+
+    pybind11::bytes result;
+    if (use_exported_str) {
+        result = pybind11::bytes(exported_str_ptr, str_length);
+        delete[] exported_str_ptr;
+    } else if (!slices.slices().empty()) {
+        result = pybind11::bytes(static_cast<char *>(slices.slices()[0].ptr),
+                                 str_length);
+    } else {
+        result = kNullString;
     }
 
-    const char *str = exportSlices(slices, str_length);
-    freeSlices(slices);
-    if (!str) return kNullString;
-
-    pybind11::bytes result(str, str_length);
-    delete[] str;
     return result;
 }
 
@@ -387,20 +433,19 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     return total_size;
 }
 
-namespace py = pybind11;
-
 PYBIND11_MODULE(store, m) {
-
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def("setup", &DistributedObjectStore::setup)
         .def("init_all", &DistributedObjectStore::initAll)
-        .def("get", &DistributedObjectStore::get)
-        .def("put", &DistributedObjectStore::put)
-        .def("remove", &DistributedObjectStore::remove)
-        .def("is_exist", &DistributedObjectStore::isExist)
+        .def("get", &DistributedObjectStore::get)  // Removed call_guard
+        .def("put", &DistributedObjectStore::put,
+             py::call_guard<py::gil_scoped_release>())
+        .def("remove", &DistributedObjectStore::remove,
+             py::call_guard<py::gil_scoped_release>())
+        .def("is_exist", &DistributedObjectStore::isExist,
+             py::call_guard<py::gil_scoped_release>())
         .def("close", &DistributedObjectStore::tearDownAll)
-        .def("get_size", &DistributedObjectStore::getSize);
-
+        .def("get_size", &DistributedObjectStore::getSize,
+             py::call_guard<py::gil_scoped_release>());
 }
-
