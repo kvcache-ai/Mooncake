@@ -116,14 +116,14 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            context_.engine().meta()->dumpMetadataContent(
-                peer_segment_desc->name, slice->rdma.dest_addr,
-                slice->length);
-
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 slice->markFailed();
+
+                context_.engine().meta()->dumpMetadataContent(
+                    peer_segment_desc->name, slice->rdma.dest_addr,
+                    slice->length);
                 continue;
             }
         }
