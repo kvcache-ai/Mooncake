@@ -13,6 +13,9 @@
 
 class DistributedObjectStore;
 
+// Forward declarations
+class SliceGuard;
+
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
    public:
@@ -48,6 +51,8 @@ class ResourceTracker {
 
 class DistributedObjectStore {
    public:
+    friend class SliceGuard;  // Allow SliceContainer to access private
+                              // members
     DistributedObjectStore();
     ~DistributedObjectStore();
 
@@ -99,7 +104,7 @@ class DistributedObjectStore {
     int freeSlices(const std::vector<mooncake::Slice> &slices);
 
    public:
-    std::unique_ptr<mooncake::Client> client_ = nullptr;
+    std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::unique_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
         nullptr;
     struct SegmentDeleter {
