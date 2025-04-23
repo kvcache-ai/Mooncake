@@ -15,6 +15,9 @@
 #include "allocator.h"
 #include "types.h"
 
+#define USE_LRU_MASTER "ON"
+#define LRU_MAX_CAPACITY 32
+
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
@@ -167,6 +170,12 @@ class MasterService {
     // Buffer allocator management
     std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
+#ifdef USE_LRU_MASTER
+    // LRU statistics
+    std::list <std::string> all_key_list_;
+    std::unordered_map<std::string, std::list<std::string>::iterator> all_key_idx_map_;
+#endif
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 

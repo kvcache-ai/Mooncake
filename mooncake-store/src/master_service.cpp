@@ -76,6 +76,11 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
+#ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU enabled ###";
+    all_key_list_.clear();
+    all_key_idx_map_.clear();
+#endif
 }
 
 MasterService::~MasterService() {
@@ -92,6 +97,11 @@ MasterService::~MasterService() {
             delete task;
         }
     }
+#ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU cleared ###";
+    all_key_list_.clear();
+    all_key_idx_map_.clear();
+#endif
 }
 
 ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
@@ -114,9 +124,25 @@ ErrorCode MasterService::GetReplicaList(
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+#ifdef USE_LRU_MASTER
+        if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
+        {
+            all_key_list_.erase(all_key_idx_map_[key]);
+            all_key_idx_map_.erase(key);
+        } 
+#endif
         return ErrorCode::OBJECT_NOT_FOUND;
     }
-
+#ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU Update in Get() ###";
+    if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
+    {
+        all_key_list_.erase(all_key_idx_map_[key]);
+        all_key_idx_map_.erase(key);
+    }
+    all_key_list_.push_front(key);
+    all_key_idx_map_[key] = all_key_list_.begin();
+#endif
     auto& metadata = accessor.Get();
     for (const auto& replica : metadata.replicas) {
         auto status = replica.status();
@@ -151,6 +177,24 @@ ErrorCode MasterService::PutStart(
                    << ", error=invalid_params";
         return ErrorCode::INVALID_PARAMS;
     }
+#ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU Update in Put() ###";
+    if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
+    {
+        all_key_list_.erase(all_key_idx_map_[key]);
+        all_key_idx_map_.erase(key);
+    }
+    all_key_list_.push_front(key);
+    all_key_idx_map_[key] = all_key_list_.begin();
+    if(all_key_list_.size() >= LRU_MAX_CAPACITY)
+    {
+        std::string evicted_key = all_key_list_.back();
+        all_key_list_.pop_back();
+        all_key_idx_map_.erase(evicted_key);
+        LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
+        Remove(evicted_key);
+    }
+#endif
 
     // Validate slice lengths
     uint64_t total_length = 0;
