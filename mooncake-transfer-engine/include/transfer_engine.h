@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "multi_transport.h"
+#include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -50,6 +51,12 @@ class TransferEngine {
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover) {}
 
+    TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
+        : metadata_(nullptr),
+          local_topology_(std::make_shared<Topology>()),
+          auto_discover_(auto_discover),
+          filter_(filter) {}
+
     ~TransferEngine() { freeEngine(); }
 
     int init(const std::string &metadata_conn_string,
@@ -64,6 +71,8 @@ class TransferEngine {
 
     int uninstallTransport(const std::string &proto);
 
+    std::string getLocalIpAndPort();
+
     int getRpcPort();
 
     SegmentHandle openSegment(const std::string &segment_name);
@@ -71,7 +80,7 @@ class TransferEngine {
     int closeSegment(SegmentHandle handle);
 
     int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
+                            const std::string &location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
@@ -125,6 +134,7 @@ class TransferEngine {
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;
+    std::vector<std::string> filter_;
 };
 }  // namespace mooncake
 

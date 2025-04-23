@@ -174,15 +174,26 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
-    const char *verbose_env = std::getenv("MC_VERBOSE");
-    if (verbose_env) {
-        config.verbose = true;
-    }
-
     const char *disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
     }
+
+    const char *log_level = std::getenv("MC_LOG_LEVEL");
+    config.trace = false;
+    if (log_level) {
+        if (strcmp(log_level, "TRACE") == 0) {
+            config.log_level = google::INFO;
+            config.trace = true;
+        }
+        if (strcmp(log_level, "INFO") == 0)
+            config.log_level = google::INFO;
+        else if (strcmp(log_level, "WARNING") == 0)
+            config.log_level = google::WARNING;
+        else if (strcmp(log_level, "ERROR") == 0)
+            config.log_level = google::ERROR;
+    }
+    FLAGS_minloglevel = config.log_level;
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -228,7 +239,6 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
-    LOG(INFO) << "verbose = " << (config.verbose ? "true" : "false");
 }
 
 GlobalConfig &globalConfig() {
@@ -238,7 +248,5 @@ GlobalConfig &globalConfig() {
     return config;
 }
 
-uint16_t getDefaultHandshakePort() {
-    return globalConfig().handshake_port;
-}
+uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
 }  // namespace mooncake

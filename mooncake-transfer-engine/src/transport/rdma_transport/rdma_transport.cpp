@@ -100,8 +100,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     // Get the memory location automatically after registered MR(pinned),
-    // when the name is "*".
-    if (name == "*") {
+    // when the name is kWildcardLocation("*").
+    if (name == kWildcardLocation) {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         for (auto &entry : entries) {
@@ -242,12 +242,10 @@ Status RdmaTransport::submitTransfer(
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
-                ;
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) delete s;
                 LOG(ERROR)
@@ -304,12 +302,10 @@ Status RdmaTransport::submitTransferTask(
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
                 __sync_fetch_and_add(&task.slice_count, 1);
-                ;
                 break;
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                delete slice;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) delete s;
                 LOG(ERROR)
@@ -405,26 +401,27 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    if (local_topology_->empty()) {
-        LOG(ERROR) << "RdmaTransport: No available RNIC";
-        return ERR_DEVICE_NOT_FOUND;
-    }
-
     std::vector<int> device_speed_list;
-    for (auto &device_name : local_topology_->getHcaList()) {
+    auto hca_list = local_topology_->getHcaList();
+    for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
-        if (!context) return ERR_MEMORY;
-
         auto &config = globalConfig();
         int ret = context->construct(config.num_cq_per_ctx,
                                      config.num_comp_channels_per_ctx,
                                      config.port, config.gid_index,
                                      config.max_cqe, config.max_ep_per_ctx);
-        if (ret) return ret;
-        device_speed_list.push_back(context->activeSpeed());
-        context_list_.push_back(context);
+        if (ret) {
+            local_topology_->disableDevice(device_name);
+            LOG(WARNING) << "Disable device " << device_name;
+        } else {
+            device_speed_list.push_back(context->activeSpeed());
+            context_list_.push_back(context);
+        }
     }
-
+    if (local_topology_->empty()) {
+        LOG(ERROR) << "RdmaTransport: No available RNIC";
+        return ERR_DEVICE_NOT_FOUND;
+    }
     return 0;
 }
 
@@ -447,6 +444,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
         device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count);
         if (device_id >= 0) return 0;
     }
 

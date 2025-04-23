@@ -65,13 +65,7 @@ jobs:
           # Move all wheels to a single directory
           mkdir -p mooncake-wheel/dist-release
           find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
-          
-          # Verify 3.10 and 3.12 wheels are present
-          if [ ! -f "mooncake-wheel/dist-release/mooncake-*.cp310-cp310-linux_x86_64.whl" ] || [ ! -f "mooncake-wheel/dist-release/mooncake-*.cp312-cp312-linux_x86_64.whl" ]; then
-            echo "ERROR: Missing required wheels for release!"
-            exit 1
-          fi
-          
+          ls -la mooncake-wheel/dist-release/
           # List all collected wheels
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/

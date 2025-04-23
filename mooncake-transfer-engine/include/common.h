@@ -25,6 +25,10 @@
 #include <cstdint>
 #include <ctime>
 #include <thread>
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 #include "error.h"
 
@@ -50,7 +54,7 @@ enum class HandShakeRequestType {
 
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
-        LOG(ERROR) << "The platform does not support NUMA";
+        LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
     }
     cpu_set_t cpu_set;
@@ -71,7 +75,7 @@ static inline int bindToSocket(int socket_id) {
     numa_free_cpumask(cpu_list);
     if (nr_cpus == 0) return 0;
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set)) {
-        LOG(ERROR) << "Failed to set socket affinity";
+        LOG(ERROR) << "bindToSocket: pthread_setaffinity_np failed";
         return ERR_NUMA;
     }
     return 0;
@@ -81,10 +85,20 @@ static inline int64_t getCurrentTimeInNano() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts)) {
-        PLOG(ERROR) << "Failed to read real-time lock";
+        PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
         return ERR_CLOCK;
     }
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
+}
+
+static inline std::string getCurrentDateTime() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto local_time = *std::localtime(&time_t_now);
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
+    return oss.str();
 }
 
 uint16_t getDefaultHandshakePort();
@@ -150,8 +164,8 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
 static inline int writeString(int fd, const HandShakeRequestType type,
                               const std::string &str) {
     uint8_t byte = static_cast<uint8_t>(type);
-    LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
-              << "): " << str;
+    // LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
+    //           << "): " << str;
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
@@ -161,7 +175,7 @@ static inline int writeString(int fd, const HandShakeRequestType type,
         if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), length) != (ssize_t)length)
+    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }

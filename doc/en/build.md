@@ -66,7 +66,7 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel \
+                libcurl-devel
     ```
 
     NOTE: You may need to install gtest, glog, gflags from source code:
@@ -124,8 +124,10 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
-- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.22+
+- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
 - `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
+- `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
+- `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
