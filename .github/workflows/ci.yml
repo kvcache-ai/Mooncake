@@ -136,7 +136,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_NVMEOF=ON -DUSE_ETCD=ON -DUSE_ETCD_LEGACY=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON
+        cmake .. -DUSE_ETCD=ON -DUSE_ETCD_LEGACY=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON
         sudo make install -j
       shell: bash
     
