@@ -356,9 +356,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
         if (slices.slices().size() == 1 &&
             slices.slices()[0].size == str_length) {
-            LOG(INFO) << "Single slice optimization path";
         } else {
-            LOG(INFO) << "Exporting multiple slices";
             exported_str_ptr = exportSlices(slices.slices(), str_length);
             if (!exported_str_ptr) {
                 py::gil_scoped_acquire acquire_gil;
