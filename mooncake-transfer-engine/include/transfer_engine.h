@@ -79,7 +79,7 @@ class TransferEngine {
 
     int closeSegment(SegmentHandle handle);
 
-    int closeSegment(const std::string &segment_name);
+    int removeSegment(const std::string &segment_name);
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location = kWildcardLocation,

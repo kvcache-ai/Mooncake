@@ -112,7 +112,7 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_na
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
 
-int closeSegmentByName(transfer_engine_t engine, const char *segment_name);
+int removeSegmentByName(transfer_engine_t engine, const char *segment_name);
 
 void destroyTransferEngine(transfer_engine_t engine);
 

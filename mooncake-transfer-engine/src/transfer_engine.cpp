@@ -185,13 +185,13 @@ Transport::SegmentHandle TransferEngine::openSegment(
 
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
 
-int TransferEngine::closeSegment(const std::string &segment_name) { 
+int TransferEngine::removeSegment(const std::string &segment_name) { 
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
         trimmed_segment_name.erase(0, 1);
     if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->removeSegmentDesc(trimmed_segment_name);
+    return metadata_->removeLocalSegment(trimmed_segment_name);
 }
 
 bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
