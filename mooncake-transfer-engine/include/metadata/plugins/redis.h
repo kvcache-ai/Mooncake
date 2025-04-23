@@ -90,7 +90,6 @@ class RedisMetadataPlugin : public MetadataPlugin {
     }
 
     virtual Status remove(const std::string &key) {
-        char *err_str;
         if (!connected_) {
             return Status::Metadata("redis: connection not available");
         }
