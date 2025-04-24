@@ -18,7 +18,7 @@ class TestClass:
         struct.pack_into("i", buffer, 0, self.version)
         struct.pack_into("3i", buffer, 4, *self.shape)
         
-    def seralize_into(self):
+    def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
         shape_bytes = struct.pack("3i", *self.shape)
         return (version_bytes, shape_bytes)
@@ -181,7 +181,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Clean up
         self.assertEqual(self.store.remove(key), 0)
         
-        (version_bytes, shape_bytes) = test_object.seralize_into()
+        (version_bytes, shape_bytes) = test_object.serialize_into()
         self.assertEqual(self.store.put_parts(key, version_bytes, shape_bytes),0)
         
         retrieved_buffer = self.store.get_buffer(key)
