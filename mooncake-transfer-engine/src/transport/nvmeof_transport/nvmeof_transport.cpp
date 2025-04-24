@@ -165,7 +165,7 @@ Status NVMeoFTransport::submitTransfer(
                     std::min(segment_end, current_offset + buffer_desc.length);
                 // 3. init slice and put into TransferTask
                 const char *file_path =
-                    buffer_desc.local_path_map[local_server_name_].c_str();
+                    buffer_desc.mounted_path_map[local_server_name_].c_str();
                 void *source_addr =
                     (char *)request.source + slice_start - segment_start;
                 uint64_t file_offset = slice_start - current_offset;

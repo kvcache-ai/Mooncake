@@ -52,8 +52,8 @@ std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
         desc->name = getItem(segmentJSON, "name");
         desc->protocol = getItem(segmentJSON, "protocol");
         if (desc->name.empty() || desc->protocol.empty()) return nullptr;
-
         if (desc->protocol == "rdma" || desc->protocol == "shm") {
+            desc->detail = MemorySegmentDesc{};
             auto &detail = std::get<MemorySegmentDesc>(desc->detail);
             if (segmentJSON.isMember("devices"))
                 for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -91,6 +91,7 @@ std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
                 getStyledJsonString(segmentJSON, "priority_matrix");
             if (!topo_string.empty()) detail.topology.parse(topo_string);
         } else if (desc->protocol == "tcp") {
+            desc->detail = MemorySegmentDesc{};
             auto &detail = std::get<MemorySegmentDesc>(desc->detail);
             if (segmentJSON.isMember("buffers"))
                 for (const auto &bufferJSON : segmentJSON["buffers"]) {
@@ -105,8 +106,9 @@ std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
                     detail.buffers.push_back(buffer);
                 }
         } else if (desc->protocol == "nvmeof") {
+            desc->detail = FileSegmentDesc{};
             auto &detail = std::get<FileSegmentDesc>(desc->detail);
-            if (segmentJSON.isMember("buffers"))
+            if (segmentJSON.isMember("buffers")) {
                 for (const auto &bufferJSON : segmentJSON["buffers"]) {
                     FileBufferDesc buffer;
                     buffer.original_path = getItem(bufferJSON, "file_path");
@@ -120,11 +122,13 @@ std::shared_ptr<SegmentDesc> TransferMetadata::praseSegmentDesc(
                     if (buffer.original_path.empty()) return nullptr;
                     detail.buffers.push_back(buffer);
                 }
+            }
         } else {
             return nullptr;
         }
         return desc;
-    } catch (...) {
+    } catch (std::exception &ex) {
+        LOG(ERROR) << "internal exception: " << ex.what();
         return nullptr;
     }
 }
