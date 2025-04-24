@@ -117,6 +117,14 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
+    void setAutoDiscover(bool auto_discover) {
+        auto_discover_ = auto_discover;
+    }
+
+    void setWhitelistFilters(std::vector<std::string> &&filters) {
+        filter_ = std::move(filters);
+    }
+
    private:
     struct MemoryRegion {
         void *addr;
