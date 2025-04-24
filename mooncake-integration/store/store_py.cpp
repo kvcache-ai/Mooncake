@@ -235,6 +235,71 @@ int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
     return 0;
 }
 
+int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
+                                           std::span<const char> value) {
+    uint64_t offset = 0;
+    while (offset < value.size()) {
+        auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
+        auto ptr = client_buffer_allocator_->allocate(chunk_size);
+        if (!ptr) {
+            // Deallocate any previously allocated slices
+            for (auto &slice : slices) {
+                client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+            }
+            slices.clear();
+            return 1;
+        }
+        memcpy(ptr, value.data() + offset, chunk_size);
+        slices.emplace_back(Slice{ptr, chunk_size});
+        offset += chunk_size;
+    }
+    return 0;
+}
+
+int DistributedObjectStore::allocateSlicesPacked(
+    std::vector<mooncake::Slice> &slices,
+    const std::vector<std::span<const char>> &parts) {
+    size_t total = 0;
+    for (auto p : parts) total += p.size();
+
+    if (total == 0) return 0;
+
+    size_t n_slice = (total + kMaxSliceSize - 1) / kMaxSliceSize;
+    slices.reserve(n_slice);
+
+    size_t remaining = total;
+    for (size_t i = 0; i < n_slice; ++i) {
+        size_t sz = std::min(remaining, (size_t)kMaxSliceSize);
+        void *ptr = client_buffer_allocator_->allocate(sz);
+        if (!ptr) return 1;  // Caller will free
+        slices.emplace_back(mooncake::Slice{ptr, sz});
+        remaining -= sz;
+    }
+
+    size_t idx = 0;
+    char *dst = static_cast<char *>(slices[0].ptr);
+    size_t dst_left = slices[0].size;
+
+    for (auto part : parts) {
+        const char *src = part.data();
+        size_t n = part.size();
+
+        while (n > 0) {
+            if (dst_left == 0) {
+                dst = static_cast<char *>(slices[++idx].ptr);
+                dst_left = slices[idx].size;
+            }
+            size_t chunk = std::min(n, dst_left);
+            memcpy(dst, src, chunk);
+            dst += chunk;
+            dst_left -= chunk;
+            src += chunk;
+            n -= chunk;
+        }
+    }
+    return 0;
+}
+
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
@@ -288,12 +353,11 @@ int DistributedObjectStore::tearDownAll() {
 }
 
 int DistributedObjectStore::put(const std::string &key,
-                                const std::string &value) {
+                                std::span<const char> value) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-
     SliceGuard slices(*this);
     int ret = allocateSlices(slices.slices(), value);
     if (ret) {
@@ -302,8 +366,7 @@ int DistributedObjectStore::put(const std::string &key,
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;  // TODO: Make configurable
-
+    config.replica_num = 1;  // Make configurable
     ErrorCode error_code = client_->Put(key, slices.slices(), config);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Put operation failed with error: "
@@ -311,6 +374,29 @@ int DistributedObjectStore::put(const std::string &key,
         return toInt(error_code);
     }
 
+    return 0;
+}
+
+int DistributedObjectStore::put_parts(
+    const std::string &key, std::vector<std::span<const char>> values) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+    SliceGuard slices(*this);
+    int ret = allocateSlicesPacked(slices.slices(), values);
+    if (ret) {
+        LOG(ERROR) << "Failed to allocate slices for put operation";
+        return ret;
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;  // Make configurable
+    ErrorCode error_code = client_->Put(key, slices.slices(), config);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(error_code);
+        return toInt(error_code);
+    }
     return 0;
 }
 
@@ -590,13 +676,43 @@ PYBIND11_MODULE(store, m) {
         .def("get_buffer", &DistributedObjectStore::get_buffer,
              py::call_guard<py::gil_scoped_release>(),
              py::return_value_policy::take_ownership)
-        .def("put", &DistributedObjectStore::put,
-             py::call_guard<py::gil_scoped_release>())
         .def("remove", &DistributedObjectStore::remove,
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
              py::call_guard<py::gil_scoped_release>())
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
-             py::call_guard<py::gil_scoped_release>());
+             py::call_guard<py::gil_scoped_release>())
+        .def("put",
+             [](DistributedObjectStore &self, const std::string &key,
+                py::buffer buf) {
+                 py::buffer_info info = buf.request(/*writable=*/false);
+                 py::gil_scoped_release release;
+                 return self.put(key, std::span<const char>(
+                                          static_cast<char *>(info.ptr),
+                                          static_cast<size_t>(info.size)));
+             })
+        .def("put_parts", [](DistributedObjectStore &self,
+                             const std::string &key, py::args parts) {
+            // 1) Python buffer → span
+            std::vector<py::buffer_info> infos;
+            std::vector<std::span<const char>> spans;
+            infos.reserve(parts.size());
+            spans.reserve(parts.size());
+
+            for (auto &obj : parts) {
+                py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
+                infos.emplace_back(buf.request(false));
+                const auto &info = infos.back();
+                if (info.ndim != 1 || info.itemsize != 1)
+                    throw std::runtime_error("parts must be 1-D bytes-like");
+
+                spans.emplace_back(static_cast<const char *>(info.ptr),
+                                   static_cast<size_t>(info.size));
+            }
+
+            // 2) Call C++ function
+            py::gil_scoped_release unlock;
+            return self.put_parts(key, spans);
+        });
 }

@@ -18,6 +18,11 @@ class TestClass:
         struct.pack_into("i", buffer, 0, self.version)
         struct.pack_into("3i", buffer, 4, *self.shape)
         
+    def seralize_into(self):
+        version_bytes = struct.pack("i", self.version)
+        shape_bytes = struct.pack("3i", *self.shape)
+        return (version_bytes, shape_bytes)
+        
     def deserialize_from(buffer):
         version = struct.unpack_from("i", buffer, 0)[0]
         shape = struct.unpack_from("3i", buffer, 4)
@@ -175,11 +180,23 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Clean up
         self.assertEqual(self.store.remove(key), 0)
+        
+        (version_bytes, shape_bytes) = test_object.seralize_into()
+        self.assertEqual(self.store.put_parts(key, version_bytes, shape_bytes),0)
+        
+        retrieved_buffer = self.store.get_buffer(key)
+        retrieved_buffer = memoryview(retrieved_buffer)
+        self.assertEqual(len(retrieved_buffer), 16)
+        deserialized_object = TestClass.deserialize_from(retrieved_buffer)
+        self.assertEqual(deserialized_object.version, 1)
+        self.assertEqual(deserialized_object.shape, (1, 2, 3))
+        
+        self.assertEqual(self.store.remove(key), 0)
 
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
         NUM_THREADS = 8
-        VALUE_SIZE = 1 * 1024 * 1024  # 1MB
+        VALUE_SIZE = 5 * 1024 * 1024  # 1MB
         OPERATIONS_PER_THREAD = 100
         
         # Create barriers for synchronization
