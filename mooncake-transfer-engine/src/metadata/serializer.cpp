@@ -17,10 +17,10 @@
 #include <cassert>
 #include <set>
 
-#include "common.h"
-#include "config.h"
-#include "error.h"
-#include "transfer_metadata.h"
+#include "common/common.h"
+#include "common/config.h"
+#include "common/error.h"
+#include "metadata/metadata.h"
 #include "metadata/handshake.h"
 
 namespace mooncake {

@@ -18,7 +18,7 @@
 
 #include <cassert>
 
-#include "config.h"
+#include "common/config.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"

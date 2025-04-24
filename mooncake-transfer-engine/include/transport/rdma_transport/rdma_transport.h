@@ -27,8 +27,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "topology.h"
-#include "transfer_metadata.h"
+#include "utility/topology.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {

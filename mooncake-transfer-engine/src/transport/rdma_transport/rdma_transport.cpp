@@ -23,10 +23,10 @@
 #include <future>
 #include <set>
 
-#include "common.h"
-#include "config.h"
-#include "memory_location.h"
-#include "topology.h"
+#include "common/common.h"
+#include "common/config.h"
+#include "utility/memory_location.h"
+#include "utility/topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 

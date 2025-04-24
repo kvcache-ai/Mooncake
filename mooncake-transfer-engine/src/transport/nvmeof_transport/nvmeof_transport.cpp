@@ -26,9 +26,9 @@
 #include <memory>
 #include <tuple>
 
-#include "common.h"
+#include "common/common.h"
 #include "transfer_engine.h"
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/nvmeof_transport/cufile_context.h"
 #include "transport/nvmeof_transport/cufile_desc_pool.h"
 #include "transport/transport.h"

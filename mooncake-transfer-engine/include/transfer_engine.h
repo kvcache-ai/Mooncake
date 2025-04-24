@@ -30,9 +30,9 @@
 #include <utility>
 #include <vector>
 
-#include "multi_transport.h"
-#include "memory_location.h"
-#include "transfer_metadata.h"
+#include "transport/multi_transport.h"
+#include "utility/memory_location.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {

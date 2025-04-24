@@ -27,7 +27,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include "common.h"
+#include "common/common.h"
 
 namespace mooncake {
 struct TopologyEntry {

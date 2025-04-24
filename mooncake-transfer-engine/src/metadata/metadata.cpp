@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 
 #include <jsoncpp/json/value.h>
 
 #include <cassert>
 #include <set>
 
-#include "common.h"
-#include "config.h"
-#include "error.h"
+#include "common/common.h"
+#include "common/config.h"
+#include "common/error.h"
 #include "metadata/handshake.h"
 
 namespace mooncake {

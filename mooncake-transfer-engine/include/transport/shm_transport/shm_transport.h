@@ -22,7 +22,7 @@
 #include <queue>
 #include <string>
 
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {

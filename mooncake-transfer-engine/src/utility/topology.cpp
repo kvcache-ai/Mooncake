@@ -35,8 +35,8 @@
 #include <string.h>
 #include <sys/types.h>
 
-#include "memory_location.h"
-#include "topology.h"
+#include "utility/memory_location.h"
+#include "utility/topology.h"
 
 namespace mooncake {
 struct InfinibandDevice {

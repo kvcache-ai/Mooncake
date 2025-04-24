@@ -20,7 +20,7 @@
 
 #include <atomic>
 
-#include "common.h"
+#include "common/common.h"
 #include "metadata/plugin.h"
 
 namespace mooncake {

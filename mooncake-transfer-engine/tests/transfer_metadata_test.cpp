@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>

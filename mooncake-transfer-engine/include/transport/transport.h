@@ -27,8 +27,8 @@
 #include <queue>
 #include <string>
 
-#include "common/base/status.h"
-#include "transfer_metadata.h"
+#include "common/status.h"
+#include "metadata/metadata.h"
 
 namespace mooncake {
 class TransferMetadata;

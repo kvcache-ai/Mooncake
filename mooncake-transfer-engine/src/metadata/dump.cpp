@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "config.h"
-#include "transfer_metadata.h"
+#include "common/config.h"
+#include "metadata/metadata.h"
 
 namespace mooncake {
 void SegmentDesc::dump() const {

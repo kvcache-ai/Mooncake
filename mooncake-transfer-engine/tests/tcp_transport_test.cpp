@@ -32,7 +32,7 @@
 
 #include <cassert>
 
-#include "common/base/status.h"
+#include "common/status.h"
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {

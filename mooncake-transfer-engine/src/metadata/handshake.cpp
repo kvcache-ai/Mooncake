@@ -26,9 +26,9 @@
 #include <random>
 #include <set>
 
-#include "common.h"
-#include "config.h"
-#include "error.h"
+#include "common/common.h"
+#include "common/config.h"
+#include "common/error.h"
 
 namespace mooncake {
 

@@ -19,7 +19,7 @@
 #include <cassert>
 #include <cstddef>
 
-#include "config.h"
+#include "common/config.h"
 
 namespace mooncake {
 const static uint8_t MAX_HOP_LIMIT = 16;

@@ -30,7 +30,7 @@
 #include <iomanip>
 #include <sstream>
 
-#include "error.h"
+#include "common/error.h"
 
 #if defined(__x86_64__)
 #include <immintrin.h>

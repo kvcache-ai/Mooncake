@@ -16,7 +16,7 @@
 // modifications.
 // https://github.com/facebook/rocksdb/blob/main/util/status.cc
 
-#include "common/base/status.h"
+#include "common/status.h"
 
 #include <cstring>
 

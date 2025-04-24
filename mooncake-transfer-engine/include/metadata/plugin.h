@@ -18,7 +18,7 @@
 #include <memory>
 #include <string>
 
-#include "common/base/status.h"
+#include "common/status.h"
 
 namespace mooncake {
 struct MetadataPlugin {

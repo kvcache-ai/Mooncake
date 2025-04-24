@@ -20,7 +20,7 @@
 #include <memory>
 #include <string>
 
-#include "common.h"
+#include "common/common.h"
 
 const int pagesize = 4096;
 

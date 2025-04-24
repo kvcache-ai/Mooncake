@@ -24,7 +24,7 @@
 #include <string>
 #include <thread>
 
-#include "common.h"
+#include "common/common.h"
 
 namespace mooncake {
 struct HandShakePlugin {

@@ -24,9 +24,9 @@
 #include <iomanip>
 #include <memory>
 
-#include "common.h"
+#include "common/common.h"
 #include "transfer_engine.h"
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {

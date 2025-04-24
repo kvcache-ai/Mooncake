@@ -28,8 +28,8 @@
 #include <unordered_map>
 #include <variant>
 
-#include "common.h"
-#include "topology.h"
+#include "common/common.h"
+#include "utility/topology.h"
 #include "metadata/plugin.h"
 
 namespace mooncake {

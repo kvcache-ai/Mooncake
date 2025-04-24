@@ -30,7 +30,7 @@
 #include <sstream>
 #include <unordered_map>
 
-#include "common/base/status.h"
+#include "common/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
