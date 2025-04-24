@@ -18,18 +18,6 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
-struct MetadataStoragePlugin {
-    static std::shared_ptr<MetadataStoragePlugin> Create(
-        const std::string &conn_string);
-
-    MetadataStoragePlugin() {}
-    virtual ~MetadataStoragePlugin() {}
-
-    virtual bool get(const std::string &key, Json::Value &value) = 0;
-    virtual bool set(const std::string &key, const Json::Value &value) = 0;
-    virtual bool remove(const std::string &key) = 0;
-};
-
 struct HandShakePlugin {
     static std::shared_ptr<HandShakePlugin> Create(
         const std::string &conn_string);

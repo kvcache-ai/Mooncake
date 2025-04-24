@@ -30,9 +30,10 @@
 
 #include "common.h"
 #include "topology.h"
+#include "metadata/plugin.h"
 
 namespace mooncake {
-struct MetadataStoragePlugin;
+struct MetadataPlugin;
 struct HandShakePlugin;
 
 using SegmentID = uint64_t;
@@ -172,7 +173,7 @@ class TransferMetadata {
     std::atomic<SegmentID> next_segment_id_;
 
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
-    std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
+    std::shared_ptr<MetadataPlugin> storage_plugin_;
 };
 
 }  // namespace mooncake

@@ -61,7 +61,7 @@ struct TransferHandshakeUtil {
     }
 };
 
-TransferMetadata::TransferMetadata(const std::string &conn_string) { 
+TransferMetadata::TransferMetadata(const std::string &conn_string) {
     next_segment_id_.store(1);
     handshake_plugin_ = HandShakePlugin::Create(conn_string);
     if (!handshake_plugin_) {
@@ -73,7 +73,7 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
         p2p_handshake_mode_ = true;
         return;
     }
-    storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
+    storage_plugin_ = MetadataPlugin::Create(conn_string);
     if (!storage_plugin_) {
         LOG(ERROR)
             << "Unable to create metadata storage plugin with conn string "
@@ -87,20 +87,30 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
                                         const SegmentDesc &desc) {
     if (p2p_handshake_mode_) return 0;
     auto segmentJSON = exportSegmentDesc(desc);
-    if (segmentJSON.empty() ||
-        !storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
-        LOG(ERROR) << "Failed to register segment descriptor, name "
-                   << desc.name << " protocol " << desc.protocol;
+    if (segmentJSON.empty()) {
+        LOG(ERROR) << "export segment descriptor failed, name " << desc.name
+                   << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
+
+    const std::string value = Json::FastWriter{}.write(segmentJSON);
+    auto status = storage_plugin_->set(getFullMetadataKey(segment_name), value);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to register segment descriptor, name "
+                   << desc.name << " protocol " << desc.protocol << " detail "
+                   << status.ToString();
+        return ERR_METADATA;
+    }
+
     return 0;
 }
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) return 0;
-    if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
+    auto status = storage_plugin_->remove(getFullMetadataKey(segment_name));
+    if (!status.ok()) {
         LOG(ERROR) << "Failed to unregister segment descriptor, name "
-                   << segment_name;
+                   << segment_name << " detail " << status.ToString();
         return ERR_METADATA;
     }
     return 0;
@@ -131,14 +141,24 @@ std::shared_ptr<SegmentDesc> TransferMetadata::getSegmentDesc(
             return nullptr;
         }
     } else {
-        if (!storage_plugin_->get(getFullMetadataKey(segment_name),
-                                  peer_json)) {
-            LOG(WARNING) << "Failed to retrieve segment descriptor, name "
+        std::string value;
+        auto status =
+            storage_plugin_->get(getFullMetadataKey(segment_name), value);
+        if (status.IsNotSuchKey()) {
+            LOG(WARNING) << "segment descriptor not found, name "
                          << segment_name;
+            return nullptr;
+        } else if (!status.ok()) {
+            LOG(ERROR) << "get segment descriptor failed, name " << segment_name
+                       << " detail " << status.ToString();
+            return nullptr;
+        }
+        if (!Json::Reader{}.parse(value, peer_json)) {
+            LOG(ERROR) << "parse segment descriptor to JSON failed, name "
+                       << segment_name;
             return nullptr;
         }
     }
-
     auto desc = praseSegmentDesc(peer_json);
     if (!desc) {
         LOG(WARNING) << "Corrupted segment descriptor, name " << segment_name;
@@ -299,8 +319,11 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
-    if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
-        LOG(ERROR) << "Failed to set location of " << server_name;
+    const std::string value = Json::FastWriter{}.write(rpcMetaJSON);
+    auto status = storage_plugin_->set(kRpcMetaPrefix + server_name, value);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to update rpc metadata entry, name "
+                   << server_name << " detail " << status.ToString();
         return ERR_METADATA;
     }
     return 0;
@@ -310,8 +333,10 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     if (p2p_handshake_mode_) {
         return 0;
     }
-    if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
-        LOG(ERROR) << "Failed to remove location of " << server_name;
+    auto status = storage_plugin_->remove(kRpcMetaPrefix + server_name);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to remove rpc metadata entry, name "
+                   << server_name << " detail " << status.ToString();
         return ERR_METADATA;
     }
     return 0;
@@ -333,8 +358,19 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
-            LOG(ERROR) << "Failed to find location of " << server_name;
+        std::string value;
+        auto status = storage_plugin_->get(kRpcMetaPrefix + server_name, value);
+        if (status.IsNotSuchKey()) {
+            LOG(ERROR) << "rpc metadata entry not found, name " << server_name;
+            return ERR_METADATA;
+        } else if (!status.ok()) {
+            LOG(ERROR) << "find rpc metadata entry failed, name "
+                       << server_name << " detail " << status.ToString();
+            return ERR_METADATA;
+        }
+        if (!Json::Reader{}.parse(value, rpcMetaJSON)) {
+            LOG(ERROR) << "parse rpc metadata entry to JSON failed, name "
+                       << server_name;
             return ERR_METADATA;
         }
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
