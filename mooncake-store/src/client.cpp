@@ -48,7 +48,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
     return master_client_.Connect(master_addr);
 }
 
-static bool get_auto_discovery() {
+static bool get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
         int iv = atoi(ev_ad);
@@ -72,11 +72,11 @@ static inline void rtrim(std::string &s) {
     }).base(), s.end());
 }
 
-static std::vector<std::string> get_auto_discovery_filters(bool auto_discovery) {
+static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     std::vector<std::string> whitelst_filters;
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
-        if (!auto_discovery) {
+        if (!auto_discover) {
             LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
             return whitelst_filters;
         }
@@ -105,13 +105,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
                                      const std::string& metadata_connstring,
                                      const std::string& protocol,
                                      void** protocol_args) {
-    bool auto_discovery = get_auto_discovery();
-
-    std::vector<std::string> whitelst_filters = get_auto_discovery_filters(auto_discovery);
-
-    // Create transfer engine
-    transfer_engine_ = std::make_unique<TransferEngine>(auto_discovery, whitelst_filters);
-    CHECK(transfer_engine_) << "Failed to create transfer engine";
+    // get auto_discover and filters from env
+    bool auto_discover = get_auto_discover();
+    transfer_engine_.setAutoDiscover(auto_discover);
+    transfer_engine_.setWhitelistFilters(get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
