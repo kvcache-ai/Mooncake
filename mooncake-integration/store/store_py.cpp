@@ -579,7 +579,7 @@ PYBIND11_MODULE(store, m) {
                 // Return the consolidated pointer as an integer for Python
                 return reinterpret_cast<uintptr_t>(self.consolidated_ptr());
             },
-            py::call_guard<py::gil_scoped_acquire>());
+            py::call_guard<py::gil_scoped_release>());
 
     // Define the DistributedObjectStore class
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
