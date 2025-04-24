@@ -185,6 +185,7 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
                                         size_t length) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -223,6 +224,7 @@ int TransferEnginePy::transferSyncRead(const char *target_hostname,
                                        uintptr_t buffer,
                                        uintptr_t peer_buffer_address,
                                        size_t length) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
@@ -261,6 +263,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
                                    TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
