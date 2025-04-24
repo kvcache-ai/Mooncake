@@ -22,12 +22,17 @@ if (NOT GLOBAL_CONFIG)
   option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
   option(USE_CUDA "option for using gpu direct" OFF)
   option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
+  option(USE_TCP "option for using TCP transport" ON)
   option(USE_CXL "option for using cxl protocol" OFF)
   option(USE_REDIS "option for enable redis as metadata server" OFF)
   option(USE_HTTP "option for enable http as metadata server" ON)
   option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 
   add_definitions(-DCONFIG_ERDMA)
+
+  if (USE_TCP)
+    add_compile_definitions(USE_TCP)
+  endif()
 
   if (USE_CUDA)
     add_compile_definitions(USE_CUDA)

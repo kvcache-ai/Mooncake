@@ -156,7 +156,6 @@ class Transport {
             }
             auto slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
             tail_++;
-            new (slice) Slice();
             return slice;
         }
 

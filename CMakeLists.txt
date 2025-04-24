@@ -41,6 +41,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
+option(USE_TCP "option for using TCP transport" ON)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
@@ -72,6 +73,10 @@ if (USE_CUDA)
   link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
 elseif(USE_NVMEOF)
   message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
+endif()
+
+if (USE_TCP)
+  add_compile_definitions(USE_TCP)
 endif()
 
 if (USE_REDIS)
