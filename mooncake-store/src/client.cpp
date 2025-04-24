@@ -51,9 +51,9 @@ ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
 static bool get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = atoi(ev_ad);
+        int iv = std::stoi(ev_ad);
         if (iv == 1) {
-            LOG(INFO) << "auto discovery set by env MC_TE_AUTO_DISC";
+            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
             return true;
         }
     }
