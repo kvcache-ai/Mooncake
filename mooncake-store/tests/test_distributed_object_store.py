@@ -1,4 +1,5 @@
 import ctypes
+import struct
 import unittest
 import os
 import time
@@ -7,6 +8,21 @@ import random
 from mooncake.store import MooncakeDistributedStore
 
 
+# Define a test class for serialization
+class TestClass:
+    def __init__(self, version=1, shape=(1, 2, 3)):
+        self.version = version
+        self.shape = shape
+    
+    def serialize_into(self, buffer):
+        struct.pack_into("i", buffer, 0, self.version)
+        struct.pack_into("3i", buffer, 4, *self.shape)
+        
+    def deserialize_from(buffer):
+        version = struct.unpack_from("i", buffer, 0)[0]
+        shape = struct.unpack_from("3i", buffer, 4)
+        return TestClass(version, shape)
+         
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -84,28 +100,28 @@ class TestDistributedObjectStore(unittest.TestCase):
         empty_data = self.store.get(key)
         self.assertEqual(empty_data, b"")
 
-        # Test isExist functionality
+        # Test is_exist functionality
         test_data_2 = b"Testing exists!"
         key_2 = "test_exist_key"
         
         # Should not exist initially
-        self.assertLess(self.store.getSize(key_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 0)
+        self.assertLess(self.store.get_size(key_2), 0)
+        self.assertEqual(self.store.is_exist(key_2), 0)
         
         # Should exist after put
         self.assertEqual(self.store.put(key_2, test_data_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 1)
-        self.assertEqual(self.store.getSize(key_2), len(test_data_2))
+        self.assertEqual(self.store.is_exist(key_2), 1)
+        self.assertEqual(self.store.get_size(key_2), len(test_data_2))
         
         # Should not exist after remove
         self.assertEqual(self.store.remove(key_2), 0)
-        self.assertLess(self.store.getSize(key_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 0)
+        self.assertLess(self.store.get_size(key_2), 0)
+        self.assertEqual(self.store.is_exist(key_2), 0)
         
     def test_large_buffer(self):
         """Test SliceBuffer with large data that might span multiple slices."""
         # Create a large data buffer (10MB)
-        size = 10 * 1024 * 1024
+        size = 20 * 1024 * 1024
         test_data = os.urandom(size)
         key = "test_large_slice_buffer_key"
         
@@ -131,7 +147,34 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_data, test_data)
         
         # Clean up
-        self.assertEqual(self.store.remove(key), 0)  
+        self.assertEqual(self.store.remove(key), 0)
+    
+    def test_serialization_and_deserialization(self):
+        """Test serialization and deserialization of custom objects."""
+        test_object = TestClass()
+        key = "test_serialization_key"
+        
+        # Serialize the object into a buffer
+        buffer = bytearray(16)  # 16 bytes for the test object
+        test_object.serialize_into(buffer)
+        
+        # Put the serialized data
+        self.assertEqual(self.store.put(key, buffer), 0)
+        
+        # Get the serialized data
+        retrieved_buffer = self.store.get_buffer(key)
+        retrieved_buffer = memoryview(retrieved_buffer)
+        self.assertEqual(len(retrieved_buffer), 16)
+        
+        # Deserialize the object from the retrieved buffer
+        deserialized_object = TestClass.deserialize_from(retrieved_buffer)
+        
+        # Verify deserialized object
+        self.assertEqual(deserialized_object.version, 1)
+        self.assertEqual(deserialized_object.shape, (1, 2, 3))
+        
+        # Clean up
+        self.assertEqual(self.store.remove(key), 0)
 
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
