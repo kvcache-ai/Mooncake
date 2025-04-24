@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transfer_metadata_plugin.h"
+#include "metadata/handshake.h"
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
@@ -31,25 +31,6 @@
 #include "error.h"
 
 namespace mooncake {
-
-std::pair<std::string, std::string> parseConnectionString(
-    const std::string &conn_string) {
-    std::pair<std::string, std::string> result;
-    std::string proto = "etcd";
-    std::string domain;
-    std::size_t pos = conn_string.find("://");
-
-    if (pos != std::string::npos) {
-        proto = conn_string.substr(0, pos);
-        domain = conn_string.substr(pos + 3);
-    } else {
-        domain = conn_string;
-    }
-
-    result.first = proto;
-    result.second = domain;
-    return result;
-}
 
 static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     if (addr->sa_family == AF_INET) {

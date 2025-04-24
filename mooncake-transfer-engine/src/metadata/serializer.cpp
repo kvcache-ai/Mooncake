@@ -21,7 +21,7 @@
 #include "config.h"
 #include "error.h"
 #include "transfer_metadata.h"
-#include "transfer_metadata_plugin.h"
+#include "metadata/handshake.h"
 
 namespace mooncake {
 static inline std::string getItem(const Json::Value &parent,

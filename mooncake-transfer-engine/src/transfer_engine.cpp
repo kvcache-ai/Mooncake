@@ -14,10 +14,10 @@
 
 #include "transfer_engine.h"
 
-#include "transfer_metadata_plugin.h"
-#include "transport/transport.h"
-
 #include <fstream>
+
+#include "metadata/handshake.h"
+#include "transport/transport.h"
 
 namespace mooncake {
 static std::string loadTopologyJsonFile(const std::string &path) {

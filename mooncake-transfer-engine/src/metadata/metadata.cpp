@@ -22,7 +22,7 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
-#include "transfer_metadata_plugin.h"
+#include "metadata/handshake.h"
 
 namespace mooncake {
 

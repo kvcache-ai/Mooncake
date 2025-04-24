@@ -15,7 +15,16 @@
 #ifndef TRANSFER_METADATA_PLUGIN
 #define TRANSFER_METADATA_PLUGIN
 
-#include "transfer_metadata.h"
+#include <jsoncpp/json/json.h>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+
+#include "common.h"
 
 namespace mooncake {
 struct HandShakePlugin {
