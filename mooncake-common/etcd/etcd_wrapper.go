@@ -1,14 +1,14 @@
 package main
 
 /*
-#include <stdint.h> 
+#include <stdint.h>
 */
 import "C"
 
 import (
 	"context"
-	"time"
 	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -51,7 +51,7 @@ func EtcdPutWrapper(key *C.char, value *C.char, errMsg **C.char) int {
 	k := C.GoString(key)
 	v := C.GoString(value)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	defer cancel()
 	_, err := globalClient.Put(ctx, k, v)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -68,7 +68,7 @@ func EtcdGetWrapper(key *C.char, value **C.char, errMsg **C.char) int {
 	}
 	k := C.GoString(key)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	defer cancel()
 	resp, err := globalClient.Get(ctx, k)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -91,7 +91,7 @@ func EtcdDeleteWrapper(key *C.char, errMsg **C.char) int {
 	}
 	k := C.GoString(key)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	defer cancel()
 	_, err := globalClient.Delete(ctx, k)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
