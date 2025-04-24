@@ -68,6 +68,7 @@ class DistributedObjectStore {
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
     int put(const std::string &key, const std::string &value);
+    int put(const std::string &key, pybind11::buffer value);
 
     pybind11::bytes get(const std::string &key);
 
@@ -92,7 +93,7 @@ class DistributedObjectStore {
 
    private:
     int allocateSlices(std::vector<mooncake::Slice> &slices,
-                       const std::string &value);
+                       std::string_view value);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const mooncake::Client::ObjectInfo &object_info,

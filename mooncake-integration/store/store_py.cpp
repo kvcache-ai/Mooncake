@@ -219,7 +219,7 @@ int DistributedObjectStore::initAll(const std::string &protocol_,
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
-                                           const std::string &value) {
+                                           std::string_view value) {
     uint64_t offset = 0;
     while (offset < value.size()) {
         auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
@@ -289,6 +289,39 @@ int DistributedObjectStore::tearDownAll() {
     device_name = "";
     protocol = "";
     return 0;
+}
+
+int DistributedObjectStore::put(const std::string &key, pybind11::buffer value_data) {
+    py::gil_scoped_release release_gil;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+
+    auto info = value_data.request();
+    char* data = static_cast<char*>(info.ptr);
+    size_t size = info.shape[0];
+
+    std::string_view value(data, size);
+
+    SliceGuard slices(*this);
+    int ret = allocateSlices(slices.slices(), value);
+    if (ret) {
+        LOG(ERROR) << "Failed to allocate slices for put operation";
+        return ret;
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;  // TODO: Make configurable
+
+    ErrorCode error_code = client_->Put(key, slices.slices(), config);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(error_code);
+        return toInt(error_code);
+    }
+
+    return 0;    
 }
 
 int DistributedObjectStore::put(const std::string &key,
@@ -437,8 +470,8 @@ PYBIND11_MODULE(store, m) {
         .def("setup", &DistributedObjectStore::setup)
         .def("init_all", &DistributedObjectStore::initAll)
         .def("get", &DistributedObjectStore::get)  // Removed call_guard
-        .def("put", &DistributedObjectStore::put,
-             py::call_guard<py::gil_scoped_release>())
+        // .def("put", py::overload_cast<const std::string&, const std::string &>(&DistributedObjectStore::put))
+        .def("put", py::overload_cast<const std::string&, pybind11::buffer>(&DistributedObjectStore::put))
         .def("remove", &DistributedObjectStore::remove,
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
