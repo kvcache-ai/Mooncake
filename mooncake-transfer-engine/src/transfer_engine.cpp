@@ -14,12 +14,26 @@
 
 #include "transfer_engine.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
-#include <fstream>
-
 namespace mooncake {
+
+// Helper function to convert string to lowercase for case-insensitive
+// comparison
+static std::string toLower(const std::string &s) {
+    std::string result = s;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return result;
+}
+
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -275,4 +289,90 @@ int TransferEngine::unregisterLocalMemoryBatch(
     }
     return 0;
 }
+void TransferEngine::InitializeMetricsConfig() {
+    // Check if metrics reporting is enabled via environment variable
+    const char *metric_env = getenv("MC_TE_METRIC");
+    if (metric_env) {
+        std::string value = toLower(metric_env);
+        metrics_enabled_ = (value == "1" || value == "true" || value == "yes" ||
+                            value == "on");
+    }
+
+    // Check for custom reporting interval
+    const char *interval_env = getenv("MC_TE_METRIC_INTERVAL_SECONDS");
+    if (interval_env) {
+        try {
+            int interval = std::stoi(interval_env);
+            if (interval > 0) {
+                metrics_interval_seconds_ = static_cast<uint64_t>(interval);
+                LOG(INFO) << "Metrics reporting interval set to "
+                          << metrics_interval_seconds_ << " seconds";
+            } else {
+                LOG(WARNING)
+                    << "Invalid MC_TE_METRIC_INTERVAL_SECONDS value: "
+                    << interval_env << ", must be positive. Using default: "
+                    << metrics_interval_seconds_;
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Failed to parse MC_TE_METRIC_INTERVAL_SECONDS: "
+                         << interval_env
+                         << ", using default: " << metrics_interval_seconds_;
+        }
+    }
+}
+
+void TransferEngine::StartMetricsReportingThread() {
+    // Only start the metrics thread if metrics are enabled
+    if (!metrics_enabled_) {
+        LOG(INFO)
+            << "Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)";
+        return;
+    }
+
+    should_stop_metrics_thread_ = false;
+    metrics_reporting_thread_ = std::thread([this]() {
+        LOG(INFO) << "Metrics reporting thread started (interval: "
+                  << metrics_interval_seconds_ << "s)";
+        constexpr double kBytesPerMegabyte = 1024.0 * 1024.0;
+
+        while (!should_stop_metrics_thread_) {
+            // Sleep for the interval, checking periodically for stop signal
+            for (uint64_t i = 0;
+                 i < metrics_interval_seconds_ && !should_stop_metrics_thread_;
+                 ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (should_stop_metrics_thread_) {
+                break;  // Exit if stopped during sleep
+            }
+
+            auto bytes_transferred_in_interval =
+                transferred_bytes_counter_.value();
+            transferred_bytes_counter_
+                .reset();  // Reset counter for the next interval
+
+            // Calculate throughput in MB/s for better readability
+            double throughput_megabytes_per_second =
+                static_cast<double>(bytes_transferred_in_interval) /
+                (metrics_interval_seconds_ * kBytesPerMegabyte);
+
+            LOG(INFO) << "[Metrics] Transfer Engine Throughput: " << std::fixed
+                      << std::setprecision(2) << throughput_megabytes_per_second
+                      << " MB/s (over last " << metrics_interval_seconds_
+                      << "s)";
+        }
+        LOG(INFO) << "Metrics reporting thread stopped";
+    });
+}
+
+void TransferEngine::StopMetricsReportingThread() {
+    should_stop_metrics_thread_ = true;  // Signal the thread to stop
+    if (metrics_reporting_thread_.joinable()) {
+        LOG(INFO) << "Waiting for metrics reporting thread to join...";
+        metrics_reporting_thread_.join();  // Wait for the thread to finish
+        LOG(INFO) << "Metrics reporting thread joined";
+    }
+}
+
 }  // namespace mooncake
