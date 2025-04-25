@@ -380,6 +380,16 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
     return 0;
 }
 
+int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    if (segment_name_to_id_map_.count(segment_name)) {
+        int segment_id = segment_name_to_id_map_[segment_name];
+        segment_name_to_id_map_.erase(segment_name);
+        segment_id_to_desc_map_.erase(segment_id);
+    }
+    return 0;
+}
+
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     {
