@@ -12,6 +12,17 @@
 
 namespace mooncake {
 
+static std::vector<std::string> buildDeviceFilter(
+    const std::string& device_names) {
+    std::stringstream ss(device_names);
+    std::string item;
+    std::vector<std::string> tokens;
+    while (getline(ss, item, ',')) {
+        tokens.push_back(item);
+    }
+    return tokens;
+}
+
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
     for (const auto& slice : slices) {
@@ -23,6 +34,12 @@ namespace mooncake {
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
     : local_hostname_(local_hostname),
+      metadata_connstring_(metadata_connstring) {}
+
+Client::Client(const std::string& local_hostname,
+               const std::string& metadata_connstring, bool auto_discover, std::string device_name)
+    :transfer_engine_(auto_discover, buildDeviceFilter(device_name)),
+      local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring) {}
 
 Client::~Client() {
@@ -50,59 +67,97 @@ ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
                                      const std::string& metadata_connstring,
                                      const std::string& protocol,
-                                     void** protocol_args) {
-    auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
-                                   hostname, port);
-    CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
+                                     void** protocol_args,
+                                     const std::string& device_name) {
+    if (protocol_args) {
+        auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        int rc = transfer_engine_.init(metadata_connstring, local_hostname,
+                                       hostname, port);
+        CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
 
-    Transport* transport = nullptr;
-    if (protocol == "rdma") {
-        LOG(INFO) << "transport_type=rdma";
-        transport = transfer_engine_.installTransport("rdma", protocol_args);
-    } else if (protocol == "tcp") {
-        LOG(INFO) << "transport_type=tcp";
-        try {
-            transport = transfer_engine_.installTransport("tcp", protocol_args);
-        } catch (std::exception& e) {
-            LOG(ERROR) << "tcp_transport_install_failed error_message=\""
-                       << e.what() << "\"";
-            return ErrorCode::INTERNAL_ERROR;
+        Transport* transport = nullptr;
+        if (protocol == "rdma") {
+            LOG(INFO) << "transport_type=rdma";
+            transport =
+                transfer_engine_.installTransport("rdma", protocol_args);
+        } else if (protocol == "tcp") {
+            LOG(INFO) << "transport_type=tcp";
+            try {
+                transport =
+                    transfer_engine_.installTransport("tcp", protocol_args);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "tcp_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else {
+            LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
+            return ErrorCode::INVALID_PARAMS;
         }
+        CHECK(transport) << "Failed to install transport";
+        return ErrorCode::OK;
     } else {
-        LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
-        return ErrorCode::INVALID_PARAMS;
+        auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        int rc = transfer_engine_.init(metadata_connstring, local_hostname,
+                                       hostname, port);
+        CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
+        return ErrorCode::OK;
     }
-    CHECK(transport) << "Failed to install transport";
+}
 
-    return ErrorCode::OK;
+// Internal static helper for creating Client instances
+std::optional<std::shared_ptr<Client>> Client::CreateInternal(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, void** protocol_args,
+    const std::string& device_name, const std::string& master_addr) {
+    // Note: Using 'new' directly because the constructor is private.
+    // std::make_shared requires public constructor access.
+    // Create the appropriate client using the private constructor
+    std::shared_ptr<Client> client;
+    if (protocol_args) {
+        // Call the constructor that doesn't initialize transfer_engine directly
+        client = std::shared_ptr<Client>(new Client(local_hostname, metadata_connstring));
+    } else {
+        // Call the constructor that initializes transfer_engine with device_name
+        client = std::shared_ptr<Client>(new Client(local_hostname, metadata_connstring, true, device_name));
+    }
+
+    // Connect to master service
+    ErrorCode err = client->ConnectToMaster(master_addr);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to Master: " << toString(err);
+        return std::nullopt;
+    }
+    LOG(INFO) << "Connect to Master success";
+
+    // Initialize transfer engine
+    err = client->InitTransferEngine(local_hostname, metadata_connstring,
+                                     protocol, protocol_args, device_name);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize transfer engine: " << toString(err);
+        return std::nullopt;
+    }
+    LOG(INFO) << "Transfer Engine initialized successfully.";
+
+    return client;
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
     const std::string& master_addr) {
-    auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+    // Call internal helper with empty device_name
+    return CreateInternal(local_hostname, metadata_connstring, protocol,
+                          protocol_args, "", master_addr);
+}
 
-    // Connect to master service
-    ErrorCode err = client->ConnectToMaster(master_addr);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to Master";
-        return std::nullopt;
-    }
-
-    LOG(INFO) << "Connect to Master success";
-
-    // Initialize transfer engine
-    err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                     protocol, protocol_args);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to initialize transfer engine";
-        return std::nullopt;
-    }
-
-    return client;
+std::optional<std::shared_ptr<Client>> Client::Create(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::string& device_name,
+    const std::string& master_addr) {
+    // Call internal helper with nullptr for protocol_args
+    return CreateInternal(local_hostname, metadata_connstring, protocol,
+                          nullptr, device_name, master_addr);
 }
 
 ErrorCode Client::Get(const std::string& object_key,

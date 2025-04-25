@@ -36,6 +36,12 @@ class Client {
         void** protocol_args,
         const std::string& master_addr = kDefaultMasterAddress);
 
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::string& device_name,
+        const std::string& master_addr = kDefaultMasterAddress);
+
     /**
      * @brief Retrieves data for a given key
      * @param object_key Key to retrieve
@@ -136,10 +142,25 @@ class Client {
 
    private:
     /**
+     * @brief Internal static helper for creating Client instances.
+     */
+    static std::optional<std::shared_ptr<Client>> CreateInternal(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        void** protocol_args, const std::string& device_name,
+        const std::string& master_addr);
+
+    /**
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring);
+
+    /**
+     * @brief Private constructor to enforce creation through Create() method
+     */
+    Client(const std::string& local_hostname,
+           const std::string& metadata_connstring, bool auto_discover, std::string device_name);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -148,7 +169,8 @@ class Client {
     ErrorCode InitTransferEngine(const std::string& local_hostname,
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,
-                                 void** protocol_args);
+                                 void** protocol_args,
+                                 const std::string& device_name);
     ErrorCode TransferData(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code);
