@@ -89,6 +89,8 @@ class TransferEngine {
 
     int closeSegment(SegmentHandle handle);
 
+    int removeLocalSegment(const std::string &segment_name);
+
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location = kWildcardLocation,
                             bool remote_accessible = true,
