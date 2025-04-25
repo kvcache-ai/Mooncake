@@ -77,9 +77,9 @@ int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
     return native->closeSegment(segment_id);
 }
 
-int removeSegmentByName(transfer_engine_t engine, const char *segment_name) {
+int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->removeSegment(segment_name);
+    return native->removeLocalSegment(segment_name);
 }
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,

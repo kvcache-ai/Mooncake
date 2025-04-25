@@ -185,7 +185,7 @@ Transport::SegmentHandle TransferEngine::openSegment(
 
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
 
-int TransferEngine::removeSegment(const std::string &segment_name) { 
+int TransferEngine::removeLocalSegment(const std::string &segment_name) { 
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
