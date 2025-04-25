@@ -51,6 +51,7 @@ class TransferEngine {
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover) {
+        InitializeMetricsConfig();
         StartMetricsReportingThread();
     }
 
@@ -59,6 +60,7 @@ class TransferEngine {
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover),
           filter_(filter) {
+        InitializeMetricsConfig();
         StartMetricsReportingThread();
     }
 
@@ -118,7 +120,7 @@ class TransferEngine {
             multi_transports_->getTransferStatus(batch_id, task_id, status);
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.update(status.transferred_bytes);
+                transferred_bytes_counter_.inc(status.transferred_bytes);
             }
         }
         return result;
@@ -155,8 +157,11 @@ class TransferEngine {
         "transferred bytes", "Measure transferred bytes"};
     std::thread metrics_reporting_thread_;
     std::atomic<bool> should_stop_metrics_thread_{false};
+    bool metrics_enabled_{false};
+    uint64_t metrics_interval_seconds_{5};
 
     // Helper methods for metrics reporting thread management
+    void InitializeMetricsConfig();
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
 };
