@@ -21,7 +21,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <iomanip>
 #include <memory>
 
 #include "common.h"
@@ -30,7 +29,7 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-using tcpsocket = boost::asio::ip::tcp::socket;
+using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
 
 struct SessionHeader {
@@ -70,9 +69,9 @@ struct Session : public std::enable_shared_from_this<Session> {
     void writeHeader() {
         // LOG(INFO) << "writeHeader";
         auto self(shared_from_this());
-        boost::asio::async_write(
-            socket_, boost::asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const boost::system::error_code &ec, std::size_t len) {
+        asio::async_write(
+            socket_, asio::buffer(&header_, sizeof(SessionHeader)),
+            [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
@@ -88,9 +87,9 @@ struct Session : public std::enable_shared_from_this<Session> {
     void readHeader() {
         // LOG(INFO) << "readHeader";
         auto self(shared_from_this());
-        boost::asio::async_read(
-            socket_, boost::asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const boost::system::error_code &ec, std::size_t len) {
+        asio::async_read(
+            socket_, asio::buffer(&header_, sizeof(SessionHeader)),
+            [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
@@ -119,10 +118,9 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const boost::system::error_code &ec,
+        asio::async_write(
+            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
+            [this, addr, self](const asio::error_code &ec,
                                std::size_t transferred_bytes) {
                 if (ec) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
@@ -148,10 +146,9 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
-        boost::asio::async_read(
-            socket_,
-            boost::asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const boost::system::error_code &ec,
+        asio::async_read(
+            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
+            [this, addr, self](const asio::error_code &ec,
                                std::size_t transferred_bytes) {
                 if (ec) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
@@ -166,20 +163,18 @@ struct Session : public std::enable_shared_from_this<Session> {
 
 struct TcpContext {
     TcpContext(short port)
-        : acceptor(io_context, boost::asio::ip::tcp::endpoint(
-                                   boost::asio::ip::tcp::v4(), port)) {}
+        : acceptor(io_context,
+                   asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)) {}
 
     void doAccept() {
-        acceptor.async_accept(
-            [this](boost::system::error_code ec, tcpsocket socket) {
-                if (!ec)
-                    std::make_shared<Session>(std::move(socket))->onAccept();
-                doAccept();
-            });
+        acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
+            if (!ec) std::make_shared<Session>(std::move(socket))->onAccept();
+            doAccept();
+        });
     }
 
-    boost::asio::io_context io_context;
-    boost::asio::ip::tcp::acceptor acceptor;
+    asio::io_context io_context;
+    asio::ip::tcp::acceptor acceptor;
 };
 
 TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
@@ -363,8 +358,8 @@ void TcpTransport::worker() {
 
 void TcpTransport::startTransfer(Slice *slice) {
     try {
-        boost::asio::ip::tcp::resolver resolver(context_->io_context);
-        boost::asio::ip::tcp::socket socket(context_->io_context);
+        asio::ip::tcp::resolver resolver(context_->io_context);
+        asio::ip::tcp::socket socket(context_->io_context);
         auto desc = metadata_->getSegmentDescByID(slice->target_id);
         if (!desc) {
             slice->markFailed();
@@ -376,10 +371,10 @@ void TcpTransport::startTransfer(Slice *slice) {
             slice->markFailed();
             return;
         }
-        auto endpoint_iterator = resolver.resolve(
-            boost::asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
-            std::to_string(meta_entry.rpc_port + 1));
-        boost::asio::connect(socket, endpoint_iterator);
+        auto endpoint_iterator =
+            resolver.resolve(asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
+                             std::to_string(meta_entry.rpc_port + 1));
+        asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
             if (status == TransferStatusEnum::COMPLETED)
