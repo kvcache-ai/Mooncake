@@ -352,6 +352,10 @@ void TransferEngine::StartMetricsReportingThread() {
             transferred_bytes_counter_
                 .reset();  // Reset counter for the next interval
 
+            if (bytes_transferred_in_interval == 0) {
+                continue;
+            }
+
             // Calculate throughput in MB/s for better readability
             double throughput_megabytes_per_second =
                 static_cast<double>(bytes_transferred_in_interval) /
