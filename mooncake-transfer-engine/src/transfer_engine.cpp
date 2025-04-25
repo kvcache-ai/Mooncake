@@ -14,10 +14,10 @@
 
 #include "transfer_engine.h"
 
+#include <fstream>
+
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
-
-#include <fstream>
 
 namespace mooncake {
 static std::string loadTopologyJsonFile(const std::string &path) {
@@ -275,4 +275,52 @@ int TransferEngine::unregisterLocalMemoryBatch(
     }
     return 0;
 }
+void TransferEngine::StartMetricsReportingThread() {
+    should_stop_metrics_thread_ = false;
+    metrics_reporting_thread_ = std::thread([this]() {
+        LOG(INFO) << "Metrics reporting thread started";
+        constexpr uint64_t kMetricsReportingIntervalSeconds =
+            5;  // Report every 5 seconds
+        constexpr double kBytesPerMegabyte = 1024.0 * 1024.0;
+
+        while (!should_stop_metrics_thread_) {
+            // Sleep for the interval, checking periodically for stop signal
+            for (uint64_t i = 0; i < kMetricsReportingIntervalSeconds &&
+                                 !should_stop_metrics_thread_;
+                 ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (should_stop_metrics_thread_) {
+                break;  // Exit if stopped during sleep
+            }
+
+            auto bytes_transferred_in_interval =
+                transferred_bytes_counter_.value();
+            transferred_bytes_counter_
+                .reset();  // Reset counter for the next interval
+
+            // Calculate throughput in MB/s for better readability
+            double throughput_megabytes_per_second =
+                static_cast<double>(bytes_transferred_in_interval) /
+                (kMetricsReportingIntervalSeconds * kBytesPerMegabyte);
+
+            LOG(INFO) << "[Metrics] Transfer Engine Throughput: " << std::fixed
+                      << std::setprecision(2) << throughput_megabytes_per_second
+                      << " MB/s (over last " << kMetricsReportingIntervalSeconds
+                      << "s)";
+        }
+        LOG(INFO) << "Metrics reporting thread stopped";
+    });
+}
+
+void TransferEngine::StopMetricsReportingThread() {
+    should_stop_metrics_thread_ = true;  // Signal the thread to stop
+    if (metrics_reporting_thread_.joinable()) {
+        LOG(INFO) << "Waiting for metrics reporting thread to join...";
+        metrics_reporting_thread_.join();  // Wait for the thread to finish
+        LOG(INFO) << "Metrics reporting thread joined";
+    }
+}
+
 }  // namespace mooncake

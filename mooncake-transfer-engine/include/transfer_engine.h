@@ -20,20 +20,21 @@
 #include <limits.h>
 #include <string.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <utility>
+#include <thread>
 #include <vector>
+#include <ylt/metric/counter.hpp>
 
-#include "multi_transport.h"
 #include "memory_location.h"
+#include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "ylt/metric/counter.hpp"
 
 namespace mooncake {
 using TransferRequest = Transport::TransferRequest;
@@ -49,15 +50,22 @@ class TransferEngine {
     TransferEngine(bool auto_discover = false)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover) {}
+          auto_discover_(auto_discover) {
+        StartMetricsReportingThread();
+    }
 
     TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover),
-          filter_(filter) {}
+          filter_(filter) {
+        StartMetricsReportingThread();
+    }
 
-    ~TransferEngine() { freeEngine(); }
+    ~TransferEngine() {
+        StopMetricsReportingThread();
+        freeEngine();
+    }
 
     int init(const std::string &metadata_conn_string,
              const std::string &local_server_name,
@@ -106,7 +114,14 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
-        return multi_transports_->getTransferStatus(batch_id, task_id, status);
+        Status result =
+            multi_transports_->getTransferStatus(batch_id, task_id, status);
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes > 0) {
+                transferred_bytes_counter_.update(status.transferred_bytes);
+            }
+        }
+        return result;
     }
 
     int syncSegmentCache(const std::string &segment_name = "") {
@@ -135,6 +150,15 @@ class TransferEngine {
     // Set it to false only for testing.
     bool auto_discover_;
     std::vector<std::string> filter_;
+
+    ylt::metric::counter_t transferred_bytes_counter_{
+        "transferred bytes", "Measure transferred bytes"};
+    std::thread metrics_reporting_thread_;
+    std::atomic<bool> should_stop_metrics_thread_{false};
+
+    // Helper methods for metrics reporting thread management
+    void StartMetricsReportingThread();
+    void StopMetricsReportingThread();
 };
 }  // namespace mooncake
 
