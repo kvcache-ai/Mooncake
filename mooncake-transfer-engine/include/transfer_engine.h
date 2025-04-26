@@ -24,17 +24,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
-#include <ylt/metric/counter.hpp>
 
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
+#endif
 
 namespace mooncake {
 using TransferRequest = Transport::TransferRequest;
@@ -51,8 +53,10 @@ class TransferEngine {
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover) {
+#ifdef WITH_METRICS
         InitializeMetricsConfig();
         StartMetricsReportingThread();
+#endif
     }
 
     TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
@@ -60,12 +64,16 @@ class TransferEngine {
           local_topology_(std::make_shared<Topology>()),
           auto_discover_(auto_discover),
           filter_(filter) {
+#ifdef WITH_METRICS
         InitializeMetricsConfig();
         StartMetricsReportingThread();
+#endif
     }
 
     ~TransferEngine() {
+#ifdef WITH_METRICS
         StopMetricsReportingThread();
+#endif
         freeEngine();
     }
 
@@ -120,11 +128,13 @@ class TransferEngine {
                              TransferStatus &status) {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
+#ifdef WITH_METRICS
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
                 transferred_bytes_counter_.inc(status.transferred_bytes);
             }
         }
+#endif
         return result;
     }
 
@@ -155,6 +165,7 @@ class TransferEngine {
     bool auto_discover_;
     std::vector<std::string> filter_;
 
+#ifdef WITH_METRICS
     ylt::metric::counter_t transferred_bytes_counter_{
         "transferred bytes", "Measure transferred bytes"};
     std::thread metrics_reporting_thread_;
@@ -166,6 +177,7 @@ class TransferEngine {
     void InitializeMetricsConfig();
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
+#endif
 };
 }  // namespace mooncake
 
