@@ -27,6 +27,7 @@ if (NOT GLOBAL_CONFIG)
   option(USE_REDIS "option for enable redis as metadata server" OFF)
   option(USE_HTTP "option for enable http as metadata server" ON)
   option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
+  option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 
   add_definitions(-DCONFIG_ERDMA)
 
@@ -61,6 +62,11 @@ if (NOT GLOBAL_CONFIG)
 
   if (USE_ETCD)
     message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
+  endif()
+
+  if (WITH_METRICS)
+    add_compile_definitions(WITH_METRICS)
+    message(STATUS "metrics is enabled")
   endif()
 
 endif() # GLOBAL_CONFIG
