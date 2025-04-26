@@ -584,6 +584,9 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
 
     // Query the object info
     error_code = client_->Query(key, object_info);
+    if (error_code == ErrorCode::OBJECT_NOT_FOUND) {
+        return nullptr;
+    }
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(error_code);
