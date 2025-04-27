@@ -47,7 +47,6 @@ option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
-option(LRU_MAX_CAPACITY "max LRU capacity" 1000)
 
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
@@ -60,6 +59,11 @@ execute_process(
     OUTPUT_VARIABLE PYTHON_SYS_PATH
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
+
+if (USE_LRU_MASTER)
+  add_compile_definitions(USE_LRU_MASTER)
+  add_compile_definitions(LRU_MAX_CAPACITY=1000)
+endif()
 
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
