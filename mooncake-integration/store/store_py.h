@@ -51,30 +51,31 @@ class ResourceTracker {
 };
 
 /**
- * @brief A class that holds allocated slices and provides a contiguous view of
- * the data This class is responsible for freeing the slices when it's destroyed
- * (RAII)
+ * @brief A class that holds a contiguous buffer of data
+ * This class is responsible for freeing the buffer when it's destroyed (RAII)
  */
 class SliceBuffer {
    public:
     /**
-     * @brief Construct a new SliceBuffer object
+     * @brief Construct a new SliceBuffer object with contiguous memory
      * @param store Reference to the DistributedObjectStore that owns the
      * allocator
-     * @param slices Vector of slices that contain the data
-     * @param total_size Total size of the data across all slices
+     * @param buffer Pointer to the contiguous buffer
+     * @param size Size of the buffer in bytes
+     * @param use_allocator_free If true, use SimpleAllocator to free the
+     * buffer, otherwise use delete[]
      */
-    SliceBuffer(DistributedObjectStore &store,
-                std::vector<mooncake::Slice> slices, uint64_t total_size);
+    SliceBuffer(DistributedObjectStore &store, void *buffer, uint64_t size,
+                bool use_allocator_free = true);
 
     /**
-     * @brief Destructor that frees all slices
+     * @brief Destructor that frees the buffer
      */
     ~SliceBuffer();
 
     /**
      * @brief Get a pointer to the data
-     * @return void* Pointer to the data (first slice if multiple slices)
+     * @return void* Pointer to the dat
      */
     void *ptr() const;
 
@@ -84,30 +85,11 @@ class SliceBuffer {
      */
     uint64_t size() const;
 
-    /**
-     * @brief Get a contiguous buffer containing all the data
-     * @return void* Pointer to the contiguous buffer (caller must NOT free
-     * this)
-     */
-    void *consolidated_ptr();
-
-    /**
-     * @brief Check if the data is stored in a single slice
-     * @return true if data is in a single slice, false otherwise
-     */
-    bool is_contiguous() const;
-
-    /**
-     * @brief Get the raw slices
-     * @return const std::vector<mooncake::Slice>& Reference to the slices
-     */
-    const std::vector<mooncake::Slice> &slices() const;
-
    private:
     DistributedObjectStore &store_;
-    std::vector<mooncake::Slice> slices_;
-    uint64_t total_size_;
-    char *consolidated_buffer_ = nullptr;
+    void *buffer_;
+    uint64_t size_;
+    bool use_allocator_free_;  // Flag to control deallocation method
 };
 
 class DistributedObjectStore {
