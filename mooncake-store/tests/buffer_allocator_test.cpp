@@ -4,6 +4,7 @@
 
 #include <memory>
 
+#include "Slab.h"
 #include "allocator.h"
 
 namespace mooncake {
@@ -27,7 +28,7 @@ class BufferAllocatorTest : public ::testing::Test {
 TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
     std::string segment_name = "1";
     const size_t base = 0x100000000;
-    const size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+    const size_t size = facebook::cachelib::Slab::kSize;
 
     auto allocator =
         std::make_shared<BufferAllocator>(segment_name, base, size);
@@ -50,7 +51,7 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
 TEST_F(BufferAllocatorTest, AllocateMultiple) {
     std::string segment_name = "1";
     const size_t base = 0x200000000;
-    const size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+    const size_t size = facebook::cachelib::Slab::kSize;
 
     auto allocator =
         std::make_shared<BufferAllocator>(segment_name, base, size);
@@ -76,7 +77,7 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
 TEST_F(BufferAllocatorTest, AllocateTooLarge) {
     std::string segment_name = "3";
     const size_t base = 0x300000000;
-    const size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+    const size_t size = facebook::cachelib::Slab::kSize;
 
     auto allocator =
         std::make_shared<BufferAllocator>(segment_name, base, size);
@@ -121,7 +122,7 @@ TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
 
 // Test multiple allocations and deallocations
 TEST_F(SimpleAllocatorTest, MultipleAllocations) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = facebook::cachelib::Slab::kSize;
     SimpleAllocator allocator(total_size);
 
     std::vector<std::pair<void*, size_t>> allocations;
@@ -144,7 +145,7 @@ TEST_F(SimpleAllocatorTest, MultipleAllocations) {
 
 // Test allocation request larger than available space
 TEST_F(SimpleAllocatorTest, AllocationTooLarge) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = facebook::cachelib::Slab::kSize;
     SimpleAllocator allocator(total_size);
 
     void* ptr = allocator.allocate(total_size + 1);

@@ -30,8 +30,9 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
-    // Define the size of the segment (16MB).
-    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    // Define the size of the segment.
+    constexpr size_t kSegmentSize = facebook::cachelib::Slab::kSize;
+
     // Define the name of the test segment.
     std::string segment_name = "test_segment";
 
@@ -86,8 +87,7 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
     std::uniform_int_distribution<> dis(1, 10);
     while (times--) {
         int random_number = dis(gen);
-        // Define the size of the segment (16MB).
-        size_t kSegmentSize = 1024 * 1024 * 16 * random_number;
+        size_t kSegmentSize = facebook::cachelib::Slab::kSize * random_number;
         // Test remounting after unmount.
         EXPECT_EQ(
             ErrorCode::OK,
@@ -108,7 +108,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
         threads.emplace_back([&service_, i, &success_count]() {
             std::string segment_name = "segment_" + std::to_string(i);
             size_t buffer = 0x300000000 + i * 0x10000000;
-            constexpr size_t size = 16 * 1024 * 1024;
+            constexpr size_t size = facebook::cachelib::Slab::kSize;
 
             for (size_t j = 0; j < iterations; j++) {
                 if (service_->MountSegment(buffer, size, segment_name) ==
@@ -133,7 +133,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
 TEST_F(MasterServiceTest, PutStartInvalidParams) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
               service_->MountSegment(buffer, size, segment_name));
@@ -161,7 +161,7 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 TEST_F(MasterServiceTest, PutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
 
     ASSERT_EQ(ErrorCode::OK,
@@ -197,7 +197,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
 
     ASSERT_EQ(ErrorCode::OK,
@@ -242,7 +242,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
               service_->MountSegment(buffer, size, segment_name));
@@ -265,7 +265,8 @@ TEST_F(MasterServiceTest, RemoveObject) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
+
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
               service_->MountSegment(buffer, size, segment_name));
@@ -295,7 +296,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
               service_->MountSegment(buffer, size, segment_name));
@@ -496,7 +497,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Mount a segment for testing
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;  // 16MB
+    constexpr size_t size = facebook::cachelib::Slab::kSize;
     std::string segment_name = "test_segment";
 
     // Mount the segment
