@@ -17,6 +17,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::INVALID_READ, "INVALID_READ"},
         {ErrorCode::INVALID_REPLICA, "INVALID_REPLICA"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
+        {ErrorCode::INTERNAL_ERROR, "INTERNAL_ERROR"},
+        {ErrorCode::REPLICA_IS_NOT_READY, "REPLICA_IS_NOT_READY"},
+        {ErrorCode::OBJECT_NOT_FOUND, "OBJECT_NOT_FOUND"},
+        {ErrorCode::OBJECT_ALREADY_EXISTS, "OBJECT_ALREADY_EXISTS"},
+        {ErrorCode::RPC_FAIL, "RPC_FAIL"},
     };
 
     auto it = errorCodeMap.find(errorCode);
