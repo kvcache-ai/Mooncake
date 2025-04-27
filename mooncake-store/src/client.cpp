@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 
@@ -62,6 +63,59 @@ Client::~Client() {
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
     return master_client_.Connect(master_addr);
+}
+
+static bool get_auto_discover() {
+    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
+    if (ev_ad) {
+        int iv = std::stoi(ev_ad);
+        if (iv == 1) {
+            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), s.end());
+}
+
+static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
+    std::vector<std::string> whitelst_filters;
+    char* ev_ad = std::getenv("MC_MS_FILTERS");
+    if (ev_ad) {
+        if (!auto_discover) {
+            LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
+            return whitelst_filters;
+        }
+        LOG(INFO) << "whitelist filters: " << ev_ad;
+        char delimiter = ',';
+        char * end = ev_ad + std::strlen(ev_ad);
+        char * start = ev_ad, * pos = ev_ad;
+        while ((pos=std::find(start, end, delimiter)) != end) {
+            std::string str(start, pos);
+            ltrim(str);
+            rtrim(str);
+            whitelst_filters.push_back(std::move(str));
+            start = pos + 1;
+        }
+        if (start != (end + 1)) {
+            std::string str(start, end);
+            ltrim(str);
+            rtrim(str);
+            whitelst_filters.push_back(std::move(str));
+        }
+    }
+    return whitelst_filters;
 }
 
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,

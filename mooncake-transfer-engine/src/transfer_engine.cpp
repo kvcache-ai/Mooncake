@@ -25,15 +25,6 @@
 
 namespace mooncake {
 
-// Helper function to convert string to lowercase for case-insensitive
-// comparison
-static std::string toLower(const std::string &s) {
-    std::string result = s;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return result;
-}
-
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -298,6 +289,17 @@ int TransferEngine::unregisterLocalMemoryBatch(
     }
     return 0;
 }
+
+#ifdef WITH_METRICS
+// Helper function to convert string to lowercase for case-insensitive
+// comparison
+static std::string toLower(const std::string &s) {
+    std::string result = s;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return result;
+}
+
 void TransferEngine::InitializeMetricsConfig() {
     // Check if metrics reporting is enabled via environment variable
     const char *metric_env = getenv("MC_TE_METRIC");
@@ -387,5 +389,6 @@ void TransferEngine::StopMetricsReportingThread() {
         LOG(INFO) << "Metrics reporting thread joined";
     }
 }
+#endif
 
 }  // namespace mooncake
