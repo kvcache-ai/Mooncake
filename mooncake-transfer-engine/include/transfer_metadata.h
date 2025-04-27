@@ -16,7 +16,7 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
+#include <json/json.h>
 #include <netdb.h>
 
 #include <atomic>

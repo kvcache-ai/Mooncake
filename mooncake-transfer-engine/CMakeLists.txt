@@ -71,7 +71,7 @@ if (NOT GLOBAL_CONFIG)
 
 endif() # GLOBAL_CONFIG
 
-include_directories(include)
+include_directories(include /usr/include/jsoncpp)
 add_subdirectory(include)
 add_subdirectory(src)
 
