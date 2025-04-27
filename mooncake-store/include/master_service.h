@@ -15,8 +15,6 @@
 #include "allocator.h"
 #include "types.h"
 
-#define USE_LRU_MASTER "ON"
-#define LRU_MAX_CAPACITY 32
 
 namespace mooncake {
 // Forward declarations
