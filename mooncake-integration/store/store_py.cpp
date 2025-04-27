@@ -361,7 +361,8 @@ int DistributedObjectStore::put(const std::string &key,
     SliceGuard slices(*this);
     int ret = allocateSlices(slices.slices(), value);
     if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put operation";
+        LOG(ERROR) << "Failed to allocate slices for put operation, key: "
+                   << key << ", value size: " << value.size();
         return ret;
     }
 
@@ -386,7 +387,8 @@ int DistributedObjectStore::put_parts(
     SliceGuard slices(*this);
     int ret = allocateSlicesPacked(slices.slices(), values);
     if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put operation";
+        LOG(ERROR) << "Failed to allocate slices for put operation, key: "
+                   << key << ", values size: " << values.size();
         return ret;
     }
     ReplicateConfig config;

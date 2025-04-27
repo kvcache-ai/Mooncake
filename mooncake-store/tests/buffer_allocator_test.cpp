@@ -101,7 +101,7 @@ class SimpleAllocatorTest : public ::testing::Test {
 
 // Test basic memory allocation and deallocation
 TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+    const size_t total_size = facebook::cachelib::Slab::kSize;
     SimpleAllocator allocator(total_size);
 
     // Test basic allocation
