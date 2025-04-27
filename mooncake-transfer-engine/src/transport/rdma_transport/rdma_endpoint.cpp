@@ -141,7 +141,12 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     if (peer_desc.local_nic_path != peer_nic_path_ ||
         peer_desc.peer_nic_path != local_desc.local_nic_path) {
-        LOG(ERROR) << "Invalid argument: received packet mismatch";
+        LOG(ERROR) << "Invalid argument: received packet mismatch, "
+                      "local.local_nic_path: "
+                   << local_desc.local_nic_path
+                   << ", local.peer_nic_path: " << local_desc.peer_nic_path
+                   << ", peer.local_nic_path: " << peer_desc.local_nic_path
+                   << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -271,12 +276,6 @@ int RdmaEndPoint::submitPostSend(
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
         slice->status = Transport::Slice::POSTED;
         slice->rdma.qp_depth = &wr_depth_list_[qp_index];
-        // if (globalConfig().verbose)
-        // {
-        //     LOG(INFO) << "WR: local addr " << slice->source_addr
-        //               << " remote addr " << slice->rdma.dest_addr
-        //               << " rkey " << slice->rdma.dest_rkey;
-        // }
     }
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     __sync_fetch_and_add(cq_outstanding_, wr_count);

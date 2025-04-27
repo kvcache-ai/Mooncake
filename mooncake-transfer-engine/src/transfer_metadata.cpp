@@ -57,12 +57,6 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
-        if (globalConfig().verbose) {
-            LOG(INFO) << "TransferHandshakeUtil::decode: local_nic_path "
-                      << desc.local_nic_path << " peer_nic_path "
-                      << desc.peer_nic_path << " qp_num count "
-                      << desc.qp_num.size();
-        }
         return 0;
     }
 };
@@ -93,6 +87,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
+    segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma") {
         Json::Value devicesJSON(Json::arrayValue);
@@ -178,6 +173,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
+    if (segmentJSON.isMember("timestamp"))
+        desc->timestamp = segmentJSON["timestamp"].asString();
 
     if (desc->protocol == "rdma") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -380,6 +377,16 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
+    return 0;
+}
+
+int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    if (segment_name_to_id_map_.count(segment_name)) {
+        int segment_id = segment_name_to_id_map_[segment_name];
+        segment_name_to_id_map_.erase(segment_name);
+        segment_id_to_desc_map_.erase(segment_id);
+    }
     return 0;
 }
 

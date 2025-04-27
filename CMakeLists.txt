@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake CXX C)
 
+# indicates cmake is invoked from top-level dir
+set(GLOBAL_CONFIG "true")
+
 option(ENABLE_CCACHE "Whether to open ccache" OFF)
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND AND ENABLE_CCACHE)
@@ -9,7 +12,13 @@ if(CCACHE_FOUND AND ENABLE_CCACHE)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif()
 
-enable_testing()
+option(BUILD_EXAMPLES "Build examples" ON)
+
+# unit test
+option(BUILD_UNIT_TESTS "Build unit tests" ON)
+if (BUILD_UNIT_TESTS)
+  enable_testing()
+endif()
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
@@ -32,6 +41,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
+option(USE_TCP "option for using TCP transport" ON)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" ON)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
@@ -65,6 +75,10 @@ elseif(USE_NVMEOF)
   message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
 endif()
 
+if (USE_TCP)
+  add_compile_definitions(USE_TCP)
+endif()
+
 if (USE_REDIS)
   add_compile_definitions(USE_REDIS)
   message(STATUS "Redis as metadata server support is enabled")
@@ -86,7 +100,7 @@ if (USE_ETCD)
 endif()
 
 if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
-  message(FATAL_ERROR "Please enable at least one metadata type: USE_ETCD, USE_REDIS, or USE_HTTP")
+  message(STATUS "None of USE_ETCD, USE_REDIS, USE_HTTP is selected, only \"P2PHANDSHAKE\" is supported as metadata server")
 endif()
 
 add_subdirectory(mooncake-common)

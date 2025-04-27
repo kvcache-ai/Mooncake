@@ -70,6 +70,9 @@ class TransferMetadata {
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // TODO : make these two a union or a std::variant
+        std::string timestamp;
+
+        void dump() const;
     };
 
     struct RpcMetaDesc {
@@ -117,6 +120,8 @@ class TransferMetadata {
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
+    
+    int removeLocalSegment(const std::string &segment_name);
 
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
@@ -134,6 +139,11 @@ class TransferMetadata {
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
+
+    void dumpMetadataContent(const std::string &segment_name = "",
+                             uint64_t offset = 0, uint64_t length = 0);
+
+    void dumpMetadataContentUnlocked();
 
    private:
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);

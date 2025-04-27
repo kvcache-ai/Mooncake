@@ -38,6 +38,7 @@ class Status final {
     kBatchBusy = 4,
     kDeviceNotFound = 6,
     kAddressOverlapped = 7,
+    kNotSupportedTransport = 8,
     kDns = 101,
     kSocket = 102,
     kMalformedJson = 103,
@@ -167,6 +168,11 @@ class Status final {
     return Code::kNotImplemented == code_;
   }
 
+  // Returns true iff the status indicates a NotImplemented error.
+  [[nodiscard]] bool IsNotSupportedTransport() const {
+    return Code::kNotSupportedTransport == code_;
+  }
+
   // Return a combination of the error code name and message.
   std::string ToString() const;
 
@@ -225,6 +231,9 @@ class Status final {
   }
   static Status NotImplemented(std::string_view msg) {
     return Status(Code::kNotImplemented, msg);
+  }
+  static Status NotSupportedTransport(std::string_view msg) {
+    return Status(Code::kNotSupportedTransport, msg);
   }
 
   // Return a human-readable name of the 'code'.

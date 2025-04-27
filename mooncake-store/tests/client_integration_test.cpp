@@ -65,31 +65,33 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeClient() {
-        client_ = std::make_unique<Client>();
         void** args =
             (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-        ASSERT_EQ(client_->Init(
-                      "localhost:17812",                   // Local hostname
-                      FLAGS_transfer_engine_metadata_url,  // Metadata
-                                                           // connection string
-                      FLAGS_protocol, args,
-                      "localhost:50051"  // Master server address
-                      ),
-                  ErrorCode::OK);
+
+        auto client_opt = Client::Create(
+            "localhost:17812",                   // Local hostname
+            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
+            FLAGS_protocol, args,
+            "localhost:50051"  // Master server address
+        );
+
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = *client_opt;
+
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
-        ErrorCode rc = client_->RegisterLocalMemory(
+        ErrorCode error_code = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), 128 * 1024 * 1024, "cpu:0",
             false, false);
-        if (rc != ErrorCode::OK) {
+        if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to allocate transfer buffer: "
-                       << toString(rc);
+                       << toString(error_code);
         }
     }
 
     static void CleanupClient() {
         if (client_) {
-            client_.reset();
+            client_.reset();  // Release the client
         }
     }
 
@@ -100,7 +102,7 @@ class ClientIntegrationTest : public ::testing::Test {
         }
     }
 
-    static std::unique_ptr<Client> client_;
+    static std::shared_ptr<Client> client_;
     // Here we use a simple allocator for the client buffer. In a real
     // application, user should manage the memory allocation and deallocation
     // themselves.
@@ -109,7 +111,7 @@ class ClientIntegrationTest : public ::testing::Test {
 };
 
 // Static members initialization
-std::unique_ptr<Client> ClientIntegrationTest::client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::client_ = nullptr;
 void* ClientIntegrationTest::segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;

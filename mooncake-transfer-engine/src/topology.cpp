@@ -52,7 +52,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
     if (!device_list || num_devices <= 0) {
-        LOG(WARNING) << "No IB devices found";
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
         return {};
     }
 
@@ -69,7 +69,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  device_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
-            PLOG(ERROR) << "Failed to parse realpath";
+            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path << " failed";
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
@@ -92,7 +92,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        PLOG(WARNING) << "Failed to open /sys/devices/system/node";
+        PLOG(WARNING) << "discoverCpuTopology: open /sys/devices/system/node failed";
         return {};
     }
     while ((entry = readdir(dir))) {
@@ -221,7 +221,6 @@ int Topology::parse(const std::string &topology_json) {
     Json::Reader reader;
 
     if (topology_json.empty() || !reader.parse(topology_json, root)) {
-        LOG(ERROR) << "Topology: malformed json format: " << topology_json;
         return ERR_MALFORMED_JSON;
     }
 
@@ -241,7 +240,6 @@ int Topology::parse(const std::string &topology_json) {
             }
             matrix_[key] = topo_entry;
         } else {
-            LOG(ERROR) << "Topology: malformed json format";
             return ERR_MALFORMED_JSON;
         }
     }
