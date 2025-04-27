@@ -221,12 +221,7 @@ int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
         auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
         if (!ptr) {
-            // Deallocate any previously allocated slices
-            for (auto &slice : slices) {
-                client_buffer_allocator_->deallocate(slice.ptr, slice.size);
-            }
-            slices.clear();
-            return 1;
+            return 1;  // SliceGuard will handle cleanup
         }
         memcpy(ptr, value.data() + offset, chunk_size);
         slices.emplace_back(Slice{ptr, chunk_size});
@@ -242,12 +237,7 @@ int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
         auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
         if (!ptr) {
-            // Deallocate any previously allocated slices
-            for (auto &slice : slices) {
-                client_buffer_allocator_->deallocate(slice.ptr, slice.size);
-            }
-            slices.clear();
-            return 1;
+            return 1;  // SliceGuard will handle cleanup
         }
         memcpy(ptr, value.data() + offset, chunk_size);
         slices.emplace_back(Slice{ptr, chunk_size});
@@ -271,7 +261,9 @@ int DistributedObjectStore::allocateSlicesPacked(
     for (size_t i = 0; i < n_slice; ++i) {
         size_t sz = std::min(remaining, (size_t)kMaxSliceSize);
         void *ptr = client_buffer_allocator_->allocate(sz);
-        if (!ptr) return 1;  // Caller will free
+        if (!ptr) {
+            return 1;  // SliceGuard will handle cleanup
+        }
         slices.emplace_back(mooncake::Slice{ptr, sz});
         remaining -= sz;
     }
@@ -310,7 +302,9 @@ int DistributedObjectStore::allocateSlices(
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
-        if (!ptr) return 1;
+        if (!ptr) {
+            return 1;  // SliceGuard will handle cleanup
+        }
         slices.emplace_back(Slice{ptr, chunk_size});
         length += chunk_size;
     }
@@ -409,7 +403,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     }
 
     mooncake::Client::ObjectInfo object_info;
-    SliceGuard slices(*this);
+    SliceGuard guard(*this);  // Use SliceGuard for RAII
     uint64_t str_length = 0;
     ErrorCode error_code;
     char *exported_str_ptr = nullptr;
@@ -426,22 +420,22 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
             return kNullString;
         }
 
-        int ret = allocateSlices(slices.slices(), object_info, str_length);
+        int ret = allocateSlices(guard.slices(), object_info, str_length);
         if (ret) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
 
-        error_code = client_->Get(key, object_info, slices.slices());
+        error_code = client_->Get(key, object_info, guard.slices());
         if (error_code != ErrorCode::OK) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
 
-        if (slices.slices().size() == 1 &&
-            slices.slices()[0].size == str_length) {
+        if (guard.slices().size() == 1 &&
+            guard.slices()[0].size == str_length) {
         } else {
-            exported_str_ptr = exportSlices(slices.slices(), str_length);
+            exported_str_ptr = exportSlices(guard.slices(), str_length);
             if (!exported_str_ptr) {
                 py::gil_scoped_acquire acquire_gil;
                 return kNullString;
@@ -456,8 +450,8 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     if (use_exported_str) {
         result = pybind11::bytes(exported_str_ptr, str_length);
         delete[] exported_str_ptr;
-    } else if (!slices.slices().empty()) {
-        result = pybind11::bytes(static_cast<char *>(slices.slices()[0].ptr),
+    } else if (!guard.slices().empty()) {
+        result = pybind11::bytes(static_cast<char *>(guard.slices()[0].ptr),
                                  str_length);
     } else {
         result = kNullString;
@@ -516,59 +510,29 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
 }
 
 // SliceBuffer implementation
-SliceBuffer::SliceBuffer(DistributedObjectStore &store,
-                         std::vector<mooncake::Slice> slices,
-                         uint64_t total_size)
-    : store_(store), slices_(std::move(slices)), total_size_(total_size) {}
+SliceBuffer::SliceBuffer(DistributedObjectStore &store, void *buffer,
+                         uint64_t size, bool use_allocator_free)
+    : store_(store),
+      buffer_(buffer),
+      size_(size),
+      use_allocator_free_(use_allocator_free) {}
 
 SliceBuffer::~SliceBuffer() {
-    if (consolidated_buffer_) {
-        delete[] consolidated_buffer_;
-        consolidated_buffer_ = nullptr;
+    if (buffer_) {
+        if (use_allocator_free_) {
+            // Use SimpleAllocator to deallocate memory
+            store_.client_buffer_allocator_->deallocate(buffer_, size_);
+        } else {
+            // Use delete[] for memory allocated with new[]
+            delete[] static_cast<char *>(buffer_);
+        }
+        buffer_ = nullptr;
     }
-
-    // Free all slices
-    store_.freeSlices(slices_);
 }
 
-void *SliceBuffer::ptr() const {
-    if (slices_.empty()) {
-        return nullptr;
-    }
-    return slices_[0].ptr;
-}
+void *SliceBuffer::ptr() const { return buffer_; }
 
-uint64_t SliceBuffer::size() const { return total_size_; }
-
-bool SliceBuffer::is_contiguous() const {
-    return slices_.size() == 1 || consolidated_buffer_ != nullptr;
-}
-
-void *SliceBuffer::consolidated_ptr() {
-    // If we already have a consolidated buffer, return it
-    if (consolidated_buffer_) {
-        return consolidated_buffer_;
-    }
-
-    // If there's only one slice, just return its pointer
-    if (slices_.size() == 1) {
-        return slices_[0].ptr;
-    }
-
-    // Otherwise, create a consolidated buffer
-    consolidated_buffer_ = new char[total_size_];
-    uint64_t offset = 0;
-    for (const auto &slice : slices_) {
-        memcpy(consolidated_buffer_ + offset, slice.ptr, slice.size);
-        offset += slice.size;
-    }
-
-    return consolidated_buffer_;
-}
-
-const std::vector<mooncake::Slice> &SliceBuffer::slices() const {
-    return slices_;
-}
+uint64_t SliceBuffer::size() const { return size_; }
 
 // Implementation of get_buffer method
 std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
@@ -579,7 +543,7 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
     }
 
     mooncake::Client::ObjectInfo object_info;
-    std::vector<Slice> slices;
+    SliceGuard guard(*this);  // Use SliceGuard for RAII
     uint64_t total_length = 0;
     ErrorCode error_code;
     std::shared_ptr<SliceBuffer> result = nullptr;
@@ -595,26 +559,33 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
         return nullptr;
     }
 
-    // Allocate slices for the object
-    int ret = allocateSlices(slices, object_info, total_length);
+    // Allocate slices for the object using the guard
+    int ret = allocateSlices(guard.slices(), object_info, total_length);
     if (ret) {
         LOG(ERROR) << "Failed to allocate slices for key: " << key;
         return nullptr;
     }
 
     // Get the object data
-    error_code = client_->Get(key, object_info, slices);
+    error_code = client_->Get(key, object_info, guard.slices());
     if (error_code != ErrorCode::OK) {
-        // Free slices on error
-        freeSlices(slices);
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(error_code);
         return nullptr;
     }
 
-    // Create the SliceBuffer
-    result =
-        std::make_shared<SliceBuffer>(*this, std::move(slices), total_length);
+    if (guard.slices().size() == 1) {
+        auto ptr = guard.slices()[0].ptr;
+        guard.slices().clear();
+        // Use SimpleAllocator for deallocation (default behavior)
+        result = std::make_shared<SliceBuffer>(*this, ptr, total_length, true);
+    } else {
+        auto contiguous_buffer = exportSlices(guard.slices(), total_length);
+        // Use delete[] for deallocation since exportSlices uses new char[]
+        result = std::make_shared<SliceBuffer>(*this, contiguous_buffer,
+                                               total_length, false);
+    }
+
     return result;
 }
 
@@ -628,20 +599,9 @@ PYBIND11_MODULE(store, m) {
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
         .def("size", &SliceBuffer::size)
-        .def("is_contiguous", &SliceBuffer::is_contiguous)
         .def_buffer([](SliceBuffer &self) -> py::buffer_info {
-            if (!self.is_contiguous()) {
-                void *consolidated_data = self.consolidated_ptr();
-                return py::buffer_info(
-                    consolidated_data, /* Pointer to buffer */
-                    sizeof(char),      /* Size of one scalar */
-                    py::format_descriptor<char>::
-                        format(), /* Python struct-style format descriptor */
-                    1,            /* Number of dimensions */
-                    {(size_t)self.size()}, /* Buffer dimensions */
-                    {sizeof(char)} /* Strides (in bytes) for each index */
-                );
-            } else if (self.size() > 0) {
+            // SliceBuffer now always contains contiguous memory
+            if (self.size() > 0) {
                 return py::buffer_info(
                     self.ptr(),   /* Pointer to buffer */
                     sizeof(char), /* Size of one scalar */
@@ -663,14 +623,7 @@ PYBIND11_MODULE(store, m) {
                     {sizeof(char)} /* Strides (in bytes) for each index */
                 );
             }
-        })
-        .def(
-            "consolidated_ptr",
-            [](SliceBuffer &self) {
-                // Return the consolidated pointer as an integer for Python
-                return reinterpret_cast<uintptr_t>(self.consolidated_ptr());
-            },
-            py::call_guard<py::gil_scoped_release>());
+        });
 
     // Define the DistributedObjectStore class
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
