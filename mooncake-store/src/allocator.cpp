@@ -7,6 +7,11 @@
 
 namespace mooncake {
 
+std::set<uint32_t> get_alloc_sizes() {
+    return facebook::cachelib::MemoryAllocator::generateAllocSizes(
+        1.5, facebook::cachelib::Slab::kSize, 4 * 1024, true);
+}
+
 AllocatedBuffer::~AllocatedBuffer() {
     auto alloc = allocator_.lock();
     if (alloc) {
@@ -36,8 +41,7 @@ BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
 
     // Initialize the CacheLib MemoryAllocator.
     memory_allocator_ = std::make_unique<facebook::cachelib::MemoryAllocator>(
-        facebook::cachelib::MemoryAllocator::Config(
-            facebook::cachelib::MemoryAllocator::generateAllocSizes()),
+        facebook::cachelib::MemoryAllocator::Config(get_alloc_sizes()),
         reinterpret_cast<void*>(header_region_start_.get()),
         header_region_size_, reinterpret_cast<void*>(base), size);
 
@@ -123,8 +127,7 @@ SimpleAllocator::SimpleAllocator(size_t size) {
         // Initialize CacheLib memory allocator
         memory_allocator_ =
             std::make_unique<facebook::cachelib::MemoryAllocator>(
-                facebook::cachelib::MemoryAllocator::Config(
-                    facebook::cachelib::MemoryAllocator::generateAllocSizes()),
+                facebook::cachelib::MemoryAllocator::Config(get_alloc_sizes()),
                 header_region_start_.get(), header_region_size_, base_, size);
 
         if (!memory_allocator_) {
