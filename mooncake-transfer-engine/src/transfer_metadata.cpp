@@ -14,7 +14,7 @@
 
 #include "transfer_metadata.h"
 
-#include <jsoncpp/json/value.h>
+#include <json/value.h>
 
 #include <cassert>
 #include <set>
