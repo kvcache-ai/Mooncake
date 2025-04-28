@@ -302,6 +302,50 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     }
 }
 
+int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
+                                          uintptr_t buffer,
+                                          uintptr_t peer_buffer_address,
+                                          size_t length) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    if (handle_map_.count(target_hostname)) {
+        handle = handle_map_[target_hostname];
+    } else {
+        handle = engine_->openSegment(target_hostname);
+        if (handle == (Transport::SegmentHandle)-1) return -1;
+        handle_map_[target_hostname] = handle;
+    }
+
+    auto batch_id = engine_->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = TransferRequest::WRITE;
+    entry.length = length;
+    entry.source = (void *)buffer;
+    entry.target_id = handle;
+    entry.target_offset = peer_buffer_address;
+
+    Status s = engine_->submitTransfer(batch_id, {entry});
+    if (!s.ok()) return -1;
+
+    return batch_id;
+}
+
+int TransferEnginePy::transferCheckStatus(int batch_id) {
+    pybind11::gil_scoped_release release;
+    TransferStatus status;
+    Status s = engine_->getTransferStatus(batch_id, 0, status);
+    LOG_ASSERT(s.ok());
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(batch_id);
+        return 1;
+    } else if (status.s == TransferStatusEnum::FAILED) {
+        engine_->freeBatchID(batch_id);
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity);
@@ -341,6 +385,8 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite)
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
+            .def("transfer_submit_write", &TransferEnginePy::transferSubmitWrite)
+            .def("transfer_check_status", &TransferEnginePy::transferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
