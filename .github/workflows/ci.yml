@@ -136,9 +136,21 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_ETCD_LEGACY=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS -DBUILD_UNIT_TESTS -DBUILD_EXAMPLES
         sudo make install -j
       shell: bash
+      # TODO: lack USE_CUDA and USE_NVMEOF
+
+    - name: Configure and build project with unit tests and examples
+      run: |
+        sudo apt update -y
+        sudo bash -x dependencies.sh -y
+        mkdir build
+        cd build
+        cmake .. -DBUILD_UNIT_TESTS -DBUILD_EXAMPLES
+        sudo make install -j
+      shell: bash
+      # TODO: lack WITH_RUST_EXAMPLE
     
     - name: Build Python wheel
       run: |
