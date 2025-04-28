@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -86,23 +87,37 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true);
+    MasterService(bool enable_gc = true, bool enable_heartbeat = true);
     ~MasterService();
 
     /**
      * @brief Mount a memory segment for buffer allocation
+     * @param client_id Unique identifier of the client
+     * @param buffer Memory buffer to register
+     * @param size Size of the buffer in bytes
+     * @param segment_name Unique identifier for the segment
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * exists or params invalid, ErrorCode::INTERNAL_ERROR if allocation fails
      */
-    ErrorCode MountSegment(uint64_t buffer, uint64_t size,
-                           const std::string& segment_name);
+    ErrorCode MountSegment(const ClientID& client_id, uint64_t buffer,
+                           uint64_t size, const std::string& segment_name);
 
     /**
      * @brief Unmount a memory segment
+     * @param client_id Unique identifier of the client
+     * @param segment_name Name of the segment to unregister
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
-     * not found
+     * not found or doesn't belong to the client
      */
-    ErrorCode UnmountSegment(const std::string& segment_name);
+    ErrorCode UnmountSegment(const ClientID& client_id,
+                             const std::string& segment_name);
+
+    /**
+     * @brief Process a heartbeat from a client
+     * @param client_id Unique identifier of the client
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode Heartbeat(const ClientID& client_id);
 
     /**
      * @brief Check if an object exists
@@ -164,6 +179,12 @@ class MasterService {
     // GC thread function
     void GCThreadFunc();
 
+    // Heartbeat monitor thread function
+    void HeartbeatMonitorFunc();
+
+    // Cleanup segments associated with a timed-out client
+    void CleanupClientSegments(const ClientID& client_id);
+
     // Internal data structures
     struct ObjectMetadata {
         std::vector<Replica> replicas;
@@ -199,6 +220,22 @@ class MasterService {
     bool enable_gc_{true};  // Flag to enable/disable garbage collection
     static constexpr uint64_t kGCThreadSleepMs =
         10;  // 10 ms sleep between GC checks
+
+    // Heartbeat related members
+    std::unordered_map<ClientID, std::unordered_set<std::string>>
+        client_segments_;
+    mutable std::mutex client_segments_mutex_;
+    std::unordered_map<ClientID, std::chrono::steady_clock::time_point>
+        client_last_heartbeat_;
+    mutable std::mutex client_last_heartbeat_mutex_;
+    std::thread heartbeat_monitor_thread_;
+    std::atomic<bool> monitor_running_{false};
+    static constexpr std::chrono::milliseconds HEARTBEAT_INTERVAL{
+        1000};  // 1 seconds
+    static constexpr std::chrono::milliseconds TIMEOUT_THRESHOLD{
+        5000};  // 5 seconds
+    static constexpr uint64_t kHeartbeatMonitorSleepMs =
+        1000;  // 1 second sleep between checks
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

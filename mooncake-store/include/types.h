@@ -30,6 +30,7 @@ using ObjectKey = std::string;
 using Version = uint64_t;
 using SegmentId = int64_t;
 using TaskID = int64_t;
+using ClientID = std::string;  // Unique identifier for clients
 using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 // using ReplicaList = std::vector<ReplicaInfo>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;

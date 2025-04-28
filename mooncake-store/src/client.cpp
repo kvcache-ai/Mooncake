@@ -3,7 +3,11 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <boost/uuid/uuid.hpp>             // boost::uuids::uuid
+#include <boost/uuid/uuid_generators.hpp>  // boost::uuids::random_generator
+#include <boost/uuid/uuid_io.hpp>          // boost::uuids::to_string
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 
 #include "rpc_service.h"
@@ -21,12 +25,26 @@ namespace mooncake {
     return slice_size;
 }
 
+ClientID Client::GenerateClientID() {
+    boost::uuids::random_generator gen;
+
+    boost::uuids::uuid id = gen();
+
+    return boost::uuids::to_string(id);
+}
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring),
+      client_id_(GenerateClientID()) {
+    LOG(INFO) << "Created client with ID: " << client_id_;
+}
 
 Client::~Client() {
+    // Stop heartbeat thread
+    StopHeartbeat();
+
     // No need for mutex here since the client is being destroyed(protected by
     // shared_ptr)
     // Make a copy of mounted_segments_ to avoid modifying while iterating
@@ -39,9 +57,6 @@ Client::~Client() {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
     }
-
-    // Clear any remaining segments
-    mounted_segments_.clear();
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
@@ -60,16 +75,17 @@ static bool get_auto_discover() {
     return false;
 }
 
-static inline void ltrim(std::string &s) {
+static inline void ltrim(std::string& s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }));
+                return !std::isspace(ch);
+            }));
 }
 
-static inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
+static inline void rtrim(std::string& s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
 }
 
 static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
@@ -77,14 +93,16 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
         if (!auto_discover) {
-            LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
+            LOG(WARNING)
+                << "auto discovery not set, but find whitelist filters: "
+                << ev_ad;
             return whitelst_filters;
         }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
-        char * end = ev_ad + std::strlen(ev_ad);
-        char * start = ev_ad, * pos = ev_ad;
-        while ((pos=std::find(start, end, delimiter)) != end) {
+        char* end = ev_ad + std::strlen(ev_ad);
+        char *start = ev_ad, *pos = ev_ad;
+        while ((pos = std::find(start, end, delimiter)) != end) {
             std::string str(start, pos);
             ltrim(str);
             rtrim(str);
@@ -108,7 +126,8 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
     transfer_engine_.setAutoDiscover(auto_discover);
-    transfer_engine_.setWhitelistFilters(get_auto_discover_filters(auto_discover));
+    transfer_engine_.setWhitelistFilters(
+        get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
@@ -160,6 +179,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;
     }
+
+    // Start heartbeat thread
+    client->StartHeartbeat();
+    LOG(INFO) << "Started heartbeat thread for client: "
+              << client->GetClientID();
 
     return client;
 }
@@ -300,7 +324,8 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     }
 
     ErrorCode err =
-        master_client_.MountSegment(segment_name, buffer, size).error_code;
+        master_client_.MountSegment(client_id_, segment_name, buffer, size)
+            .error_code;
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -327,7 +352,8 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
         mounted_segments_.erase(it);
     }
 
-    ErrorCode err = master_client_.UnmountSegment(segment_name).error_code;
+    ErrorCode err =
+        master_client_.UnmountSegment(client_id_, segment_name).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);
@@ -487,6 +513,47 @@ ErrorCode Client::TransferRead(
     }
 
     return TransferData(handles, slices, TransferRequest::READ);
+}
+
+void Client::StartHeartbeat() {
+    heartbeat_running_ = true;
+    heartbeat_thread_ = std::thread(&Client::HeartbeatThreadFunc, this);
+    VLOG(1) << "client_id=" << client_id_
+            << ", action=heartbeat_thread_started";
+}
+
+void Client::StopHeartbeat() {
+    if (heartbeat_running_) {
+        heartbeat_running_ = false;
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
+        }
+        VLOG(1) << "client_id=" << client_id_
+                << ", action=heartbeat_thread_stopped";
+    }
+}
+
+void Client::HeartbeatThreadFunc() {
+    VLOG(1) << "client_id=" << client_id_
+            << ", action=heartbeat_thread_running";
+
+    while (heartbeat_running_) {
+        // Send heartbeat to master
+        HeartbeatResponse response = master_client_.Heartbeat(client_id_);
+
+        if (response.error_code != ErrorCode::OK) {
+            LOG(WARNING) << "client_id=" << client_id_
+                         << ", error=heartbeat_failed, error_code="
+                         << response.error_code;
+
+            // If heartbeat fails, we might want to retry more frequently
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(HEARTBEAT_INTERVAL / 3));
+        } else {
+            // Sleep for the heartbeat interval
+            std::this_thread::sleep_for(HEARTBEAT_INTERVAL);
+        }
+    }
 }
 
 }  // namespace mooncake
