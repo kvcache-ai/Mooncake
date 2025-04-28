@@ -14,6 +14,7 @@ using namespace async_simple::coro;
 DEFINE_int32(port, 50051, "Port for master service to listen on");
 DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
 DEFINE_bool(enable_gc, false, "Enable garbage collection");
+DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 
 int main(int argc, char* argv[]) {
     // Initialize gflags
@@ -28,9 +29,11 @@ int main(int argc, char* argv[]) {
         /*port=*/FLAGS_port);
     LOG(INFO) << "Master service started on port " << FLAGS_port
               << ", enable_gc=" << FLAGS_enable_gc
-              << ", max_threads=" << FLAGS_max_threads;
+              << ", max_threads=" << FLAGS_max_threads
+              << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting;
 
-    mooncake::WrappedMasterService wrapped_master_service(FLAGS_enable_gc);
+    mooncake::WrappedMasterService wrapped_master_service(
+        FLAGS_enable_gc, FLAGS_enable_metric_reporting);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(

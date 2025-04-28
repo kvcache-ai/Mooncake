@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <sstream>  // For string formatting
 #include <string>
 
 #include "ylt/metric/counter.hpp"
@@ -22,15 +23,12 @@ class MasterMetricManager {
     // Storage Metrics
     void inc_allocated_size(int64_t val = 1.0);
     void dec_allocated_size(int64_t val = 1.0);
-    void set_allocated_size(int64_t val);  // Use update for gauge
     void inc_total_capacity(int64_t val = 1.0);
     void dec_total_capacity(int64_t val = 1.0);
-    void set_total_capacity(int64_t val);  // Use update for gauge
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1.0);
     void dec_key_count(int64_t val = 1.0);
-    void set_key_count(int64_t val);  // Use update for gauge
     void observe_value_size(int64_t size);
 
     // Operation Statistics (Counters)
@@ -56,6 +54,12 @@ class MasterMetricManager {
      */
     std::string serialize_metrics();
 
+    /**
+     * @brief Generates a concise, human-readable summary of key metrics.
+     * @return A string containing the formatted summary.
+     */
+    std::string get_summary_string();
+
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();
@@ -64,12 +68,12 @@ class MasterMetricManager {
     // --- Metric Members ---
 
     // Storage Metrics
-    ylt::metric::gauge_d allocated_size_;
-    ylt::metric::gauge_d total_capacity_;
+    ylt::metric::gauge_d allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_d total_capacity_;  // Use update for gauge
 
     // Key/Value Metrics
     ylt::metric::gauge_d key_count_;
-    ylt::metric::histogram_d value_size_distribution_;  // Example buckets
+    ylt::metric::histogram_d value_size_distribution_;
 
     // Operation Statistics
     ylt::metric::counter_d put_start_requests_;

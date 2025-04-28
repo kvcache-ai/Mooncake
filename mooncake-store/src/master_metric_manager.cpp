@@ -1,5 +1,6 @@
 #include "master_metric_manager.h"
 
+#include <iomanip>  // For std::fixed, std::setprecision
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 
@@ -21,11 +22,11 @@ MasterMetricManager::MasterMetricManager()
                       "Total capacity across all mounted segments"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
-      // Initialize Histogram (Example buckets: 1KB, 4KB, 16KB, 64KB, 256KB,
-      // 1MB, 4MB) Buckets should be sorted.
-      value_size_distribution_(
-          "master_value_size_bytes", "Distribution of object value sizes",
-          {1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0}),
+      // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
+      value_size_distribution_("master_value_size_bytes",
+                               "Distribution of object value sizes",
+                               {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
+                                16777216.0, 67108864.0}),
       // Initialize Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
@@ -75,25 +76,18 @@ void MasterMetricManager::inc_allocated_size(int64_t val) {
 void MasterMetricManager::dec_allocated_size(int64_t val) {
     allocated_size_.dec(val);
 }
-void MasterMetricManager::set_allocated_size(int64_t val) {
-    allocated_size_.update(val);
-}  // Use update for gauge
+
 void MasterMetricManager::inc_total_capacity(int64_t val) {
     total_capacity_.inc(val);
 }
 void MasterMetricManager::dec_total_capacity(int64_t val) {
     total_capacity_.dec(val);
 }
-void MasterMetricManager::set_total_capacity(int64_t val) {
-    total_capacity_.update(val);
-}  // Use update for gauge
 
 // Key/Value Metrics
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
-void MasterMetricManager::set_key_count(int64_t val) {
-    key_count_.update(val);
-}  // Use update for gauge
+
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
 }
@@ -217,6 +211,65 @@ std::string MasterMetricManager::serialize_metrics() {
     gc_remove_failures_.serialize(temp_str);
     ss << temp_str;
     temp_str.clear();
+
+    return ss.str();
+}
+
+// --- Human-Readable Summary ---
+std::string MasterMetricManager::get_summary_string() {
+    std::lock_guard<std::mutex> lock(serialization_mutex_);
+    std::stringstream ss;
+
+    // --- Helper lambda for formatting bytes ---
+    auto format_bytes = [](double bytes) -> std::string {
+        std::stringstream byte_ss;
+        byte_ss << std::fixed << std::setprecision(2);
+        if (bytes >= 1024.0 * 1024.0 * 1024.0) {  // GB
+            byte_ss << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB";
+        } else if (bytes >= 1024.0 * 1024.0) {  // MB
+            byte_ss << (bytes / (1024.0 * 1024.0)) << " MB";
+        } else if (bytes >= 1024.0) {  // KB
+            byte_ss << (bytes / 1024.0) << " KB";
+        } else {
+            byte_ss << bytes << " B";
+        }
+        return byte_ss.str();
+    };
+
+    // --- Get current values ---
+    double allocated = allocated_size_.value();
+    double capacity = total_capacity_.value();
+    double keys = key_count_.value();
+
+    // Request counters
+    double put_starts = put_start_requests_.value();
+    double put_start_fails = put_start_failures_.value();
+    double put_ends = put_end_requests_.value();
+    double put_end_fails = put_end_failures_.value();
+    double get_replicas = get_replica_list_requests_.value();
+    double get_replica_fails = get_replica_list_failures_.value();
+    double removes = remove_requests_.value();
+    double remove_fails = remove_failures_.value();
+
+    // --- Format the summary string ---
+    ss << "Storage: " << format_bytes(allocated) << " / "
+       << format_bytes(capacity);
+    if (capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << (allocated / capacity * 100.0) << "%)";
+    }
+    ss << " | Keys: " << static_cast<int64_t>(keys);
+
+    // Request summary - focus on the most important metrics
+    ss << " | Requests (Success/Total): ";
+    ss << "Put="
+       << static_cast<int64_t>(put_starts - put_start_fails + put_ends -
+                               put_end_fails)
+       << "/" << static_cast<int64_t>(put_starts + put_ends) << ", ";
+    ss << "Get=" << static_cast<int64_t>(get_replicas - get_replica_fails)
+       << "/" << static_cast<int64_t>(get_replicas) << ", ";
+    ss << "Del=" << static_cast<int64_t>(removes - remove_fails) << "/"
+       << static_cast<int64_t>(removes);
 
     return ss.str();
 }

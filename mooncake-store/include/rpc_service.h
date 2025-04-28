@@ -46,25 +46,25 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+constexpr uint64_t kMetricReportIntervalSeconds = 10;
+
 class WrappedMasterService {
    public:
-    WrappedMasterService(bool enable_gc)
-        : master_service_(enable_gc), metric_report_running_(true) {
-        // Start metric reporting thread
-        metric_report_thread_ = std::thread([this]() {
-            while (metric_report_running_) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));
-                try {
-                    std::string metrics_str =
-                        MasterMetricManager::instance().serialize_metrics();
-                    LOG(INFO) << "Master Metrics:\n" << metrics_str;
-                } catch (const std::exception& e) {
-                    LOG(ERROR) << "Error serializing metrics: " << e.what();
-                } catch (...) {
-                    LOG(ERROR) << "Unknown error serializing metrics.";
+    WrappedMasterService(bool enable_gc, bool enable_metric_reporting = true)
+        : master_service_(enable_gc),
+          metric_report_running_(enable_metric_reporting) {
+        // Start metric reporting thread if enabled
+        if (enable_metric_reporting) {
+            metric_report_thread_ = std::thread([this]() {
+                while (metric_report_running_) {
+                    std::string metrics_summary =
+                        MasterMetricManager::instance().get_summary_string();
+                    LOG(INFO) << "Master Metrics: " << metrics_summary;
+                    std::this_thread::sleep_for(
+                        std::chrono::seconds(kMetricReportIntervalSeconds));
                 }
-            }
-        });
+            });
+        }
     }
 
     ~WrappedMasterService() {
@@ -117,8 +117,6 @@ class WrappedMasterService {
         } else {
             // Increment key count on successful put start
             MasterMetricManager::instance().inc_key_count();
-            // Update allocated size
-            MasterMetricManager::instance().inc_allocated_size(value_length);
         }
 
         timer.LogResponseJson(response);
