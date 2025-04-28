@@ -1,5 +1,7 @@
 #include <gflags/gflags.h>
 
+#include <chrono>  // For std::chrono
+#include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
@@ -43,6 +45,8 @@ int main(int argc, char* argv[]) {
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
+
+    // Metric reporting is now handled by WrappedMasterService
 
     return !server.start();
 }

@@ -1,11 +1,17 @@
 #ifndef BUFFER_ALLOCATOR_H
 #define BUFFER_ALLOCATOR_H
 
+#include <atomic>
 #include <memory>
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "types.h"
+// Removed ylt metric includes
+// #include "ylt/metric/counter.hpp"
+// #include "ylt/metric/gauge.hpp"
+// #include "ylt/metric/metric_manager.hpp"
+#include "master_metric_manager.h"  // Added
 
 using facebook::cachelib::MemoryAllocator;
 using facebook::cachelib::PoolId;
@@ -36,6 +42,7 @@ namespace mooncake {
  */
 class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
    public:
+    // Removed allocated_bytes parameter
     BufferAllocator(std::string segment_name, size_t base, size_t size);
 
     ~BufferAllocator();
@@ -50,11 +57,13 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
 
    private:
     // metadata
-    std::string segment_name_;
-    size_t base_;
-    size_t total_size_;
-    std::atomic<size_t> cur_size_{0};
+    const std::string segment_name_;
+    const size_t base_;
+    const size_t total_size_;
+    std::atomic_size_t cur_size_;
 
+    // metrics - removed allocated_bytes_ member
+    // ylt::metric::gauge_t* allocated_bytes_{nullptr};
     // cachelib
     std::unique_ptr<char[]> header_region_start_;
     size_t header_region_size_;
