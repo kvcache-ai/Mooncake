@@ -342,7 +342,7 @@ int TransferEnginePy::transferCheckStatus(int batch_id) {
         engine_->freeBatchID(batch_id);
         return -1;
     } else {
-	    return 0;
+        return 0;
     }
 }
 
