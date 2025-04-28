@@ -6,12 +6,8 @@
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
+#include "master_metric_manager.h"
 #include "types.h"
-// Removed ylt metric includes
-// #include "ylt/metric/counter.hpp"
-// #include "ylt/metric/gauge.hpp"
-// #include "ylt/metric/metric_manager.hpp"
-#include "master_metric_manager.h"  // Added
 
 using facebook::cachelib::MemoryAllocator;
 using facebook::cachelib::PoolId;
@@ -42,7 +38,6 @@ namespace mooncake {
  */
 class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
    public:
-    // Removed allocated_bytes parameter
     BufferAllocator(std::string segment_name, size_t base, size_t size);
 
     ~BufferAllocator();

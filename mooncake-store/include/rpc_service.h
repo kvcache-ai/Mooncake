@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "master_metric_manager.h"
@@ -50,9 +52,14 @@ constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(bool enable_gc, bool enable_metric_reporting = true)
+    WrappedMasterService(bool enable_gc, bool enable_metric_reporting = true,
+                         uint16_t http_port = 9003)
         : master_service_(enable_gc),
+          http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
+        // Initialize HTTP server for metrics
+        init_http_server();
+
         // Start metric reporting thread if enabled
         if (enable_metric_reporting) {
             metric_report_thread_ = std::thread([this]() {
@@ -72,6 +79,44 @@ class WrappedMasterService {
         if (metric_report_thread_.joinable()) {
             metric_report_thread_.join();
         }
+        // Stop HTTP server
+        http_server_.stop();
+    }
+
+    // Initialize and start the HTTP server
+    void init_http_server() {
+        using namespace coro_http;
+
+        // Endpoint for Prometheus metrics
+        http_server_.set_http_handler<GET>(
+            "/metrics", [](coro_http_request& req, coro_http_response& resp) {
+                std::string metrics =
+                    MasterMetricManager::instance().serialize_metrics();
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, metrics);
+            });
+
+        // Endpoint for human-readable metrics summary
+        http_server_.set_http_handler<GET>(
+            "/metrics/summary",
+            [](coro_http_request& req, coro_http_response& resp) {
+                std::string summary =
+                    MasterMetricManager::instance().get_summary_string();
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, summary);
+            });
+
+        // Health check endpoint
+        http_server_.set_http_handler<GET>(
+            "/health", [](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, "OK");
+            });
+
+        // Start the HTTP server asynchronously
+        http_server_.async_start();
+        LOG(INFO) << "HTTP metrics server started on port "
+                  << http_server_.port();
     }
 
     GetReplicaListResponse GetReplicaList(const std::string& key) {
@@ -233,6 +278,7 @@ class WrappedMasterService {
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
+    coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
 };
 

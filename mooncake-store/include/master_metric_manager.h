@@ -1,7 +1,6 @@
 #pragma once
 
 #include <mutex>
-#include <sstream>  // For string formatting
 #include <string>
 
 #include "ylt/metric/counter.hpp"
@@ -90,14 +89,6 @@ class MasterMetricManager {
     ylt::metric::counter_d mount_segment_failures_;
     ylt::metric::counter_d unmount_segment_requests_;
     ylt::metric::counter_d unmount_segment_failures_;
-
-    // GC Statistics
-    ylt::metric::counter_d gc_tasks_added_;
-    ylt::metric::counter_d gc_tasks_processed_;
-    ylt::metric::counter_d gc_remove_failures_;
-
-    // Mutex for thread-safe serialization
-    std::mutex serialization_mutex_;
 };
 
 }  // namespace mooncake

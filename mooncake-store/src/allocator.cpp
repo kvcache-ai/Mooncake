@@ -26,9 +26,7 @@ BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0)
-// allocated_bytes_(allocated_bytes) // Removed
-{
+      cur_size_(0) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;

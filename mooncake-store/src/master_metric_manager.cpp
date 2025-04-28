@@ -59,13 +59,7 @@ MasterMetricManager::MasterMetricManager()
           "Total number of UnmountSegment requests received"),
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
-          "Total number of failed UnmountSegment requests"),
-      gc_tasks_added_("master_gc_tasks_added_total",
-                      "Total number of tasks added to the GC queue"),
-      gc_tasks_processed_("master_gc_tasks_processed_total",
-                          "Total number of tasks processed by the GC thread"),
-      gc_remove_failures_("master_gc_remove_failures_total",
-                          "Total number of failures during GC key removal") {}
+          "Total number of failed UnmountSegment requests") {}
 
 // --- Metric Interface Methods ---
 
@@ -138,86 +132,47 @@ void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
 
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
-    std::lock_guard<std::mutex> lock(serialization_mutex_);
+    // Note: Following Prometheus style, metrics with value 0 that haven't
+    // changed will not be included in the output. If all metrics are 0 and
+    // unchanged, this function will return an empty string.
     std::stringstream ss;
-    std::string
-        temp_str;  // Temporary string for individual metric serialization
+
+    // Helper function to serialize a metric and append it to the stringstream
+    auto serialize_metric = [&ss](auto& metric) {
+        std::string metric_str;
+        metric.serialize(metric_str);
+        ss << metric_str;
+    };
 
     // Serialize Gauges
-    allocated_size_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    total_capacity_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    key_count_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
+    serialize_metric(allocated_size_);
+    serialize_metric(total_capacity_);
+    serialize_metric(key_count_);
 
     // Serialize Histogram
-    value_size_distribution_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
+    serialize_metric(value_size_distribution_);
 
     // Serialize Counters
-    put_start_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    put_start_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    put_end_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    put_end_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    put_revoke_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    put_revoke_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    get_replica_list_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    get_replica_list_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    remove_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    remove_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    mount_segment_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    mount_segment_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    unmount_segment_requests_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    unmount_segment_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    gc_tasks_added_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    gc_tasks_processed_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
-    gc_remove_failures_.serialize(temp_str);
-    ss << temp_str;
-    temp_str.clear();
+    serialize_metric(put_start_requests_);
+    serialize_metric(put_start_failures_);
+    serialize_metric(put_end_requests_);
+    serialize_metric(put_end_failures_);
+    serialize_metric(put_revoke_requests_);
+    serialize_metric(put_revoke_failures_);
+    serialize_metric(get_replica_list_requests_);
+    serialize_metric(get_replica_list_failures_);
+    serialize_metric(remove_requests_);
+    serialize_metric(remove_failures_);
+    serialize_metric(mount_segment_requests_);
+    serialize_metric(mount_segment_failures_);
+    serialize_metric(unmount_segment_requests_);
+    serialize_metric(unmount_segment_failures_);
 
     return ss.str();
 }
 
 // --- Human-Readable Summary ---
 std::string MasterMetricManager::get_summary_string() {
-    std::lock_guard<std::mutex> lock(serialization_mutex_);
     std::stringstream ss;
 
     // --- Helper lambda for formatting bytes ---
