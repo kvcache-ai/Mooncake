@@ -327,7 +327,7 @@ int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
     Status s = engine_->submitTransfer(batch_id, {entry});
     if (!s.ok()) return -1;
 
-    return batch_id
+    return batch_id;
 }
 
 int TransferEnginePy::transferCheckStatus(int batch_id) {
