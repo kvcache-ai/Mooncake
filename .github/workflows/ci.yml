@@ -143,6 +143,7 @@ jobs:
 
     - name: Configure and build project with unit tests and examples
       run: |
+        cd build
         cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
         sudo make install -j
       shell: bash
