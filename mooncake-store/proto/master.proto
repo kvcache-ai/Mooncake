@@ -32,6 +32,16 @@ message ReplicaInfo {
   required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status.
 }
 
+// Request to check key existence.
+message ExistKeyRequest {
+  required string key = 1; // Object key.
+}
+
+// Response to check key existence.
+message ExistKeyResponse {
+  required int32 status_code = 1; // Status.
+}
+
 // Request to get replica list.
 message GetReplicaListRequest {
   required string key = 1; // Object key.
@@ -137,4 +147,7 @@ service MasterService {
 
   // Unmount a segment.
   rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
+
+  // Check existence of a key.
+  rpc ExistKey(ExistKeyRequest) returns (ExistKeyResponse);
 }

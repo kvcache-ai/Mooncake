@@ -36,6 +36,8 @@ int main(int argc, char* argv[]) {
 
     mooncake::WrappedMasterService wrapped_master_service(
         FLAGS_enable_gc, FLAGS_enable_metric_reporting, FLAGS_metrics_port);
+    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(

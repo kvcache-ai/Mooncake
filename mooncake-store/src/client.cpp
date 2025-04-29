@@ -363,8 +363,8 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 }
 
 ErrorCode Client::IsExist(const std::string& key) {
-    ObjectInfo object_info;
-    return Query(key, object_info);
+    auto response = master_client_.ExistKey(key);
+    return response.error_code;
 }
 
 ErrorCode Client::TransferData(
