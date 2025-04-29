@@ -78,6 +78,10 @@ enum class ErrorCode : int32_t {
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
+
+    // Persistence errors (Range: -1000 to -1099)
+    BAD_FILE = -1000,  ///< Bad file.
+    BAD_ARGS = -1001,  ///< Bad arguments.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

@@ -7,22 +7,33 @@ target_link_libraries(master_service_test PUBLIC mooncake_store cachelib_memory_
 add_test(NAME master_service_test COMMAND master_service_test)
 
 add_executable(client_integration_test client_integration_test.cpp)
-target_link_libraries(client_integration_test PUBLIC 
-    mooncake_store 
-    cachelib_memory_allocator 
-    glog 
-    gtest 
-    gtest_main 
+target_link_libraries(client_integration_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
     pthread
 )
 add_test(NAME client_integration_test COMMAND client_integration_test)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
-target_link_libraries(stress_workload_test PUBLIC 
-    mooncake_store 
-    cachelib_memory_allocator 
-    glog 
-    gtest 
-    gtest_main 
+target_link_libraries(stress_workload_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
     pthread
 )
+
+add_executable(local_file_test local_file_test.cpp)
+target_link_libraries(local_file_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME local_file_test COMMAND local_file_test)

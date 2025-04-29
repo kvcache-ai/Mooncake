@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     master_client.cpp
     utils.cpp
     master_metric_manager.cpp
+    local_file.cpp
 )
 
 # The cache_allocator library
