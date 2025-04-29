@@ -5,6 +5,7 @@
 #include <queue>
 #include <shared_mutex>
 
+#include "master_metric_manager.h"
 #include "types.h"
 
 namespace mooncake {
@@ -60,6 +61,7 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    MasterMetricManager::instance().dec_total_capacity(it->second->capacity());
     buf_allocators_.erase(it);
     return ErrorCode::OK;
 }
