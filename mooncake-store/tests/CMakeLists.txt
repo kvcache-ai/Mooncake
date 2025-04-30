@@ -37,3 +37,14 @@ target_link_libraries(local_file_test PUBLIC
     pthread
 )
 add_test(NAME local_file_test COMMAND local_file_test)
+
+add_executable(thread_pool_test thread_pool_test.cpp)
+target_link_libraries(thread_pool_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME thread_pool_test COMMAND thread_pool_test)
