@@ -12,6 +12,8 @@ if(CCACHE_FOUND AND ENABLE_CCACHE)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif()
 
+add_compile_definitions(GLOG_USE_GLOG_EXPORT)
+
 option(BUILD_EXAMPLES "Build examples" ON)
 
 # unit test
