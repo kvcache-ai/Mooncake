@@ -13,6 +13,11 @@
 #include "utils/scoped_vlog_timer.h"
 namespace mooncake {
 
+struct ExistKeyResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(ExistKeyResponse, error_code)
+
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replica_list;
     ErrorCode error_code = ErrorCode::OK;
@@ -117,6 +122,25 @@ class WrappedMasterService {
         http_server_.async_start();
         LOG(INFO) << "HTTP metrics server started on port "
                   << http_server_.port();
+    }
+
+    ExistKeyResponse ExistKey(const std::string& key) {
+        ScopedVLogTimer timer(1, "ExistKey");
+        timer.LogRequest("key=", key);
+
+        // Increment request metric
+        MasterMetricManager::instance().inc_exist_key_requests();
+
+        ExistKeyResponse response;
+        response.error_code = master_service_.ExistKey(key);
+
+        // Track failures if needed
+        if (response.error_code != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_exist_key_failures();
+        }
+
+        timer.LogResponseJson(response);
+        return response;
     }
 
     GetReplicaListResponse GetReplicaList(const std::string& key) {

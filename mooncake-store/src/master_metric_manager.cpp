@@ -46,6 +46,12 @@ MasterMetricManager::MasterMetricManager()
       get_replica_list_failures_(
           "master_get_replica_list_failures_total",
           "Total number of failed GetReplicaList requests"),
+      exist_key_requests_(
+          "master_exist_key_requests_total",
+          "Total number of ExistKey requests received"),
+      exist_key_failures_(
+          "master_exist_key_failures_total",
+          "Total number of failed ExistKey requests"),
       remove_requests_("master_remove_requests_total",
                        "Total number of Remove requests received"),
       remove_failures_("master_remove_failures_total",
@@ -87,6 +93,12 @@ void MasterMetricManager::observe_value_size(int64_t size) {
 }
 
 // Operation Statistics (Counters)
+void MasterMetricManager::inc_exist_key_requests(int64_t val) {
+    exist_key_requests_.inc(val);
+}
+void MasterMetricManager::inc_exist_key_failures(int64_t val) {
+    exist_key_failures_.inc(val);
+}
 void MasterMetricManager::inc_put_start_requests(int64_t val) {
     put_start_requests_.inc(val);
 }
@@ -153,6 +165,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(value_size_distribution_);
 
     // Serialize Counters
+    serialize_metric(exist_key_requests_);
+    serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
     serialize_metric(put_end_requests_);
@@ -197,6 +211,8 @@ std::string MasterMetricManager::get_summary_string() {
     double keys = key_count_.value();
 
     // Request counters
+    double exist_keys = exist_key_requests_.value();
+    double exist_key_fails = exist_key_failures_.value();
     double put_starts = put_start_requests_.value();
     double put_start_fails = put_start_failures_.value();
     double put_ends = put_end_requests_.value();
@@ -223,6 +239,8 @@ std::string MasterMetricManager::get_summary_string() {
        << "/" << static_cast<int64_t>(put_starts + put_ends) << ", ";
     ss << "Get=" << static_cast<int64_t>(get_replicas - get_replica_fails)
        << "/" << static_cast<int64_t>(get_replicas) << ", ";
+    ss << "Exist=" << static_cast<int64_t>(exist_keys - exist_key_fails)
+       << "/" << static_cast<int64_t>(exist_keys) << ", ";
     ss << "Del=" << static_cast<int64_t>(removes - remove_fails) << "/"
        << static_cast<int64_t>(removes);
 
