@@ -39,6 +39,8 @@ class MasterMetricManager {
     void inc_put_revoke_failures(int64_t val = 1.0);
     void inc_get_replica_list_requests(int64_t val = 1.0);
     void inc_get_replica_list_failures(int64_t val = 1.0);
+    void inc_exist_key_requests(int64_t val = 1.0);
+    void inc_exist_key_failures(int64_t val = 1.0);
     void inc_remove_requests(int64_t val = 1.0);
     void inc_remove_failures(int64_t val = 1.0);
     void inc_mount_segment_requests(int64_t val = 1.0);
@@ -83,6 +85,8 @@ class MasterMetricManager {
     ylt::metric::counter_d put_revoke_failures_;
     ylt::metric::counter_d get_replica_list_requests_;
     ylt::metric::counter_d get_replica_list_failures_;
+    ylt::metric::counter_d exist_key_requests_;
+    ylt::metric::counter_d exist_key_failures_;
     ylt::metric::counter_d remove_requests_;
     ylt::metric::counter_d remove_failures_;
     ylt::metric::counter_d mount_segment_requests_;

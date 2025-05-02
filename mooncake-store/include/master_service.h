@@ -105,6 +105,12 @@ class MasterService {
     ErrorCode UnmountSegment(const std::string& segment_name);
 
     /**
+     * @brief Check if an object exists
+     * @return ErrorCode::OK if exists, otherwise return other ErrorCode
+     */
+    ErrorCode ExistKey(const std::string& key);
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
