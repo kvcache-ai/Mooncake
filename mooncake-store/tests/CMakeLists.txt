@@ -48,3 +48,14 @@ target_link_libraries(thread_pool_test PUBLIC
     pthread
 )
 add_test(NAME thread_pool_test COMMAND thread_pool_test)
+
+add_executable(file_storage_backend_test file_storage_backend_test.cpp)
+target_link_libraries(file_storage_backend_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME file_storage_backend_test COMMAND file_storage_backend_test)

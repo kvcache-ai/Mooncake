@@ -57,11 +57,12 @@ class LocalFile {
 
     const char *getFileName() const { return file_name_.c_str(); }
 
-    ErrorCode error_code_;
+    ErrorCode error_code() const { return error_code_; }
 
    private:
     std::string file_name_;
     FILE *file_;
+    ErrorCode error_code_;
 };
 
 }  // namespace mooncake

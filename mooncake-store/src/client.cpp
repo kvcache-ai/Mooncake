@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdint>
 
+#include "file_storage_backend.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -24,7 +25,16 @@ namespace mooncake {
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring),
+      background_writer_(2) {
+    const char* env_path = std::getenv("MOONCAKE_SSD_PATH");
+    if (env_path && *env_path) {
+        SetLocalSSDPath(env_path);
+        LOG(INFO) << "Initialized storage backend with path from MOONCAKE_SSD_PATH: " << env_path;
+    } else {
+        LOG(WARNING) << "MOONCAKE_SSD_PATH not set, persistent storage will be disabled.";
+    }
+}
 
 Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
@@ -42,6 +52,9 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
+
+    // Exit back ground writer thread pool
+    background_writer_.exit();
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
@@ -168,8 +181,21 @@ ErrorCode Client::Get(const std::string& object_key,
                       std::vector<Slice>& slices) {
     ObjectInfo object_info;
     auto err = Query(object_key, object_info);
-    if (err != ErrorCode::OK) return err;
-    return Get(object_key, object_info, slices);
+    if (err == ErrorCode::OK) {
+        return Get(object_key, object_info, slices);
+    }
+
+    if (err == ErrorCode::NOT_FOUND) {
+        if (storage_backend_) {
+            ErrorCode local_err = storage_backend_->Read(object_key, slices);
+            if (local_err == ErrorCode::OK) {
+                LOG(INFO) << "Read key=" << object_key << " from persistent storage.";
+                return ErrorCode::OK;
+            }
+            LOG(WARNING) << "Key=" << object_key << " not found in persistent storage.";
+        }
+    }
+    return err;
 }
 
 ErrorCode Client::Query(const std::string& object_key,
@@ -265,7 +291,25 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
+    SaveToPersistentStorage(key, slices);
+
     return ErrorCode::OK;
+}
+
+void Client::SetLocalSSDPath(const std::string& path) {
+    local_ssd_path_ = path;
+    if (!std::filesystem::exists(local_ssd_path_)) {
+        std::filesystem::create_directories(local_ssd_path_);
+    }
+    storage_backend_ = std::make_shared<FileStorageBackend>(local_ssd_path_);
+}
+
+void Client::SaveToPersistentStorage(const ObjectKey& key, const std::vector<Slice>& slices) {
+    if (!storage_backend_) return;
+    background_writer_.enqueue([backend = storage_backend_, key, slices] {
+        backend->Write(key, slices);
+    });
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {

@@ -8,6 +8,8 @@
 
 #include "master_client.h"
 #include "rpc_service.h"
+#include "thread_pool.h"
+#include "storage_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
 
@@ -159,6 +161,11 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    void SetLocalSSDPath(const std::string& path);
+
+    void SaveToPersistentStorage(
+        const ObjectKey& key, const std::vector<Slice>& slices);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
@@ -170,6 +177,11 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // Persistence
+    std::string local_ssd_path_;
+    ThreadPool background_writer_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 };
 
 }  // namespace mooncake

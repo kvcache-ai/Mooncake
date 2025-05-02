@@ -59,7 +59,7 @@ TEST_F(LocalFileTest, TestRead) {
     LocalFile bad_file("bad_file.txt", nullptr);
     bytes_read = bad_file.read(buffer, sizeof(buffer) - 1);
     ASSERT_EQ(bytes_read, -1);
-    ASSERT_EQ(bad_file.error_code_, ErrorCode::BAD_FILE);
+    ASSERT_EQ(bad_file.error_code(), ErrorCode::BAD_FILE);
 
 }
 
@@ -89,7 +89,7 @@ TEST_F(LocalFileTest, TestWrite) {
     LocalFile bad_file("bad_file.txt", nullptr);
     bytes_written = bad_file.write(write_data, strlen(write_data));
     ASSERT_EQ(bytes_written, -1);
-    ASSERT_EQ(bad_file.error_code_, ErrorCode::BAD_FILE);
+    ASSERT_EQ(bad_file.error_code(), ErrorCode::BAD_FILE);
 
 }
 
@@ -136,7 +136,7 @@ TEST_F(LocalFileTest, TestPreadv) {
     LocalFile bad_file("bad_file.txt", nullptr);
     bytes_read = bad_file.preadv(iov, 3, 0);
     ASSERT_EQ(bytes_read, -1);
-    ASSERT_EQ(bad_file.error_code_, ErrorCode::BAD_FILE);
+    ASSERT_EQ(bad_file.error_code(), ErrorCode::BAD_FILE);
 }
 
 TEST_F(LocalFileTest, TestPwritev) {
@@ -169,7 +169,7 @@ TEST_F(LocalFileTest, TestPwritev) {
     LocalFile bad_file("bad_file.txt", nullptr);
     bytes_written = bad_file.pwritev(iov, 1, 0);
     ASSERT_EQ(bytes_written, -1);
-    ASSERT_EQ(bad_file.error_code_, ErrorCode::BAD_FILE);
+    ASSERT_EQ(bad_file.error_code(), ErrorCode::BAD_FILE);
 
 }
 
@@ -185,7 +185,7 @@ TEST_F(LocalFileTest, TestErrorCodes) {
     // Test error code when file is null
     LocalFile bad_file("bad_file.txt", nullptr);
     bad_file.read(nullptr, 0);
-    ASSERT_EQ(bad_file.error_code_, ErrorCode::BAD_FILE);
+    ASSERT_EQ(bad_file.error_code(), ErrorCode::BAD_FILE);
 
 }
 

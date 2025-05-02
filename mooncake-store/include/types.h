@@ -82,6 +82,7 @@ enum class ErrorCode : int32_t {
     // Persistence errors (Range: -1000 to -1099)
     BAD_FILE = -1000,  ///< Bad file.
     BAD_ARGS = -1001,  ///< Bad arguments.
+    NOT_FOUND = -1002,  ///< Not found.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
