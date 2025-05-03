@@ -220,7 +220,7 @@ void RdmaEndPoint::disconnectUnlocked() {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) PLOG(ERROR) << "Failed to modify QP to RESET";
     }
-    peer_nic_path_.clear();
+    // peer_nic_path_.clear();
     for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
     status_.store(UNCONNECTED, std::memory_order_release);
 }

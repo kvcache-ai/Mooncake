@@ -266,7 +266,7 @@ void WorkerPool::performPollCq(int thread_id) {
                                << slice->opcode
                                << ", source_addr: " << slice->source_addr
                                << ", length: " << slice->length
-                               << ", dest_addr: " << slice->rdma.dest_addr
+                               << ", dest_addr: " << (void *) slice->rdma.dest_addr
                                << ", local_nic: " << context_.deviceName()
                                << ", peer_nic: " << slice->peer_nic_path
                                << ", dest_rkey: " << slice->rdma.dest_rkey
