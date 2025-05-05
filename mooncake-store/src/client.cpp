@@ -23,16 +23,17 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::string& storage_root_path)
     : local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
+      storage_root_path_(storage_root_path),
       background_writer_(2) {
-    const char* env_path = std::getenv("MOONCAKE_SSD_PATH");
-    if (env_path && *env_path) {
-        SetLocalSSDPath(env_path);
-        LOG(INFO) << "Initialized storage backend with path from MOONCAKE_SSD_PATH: " << env_path;
+    if (!storage_root_path_.empty()) {
+        PrepareStorageRoot(storage_root_path_);
+        LOG(INFO) << "Initialized storage backend: " << storage_root_path_;
     } else {
-        LOG(WARNING) << "MOONCAKE_SSD_PATH not set, persistent storage will be disabled.";
+        LOG(WARNING) << "storage_root_path not set, persistent storage will be disabled.";
     }
 }
 
@@ -153,9 +154,9 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_addr) {
+    const std::string& master_addr, const std::string& storage_root_path) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, storage_root_path));
 
     // Connect to master service
     ErrorCode err = client->ConnectToMaster(master_addr);
@@ -297,12 +298,11 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     return ErrorCode::OK;
 }
 
-void Client::SetLocalSSDPath(const std::string& path) {
-    local_ssd_path_ = path;
-    if (!std::filesystem::exists(local_ssd_path_)) {
-        std::filesystem::create_directories(local_ssd_path_);
+void Client::PrepareStorageRoot(const std::string& path) {
+    if (!std::filesystem::exists(storage_root_path_)) {
+        std::filesystem::create_directories(storage_root_path_);
     }
-    storage_backend_ = std::make_shared<FileStorageBackend>(local_ssd_path_);
+    storage_backend_ = std::make_shared<FileStorageBackend>(storage_root_path_);
 }
 
 void Client::SaveToPersistentStorage(const ObjectKey& key, const std::vector<Slice>& slices) {

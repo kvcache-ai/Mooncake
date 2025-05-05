@@ -6,6 +6,7 @@
 
 namespace mooncake {
 
+static const std::string kDefaultStorageRootPath = "";
 class StorageBackend {
  public:
   virtual ~StorageBackend() = default;

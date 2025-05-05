@@ -36,7 +36,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_addr = kDefaultMasterAddress,
+        const std::string& storage_root_path = kDefaultStorageRootPath);
 
     /**
      * @brief Retrieves data for a given key
@@ -141,7 +142,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::string& storage_root_path);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -161,7 +163,7 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
-    void SetLocalSSDPath(const std::string& path);
+    void PrepareStorageRoot(const std::string& path);
 
     void SaveToPersistentStorage(
         const ObjectKey& key, const std::vector<Slice>& slices);
@@ -179,7 +181,7 @@ class Client {
     const std::string metadata_connstring_;
 
     // Persistence
-    std::string local_ssd_path_;
+    std::string storage_root_path_;
     ThreadPool background_writer_;
     std::shared_ptr<StorageBackend> storage_backend_;
 };

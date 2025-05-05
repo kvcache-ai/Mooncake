@@ -22,7 +22,8 @@ class DistributedObjectStore {
               const std::string &master_server_addr = "127.0.0.1:50051");
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
+                size_t mount_segment_size = 1024 * 1024 * 16, // Default 16MB
+                const std::string &storage_root_path);
 
     int put(const std::string &key, const std::string &value);
 
