@@ -87,6 +87,12 @@ class Client {
     ErrorCode Remove(const ObjectKey& key);
 
     /**
+     * @brief Removes all objects and all its replicas
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode RemoveAll();
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param segment_name Unique identifier for the segment
      * @param buffer Memory buffer to register

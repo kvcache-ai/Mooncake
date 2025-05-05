@@ -22,12 +22,14 @@ class MasterMetricManager {
     // Storage Metrics
     void inc_allocated_size(int64_t val = 1.0);
     void dec_allocated_size(int64_t val = 1.0);
+    void reset_allocated_size();
     void inc_total_capacity(int64_t val = 1.0);
     void dec_total_capacity(int64_t val = 1.0);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1.0);
     void dec_key_count(int64_t val = 1.0);
+    void reset_key_count();
     void observe_value_size(int64_t size);
 
     // Operation Statistics (Counters)
@@ -43,6 +45,8 @@ class MasterMetricManager {
     void inc_exist_key_failures(int64_t val = 1.0);
     void inc_remove_requests(int64_t val = 1.0);
     void inc_remove_failures(int64_t val = 1.0);
+    void inc_remove_all_requests(int64_t val = 1.0);
+    void inc_remove_all_failures(int64_t val = 1.0);
     void inc_mount_segment_requests(int64_t val = 1.0);
     void inc_mount_segment_failures(int64_t val = 1.0);
     void inc_unmount_segment_requests(int64_t val = 1.0);
@@ -89,6 +93,8 @@ class MasterMetricManager {
     ylt::metric::counter_d exist_key_failures_;
     ylt::metric::counter_d remove_requests_;
     ylt::metric::counter_d remove_failures_;
+    ylt::metric::counter_d remove_all_requests_;
+    ylt::metric::counter_d remove_all_failures_;
     ylt::metric::counter_d mount_segment_requests_;
     ylt::metric::counter_d mount_segment_failures_;
     ylt::metric::counter_d unmount_segment_requests_;

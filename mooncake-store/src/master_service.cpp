@@ -318,6 +318,21 @@ ErrorCode MasterService::Remove(const std::string& key) {
     return ErrorCode::OK;
 }
 
+ErrorCode MasterService::RemoveAll() {
+    for (auto& shard : metadata_shards_) {
+        std::unique_lock<std::mutex> lock(shard.mutex);
+
+        // Clear all metadata
+        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); ) {
+            // Remove metadata will trigger replica deletion.
+            it = shard.metadata.erase(it);
+        }
+    }
+
+    VLOG(1) << "action=remove_all_objects";
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
     // Create a new GC task and add it to the queue
     GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
