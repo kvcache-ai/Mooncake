@@ -265,13 +265,11 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     auto endpoint = endpoint_store_->getEndpoint(peer_nic_path);
     if (endpoint) {
         return endpoint;
-    } else {
-        auto endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
-        return endpoint;
     }
 
+    endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
     endpoint_store_->reclaimEndpoint();
-    return nullptr;
+    return endpoint;
 }
 
 int RdmaContext::disconnectAllEndpoints() {
@@ -328,13 +326,13 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
-            PLOG(ERROR) << "Failed to query GID " << i << " on "
-                        << device_name << "/" << port;
-            continue; // if gid is invalid ibv_query_gid_ex() will return !0
+            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
+                        << "/" << port;
+            continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
         if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
-            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2)
-            || gid_entry.gid_type == IBV_GID_TYPE_IB) {
+             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+            gid_entry.gid_type == IBV_GID_TYPE_IB) {
             gid_index = i;
             break;
         }
