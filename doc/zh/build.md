@@ -66,7 +66,7 @@
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel \
+                libcurl-devel
     ```
 
     注意：如果源没有gtest, glog, gflags, 则需要通过源码安装
@@ -113,8 +113,10 @@
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
-- `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，注意 go 1.22+
+- `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，注意 go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: 启用 Rust 支持
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
+- `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
+- `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON

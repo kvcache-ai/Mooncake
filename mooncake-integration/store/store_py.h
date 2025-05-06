@@ -13,6 +13,10 @@
 
 class DistributedObjectStore;
 
+// Forward declarations
+class SliceGuard;
+class SliceBuffer;
+
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
    public:
@@ -46,8 +50,52 @@ class ResourceTracker {
     std::unordered_set<DistributedObjectStore *> instances_;
 };
 
+/**
+ * @brief A class that holds a contiguous buffer of data
+ * This class is responsible for freeing the buffer when it's destroyed (RAII)
+ */
+class SliceBuffer {
+   public:
+    /**
+     * @brief Construct a new SliceBuffer object with contiguous memory
+     * @param store Reference to the DistributedObjectStore that owns the
+     * allocator
+     * @param buffer Pointer to the contiguous buffer
+     * @param size Size of the buffer in bytes
+     * @param use_allocator_free If true, use SimpleAllocator to free the
+     * buffer, otherwise use delete[]
+     */
+    SliceBuffer(DistributedObjectStore &store, void *buffer, uint64_t size,
+                bool use_allocator_free = true);
+
+    /**
+     * @brief Destructor that frees the buffer
+     */
+    ~SliceBuffer();
+
+    /**
+     * @brief Get a pointer to the data
+     * @return void* Pointer to the dat
+     */
+    void *ptr() const;
+
+    /**
+     * @brief Get the size of the data
+     * @return uint64_t Size of the data in bytes
+     */
+    uint64_t size() const;
+
+   private:
+    DistributedObjectStore &store_;
+    void *buffer_;
+    uint64_t size_;
+    bool use_allocator_free_;  // Flag to control deallocation method
+};
+
 class DistributedObjectStore {
    public:
+    friend class SliceGuard;   // Allow SliceGuard to access private members
+    friend class SliceBuffer;  // Allow SliceBuffer to access private members
     DistributedObjectStore();
     ~DistributedObjectStore();
 
@@ -62,9 +110,20 @@ class DistributedObjectStore {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
-    int put(const std::string &key, const std::string &value);
+    int put(const std::string &key, std::span<const char> value);
+
+    int put_parts(const std::string &key,
+                  std::vector<std::span<const char>> values);
 
     pybind11::bytes get(const std::string &key);
+
+    /**
+     * @brief Get a buffer containing the data for a key
+     * @param key Key to get data for
+     * @return std::shared_ptr<SliceBuffer> Buffer containing the data, or
+     * nullptr if error
+     */
+    std::shared_ptr<SliceBuffer> get_buffer(const std::string &key);
 
     int remove(const std::string &key);
 
@@ -93,13 +152,19 @@ class DistributedObjectStore {
                        const mooncake::Client::ObjectInfo &object_info,
                        uint64_t &length);
 
+    int allocateSlices(std::vector<mooncake::Slice> &slices,
+                       std::span<const char> value);
+
+    int allocateSlicesPacked(std::vector<mooncake::Slice> &slices,
+                             const std::vector<std::span<const char>> &parts);
+
     char *exportSlices(const std::vector<mooncake::Slice> &slices,
                        uint64_t length);
 
     int freeSlices(const std::vector<mooncake::Slice> &slices);
 
    public:
-    std::unique_ptr<mooncake::Client> client_ = nullptr;
+    std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::unique_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
         nullptr;
     struct SegmentDeleter {

@@ -170,9 +170,13 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         disconnectUnlocked();
     }
 
-    peer_nic_path_ = peer_desc.local_nic_path;
-    if (peer_desc.peer_nic_path != context_.nicPath()) {
-        local_desc.reply_msg = "Invalid argument: peer nic path inconsistency";
+    if (peer_desc.peer_nic_path != context_.nicPath() ||
+        peer_desc.local_nic_path != peer_nic_path_) {
+        local_desc.reply_msg =
+            "Invalid argument: peer nic path inconsistency, expect " +
+            context_.nicPath() + " + " + peer_nic_path_ + ", while got " +
+            peer_desc.peer_nic_path + " + " + peer_desc.local_nic_path;
+
         LOG(ERROR) << local_desc.reply_msg;
         return ERR_REJECT_HANDSHAKE;
     }
@@ -220,7 +224,6 @@ void RdmaEndPoint::disconnectUnlocked() {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) PLOG(ERROR) << "Failed to modify QP to RESET";
     }
-    peer_nic_path_.clear();
     for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
     status_.store(UNCONNECTED, std::memory_order_release);
 }

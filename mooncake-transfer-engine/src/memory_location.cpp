@@ -41,8 +41,8 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     cudaError_t result;
     result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
-        LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << cudaGetErrorString(result) << ")" << std::endl;
+        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
+                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }

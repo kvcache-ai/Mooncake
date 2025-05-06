@@ -18,7 +18,6 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
-#include <boost/asio.hpp>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -30,6 +29,7 @@
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "ylt/coro_io/coro_io.hpp"
 
 namespace mooncake {
 class TransferMetadata;

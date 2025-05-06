@@ -34,6 +34,14 @@ class MasterClient {
         const std::string& master_addr = kDefaultMasterAddress);
 
     /**
+     * @brief Checks if an object exists
+     * @param object_key Key to query
+     * @return ErrorCode indicating exist or not
+     */
+    [[nodiscard]] ExistKeyResponse ExistKey(
+        const std::string& object_key);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
      * @param object_info Output parameter for object metadata

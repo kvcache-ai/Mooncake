@@ -15,7 +15,9 @@
 #include "multi_transport.h"
 
 #include "transport/rdma_transport/rdma_transport.h"
+#ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
+#endif
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
@@ -128,9 +130,12 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     Transport *transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
-    } else if (std::string(proto) == "tcp") {
+    }
+#ifdef USE_TCP
+    else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
     }
+#endif
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();

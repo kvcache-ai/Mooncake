@@ -116,13 +116,14 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            context_.engine().meta()->dumpMetadataContent(
-                peer_segment_desc->name, slice->rdma.dest_addr, slice->length);
-
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 slice->markFailed();
+
+                context_.engine().meta()->dumpMetadataContent(
+                    peer_segment_desc->name, slice->rdma.dest_addr,
+                    slice->length);
                 continue;
             }
         }
@@ -271,7 +272,7 @@ void WorkerPool::performPollCq(int thread_id) {
                                << slice->opcode
                                << ", source_addr: " << slice->source_addr
                                << ", length: " << slice->length
-                               << ", dest_addr: " << slice->rdma.dest_addr
+                               << ", dest_addr: " << (void *) slice->rdma.dest_addr
                                << ", local_nic: " << context_.deviceName()
                                << ", peer_nic: " << slice->peer_nic_path
                                << ", dest_rkey: " << slice->rdma.dest_rkey
