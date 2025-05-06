@@ -117,7 +117,7 @@ jobs:
         deactivate
       shell: bash
   
-  build_with_all_flags:
+  build-flags:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -130,10 +130,23 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
     
-    - name: Configure and build project with all settings are ON
+    - name: Install dependencies
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+      shell: bash
+
+    - name: Build transfer engine only
+      run: |
+        cd mooncake-transfer-engine
+        mkdir build
+        cd build
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+        sudo make install -j
+      shell: bash
+
+    - name: Configure and build project with all settings are ON
+      run: |
         mkdir build
         cd build
         cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
