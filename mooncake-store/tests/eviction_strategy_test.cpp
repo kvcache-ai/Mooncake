@@ -87,8 +87,8 @@ TEST_F(EvictionStrategyTest, FIFOAddAndRemoveKey) {
     EXPECT_EQ(eviction_strategy.GetSize(), 2);
 
     // Remove a key
-    EXPECT_EQ(eviction_strategy.RemoveKey("key1"), ErrorCode::OK);
-    EXPECT_EQ(eviction_strategy.GetSize(), 1);
+    EXPECT_EQ(eviction_strategy.RemoveKey("key1"), ErrorCode::OK); // FIFO not support remove a randomly accessed key
+    EXPECT_EQ(eviction_strategy.GetSize(), 2);
 
     // Clean up
     eviction_strategy.CleanUp();
