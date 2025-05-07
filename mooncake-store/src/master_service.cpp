@@ -67,6 +67,7 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 MasterService::MasterService(bool enable_gc)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      eviction_strategy_(std::make_shared<LRUEvictionStrategy>()),
       enable_gc_(enable_gc) {
     // Start the GC thread if enabled
     if (enable_gc_) {
@@ -76,11 +77,7 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
-#ifdef USE_LRU_MASTER
-    LOG(INFO) << "### LRU enabled ###";
-    all_key_list_.clear();
-    all_key_idx_map_.clear();
-#endif
+    eviction_strategy_.CleanUp();
 }
 
 MasterService::~MasterService() {
@@ -97,11 +94,10 @@ MasterService::~MasterService() {
             delete task;
         }
     }
-#ifdef USE_LRU_MASTER
+
     LOG(INFO) << "### LRU cleared ###";
-    all_key_list_.clear();
-    all_key_idx_map_.clear();
-#endif
+    eviction_strategy_.CleanUp();
+
 }
 
 ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
@@ -124,25 +120,11 @@ ErrorCode MasterService::GetReplicaList(
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
-#ifdef USE_LRU_MASTER
-        if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
-        {
-            all_key_list_.erase(all_key_idx_map_[key]);
-            all_key_idx_map_.erase(key);
-        } 
-#endif
+        // If the object is not found, we should synchronize the EvictionStrategy
+        eviction_strategy_->RemoveKey(key);
         return ErrorCode::OBJECT_NOT_FOUND;
     }
-#ifdef USE_LRU_MASTER
-    LOG(INFO) << "### LRU Update in Get() ###";
-    if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
-    {
-        all_key_list_.erase(all_key_idx_map_[key]);
-        all_key_idx_map_.erase(key);
-    }
-    all_key_list_.push_front(key);
-    all_key_idx_map_[key] = all_key_list_.begin();
-#endif
+    eviction_strategy_->UpdateKey(key);
     auto& metadata = accessor.Get();
     for (const auto& replica : metadata.replicas) {
         auto status = replica.status();
@@ -177,24 +159,16 @@ ErrorCode MasterService::PutStart(
                    << ", error=invalid_params";
         return ErrorCode::INVALID_PARAMS;
     }
-#ifdef USE_LRU_MASTER
+
     LOG(INFO) << "### LRU Update in Put() ###";
-    if(all_key_idx_map_.find(key) != all_key_idx_map_.end())
+    eviction_strategy_->AddKey(key);
+    if(eviction_strategy_.GetSize() >= LRU_MAX_CAPACITY)
     {
-        all_key_list_.erase(all_key_idx_map_[key]);
-        all_key_idx_map_.erase(key);
-    }
-    all_key_list_.push_front(key);
-    all_key_idx_map_[key] = all_key_list_.begin();
-    if(all_key_list_.size() >= LRU_MAX_CAPACITY)
-    {
-        std::string evicted_key = all_key_list_.back();
-        all_key_list_.pop_back();
-        all_key_idx_map_.erase(evicted_key);
+        std::string evicted_key = eviction_strategy_->EvictKey();
         LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
         Remove(evicted_key);
     }
-#endif
+
 
     // Validate slice lengths
     uint64_t total_length = 0;
