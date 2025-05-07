@@ -3,6 +3,7 @@ add_subdirectory(common)
 add_subdirectory(metadata)
 add_subdirectory(transport)
 add_subdirectory(utility)
+add_subdirectory(transport_v1)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
@@ -27,7 +28,7 @@ endif()
 target_link_libraries(
     transfer_engine
     PUBLIC
-    common utility transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread
+    common utility transport_v1 transport_rdma_v1 transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread
     )
 
 if (USE_CUDA)
