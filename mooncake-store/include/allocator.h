@@ -1,10 +1,12 @@
 #ifndef BUFFER_ALLOCATOR_H
 #define BUFFER_ALLOCATOR_H
 
+#include <atomic>
 #include <memory>
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
+#include "master_metric_manager.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
@@ -50,11 +52,13 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
 
    private:
     // metadata
-    std::string segment_name_;
-    size_t base_;
-    size_t total_size_;
-    std::atomic<size_t> cur_size_{0};
+    const std::string segment_name_;
+    const size_t base_;
+    const size_t total_size_;
+    std::atomic_size_t cur_size_;
 
+    // metrics - removed allocated_bytes_ member
+    // ylt::metric::gauge_t* allocated_bytes_{nullptr};
     // cachelib
     std::unique_ptr<char[]> header_region_start_;
     size_t header_region_size_;

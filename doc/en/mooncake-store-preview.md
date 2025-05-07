@@ -568,7 +568,11 @@ retcode = store.setup(
 ```
 
 2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+
 No error messages indicate successful data transfer.
 
 ## Example Code

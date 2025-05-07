@@ -203,6 +203,24 @@ fi
 
 print_section "Installing Go $GOVER"
 
+install_go() {
+    # Download Go
+    echo "Downloading Go $GOVER..."
+    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-amd64.tar.gz
+    check_success "Failed to download Go $GOVER"
+
+    # Install Go
+    echo "Installing Go $GOVER..."
+    tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
+    check_success "Failed to install Go $GOVER"
+
+    # Clean up downloaded file
+    rm -f go$GOVER.linux-amd64.tar.gz
+    check_success "Failed to clean up Go installation file"
+
+    print_success "Go $GOVER installed successfully"
+}
+
 # Check if Go is already installed
 if command -v go &> /dev/null; then
     GO_VERSION=$(go version | awk '{print $3}')
@@ -210,24 +228,11 @@ if command -v go &> /dev/null; then
         echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
     else
         echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
+        install_go
     fi
+else
+    install_go
 fi
-
-# Download Go
-echo "Downloading Go $GOVER..."
-wget -q --show-progress https://go.dev/dl/go$GOVER.linux-amd64.tar.gz
-check_success "Failed to download Go $GOVER"
-
-# Install Go
-echo "Installing Go $GOVER..."
-tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
-check_success "Failed to install Go $GOVER"
-
-# Clean up downloaded file
-rm -f go$GOVER.linux-amd64.tar.gz
-check_success "Failed to clean up Go installation file"
-
-print_success "Go $GOVER installed successfully"
 
 # Add Go to PATH if not already there
 if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then

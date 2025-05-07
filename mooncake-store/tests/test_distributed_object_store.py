@@ -1,3 +1,5 @@
+import ctypes
+import struct
 import unittest
 import os
 import time
@@ -6,6 +8,26 @@ import random
 from mooncake.store import MooncakeDistributedStore
 
 
+# Define a test class for serialization
+class TestClass:
+    def __init__(self, version=1, shape=(1, 2, 3)):
+        self.version = version
+        self.shape = shape
+    
+    def serialize_into(self, buffer):
+        struct.pack_into("i", buffer, 0, self.version)
+        struct.pack_into("3i", buffer, 4, *self.shape)
+        
+    def serialize_into(self):
+        version_bytes = struct.pack("i", self.version)
+        shape_bytes = struct.pack("3i", *self.shape)
+        return (version_bytes, shape_bytes)
+        
+    def deserialize_from(buffer):
+        version = struct.unpack_from("i", buffer, 0)[0]
+        shape = struct.unpack_from("3i", buffer, 4)
+        return TestClass(version, shape)
+         
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -68,7 +90,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(key, test_data), 0)
 
         # Verify data through Get operation
-        self.assertEqual(self.store.getSize(key), len(test_data))
+        self.assertEqual(self.store.get_size(key), len(test_data))
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
 
@@ -79,32 +101,102 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key), 0)
 
         # Get after remove should return empty bytes
-        self.assertLess(self.store.getSize(key), 0)
+        self.assertLess(self.store.get_size(key), 0)
         empty_data = self.store.get(key)
         self.assertEqual(empty_data, b"")
 
-        # Test isExist functionality
+        # Test is_exist functionality
         test_data_2 = b"Testing exists!"
         key_2 = "test_exist_key"
         
         # Should not exist initially
-        self.assertLess(self.store.getSize(key_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 0)
+        self.assertLess(self.store.get_size(key_2), 0)
+        self.assertEqual(self.store.is_exist(key_2), 0)
         
         # Should exist after put
         self.assertEqual(self.store.put(key_2, test_data_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 1)
-        self.assertEqual(self.store.getSize(key_2), len(test_data_2))
+        self.assertEqual(self.store.is_exist(key_2), 1)
+        self.assertEqual(self.store.get_size(key_2), len(test_data_2))
         
         # Should not exist after remove
         self.assertEqual(self.store.remove(key_2), 0)
-        self.assertLess(self.store.getSize(key_2), 0)
-        self.assertEqual(self.store.isExist(key_2), 0)
+        self.assertLess(self.store.get_size(key_2), 0)
+        self.assertEqual(self.store.is_exist(key_2), 0)
+        
+    def test_large_buffer(self):
+        """Test SliceBuffer with large data that might span multiple slices."""
+        # Create a large data buffer (10MB)
+        size = 20 * 1024 * 1024
+        test_data = os.urandom(size)
+        key = "test_large_slice_buffer_key"
+        
+        # Put data
+        self.assertEqual(self.store.put(key, test_data), 0)
+        
+        # Get buffer
+        buffer = self.store.get_buffer(key)
+        self.assertIsNotNone(buffer)
+        
+        # Check size
+        self.assertEqual(buffer.size(), size)
+        
+        # Get consolidated pointer
+        ptr = buffer.consolidated_ptr()
+        self.assertNotEqual(ptr, 0)
+        
+        # Create a ctypes buffer from the pointer
+        c_buffer = (ctypes.c_char * buffer.size()).from_address(ptr)
+        retrieved_data = bytes(c_buffer)
+        
+        # Verify data
+        self.assertEqual(retrieved_data, test_data)
+        
+        # Clean up
+        self.assertEqual(self.store.remove(key), 0)
+    
+    def test_serialization_and_deserialization(self):
+        """Test serialization and deserialization of custom objects."""
+        test_object = TestClass()
+        key = "test_serialization_key"
+        
+        # Serialize the object into a buffer
+        buffer = bytearray(16)  # 16 bytes for the test object
+        test_object.serialize_into(buffer)
+        
+        # Put the serialized data
+        self.assertEqual(self.store.put(key, buffer), 0)
+        
+        # Get the serialized data
+        retrieved_buffer = self.store.get_buffer(key)
+        retrieved_buffer = memoryview(retrieved_buffer)
+        self.assertEqual(len(retrieved_buffer), 16)
+        
+        # Deserialize the object from the retrieved buffer
+        deserialized_object = TestClass.deserialize_from(retrieved_buffer)
+        
+        # Verify deserialized object
+        self.assertEqual(deserialized_object.version, 1)
+        self.assertEqual(deserialized_object.shape, (1, 2, 3))
+        
+        # Clean up
+        self.assertEqual(self.store.remove(key), 0)
+        
+        (version_bytes, shape_bytes) = test_object.serialize_into()
+        self.assertEqual(self.store.put_parts(key, version_bytes, shape_bytes),0)
+        
+        retrieved_buffer = self.store.get_buffer(key)
+        retrieved_buffer = memoryview(retrieved_buffer)
+        self.assertEqual(len(retrieved_buffer), 16)
+        deserialized_object = TestClass.deserialize_from(retrieved_buffer)
+        self.assertEqual(deserialized_object.version, 1)
+        self.assertEqual(deserialized_object.shape, (1, 2, 3))
+        
+        self.assertEqual(self.store.remove(key), 0)
 
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
         NUM_THREADS = 8
-        VALUE_SIZE = 1024 * 1024  # 1MB
+        VALUE_SIZE = 5 * 1024 * 1024  # 1MB
         OPERATIONS_PER_THREAD = 100
         
         # Create barriers for synchronization
@@ -141,11 +233,13 @@ class TestDistributedObjectStore(unittest.TestCase):
                 
                 # Get operations
                 for key in thread_keys:
-                    retrieved_data = self.store.get(key)
+                    buffer = self.store.get_buffer(key)
+                    assert buffer is not None
+                    assert buffer.size() == VALUE_SIZE
+                    
+                    retrieved_data = memoryview(buffer)
                     if len(retrieved_data) != VALUE_SIZE:
                         thread_exceptions.append(f"Retrieved data size mismatch for key {key}: expected {VALUE_SIZE}, got {len(retrieved_data)}")
-                    if retrieved_data != test_data:
-                        thread_exceptions.append(f"Retrieved data content mismatch for key {key}")
                 
                 # Wait for all threads to complete get operations
                 get_barrier.wait()

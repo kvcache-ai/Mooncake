@@ -64,6 +64,11 @@ class TransferEnginePy {
     int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
                           uintptr_t peer_buffer_address, size_t length);
 
+    int transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
+                            uintptr_t peer_buffer_address, size_t length);
+
+    int transferCheckStatus(int batch_id);
+
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length);
 

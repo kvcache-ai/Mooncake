@@ -5,6 +5,7 @@
 #include <queue>
 #include <shared_mutex>
 
+#include "master_metric_manager.h"
 #include "types.h"
 
 namespace mooncake {
@@ -60,6 +61,7 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    MasterMetricManager::instance().dec_total_capacity(it->second->capacity());
     buf_allocators_.erase(it);
     return ErrorCode::OK;
 }
@@ -107,6 +109,26 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
     return buffer_allocator_manager_->RemoveSegment(segment_name);
+}
+
+ErrorCode MasterService::ExistKey(const std::string& key) {
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+
+    auto& metadata = accessor.Get();
+    for (const auto& replica : metadata.replicas) {
+        auto status = replica.status();
+        if (status != ReplicaStatus::COMPLETE) {
+            LOG(WARNING) << "key=" << key << ", status=" << status
+                         << ", error=replica_not_ready";
+            return ErrorCode::REPLICA_IS_NOT_READY;
+        }
+    }
+
+    return ErrorCode::OK;
 }
 
 ErrorCode MasterService::GetReplicaList(

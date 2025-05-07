@@ -24,7 +24,7 @@ This document describes how to build Mooncake.
    ```
 3. Install Mooncake python package and mooncake_master executable
    ```bash
-   make install
+   sudo make install
    ```
 
 Note: If you plan to use Mooncake Store with vLLM, you need to have the package `mooncake_vllm_adaptor` installed in your active python library. You can verify if the package exists by running `python -c "import mooncake_vllm_adaptor"`. If the package is missing, you can manually copy the built shared library into your python library directory (e.g. `cp ./build/mooncake-integration/mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so .venv/lib/python3.10/site-packages/`)
@@ -46,14 +46,21 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
     ```bash
     # For debian/ubuntu
     apt-get install -y build-essential \
-                   cmake \
-                   libibverbs-dev \
-                   libgoogle-glog-dev \
-                   libgtest-dev \
-                   libjsoncpp-dev \
-                   libnuma-dev \
-                   libcurl4-openssl-dev \
-                   libhiredis-dev
+                       cmake \
+                       libibverbs-dev \
+                       libgoogle-glog-dev \
+                       libgtest-dev \
+                       libjsoncpp-dev \
+                       libnuma-dev \
+                       libunwind-dev \
+                       libpython3-dev \
+                       libboost-all-dev \
+                       libssl-dev \
+                       pybind11-dev \
+                       libcurl4-openssl-dev \
+                       libhiredis-dev \
+                       pkg-config \
+                       patchelf
 
     # For centos/alibaba linux os
     yum install cmake \
@@ -66,7 +73,7 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel \
+                libcurl-devel
     ```
 
     NOTE: You may need to install gtest, glog, gflags from source code:
@@ -109,14 +116,14 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
-For the the container to use the host's network resources, you need to add the option when starting the container. The following is an example.
+For the the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host
 sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
-# In container
-root@vm-5-3-3:/# cd /Mooncake-main/build/mooncake-transfer-engine/example
-root@vm-5-3-3:/Mooncake-main/build/mooncake-transfer-engine/example# ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
+# Run transfer engine in container
+cd /Mooncake-main/build/mooncake-transfer-engine/example
+./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
 
 ## Advanced Compile Options
@@ -124,8 +131,10 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
-- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.22+
+- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
 - `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
+- `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
+- `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON

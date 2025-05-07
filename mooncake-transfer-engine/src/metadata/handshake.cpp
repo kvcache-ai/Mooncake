@@ -17,7 +17,7 @@
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
 #include <ifaddrs.h>
-#include <jsoncpp/json/value.h>
+#include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>

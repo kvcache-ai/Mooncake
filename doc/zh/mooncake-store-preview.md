@@ -581,7 +581,10 @@ retcode = store.setup(
 ```
 
 2. 在一台机器上运行 `ROLE=prefill python3 ./stress_cluster_benchmark.py`，启动 Prefill 节点。
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
 3. 在另一台机器上运行 `ROLE=decode python3 ./stress_cluster_benchmark.py`，启动 Decode 节点。
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+
 无报错信息表示数据传输成功。
 
 ## 范例代码

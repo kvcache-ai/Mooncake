@@ -125,10 +125,11 @@ DistributedObjectStore::~DistributedObjectStore() {
 
     if (client_ && segment_ptr_) {
         // Try to unmount the segment using saved local_hostname
-        ErrorCode rc = client_->UnInit();
-        if (rc != ErrorCode::OK) {
+        ErrorCode error_code =
+            client_->UnmountSegment(local_hostname, segment_ptr_.get());
+        if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment in destructor: "
-                       << toString(rc);
+                       << toString(error_code);
         }
         // The unique_ptr will automatically free the memory when reset
         segment_ptr_.reset();
@@ -161,22 +162,24 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         this->local_hostname = local_hostname;
     }
 
-    client_ = std::make_unique<mooncake::Client>();
-
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
-    ErrorCode rc = client_->Init(this->local_hostname, metadata_server,
+    auto client_opt =
+        mooncake::Client::Create(this->local_hostname, metadata_server,
                                  protocol, args, master_server_addr);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to initialize client: " << toString(rc);
+    if (!client_opt) {
+        LOG(ERROR) << "Failed to create client";
         return 1;
     }
+    client_ = *client_opt;
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    rc = client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
-                                      local_buffer_size, "cpu:0", false, false);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to register local memory: " << toString(rc);
+    ErrorCode error_code =
+        client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
+                                     local_buffer_size, "cpu:0", false, false);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to register local memory: "
+                   << toString(error_code);
         return 1;
     }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
@@ -185,10 +188,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    rc = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
-                               global_segment_size);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to mount segment: " << toString(rc);
+    error_code = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
+                                       global_segment_size);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
         return 1;
     }
     return 0;
@@ -269,11 +272,18 @@ int DistributedObjectStore::tearDownAll() {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ErrorCode rc = client_->UnInit();
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to unmount segment: " << toString(rc);
-        return 1;
+
+    // Unmount all segments before destroying the client
+    if (segment_ptr_) {
+        ErrorCode error_code =
+            client_->UnmountSegment(local_hostname, segment_ptr_.get());
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to unmount segment: " << toString(error_code);
+            return 1;
+        }
     }
+
+    // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
     segment_ptr_.reset();

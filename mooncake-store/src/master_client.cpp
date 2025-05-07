@@ -33,6 +33,33 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     return ErrorCode::OK;
 }
 
+ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::ExistKey");
+    timer.LogRequest("object_key=", object_key);
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::ExistKey>(object_key);
+    std::optional<ExistKeyResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to check key existence: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        auto response = ExistKeyResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");

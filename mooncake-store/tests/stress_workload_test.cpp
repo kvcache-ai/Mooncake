@@ -130,22 +130,26 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeClient() {
-        client_ = std::make_unique<Client>();
         void** args =
             (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-        ASSERT_EQ(client_->Init("localhost:12345",  // Local hostname
-                                "127.0.0.1:2379",  // Metadata connection string
-                                FLAGS_protocol, args, FLAGS_master_address),
-                  ErrorCode::OK);
+
+        auto client_opt =
+            Client::Create("localhost:12345",  // Local hostname
+                           "127.0.0.1:2379",   // Metadata connection string
+                           FLAGS_protocol, args, FLAGS_master_address);
+
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = *client_opt;
+
         auto client_buffer_allocator_size = 128 * 1024 * 1024;
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(client_buffer_allocator_size);
-        ErrorCode rc = client_->RegisterLocalMemory(
+        ErrorCode error_code = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), client_buffer_allocator_size,
             "cpu:0", false, false);
-        if (rc != ErrorCode::OK) {
+        if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to allocate transfer buffer: "
-                       << toString(rc);
+                       << toString(error_code);
         }
     }
 
@@ -155,13 +159,13 @@ class ClientIntegrationTest : public ::testing::Test {
         }
     }
 
-    static std::unique_ptr<Client> client_;
+    static std::shared_ptr<Client> client_;
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
     static void* segment_ptr_;
 };
 
 // Static members initialization
-std::unique_ptr<Client> ClientIntegrationTest::client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::client_ = nullptr;
 void* ClientIntegrationTest::segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;

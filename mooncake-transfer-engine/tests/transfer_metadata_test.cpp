@@ -75,6 +75,8 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
     ASSERT_EQ(des, segment_des);
     auto id = metadata_client->getSegmentID(segment_name);
     ASSERT_EQ(id, segment_id);
+    re = metadata_client->removeLocalSegment(segment_name);
+    ASSERT_EQ(re, 0);
 }
 
 // add and remove LocalMemoryBufferMeta
@@ -101,6 +103,8 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
         re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
         ASSERT_EQ(re, 0);
     }
+    re = metadata_client->removeLocalSegment("test_local_segment");
+    ASSERT_EQ(re, 0);
 }
 
 // add, get and remove RPCMetaEntryMeta

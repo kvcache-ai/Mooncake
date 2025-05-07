@@ -5,6 +5,8 @@
 
 #include <memory>
 
+#include "master_metric_manager.h"
+
 namespace mooncake {
 
 AllocatedBuffer::~AllocatedBuffer() {
@@ -18,9 +20,13 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+// Removed allocated_bytes parameter and member initialization
 BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
                                  size_t size)
-    : segment_name_(segment_name), base_(base), total_size_(size) {
+    : segment_name_(segment_name),
+      base_(base),
+      total_size_(size),
+      cur_size_(0) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -74,8 +80,8 @@ std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     }
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
-    // Create and return a new BufHandle.
     cur_size_.fetch_add(size);
+    MasterMetricManager::instance().inc_allocated_size(size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
                                              buffer, size);
 }
@@ -85,9 +91,12 @@ void BufferAllocator::deallocate(AllocatedBuffer* handle) {
         // Deallocate memory using CacheLib.
         memory_allocator_->free(handle->buffer_ptr_);
         handle->status = BufStatus::UNREGISTERED;
-        cur_size_.fetch_sub(handle->size_);
+        size_t freed_size =
+            handle->size_;  // Store size before handle might become invalid
+        cur_size_.fetch_sub(freed_size);
+        MasterMetricManager::instance().dec_allocated_size(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
-                << " size=" << handle->size_ << " segment=" << segment_name_;
+                << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "deallocation_exception error=" << e.what();
     } catch (...) {
