@@ -116,14 +116,14 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            context_.engine().meta()->dumpMetadataContent(
-                peer_segment_desc->name, slice->rdma.dest_addr,
-                slice->length);
-
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 slice->markFailed();
+
+                context_.engine().meta()->dumpMetadataContent(
+                    peer_segment_desc->name, slice->rdma.dest_addr,
+                    slice->length);
                 continue;
             }
         }
@@ -218,10 +218,16 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        if (!endpoint->active()) {
+            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            entry.second.clear();
+            continue;
+        }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first;
+                       << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            endpoint->set_active(false);
             entry.second.clear();
             continue;
         }
@@ -266,12 +272,18 @@ void WorkerPool::performPollCq(int thread_id) {
                                << slice->opcode
                                << ", source_addr: " << slice->source_addr
                                << ", length: " << slice->length
-                               << ", dest_addr: " << slice->rdma.dest_addr
+                               << ", dest_addr: " << (void *) slice->rdma.dest_addr
                                << ", local_nic: " << context_.deviceName()
                                << ", peer_nic: " << slice->peer_nic_path
                                << ", dest_rkey: " << slice->rdma.dest_rkey
                                << ", retry_cnt: " << slice->rdma.retry_cnt
                                << "): " << ibv_wc_status_str(wc[i].status);
+                context_.traceFailure();
+                if (context_.failedCount() > 16) {
+                    LOG(WARNING) << "Too many errors found in local RNIC "
+                                 << context_.nicPath() << ", mark it inactive";
+                    context_.set_active(false);
+                }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {

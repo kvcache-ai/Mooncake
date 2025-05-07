@@ -10,9 +10,6 @@ if (BUILD_UNIT_TESTS)
   enable_testing()
 endif()
 
-option(USE_LRU_MASTER "option for using LRU in master service" OFF)
-set(LRU_MAX_CAPACITY 1000)
-
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
@@ -25,10 +22,6 @@ execute_process(
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
-if (USE_LRU_MASTER)
-  add_compile_definitions(USE_LRU_MASTER)
-  add_compile_definitions(LRU_MAX_CAPACITY)
-endif()
 
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
@@ -53,10 +46,6 @@ if (WITH_STORE)
 endif()
 
 add_subdirectory(mooncake-integration)
-
-if (WITH_P2P_STORE AND USE_CUDA)
-  message(FATAL_ERROR "Cannot enable both WITH_P2P_STORE and USE_CUDA at the same time.")
-endif()
 
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)

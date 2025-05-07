@@ -24,7 +24,7 @@ This document describes how to build Mooncake.
    ```
 3. Install Mooncake python package and mooncake_master executable
    ```bash
-   make install
+   sudo make install
    ```
 
 Note: If you plan to use Mooncake Store with vLLM, you need to have the package `mooncake_vllm_adaptor` installed in your active python library. You can verify if the package exists by running `python -c "import mooncake_vllm_adaptor"`. If the package is missing, you can manually copy the built shared library into your python library directory (e.g. `cp ./build/mooncake-integration/mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so .venv/lib/python3.10/site-packages/`)
@@ -46,14 +46,21 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
     ```bash
     # For debian/ubuntu
     apt-get install -y build-essential \
-                   cmake \
-                   libibverbs-dev \
-                   libgoogle-glog-dev \
-                   libgtest-dev \
-                   libjsoncpp-dev \
-                   libnuma-dev \
-                   libcurl4-openssl-dev \
-                   libhiredis-dev
+                       cmake \
+                       libibverbs-dev \
+                       libgoogle-glog-dev \
+                       libgtest-dev \
+                       libjsoncpp-dev \
+                       libnuma-dev \
+                       libunwind-dev \
+                       libpython3-dev \
+                       libboost-all-dev \
+                       libssl-dev \
+                       pybind11-dev \
+                       libcurl4-openssl-dev \
+                       libhiredis-dev \
+                       pkg-config \
+                       patchelf
 
     # For centos/alibaba linux os
     yum install cmake \
@@ -109,14 +116,14 @@ Note: If you plan to use Mooncake Store with vLLM, you need to have the package 
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
-For the the container to use the host's network resources, you need to add the option when starting the container. The following is an example.
+For the the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host
 sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
-# In container
-root@vm-5-3-3:/# cd /Mooncake-main/build/mooncake-transfer-engine/example
-root@vm-5-3-3:/Mooncake-main/build/mooncake-transfer-engine/example# ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
+# Run transfer engine in container
+cd /Mooncake-main/build/mooncake-transfer-engine/example
+./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
 
 ## Advanced Compile Options

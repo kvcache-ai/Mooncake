@@ -8,7 +8,7 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/common.cmake)
 endif() # GLOBAL_CONFIG
 
-include_directories(include)
+include_directories(include /usr/include/jsoncpp)
 add_subdirectory(include)
 add_subdirectory(src)
 
