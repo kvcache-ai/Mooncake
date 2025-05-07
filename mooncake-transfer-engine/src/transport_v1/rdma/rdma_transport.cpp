@@ -87,12 +87,16 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to upload local segment descriptor");
     }
 
+    workers_ = std::make_shared<Workers>(resources_);
+    workers_->start();
+
     installed_ = true;
     return Status::OK();
 }
 
 Status RdmaTransport::uninstall() {
     if (installed_) {
+        workers_.reset();
         resources_->metadata_manager->removeSegmentDesc(
             resources_->local_segment_name);
         resources_.reset();
@@ -136,13 +140,15 @@ Status RdmaTransport::submitTransferTasks(
             slice->task = &task;
             slice++;
         }
-        workers_->submit(slice, task.num_slices);
+        LOG(INFO) << "Submit base " << task.slices << " count "
+                  << task.num_slices;
+        workers_->submit(task.slices, task.num_slices);
     }
     return Status::OK();
 }
 
-Transport::TransferStatus RdmaTransport::getTransferStatus(
-    SubBatchRef &batch, int request_index) {
+Transport::TransferStatus RdmaTransport::getTransferStatus(SubBatchRef &batch,
+                                                           int request_index) {
     auto rdma_batch = std::dynamic_pointer_cast<RdmaSubBatch>(batch);
     if (!rdma_batch) return TransferStatus{INVALID, 0};
     if (request_index < 0 ||
@@ -224,7 +230,7 @@ void RdmaTransport::allocateLocalSegmentID() {
 }
 
 int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
-                                               bool update_meta) {
+                                             bool update_meta) {
     BufferDesc buffer_desc;
     for (auto &entry : resources_->context_group) {
         auto &local_buffers = entry.second.local_buffers;
@@ -270,7 +276,7 @@ int RdmaTransport::unregisterSingleLocalMemory(void *addr, bool update_meta) {
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                                            HandShakeDesc &local_desc) {
+                                          HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty() ||
         !resources_->context_group.count(local_nic_name))
@@ -316,8 +322,8 @@ int RdmaTransport::startHandshakeDaemon() {
 }
 
 int RdmaTransport::sendHandshake(const std::string &peer_server_name,
-                                   const HandShakeDesc &local_desc,
-                                   HandShakeDesc &peer_desc) {
+                                 const HandShakeDesc &local_desc,
+                                 HandShakeDesc &peer_desc) {
     return resources_->metadata_manager->sendHandshake(peer_server_name,
                                                        local_desc, peer_desc);
 }

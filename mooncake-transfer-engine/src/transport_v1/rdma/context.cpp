@@ -270,6 +270,9 @@ RdmaContext::MemRegIndex RdmaContext::registerMemReg(void *addr, size_t length,
         return ERR_CONTEXT;
     }
 
+    LOG(INFO) << "register ... " << addr << " " << length << " " << mr->lkey
+              << " " << mr->rkey << " perm " << access;
+
     int index = next_mr_index_.fetch_add(1);
     RWSpinlock::WriteGuard guard(mr_lock_);
     mr_map_[index] = mr;
@@ -347,7 +350,7 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     switch (operation) {
         case EP_GET_OR_CREATE:
             if (!endpoint)
-                endpoint = endpoint_store_->insertEndpoint(key, this);
+                endpoint = endpoint_store_->insertEndpoint(full_key, this);
             return endpoint;
         case EP_GET:
             return endpoint;
@@ -356,7 +359,7 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
             return endpoint;
         case EP_RECREATE:
             endpoint_store_->deleteEndpoint(full_key);
-            endpoint = endpoint_store_->insertEndpoint(key, this);
+            endpoint = endpoint_store_->insertEndpoint(full_key, this);
             return endpoint;
         default:
             return nullptr;

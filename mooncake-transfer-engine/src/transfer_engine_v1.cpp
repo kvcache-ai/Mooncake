@@ -34,7 +34,7 @@ static std::string loadTopologyJsonFile(const std::string &path) {
 }
 
 int TransferEngine::init(const std::string &metadata_conn_string,
-                           const std::string &local_server_name) {
+                         const std::string &local_server_name) {
     local_server_name_ = local_server_name;
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     transport_ = std::make_shared<RdmaTransport>();
@@ -99,17 +99,14 @@ int TransferEngine::freeEngine() {
     return 0;
 }
 
-int TransferEngine::getRpcPort() {
-    return metadata_->localRpcMeta().rpc_port;
-}
+int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
 
 std::string TransferEngine::getLocalIpAndPort() {
     return metadata_->localRpcMeta().ip_or_host_name + ":" +
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
-SegmentHandle TransferEngine::openSegment(
-    const std::string &segment_name) {
+SegmentHandle TransferEngine::openSegment(const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
@@ -118,21 +115,19 @@ SegmentHandle TransferEngine::openSegment(
     return metadata_->getSegmentID(trimmed_segment_name);
 }
 
-int TransferEngine::closeSegment(SegmentHandle handle) {
-    return 0;
-}
+int TransferEngine::closeSegment(SegmentHandle handle) { return 0; }
 
 int TransferEngine::registerLocalMemory(void *addr, size_t length,
-                                          const std::string &location,
-                                          bool remote_accessible,
-                                          bool update_metadata,
-                                          const std::string &shm_path) {
+                                        const std::string &location,
+                                        bool remote_accessible,
+                                        bool update_metadata,
+                                        const std::string &shm_path) {
     BufferEntry entry;
     entry.addr = addr;
     entry.length = length;
     entry.location = location;
     entry.shm_path = shm_path;
-    entry.visibility = Transport::BufferVisibility::kLocalReadWrite;
+    entry.visibility = Transport::BufferVisibility::kGlobalReadWrite;
     return registerLocalMemoryBatch({entry}, location);
 }
 
@@ -171,7 +166,7 @@ Status TransferEngine::submitTransfer(
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
-                                           TransferStatus &status) {
+                                         TransferStatus &status) {
     mutex_.lock_shared();
     if (!batch_mapping_.count(batch_id)) {
         mutex_.unlock_shared();

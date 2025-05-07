@@ -81,6 +81,8 @@ class RdmaEndPoint {
 
     int outstandingSlices() const;
 
+    RdmaContext &context() const { return *cq_->context; }
+
    public:
     struct Request {
         struct SglEntry {

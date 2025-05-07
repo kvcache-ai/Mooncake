@@ -64,6 +64,10 @@ class Workers {
 
     void asyncPollCq();
 
+    int doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
+                    const std::string &peer_server_name,
+                    const std::string &peer_nic_name);
+
    private:
     std::shared_ptr<RdmaResources> resources_;
     const size_t num_workers_;

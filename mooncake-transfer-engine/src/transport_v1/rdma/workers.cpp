@@ -14,8 +14,9 @@
 
 #include "transport_v1/rdma/workers.h"
 
-#include "transport_v1/rdma/endpoint_store.h"
+#include <cassert>
 
+#include "transport_v1/rdma/endpoint_store.h"
 namespace mooncake {
 namespace v1 {
 const static size_t kDefaultNumWorkers = 4;
@@ -124,7 +125,6 @@ void Workers::asyncPostSend() {
     for (auto &slice : slice_to_send) {
         auto target_id = slice->task->request.target_id;
         auto &peer_segment_desc = segment_desc_map[target_id];
-        auto &detail = std::get<MemorySegmentDesc>(peer_segment_desc->detail);
         int buffer_id = 0, local_device_id = 0, peer_device_id = 0;
         uint32_t source_lkey = 0, dest_rkey = 0;
 
@@ -132,12 +132,14 @@ void Workers::asyncPostSend() {
         selectDevice(local_segment_desc, (uint64_t)slice->source_addr,
                      slice->length, buffer_id, local_device_id,
                      slice->retry_count % local_device_count);
-        source_lkey = detail.buffers[buffer_id].lkey[local_device_id];
-        auto local_device_name = detail.devices[local_device_id].name;
+        auto &local_detail = std::get<MemorySegmentDesc>(local_segment_desc->detail);
+        source_lkey = local_detail.buffers[buffer_id].lkey[local_device_id];
+        auto local_device_name = local_detail.devices[local_device_id].name;
 
         selectDevice(peer_segment_desc, slice->target_addr, slice->length,
                      buffer_id, peer_device_id,
                      slice->retry_count / local_device_count);
+        auto &detail = std::get<MemorySegmentDesc>(peer_segment_desc->detail);
         dest_rkey = detail.buffers[buffer_id].rkey[peer_device_id];
 
         auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
@@ -145,6 +147,11 @@ void Workers::asyncPostSend() {
 
         auto context = resources_->context_group[local_device_name].context;
         auto endpoint = context->endpoint(peer_nic_path);
+        if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
+            doHandshake(endpoint, peer_segment_desc->name,
+                        detail.devices[peer_device_id].name);
+        }
+
         std::vector<RdmaEndPoint::Request> requests;
         RdmaEndPoint::Request request;
         switch (slice->task->request.opcode) {
@@ -157,7 +164,6 @@ void Workers::asyncPostSend() {
             default:
                 break;
         }
-
         request.local.push_back(RdmaEndPoint::Request::SglEntry{
             (uint32_t)slice->length, (uint64_t)slice->source_addr,
             source_lkey});
@@ -166,13 +172,42 @@ void Workers::asyncPostSend() {
         request.user_context = slice;
         requests.push_back(request);
         endpoint->submitGeneralRequests(requests);
-        if (!request.submitted) {
-            slice_to_send.push_back(slice);
-        } else if (request.failed) {
+        if (!requests[0].submitted || requests[0].failed) {
+            LOG(INFO) << requests[0].submitted << " " << requests[0].failed;
             slice->retry_count++;
-            slice_to_send.push_back(slice);
+            mutex_.lock();
+            slices_.push(slice);
+            mutex_.unlock();
         }
     }
+}
+
+int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
+                         const std::string &peer_server_name,
+                         const std::string &peer_nic_name) {
+    // TODO loopback
+    HandShakeDesc local_desc, peer_desc;
+    local_desc.local_nic_path =
+        MakeNicPath(resources_->local_segment_name, endpoint->context().name());
+    local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
+    local_desc.qp_num = endpoint->qpNum();
+    int rc = resources_->metadata_manager->sendHandshake(peer_server_name,
+                                                         local_desc, peer_desc);
+    if (rc) return rc;
+    assert(peer_desc.qp_num.size());
+
+    auto segment_desc =
+        resources_->metadata_manager->getSegmentDescByName(peer_server_name);
+    if (segment_desc) {
+        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+        for (auto &nic : detail.devices)
+            if (nic.name == peer_nic_name) {
+                return endpoint->configurePeer(nic.gid, nic.lid,
+                                               peer_desc.qp_num);
+            }
+    }
+
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 void Workers::asyncPollCq() {
