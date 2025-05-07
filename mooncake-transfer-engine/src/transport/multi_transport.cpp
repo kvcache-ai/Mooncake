@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "multi_transport.h"
+#include "transport/multi_transport.h"
 
+#include "transport/transport.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/tcp_transport/tcp_transport.h"
-#include "transport/transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
@@ -130,6 +131,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new RdmaTransport();
     } else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
+    } else if (std::string(proto) == "shm") {
+        transport = new ShmTransport();
     }
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {

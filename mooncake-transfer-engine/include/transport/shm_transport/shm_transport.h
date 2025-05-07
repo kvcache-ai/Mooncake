@@ -15,7 +15,7 @@
 #ifndef SHM_TRANSPORT_H_
 #define SHM_TRANSPORT_H_
 
-#include <boost/asio.hpp>
+#include <asio.hpp>
 #include <boost/thread.hpp>
 #include <functional>
 #include <iostream>
@@ -32,11 +32,11 @@ class ThreadPool {
    public:
     ThreadPool(size_t threadCount)
         : ioService_(),
-          work_(boost::asio::make_work_guard(ioService_)),
+          work_(asio::make_work_guard(ioService_)),
           stopped_(false) {
         for (size_t i = 0; i < threadCount; ++i) {
             threads_.create_thread(
-                boost::bind(&boost::asio::io_service::run, &ioService_));
+                boost::bind(&asio::io_service::run, &ioService_));
         }
     }
 
@@ -55,8 +55,8 @@ class ThreadPool {
     }
 
    private:
-    boost::asio::io_service ioService_;
-    boost::asio::executor_work_guard<boost::asio::io_service::executor_type>
+    asio::io_service ioService_;
+    asio::executor_work_guard<asio::io_service::executor_type>
         work_;
     boost::thread_group threads_;
     bool stopped_;
