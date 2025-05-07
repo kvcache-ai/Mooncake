@@ -13,7 +13,7 @@ namespace mooncake {
  * @brief Abstract interface for eviction strategy, responsible for choosing
  *        which kvcache object to be evicted before pool overflow.
  */
-class EvictionStrategy {
+class EvictionStrategy : public std::enable_shared_from_this<EvictionStrategy>{
    public:
     virtual ~EvictionStrategy() = default;
     virtual ErrorCode AddKey(const std::string& key) = 0;
@@ -35,7 +35,7 @@ class EvictionStrategy {
         all_key_list_.clear();
         all_key_idx_map_.clear();
     }
-   private:
+   protected:
     std::list<std::string> all_key_list_;
     std::unordered_map<std::string, std::list<std::string>::iterator> all_key_idx_map_;
 };
@@ -96,3 +96,4 @@ class FIFOEvictionStrategy : public EvictionStrategy {
     }  
 };
 
+}

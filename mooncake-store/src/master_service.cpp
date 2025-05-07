@@ -77,7 +77,7 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
-    eviction_strategy_.CleanUp();
+    eviction_strategy_ -> CleanUp();
 }
 
 MasterService::~MasterService() {
@@ -96,7 +96,7 @@ MasterService::~MasterService() {
     }
 
     LOG(INFO) << "### LRU cleared ###";
-    eviction_strategy_.CleanUp();
+    eviction_strategy_ -> CleanUp();
 
 }
 
@@ -162,7 +162,7 @@ ErrorCode MasterService::PutStart(
 
     LOG(INFO) << "### LRU Update in Put() ###";
     eviction_strategy_->AddKey(key);
-    if(eviction_strategy_.GetSize() >= LRU_MAX_CAPACITY)
+    if(eviction_strategy_ -> GetSize() >= LRU_MAX_CAPACITY)
     {
         std::string evicted_key = eviction_strategy_->EvictKey();
         LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
