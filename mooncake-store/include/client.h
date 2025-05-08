@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "master_client.h"
@@ -134,6 +136,12 @@ class Client {
      */
     ErrorCode IsExist(const std::string& key);
 
+    /**
+     * @brief Gets the client's unique identifier
+     * @return The client ID
+     */
+    const ClientID& GetClientID() const { return client_id_; }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -159,6 +167,14 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    // Heartbeat management
+    void StartHeartbeat();
+    void StopHeartbeat();
+    void HeartbeatThreadFunc();
+
+    // Generate a unique client ID
+    static ClientID GenerateClientID();
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
@@ -170,6 +186,13 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // Client identification and heartbeat
+    const ClientID client_id_;
+    std::thread heartbeat_thread_;
+    std::atomic<bool> heartbeat_running_{false};
+    static constexpr std::chrono::milliseconds HEARTBEAT_INTERVAL{
+        1000};  // 1 seconds
 };
 
 }  // namespace mooncake

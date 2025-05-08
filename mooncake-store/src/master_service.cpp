@@ -66,7 +66,7 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
     return ErrorCode::OK;
 }
 
-MasterService::MasterService(bool enable_gc)
+MasterService::MasterService(bool enable_gc, bool enable_heartbeat)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc) {
@@ -78,6 +78,16 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
+
+    // Start the heartbeat monitor thread if enabled
+    if (enable_heartbeat) {
+        monitor_running_ = true;
+        heartbeat_monitor_thread_ =
+            std::thread(&MasterService::HeartbeatMonitorFunc, this);
+        VLOG(1) << "action=start_heartbeat_monitor_thread";
+    } else {
+        VLOG(1) << "action=heartbeat_monitor_disabled";
+    }
 }
 
 MasterService::~MasterService() {
@@ -85,6 +95,12 @@ MasterService::~MasterService() {
     gc_running_ = false;
     if (gc_thread_.joinable()) {
         gc_thread_.join();
+    }
+
+    // Stop and join the heartbeat monitor thread
+    monitor_running_ = false;
+    if (heartbeat_monitor_thread_.joinable()) {
+        heartbeat_monitor_thread_.join();
     }
 
     // Clean up any remaining GC tasks
@@ -96,19 +112,71 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
+ErrorCode MasterService::MountSegment(const ClientID& client_id,
+                                      uint64_t buffer, uint64_t size,
                                       const std::string& segment_name) {
     if (buffer == 0 || size == 0) {
-        LOG(ERROR) << "buffer=" << buffer << ", size=" << size
-                   << ", error=invalid_buffer_params";
+        LOG(ERROR) << "client_id=" << client_id << ", buffer=" << buffer
+                   << ", size=" << size << ", error=invalid_buffer_params";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
+    // Add segment to buffer allocator
+    ErrorCode result =
+        buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
+    if (result != ErrorCode::OK) {
+        return result;
+    }
+
+    // Associate segment with client
+    {
+        std::lock_guard<std::mutex> lock(client_segments_mutex_);
+        client_segments_[client_id].insert(segment_name);
+    }
+
+    // Update client's last heartbeat time
+    {
+        std::lock_guard<std::mutex> lock(client_last_heartbeat_mutex_);
+        client_last_heartbeat_[client_id] = std::chrono::steady_clock::now();
+    }
+
+    VLOG(1) << "client_id=" << client_id << ", segment_name=" << segment_name
+            << ", action=segment_mounted";
+    return ErrorCode::OK;
 }
 
-ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
+ErrorCode MasterService::UnmountSegment(const ClientID& client_id,
+                                        const std::string& segment_name) {
+    // Verify client owns this segment
+    {
+        std::lock_guard<std::mutex> lock(client_segments_mutex_);
+        auto client_it = client_segments_.find(client_id);
+        if (client_it == client_segments_.end() ||
+            client_it->second.find(segment_name) == client_it->second.end()) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", segment_name=" << segment_name
+                         << ", error=segment_not_owned_by_client";
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        // Remove segment from client's set
+        client_it->second.erase(segment_name);
+
+        // If client has no more segments, remove client entry
+        if (client_it->second.empty()) {
+            client_segments_.erase(client_it);
+        }
+    }
+
+    // Remove segment from buffer allocator
     return buffer_allocator_manager_->RemoveSegment(segment_name);
+}
+
+ErrorCode MasterService::Heartbeat(const ClientID& client_id) {
+    std::lock_guard<std::mutex> lock(client_last_heartbeat_mutex_);
+    client_last_heartbeat_[client_id] = std::chrono::steady_clock::now();
+    VLOG(1) << "client_id=" << client_id << ", action=heartbeat_received";
+    return ErrorCode::OK;
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -392,6 +460,73 @@ void MasterService::GCThreadFunc() {
     }
 
     VLOG(1) << "action=gc_thread_stopped";
+}
+
+void MasterService::HeartbeatMonitorFunc() {
+    VLOG(1) << "action=heartbeat_monitor_thread_started";
+
+    while (monitor_running_) {
+        std::vector<ClientID> timed_out_clients;
+
+        {
+            std::lock_guard<std::mutex> lock(client_last_heartbeat_mutex_);
+            auto now = std::chrono::steady_clock::now();
+
+            for (auto it = client_last_heartbeat_.begin();
+                 it != client_last_heartbeat_.end();) {
+                if (now - it->second > TIMEOUT_THRESHOLD) {
+                    timed_out_clients.push_back(it->first);
+                    it = client_last_heartbeat_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Clean up segments for timed-out clients
+        for (const auto& client_id : timed_out_clients) {
+            CleanupClientSegments(client_id);
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kHeartbeatMonitorSleepMs));
+    }
+
+    VLOG(1) << "action=heartbeat_monitor_thread_stopped";
+}
+
+void MasterService::CleanupClientSegments(const ClientID& client_id) {
+    VLOG(1) << "client_id=" << client_id << ", action=cleanup_start";
+
+    std::unordered_set<std::string> segments_to_remove;
+
+    {
+        std::lock_guard<std::mutex> lock(client_segments_mutex_);
+        auto it = client_segments_.find(client_id);
+        if (it != client_segments_.end()) {
+            segments_to_remove = std::move(it->second);
+            client_segments_.erase(it);
+        }
+    }
+
+    for (const auto& segment_name : segments_to_remove) {
+        ErrorCode result =
+            buffer_allocator_manager_->RemoveSegment(segment_name);
+        if (result != ErrorCode::OK) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", segment_name=" << segment_name
+                         << ", error=failed_to_remove_segment, error_code="
+                         << result;
+        } else {
+            VLOG(1) << "client_id=" << client_id
+                    << ", segment_name=" << segment_name
+                    << ", action=segment_removed_due_to_timeout";
+        }
+    }
+
+    LOG(INFO) << "client_id=" << client_id
+              << ", segments_removed=" << segments_to_remove.size()
+              << ", action=client_cleanup_complete";
 }
 
 }  // namespace mooncake

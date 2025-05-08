@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <memory>
 #include <random>
 #include <thread>
@@ -18,16 +21,26 @@ class MasterServiceTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterServiceTest");
         FLAGS_logtostderr = true;
+        client_id_ = GenerateClientID();
     }
 
     std::vector<Replica::Descriptor> replica_list;
+    ClientID client_id_;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    // Helper function to generate a ClientID using UUID
+    static ClientID GenerateClientID() {
+        boost::uuids::random_generator gen;
+        boost::uuids::uuid id = gen();
+        return boost::uuids::to_string(id);
+    }
 };
 
 TEST_F(MasterServiceTest, MountUnmountSegment) {
-    // Create a MasterService instance for testing.
-    std::unique_ptr<MasterService> service_(new MasterService());
+    // Create a MasterService instance for testing with GC enabled but heartbeat
+    // disabled.
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the size of the segment (16MB).
@@ -37,45 +50,52 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
 
     // Test invalid parameters.
     // Invalid buffer address (0).
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(0, kSegmentSize, segment_name));
+    EXPECT_EQ(
+        ErrorCode::INVALID_PARAMS,
+        service_->MountSegment(client_id_, 0, kSegmentSize, segment_name));
     // Invalid segment size (0).
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(kBufferAddress, 0, segment_name));
+    EXPECT_EQ(
+        ErrorCode::INVALID_PARAMS,
+        service_->MountSegment(client_id_, kBufferAddress, 0, segment_name));
     // Base is not aligned
-    EXPECT_EQ(
-        ErrorCode::INVALID_PARAMS,
-        service_->MountSegment(kBufferAddress + 1, kSegmentSize, segment_name));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              service_->MountSegment(client_id_, kBufferAddress + 1,
+                                     kSegmentSize, segment_name));
     // Size is not aligned
-    EXPECT_EQ(
-        ErrorCode::INVALID_PARAMS,
-        service_->MountSegment(kBufferAddress, kSegmentSize + 1, segment_name));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              service_->MountSegment(client_id_, kBufferAddress,
+                                     kSegmentSize + 1, segment_name));
 
     // Test normal mount operation.
-    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(
-                                 kBufferAddress, kSegmentSize, segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->MountSegment(client_id_, kBufferAddress, kSegmentSize,
+                                     segment_name));
 
     // Test mounting the same segment again (should fail).
-    EXPECT_EQ(
-        ErrorCode::INVALID_PARAMS,
-        service_->MountSegment(kBufferAddress, kSegmentSize, segment_name));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              service_->MountSegment(client_id_, kBufferAddress, kSegmentSize,
+                                     segment_name));
 
     // Test unmounting the segment.
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(client_id_, segment_name));
 
     // Test unmounting a non-existent segment (should fail).
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->UnmountSegment("non_existent"));
+              service_->UnmountSegment(client_id_, "non_existent"));
 
     // Test remounting after unmount.
-    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(
-                                 kBufferAddress, kSegmentSize, segment_name));
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->MountSegment(client_id_, kBufferAddress, kSegmentSize,
+                                     segment_name));
+    EXPECT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(client_id_, segment_name));
 }
 
 TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
-    // Create a MasterService instance for testing.
-    std::unique_ptr<MasterService> service_(new MasterService());
+    // Create a MasterService instance for testing with GC enabled but heartbeat
+    // disabled.
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the name of the test segment.
@@ -89,15 +109,16 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         // Define the size of the segment (16MB).
         size_t kSegmentSize = 1024 * 1024 * 16 * random_number;
         // Test remounting after unmount.
-        EXPECT_EQ(
-            ErrorCode::OK,
-            service_->MountSegment(kBufferAddress, kSegmentSize, segment_name));
-        EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+        EXPECT_EQ(ErrorCode::OK,
+                  service_->MountSegment(client_id_, kBufferAddress,
+                                         kSegmentSize, segment_name));
+        EXPECT_EQ(ErrorCode::OK,
+                  service_->UnmountSegment(client_id_, segment_name));
     }
 }
 
 TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     constexpr size_t num_threads = 4;
     constexpr size_t iterations = 100;
     std::vector<std::thread> threads;
@@ -105,16 +126,16 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
 
     // Launch multiple threads to mount/unmount segments concurrently
     for (size_t i = 0; i < num_threads; i++) {
-        threads.emplace_back([&service_, i, &success_count]() {
+        threads.emplace_back([&service_, i, &success_count, this]() {
             std::string segment_name = "segment_" + std::to_string(i);
             size_t buffer = 0x300000000 + i * 0x10000000;
             constexpr size_t size = 16 * 1024 * 1024;
 
             for (size_t j = 0; j < iterations; j++) {
-                if (service_->MountSegment(buffer, size, segment_name) ==
-                    ErrorCode::OK) {
-                    EXPECT_EQ(ErrorCode::OK,
-                              service_->UnmountSegment(segment_name));
+                if (service_->MountSegment(client_id_, buffer, size,
+                                           segment_name) == ErrorCode::OK) {
+                    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(
+                                                 client_id_, segment_name));
                     success_count++;
                 }
             }
@@ -131,12 +152,12 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
 }
 
 TEST_F(MasterServiceTest, PutStartInvalidParams) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     std::string key = "test_key";
     ReplicateConfig config;
@@ -159,13 +180,13 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 }
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     // Test PutStart
     std::string key = "test_key";
@@ -195,13 +216,13 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     // Test PutStart
     std::string key = "test_key";
@@ -233,7 +254,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
 }
 
 TEST_F(MasterServiceTest, GetReplicaList) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     // Test getting non-existent key
     std::vector<Replica::Descriptor> replica_list_local;
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
@@ -245,7 +266,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
@@ -262,13 +283,13 @@ TEST_F(MasterServiceTest, GetReplicaList) {
 }
 
 TEST_F(MasterServiceTest, RemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
@@ -292,13 +313,13 @@ TEST_F(MasterServiceTest, RemoveObject) {
 }
 
 TEST_F(MasterServiceTest, RandomRemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
     int times = 10;
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -324,15 +345,16 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
 }
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(true, false));
 
     // Mount a segment with sufficient size for multiple replicas
     constexpr size_t buffer = 0x300000000;
     constexpr size_t segment_size =
         1024 * 1024 * 64;  // 64MB to accommodate multiple replicas
     std::string segment_name = "test_segment_multi";
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, segment_size, segment_name));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        service_->MountSegment(client_id_, buffer, segment_size, segment_name));
 
     // Test parameters
     std::string key = "multi_slice_object";
@@ -412,7 +434,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(true, false));
 
     // Mount segment for testing
     constexpr size_t buffer = 0x300000000;
@@ -420,7 +442,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
         1024 * 1024 * 256;  // Larger segment for concurrent use
     std::string segment_name = "concurrent_gc_segment";
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     constexpr size_t num_threads = 4;
     constexpr size_t objects_per_thread = 25;
@@ -492,7 +514,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     EXPECT_EQ(0, found_count);
 }
 TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    std::unique_ptr<MasterService> service_(new MasterService(false, false));
 
     // Mount a segment for testing
     constexpr size_t buffer = 0x300000000;
@@ -501,7 +523,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Mount the segment
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     // Create an object that will be stored in the segment
     std::string key = "segment_object";
@@ -521,7 +543,8 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     ASSERT_EQ(1, retrieved_replicas.size());
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(client_id_, segment_name));
 
     // Try to get the object - it should be automatically removed since the
     // replica is invalid
@@ -532,7 +555,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Mount the segment again
     ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(buffer, size, segment_name));
+              service_->MountSegment(client_id_, buffer, size, segment_name));
 
     // Create another object
     std::string key2 = "another_segment_object";
@@ -547,7 +570,8 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
               service_->GetReplicaList(key2, retrieved_replicas));
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->UnmountSegment(client_id_, segment_name));
 
     // Try to remove the object that should already be cleaned up
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key2));

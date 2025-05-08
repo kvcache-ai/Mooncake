@@ -53,6 +53,11 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct HeartbeatResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(HeartbeatResponse, error_code)
+
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
@@ -255,17 +260,19 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(uint64_t buffer, uint64_t size,
+    MountSegmentResponse MountSegment(const ClientID& client_id,
+                                      uint64_t buffer, uint64_t size,
                                       const std::string& segment_name) {
         ScopedVLogTimer timer(1, "MountSegment");
-        timer.LogRequest("buffer=", buffer, ", size=", size,
-                         ", segment_name=", segment_name);
+        timer.LogRequest("client_id=", client_id, ", buffer=", buffer,
+                         ", size=", size, ", segment_name=", segment_name);
 
         // Increment request metric
         MasterMetricManager::instance().inc_mount_segment_requests();
 
         MountSegmentResponse response;
         response.error_code =
+            master_service_.MountSegment(client_id, buffer, size, segment_name);
             master_service_.MountSegment(buffer, size, segment_name);
 
         // Track failures if needed
@@ -280,14 +287,28 @@ class WrappedMasterService {
         return response;
     }
 
-    UnmountSegmentResponse UnmountSegment(const std::string& segment_name) {
+    UnmountSegmentResponse UnmountSegment(const ClientID& client_id,
+                                          const std::string& segment_name) {
         ScopedVLogTimer timer(1, "UnmountSegment");
-        timer.LogRequest("segment_name=", segment_name);
+        timer.LogRequest("client_id=", client_id,
+                         ", segment_name=", segment_name);
 
         // Increment request metric
         MasterMetricManager::instance().inc_unmount_segment_requests();
 
         UnmountSegmentResponse response;
+        response.error_code =
+            master_service_.UnmountSegment(client_id, segment_name);
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    HeartbeatResponse Heartbeat(const ClientID& client_id) {
+        ScopedVLogTimer timer(1, "Heartbeat");
+        timer.LogRequest("client_id=", client_id);
+
+        HeartbeatResponse response;
+        response.error_code = master_service_.Heartbeat(client_id);
         response.error_code = master_service_.UnmountSegment(segment_name);
 
         // Track failures if needed

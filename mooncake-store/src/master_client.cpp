@@ -195,19 +195,20 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
     return result.value();
 }
 
-MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
+MountSegmentResponse MasterClient::MountSegment(const ClientID& client_id,
+                                                const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
-    timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
-                     ", size=", size);
+    timer.LogRequest("client_id=", client_id, ", segment_name=", segment_name,
+                     ", buffer=", buffer, ", size=", size);
 
     std::optional<MountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
             Lazy<async_rpc_result<MountSegmentResponse>> handler =
                 co_await client_
                     .send_request<&WrappedMasterService::MountSegment>(
-                        reinterpret_cast<uint64_t>(buffer),
+                        client_id, reinterpret_cast<uint64_t>(buffer),
                         static_cast<uint64_t>(size), segment_name);
             async_rpc_result<MountSegmentResponse> result = co_await handler;
             if (!result) {
@@ -226,13 +227,13 @@ MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
 }
 
 UnmountSegmentResponse MasterClient::UnmountSegment(
-    const std::string& segment_name) {
+    const ClientID& client_id, const std::string& segment_name) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
-    timer.LogRequest("segment_name=", segment_name);
+    timer.LogRequest("client_id=", client_id, ", segment_name=", segment_name);
 
     auto request_result =
         client_.send_request<&WrappedMasterService::UnmountSegment>(
-            segment_name);
+            client_id, segment_name);
     std::optional<UnmountSegmentResponse> result = coro::syncAwait(
         [&]() -> coro::Lazy<std::optional<UnmountSegmentResponse>> {
             auto result = co_await co_await request_result;
@@ -245,6 +246,33 @@ UnmountSegmentResponse MasterClient::UnmountSegment(
         }());
     if (!result) {
         auto response = UnmountSegmentResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+HeartbeatResponse MasterClient::Heartbeat(const ClientID& client_id) {
+    ScopedVLogTimer timer(
+        2,
+        "MasterClient::Heartbeat");  // Use VLOG level 2 for frequent heartbeats
+    timer.LogRequest("client_id=", client_id);
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::Heartbeat>(client_id);
+    std::optional<HeartbeatResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<HeartbeatResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to send heartbeat: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = HeartbeatResponse{ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

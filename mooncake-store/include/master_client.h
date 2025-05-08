@@ -92,15 +92,24 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] MountSegmentResponse MountSegment(
-        const std::string& segment_name, const void* buffer, size_t size);
+        const ClientID& client_id, const std::string& segment_name,
+        const void* buffer, size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
+     * @param client_id Unique identifier of the client
      * @param segment_name Name which is used to register the segment
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] UnmountSegmentResponse UnmountSegment(
-        const std::string& segment_name);
+        const ClientID& client_id, const std::string& segment_name);
+
+    /**
+     * @brief Sends a heartbeat to the master to indicate client is alive
+     * @param client_id Unique identifier of the client
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] HeartbeatResponse Heartbeat(const ClientID& client_id);
 
    private:
     coro_rpc_client client_;
