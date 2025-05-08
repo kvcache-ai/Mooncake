@@ -358,6 +358,14 @@ int DistributedObjectStore::remove(const std::string &key) {
     return 0;
 }
 
+long DistributedObjectStore::removeAll() {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+    return client_->RemoveAll();
+}
+
 int DistributedObjectStore::isExist(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";

@@ -43,6 +43,8 @@ class MasterMetricManager {
     void inc_exist_key_failures(int64_t val = 1.0);
     void inc_remove_requests(int64_t val = 1.0);
     void inc_remove_failures(int64_t val = 1.0);
+    void inc_remove_all_requests(int64_t val = 1.0);
+    void inc_remove_all_failures(int64_t val = 1.0);
     void inc_mount_segment_requests(int64_t val = 1.0);
     void inc_mount_segment_failures(int64_t val = 1.0);
     void inc_unmount_segment_requests(int64_t val = 1.0);
@@ -89,6 +91,8 @@ class MasterMetricManager {
     ylt::metric::counter_d exist_key_failures_;
     ylt::metric::counter_d remove_requests_;
     ylt::metric::counter_d remove_failures_;
+    ylt::metric::counter_d remove_all_requests_;
+    ylt::metric::counter_d remove_all_failures_;
     ylt::metric::counter_d mount_segment_requests_;
     ylt::metric::counter_d mount_segment_failures_;
     ylt::metric::counter_d unmount_segment_requests_;

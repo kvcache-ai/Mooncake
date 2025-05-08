@@ -127,6 +127,8 @@ class DistributedObjectStore {
 
     int remove(const std::string &key);
 
+    long removeAll();
+
     int tearDownAll();
 
     /**

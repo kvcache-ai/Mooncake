@@ -306,6 +306,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
         .def("get", &DistributedObjectStore::get)
         .def("put", &DistributedObjectStore::put)
         .def("remove", &DistributedObjectStore::remove)
+        .def("removeAll", &DistributedObjectStore::removeAll)
         .def("isExist", &DistributedObjectStore::isExist)
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("getSize", &DistributedObjectStore::getSize);

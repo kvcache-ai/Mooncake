@@ -323,6 +323,34 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     }
 }
 
+TEST_F(MasterServiceTest, RemoveAll) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    // Mount segment and put 10 objects
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
+    int times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                    config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    }
+    ASSERT_EQ(10, service_->RemoveAll());
+    times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+    }
+}
+
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -551,6 +579,186 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Try to remove the object that should already be cleaned up
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key2));
+}
+
+
+TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
+    std::string segment_name = "concurrent_segment";
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer, size, segment_name));
+
+    constexpr int num_threads = 4;
+    constexpr int objects_per_thread = 100;
+    std::atomic success_writes(0);
+    std::atomic remove_all_done(false);
+    std::atomic total_removed(0);
+
+    // Writer threads
+    std::vector<std::thread> writers;
+    for (int i = 0; i < num_threads; ++i) {
+        writers.emplace_back([&, i]() {
+            for (int j = 0; j < objects_per_thread; ++j) {
+                std::string key = "key_" + std::to_string(i) + "_" + std::to_string(j);
+                std::vector<uint64_t> slice_lengths = {1024};
+                ReplicateConfig config;
+                config.replica_num = 1;
+                std::vector<Replica::Descriptor> replica_list;
+
+                if (service_->PutStart(key, 1024, slice_lengths, config, replica_list) == ErrorCode::OK &&
+                    service_->PutEnd(key) == ErrorCode::OK) {
+                    success_writes++;
+                }
+
+                // Random sleep to increase concurrency complexity
+                std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 10));
+            }
+        });
+    }
+
+    // RemoveAll thread
+    std::thread remove_thread([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Let some writes start
+        long removed = service_->RemoveAll();
+        LOG(INFO) << "Removed " << removed << " objects during concurrent writes";
+        ASSERT_GT(removed, 0);
+        remove_all_done = true;
+        total_removed.fetch_add(removed);
+    });
+
+    // Join all threads
+    for (auto& t : writers) {
+        t.join();
+    }
+    remove_thread.join();
+
+    // Verify results
+    EXPECT_GT(success_writes, 0);
+    EXPECT_TRUE(remove_all_done);
+
+    // Final RemoveAll to ensure clean state
+    long final_removed = service_->RemoveAll();
+    LOG(INFO) << "Final RemoveAll removed " << final_removed << " objects";
+    ASSERT_GT(final_removed, 0);
+    total_removed.fetch_add(final_removed);
+    ASSERT_EQ(total_removed, num_threads * objects_per_thread);
+}
+
+
+TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
+    std::string segment_name = "concurrent_segment";
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer, size, segment_name));
+
+    // Pre-populate with test data
+    constexpr int num_objects = 1000;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    }
+
+    std::atomic<int> success_reads(0);
+    std::atomic<bool> remove_all_done(false);
+
+    // Reader threads
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&, i]() {
+            std::vector<Replica::Descriptor> replica_list;
+            for (int j = 0; j < num_objects; ++j) {
+                std::string key = "pre_key_" + std::to_string(j);
+                if (service_->GetReplicaList(key, replica_list) == ErrorCode::OK) {
+                    success_reads++;
+                }
+
+                // Random sleep to increase concurrency complexity
+                std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 5));
+            }
+        });
+    }
+
+    // RemoveAll thread
+    std::thread remove_thread([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Let some reads start
+        long removed = service_->RemoveAll();
+        LOG(INFO) << "Removed " << removed << " objects during concurrent reads";
+        remove_all_done = true;
+    });
+
+    // Join all threads
+    for (auto& t : readers) {
+        t.join();
+    }
+    remove_thread.join();
+
+    EXPECT_TRUE(remove_all_done);
+    // Verify 0 < success_reads < num_objects
+    EXPECT_GT(success_reads, 0);
+    EXPECT_NE(success_reads, num_objects);
+
+    // Verify all objects were removed
+    std::vector<Replica::Descriptor> replica_list;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
+    }
+}
+
+TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
+    std::string segment_name = "concurrent_segment";
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer, size, segment_name));
+
+    // Pre-populate with test data
+    constexpr int num_objects = 1000000;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    }
+
+    std::atomic<int> remove_all_count(0);
+
+    // Two RemoveAll threads
+    std::vector<std::thread> remove_threads;
+    for (int i = 0; i < 2; ++i) {
+        remove_threads.emplace_back([&]() {
+            long removed = service_->RemoveAll();
+            LOG(INFO) << "RemoveAll removed " << removed << " objects";
+            remove_all_count += removed;
+        });
+    }
+
+    // Join all threads
+    for (auto& t : remove_threads) {
+        t.join();
+    }
+
+    // Verify results - one RemoveAll should return num_objects, the other 0
+    EXPECT_EQ(num_objects, remove_all_count);
+
+    // Verify all objects were removed
+    std::vector<Replica::Descriptor> replica_list;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
+    }
 }
 
 }  // namespace mooncake::test

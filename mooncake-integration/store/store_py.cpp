@@ -470,6 +470,14 @@ int DistributedObjectStore::remove(const std::string &key) {
     return 0;
 }
 
+long DistributedObjectStore::removeAll() {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+    return client_->RemoveAll();
+}
+
 int DistributedObjectStore::isExist(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -637,6 +645,8 @@ PYBIND11_MODULE(store, m) {
              py::call_guard<py::gil_scoped_release>(),
              py::return_value_policy::take_ownership)
         .def("remove", &DistributedObjectStore::remove,
+             py::call_guard<py::gil_scoped_release>())
+        .def("remove_all", &DistributedObjectStore::removeAll,
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
              py::call_guard<py::gil_scoped_release>())
