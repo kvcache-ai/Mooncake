@@ -88,9 +88,9 @@ class Client {
 
     /**
      * @brief Removes all objects and all its replicas
-     * @return ErrorCode indicating success/failure
+     * @return The number of objects removed, negative on error
      */
-    ErrorCode RemoveAll();
+    long RemoveAll();
 
     /**
      * @brief Registers a memory segment to master for allocation

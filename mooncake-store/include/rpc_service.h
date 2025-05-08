@@ -44,9 +44,9 @@ struct RemoveResponse {
 };
 YLT_REFL(RemoveResponse, error_code)
 struct RemoveAllResponse {
-    ErrorCode error_code = ErrorCode::OK;
+    long removed_count = 0;
 };
-YLT_REFL(RemoveAllResponse, error_code)
+YLT_REFL(RemoveAllResponse, removed_count)
 struct MountSegmentResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
@@ -269,15 +269,8 @@ class WrappedMasterService {
         RemoveAllResponse response;
         const long removed_count = master_service_.RemoveAll();
 
-        // Track failures if needed
-        if (removed_count < 0) {
-            response.error_code = ErrorCode::INTERNAL_ERROR;
-            MasterMetricManager::instance().inc_remove_all_failures();
-            LOG(ERROR) << "RemoveAll failed with error code: "
-                      << static_cast<int>(response.error_code);
-        } else {
-            response.error_code = ErrorCode::OK;
-        }
+        assert(removed_count >= 0);
+        response.removed_count = removed_count;
         timer.LogResponseJson(response);
         return response;
     }

@@ -272,8 +272,8 @@ ErrorCode Client::Remove(const ObjectKey& key) {
     return master_client_.Remove(key).error_code;
 }
 
-ErrorCode Client::RemoveAll() {
-    return master_client_.RemoveAll().error_code;
+long Client::RemoveAll() {
+    return master_client_.RemoveAll().removed_count;
 }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,

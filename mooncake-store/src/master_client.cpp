@@ -213,7 +213,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
         }());
 
     if (!result) {
-        auto response = RemoveAllResponse{ErrorCode::RPC_FAIL};
+        auto response = RemoveAllResponse{toInt(ErrorCode::RPC_FAIL)};
         timer.LogResponseJson(response);
         return response;
     }
