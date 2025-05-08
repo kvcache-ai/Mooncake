@@ -43,6 +43,10 @@ struct RemoveResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(RemoveResponse, error_code)
+struct RemoveAllResponse {
+    long removed_count = 0;
+};
+YLT_REFL(RemoveAllResponse, removed_count)
 struct MountSegmentResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
@@ -251,6 +255,22 @@ class WrappedMasterService {
             MasterMetricManager::instance().dec_key_count();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    RemoveAllResponse RemoveAll() {
+        ScopedVLogTimer timer(1, "RemoveAll");
+        timer.LogRequest("action=remove_all_objects");
+
+        // Increment request metric
+        MasterMetricManager::instance().inc_remove_all_requests();
+
+        RemoveAllResponse response;
+        const long removed_count = master_service_.RemoveAll();
+
+        assert(removed_count >= 0);
+        response.removed_count = removed_count;
         timer.LogResponseJson(response);
         return response;
     }

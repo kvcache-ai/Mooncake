@@ -56,6 +56,11 @@ MasterMetricManager::MasterMetricManager()
                        "Total number of Remove requests received"),
       remove_failures_("master_remove_failures_total",
                        "Total number of failed Remove requests"),
+      remove_all_requests_("master_remove_all_requests_total",
+                       "Total number of Remove all requests received"),
+      remove_all_failures_("master_remove_all_failures_total",
+                       "Total number of failed Remove all requests"),
+
       mount_segment_requests_("master_mount_segment_requests_total",
                               "Total number of MountSegment requests received"),
       mount_segment_failures_("master_mount_segment_failures_total",
@@ -129,6 +134,12 @@ void MasterMetricManager::inc_remove_requests(int64_t val) {
 void MasterMetricManager::inc_remove_failures(int64_t val) {
     remove_failures_.inc(val);
 }
+void MasterMetricManager::inc_remove_all_requests(int64_t val) {
+    remove_all_requests_.inc(val);
+}
+void MasterMetricManager::inc_remove_all_failures(int64_t val) {
+    remove_all_failures_.inc(val);
+}
 void MasterMetricManager::inc_mount_segment_requests(int64_t val) {
     mount_segment_requests_.inc(val);
 }
@@ -177,6 +188,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(get_replica_list_failures_);
     serialize_metric(remove_requests_);
     serialize_metric(remove_failures_);
+    serialize_metric(remove_all_requests_);
+    serialize_metric(remove_all_failures_);
     serialize_metric(mount_segment_requests_);
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
@@ -221,6 +234,8 @@ std::string MasterMetricManager::get_summary_string() {
     double get_replica_fails = get_replica_list_failures_.value();
     double removes = remove_requests_.value();
     double remove_fails = remove_failures_.value();
+    double remove_all = remove_all_requests_.value();
+    double remove_all_fails = remove_all_failures_.value();
 
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
@@ -242,7 +257,9 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Exist=" << static_cast<int64_t>(exist_keys - exist_key_fails)
        << "/" << static_cast<int64_t>(exist_keys) << ", ";
     ss << "Del=" << static_cast<int64_t>(removes - remove_fails) << "/"
-       << static_cast<int64_t>(removes);
+       << static_cast<int64_t>(removes) << ", ";
+    ss << "DelAll=" << static_cast<int64_t>(remove_all - remove_all_fails) << "/"
+       << static_cast<int64_t>(remove_all);
 
     return ss.str();
 }
