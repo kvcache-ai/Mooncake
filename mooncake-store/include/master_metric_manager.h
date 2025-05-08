@@ -22,14 +22,12 @@ class MasterMetricManager {
     // Storage Metrics
     void inc_allocated_size(int64_t val = 1.0);
     void dec_allocated_size(int64_t val = 1.0);
-    void reset_allocated_size();
     void inc_total_capacity(int64_t val = 1.0);
     void dec_total_capacity(int64_t val = 1.0);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1.0);
     void dec_key_count(int64_t val = 1.0);
-    void reset_key_count();
     void observe_value_size(int64_t size);
 
     // Operation Statistics (Counters)

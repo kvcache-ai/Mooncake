@@ -267,17 +267,16 @@ class WrappedMasterService {
         MasterMetricManager::instance().inc_remove_all_requests();
 
         RemoveAllResponse response;
-        response.error_code = master_service_.RemoveAll();
+        const long removed_count = master_service_.RemoveAll();
 
         // Track failures if needed
-        if (response.error_code != ErrorCode::OK) {
+        if (removed_count < 0) {
+            response.error_code = ErrorCode::INTERNAL_ERROR;
             MasterMetricManager::instance().inc_remove_all_failures();
             LOG(ERROR) << "RemoveAll failed with error code: "
                       << static_cast<int>(response.error_code);
         } else {
-            // Reset related metrics on successful remove all
-            MasterMetricManager::instance().reset_key_count();
-            MasterMetricManager::instance().reset_allocated_size();
+            response.error_code = ErrorCode::OK;
         }
         timer.LogResponseJson(response);
         return response;

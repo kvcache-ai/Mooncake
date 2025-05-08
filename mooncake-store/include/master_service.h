@@ -161,9 +161,9 @@ class MasterService {
     ErrorCode Remove(const std::string& key);
     /**
      * @brief Remove all objects and their replicas
-     * @return Always return ErrorCode::OK
+     * @return return the number of objects removed
      */
-    ErrorCode RemoveAll();
+    long RemoveAll();
 
 
    private:

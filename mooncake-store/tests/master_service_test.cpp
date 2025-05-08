@@ -323,6 +323,34 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     }
 }
 
+TEST_F(MasterServiceTest, RemoveAll) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    // Mount segment and put 10 objects
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
+    int times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                    config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    }
+    ASSERT_EQ(10, service_->RemoveAll());
+    times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+    }
+}
+
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
 

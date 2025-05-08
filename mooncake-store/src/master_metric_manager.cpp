@@ -81,9 +81,6 @@ void MasterMetricManager::inc_allocated_size(int64_t val) {
 void MasterMetricManager::dec_allocated_size(int64_t val) {
     allocated_size_.dec(val);
 }
-void MasterMetricManager::reset_allocated_size() {
-    allocated_size_.dec(allocated_size_.value());
-}
 
 void MasterMetricManager::inc_total_capacity(int64_t val) {
     total_capacity_.inc(val);
@@ -95,7 +92,6 @@ void MasterMetricManager::dec_total_capacity(int64_t val) {
 // Key/Value Metrics
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
-void MasterMetricManager::reset_key_count() { key_count_.dec(key_count_.value()); }
 
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);

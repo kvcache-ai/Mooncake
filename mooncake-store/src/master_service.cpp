@@ -318,19 +318,27 @@ ErrorCode MasterService::Remove(const std::string& key) {
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::RemoveAll() {
+long MasterService::RemoveAll() {
+    long removed_count = 0;
+    uint64_t total_freed_size = 0;
     for (auto& shard : metadata_shards_) {
-        std::unique_lock<std::mutex> lock(shard.mutex);
-
-        // Clear all metadata
-        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); ) {
-            // Remove metadata will trigger replica deletion.
-            it = shard.metadata.erase(it);
+        std::unique_lock lock(shard.mutex);
+        std::size_t object_count = shard.metadata.size();
+        if (object_count == 0)
+            continue;
+        for (const auto& [key, metadata] : shard.metadata) {
+            // Calculate the total freed size of the object
+            total_freed_size += metadata.size * metadata.replicas.size();
         }
+        removed_count += object_count;
+        // Reset related metrics on successful removed
+        MasterMetricManager::instance().dec_key_count(removed_count);
+        MasterMetricManager::instance().dec_allocated_size(total_freed_size);
+        shard.metadata.clear();
     }
-
-    VLOG(1) << "action=remove_all_objects";
-    return ErrorCode::OK;
+    VLOG(1) << "action=remove_all_objects" << ", removed_count=" << removed_count
+            << ", total_freed_size=" << total_freed_size;
+    return removed_count;
 }
 
 ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
