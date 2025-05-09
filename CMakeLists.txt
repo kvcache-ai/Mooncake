@@ -5,7 +5,6 @@ project(mooncake CXX C)
 set(GLOBAL_CONFIG "true")
 
 include(mooncake-common/common.cmake)
-
 # unit test
 if (BUILD_UNIT_TESTS)
   enable_testing()
@@ -22,6 +21,7 @@ execute_process(
     OUTPUT_VARIABLE PYTHON_SYS_PATH
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
+
 
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
