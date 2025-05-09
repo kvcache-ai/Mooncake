@@ -48,7 +48,10 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-echo "Repairing wheel with auditwheel..."
+PLATFORM_TAG="manylinux_2_35_x86_64"
+PLATFORM_TAG=$(echo "$PLATFORM_TAG" | sed 's/x86_64/aarch64/')
+
+echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
 python -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
@@ -89,7 +92,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libkeyutils.so* \
 --exclude libresolv.so* \
 --exclude libffi.so* \
--w ${REPAIRED_DIR}/ --plat manylinux_2_35_x86_64
+-w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 
 # Replace original wheel with repaired wheel
