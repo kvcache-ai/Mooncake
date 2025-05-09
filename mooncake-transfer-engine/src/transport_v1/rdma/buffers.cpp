@@ -156,13 +156,14 @@ int LocalBufferSet::registerMemReg(LocalBufferSet::BufferItem &item) {
 
 int LocalBufferSet::unregisterMemReg(LocalBufferSet::BufferItem &item,
                                      RdmaContext *context_filter) {
-    for (auto iter = item.mem_reg_map.begin(); iter != item.mem_reg_map.end();
-         iter++) {
+    for (auto iter = item.mem_reg_map.begin(); iter != item.mem_reg_map.end();) {
         auto &context = iter->first;
         auto &mem_reg = iter->second;
         if (!context_filter || context_filter == context) {
             context->unregisterMemReg(mem_reg);
             iter = item.mem_reg_map.erase(iter);
+        } else {
+            ++iter;
         }
     }
     return 0;

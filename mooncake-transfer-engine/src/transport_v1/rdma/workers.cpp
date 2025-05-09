@@ -105,6 +105,7 @@ void Workers::asyncPostSend() {
         slices_.pop();
     }
     mutex_.unlock();
+    if (slice_to_send.empty()) return;
 
     auto local_segment_desc =
         resources_->metadata_manager->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -149,8 +150,12 @@ void Workers::asyncPostSend() {
         auto context = resources_->context_set[local_device_name];
         auto endpoint = context->endpoint(peer_nic_path);
         if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
-            doHandshake(endpoint, peer_segment_desc->name,
-                        detail.devices[peer_device_id].name);
+            mutex_.lock();
+            if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
+                doHandshake(endpoint, peer_segment_desc->name,
+                            detail.devices[peer_device_id].name);
+            }
+            mutex_.unlock();
         }
 
         std::vector<RdmaEndPoint::Request> requests;
@@ -224,7 +229,7 @@ void Workers::asyncPollCq() {
             }
             for (int i = 0; i < nr_poll; ++i) {
                 auto slice = (RdmaSlice *)wc[i].wr_id;
-                __sync_fetch_and_add(&slice->quota_counter, 1);
+                __sync_fetch_and_sub(slice->quota_counter, 1);
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                         LOG(ERROR)

@@ -143,8 +143,6 @@ Status RdmaTransport::submitTransferTasks(
             slice->task = &task;
             slice++;
         }
-        LOG(INFO) << "Submit base " << task.slices << " count "
-                  << task.num_slices;
         workers_->submit(task.slices, task.num_slices);
     }
     return Status::OK();
