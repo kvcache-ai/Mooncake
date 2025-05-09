@@ -301,15 +301,7 @@ PYBIND11_MODULE(mooncake_vllm_adaptor, m) {
 
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
-        .def("setup", &DistributedObjectStore::setup,
-             py::arg("local_hostname"),
-             py::arg("metadata_server"),
-             py::arg("global_segment_size") = 1024 * 1024 * 16,
-             py::arg("local_buffer_size") = 1024 * 1024 * 16,
-             py::arg("protocol") = "tcp",
-             py::arg("rdma_devices") = "",
-             py::arg("master_server_addr") = "127.0.0.1:50051",
-             py::arg("with_store") = true)
+        .def("setup", &DistributedObjectStore::setup)
         .def("initAll", &DistributedObjectStore::initAll)
         .def("get", &DistributedObjectStore::get)
         .def("put", &DistributedObjectStore::put)
