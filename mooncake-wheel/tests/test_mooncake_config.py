@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from ..mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE
+from mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE
 
 class TestMooncakeConfig(unittest.TestCase):
     def setUp(self):
