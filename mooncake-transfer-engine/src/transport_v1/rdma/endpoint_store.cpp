@@ -50,8 +50,8 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         return nullptr;
     }
     int cq_index = SimpleRandom::Get().next(context->cqCount());
-    int ret = endpoint->construct(context->cq(cq_index),
-                                  RdmaEndPoint::EndPointParams{});
+    int ret =
+        endpoint->construct(context->cq(cq_index), &context->params().endpoint);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -97,6 +97,21 @@ void FIFOEndpointStore::reclaimEndpoint() {
 
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
 
+void FIFOEndpointStore::clearEndpoints(const std::string &prefix) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    std::vector<std::string> to_delete;
+    for (auto &entry : endpoint_map_) {
+        if (entry.first.substr(0, prefix.length()) == prefix)
+            to_delete.push_back(entry.first);
+    }
+    for (auto &key : to_delete) {
+        endpoint_map_.erase(key);
+        auto fifo_iter = fifo_map_[key];
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(key);
+    }
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     const std::string &key) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
@@ -124,8 +139,8 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         return nullptr;
     }
     int cq_index = SimpleRandom::Get().next(context->cqCount());
-    int ret = endpoint->construct(context->cq(cq_index),
-                                  RdmaEndPoint::EndPointParams{});
+    int ret =
+        endpoint->construct(context->cq(cq_index), &context->params().endpoint);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -191,5 +206,24 @@ void SIEVEEndpointStore::reclaimEndpoint() {
 }
 
 size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+
+void SIEVEEndpointStore::clearEndpoints(const std::string &prefix) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    std::vector<std::string> to_delete;
+    for (auto &entry : endpoint_map_) {
+        if (entry.first.substr(0, prefix.length()) == prefix)
+            to_delete.push_back(entry.first);
+    }
+    for (auto &key : to_delete) {
+        endpoint_map_.erase(key);
+        auto fifo_iter = fifo_map_[key];
+        if (hand_.has_value() && hand_.value() == fifo_iter) {
+            fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                            : hand_ = std::prev(fifo_iter);
+        }
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(key);
+    }
+}
 }  // namespace v1
 }  // namespace mooncake

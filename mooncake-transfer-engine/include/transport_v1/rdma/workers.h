@@ -25,22 +25,8 @@
 
 namespace mooncake {
 namespace v1 {
-struct RdmaResources {
-    using DeviceID = std::string;
 
-    struct ContextLocal {
-        std::shared_ptr<RdmaContext> context;
-        std::shared_ptr<LocalBuffers> local_buffers;
-    };
-
-    std::string local_segment_name;
-    std::shared_ptr<Topology> local_topology;
-    std::unordered_map<DeviceID, ContextLocal> context_group;
-
-    // TODO will move out
-    std::shared_ptr<mooncake::TransferMetadata> metadata_manager;
-};
-
+class RdmaResources;
 class Workers {
    public:
     Workers(std::shared_ptr<RdmaResources> &resources);

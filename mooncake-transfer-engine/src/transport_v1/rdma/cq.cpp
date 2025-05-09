@@ -1,0 +1,72 @@
+// Copyright 2025 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "transport_v1/rdma/cq.h"
+
+#include <fcntl.h>
+#include <sys/epoll.h>
+
+#include <atomic>
+#include <cassert>
+#include <fstream>
+#include <memory>
+#include <thread>
+
+#include "transport_v1/rdma/context.h"
+
+namespace mooncake {
+namespace v1 {
+RdmaCQ::~RdmaCQ() {
+    if (cq_) {
+        ibv_destroy_cq(cq_);
+        cq_ = nullptr;
+    }
+}
+
+int RdmaCQ::construct(RdmaContext *context, int cqe_limit, int index) {
+    context_ = context;
+    cqe_limit_ = cqe_limit;
+    cq_ = ibv_create_cq(
+        context_->context(), cqe_limit, nullptr,
+        context_->comp_channel_[index % context_->num_comp_channel_],
+        index % context_->context()->num_comp_vectors);
+    if (!cq_) {
+        PLOG(ERROR) << "Failed to create completion queue";
+        return ERR_CONTEXT;
+    }
+    return 0;
+}
+
+bool RdmaCQ::reserveQuota(int num_entries) {
+    int prev_cqe_now = __sync_fetch_and_add(&cqe_now_, num_entries);
+    if (prev_cqe_now + num_entries > cqe_limit_) {
+        cancelQuota(num_entries);
+        return false;
+    }
+    return true;
+}
+
+void RdmaCQ::cancelQuota(int num_entries) {
+    __sync_fetch_and_sub(&cqe_now_, num_entries);
+}
+
+int RdmaCQ::poll(int num_entries, ibv_wc *wc) {
+    int ret = ibv_poll_cq(cq_, num_entries, wc);
+    if (ret > 0) {
+        __sync_fetch_and_sub(&cqe_now_, ret);
+    }
+    return ret;
+}
+}  // namespace v1
+}  // namespace mooncake

@@ -27,34 +27,7 @@ class RdmaEndPoint {
 
     ~RdmaEndPoint();
 
-    struct EndPointParams {
-        int qp_mul_factor = 1;
-        int max_sge = 4;
-        int max_qp_wr = 256;
-        int max_inline_bytes = 64;
-
-        // Advanced parameters, do not change unless you understand them
-        // INIT State
-        uint16_t pkey_index = 0;
-        // RTR State
-        uint8_t hop_limit = 16;
-        uint32_t flow_label = 0;
-        uint8_t traffic_class = 0;
-        uint8_t service_level = 0;
-        uint8_t src_path_bits = 0;
-        uint8_t static_rate = 0;
-        uint32_t rq_psn = 0;
-        uint8_t max_dest_rd_atomic = 16;
-        uint8_t min_rnr_timer = 12;
-        // RTS State
-        uint32_t sq_psn = 0;
-        uint8_t send_timeout = 14;
-        uint8_t send_retry_count = 7;
-        uint8_t send_rnr_count = 7;
-        uint8_t max_rd_atomic = 16;
-    };
-
-    int construct(CompletionQueue *cq, const EndPointParams &params);
+    int construct(RdmaCQ *cq, EndPointParams *params);
 
    public:
     // Enable, disable, restart
@@ -81,7 +54,7 @@ class RdmaEndPoint {
 
     int outstandingSlices() const;
 
-    RdmaContext &context() const { return *cq_->context; }
+    RdmaContext &context() const { return cq_->context(); }
 
    public:
     struct Request {
@@ -96,9 +69,6 @@ class RdmaEndPoint {
         uint32_t remote_key;
         uint32_t imm_data;
         void *user_context;
-        // managed by endpoint
-        volatile int *wr_depth_ptr;
-        bool submitted;
         bool failed;
     };
 
@@ -106,18 +76,25 @@ class RdmaEndPoint {
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
+    volatile int *getQuotaCounter(int qp_index) const {
+        return &wr_depth_list_[qp_index];
+    }
+
    private:
     int setupSingleQueuePair(int qp_index, const std::string &peer_gid,
                              uint16_t peer_lid, uint32_t peer_qp_num,
                              std::string *reply_msg = nullptr);
+    
+    bool reserveQuota(int qp_index, int num_entries);
+
+    void cancelQuota(int qp_index, int num_entries);
 
    private:
     std::atomic<EndPointStatus> status_;
     RWSpinlock ep_lock_;
 
-    CompletionQueue *cq_;
-    volatile int *cqe_now_ptr_;
-    EndPointParams params_;
+    RdmaCQ *cq_;
+    EndPointParams *params_;
 
     std::vector<ibv_qp *> qp_list_;
     volatile int *wr_depth_list_;

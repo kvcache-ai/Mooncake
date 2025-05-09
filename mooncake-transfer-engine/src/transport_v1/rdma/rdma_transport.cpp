@@ -51,24 +51,24 @@ Status RdmaTransport::install(
         return Status::DeviceNotFound("no RDMA device found in topology");
     }
 
+    auto params = std::make_shared<RdmaParams>();
     resources_ = std::make_shared<RdmaResources>();
     resources_->metadata_manager = metadata_manager;
     resources_->local_segment_name = local_segment_name;
     resources_->local_topology = local_topology;
-    auto endpoint_store = std::make_shared<SIEVEEndpointStore>(256);
+    auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
+        params->endpoint.endpoint_store_cap);
     auto hca_list = resources_->local_topology->getHcaList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>();
-        int ret = context->construct(device_name, endpoint_store,
-                                     RdmaContext::DeviceParams{});
+        int ret = context->construct(device_name, endpoint_store, params);
         if (ret) {
             resources_->local_topology->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
             continue;
         }
-        resources_->context_group[device_name].context = context;
-        resources_->context_group[device_name].local_buffers =
-            std::make_shared<LocalBuffers>(context);
+        resources_->context_set[device_name] = context;
+        resources_->local_buffer_set.addDevice(context.get());
     }
     if (resources_->local_topology->empty()) {
         uninstall();
@@ -99,6 +99,9 @@ Status RdmaTransport::uninstall() {
         workers_.reset();
         resources_->metadata_manager->removeSegmentDesc(
             resources_->local_segment_name);
+        resources_->metadata_manager.reset();
+        resources_->local_buffer_set.clear();
+        resources_->context_set.clear();
         resources_.reset();
         installed_ = false;
     }
@@ -216,9 +219,9 @@ void RdmaTransport::allocateLocalSegmentID() {
     desc->name = resources_->local_segment_name;
     desc->protocol = "rdma";
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (auto &entry : resources_->context_group) {
+    for (auto &entry : resources_->context_set) {
         DeviceDesc device_desc;
-        auto &context = entry.second.context;
+        auto &context = entry.second;
         device_desc.name = context->name();
         device_desc.lid = context->lid();
         device_desc.gid = context->gid();
@@ -232,11 +235,12 @@ void RdmaTransport::allocateLocalSegmentID() {
 int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
                                              bool update_meta) {
     BufferDesc buffer_desc;
-    for (auto &entry : resources_->context_group) {
-        auto &local_buffers = entry.second.local_buffers;
+    int ret = resources_->local_buffer_set.addBuffer(buffer);
+    if (ret) return ret;
+    for (auto &entry : resources_->context_set) {
         uint32_t lkey, rkey;
-        int ret = local_buffers->add(buffer, lkey, rkey);
-        if (ret) return ret;
+        resources_->local_buffer_set.findBufferLegacy(
+            buffer.addr, entry.second.get(), lkey, rkey);
         buffer_desc.lkey.push_back(lkey);
         buffer_desc.rkey.push_back(rkey);
     }
@@ -269,9 +273,7 @@ int RdmaTransport::unregisterSingleLocalMemory(void *addr, bool update_meta) {
     int rc = resources_->metadata_manager->removeLocalMemoryBuffer(addr,
                                                                    update_meta);
     if (rc) return rc;
-    for (auto &entry : resources_->context_group) {
-        entry.second.local_buffers->remove(addr);
-    }
+    resources_->local_buffer_set.removeBufferLegacy(addr);
     return 0;
 }
 
@@ -279,9 +281,9 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty() ||
-        !resources_->context_group.count(local_nic_name))
+        !resources_->context_set.count(local_nic_name))
         return ERR_INVALID_ARGUMENT;
-    auto context = resources_->context_group[local_nic_name].context;
+    auto context = resources_->context_set[local_nic_name];
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     auto peer_nic_path_ = peer_desc.local_nic_path;

@@ -128,11 +128,12 @@ void Workers::asyncPostSend() {
         int buffer_id = 0, local_device_id = 0, peer_device_id = 0;
         uint32_t source_lkey = 0, dest_rkey = 0;
 
-        int local_device_count = (int)resources_->context_group.size();
+        int local_device_count = (int)resources_->context_set.size();
         selectDevice(local_segment_desc, (uint64_t)slice->source_addr,
                      slice->length, buffer_id, local_device_id,
                      slice->retry_count % local_device_count);
-        auto &local_detail = std::get<MemorySegmentDesc>(local_segment_desc->detail);
+        auto &local_detail =
+            std::get<MemorySegmentDesc>(local_segment_desc->detail);
         source_lkey = local_detail.buffers[buffer_id].lkey[local_device_id];
         auto local_device_name = local_detail.devices[local_device_id].name;
 
@@ -145,7 +146,7 @@ void Workers::asyncPostSend() {
         auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
                                          detail.devices[peer_device_id].name);
 
-        auto context = resources_->context_group[local_device_name].context;
+        auto context = resources_->context_set[local_device_name];
         auto endpoint = context->endpoint(peer_nic_path);
         if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
             doHandshake(endpoint, peer_segment_desc->name,
@@ -172,8 +173,7 @@ void Workers::asyncPostSend() {
         request.user_context = slice;
         requests.push_back(request);
         endpoint->submitGeneralRequests(requests);
-        if (!requests[0].submitted || requests[0].failed) {
-            LOG(INFO) << requests[0].submitted << " " << requests[0].failed;
+        if (requests[0].failed) {
             slice->retry_count++;
             mutex_.lock();
             slices_.push(slice);
@@ -212,19 +212,19 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
 
 void Workers::asyncPollCq() {
     const static size_t kPollCount = 64;
-    auto &context_group = resources_->context_group;
-    for (auto &entry : context_group) {
-        int cq_count = entry.second.context->cqCount();
+    for (auto &entry : resources_->context_set) {
+        int cq_count = entry.second->cqCount();
         for (int cq_index = 0; cq_index < cq_count; ++cq_index) {
-            auto cq = entry.second.context->cq(cq_index);
+            auto cq = entry.second->cq(cq_index);
             ibv_wc wc[kPollCount];
-            int nr_poll = ibv_poll_cq(cq->cq, kPollCount, wc);
+            int nr_poll = cq->poll(kPollCount, wc);
             if (nr_poll < 0) {
                 LOG(ERROR) << "Worker: Failed to poll completion queue";
                 continue;
             }
             for (int i = 0; i < nr_poll; ++i) {
                 auto slice = (RdmaSlice *)wc[i].wr_id;
+                __sync_fetch_and_add(&slice->quota_counter, 1);
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                         LOG(ERROR)
@@ -233,7 +233,7 @@ void Workers::asyncPollCq() {
                             << ", source_addr: " << (void *)slice->source_addr
                             << ", dest_addr: " << (void *)slice->target_addr
                             << ", length: " << slice->length
-                            << ", local_nic: " << entry.second.context->name()
+                            << ", local_nic: " << entry.second->name()
                             << "): " << ibv_wc_status_str(wc[i].status);
                     }
                     slice->retry_count++;

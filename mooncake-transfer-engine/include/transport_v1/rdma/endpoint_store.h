@@ -37,6 +37,7 @@ class EndpointStore {
     virtual int deleteEndpoint(const std::string &key) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
+    virtual void clearEndpoints(const std::string &prefix) = 0;
     virtual size_t getSize() = 0;
 };
 
@@ -50,6 +51,7 @@ class FIFOEndpointStore : public EndpointStore {
     int deleteEndpoint(const std::string &key) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
+    void clearEndpoints(const std::string &prefix);
     size_t getSize() override;
 
    private:
@@ -75,6 +77,7 @@ class SIEVEEndpointStore : public EndpointStore {
     int deleteEndpoint(const std::string &key) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
+    void clearEndpoints(const std::string &prefix);
     size_t getSize() override;
 
    private:

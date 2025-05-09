@@ -15,7 +15,10 @@
 #ifndef RDMA_BUFFERS_H
 #define RDMA_BUFFERS_H
 
+#include <map>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 
 #include "transport_v1/transport.h"
 
@@ -58,18 +61,17 @@ struct AddressRange {
     }
 };
 
-class LocalBuffers {
+class LocalBufferSet {
    public:
-    LocalBuffers(std::shared_ptr<RdmaContext> &context);
+    LocalBufferSet();
 
-    ~LocalBuffers();
+    ~LocalBufferSet();
 
-    int add(const Transport::BufferEntry &buffer, uint32_t &lkey,
-            uint32_t &rkey);
+    int addBuffer(const Transport::BufferEntry &entry);
 
-    int remove(const AddressRange &range);
+    int removeBuffer(const AddressRange &range);
 
-    int remove(void *addr);  // legacy remove
+    int removeBufferLegacy(void *addr);
 
     struct Result {
         void *addr;
@@ -77,17 +79,36 @@ class LocalBuffers {
         uint32_t lkey, rkey;
     };
 
-    int query(const AddressRange &target_range, std::vector<Result> &result);
+    int findBuffer(const AddressRange &range, RdmaContext *context,
+                   Transport::BufferVisibility visibility,
+                   std::vector<Result> &result);
+
+    int findBufferLegacy(void *addr, RdmaContext *context, uint32_t &lkey,
+                         uint32_t &rkey);
+
+    int addDevice(RdmaContext *context);
+
+    int removeDevice(RdmaContext *context);
+
+    int clear();
 
    private:
     struct BufferItem {
-        int mem_reg_index;
-        uint32_t lkey, rkey;
+        int ref_cnt;
+        Transport::BufferEntry entry;
+        std::unordered_map<RdmaContext *, void *> mem_reg_map;
     };
 
-    std::shared_ptr<RdmaContext> context_;
+    int registerMemReg(BufferItem &item);
+
+    int unregisterMemReg(BufferItem &item,
+                         RdmaContext *context_filter = nullptr);
+
+   private:
     RWSpinlock lock_;
-    std::map<AddressRange, BufferItem> sorted_buffers_;
+    std::map<AddressRange, BufferItem>
+        buffer_lists_[3];  // each represents one visibility level
+    std::unordered_set<RdmaContext *> context_list_;
 };
 
 class PeerBuffers {

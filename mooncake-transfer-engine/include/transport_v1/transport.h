@@ -104,10 +104,9 @@ class Transport {
     }
 
     enum BufferVisibility {
-        kGlobalReadWrite,
-        kGlobalReadOnly,
         kLocalReadWrite,
-        kDelete
+        kGlobalReadOnly,
+        kGlobalReadWrite,
     };
 
     using Location = std::string;

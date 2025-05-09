@@ -24,67 +24,57 @@
 
 namespace mooncake {
 namespace v1 {
-RdmaEndPoint::RdmaEndPoint()
-    : status_(kEndPointUninitialized), cqe_now_ptr_(nullptr) {}
+RdmaEndPoint::RdmaEndPoint() : status_(kEndPointUninitialized) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
     if (status_ == kEndPointReady) disable();
 }
 
-int RdmaEndPoint::construct(CompletionQueue *cq, const EndPointParams &params) {
+int RdmaEndPoint::construct(RdmaCQ *cq, EndPointParams *params) {
     if (status_ != kEndPointUninitialized) {
-        LOG(ERROR) << "RdmaEndPoint object " << this << " has been constructed";
+        LOG(ERROR) << "Rdma endpoint " << this << " has been initialized";
         return ERR_ENDPOINT;
     }
 
     cq_ = cq;
-    cqe_now_ptr_ = &cq->cqe_now;
     params_ = params;
     status_ = kEndPointDisabled;
-
-    ibv_device_attr device_attr;
-    int ret = ibv_query_device(cq->context->context(), &device_attr);
-    if (ret) {
-        PLOG(WARNING) << "Failed to query attributes on "
-                      << cq->context->name();
-        return ERR_CONTEXT;
-    }
-
-    params_.max_sge = std::min(
-        params_.max_sge, std::min(device_attr.max_sge, device_attr.max_sge_rd));
-    params_.max_qp_wr = std::min(params_.max_qp_wr, device_attr.max_qp_wr);
     return enable();
 }
 
 int RdmaEndPoint::enable() {
     RWSpinlock::WriteGuard guard(ep_lock_);
-    if (status_ != kEndPointDisabled) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in disabled state";
+    if (status_ == kEndPointUninitialized) {
+        LOG(ERROR) << "Rdma endpoint " << this << " has not been initialized";
         return ERR_ENDPOINT;
     }
 
-    qp_list_.resize(params_.qp_mul_factor);
-    wr_depth_list_ = new volatile int[params_.qp_mul_factor];
+    if (status_ != kEndPointDisabled) {
+        LOG(INFO) << "Rdma endPoint " << this << " is enabled";
+        return reset();
+    }
+
+    qp_list_.resize(params_->qp_mul_factor);
+    wr_depth_list_ = new volatile int[params_->qp_mul_factor];
     if (!wr_depth_list_) {
-        LOG(ERROR) << "Failed to allocate memory for work request depth list";
         disable();
         return ERR_MEMORY;
     }
-    for (int i = 0; i < params_.qp_mul_factor; ++i) {
+
+    for (int i = 0; i < params_->qp_mul_factor; ++i) {
         wr_depth_list_[i] = 0;
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
-        attr.send_cq = cq_->cq;
-        attr.recv_cq = cq_->cq;
+        attr.send_cq = cq_->cq();
+        attr.recv_cq = cq_->cq();
         attr.sq_sig_all = false;
         attr.qp_type = IBV_QPT_RC;
-        attr.cap.max_send_wr = attr.cap.max_recv_wr = params_.max_qp_wr;
-        attr.cap.max_send_sge = attr.cap.max_recv_sge = params_.max_sge;
-        attr.cap.max_inline_data = params_.max_inline_bytes;
-        qp_list_[i] = ibv_create_qp(cq_->context->pd(), &attr);
+        attr.cap.max_send_wr = attr.cap.max_recv_wr = params_->max_qp_wr;
+        attr.cap.max_send_sge = attr.cap.max_recv_sge = params_->max_sge;
+        attr.cap.max_inline_data = params_->max_inline_bytes;
+        qp_list_[i] = ibv_create_qp(context().pd(), &attr);
         if (!qp_list_[i]) {
-            PLOG(ERROR) << "Failed to create queue pair";
+            PLOG(ERROR) << "RdmaEndPoint Failure: ibv_create_qp";
             disable();
             return ERR_ENDPOINT;
         }
@@ -95,17 +85,15 @@ int RdmaEndPoint::enable() {
 
 int RdmaEndPoint::disable() {
     RWSpinlock::WriteGuard guard(ep_lock_);
-    if (status_ != kEndPointPreparing && status_ != kEndPointReady) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in preparing or ready state";
-        return ERR_ENDPOINT;
-    }
+
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         // TODO force cancel these work requests
         if (wr_depth_list_[i] != 0)
             LOG(WARNING)
                 << "Outstanding work requests found, CQ will not be generated";
-        if (ibv_destroy_qp(qp_list_[i])) PLOG(ERROR) << "Failed to destroy QP";
+        if (ibv_destroy_qp(qp_list_[i])) {
+            PLOG(ERROR) << "RdmaEndPoint Failure: ibv_destroy_qp";
+        }
     }
 
     qp_list_.clear();
@@ -118,8 +106,7 @@ int RdmaEndPoint::disable() {
 int RdmaEndPoint::reset() {
     RWSpinlock::WriteGuard guard(ep_lock_);
     if (status_ != kEndPointPreparing && status_ != kEndPointReady) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in preparing or ready state";
+        LOG(ERROR) << "Rdma endpoint " << this << " is not enabled";
         return ERR_ENDPOINT;
     }
     for (size_t i = 0; i < qp_list_.size(); ++i) {
@@ -149,16 +136,16 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
                                 std::string *reply_msg) {
     RWSpinlock::WriteGuard guard(ep_lock_);
     if (status_ != kEndPointPreparing) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in preparing state";
+        LOG(ERROR) << "Rdma endpoint " << this << " not in preparing state";
         return ERR_INVALID_ARGUMENT;
     }
+
     if (qp_list_.size() != peer_qp_num_list.size()) {
-        std::string message = "Inconsistent qp_mul_factor in local (" +
-                              std::to_string(qp_list_.size()) +
-                              ") and peer endpoint (" +
-                              std::to_string(peer_qp_num_list.size()) + ")";
-        LOG(ERROR) << message;
+        std::string message =
+            "[ERR-01] Inconsistent qp_mul_factor detected: local (expected) " +
+            std::to_string(qp_list_.size()) + ", peer " +
+            std::to_string(peer_qp_num_list.size());
+        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_INVALID_ARGUMENT;
     }
@@ -168,7 +155,8 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
                                        peer_qp_num_list[qp_index], reply_msg);
         if (ret) return ret;
     }
-    status_.store(kEndPointReady, std::memory_order_relaxed);
+
+    status_ = kEndPointReady;
     return 0;
 }
 
@@ -176,31 +164,28 @@ int RdmaEndPoint::submitGeneralRequests(
     std::vector<RdmaEndPoint::Request> &requests) {
     RWSpinlock::ReadGuard guard(ep_lock_);
     if (status_ != kEndPointReady) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in ready state";
+        LOG(ERROR) << "Rdma endpoint " << this << " not in ready state";
         return ERR_INVALID_ARGUMENT;
     }
 
     int sge_count = 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
-    int wr_count = std::min(params_.max_qp_wr - wr_depth_list_[qp_index],
+    int wr_count = std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
                             (int)requests.size());
-    wr_count = std::min(int(globalConfig().max_cqe) - *cqe_now_ptr_, wr_count);
+    wr_count =
+        std::min(int(globalConfig().max_cqe) - cq_->getQuota(), wr_count);
 
     for (auto &entry : requests) {
-        entry.submitted = false;
         entry.failed = false;
         sge_count += entry.local.size();
-    }
-
-    for (auto &entry : requests) {
-        if (params_.max_sge < (int)entry.local.size()) {
-            LOG(ERROR) << "Scatter/gather entry count exceeded";
+        if (params_->max_sge < (int)entry.local.size()) {
+            LOG(ERROR)
+                << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
             return ERR_INVALID_ARGUMENT;
         }
     }
 
-    if (wr_count <= 0) return 0;
+    if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
 
     ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
     ibv_sge sge_list[sge_count];
@@ -215,6 +200,8 @@ int RdmaEndPoint::submitGeneralRequests(
             sge.length = entry.local[sge_off].length;
             sge.lkey = entry.local[sge_off].lkey;
         }
+        ((RdmaSlice *)entry.user_context)->quota_counter =
+            &wr_depth_list_[qp_index];
         wr.wr_id = (uint64_t)entry.user_context;
         wr.opcode = entry.opcode;
         wr.num_sge = entry.local.size();
@@ -224,30 +211,26 @@ int RdmaEndPoint::submitGeneralRequests(
         wr.imm_data = entry.imm_data;
         wr.wr.rdma.remote_addr = entry.remote_addr;
         wr.wr.rdma.rkey = entry.remote_key;
-        entry.wr_depth_ptr = &wr_depth_list_[qp_index];
-        entry.submitted = true;
         sge_idx += wr.num_sge;
     }
-    __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-    __sync_fetch_and_add(cqe_now_ptr_, wr_count);
+
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "Failed to ibv_post_send";
+        PLOG(ERROR) << "RdmaEndPoint Failure: ibv_post_send";
         while (bad_wr) {
             requests[bad_wr - wr_list].failed = true;
-            __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-            __sync_fetch_and_sub(cqe_now_ptr_, 1);
+            cancelQuota(qp_index, 1);
             bad_wr = bad_wr->next;
         }
     }
-    return 0;
+
+    return wr_count;
 }
 
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     RWSpinlock::ReadGuard guard(ep_lock_);
     if (status_ != kEndPointReady) {
-        LOG(ERROR) << "RdmaEndPoint object " << this
-                   << " is not in ready state";
+        LOG(ERROR) << "RDMA endpoint " << this << " not in ready state";
         return ERR_INVALID_ARGUMENT;
     }
     if (qp_index < 0 || qp_index >= (int)qp_list_.size())
@@ -255,16 +238,16 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     ibv_recv_wr wr, *bad_wr;
     memset(&wr, 0, sizeof(ibv_recv_wr));
     wr.wr_id = id;
+    if (!reserveQuota(qp_index, 1)) return 0;
     __sync_fetch_and_add(&wr_depth_list_[qp_index], 1);
-    __sync_fetch_and_add(cqe_now_ptr_, 1);
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
         __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-        __sync_fetch_and_sub(cqe_now_ptr_, 1);
-        PLOG(ERROR) << "Failed to ibv_post_recv";
+        cancelQuota(qp_index, 1);
+        PLOG(ERROR) << "RdmaEndPoint Failure: ibv_post_recv";
         return ERR_ENDPOINT;
     }
-    return 0;
+    return 1;
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() {
@@ -280,6 +263,21 @@ int RdmaEndPoint::outstandingSlices() const {
     int sum = 0;
     for (int i = 0; i < (int)qp_list_.size(); ++i) sum += wr_depth_list_[i];
     return sum;
+}
+
+bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
+    if (!cq_->reserveQuota(num_entries)) return false;
+    auto prev_depth_list =
+        __sync_fetch_and_add(&wr_depth_list_[qp_index], num_entries);
+    if (prev_depth_list + num_entries > params_->max_qp_wr) {
+        cancelQuota(qp_index, num_entries);
+        return false;
+    }
+    return true;
+}
+
+void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
+    __sync_fetch_and_sub(&wr_depth_list_[qp_index], num_entries);
 }
 
 int RdmaEndPoint::setupSingleQueuePair(int qp_index,
@@ -298,7 +296,7 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     if (ret) {
         std::string message =
             "Failed to modify QP to RESET, error code " + std::to_string(ret);
-        LOG(ERROR) << message;
+        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -306,8 +304,8 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     // RESET -> INIT
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
-    attr.port_num = cq_->context->portNum();
-    attr.pkey_index = params_.pkey_index;
+    attr.port_num = context().portNum();
+    attr.pkey_index = params_->pkey_index;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
     ret = ibv_modify_qp(
@@ -315,10 +313,10 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         std::string message =
-            "Failed to modify QP to INIT, check local context port num, error "
-            "code " +
+            "[ERR-02] Failed to modify QP to INIT, check local context port "
+            "num, error code " +
             std::to_string(ret);
-        LOG(ERROR) << message;
+        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -326,7 +324,7 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     // INIT -> RTR
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = cq_->context->activeMTU();
+    attr.path_mtu = params_->path_mtu;
     ibv_gid peer_gid_raw;
     std::istringstream iss(peer_gid);
     for (int i = 0; i < 16; ++i) {
@@ -337,30 +335,30 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     }
 
     attr.ah_attr.grh.dgid = peer_gid_raw;
-    attr.ah_attr.grh.sgid_index = cq_->context->gidIndex();
-    attr.ah_attr.grh.hop_limit = params_.hop_limit;
-    attr.ah_attr.grh.flow_label = params_.flow_label;
-    attr.ah_attr.grh.traffic_class = params_.traffic_class;
+    attr.ah_attr.grh.sgid_index = context().gidIndex();
+    attr.ah_attr.grh.hop_limit = params_->hop_limit;
+    attr.ah_attr.grh.flow_label = params_->flow_label;
+    attr.ah_attr.grh.traffic_class = params_->traffic_class;
     attr.ah_attr.dlid = peer_lid;
-    attr.ah_attr.sl = params_.service_level;
-    attr.ah_attr.src_path_bits = params_.src_path_bits;
-    attr.ah_attr.static_rate = params_.static_rate;
+    attr.ah_attr.sl = params_->service_level;
+    attr.ah_attr.src_path_bits = params_->src_path_bits;
+    attr.ah_attr.static_rate = params_->static_rate;
     attr.ah_attr.is_global = 1;
-    attr.ah_attr.port_num = cq_->context->portNum();
+    attr.ah_attr.port_num = context().portNum();
     attr.dest_qp_num = peer_qp_num;
-    attr.rq_psn = params_.rq_psn;
-    attr.max_dest_rd_atomic = params_.max_dest_rd_atomic;
-    attr.min_rnr_timer = params_.min_rnr_timer;
+    attr.rq_psn = params_->rq_psn;
+    attr.max_dest_rd_atomic = params_->max_dest_rd_atomic;
+    attr.min_rnr_timer = params_->min_rnr_timer;
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
                             IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC |
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
         std::string message =
-            "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp "
-            "num, error code " +
+            "[ERR-03] Failed to modify QP to RTR, check mtu, gid, peer lid, "
+            "peer qp num, error code " +
             std::to_string(ret);
-        LOG(ERROR) << message;
+        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -368,19 +366,20 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     // RTR -> RTS
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
-    attr.timeout = params_.send_timeout;
-    attr.retry_cnt = params_.send_retry_count;
-    attr.rnr_retry = params_.send_rnr_count;
-    attr.sq_psn = params_.sq_psn;
-    attr.max_rd_atomic = params_.max_rd_atomic;
+    attr.timeout = params_->send_timeout;
+    attr.retry_cnt = params_->send_retry_count;
+    attr.rnr_retry = params_->send_rnr_count;
+    attr.sq_psn = params_->sq_psn;
+    attr.max_rd_atomic = params_->max_rd_atomic;
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         std::string message =
-            "Failed to modify QP to RTS, error code " + std::to_string(ret);
-        LOG(ERROR) << "[Handshake failed] " << message;
+            "[ERR-04] Failed to modify QP to RTS, error code " +
+            std::to_string(ret);
+        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }

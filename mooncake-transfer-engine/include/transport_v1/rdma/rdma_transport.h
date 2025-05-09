@@ -18,6 +18,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "buffers.h"
 #include "context.h"
 #include "metadata/metadata.h"
 #include "transport_v1/transport.h"
@@ -36,10 +38,21 @@ namespace mooncake {
 namespace v1 {
 class RdmaContext;
 class RdmaEndPoint;
-class RdmaResources;
 class Workers;
 class EndpointStore;
 class LocalBuffers;
+
+using DeviceID = std::string;
+using RdmaContextSet =
+    std::unordered_map<DeviceID, std::shared_ptr<RdmaContext>>;
+
+struct RdmaResources {
+    std::string local_segment_name;
+    std::shared_ptr<Topology> local_topology;
+    std::shared_ptr<mooncake::TransferMetadata> metadata_manager;
+    LocalBufferSet local_buffer_set;
+    RdmaContextSet context_set;
+};
 
 struct RdmaSlice;
 
@@ -64,8 +77,10 @@ struct RdmaSlice {
 
     int retry_count = 0;
     RdmaTask *task = nullptr;
+    volatile int *quota_counter = nullptr;
 
     void markSuccess() {
+        assert(task);
         __sync_fetch_and_add(&task->status.transferred_bytes, length);
         auto finish_slices = __sync_fetch_and_add(&task->finish_slices, 1);
         if (finish_slices + 1 == task->num_slices) {
@@ -74,6 +89,7 @@ struct RdmaSlice {
     }
 
     void markFailed(const std::string &reason) {
+        assert(task);
         __sync_fetch_and_add(&task->finish_slices, 1);
         task->status.s = Transport::FAILED;
     }
@@ -116,7 +132,7 @@ class RdmaTransport : public Transport {
 
     virtual Status unregisterLocalMemory(const std::vector<void *> &addr_list);
 
-    virtual const char *getName() const { return "rdma-v1"; }
+    virtual const char *getName() const { return "rdma"; }
 
    public:
     int startHandshakeDaemon();
