@@ -60,16 +60,17 @@ static bool get_auto_discover() {
     return false;
 }
 
-static inline void ltrim(std::string &s) {
+static inline void ltrim(std::string& s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }));
+                return !std::isspace(ch);
+            }));
 }
 
-static inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
+static inline void rtrim(std::string& s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
 }
 
 static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
@@ -77,14 +78,16 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
         if (!auto_discover) {
-            LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
+            LOG(WARNING)
+                << "auto discovery not set, but find whitelist filters: "
+                << ev_ad;
             return whitelst_filters;
         }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
-        char * end = ev_ad + std::strlen(ev_ad);
-        char * start = ev_ad, * pos = ev_ad;
-        while ((pos=std::find(start, end, delimiter)) != end) {
+        char* end = ev_ad + std::strlen(ev_ad);
+        char *start = ev_ad, *pos = ev_ad;
+        while ((pos = std::find(start, end, delimiter)) != end) {
             std::string str(start, pos);
             ltrim(str);
             rtrim(str);
@@ -108,7 +111,8 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
     transfer_engine_.setAutoDiscover(auto_discover);
-    transfer_engine_.setWhitelistFilters(get_auto_discover_filters(auto_discover));
+    transfer_engine_.setWhitelistFilters(
+        get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
@@ -203,6 +207,17 @@ ErrorCode Client::Get(const std::string& object_key,
                 }
                 handles.push_back(handle);
             }
+            // Fast path: if segment is on local host and we have single slice
+            // and handle, use memcpy instead of going through the transfer
+            // engine to improve performance and save bandwidth
+            if (slices.size() == 1 && handles.size() == 1 &&
+                handles[0].size_ == slices[0].size &&
+                handles[0].segment_name_ == this->local_hostname_) {
+                VLOG(1) << "Using fast path (memcpy) for local transfer";
+                memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
+                       handles[0].size_);
+                return ErrorCode::OK;
+            }
 
             if (TransferRead(handles, slices) != ErrorCode::OK) {
                 LOG(ERROR) << "transfer_read_failed key=" << object_key;
@@ -246,16 +261,27 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);
         }
-        // Write just ignore the transfer size
-        ErrorCode transfer_err = TransferWrite(handles, slices);
-        if (transfer_err != ErrorCode::OK) {
-            // Revoke put operation
-            auto revoke_err = master_client_.PutRevoke(key);
-            if (revoke_err.error_code != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to revoke put operation";
-                return revoke_err.error_code;
+
+        // Fast path: if segment is on local host and we have single slice and
+        // handle, use memcpy instead of going through the transfer engine
+        if (slices.size() == 1 && handles.size() == 1 &&
+            handles[0].size_ == slices[0].size &&
+            handles[0].segment_name_ == this->local_hostname_) {
+            VLOG(1) << "Using fast path (memcpy) for local transfer";
+            memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
+                   handles[0].size_);
+        } else {
+            // Normal path: use transfer engine
+            ErrorCode transfer_err = TransferWrite(handles, slices);
+            if (transfer_err != ErrorCode::OK) {
+                // Revoke put operation
+                auto revoke_err = master_client_.PutRevoke(key);
+                if (revoke_err.error_code != ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return revoke_err.error_code;
+                }
+                return transfer_err;
             }
-            return transfer_err;
         }
     }
 
@@ -272,9 +298,7 @@ ErrorCode Client::Remove(const ObjectKey& key) {
     return master_client_.Remove(key).error_code;
 }
 
-long Client::RemoveAll() {
-    return master_client_.RemoveAll().removed_count;
-}
+long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
