@@ -148,7 +148,8 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_addr) {
+                                  const std::string &master_server_addr,
+                                  bool with_store /* true */) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -186,6 +187,9 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         LOG(ERROR) << "Failed to register local memory: "
                    << toString(error_code);
         return 1;
+    }
+    if (!with_store) {
+        return 0;
     }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
     if (!ptr) {
