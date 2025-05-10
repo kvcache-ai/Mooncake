@@ -3,6 +3,13 @@ import platform
 from setuptools import setup, Distribution
 from wheel.bdist_wheel import bdist_wheel
 
+import sys
+import platform
+
+# Fail gracefully on unsupported platforms
+unsupported_platforms = ["win32", "darwin"]
+if sys.platform in unsupported_platforms:
+    sys.exit(f"Error: mooncake does not support {platform.system()} at this time. Please use a supported Linux distribution.")
 
 def get_arch():
     """
