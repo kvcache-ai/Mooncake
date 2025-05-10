@@ -17,8 +17,8 @@ class MooncakeConfig:
     Attributes:
         local_hostname (str): The hostname of the local machine.
         metadata_server (str): The address of the metadata server.
-        global_segment_size_bytes (int): The size of each global segment in bytes.
-        local_buffer_size_bytes (int): The size of the local buffer in bytes.
+        global_segment_size (int): The size of each global segment in bytes.
+        local_buffer_size (int): The size of the local buffer in bytes.
         protocol (str): The communication protocol to use.
         device_name (Optional[str]): The name of the device to use.
         master_server_address (str): The address of the master server.
@@ -27,8 +27,8 @@ class MooncakeConfig:
         {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "global_segment_size_bytes": 3355443200,
-            "local_buffer_size_bytes": 1073741824,
+            "global_segment_size": 3355443200,
+            "local_buffer_size": 1073741824,
             "protocol": "tcp",
             "device_name": "",
             "master_server_address": "localhost:8081"
@@ -36,8 +36,8 @@ class MooncakeConfig:
     """
     local_hostname: str
     metadata_server: str
-    global_segment_size_bytes: int
-    local_buffer_size_bytes: int
+    global_segment_size: int
+    local_buffer_size: int
     protocol: str
     device_name: Optional[str]
     master_server_address: str
@@ -58,10 +58,10 @@ class MooncakeConfig:
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
-            global_segment_size_bytes=config.get("global_segment_size_bytes",
-                                                 DEFAULT_GLOBAL_SEGMENT_SIZE),
-            local_buffer_size_bytes=config.get("local_buffer_size_bytes",
-                                               DEFAULT_LOCAL_BUFFER_SIZE),
+            global_segment_size=config.get("global_segment_size",
+                                           DEFAULT_GLOBAL_SEGMENT_SIZE),
+            local_buffer_size=config.get("local_buffer_size",
+                                         DEFAULT_LOCAL_BUFFER_SIZE),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
