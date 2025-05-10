@@ -11,6 +11,7 @@ NUM_DECODE=${NUM_DECODE:-"4"}
 PREFIX_LEN=${PREFIX_LEN:-"50"}
 NUM_FOLDS=${NUM_FOLDS:-"20"}
 MASTER_PORT=${MASTER_PORT:-"10001"}
+METADATA_PORT=${METADATA_PORT:-"2379"}
 PREFILL_PORT_BASE=${PREFILL_PORT_BASE:-"8100"}
 DECODE_PORT_BASE=${DECODE_PORT_BASE:-"8200"}
 PROXY_PORT=${PROXY_PORT:-"8000"}
@@ -31,7 +32,7 @@ wait_for_server() {
   # return 1 if vllm server crashes
   local port=$1
   timeout 1200 bash -c "
-    until curl -X POST -s http://localhost:${port}/v1/models > /dev/null; do
+    until curl -s http://localhost:${port}/v1/models > /dev/null; do
       sleep 1
     done" && return 0 || return 1
 }
@@ -62,7 +63,8 @@ destroy_vllm_engine()
 
 kill_nodes() {
   # kill all processes by port
-  lsof -t -i:$(PROXY_PORT) | xargs -r kill -9
+  lsof -t -i:$PROXY_PORT | xargs -r kill -9
+  lsof -t -i:$METADATA_PORT | xargs -r kill -9
   for ((i=0; i<NUM_PREFILL; i++)); do
     destroy_vllm_engine $((${PREFILL_PORT_BASE} + i))
   done
@@ -87,6 +89,7 @@ kill_process_by_pid() {
 }
 
 launch_nodes() {
+  etcd --listen-client-urls http://localhost:${METADATA_PORT} --advertise-client-urls http://localhost:${METADATA_PORT} > ${logs_root}/metadata.txt 2>&1 &
   nohup mooncake_master --port ${MASTER_PORT} > ${logs_root}/master.txt 2>&1 &
   # launch prefill instance
   for ((i=0; i<NUM_PREFILL; i++)); do
@@ -150,9 +153,9 @@ launch_disagg_proxy() {
   --model $MODEL \
   --prefill $prefill_ports_str \
   --decode $decode_ports_str \
-  --port 8000 \
+  --port $PROXY_PORT \
   2>&1 | tee ${logs_root}/proxy-${num_prefill}-${num_decode}.txt 2>&1 &
-  PROXY_ID=$!
+  PROXY_ID=$(ps -ef | grep $DEMO_PATH | grep "port $PROXY_PORT" | awk -F ' ' '{print $2}')
   echo "Launched disagg_proxy with PID: $PROXY_ID"
   sleep 1
 }
