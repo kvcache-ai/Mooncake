@@ -187,6 +187,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                    << toString(error_code);
         return 1;
     }
+    // Skip mount segment if global_segment_size is 0
+    if (global_segment_size == 0) {
+        return 0;
+    }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
     if (!ptr) {
         LOG(ERROR) << "Failed to allocate segment memory";
