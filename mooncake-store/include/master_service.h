@@ -166,6 +166,12 @@ class MasterService {
     long RemoveAll();
 
 
+    /**
+     * @brief Get the count of keys
+     * @return The count of keys
+     */
+    size_t GetKeyCount() const;
+
    private:
     // GC thread function
     void GCThreadFunc();
