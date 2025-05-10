@@ -16,8 +16,8 @@ class TestMooncakeConfig(unittest.TestCase):
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
             "master_server_address": "localhost:8081",
-            "global_segment_size_bytes": 3355443200,
-            "local_buffer_size_bytes": 1073741824,
+            "global_segment_size": 3355443200,
+            "local_buffer_size": 1073741824,
             "protocol": "tcp",
             "device_name": "eth0"
         }
@@ -38,8 +38,8 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.local_hostname, "localhost")
         self.assertEqual(config.metadata_server, "localhost:8080")
         self.assertEqual(config.master_server_address, "localhost:8081")
-        self.assertEqual(config.global_segment_size_bytes, 3355443200)
-        self.assertEqual(config.local_buffer_size_bytes, 1073741824)
+        self.assertEqual(config.global_segment_size, 3355443200)
+        self.assertEqual(config.local_buffer_size, 1073741824)
         self.assertEqual(config.protocol, "tcp")
         self.assertEqual(config.device_name, "eth0")
 
@@ -53,8 +53,8 @@ class TestMooncakeConfig(unittest.TestCase):
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
 
-        self.assertEqual(config.global_segment_size_bytes, DEFAULT_GLOBAL_SEGMENT_SIZE)
-        self.assertEqual(config.local_buffer_size_bytes, DEFAULT_LOCAL_BUFFER_SIZE)
+        self.assertEqual(config.global_segment_size, DEFAULT_GLOBAL_SEGMENT_SIZE)
+        self.assertEqual(config.local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE)
         self.assertEqual(config.protocol, "tcp")
         self.assertEqual(config.device_name, "")
 
