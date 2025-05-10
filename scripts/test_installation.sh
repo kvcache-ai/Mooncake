@@ -39,6 +39,9 @@ cp -r mooncake-wheel/tests test_env/
 cd test_env
 python tests/test_import_structure.py
 
+echo "Running mooncake config test..."
+python tests/test_mooncake_config.py
+
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
