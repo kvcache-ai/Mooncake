@@ -73,6 +73,11 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
+                    LOG(ERROR)
+                        << "Session::writeHeader failed. Error: "
+                        << ec.message() << " (value: " << ec.value() << ")"
+                        << ", bytes written: " << len
+                        << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -91,6 +96,11 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
+                    LOG(ERROR)
+                        << "Session::readHeader failed. Error: " << ec.message()
+                        << " (value: " << ec.value() << ")"
+                        << ", bytes read: " << len
+                        << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -123,6 +133,12 @@ struct Session : public std::enable_shared_from_this<Session> {
             [this, addr, self](const asio::error_code &ec,
                                std::size_t transferred_bytes) {
                 if (ec) {
+                    LOG(ERROR)
+                        << "Session::writeBody failed. Error: " << ec.message()
+                        << " (value: " << ec.value() << ")"
+                        << ", total_transferred_bytes_: "
+                        << total_transferred_bytes_
+                        << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -151,6 +167,12 @@ struct Session : public std::enable_shared_from_this<Session> {
             [this, addr, self](const asio::error_code &ec,
                                std::size_t transferred_bytes) {
                 if (ec) {
+                    LOG(ERROR)
+                        << "Session::readBody failed. Error: " << ec.message()
+                        << " (value: " << ec.value() << ")"
+                        << ", total_transferred_bytes_: "
+                        << total_transferred_bytes_
+                        << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -351,7 +373,9 @@ void TcpTransport::worker() {
             context_->doAccept();
             context_->io_context.run();
         } catch (std::exception &e) {
-            LOG(ERROR) << "TcpTransport: exception: " << e.what();
+            LOG(ERROR) << "TcpTransport::worker encountered an exception "
+                          "during doAccept/run: "
+                       << e.what();
         }
     }
 }
@@ -362,12 +386,18 @@ void TcpTransport::startTransfer(Slice *slice) {
         asio::ip::tcp::socket socket(context_->io_context);
         auto desc = metadata_->getSegmentDescByID(slice->target_id);
         if (!desc) {
+            LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
+                          "description for target_id: "
+                       << slice->target_id;
             slice->markFailed();
             return;
         }
 
         TransferMetadata::RpcMetaDesc meta_entry;
         if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
+            LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
+                          "entry for segment name: "
+                       << desc->name;
             slice->markFailed();
             return;
         }
@@ -385,7 +415,12 @@ void TcpTransport::startTransfer(Slice *slice) {
         session->initiate(slice->source_addr, slice->tcp.dest_addr,
                           slice->length, slice->opcode);
     } catch (std::exception &e) {
-        LOG(ERROR) << "TcpTransport: ASIO exception: " << e.what();
+        LOG(ERROR) << "TcpTransport::startTransfer encountered an ASIO "
+                      "exception. Slice details - source_addr: "
+                   << slice->source_addr << ", length: " << slice->length
+                   << ", opcode: " << (int)slice->opcode
+                   << ", target_id: " << slice->target_id
+                   << ". Exception: " << e.what();
         slice->markFailed();
     }
 }
