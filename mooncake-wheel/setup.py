@@ -3,17 +3,55 @@ import platform
 from setuptools import setup, Distribution
 from wheel.bdist_wheel import bdist_wheel
 
-import sys
-import platform
-
-# Fail gracefully on unsupported platforms
-unsupported_platforms = ["win32", "darwin"]
+# ---------------------------------------------------------------------------
+# Platform guard
+# ---------------------------------------------------------------------------
+unsupported_platforms = ["win32", "darwin"]  # Still blocking non-Linux builds
 if sys.platform in unsupported_platforms:
-    sys.exit(f"Error: mooncake does not support {platform.system()} at this time. Please use a supported Linux distribution.")
+    sys.exit(
+        f"Error: mooncake does not support {platform.system()} at this time. "
+        "Please use a supported Linux distribution."
+    )
 
-def get_arch():
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+try:
+    # packaging ≥20 provides a robust glibc detector used by pip/build
+    from packaging.tags import glibc_version_string
+except ImportError:
+    glibc_version_string = None
+
+
+def _detect_manylinux_tag() -> str:
     """
-    Returns the system architecture for the current system.
+    Return a PEP 600-style manylinux tag matching *this* build host (e.g. 'manylinux_2_31').
+    Falls back to 'manylinux_2_17' if detection fails for maximum compatibility.
+    """
+    if glibc_version_string is not None:
+        ver = glibc_version_string()
+    else:
+        import ctypes
+
+        try:
+            ver = (
+                ctypes.CDLL("libc.so.6")
+                .gnu_get_libc_version()
+                .decode("ascii", "replace")
+            )
+        except Exception:
+            ver = "2.17"  # conservative baseline
+
+    major, minor, *_ = ver.split(".")
+    return f"manylinux_{major}_{minor}"
+
+
+# ---------------------------------------------------------------------------
+# wheel tag builders
+# ---------------------------------------------------------------------------
+def get_arch() -> str:
+    """
+    CPU architecture component of the wheel tag.
     """
     if sys.platform.startswith("linux"):
         if platform.machine() == "x86_64":
@@ -21,37 +59,39 @@ def get_arch():
         if platform.machine() in ("arm64", "aarch64"):
             return "aarch64"
     elif sys.platform == "darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
-        arch = "x86_64" if platform.machine() == "x86_64" else platform.machine()
-        return f"macosx_{mac_version}_{arch}"
+        # Return only the arch; macOS deployment target lives in get_system()
+        return "aarch64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
     elif sys.platform == "win32":
         return "win_amd64"
-    else:
-        raise ValueError(f"Unsupported platform: {sys.platform}")
+
+    raise ValueError(f"Unsupported platform: {sys.platform}")
 
 
-def get_system():
+def get_system() -> str:
     """
-    Returns the system name as used in wheel filenames.
+    OS component of the wheel tag (PEP 425 / PEP 600 compliant).
     """
-    if platform.system() == "Windows":
+    sys_name = platform.system()
+    if sys_name == "Windows":
         return "win"
-    elif platform.system() == "Darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
-        return f"macos_{mac_version}"
-    elif platform.system() == "Linux":
-        return "manylinux_2_35"
-    else:
-        raise ValueError(f"Unsupported system: {platform.system()}")
+    elif sys_name == "Darwin":
+        # Use macosx_{major}_{minor} layout (underscored) per PEP 425
+        major, minor, *_ = (platform.mac_ver()[0] or "11.0").split(".")
+        return f"macosx_{major}_{minor}"
+    elif sys_name == "Linux":
+        return _detect_manylinux_tag()
+
+    raise ValueError(f"Unsupported system: {sys_name}")
 
 
-def get_platform():
-    """
-    Returns the platform name as used in wheel filenames.
-    """
+def get_platform() -> str:
+    """Full `{system}_{arch}` tag used by bdist_wheel."""
     return f"{get_system()}_{get_arch()}"
 
 
+# ---------------------------------------------------------------------------
+# dist / cmd hooks
+# ---------------------------------------------------------------------------
 class BinaryDistribution(Distribution):
     def has_ext_modules(self):
         return True
@@ -65,9 +105,10 @@ class CustomBdistWheel(bdist_wheel):
         self.plat_name = get_platform()
 
 
+# ---------------------------------------------------------------------------
+# setup()
+# ---------------------------------------------------------------------------
 setup(
     distclass=BinaryDistribution,
-    cmdclass={
-        'bdist_wheel': CustomBdistWheel,
-    },
+    cmdclass={"bdist_wheel": CustomBdistWheel},
 )
