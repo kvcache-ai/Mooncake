@@ -30,12 +30,11 @@ class RdmaEndPoint {
     int construct(RdmaCQ *cq, EndPointParams *params);
 
    public:
-    // Enable, disable, restart
     enum EndPointStatus {
-        kEndPointUninitialized,
-        kEndPointDisabled,
-        kEndPointPreparing,
-        kEndPointReady
+        EP_UNINIT,
+        EP_DISABLED,
+        EP_INPROGRESS,
+        EP_READY
     };
 
     int enable();
@@ -74,6 +73,8 @@ class RdmaEndPoint {
 
     int submitGeneralRequests(std::vector<Request> &requests);
 
+    int submitSlices(std::vector<RdmaSlice *> &slices);
+
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
     volatile int *getQuotaCounter(int qp_index) const {
@@ -95,6 +96,7 @@ class RdmaEndPoint {
 
     RdmaCQ *cq_;
     EndPointParams *params_;
+    std::string endpoint_name_;
 
     std::vector<ibv_qp *> qp_list_;
     volatile int *wr_depth_list_;

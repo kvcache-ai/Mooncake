@@ -33,8 +33,6 @@
 
 namespace mooncake {
 namespace v1 {
-RdmaTask::~RdmaTask() { delete[] slices; }
-
 RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
@@ -52,25 +50,24 @@ Status RdmaTransport::install(
     }
 
     auto params = std::make_shared<RdmaParams>();
-    resources_ = std::make_shared<RdmaResources>();
-    resources_->metadata_manager = metadata_manager;
-    resources_->local_segment_name = local_segment_name;
-    resources_->local_topology = local_topology;
+    metadata_manager_ = metadata_manager;
+    local_segment_name_ = local_segment_name;
+    local_topology_ = local_topology;
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params->endpoint.endpoint_store_cap);
-    auto hca_list = resources_->local_topology->getHcaList();
+    auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>();
         int ret = context->construct(device_name, endpoint_store, params);
         if (ret) {
-            resources_->local_topology->disableDevice(device_name);
+            local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
             continue;
         }
-        resources_->context_set[device_name] = context;
-        resources_->local_buffer_set.addDevice(context.get());
+        context_set_[device_name] = context;
+        local_buffer_set_.addDevice(context.get());
     }
-    if (resources_->local_topology->empty()) {
+    if (local_topology_->empty()) {
         uninstall();
         return Status::DeviceNotFound("no RDMA device detected in active");
     }
@@ -82,12 +79,12 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to start handshake daemon thread");
     }
 
-    if (resources_->metadata_manager->updateLocalSegmentDesc()) {
+    if (metadata_manager_->updateLocalSegmentDesc()) {
         uninstall();
         return Status::Metadata("failed to upload local segment descriptor");
     }
 
-    workers_ = std::make_shared<Workers>(resources_);
+    workers_ = std::make_shared<Workers>(this);
     workers_->start();
 
     installed_ = true;
@@ -97,12 +94,10 @@ Status RdmaTransport::install(
 Status RdmaTransport::uninstall() {
     if (installed_) {
         workers_.reset();
-        resources_->metadata_manager->removeSegmentDesc(
-            resources_->local_segment_name);
-        resources_->metadata_manager.reset();
-        resources_->local_buffer_set.clear();
-        resources_->context_set.clear();
-        resources_.reset();
+        metadata_manager_->removeSegmentDesc(local_segment_name_);
+        metadata_manager_.reset();
+        local_buffer_set_.clear();
+        context_set_.clear();
         installed_ = false;
     }
     return Status::OK();
@@ -133,16 +128,25 @@ Status RdmaTransport::submitTransferTasks(
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
         task.num_slices = (request.length + kBlockSize - 1) / kBlockSize;
-        task.slices = new RdmaSlice[task.num_slices];
-        RdmaSlice *slice = task.slices;
+        RdmaSlice *prev_slice = nullptr;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
+            auto slice = RdmaSliceStorage::Get().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->target_addr = request.target_offset + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->task = &task;
-            slice++;
+            slice->next = nullptr;
+            slice->retry_count = 0;
+            slice->endpoint_quota = nullptr;
+            if (prev_slice) {
+                prev_slice->next = slice;
+            } else {
+                task.slices = slice;
+            }
+            prev_slice = slice;
         }
+        assert(task.num_slices);
         workers_->submit(task.slices, task.num_slices);
     }
     return Status::OK();
@@ -181,7 +185,7 @@ Status RdmaTransport::registerLocalMemory(
                          << buffer_list[i].length;
         }
     }
-    int ret = resources_->metadata_manager->updateLocalSegmentDesc();
+    int ret = metadata_manager_->updateLocalSegmentDesc();
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
@@ -207,17 +211,17 @@ Status RdmaTransport::unregisterLocalMemory(
                          << addr_list[i];
         }
     }
-    int ret = resources_->metadata_manager->updateLocalSegmentDesc();
+    int ret = metadata_manager_->updateLocalSegmentDesc();
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
 
 void RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
-    desc->name = resources_->local_segment_name;
+    desc->name = local_segment_name_;
     desc->protocol = "rdma";
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (auto &entry : resources_->context_set) {
+    for (auto &entry : context_set_) {
         DeviceDesc device_desc;
         auto &context = entry.second;
         device_desc.name = context->name();
@@ -225,20 +229,20 @@ void RdmaTransport::allocateLocalSegmentID() {
         device_desc.gid = context->gid();
         detail.devices.push_back(device_desc);
     }
-    detail.topology = *(resources_->local_topology.get());
-    resources_->metadata_manager->addLocalSegment(
-        LOCAL_SEGMENT_ID, resources_->local_segment_name, std::move(desc));
+    detail.topology = *(local_topology_.get());
+    metadata_manager_->addLocalSegment(LOCAL_SEGMENT_ID, local_segment_name_,
+                                       std::move(desc));
 }
 
 int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
                                              bool update_meta) {
     BufferDesc buffer_desc;
-    int ret = resources_->local_buffer_set.addBuffer(buffer);
+    int ret = local_buffer_set_.addBuffer(buffer);
     if (ret) return ret;
-    for (auto &entry : resources_->context_set) {
+    for (auto &entry : context_set_) {
         uint32_t lkey, rkey;
-        resources_->local_buffer_set.findBufferLegacy(
-            buffer.addr, entry.second.get(), lkey, rkey);
+        local_buffer_set_.findBufferLegacy(buffer.addr, entry.second.get(),
+                                           lkey, rkey);
         buffer_desc.lkey.push_back(lkey);
         buffer_desc.rkey.push_back(rkey);
     }
@@ -252,36 +256,34 @@ int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
             buffer_desc.location = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
-            int rc = resources_->metadata_manager->addLocalMemoryBuffer(
-                buffer_desc, update_meta);
+            int rc = metadata_manager_->addLocalMemoryBuffer(buffer_desc,
+                                                             update_meta);
             if (rc) return rc;
         }
     } else {
         buffer_desc.location = buffer.location;
         buffer_desc.addr = (uint64_t)buffer.addr;
         buffer_desc.length = buffer.length;
-        int rc = resources_->metadata_manager->addLocalMemoryBuffer(
-            buffer_desc, update_meta);
+        int rc =
+            metadata_manager_->addLocalMemoryBuffer(buffer_desc, update_meta);
         if (rc) return rc;
     }
     return 0;
 }
 
 int RdmaTransport::unregisterSingleLocalMemory(void *addr, bool update_meta) {
-    int rc = resources_->metadata_manager->removeLocalMemoryBuffer(addr,
-                                                                   update_meta);
+    int rc = metadata_manager_->removeLocalMemoryBuffer(addr, update_meta);
     if (rc) return rc;
-    resources_->local_buffer_set.removeBufferLegacy(addr);
+    local_buffer_set_.removeBufferLegacy(addr);
     return 0;
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty() ||
-        !resources_->context_set.count(local_nic_name))
+    if (local_nic_name.empty() || !context_set_.count(local_nic_name))
         return ERR_INVALID_ARGUMENT;
-    auto context = resources_->context_set[local_nic_name];
+    auto context = context_set_[local_nic_name];
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     auto peer_nic_path_ = peer_desc.local_nic_path;
@@ -294,12 +296,12 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
 
     local_desc.local_nic_path =
-        MakeNicPath(resources_->local_segment_name, context->name());
+        MakeNicPath(local_segment_name_, context->name());
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = endpoint->qpNum();
 
     auto segment_desc =
-        resources_->metadata_manager->getSegmentDescByName(peer_server_name);
+        metadata_manager_->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
         for (auto &nic : detail.devices)
@@ -314,8 +316,8 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::startHandshakeDaemon() {
-    auto local_rpc_meta = resources_->metadata_manager->localRpcMeta();
-    return resources_->metadata_manager->startHandshakeDaemon(
+    auto local_rpc_meta = metadata_manager_->localRpcMeta();
+    return metadata_manager_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
         local_rpc_meta.rpc_port, local_rpc_meta.sockfd);
@@ -324,8 +326,8 @@ int RdmaTransport::startHandshakeDaemon() {
 int RdmaTransport::sendHandshake(const std::string &peer_server_name,
                                  const HandShakeDesc &local_desc,
                                  HandShakeDesc &peer_desc) {
-    return resources_->metadata_manager->sendHandshake(peer_server_name,
-                                                       local_desc, peer_desc);
+    return metadata_manager_->sendHandshake(peer_server_name, local_desc,
+                                            peer_desc);
 }
 }  // namespace v1
 }  // namespace mooncake

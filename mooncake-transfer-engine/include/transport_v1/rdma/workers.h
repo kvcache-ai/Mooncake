@@ -26,10 +26,10 @@
 namespace mooncake {
 namespace v1 {
 
-class RdmaResources;
+class RdmaTransport;
 class Workers {
    public:
-    Workers(std::shared_ptr<RdmaResources> &resources);
+    Workers(RdmaTransport *transport);
 
     ~Workers();
 
@@ -55,7 +55,7 @@ class Workers {
                     const std::string &peer_nic_name);
 
    private:
-    std::shared_ptr<RdmaResources> resources_;
+    RdmaTransport *transport_;
     const size_t num_workers_;
 
     std::vector<std::thread> workers_;

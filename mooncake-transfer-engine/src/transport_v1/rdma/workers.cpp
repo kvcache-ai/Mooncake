@@ -21,8 +21,8 @@ namespace mooncake {
 namespace v1 {
 const static size_t kDefaultNumWorkers = 4;
 
-Workers::Workers(std::shared_ptr<RdmaResources> &resources)
-    : resources_(resources),
+Workers::Workers(RdmaTransport *transport)
+    : transport_(transport),
       num_workers_(kDefaultNumWorkers),
       running_(false) {}
 
@@ -60,8 +60,11 @@ int Workers::stop() {
 int Workers::submit(RdmaSlice *slices, size_t count) {
     mutex_.lock();
     for (size_t slice_id = 0; slice_id < count; ++slice_id) {
-        slices_.push(&slices[slice_id]);
+        assert(slices);
+        slices_.push(slices);
+        slices = slices->next;
     }
+    assert(!slices);
     mutex_.unlock();
     return 0;
 }
@@ -98,7 +101,8 @@ void Workers::asyncPostSend() {
     while (!slices_.empty() && slice_to_send.size() < kMaxSlicesToSend) {
         auto slice = slices_.front();
         if (slice->retry_count >= kMaxRetryCount) {
-            slice->markFailed("slice not delivered");
+            __sync_fetch_and_add(&slice->task->finish_slices, 1);
+            slice->task->status.s = Transport::FAILED;
         } else {
             slice_to_send.push_back(slice);
         }
@@ -108,16 +112,17 @@ void Workers::asyncPostSend() {
     if (slice_to_send.empty()) return;
 
     auto local_segment_desc =
-        resources_->metadata_manager->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     for (auto &slice : slice_to_send) {
         auto target_id = slice->task->request.target_id;
         if (segment_desc_map.count(target_id)) continue;
-        auto segment_desc = resources_->metadata_manager->getSegmentDescByID(
+        auto segment_desc = transport_->metadata_manager_->getSegmentDescByID(
             slice->task->request.target_id);
         if (!segment_desc) {
-            slice->markFailed("Failed to get segment descriptor");
+            __sync_fetch_and_add(&slice->task->finish_slices, 1);
+            slice->task->status.s = Transport::FAILED;
             continue;
         }
         segment_desc_map[target_id] = segment_desc;
@@ -129,7 +134,7 @@ void Workers::asyncPostSend() {
         int buffer_id = 0, local_device_id = 0, peer_device_id = 0;
         uint32_t source_lkey = 0, dest_rkey = 0;
 
-        int local_device_count = (int)resources_->context_set.size();
+        int local_device_count = (int)transport_->context_set_.size();
         selectDevice(local_segment_desc, (uint64_t)slice->source_addr,
                      slice->length, buffer_id, local_device_id,
                      slice->retry_count % local_device_count);
@@ -147,11 +152,11 @@ void Workers::asyncPostSend() {
         auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
                                          detail.devices[peer_device_id].name);
 
-        auto context = resources_->context_set[local_device_name];
+        auto context = transport_->context_set_[local_device_name];
         auto endpoint = context->endpoint(peer_nic_path);
-        if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
+        if (endpoint->status() != RdmaEndPoint::EP_READY) {
             mutex_.lock();
-            if (endpoint->status() != RdmaEndPoint::kEndPointReady) {
+            if (endpoint->status() != RdmaEndPoint::EP_READY) {
                 doHandshake(endpoint, peer_segment_desc->name,
                             detail.devices[peer_device_id].name);
             }
@@ -192,17 +197,17 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                          const std::string &peer_nic_name) {
     // TODO loopback
     HandShakeDesc local_desc, peer_desc;
-    local_desc.local_nic_path =
-        MakeNicPath(resources_->local_segment_name, endpoint->context().name());
+    local_desc.local_nic_path = MakeNicPath(transport_->local_segment_name_,
+                                            endpoint->context().name());
     local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
     local_desc.qp_num = endpoint->qpNum();
-    int rc = resources_->metadata_manager->sendHandshake(peer_server_name,
-                                                         local_desc, peer_desc);
+    int rc = transport_->metadata_manager_->sendHandshake(
+        peer_server_name, local_desc, peer_desc);
     if (rc) return rc;
     assert(peer_desc.qp_num.size());
 
     auto segment_desc =
-        resources_->metadata_manager->getSegmentDescByName(peer_server_name);
+        transport_->metadata_manager_->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
         for (auto &nic : detail.devices)
@@ -217,7 +222,7 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
 
 void Workers::asyncPollCq() {
     const static size_t kPollCount = 64;
-    for (auto &entry : resources_->context_set) {
+    for (auto &entry : transport_->context_set_) {
         int cq_count = entry.second->cqCount();
         for (int cq_index = 0; cq_index < cq_count; ++cq_index) {
             auto cq = entry.second->cq(cq_index);
@@ -229,7 +234,7 @@ void Workers::asyncPollCq() {
             }
             for (int i = 0; i < nr_poll; ++i) {
                 auto slice = (RdmaSlice *)wc[i].wr_id;
-                __sync_fetch_and_sub(slice->quota_counter, 1);
+                __sync_fetch_and_sub(slice->endpoint_quota, 1);
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                         LOG(ERROR)
@@ -246,7 +251,14 @@ void Workers::asyncPollCq() {
                     slices_.push(slice);
                     mutex_.unlock();
                 } else {
-                    slice->markSuccess();
+                    auto task = slice->task;
+                    __sync_fetch_and_add(&task->status.transferred_bytes,
+                                         slice->length);
+                    auto finish_slices =
+                        __sync_fetch_and_add(&task->finish_slices, 1);
+                    if (finish_slices + 1 == task->num_slices) {
+                        task->status.s = Transport::COMPLETED;
+                    }
                 }
             }
         }

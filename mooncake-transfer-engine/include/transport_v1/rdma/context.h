@@ -42,6 +42,7 @@ class EndpointStore;
 
 class RdmaContext {
     friend class RdmaCQ;
+    friend class RdmaEndPoint;
 
    public:
     RdmaContext();
@@ -57,7 +58,7 @@ class RdmaContext {
 
     int disable();
 
-    enum DeviceStatus { kDeviceUninitialized, kDeviceDisabled, kDeviceEnabled };
+    enum DeviceStatus { DEVICE_UNINIT, DEVICE_DISABLED, DEVICE_ENABLED };
 
     DeviceStatus status() const { return status_; }
 
@@ -79,15 +80,16 @@ class RdmaContext {
 
     const std::string name() const { return device_name_; }
 
+   public:
     uint16_t lid() const { return lid_; }
 
     std::string gid() const;
 
     int gidIndex() const { return gid_index_; }
 
-    ibv_context *context() const { return context_; }
+    ibv_context *nativeContext() const { return native_context_; }
 
-    ibv_pd *pd() const { return pd_; }
+    ibv_pd *nativePD() const { return native_pd_; }
 
     uint8_t portNum() const { return params_->device.port; }
 
@@ -107,15 +109,15 @@ class RdmaContext {
     // lifecycle
     std::string device_name_;
     std::shared_ptr<RdmaParams> params_;
-    DeviceStatus status_;
+    std::atomic<DeviceStatus> status_;
 
     // initialized during enable() and destroyed during disable()
-    ibv_context *context_ = nullptr;
-    ibv_pd *pd_ = nullptr;
+    ibv_context *native_context_ = nullptr;
+    ibv_pd *native_pd_ = nullptr;
     int event_fd_ = -1;
 
     size_t num_comp_channel_ = 0;
-    ibv_comp_channel **comp_channel_ = nullptr;
+    std::vector<ibv_comp_channel *> comp_channel_;
 
     uint16_t lid_ = 0;
     int gid_index_ = -1;
@@ -125,7 +127,7 @@ class RdmaContext {
     std::unordered_set<ibv_mr *> mr_set_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
-    std::vector<std::shared_ptr<RdmaCQ> > cq_list_;
+    std::vector< std::shared_ptr<RdmaCQ> > cq_list_;
 };
 
 }  // namespace v1

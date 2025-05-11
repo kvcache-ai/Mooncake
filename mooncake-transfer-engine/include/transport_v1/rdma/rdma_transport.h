@@ -31,6 +31,7 @@
 #include "buffers.h"
 #include "context.h"
 #include "metadata/metadata.h"
+#include "slice.h"
 #include "transport_v1/transport.h"
 #include "utility/topology.h"
 
@@ -46,55 +47,6 @@ using DeviceID = std::string;
 using RdmaContextSet =
     std::unordered_map<DeviceID, std::shared_ptr<RdmaContext>>;
 
-struct RdmaResources {
-    std::string local_segment_name;
-    std::shared_ptr<Topology> local_topology;
-    std::shared_ptr<mooncake::TransferMetadata> metadata_manager;
-    LocalBufferSet local_buffer_set;
-    RdmaContextSet context_set;
-};
-
-struct RdmaSlice;
-
-struct RdmaTask {
-    RdmaTask() = default;
-
-    ~RdmaTask();
-
-    Transport::Request request;
-    Transport::TransferStatus status;
-
-    bool submitted = false;
-    RdmaSlice *slices = nullptr;
-    int num_slices = 0;
-    volatile int finish_slices = 0;  // including success or failed
-};
-
-struct RdmaSlice {
-    void *source_addr = nullptr;
-    uint64_t target_addr = 0;
-    size_t length = 0;
-
-    int retry_count = 0;
-    RdmaTask *task = nullptr;
-    volatile int *quota_counter = nullptr;
-
-    void markSuccess() {
-        assert(task);
-        __sync_fetch_and_add(&task->status.transferred_bytes, length);
-        auto finish_slices = __sync_fetch_and_add(&task->finish_slices, 1);
-        if (finish_slices + 1 == task->num_slices) {
-            task->status.s = Transport::COMPLETED;
-        }
-    }
-
-    void markFailed(const std::string &reason) {
-        assert(task);
-        __sync_fetch_and_add(&task->finish_slices, 1);
-        task->status.s = Transport::FAILED;
-    }
-};
-
 struct RdmaSubBatch : public Transport::SubBatch {
     RdmaSubBatch(size_t max_size) : max_size(max_size) {
         task_list.reserve(max_size);
@@ -105,6 +57,8 @@ struct RdmaSubBatch : public Transport::SubBatch {
 };
 
 class RdmaTransport : public Transport {
+    friend class Workers;
+
    public:
     RdmaTransport();
 
@@ -153,7 +107,11 @@ class RdmaTransport : public Transport {
 
    private:
     bool installed_;
-    std::shared_ptr<RdmaResources> resources_;
+    std::string local_segment_name_;
+    std::shared_ptr<Topology> local_topology_;
+    std::shared_ptr<mooncake::TransferMetadata> metadata_manager_;
+    LocalBufferSet local_buffer_set_;
+    RdmaContextSet context_set_;
     std::shared_ptr<Workers> workers_;
 };
 }  // namespace v1

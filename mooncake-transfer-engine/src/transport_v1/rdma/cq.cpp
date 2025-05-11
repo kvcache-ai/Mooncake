@@ -37,10 +37,16 @@ RdmaCQ::~RdmaCQ() {
 int RdmaCQ::construct(RdmaContext *context, int cqe_limit, int index) {
     context_ = context;
     cqe_limit_ = cqe_limit;
-    cq_ = ibv_create_cq(
-        context_->context(), cqe_limit, nullptr,
-        context_->comp_channel_[index % context_->num_comp_channel_],
-        index % context_->context()->num_comp_vectors);
+    auto native_context = context_->nativeContext();
+    ibv_comp_channel *comp_channel =
+        (context_->num_comp_channel_)
+            ? context_->comp_channel_[index % context_->num_comp_channel_]
+            : nullptr;
+    int comp_vector = (native_context->num_comp_vectors == 0)
+                          ? 0
+                          : index % native_context->num_comp_vectors;
+    cq_ = ibv_create_cq(native_context, cqe_limit, nullptr, comp_channel,
+                        comp_vector);
     if (!cq_) {
         PLOG(ERROR) << "Failed to create completion queue";
         return ERR_CONTEXT;
