@@ -54,7 +54,7 @@ Under normal conditions, a NIC from the preferred list is selected for transfers
 In case of failures, NICs from both lists may be utilized.
 The process involves identifying the appropriate local and target NICs based on the memory addresses, establishing a connection, and executing the data transfer.
 
-![topology-matrix](..image/topology-matrix.png)
+![topology-matrix](../image/topology-matrix.png)
 
 For instance, as illustrated in figure above, to transfer data from buffer 0 (assigned to cpu:0) in the local node to buffer 1 (assigned to cpu:1) in the target node, the engine first identifies the preferred NICs for cpu:0 using the local server's topology matrix and selects one, such as mlx5_1, as the local NIC. Similarly, the target NIC, such as mlx5_3, is selected based on the target memory address. This setup enables establishing an RDMA connection from mlx5_1@local to mlx5_3@target to carry out RDMA read and write operations.
 
