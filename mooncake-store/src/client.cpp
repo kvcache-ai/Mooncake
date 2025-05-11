@@ -231,10 +231,6 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         master_client_.PutStart(key, slice_lengths, slice_size, config);
     ErrorCode err = start_response.error_code;
     if (err != ErrorCode::OK) {
-        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            VLOG(1) << "object_already_exists key=" << key;
-            return ErrorCode::OK;
-        }
         LOG(ERROR) << "Failed to start put operation: " << err;
         return err;
     }
