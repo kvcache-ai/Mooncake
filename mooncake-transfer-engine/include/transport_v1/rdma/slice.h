@@ -53,9 +53,12 @@ struct RdmaSlice {
     RdmaTask *task = nullptr;
     RdmaSlice *next = nullptr;
 
-    // hidden fields, managed by worker
+    uint32_t source_lkey = 0;
+    uint32_t target_rkey = 0;
+
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;
+    bool failed = false;
 };
 
 class RdmaSliceStorage {

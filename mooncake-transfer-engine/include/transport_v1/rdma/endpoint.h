@@ -71,9 +71,7 @@ class RdmaEndPoint {
         bool failed;
     };
 
-    int submitGeneralRequests(std::vector<Request> &requests);
-
-    int submitSlices(std::vector<RdmaSlice *> &slices);
+    int submitSlices(RdmaSlice *slices, int count);
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 

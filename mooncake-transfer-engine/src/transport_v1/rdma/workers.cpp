@@ -162,28 +162,10 @@ void Workers::asyncPostSend() {
             }
             mutex_.unlock();
         }
-
-        std::vector<RdmaEndPoint::Request> requests;
-        RdmaEndPoint::Request request;
-        switch (slice->task->request.opcode) {
-            case Transport::Request::READ:
-                request.opcode = IBV_WR_RDMA_READ;
-                break;
-            case Transport::Request::WRITE:
-                request.opcode = IBV_WR_RDMA_WRITE;
-                break;
-            default:
-                break;
-        }
-        request.local.push_back(RdmaEndPoint::Request::SglEntry{
-            (uint32_t)slice->length, (uint64_t)slice->source_addr,
-            source_lkey});
-        request.remote_addr = slice->target_addr;
-        request.remote_key = dest_rkey;
-        request.user_context = slice;
-        requests.push_back(request);
-        endpoint->submitGeneralRequests(requests);
-        if (requests[0].failed) {
+        slice->source_lkey = source_lkey;
+        slice->target_rkey = dest_rkey;
+        int ret = endpoint->submitSlices(slice, 1);
+        if (ret != 1 || slice->failed) {
             slice->retry_count++;
             mutex_.lock();
             slices_.push(slice);

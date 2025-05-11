@@ -176,26 +176,43 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
     return 0;
 }
 
-int RdmaEndPoint::submitGeneralRequests(
-    std::vector<RdmaEndPoint::Request> &requests) {
+static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
+    switch (slice->task->request.opcode) {
+        case Transport::Request::READ:
+            return IBV_WR_RDMA_READ;
+        case Transport::Request::WRITE:
+            return IBV_WR_RDMA_WRITE;
+        default:
+            return IBV_WR_RDMA_READ;
+    }
+}
+
+int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
     RWSpinlock::ReadGuard guard(ep_lock_);
     CHECK_STATUS(EP_READY);
     int sge_count = 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
-    int wr_count = std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
-                            (int)requests.size());
-    wr_count =
-        std::min(int(globalConfig().max_cqe) - cq_->getQuota(), wr_count);
+    int wr_count = 0;
 
-    for (auto &entry : requests) {
-        entry.failed = false;
-        sge_count += entry.local.size();
-        if (params_->max_sge < (int)entry.local.size()) {
+    // TODO for some slices, they can be combined to one WR w/ multiple SGEs
+    const static int kSgeEntries = 1;
+    auto current = slices;
+    while (current && wr_count < count) {
+        wr_count++;
+        current->failed = false;
+        sge_count += kSgeEntries;
+        if (params_->max_sge < kSgeEntries) {
             LOG(ERROR)
                 << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
             return ERR_INVALID_ARGUMENT;
         }
+        current = current->next;
     }
+
+    wr_count = std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
+        wr_count);
+    wr_count =
+        std::min(int(globalConfig().max_cqe) - cq_->getQuota(), wr_count);
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
 
@@ -203,34 +220,40 @@ int RdmaEndPoint::submitGeneralRequests(
     ibv_sge sge_list[sge_count];
     memset(wr_list, 0, sizeof(ibv_send_wr) * wr_count);
     int sge_idx = 0;
+    current = slices;
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
-        auto &entry = requests[wr_idx];
         auto &wr = wr_list[wr_idx];
-        for (int sge_off = 0; sge_off < (int)entry.local.size(); ++sge_off) {
+        for (int sge_off = 0; sge_off < kSgeEntries; ++sge_off) {
             auto &sge = sge_list[sge_idx + sge_off];
-            sge.addr = entry.local[sge_off].addr;
-            sge.length = entry.local[sge_off].length;
-            sge.lkey = entry.local[sge_off].lkey;
+            sge.addr = (uint64_t)current->source_addr;
+            sge.length = current->length;
+            sge.lkey = current->source_lkey;
         }
-        ((RdmaSlice *)entry.user_context)->endpoint_quota =
-            &wr_depth_list_[qp_index];
-        wr.wr_id = (uint64_t)entry.user_context;
-        wr.opcode = entry.opcode;
-        wr.num_sge = entry.local.size();
+        current->endpoint_quota = &wr_depth_list_[qp_index];
+        wr.wr_id = (uint64_t)current;
+        wr.opcode = getOpCode(current);
+        wr.num_sge = kSgeEntries;
         wr.sg_list = &sge_list[sge_idx];
         wr.send_flags = IBV_SEND_SIGNALED;  // TODO remove it for performance
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
-        wr.imm_data = entry.imm_data;
-        wr.wr.rdma.remote_addr = entry.remote_addr;
-        wr.wr.rdma.rkey = entry.remote_key;
+        wr.imm_data = 0;                    // TODO notification signal for remote
+        wr.wr.rdma.remote_addr = current->target_addr;
+        wr.wr.rdma.rkey = current->target_rkey;
         sge_idx += wr.num_sge;
+        current = current->next;
     }
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
         PLOG(ERROR) << "ibv_post_send";
         while (bad_wr) {
-            requests[bad_wr - wr_list].failed = true;
+            int index = bad_wr - wr_list;
+            current = slices;
+            while (index) {
+                current = current->next;
+                index--;
+            }
+            current->failed = true;
             cancelQuota(qp_index, 1);
             bad_wr = bad_wr->next;
         }
