@@ -184,13 +184,6 @@ ErrorCode MasterService::PutStart(
 
     LOG(INFO) << "### LRU Update in Put() ###";
     eviction_strategy_->AddKey(key);
-    if(eviction_strategy_ -> GetSize() >= LRU_MAX_CAPACITY)
-    {
-        std::string evicted_key = eviction_strategy_->EvictKey();
-        LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
-        Remove(evicted_key);
-    }
-
 
     // Validate slice lengths
     uint64_t total_length = 0;
@@ -290,6 +283,14 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     for (auto& replica : metadata.replicas) {
         replica.mark_complete();
     }
+
+    // if globally used storage ratio >= 80%, evict some of them
+    if(MasterMetricManager::instance().get_global_used_ratio() >= 0.8) {
+        std::string evicted_key = eviction_strategy_->EvictKey();
+        LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
+        Remove(evicted_key);
+    }
+
     return ErrorCode::OK;
 }
 
