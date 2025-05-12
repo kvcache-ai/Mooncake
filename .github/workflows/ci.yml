@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
     - uses: actions/checkout@v4
     
@@ -56,24 +56,30 @@ jobs:
         pkill mooncake_master || true
       shell: bash
     
+    - name: Generate Python version tag
+      id: generate_tag_build
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Build Python wheel
       run: |
         # Build wheel with specific Python version
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
+        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
     - name: Upload Python wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
-        path: mooncake-wheel/dist-py${{ matrix.python-version == '3.10' && '310' || '312' }}/*.whl
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_build.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   test-wheel-ubuntu:
     needs: build
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ["3.10", "3.12"]
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4 
@@ -83,10 +89,16 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Generate Python version tag
+      id: generate_tag_test
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
         path: mooncake-wheel/dist
         
     - name: Verify wheel file exists
@@ -121,7 +133,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
     - uses: actions/checkout@v4
     
@@ -162,10 +174,16 @@ jobs:
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
     
+    - name: Generate Python version tag
+      id: generate_tag_flags
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Build Python wheel
       run: |
         # Build wheel with specific Python version
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
+        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
   spell-check:

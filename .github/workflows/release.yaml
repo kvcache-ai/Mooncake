@@ -12,7 +12,7 @@ jobs:
       contents: write
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -32,19 +32,25 @@ jobs:
           sudo make install -j
         shell: bash
 
+      - name: Generate Python version tag
+        id: generate_tag_release
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Build Python wheel
         run: |
           # Set LD_LIBRARY_PATH for wheel building
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-py${{ matrix.python-version == '3.10' && '310' || '312' }}
-          path: mooncake-wheel/dist-py${{ matrix.python-version == '3.10' && '310' || '312' }}/*.whl
+          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
     needs: build
