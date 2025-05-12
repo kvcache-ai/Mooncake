@@ -20,7 +20,7 @@ RUN bash dependencies.sh \
      && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
      && find /var/cache -type f -delete
 
-RUN if [ -d "build" ]; then rm -rf build; fi \
+RUN rm -rf build || true \
      && mkdir build && cd build \
      && cmake .. && make -j && make install
 
