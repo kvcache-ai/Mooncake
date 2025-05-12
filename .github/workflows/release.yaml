@@ -5,6 +5,8 @@ on:
     tags:
       - 'v*'
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -22,15 +24,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install system dependencies and build project
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON
+          cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
           sudo make install -j
         shell: bash
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release
