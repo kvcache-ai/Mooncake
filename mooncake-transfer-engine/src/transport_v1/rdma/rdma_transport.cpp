@@ -127,8 +127,9 @@ Status RdmaTransport::submitTransferTasks(
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
-        task.num_slices = (request.length + kBlockSize - 1) / kBlockSize;
-        RdmaSlice *prev_slice = nullptr;
+        task.slice_list.num_slices =
+            (request.length + kBlockSize - 1) / kBlockSize;
+        RdmaSlice *first_slice = nullptr, *prev_slice = nullptr;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             auto slice = RdmaSliceStorage::Get().allocate();
@@ -142,12 +143,13 @@ Status RdmaTransport::submitTransferTasks(
             if (prev_slice) {
                 prev_slice->next = slice;
             } else {
-                task.slices = slice;
+                first_slice = slice;
             }
             prev_slice = slice;
         }
-        assert(task.num_slices);
-        workers_->submit(task.slices, task.num_slices);
+        task.slice_list.first = first_slice;
+        task.slice_list.last = prev_slice;
+        workers_->submit(task.slice_list);
     }
     return Status::OK();
 }

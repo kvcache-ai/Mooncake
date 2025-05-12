@@ -37,9 +37,9 @@ class Workers {
 
     int stop();
 
-    int submit(RdmaSlice *slices, size_t count);
+    int submit(RdmaSliceList &slice_list);
 
-    int cancel(RdmaSlice *slice);
+    int cancel(RdmaSliceList &slice_list);
 
    private:
     using Task = std::function<void()>;

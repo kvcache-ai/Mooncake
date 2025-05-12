@@ -32,6 +32,12 @@ namespace mooncake {
 namespace v1 {
 struct RdmaSlice;
 
+struct RdmaSliceList {
+    RdmaSlice *first = nullptr;
+    RdmaSlice *last = nullptr;
+    int num_slices = 0;
+};
+
 struct RdmaTask {
     RdmaTask() = default;
 
@@ -39,9 +45,8 @@ struct RdmaTask {
 
     Transport::Request request;
     Transport::TransferStatus status;
+    RdmaSliceList slice_list;
 
-    RdmaSlice *slices = nullptr;
-    int num_slices = 0;
     volatile int finish_slices = 0;  // including success or failed
 };
 

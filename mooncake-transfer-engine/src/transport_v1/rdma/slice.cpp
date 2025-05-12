@@ -22,7 +22,7 @@ namespace v1 {
 thread_local RdmaSliceStorage::ThreadLocal tl_slice;
 
 RdmaTask::~RdmaTask() {
-    auto slice = slices;
+    auto slice = slice_list.first;
     while (slice) {
         auto next_slice = slice->next;
         RdmaSliceStorage::Get().deallocate(slice);

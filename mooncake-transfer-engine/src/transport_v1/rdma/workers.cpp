@@ -57,22 +57,19 @@ int Workers::stop() {
     return 0;
 }
 
-int Workers::submit(RdmaSlice *slices, size_t count) {
+int Workers::submit(RdmaSliceList &slice_list) {
     mutex_.lock();
-    for (size_t slice_id = 0; slice_id < count; ++slice_id) {
-        assert(slices);
-        slices_.push(slices);
-        slices = slices->next;
+    auto slice = slice_list.first;
+    for (int slice_id = 0; slice_id < slice_list.num_slices; ++slice_id) {
+        assert(slice);
+        slices_.push(slice);
+        slice = slice->next;
     }
-    assert(!slices);
     mutex_.unlock();
     return 0;
 }
 
-int Workers::cancel(RdmaSlice *slice) {
-    (void)slice;
-    return ERR_NOT_IMPLEMENTED;
-}
+int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
 static inline int selectDevice(std::shared_ptr<SegmentDesc> &desc,
                                uint64_t offset, size_t length, int &buffer_id,
@@ -238,7 +235,7 @@ void Workers::asyncPollCq() {
                                          slice->length);
                     auto finish_slices =
                         __sync_fetch_and_add(&task->finish_slices, 1);
-                    if (finish_slices + 1 == task->num_slices) {
+                    if (finish_slices + 1 == task->slice_list.num_slices) {
                         task->status.s = Transport::COMPLETED;
                     }
                 }
