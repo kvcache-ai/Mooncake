@@ -206,7 +206,7 @@ int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
                 << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
             return ERR_INVALID_ARGUMENT;
         }
-        current = current->next;
+        current = current->queue_next;
     }
 
     wr_count = std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
@@ -240,7 +240,7 @@ int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
         wr.wr.rdma.remote_addr = current->target_addr;
         wr.wr.rdma.rkey = current->target_rkey;
         sge_idx += wr.num_sge;
-        current = current->next;
+        current = current->queue_next;
     }
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
@@ -250,7 +250,7 @@ int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
             int index = bad_wr - wr_list;
             current = slices;
             while (index) {
-                current = current->next;
+                current = current->queue_next;
                 index--;
             }
             current->failed = true;

@@ -43,9 +43,7 @@ class Workers;
 class EndpointStore;
 class LocalBuffers;
 
-using DeviceID = std::string;
-using RdmaContextSet =
-    std::unordered_map<DeviceID, std::shared_ptr<RdmaContext>>;
+using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
 struct RdmaSubBatch : public Transport::SubBatch {
     RdmaSubBatch(size_t max_size) : max_size(max_size) {
@@ -112,6 +110,7 @@ class RdmaTransport : public Transport {
     std::shared_ptr<mooncake::TransferMetadata> metadata_manager_;
     LocalBufferSet local_buffer_set_;
     RdmaContextSet context_set_;
+    std::unordered_map<std::string, int> context_name_lookup_;
     std::shared_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
 };

@@ -29,6 +29,19 @@ namespace v1 {
 class RdmaTransport;
 class Workers {
    public:
+    struct SliceQueue {
+        RdmaSlice *head, *tail;
+        std::mutex mutex;
+        size_t num_entries;
+
+        SliceQueue() : head(nullptr), tail(nullptr), num_entries(0) {}
+
+        void push(RdmaSlice *first, RdmaSlice *last, size_t count);
+
+        RdmaSlice *pop(size_t max_count);
+    };
+
+   public:
     Workers(RdmaTransport *transport);
 
     ~Workers();
@@ -56,16 +69,16 @@ class Workers {
                     const std::string &peer_server_name,
                     const std::string &peer_nic_name);
 
+    void monitorThread();
+
+    int handleContextEvents(std::shared_ptr<RdmaContext> &context);
+
    private:
     RdmaTransport *transport_;
     size_t num_workers_;
 
-    struct SliceQueue {
-        std::queue<RdmaSlice *> items;
-        std::mutex mutex;
-    };
-
     std::vector<std::thread> workers_;
+    std::thread monitor_;
     SliceQueue *slice_queue_;
 
     std::atomic<int64_t> inflight_slices_;

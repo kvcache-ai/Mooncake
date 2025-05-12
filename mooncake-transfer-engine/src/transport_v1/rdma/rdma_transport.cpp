@@ -64,7 +64,8 @@ Status RdmaTransport::install(
             LOG(WARNING) << "Disable device " << device_name;
             continue;
         }
-        context_set_[device_name] = context;
+        context_name_lookup_[device_name] = context_set_.size();
+        context_set_.push_back(context);
         local_buffer_set_.addDevice(context.get());
     }
     if (local_topology_->empty()) {
@@ -98,6 +99,7 @@ Status RdmaTransport::uninstall() {
         metadata_manager_.reset();
         local_buffer_set_.clear();
         context_set_.clear();
+        context_name_lookup_.clear();
         installed_ = false;
     }
     return Status::OK();
@@ -223,9 +225,8 @@ void RdmaTransport::allocateLocalSegmentID() {
     desc->name = local_segment_name_;
     desc->protocol = "rdma";
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (auto &entry : context_set_) {
+    for (auto &context : context_set_) {
         DeviceDesc device_desc;
-        auto &context = entry.second;
         device_desc.name = context->name();
         device_desc.lid = context->lid();
         device_desc.gid = context->gid();
@@ -241,10 +242,10 @@ int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
     BufferDesc buffer_desc;
     int ret = local_buffer_set_.addBuffer(buffer);
     if (ret) return ret;
-    for (auto &entry : context_set_) {
+    for (auto &context : context_set_) {
         uint32_t lkey, rkey;
-        local_buffer_set_.findBufferLegacy(buffer.addr, entry.second.get(),
-                                           lkey, rkey);
+        local_buffer_set_.findBufferLegacy(buffer.addr, context.get(), lkey,
+                                           rkey);
         buffer_desc.lkey.push_back(lkey);
         buffer_desc.rkey.push_back(rkey);
     }
@@ -283,9 +284,10 @@ int RdmaTransport::unregisterSingleLocalMemory(void *addr, bool update_meta) {
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty() || !context_set_.count(local_nic_name))
+    if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name))
         return ERR_INVALID_ARGUMENT;
-    auto context = context_set_[local_nic_name];
+    auto index = context_name_lookup_[local_nic_name];
+    auto context = context_set_[index];
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     auto peer_nic_path_ = peer_desc.local_nic_path;
