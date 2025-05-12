@@ -49,16 +49,16 @@ Status RdmaTransport::install(
         return Status::DeviceNotFound("no RDMA device found in topology");
     }
 
-    auto params = std::make_shared<RdmaParams>();
+    params_ = std::make_shared<RdmaParams>();
     metadata_manager_ = metadata_manager;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
-        params->endpoint.endpoint_store_cap);
+        params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>();
-        int ret = context->construct(device_name, endpoint_store, params);
+        int ret = context->construct(device_name, endpoint_store, params_);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
@@ -122,20 +122,20 @@ Status RdmaTransport::submitTransferTasks(
     if (request_list.size() + rdma_batch->task_list.size() >
         rdma_batch->max_size)
         return Status::InvalidArgument("too many requests");
-    const static size_t kBlockSize = 65536;
+    const size_t block_size = params_->workers.block_size;
     for (auto &request : request_list) {
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
         task.slice_list.num_slices =
-            (request.length + kBlockSize - 1) / kBlockSize;
+            (request.length + block_size - 1) / block_size;
         RdmaSlice *first_slice = nullptr, *prev_slice = nullptr;
         for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
+             offset += block_size) {
             auto slice = RdmaSliceStorage::Get().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->target_addr = request.target_offset + offset;
-            slice->length = std::min(request.length - offset, kBlockSize);
+            slice->length = std::min(request.length - offset, block_size);
             slice->task = &task;
             slice->next = nullptr;
             slice->retry_count = 0;

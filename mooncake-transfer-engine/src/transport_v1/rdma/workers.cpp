@@ -19,11 +19,11 @@
 #include "transport_v1/rdma/endpoint_store.h"
 namespace mooncake {
 namespace v1 {
-const static size_t kDefaultNumWorkers = 4;
 
 Workers::Workers(RdmaTransport *transport)
     : transport_(transport),
-      num_workers_(kDefaultNumWorkers),
+      num_workers_(0),
+      inflight_slices_(0),
       running_(false) {}
 
 Workers::~Workers() {
@@ -34,8 +34,10 @@ int Workers::start() {
     if (!running_) {
         running_ = true;
         stop_flag_ = false;
-        for (size_t index = 0; index < kDefaultNumWorkers; ++index) {
-            workers_.emplace_back([this] { workerThread(); });
+        num_workers_ = transport_->params_->workers.num_workers;
+        slice_queue_ = new SliceQueue[num_workers_];
+        for (size_t index = 0; index < num_workers_; ++index) {
+            workers_.emplace_back([this, index] { workerThread(index); });
         }
     }
     return 0;
@@ -53,19 +55,45 @@ int Workers::stop() {
             worker.join();
         }
     }
+    delete[] slice_queue_;
+    slice_queue_ = nullptr;
     running_ = false;
     return 0;
 }
 
+int Workers::submit(RdmaSlice *slice) {
+    int id = SimpleRandom::Get().next(num_workers_);
+    auto &queue = slice_queue_[id];
+    queue.mutex.lock();
+    queue.items.push(slice);
+    queue.mutex.unlock();
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto prev_inflight_slices = inflight_slices_.fetch_add(1);
+    if (!prev_inflight_slices) {
+        cv_.notify_all();
+    }
+    return 0;
+}
+
 int Workers::submit(RdmaSliceList &slice_list) {
-    mutex_.lock();
+    int id = SimpleRandom::Get().next(num_workers_);
+    auto &queue = slice_queue_[id];
+    queue.mutex.lock();
     auto slice = slice_list.first;
     for (int slice_id = 0; slice_id < slice_list.num_slices; ++slice_id) {
         assert(slice);
-        slices_.push(slice);
+        queue.items.push(slice);
         slice = slice->next;
     }
-    mutex_.unlock();
+    queue.mutex.unlock();
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto prev_inflight_slices =
+        inflight_slices_.fetch_add(slice_list.num_slices);
+    if (!prev_inflight_slices) {
+        cv_.notify_all();
+    }
     return 0;
 }
 
@@ -90,22 +118,23 @@ static inline int selectDevice(std::shared_ptr<SegmentDesc> &desc,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
-void Workers::asyncPostSend() {
+void Workers::asyncPostSend(int thread_id) {
     const static size_t kMaxSlicesToSend = 32;
     const static int kMaxRetryCount = 16;
     std::vector<RdmaSlice *> slice_to_send;
-    mutex_.lock();
-    while (!slices_.empty() && slice_to_send.size() < kMaxSlicesToSend) {
-        auto slice = slices_.front();
+    auto &queue = slice_queue_[thread_id];
+    queue.mutex.lock();
+    while (!queue.items.empty() && slice_to_send.size() < kMaxSlicesToSend) {
+        auto slice = queue.items.front();
         if (slice->retry_count >= kMaxRetryCount) {
             __sync_fetch_and_add(&slice->task->finish_slices, 1);
             slice->task->status.s = Transport::FAILED;
         } else {
             slice_to_send.push_back(slice);
         }
-        slices_.pop();
+        queue.items.pop();
     }
-    mutex_.unlock();
+    queue.mutex.unlock();
     if (slice_to_send.empty()) return;
 
     auto local_segment_desc =
@@ -164,9 +193,7 @@ void Workers::asyncPostSend() {
         int ret = endpoint->submitSlices(slice, 1);
         if (ret != 1 || slice->failed) {
             slice->retry_count++;
-            mutex_.lock();
-            slices_.push(slice);
-            mutex_.unlock();
+            submit(slice);
         }
     }
 }
@@ -199,7 +226,7 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
     return ERR_DEVICE_NOT_FOUND;
 }
 
-void Workers::asyncPollCq() {
+void Workers::asyncPollCq(int thread_id) {
     const static size_t kPollCount = 64;
     for (auto &entry : transport_->context_set_) {
         int cq_count = entry.second->cqCount();
@@ -217,7 +244,7 @@ void Workers::asyncPollCq() {
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                         LOG(ERROR)
-                            << "Worker: Process failed for slice (opcode:"
+                            << "Worker: Process failed for slice (opcode: "
                             << slice->task->request.opcode
                             << ", source_addr: " << (void *)slice->source_addr
                             << ", dest_addr: " << (void *)slice->target_addr
@@ -226,9 +253,7 @@ void Workers::asyncPollCq() {
                             << "): " << ibv_wc_status_str(wc[i].status);
                     }
                     slice->retry_count++;
-                    mutex_.lock();
-                    slices_.push(slice);
-                    mutex_.unlock();
+                    submit(slice);
                 } else {
                     auto task = slice->task;
                     __sync_fetch_and_add(&task->status.transferred_bytes,
@@ -240,14 +265,29 @@ void Workers::asyncPollCq() {
                     }
                 }
             }
+            if (nr_poll > 0) {
+                inflight_slices_.fetch_sub(nr_poll);
+            }
         }
     }
 }
 
-void Workers::workerThread() {
+void Workers::workerThread(int thread_id) {
     while (!stop_flag_) {
-        asyncPostSend();
-        asyncPollCq();
+        bool executed = true;
+        if (inflight_slices_ == 0) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock,
+                     [this]() { return inflight_slices_ > 0 || stop_flag_; });
+            if (stop_flag_) {
+                break;
+            }
+            executed = (inflight_slices_ > 0);
+        }
+        if (executed) {
+            asyncPostSend(thread_id);
+            asyncPollCq(thread_id);
+        }
     }
 }
 

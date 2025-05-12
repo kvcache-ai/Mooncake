@@ -15,8 +15,8 @@
 #ifndef RDMA_PARAMS_H
 #define RDMA_PARAMS_H
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 
 namespace mooncake {
 namespace v1 {
@@ -60,6 +60,7 @@ struct EndPointParams {
 
 struct WorkerParams {
     size_t num_workers = 4;
+    size_t block_size = 65536;
 };
 
 struct RdmaParams {
@@ -67,6 +68,6 @@ struct RdmaParams {
     EndPointParams endpoint;
     WorkerParams workers;
 };
-}
-}
-#endif // RDMA_PARAMS_H
+}  // namespace v1
+}  // namespace mooncake
+#endif  // RDMA_PARAMS_H

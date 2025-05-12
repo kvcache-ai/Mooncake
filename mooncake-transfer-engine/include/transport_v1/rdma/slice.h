@@ -61,6 +61,7 @@ struct RdmaSlice {
     uint32_t source_lkey = 0;
     uint32_t target_rkey = 0;
 
+    RdmaSlice *queue_next = nullptr;
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;
     bool failed = false;

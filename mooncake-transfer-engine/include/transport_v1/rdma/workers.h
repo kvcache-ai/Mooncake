@@ -37,6 +37,8 @@ class Workers {
 
     int stop();
 
+    int submit(RdmaSlice *slice);
+
     int submit(RdmaSliceList &slice_list);
 
     int cancel(RdmaSliceList &slice_list);
@@ -44,11 +46,11 @@ class Workers {
    private:
     using Task = std::function<void()>;
 
-    void workerThread();
+    void workerThread(int thread_id);
 
-    void asyncPostSend();
+    void asyncPostSend(int thread_id);
 
-    void asyncPollCq();
+    void asyncPollCq(int thread_id);
 
     int doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                     const std::string &peer_server_name,
@@ -56,11 +58,18 @@ class Workers {
 
    private:
     RdmaTransport *transport_;
-    const size_t num_workers_;
+    size_t num_workers_;
+
+    struct SliceQueue {
+        std::queue<RdmaSlice *> items;
+        std::mutex mutex;
+    };
 
     std::vector<std::thread> workers_;
-    std::queue<RdmaSlice *> slices_;
-    std::queue<Task> tasks_;
+    SliceQueue *slice_queue_;
+
+    std::atomic<int64_t> inflight_slices_;
+
     std::mutex mutex_;
     std::condition_variable cv_;
     std::atomic<bool> running_;

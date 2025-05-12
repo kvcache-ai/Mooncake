@@ -113,6 +113,7 @@ class RdmaTransport : public Transport {
     LocalBufferSet local_buffer_set_;
     RdmaContextSet context_set_;
     std::shared_ptr<Workers> workers_;
+    std::shared_ptr<RdmaParams> params_;
 };
 }  // namespace v1
 }  // namespace mooncake
