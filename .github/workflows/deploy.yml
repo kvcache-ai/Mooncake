@@ -24,7 +24,7 @@ jobs:
   build-and-deploy:
     environment:
       name: github-pages
-      url: https://Risc-lt.github.io/Mooncake
+      url: https://mooncake.github.io
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
