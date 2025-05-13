@@ -195,6 +195,33 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
     return result.value();
 }
 
+RemoveAllResponse MasterClient::RemoveAll() {
+    ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
+    timer.LogRequest("action=remove_all_objects");
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::RemoveAll>();
+    std::optional<RemoveAllResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<RemoveAllResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to remove all objects: "
+                          << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        auto response = RemoveAllResponse{toInt(ErrorCode::RPC_FAIL)};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {

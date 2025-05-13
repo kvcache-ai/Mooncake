@@ -85,6 +85,12 @@ class MasterClient {
     [[nodiscard]] RemoveResponse Remove(const std::string& key);
 
     /**
+     * @brief Removes all objects and all its replicas
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] RemoveAllResponse RemoveAll();
+
+    /**
      * @brief Registers a segment to master for allocation
      * @param segment_name hostname:port of the segment
      * @param buffer Buffer address of the segment

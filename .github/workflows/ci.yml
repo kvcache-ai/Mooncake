@@ -6,43 +6,49 @@ on:
   pull_request:
     branches: [ "main" ]
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-    
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
     - name: Configure and build project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON
+        cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         sudo make install -j
       shell: bash
-      
+
     - name: Start Metadata Server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
         python ./bootstrap_server.py &
       shell: bash
-      
+
     - name: Start Mooncake Master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         mooncake_master &
       shell: bash
-      
+
     - name: Test (in build env)
       run: |
         cd build
@@ -50,45 +56,61 @@ jobs:
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
       shell: bash
-      
+
     - name: Stop Mooncake Master Service
       run: |
         pkill mooncake_master || true
       shell: bash
-    
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
+    - name: Generate Python version tag
+      id: generate_tag_build
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Build Python wheel
       run: |
         # Build wheel with specific Python version
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
+        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
     - name: Upload Python wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
-        path: mooncake-wheel/dist-py${{ matrix.python-version == '3.10' && '310' || '312' }}/*.whl
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_build.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   test-wheel-ubuntu:
     needs: build
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ["3.10", "3.12"]
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
-    - uses: actions/checkout@v4 
+    - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Generate Python version tag
+      id: generate_tag_test
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ matrix.python-version == '3.10' && '310' || '312' }}
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
         path: mooncake-wheel/dist
-        
+
     - name: Verify wheel file exists
       run: |
         ls -la mooncake-wheel/dist/
@@ -102,7 +124,7 @@ jobs:
       run: |
         bash scripts/test_installation.sh
       shell: bash
-    
+
     - name: Start metadata server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
@@ -116,20 +138,24 @@ jobs:
         ./scripts/run_tests.sh
         deactivate
       shell: bash
-  
+
   build-flags:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-    
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
     - name: Install dependencies
       run: |
         sudo apt update -y
@@ -141,7 +167,7 @@ jobs:
         cd mooncake-transfer-engine
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         sudo make install -j
       shell: bash
 
@@ -149,7 +175,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         sudo make install -j
       shell: bash
       # TODO: lack USE_CUDA and USE_NVMEOF
@@ -157,16 +183,26 @@ jobs:
     - name: Configure and build project with unit tests and examples
       run: |
         cd build
-        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         sudo make install -j
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
-    
+
+    - name: Generate Python version tag
+      id: generate_tag_flags
+      run: |
+        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: Build Python wheel
       run: |
         # Build wheel with specific Python version
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ matrix.python-version == '3.10' && '310' || '312' }} ./scripts/build_wheel.sh
+        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
   spell-check:
     name: Spell Check with Typos

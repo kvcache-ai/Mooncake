@@ -48,6 +48,8 @@ int main(int argc, char* argv[]) {
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(

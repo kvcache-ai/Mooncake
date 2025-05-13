@@ -39,8 +39,10 @@
 #define PAUSE()
 #endif
 
+#ifndef likely
 #define likely(x) __glibc_likely(x)
 #define unlikely(x) __glibc_unlikely(x)
+#endif
 
 namespace mooncake {
 const static int LOCAL_SEGMENT_ID = 0;

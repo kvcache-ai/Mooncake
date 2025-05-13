@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.0b6"
+version = "0.3.0"
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -17,7 +17,6 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 readme = ""
-license-files = ["../LICENSE-APACHE"]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
