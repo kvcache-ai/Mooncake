@@ -1,3 +1,5 @@
+find_package(jsoncpp REQUIRED)
+
 file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
