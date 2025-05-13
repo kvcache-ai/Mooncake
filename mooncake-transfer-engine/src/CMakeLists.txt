@@ -38,7 +38,7 @@ endif()
 target_link_libraries(
     transfer_engine
     PUBLIC
-    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
+    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa yalantinglibs::yalantinglibs
     )
 
 if (USE_CUDA)
