@@ -10,6 +10,7 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "types.h"
+#include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
 
@@ -60,16 +61,17 @@ static bool get_auto_discover() {
     return false;
 }
 
-static inline void ltrim(std::string &s) {
+static inline void ltrim(std::string& s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }));
+                return !std::isspace(ch);
+            }));
 }
 
-static inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
+static inline void rtrim(std::string& s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
 }
 
 static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
@@ -77,14 +79,16 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
         if (!auto_discover) {
-            LOG(WARNING) << "auto discovery not set, but find whitelist filters: " << ev_ad;
+            LOG(WARNING)
+                << "auto discovery not set, but find whitelist filters: "
+                << ev_ad;
             return whitelst_filters;
         }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
-        char * end = ev_ad + std::strlen(ev_ad);
-        char * start = ev_ad, * pos = ev_ad;
-        while ((pos=std::find(start, end, delimiter)) != end) {
+        char* end = ev_ad + std::strlen(ev_ad);
+        char *start = ev_ad, *pos = ev_ad;
+        while ((pos = std::find(start, end, delimiter)) != end) {
             std::string str(start, pos);
             ltrim(str);
             rtrim(str);
@@ -108,7 +112,8 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
     transfer_engine_.setAutoDiscover(auto_discover);
-    transfer_engine_.setWhitelistFilters(get_auto_discover_filters(auto_discover));
+    transfer_engine_.setWhitelistFilters(
+        get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
@@ -174,18 +179,28 @@ ErrorCode Client::Get(const std::string& object_key,
 
 ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) {
+    ScopedVLogTimer timer(1, "Client::Query");
+    timer.LogRequest("object_key=", object_key);
+
     auto response = master_client_.GetReplicaList(object_key);
     // copy vec
     object_info.replica_list.resize(response.replica_list.size());
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
         object_info.replica_list[i] = response.replica_list[i];
     }
+
+    timer.LogResponse("error_code=", response.error_code,
+                      ", replica_count=", response.replica_list.size());
     return response.error_code;
 }
 
 ErrorCode Client::Get(const std::string& object_key,
                       const ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
+    ScopedVLogTimer timer(1, "Client::GetWithInfo");
+    timer.LogRequest("object_key=", object_key,
+                     ", replica_count=", object_info.replica_list.size());
+
     // Get the first complete replica
     for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
         if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
@@ -199,6 +214,7 @@ ErrorCode Client::Get(const std::string& object_key,
                 if (handle.status_ != BufStatus::COMPLETE) {
                     LOG(ERROR) << "incomplete_handle_found segment_name="
                                << handle.segment_name_;
+                    timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
                     return ErrorCode::INVALID_PARAMS;
                 }
                 handles.push_back(handle);
@@ -206,18 +222,23 @@ ErrorCode Client::Get(const std::string& object_key,
 
             if (TransferRead(handles, slices) != ErrorCode::OK) {
                 LOG(ERROR) << "transfer_read_failed key=" << object_key;
+                timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
                 return ErrorCode::INVALID_PARAMS;
             }
+            timer.LogResponse("error_code=", ErrorCode::OK);
             return ErrorCode::OK;
         }
     }
 
     LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+    timer.LogResponse("error_code=", ErrorCode::INVALID_REPLICA);
     return ErrorCode::INVALID_REPLICA;
 }
 
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                       const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "Client::Put");
+
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
     size_t slice_size = 0;
@@ -226,6 +247,9 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         slice_size += slices[i].size;
     }
 
+    timer.LogRequest("key=", key, ", slice_count=", slices.size(),
+                     ", total_size=", slice_size);
+
     // Start put operation
     PutStartResponse start_response =
         master_client_.PutStart(key, slice_lengths, slice_size, config);
@@ -233,9 +257,12 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              ", status=already_exists");
             return ErrorCode::OK;
         }
         LOG(ERROR) << "Failed to start put operation: " << err;
+        timer.LogResponse("error_code=", err);
         return err;
     }
 
@@ -253,8 +280,12 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             auto revoke_err = master_client_.PutRevoke(key);
             if (revoke_err.error_code != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to revoke put operation";
+                timer.LogResponse("error_code=", revoke_err.error_code,
+                                  ", status=revoke_failed");
                 return revoke_err.error_code;
             }
+            timer.LogResponse("error_code=", transfer_err,
+                              ", status=transfer_failed");
             return transfer_err;
         }
     }
@@ -263,26 +294,44 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     err = master_client_.PutEnd(key).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to end put operation: " << err;
+        timer.LogResponse("error_code=", err, ", status=put_end_failed");
         return err;
     }
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
-    return master_client_.Remove(key).error_code;
+    ScopedVLogTimer timer(1, "Client::Remove");
+    timer.LogRequest("key=", key);
+
+    auto response = master_client_.Remove(key);
+    timer.LogResponse("error_code=", response.error_code);
+    return response.error_code;
 }
 
 long Client::RemoveAll() {
-    return master_client_.RemoveAll().removed_count;
+    ScopedVLogTimer timer(1, "Client::RemoveAll");
+    timer.LogRequest("action=remove_all_objects");
+
+    auto response = master_client_.RemoveAll();
+    timer.LogResponse("removed_count=", response.removed_count);
+    return response.removed_count;
 }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
+    ScopedVLogTimer timer(1, "Client::MountSegment");
+    timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
+                     ", size=", size);
+
     if (buffer == nullptr || size == 0 ||
         reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
                    << " is not aligned to " << facebook::cachelib::Slab::kSize;
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS,
+                          ", reason=alignment_error");
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -291,6 +340,8 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         if (mounted_segments_.find(segment_name) != mounted_segments_.end()) {
             LOG(ERROR) << "segment_already_exists segment_name="
                        << segment_name;
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS,
+                              ", reason=segment_exists");
             return ErrorCode::INVALID_PARAMS;
         }
     }
@@ -300,12 +351,15 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed segment_name="
                    << segment_name;
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS,
+                          ", reason=register_memory_failed");
         return ErrorCode::INVALID_PARAMS;
     }
 
     ErrorCode err =
         master_client_.MountSegment(segment_name, buffer, size).error_code;
     if (err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", err);
         return err;
     }
 
@@ -313,16 +367,22 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_[segment_name] = (void*)buffer;
     }
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
+    ScopedVLogTimer timer(1, "Client::UnmountSegment");
+    timer.LogRequest("segment_name=", segment_name, ", addr=", addr);
+
     void* segment_addr = nullptr;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         auto it = mounted_segments_.find(segment_name);
         if (it == mounted_segments_.end() || it->second != addr) {
             LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS,
+                              ", reason=segment_not_found");
             return ErrorCode::INVALID_PARAMS;
         }
         segment_addr = it->second;
@@ -335,6 +395,7 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);
+        timer.LogResponse("error_code=", err);
         return err;
     }
     int rc = transfer_engine_.unregisterLocalMemory(segment_addr);
@@ -342,8 +403,11 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
                    << rc;
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS,
+                          ", reason=unregister_memory_failed");
         return ErrorCode::INVALID_PARAMS;
     }
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
 
@@ -367,7 +431,11 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 }
 
 ErrorCode Client::IsExist(const std::string& key) {
+    ScopedVLogTimer timer(1, "Client::IsExist");
+    timer.LogRequest("key=", key);
+
     auto response = master_client_.ExistKey(key);
+    timer.LogResponse("error_code=", response.error_code);
     return response.error_code;
 }
 

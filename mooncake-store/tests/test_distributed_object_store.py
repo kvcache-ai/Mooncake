@@ -196,7 +196,7 @@ class TestDistributedObjectStore(unittest.TestCase):
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
         NUM_THREADS = 8
-        VALUE_SIZE = 5 * 1024 * 1024  # 1MB
+        VALUE_SIZE = 1 * 1024 * 1024  # 1MB
         OPERATIONS_PER_THREAD = 100
         
         # Create barriers for synchronization

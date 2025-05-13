@@ -21,7 +21,7 @@ MasterClient::MasterClient() = default;
 MasterClient::~MasterClient() = default;
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
-    ScopedVLogTimer timer(1, "MasterClient::Connect");
+    ScopedVLogTimer timer(2, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
     auto result = coro::syncAwait(client_.connect(master_addr));
@@ -34,13 +34,13 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
 }
 
 ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
-    ScopedVLogTimer timer(1, "MasterClient::ExistKey");
+    ScopedVLogTimer timer(2, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
     auto request_result =
         client_.send_request<&WrappedMasterService::ExistKey>(object_key);
-    std::optional<ExistKeyResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
+    std::optional<ExistKeyResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to check key existence: "
@@ -62,7 +62,7 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
 
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
-    ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
+    ScopedVLogTimer timer(2, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
     auto request_result =
@@ -89,7 +89,7 @@ GetReplicaListResponse MasterClient::GetReplicaList(
 PutStartResponse MasterClient::PutStart(
     const std::string& key, const std::vector<size_t>& slice_lengths,
     size_t value_length, const ReplicateConfig& config) {
-    ScopedVLogTimer timer(1, "MasterClient::PutStart");
+    ScopedVLogTimer timer(2, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", value_length=", value_length,
                      ", slice_count=", slice_lengths.size());
 
@@ -122,7 +122,7 @@ PutStartResponse MasterClient::PutStart(
 }
 
 PutEndResponse MasterClient::PutEnd(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::PutEnd");
+    ScopedVLogTimer timer(2, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
     auto request_result =
@@ -147,7 +147,7 @@ PutEndResponse MasterClient::PutEnd(const std::string& key) {
 }
 
 PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
+    ScopedVLogTimer timer(2, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
     auto request_result =
@@ -172,7 +172,7 @@ PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
 }
 
 RemoveResponse MasterClient::Remove(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::Remove");
+    ScopedVLogTimer timer(2, "MasterClient::Remove");
     timer.LogRequest("key=", key);
 
     auto request_result =
@@ -196,7 +196,7 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
 }
 
 RemoveAllResponse MasterClient::RemoveAll() {
-    ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
+    ScopedVLogTimer timer(2, "MasterClient::RemoveAll");
     timer.LogRequest("action=remove_all_objects");
 
     auto request_result =
@@ -206,7 +206,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to remove all objects: "
-                          << result.error().msg;
+                           << result.error().msg;
                 co_return std::nullopt;
             }
             co_return result->result();
@@ -225,7 +225,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
 MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {
-    ScopedVLogTimer timer(1, "MasterClient::MountSegment");
+    ScopedVLogTimer timer(2, "MasterClient::MountSegment");
     timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
                      ", size=", size);
 
@@ -254,7 +254,7 @@ MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
 
 UnmountSegmentResponse MasterClient::UnmountSegment(
     const std::string& segment_name) {
-    ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
+    ScopedVLogTimer timer(2, "MasterClient::UnmountSegment");
     timer.LogRequest("segment_name=", segment_name);
 
     auto request_result =
