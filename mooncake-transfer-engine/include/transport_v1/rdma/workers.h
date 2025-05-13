@@ -31,8 +31,8 @@ class Workers {
    public:
     struct SliceQueue {
         RdmaSlice *head, *tail;
-        std::mutex mutex;
-        size_t num_entries;
+        RWSpinlock lock;
+        std::atomic<size_t> num_entries;
 
         SliceQueue() : head(nullptr), tail(nullptr), num_entries(0) {}
 

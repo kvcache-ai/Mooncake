@@ -65,7 +65,7 @@ int Workers::stop() {
 
 void Workers::SliceQueue::push(RdmaSlice *first, RdmaSlice *last,
                                size_t count) {
-    std::lock_guard<std::mutex> lock(mutex);
+    RWSpinlock::WriteGuard guard(lock);
     auto slice = first;
     for (size_t i = 0; i < count; ++i) {
         assert(slice);
@@ -81,34 +81,32 @@ void Workers::SliceQueue::push(RdmaSlice *first, RdmaSlice *last,
         tail->queue_next = first;
         tail = last;
     }
-    num_entries += count;
+    num_entries.fetch_add(count);
 }
 
 RdmaSlice *Workers::SliceQueue::pop(size_t count) {
-    std::lock_guard<std::mutex> lock(mutex);
+    if (!num_entries) return nullptr;
+    RWSpinlock::WriteGuard guard(lock);
     auto slice = head;
     if (count >= num_entries) {
         slice = head;
         head = tail = nullptr;
-        num_entries = 0;
+        num_entries.store(0);
         return slice;
     }
     auto cursor = slice;
     for (size_t i = 0; i < count - 1; ++i) cursor = cursor->queue_next;
     head = cursor->queue_next;
     cursor->queue_next = nullptr;
-    num_entries -= count;
+    num_entries.fetch_sub(count);
     return slice;
 }
 
 int Workers::submit(RdmaSlice *slice) {
     int id = SimpleRandom::Get().next(num_workers_);
     slice_queue_[id].push(slice, slice, 1);
-    std::unique_lock<std::mutex> lock(mutex_);
     auto prev_inflight_slices = inflight_slices_.fetch_add(1);
-    if (!prev_inflight_slices) {
-        cv_.notify_all();
-    }
+    if (!prev_inflight_slices) cv_.notify_all();
     return 0;
 }
 
@@ -116,101 +114,82 @@ int Workers::submit(RdmaSliceList &slice_list) {
     int id = SimpleRandom::Get().next(num_workers_);
     slice_queue_[id].push(slice_list.first, slice_list.last,
                           slice_list.num_slices);
-    std::unique_lock<std::mutex> lock(mutex_);
     auto prev_inflight_slices =
         inflight_slices_.fetch_add(slice_list.num_slices);
-    if (!prev_inflight_slices) {
-        cv_.notify_all();
-    }
+    if (!prev_inflight_slices) cv_.notify_all();
     return 0;
 }
 
 int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
-static inline int selectDevice(std::shared_ptr<SegmentDesc> &desc,
-                               uint64_t offset, size_t length, int &buffer_id,
-                               int &device_id, int retry_count = 0) {
-    auto detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (buffer_id = 0; buffer_id < (int)detail.buffers.size(); ++buffer_id) {
-        auto &buffer_desc = detail.buffers[buffer_id];
-        if (buffer_desc.addr > offset ||
-            offset + length > buffer_desc.addr + buffer_desc.length)
-            continue;
-        device_id =
-            detail.topology.selectDevice(buffer_desc.location, retry_count);
-        if (device_id >= 0) return 0;
-        device_id =
-            detail.topology.selectDevice(kWildcardLocation, retry_count);
-        if (device_id >= 0) return 0;
-    }
-    return ERR_ADDRESS_NOT_REGISTERED;
-}
-
 void Workers::asyncPostSend(int thread_id) {
     const static size_t kMaxSlicesToSend = 32;
+    
+    PeerBuffers local_buffer_;
+    std::unordered_map<SegmentID, PeerBuffers> remote_buffers_;
 
     auto slice = slice_queue_[thread_id].pop(kMaxSlicesToSend);
     if (!slice) return;
 
-    std::vector<RdmaSlice *> slice_to_send;
+    RdmaSlice *slice_to_send[kMaxSlicesToSend];
+    int count_slices = 0;
     while (slice) {
-        slice_to_send.push_back(slice);
+        slice_to_send[count_slices] = slice;
+        count_slices++;
         slice = slice->queue_next;
     }
 
-    auto local_segment_desc =
-        transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
-        segment_desc_map;
-    for (auto &slice : slice_to_send) {
+    if (!local_buffer_.valid()) {
+        auto segment_desc = transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        local_buffer_.reload(segment_desc);
+    }
+    for (int i = 0; i < count_slices; ++i) {
+        auto &slice = slice_to_send[i];
         auto target_id = slice->task->request.target_id;
-        if (segment_desc_map.count(target_id)) continue;
-        auto segment_desc = transport_->metadata_manager_->getSegmentDescByID(
-            slice->task->request.target_id);
+        if (remote_buffers_.count(target_id)) continue;
+        auto segment_desc =
+            transport_->metadata_manager_->getSegmentDescByID(target_id);
         if (!segment_desc) {
             __sync_fetch_and_add(&slice->task->finish_slices, 1);
             slice->task->status.s = Transport::FAILED;
             continue;
         }
-        segment_desc_map[target_id] = segment_desc;
+        remote_buffers_[target_id].reload(segment_desc);
     }
 
-    for (auto &slice : slice_to_send) {
+    for (int i = 0; i < count_slices; ++i) {
+        auto &slice = slice_to_send[i];
         auto target_id = slice->task->request.target_id;
-        auto &peer_segment_desc = segment_desc_map[target_id];
-        int buffer_id = 0, local_device_id = 0, peer_device_id = 0;
-        uint32_t source_lkey = 0, dest_rkey = 0;
-
-        int local_device_count = (int)transport_->context_set_.size();
-        selectDevice(local_segment_desc, (uint64_t)slice->source_addr,
-                     slice->length, buffer_id, local_device_id,
-                     slice->retry_count % local_device_count);
-        auto &local_detail =
-            std::get<MemorySegmentDesc>(local_segment_desc->detail);
-        source_lkey = local_detail.buffers[buffer_id].lkey[local_device_id];
-
-        selectDevice(peer_segment_desc, slice->target_addr, slice->length,
-                     buffer_id, peer_device_id,
-                     slice->retry_count / local_device_count);
-        auto &detail = std::get<MemorySegmentDesc>(peer_segment_desc->detail);
-        dest_rkey = detail.buffers[buffer_id].rkey[peer_device_id];
-
-        auto peer_nic_path = MakeNicPath(peer_segment_desc->name,
-                                         detail.devices[peer_device_id].name);
-
-        auto context = transport_->context_set_[local_device_id];
-        auto endpoint = context->endpoint(peer_nic_path);
+        std::vector<PeerBuffers::Result> local_result, remote_result;
+        int ret = local_buffer_.query(AddressRange{slice->source_addr, slice->length}, 
+            local_result, slice->retry_count);
+        auto &remote_item = remote_buffers_[target_id];
+        if (!ret) {
+            ret = remote_item.query(
+                AddressRange{(void *)slice->target_addr, slice->length}, 
+                remote_result, slice->retry_count);
+        }
+        assert(!ret);
+        assert(local_result.size() == 1);
+        assert(remote_result.size() == 1);
+        auto context = transport_->context_set_[local_result[0].device_id];
+        auto peer_segment_name = remote_item.segmentName();
+        auto peer_device_name = remote_item.deviceName(remote_result[0].device_id);
+        auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
+        auto endpoint = context->endpoint(peer_name);
         if (endpoint->status() != RdmaEndPoint::EP_READY) {
             mutex_.lock();
             if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                doHandshake(endpoint, peer_segment_desc->name,
-                            detail.devices[peer_device_id].name);
+                if (doHandshake(endpoint, peer_segment_name, peer_device_name)) {
+                    __sync_fetch_and_add(&slice->task->finish_slices, 1);
+                    slice->task->status.s = Transport::FAILED;
+                }
             }
             mutex_.unlock();
         }
-        slice->source_lkey = source_lkey;
-        slice->target_rkey = dest_rkey;
-        int ret = endpoint->submitSlices(slice, 1);
+        slice->source_lkey = local_result[0].lkey;
+        slice->target_rkey = remote_result[0].rkey;
+        ret = endpoint->submitSlices(slice, 1);
         if (ret != 1 || slice->failed) {
             slice->retry_count++;
             if (slice->retry_count >=
@@ -253,53 +232,54 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
 }
 
 void Workers::asyncPollCq(int thread_id) {
-    const static size_t kPollCount = 64;
-    for (auto &context : transport_->context_set_) {
-        int cq_count = context->cqCount();
-        for (int cq_index = 0; cq_index < cq_count; ++cq_index) {
-            auto cq = context->cq(cq_index);
-            ibv_wc wc[kPollCount];
-            int nr_poll = cq->poll(kPollCount, wc);
-            if (nr_poll < 0) {
-                LOG(ERROR) << "Worker: Failed to poll completion queue";
-                continue;
-            }
-            for (int i = 0; i < nr_poll; ++i) {
-                auto slice = (RdmaSlice *)wc[i].wr_id;
-                __sync_fetch_and_sub(slice->endpoint_quota, 1);
-                if (wc[i].status != IBV_WC_SUCCESS) {
-                    if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                        LOG(ERROR)
-                            << "Worker: Process failed for slice (opcode: "
-                            << slice->task->request.opcode
-                            << ", source_addr: " << (void *)slice->source_addr
-                            << ", dest_addr: " << (void *)slice->target_addr
-                            << ", length: " << slice->length
-                            << ", local_nic: " << context->name()
-                            << "): " << ibv_wc_status_str(wc[i].status);
-                    }
-                    slice->retry_count++;
-                    if (slice->retry_count >=
-                        transport_->params_->workers.max_retry_count) {
-                        __sync_fetch_and_add(&slice->task->finish_slices, 1);
-                        slice->task->status.s = Transport::FAILED;
-                    } else {
-                        submit(slice);
-                    }
+    const static size_t kPollCount = 32;
+    int num_contexts = (int)transport_->context_set_.size();
+    int num_cq_list = transport_->params_->device.num_cq_list;
+    for (int index = thread_id; index < num_contexts * num_cq_list;
+         index += num_workers_) {
+        auto &context = transport_->context_set_[index % num_contexts];
+        auto cq = context->cq(index / num_contexts);
+        ibv_wc wc[kPollCount];
+        int nr_poll = cq->poll(kPollCount, wc);
+        if (nr_poll < 0) {
+            LOG(ERROR) << "Worker: Failed to poll completion queue";
+            continue;
+        }
+        for (int i = 0; i < nr_poll; ++i) {
+            auto slice = (RdmaSlice *)wc[i].wr_id;
+            __sync_fetch_and_sub(slice->endpoint_quota, 1);
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                    LOG(ERROR)
+                        << "Worker: Process failed for slice (opcode: "
+                        << slice->task->request.opcode
+                        << ", source_addr: " << (void *)slice->source_addr
+                        << ", dest_addr: " << (void *)slice->target_addr
+                        << ", length: " << slice->length
+                        << ", local_nic: " << context->name()
+                        << "): " << ibv_wc_status_str(wc[i].status);
+                }
+                slice->retry_count++;
+                if (slice->retry_count >=
+                    transport_->params_->workers.max_retry_count) {
+                    __sync_fetch_and_add(&slice->task->finish_slices, 1);
+                    slice->task->status.s = Transport::FAILED;
                 } else {
-                    auto task = slice->task;
-                    __sync_fetch_and_add(&task->status.transferred_bytes,
-                                         slice->length);
-                    auto finish_slices =
-                        __sync_fetch_and_add(&task->finish_slices, 1);
-                    if (finish_slices + 1 == task->slice_list.num_slices) {
-                        task->status.s = Transport::COMPLETED;
-                    }
+                    submit(slice);
+                }
+            } else {
+                auto task = slice->task;
+                __sync_fetch_and_add(&task->status.transferred_bytes,
+                                     slice->length);
+                auto finish_slices =
+                    __sync_fetch_and_add(&task->finish_slices, 1);
+                if (finish_slices + 1 == task->slice_list.num_slices) {
+                    task->status.s = Transport::COMPLETED;
                 }
             }
-            if (nr_poll > 0) {
-                inflight_slices_.fetch_sub(nr_poll);
-            }
+        }
+        if (nr_poll > 0) {
+            inflight_slices_.fetch_sub(nr_poll);
         }
     }
 }
@@ -309,8 +289,9 @@ void Workers::workerThread(int thread_id) {
         bool executed = true;
         if (inflight_slices_ == 0) {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock,
-                     [this]() { return inflight_slices_ > 0 || stop_flag_; });
+            cv_.wait_for(lock, std::chrono::microseconds(100), [this]() {
+                return inflight_slices_ > 0 || stop_flag_;
+            });
             if (stop_flag_) {
                 break;
             }

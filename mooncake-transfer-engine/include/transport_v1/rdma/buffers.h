@@ -123,10 +123,17 @@ class PeerBuffers {
         void *addr;
         size_t length;
         uint32_t lkey, rkey;
+        int device_id;
     };
 
-    int query(const AddressRange &target_range, int device_id,
-              std::vector<Result> &result);
+    bool valid() const { return segment_desc_ != nullptr; }
+
+    int query(const AddressRange &range, std::vector<Result> &result,
+              int retry_count = 0);
+    
+    const std::string &segmentName() const { return segment_desc_->name; }
+
+    const std::string &deviceName(int id);
 
    private:
     RWSpinlock lock_;

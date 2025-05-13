@@ -59,9 +59,9 @@ struct EndPointParams {
 };
 
 struct WorkerParams {
-    size_t num_workers = 4;
-    size_t max_retry_count = 8;
-    size_t block_size = 65536;
+    int num_workers = 4;
+    int max_retry_count = 8;
+    int block_size = 65536;
 };
 
 struct RdmaParams {

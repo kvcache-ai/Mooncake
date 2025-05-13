@@ -156,7 +156,8 @@ int LocalBufferSet::registerMemReg(LocalBufferSet::BufferItem &item) {
 
 int LocalBufferSet::unregisterMemReg(LocalBufferSet::BufferItem &item,
                                      RdmaContext *context_filter) {
-    for (auto iter = item.mem_reg_map.begin(); iter != item.mem_reg_map.end();) {
+    for (auto iter = item.mem_reg_map.begin();
+         iter != item.mem_reg_map.end();) {
         auto &context = iter->first;
         auto &mem_reg = iter->second;
         if (!context_filter || context_filter == context) {
@@ -193,25 +194,32 @@ int PeerBuffers::reload(const std::shared_ptr<SegmentDesc> &segment_desc) {
     return 0;
 }
 
-int PeerBuffers::query(const AddressRange &target_range, int device_id,
-                       std::vector<Result> &result) {
+int PeerBuffers::query(const AddressRange &range, std::vector<Result> &result,
+                       int retry_count) {
+    RWSpinlock::ReadGuard guard(lock_);
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc_->detail);
+    auto &topo = detail.topology;
     result.clear();
-    auto &buffers = std::get<MemorySegmentDesc>(segment_desc_->detail).buffers;
-    lock_.lockShared();
-    for (auto &entry : buffers) {
-        auto range = AddressRange{(void *)entry.addr, entry.length};
-        auto intersect = range.intersect(target_range);
+    for (auto &entry : detail.buffers) {
+        auto query_range = AddressRange{(void *)entry.addr, entry.length};
+        auto intersect = query_range.intersect(range);
         if (intersect.empty()) continue;
-        if (device_id < 0 ||
-            device_id >= (int)std::min(entry.lkey.size(), entry.rkey.size())) {
-            lock_.unlockShared();
-            return ERR_INVALID_ARGUMENT;
-        }
+        int device_id = topo.selectDevice(entry.location, retry_count);
+        if (device_id < 0)
+            device_id = topo.selectDevice(kWildcardLocation, retry_count);
+        if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
         result.push_back(Result{intersect.addr, intersect.length,
-                                entry.lkey[device_id], entry.rkey[device_id]});
+                                entry.lkey[device_id], entry.rkey[device_id],
+                                device_id});
     }
-    lock_.unlockShared();
     return 0;
+}
+
+const std::string &PeerBuffers::deviceName(int id) {
+    RWSpinlock::ReadGuard guard(lock_);
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc_->detail);
+    assert(id >= 0 && id < (int)detail.devices.size());
+    return detail.devices[id].name;
 }
 }  // namespace v1
 }  // namespace mooncake

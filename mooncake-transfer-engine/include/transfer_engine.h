@@ -30,10 +30,10 @@
 #include <thread>
 #include <vector>
 
-#include "transport/multi_transport.h"
-#include "utility/memory_location.h"
 #include "metadata/metadata.h"
+#include "transport/multi_transport.h"
 #include "transport/transport.h"
+#include "utility/memory_location.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #endif
@@ -146,9 +146,7 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) {
-        auto_discover_ = auto_discover;
-    }
+    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
     void setWhitelistFilters(std::vector<std::string> &&filters) {
         filter_ = std::move(filters);
