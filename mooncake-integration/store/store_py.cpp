@@ -187,6 +187,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                    << toString(error_code);
         return 1;
     }
+    // Skip mount segment if global_segment_size is 0
+    if (global_segment_size == 0) {
+        return 0;
+    }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
     if (!ptr) {
         LOG(ERROR) << "Failed to allocate segment memory";
@@ -470,6 +474,14 @@ int DistributedObjectStore::remove(const std::string &key) {
     return 0;
 }
 
+long DistributedObjectStore::removeAll() {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+    return client_->RemoveAll();
+}
+
 int DistributedObjectStore::isExist(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -637,6 +649,8 @@ PYBIND11_MODULE(store, m) {
              py::call_guard<py::gil_scoped_release>(),
              py::return_value_policy::take_ownership)
         .def("remove", &DistributedObjectStore::remove,
+             py::call_guard<py::gil_scoped_release>())
+        .def("remove_all", &DistributedObjectStore::removeAll,
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
              py::call_guard<py::gil_scoped_release>())

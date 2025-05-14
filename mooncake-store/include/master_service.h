@@ -162,6 +162,12 @@ class MasterService {
      * found
      */
     ErrorCode Remove(const std::string& key);
+    /**
+     * @brief Remove all objects and their replicas
+     * @return return the number of objects removed
+     */
+    long RemoveAll();
+
 
    private:
     // GC thread function

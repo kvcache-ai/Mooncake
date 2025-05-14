@@ -204,8 +204,8 @@ class AllocatedBuffer {
         uint64_t size_;
         uintptr_t buffer_address_;
         BufStatus status_;
+        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
     };
-    YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
 
     void mark_complete() { status = BufStatus::COMPLETE; }
 
@@ -272,8 +272,8 @@ class Replica {
     struct Descriptor {
         std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
         ReplicaStatus status;
+        YLT_REFL(Descriptor, buffer_descriptors, status);
     };
-    YLT_REFL(Descriptor, buffer_descriptors, status);
 
    private:
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers_;

@@ -97,5 +97,5 @@ Note:
  - TP is supported but not required, you can remove `--tp-size 2` if you want.
  - The `--disaggregation-ib-device` is the device to be used for data transmission, it is optional since we will detect this config automatically. Or you can still explicitly specify devices if needed. If multiple NIC devices are used, they can be separated by commas, such as "erdma_0,erdma_1". Please note that there are no spaces between them.
  - XpYd is supported. It is ok to run one prefill and multiple decode instances on the same node, however, multiple prefill instances on the same node are not supported due to the port conflict of bootstrap server.
-   - e.g., `python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000,http://192.168.0.140:30000 --decode http://192.168.0.137:30001,http://192.168.0.140:30001 --host 0.0.0.0 --port 8000`
+   - e.g., `python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000 http://192.168.0.140:30000 --decode http://192.168.0.137:30001 http://192.168.0.140:30001 --host 0.0.0.0 --port 8000`
  - HuggingFace timeout can be addressed by `export SGLANG_USE_MODELSCOPE=true`

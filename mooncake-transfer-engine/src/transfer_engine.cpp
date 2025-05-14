@@ -41,22 +41,30 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &local_server_name,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
+    LOG(INFO) << "Transfer Engine starting. Server: " << local_server_name
+              << ", Metadata: " << metadata_conn_string
+              << ", ip_or_host_name: " << ip_or_host_name
+              << ", rpc_port: " << rpc_port;
+
     local_server_name_ = local_server_name;
     TransferMetadata::RpcMetaDesc desc;
+    std::string rpc_binding_method;
+
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
+        rpc_binding_method = "legacy/P2P";
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
 
         if (metadata_conn_string == P2PHANDSHAKE) {
-            // use random port when no port is specified
+            rpc_binding_method = "P2P handshake";
             if (port == getDefaultHandshakePort()) {
                 desc.rpc_port = findAvailableTcpPort(desc.sockfd);
                 if (desc.rpc_port == 0) {
                     LOG(ERROR)
-                        << "not valid port for serving local TCP service";
+                        << "P2P: No valid port found for local TCP service.";
                     return -1;
                 }
             }
@@ -64,6 +72,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
         }
     } else {
+        rpc_binding_method = "new RPC mapping";
         (void)(ip_or_host_name);
         auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
         if (ip_address)
@@ -88,9 +97,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         }
     }
 
-    LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
-              << " and port " << desc.rpc_port
-              << " for serving local TCP service";
+    LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
+              << ", listening on " << desc.ip_or_host_name << ":"
+              << desc.rpc_port;
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
@@ -100,20 +109,23 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     if (ret) return ret;
 
     if (auto_discover_) {
-        // discover topology automatically
+        LOG(INFO) << "Auto-discovering topology...";
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
+            LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
-            if (!topo_json.empty())
+            if (!topo_json.empty()) {
                 local_topology_->parse(topo_json);
-            else {
-                LOG(WARNING) << "Unable to read custom topology file from "
-                             << path << ", fall back to auto-detect";
+            } else {
+                LOG(WARNING) << "Failed to load custom topology from " << path
+                             << ", falling back to auto-detect.";
                 local_topology_->discover(filter_);
             }
         } else {
             local_topology_->discover(filter_);
         }
+        LOG(INFO) << "Topology discovery complete. Found "
+                  << local_topology_->getHcaList().size() << " HCAs.";
 
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
@@ -190,7 +202,7 @@ Transport::SegmentHandle TransferEngine::openSegment(
 
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
 
-int TransferEngine::removeLocalSegment(const std::string &segment_name) { 
+int TransferEngine::removeLocalSegment(const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
     std::string trimmed_segment_name = segment_name;
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
