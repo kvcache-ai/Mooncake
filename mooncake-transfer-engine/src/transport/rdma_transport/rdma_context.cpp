@@ -193,6 +193,11 @@ int RdmaContext::deconstruct() {
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    if (length > (size_t)globalConfig().max_mr_size) {
+        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
+                      << "shrink it to " << globalConfig().max_mr_size;
+        length = (size_t)globalConfig().max_mr_size;
+    }
     ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
     if (!mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;
