@@ -150,6 +150,7 @@ class RdmaContext {
 
     ibv_context *context_ = nullptr;
     ibv_pd *pd_ = nullptr;
+    uint64_t max_mr_size;
     int event_fd_ = -1;
 
     size_t num_comp_channel_ = 0;

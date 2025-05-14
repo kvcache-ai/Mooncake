@@ -222,6 +222,8 @@ void updateGlobalConfig(ibv_device_attr &device_attr) {
         config.max_sge = device_attr.max_sge;
     if (config.max_cqe > (size_t)device_attr.max_cqe)
         config.max_cqe = device_attr.max_cqe;
+    if (config.max_mr_size > device_attr.max_mr_size)
+        config.max_mr_size = device_attr.max_mr_size;
 }
 
 void dumpGlobalConfig() {
@@ -232,6 +234,7 @@ void dumpGlobalConfig() {
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
