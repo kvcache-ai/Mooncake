@@ -333,7 +333,6 @@ long MasterService::RemoveAll() {
         removed_count += object_count;
         // Reset related metrics on successful removed
         MasterMetricManager::instance().dec_key_count(removed_count);
-        MasterMetricManager::instance().dec_allocated_size(total_freed_size);
         shard.metadata.clear();
     }
     VLOG(1) << "action=remove_all_objects" << ", removed_count=" << removed_count
