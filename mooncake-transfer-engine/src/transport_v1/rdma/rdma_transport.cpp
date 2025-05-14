@@ -85,6 +85,7 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to upload local segment descriptor");
     }
 
+    local_buffer_manager_.setTopology(local_topology);
     workers_ = std::make_shared<Workers>(this);
     workers_->start();
 

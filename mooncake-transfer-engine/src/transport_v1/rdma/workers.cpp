@@ -125,7 +125,6 @@ int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 void Workers::asyncPostSend(int thread_id) {
     const static size_t kMaxSlicesToSend = 32;
 
-    PeerBuffers local_buffer_;
     std::unordered_map<SegmentID, PeerBuffers> remote_buffers_;
 
     auto slice = slice_queue_[thread_id].pop(kMaxSlicesToSend);
@@ -139,11 +138,6 @@ void Workers::asyncPostSend(int thread_id) {
         slice = slice->queue_next;
     }
 
-    if (!local_buffer_.valid()) {
-        auto segment_desc =
-            transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        local_buffer_.reload(segment_desc);
-    }
     for (int i = 0; i < count_slices; ++i) {
         auto &slice = slice_to_send[i];
         auto target_id = slice->task->request.target_id;
@@ -161,10 +155,10 @@ void Workers::asyncPostSend(int thread_id) {
     for (int i = 0; i < count_slices; ++i) {
         auto &slice = slice_to_send[i];
         auto target_id = slice->task->request.target_id;
-        std::vector<PeerBuffers::Result> local_result, remote_result;
-        int ret =
-            local_buffer_.query(AddressRange{slice->source_addr, slice->length},
-                                local_result, slice->retry_count);
+        std::vector<BufferQueryResult> local_result, remote_result;
+        int ret = transport_->local_buffer_manager_.query(
+            AddressRange{slice->source_addr, slice->length}, local_result,
+            slice->retry_count);
         auto &remote_item = remote_buffers_[target_id];
         if (!ret) {
             ret = remote_item.query(

@@ -88,6 +88,13 @@ class AddressRangeManager {
                 std::vector<AddressRange> &dereg_parts);
 };
 
+struct BufferQueryResult {
+    void *addr;
+    size_t length;
+    uint32_t lkey, rkey;
+    int device_id;
+};
+
 class LocalBufferManager {
    public:
     LocalBufferManager();
@@ -102,13 +109,6 @@ class LocalBufferManager {
 
     int removeBuffer(const AddressRange &range);
 
-    struct Result {
-        void *addr;
-        size_t length;
-        uint32_t lkey, rkey;
-        int device_id;
-    };
-
     int addDevice(RdmaContext *context);
 
     int removeDevice(RdmaContext *context);
@@ -117,7 +117,7 @@ class LocalBufferManager {
 
     int fillBufferDesc(std::shared_ptr<SegmentDesc> &segment_desc);
 
-    int query(const AddressRange &range, std::vector<Result> &result,
+    int query(const AddressRange &range, std::vector<BufferQueryResult> &result,
               int retry_count = 0);
 
     const std::string deviceName(int id);
@@ -144,16 +144,9 @@ class PeerBuffers {
 
     int reload(const std::shared_ptr<SegmentDesc> &segment_desc);
 
-    struct Result {
-        void *addr;
-        size_t length;
-        uint32_t lkey, rkey;
-        int device_id;
-    };
-
     bool valid() const { return segment_desc_ != nullptr; }
 
-    int query(const AddressRange &range, std::vector<Result> &result,
+    int query(const AddressRange &range, std::vector<BufferQueryResult> &result,
               int retry_count = 0);
 
     const std::string &segmentName() const { return segment_desc_->name; }

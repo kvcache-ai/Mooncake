@@ -268,6 +268,7 @@ int LocalBufferManager::removeBuffer(const AddressRange &range) {
 
 int LocalBufferManager::addDevice(RdmaContext *context) {
     RWSpinlock::WriteGuard guard(lock_);
+    assert(topology_);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter != context_list_.end()) return 0;
     context_list_.push_back(context);
@@ -285,6 +286,7 @@ int LocalBufferManager::addDevice(RdmaContext *context) {
 
 int LocalBufferManager::removeDevice(RdmaContext *context) {
     RWSpinlock::WriteGuard guard(lock_);
+    assert(topology_);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter == context_list_.end()) return 0;
     for (auto &buffer : buffer_list_) {
@@ -343,7 +345,8 @@ int LocalBufferManager::fillBufferDesc(
 }
 
 int LocalBufferManager::query(const AddressRange &range,
-                              std::vector<Result> &result, int retry_count) {
+                              std::vector<BufferQueryResult> &result,
+                              int retry_count) {
     RWSpinlock::ReadGuard guard(lock_);
     result.clear();
     for (auto &buffer : buffer_list_) {
@@ -357,8 +360,8 @@ int LocalBufferManager::query(const AddressRange &range,
         auto context = context_list_[device_id];
         auto mem_reg_id = buffer.second.mem_reg_map[context];
         auto keys = context->queryMemRegKey(mem_reg_id);
-        result.push_back(Result{intersect.addr, intersect.length, keys.first,
-                                keys.second, device_id});
+        result.push_back(BufferQueryResult{intersect.addr, intersect.length,
+                                           keys.first, keys.second, device_id});
     }
     return 0;
 }
@@ -380,7 +383,8 @@ int PeerBuffers::reload(const std::shared_ptr<SegmentDesc> &segment_desc) {
     return 0;
 }
 
-int PeerBuffers::query(const AddressRange &range, std::vector<Result> &result,
+int PeerBuffers::query(const AddressRange &range,
+                       std::vector<BufferQueryResult> &result,
                        int retry_count) {
     RWSpinlock::ReadGuard guard(lock_);
     auto &detail = std::get<MemorySegmentDesc>(segment_desc_->detail);
@@ -394,9 +398,9 @@ int PeerBuffers::query(const AddressRange &range, std::vector<Result> &result,
         if (device_id < 0)
             device_id = topo.selectDevice(kWildcardLocation, retry_count);
         if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
-        result.push_back(Result{intersect.addr, intersect.length,
-                                entry.lkey[device_id], entry.rkey[device_id],
-                                device_id});
+        result.push_back(BufferQueryResult{intersect.addr, intersect.length,
+                                           entry.lkey[device_id],
+                                           entry.rkey[device_id], device_id});
     }
     return 0;
 }
