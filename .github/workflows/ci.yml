@@ -204,6 +204,18 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
+  build-docker:
+    name: Builcd Docker Image
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+  
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Build Docker image
+      run: docker build -t mooncake-app .
+
   spell-check:
     name: Spell Check with Typos
     runs-on: ubuntu-22.04
