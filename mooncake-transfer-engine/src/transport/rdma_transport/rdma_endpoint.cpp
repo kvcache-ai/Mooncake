@@ -248,6 +248,7 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
+    if (!active_) return 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());
