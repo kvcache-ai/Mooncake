@@ -73,7 +73,10 @@ class RdmaEndPoint {
 
     bool active() const { return active_; }
 
-    void set_active(bool flag) { active_ = flag; }
+    void set_active(bool flag) { 
+        RWSpinlock::WriteGuard guard(lock_);
+        active_ = flag; 
+    }
 
    public:
     bool connected() const {
