@@ -24,7 +24,7 @@ jobs:
   build-and-deploy:
     environment:
       name: github-pages
-      url: https://mooncake.github.io
+      url: https://kvcache-ai.github.io/Mooncake/
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
