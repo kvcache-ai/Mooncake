@@ -18,169 +18,355 @@
 
 namespace mooncake {
 namespace v1 {
-LocalBufferSet::LocalBufferSet() {}
 
-LocalBufferSet::~LocalBufferSet() {}
-
-int LocalBufferSet::addBuffer(const Transport::BufferEntry &entry) {
-    RWSpinlock::WriteGuard guard(lock_);
-    AddressRange range(entry.addr, entry.length);
-    auto &buffer_list = buffer_lists_[int(entry.visibility)];
-    if (buffer_list.count(range)) {
-        buffer_list[range].ref_cnt++;
-        return 0;
-    }
-    auto &item = buffer_list[range];
-    item.ref_cnt = 1;
-    item.entry = entry;
-    return registerMemReg(item);
+// Helper function to find the position where a range would be inserted
+std::vector<AddressRangeManager::AddressRangeRC>::iterator
+AddressRangeManager::findInsertPosition(const AddressRange &range) {
+    return lower_bound(addr_list.begin(), addr_list.end(), (char *)range.addr,
+                       [](const AddressRangeRC &ar, const char *target) {
+                           return static_cast<char *>(ar.addr) < target;
+                       });
 }
 
-int LocalBufferSet::removeBuffer(const AddressRange &range) {
-    RWSpinlock::WriteGuard guard(lock_);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        if (buffer_list.count(range)) {
-            auto &item = buffer_list[range];
-            item.ref_cnt--;
-            if (item.ref_cnt != 0) return 0;
-            int ret = unregisterMemReg(item);
-            buffer_list.erase(range);
-            return ret;
+// Helper function to check if two ranges overlap
+bool AddressRangeManager::rangesOverlap(const AddressRangeRC &a,
+                                        const AddressRange &b) {
+    char *a_start = static_cast<char *>(a.addr);
+    char *a_end = a_start + a.length;
+    char *b_start = static_cast<char *>(b.addr);
+    char *b_end = b_start + b.length;
+    return !(a_end <= b_start || a_start >= b_end);
+}
+
+void AddressRangeManager::add(const AddressRange &range,
+                              std::vector<AddressRange> &reg_parts) {
+    if (range.length == 0) return;
+
+    char *range_start = static_cast<char *>(range.addr);
+    char *range_end = range_start + range.length;
+
+    // Find the position to insert this range
+    auto insert_pos = findInsertPosition(range);
+
+    // Check if the range overlaps with any existing ranges
+    bool found_overlapping = false;
+
+    // Check ranges before the insert position
+    if (insert_pos != addr_list.begin()) {
+        auto prev = insert_pos - 1;
+        if (rangesOverlap(*prev, range)) {
+            found_overlapping = true;
         }
     }
-    return ERR_ADDRESS_NOT_REGISTERED;
-}
 
-int LocalBufferSet::removeBufferLegacy(void *addr) {
-    RWSpinlock::WriteGuard guard(lock_);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &item : buffer_list) {
-            if (item.first.addr == addr) {
-                item.second.ref_cnt--;
-                if (item.second.ref_cnt != 0) return 0;
-                int ret = unregisterMemReg(item.second);
-                buffer_list.erase(item.first);
-                return ret;
+    // Check ranges at and after the insert position
+    for (auto it = insert_pos; it != addr_list.end(); ++it) {
+        if (!rangesOverlap(*it, range)) {
+            break;  // Since the list is sorted, no more overlaps possible
+        }
+        found_overlapping = true;
+    }
+
+    if (!found_overlapping) {
+        // No overlap, just add the new range
+        addr_list.insert(insert_pos,
+                         AddressRangeRC(range.addr, range.length, 1));
+        reg_parts.push_back(range);
+        return;
+    }
+
+    // There are overlapping ranges, need to update the reference count
+    // for overlapping parts and split the range if necessary
+
+    // Convert the new range into a list of intervals to process
+    std::vector<std::pair<char *, char *>> intervals;
+    intervals.emplace_back(range_start, range_end);
+
+    // Iterate through existing ranges and process each interval
+    for (auto &existing : addr_list) {
+        if (intervals.empty()) break;
+
+        char *existing_start = static_cast<char *>(existing.addr);
+        char *existing_end = existing_start + existing.length;
+
+        std::vector<std::pair<char *, char *>> new_intervals;
+
+        for (auto &interval : intervals) {
+            char *int_start = interval.first;
+            char *int_end = interval.second;
+
+            if (int_end <= existing_start || int_start >= existing_end) {
+                // No overlap, keep this interval
+                new_intervals.push_back(interval);
+            } else {
+                // There is overlap with existing range
+                // Check if part of the interval is before the existing
+                // range
+                if (int_start < existing_start) {
+                    new_intervals.emplace_back(int_start, existing_start);
+                }
+                // Check if part of the interval is after the existing range
+                if (int_end > existing_end) {
+                    new_intervals.emplace_back(existing_end, int_end);
+                }
+                // Increment the reference count of the overlapping part
+                existing.ref_cnt++;
             }
         }
-    }
-    return ERR_ADDRESS_NOT_REGISTERED;
-}
 
-// TODO handle more complex buffer organization, e.g. the range
-// cross multiple buffers.
-int LocalBufferSet::findBuffer(const AddressRange &range, RdmaContext *context,
-                               Transport::BufferVisibility visibility,
-                               std::vector<LocalBufferSet::Result> &result) {
-    RWSpinlock::ReadGuard guard(lock_);
-    for (auto vis_level = (int)visibility; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &elem : buffer_list) {
-            if (elem.first.intersect(range) == range &&
-                elem.second.mem_reg_map.count(context)) {
-                LocalBufferSet::Result result_entry;
-                result_entry.addr = range.addr;
-                result_entry.length = range.length;
-                auto key =
-                    context->queryMemRegKey(elem.second.mem_reg_map[context]);
-                result_entry.lkey = key.first;
-                result_entry.rkey = key.second;
-                result.push_back(result_entry);
-                return 0;
-            }
+        intervals.swap(new_intervals);
+    }
+
+    // Add any remaining non-overlapping parts of the new range
+    for (auto &interval : intervals) {
+        if (interval.second > interval.first) {
+            addr_list.emplace_back(static_cast<void *>(interval.first),
+                                   interval.second - interval.first, 1);
+            reg_parts.push_back(
+                AddressRange{static_cast<void *>(interval.first),
+                             size_t(interval.second - interval.first)});
         }
     }
-    return ERR_ADDRESS_NOT_REGISTERED;
+
+    // Sort the addr_list again after potential insertions
+    sort(addr_list.begin(), addr_list.end(),
+         [](const AddressRangeRC &a, const AddressRangeRC &b) {
+             return static_cast<char *>(a.addr) < static_cast<char *>(b.addr);
+         });
 }
 
-int LocalBufferSet::findBufferLegacy(void *addr, RdmaContext *context,
-                                     uint32_t &lkey, uint32_t &rkey) {
-    RWSpinlock::ReadGuard guard(lock_);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &elem : buffer_list) {
-            if ((uint64_t)elem.first.addr <= (uint64_t)addr &&
-                (uint64_t)addr <
-                    (uint64_t)elem.first.addr + elem.first.length &&
-                elem.second.mem_reg_map.count(context)) {
-                auto key =
-                    context->queryMemRegKey(elem.second.mem_reg_map[context]);
-                lkey = key.first;
-                rkey = key.second;
-                return 0;
+void AddressRangeManager::remove(const AddressRange &range,
+                                 std::vector<AddressRange> &dereg_parts) {
+    if (range.length == 0) return;
+
+    dereg_parts.clear();
+
+    char *range_start = static_cast<char *>(range.addr);
+    char *range_end = range_start + range.length;
+
+    // Iterate through existing ranges and process each range
+    std::vector<AddressRangeRC> new_list;
+
+    for (auto &existing : addr_list) {
+        char *existing_start = static_cast<char *>(existing.addr);
+        char *existing_end = existing_start + existing.length;
+
+        if (range_end <= existing_start || range_start >= existing_end) {
+            // No overlap, keep this range as is
+            new_list.push_back(existing);
+            continue;
+        }
+
+        // There is overlap with this existing range
+        if (existing.ref_cnt <= 0) {
+            // Invalid reference count, skip
+            continue;
+        }
+
+        // Decrement the reference count
+        existing.ref_cnt--;
+
+        bool fully_removed = false;
+        if (existing.ref_cnt <= 0) {
+            fully_removed = true;
+        }
+
+        // Split the existing range into non-removed parts
+        if (existing_start < range_start) {
+            new_list.emplace_back(existing.addr, range_start - existing_start,
+                                  existing.ref_cnt);
+            if (fully_removed) {
+                dereg_parts.emplace_back(existing.addr,
+                                         range_start - existing_start);
             }
         }
+        if (existing_end > range_end) {
+            new_list.emplace_back(static_cast<void *>(range_end),
+                                  existing_end - range_end, existing.ref_cnt);
+            if (fully_removed) {
+                dereg_parts.emplace_back(static_cast<void *>(range_end),
+                                         existing_end - range_end);
+            }
+        }
+
+        if (fully_removed && existing_start >= range_start &&
+            existing_end <= range_end) {
+            dereg_parts.emplace_back(existing.addr, existing.length);
+        }
     }
-    return ERR_ADDRESS_NOT_REGISTERED;
+
+    // Replace the addr_list with the new_list
+    addr_list = new_list;
+
+    // Sort the addr_list again after potential modifications
+    sort(addr_list.begin(), addr_list.end(),
+         [](const AddressRangeRC &a, const AddressRangeRC &b) {
+             return static_cast<char *>(a.addr) < static_cast<char *>(b.addr);
+         });
 }
 
-int LocalBufferSet::addDevice(RdmaContext *context) {
-    RWSpinlock::WriteGuard guard(lock_);
-    context_list_.insert(context);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &item : buffer_list) registerMemReg(item.second);
-    }
-    return 0;
-}
+LocalBufferManager::LocalBufferManager() {}
 
-int LocalBufferSet::removeDevice(RdmaContext *context) {
-    RWSpinlock::WriteGuard guard(lock_);
-    context_list_.erase(context);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &item : buffer_list) unregisterMemReg(item.second, context);
-    }
-    return 0;
-}
+LocalBufferManager::~LocalBufferManager() { clear(); }
 
-int LocalBufferSet::registerMemReg(LocalBufferSet::BufferItem &item) {
-    auto &entry = item.entry;
+static inline int getAccessFlags(Transport::BufferVisibility visibility) {
     int access = IBV_ACCESS_LOCAL_WRITE;
-    if (entry.visibility == Transport::kGlobalReadWrite) {
+    if (visibility == Transport::kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-    } else if (entry.visibility == Transport::kGlobalReadOnly) {
+    } else if (visibility == Transport::kGlobalReadOnly) {
         access |= IBV_ACCESS_REMOTE_READ;
     }
-    item.mem_reg_map.clear();
-    for (auto context : context_list_) {
-        if (item.mem_reg_map.count(context)) continue;
-        auto mem_reg =
-            context->registerMemReg(entry.addr, entry.length, access);
-        if (mem_reg) item.mem_reg_map[context] = mem_reg;
-    }
-    return 0;
+    return access;
 }
 
-int LocalBufferSet::unregisterMemReg(LocalBufferSet::BufferItem &item,
-                                     RdmaContext *context_filter) {
-    for (auto iter = item.mem_reg_map.begin();
-         iter != item.mem_reg_map.end();) {
-        auto &context = iter->first;
-        auto &mem_reg = iter->second;
-        if (!context_filter || context_filter == context) {
-            context->unregisterMemReg(mem_reg);
-            iter = item.mem_reg_map.erase(iter);
-        } else {
-            ++iter;
-        }
-    }
-    return 0;
-}
-
-int LocalBufferSet::clear() {
+int LocalBufferManager::addBuffer(const Transport::BufferEntry &buffer_entry) {
     RWSpinlock::WriteGuard guard(lock_);
-    for (auto vis_level = 0; vis_level < 3; ++vis_level) {
-        auto &buffer_list = buffer_lists_[vis_level];
-        for (auto &item : buffer_list) {
-            unregisterMemReg(item.second);
+    AddressRange range(buffer_entry.addr, buffer_entry.length);
+    std::vector<AddressRange> reg_parts;
+    manager_.add(range, reg_parts);
+    auto access = getAccessFlags(buffer_entry.visibility);
+    for (auto &to_reg : reg_parts) {
+        auto &item = buffer_list_[range];
+        for (auto &context : context_list_) {
+            auto mem_reg =
+                context->registerMemReg(to_reg.addr, to_reg.length, access);
+            if (!mem_reg) return ERR_CONTEXT;
+            item.mem_reg_map[context] = mem_reg;
         }
-        buffer_list.clear();
+        auto location = buffer_entry.location;
+        if (location == kWildcardLocation) {
+            auto entries = getMemoryLocation(to_reg.addr, to_reg.length);
+            if (!entries.empty()) {
+                location = entries[0].location;
+            }
+        }
+        item.entry.addr = to_reg.addr;
+        item.entry.length = to_reg.length;
+        item.entry.location = buffer_entry.location;
+        item.entry.visibility = buffer_entry.visibility;
+        item.entry.shm_path = buffer_entry.shm_path;
+        item.entry.shm_offset =
+            buffer_entry.shm_offset +
+            ((uint64_t)to_reg.addr - (uint64_t)buffer_entry.addr);
     }
+    return 0;
+}
+
+int LocalBufferManager::removeBuffer(const AddressRange &range) {
+    RWSpinlock::WriteGuard guard(lock_);
+    std::vector<AddressRange> dereg_parts;
+    manager_.remove(range, dereg_parts);
+    for (auto &to_dereg : dereg_parts) {
+        auto &item = buffer_list_[to_dereg];
+        for (auto &elem : item.mem_reg_map) {
+            elem.first->unregisterMemReg(elem.second);
+        }
+        buffer_list_.erase(to_dereg);
+    }
+    return 0;
+}
+
+int LocalBufferManager::addDevice(RdmaContext *context) {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto iter = std::find(context_list_.begin(), context_list_.end(), context);
+    if (iter != context_list_.end()) return 0;
+    context_list_.push_back(context);
+    for (auto &buffer : buffer_list_) {
+        auto &to_reg = buffer.second.entry;
+        auto access = getAccessFlags(to_reg.visibility);
+        if (buffer.second.mem_reg_map.count(context)) continue;
+        auto mem_reg =
+            context->registerMemReg(to_reg.addr, to_reg.length, access);
+        if (!mem_reg) return ERR_CONTEXT;
+        buffer.second.mem_reg_map[context] = mem_reg;
+    }
+    return 0;
+}
+
+int LocalBufferManager::removeDevice(RdmaContext *context) {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto iter = std::find(context_list_.begin(), context_list_.end(), context);
+    if (iter == context_list_.end()) return 0;
+    for (auto &buffer : buffer_list_) {
+        if (!buffer.second.mem_reg_map.count(context)) continue;
+        context->unregisterMemReg(buffer.second.mem_reg_map[context]);
+        buffer.second.mem_reg_map.erase(context);
+    }
+    context_list_.erase(iter);
+    return 0;
+}
+
+int LocalBufferManager::clear() {
+    RWSpinlock::WriteGuard guard(lock_);
+    for (auto &buffer : buffer_list_) {
+        for (auto &elem : buffer.second.mem_reg_map)
+            elem.first->unregisterMemReg(elem.second);
+    }
+    buffer_list_.clear();
     context_list_.clear();
     return 0;
+}
+
+int LocalBufferManager::fillBufferDesc(
+    std::shared_ptr<SegmentDesc> &segment_desc) {
+    RWSpinlock::ReadGuard guard(lock_);
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+    detail.buffers.clear();
+    for (auto &buffer : buffer_list_) {
+        BufferDesc buffer_desc;
+        buffer_desc.location = buffer.second.entry.location;
+        buffer_desc.addr = (uint64_t)buffer.second.entry.addr;
+        buffer_desc.length = buffer.second.entry.length;
+        for (auto &device : detail.devices) {
+            bool found = false;
+            for (auto &elem : buffer.second.mem_reg_map) {
+                if (elem.first->name() == device.name) {
+                    auto keys = elem.first->queryMemRegKey(elem.second);
+                    buffer_desc.lkey.push_back(keys.first);
+                    buffer_desc.rkey.push_back(keys.second);
+                    found = true;
+                }
+            }
+            if (!found) {
+                LOG(WARNING)
+                    << "Unregistered memory " << (void *)buffer_desc.addr
+                    << "--" << (void *)(buffer_desc.addr + buffer_desc.length)
+                    << " for device " << device.name;
+                // representing invalid value
+                buffer_desc.lkey.push_back(UINT32_MAX);
+                buffer_desc.rkey.push_back(UINT32_MAX);
+            }
+        }
+        detail.buffers.push_back(buffer_desc);
+    }
+    return 0;
+}
+
+int LocalBufferManager::query(const AddressRange &range,
+                              std::vector<Result> &result, int retry_count) {
+    RWSpinlock::ReadGuard guard(lock_);
+    result.clear();
+    for (auto &buffer : buffer_list_) {
+        auto intersect = buffer.first.intersect(range);
+        if (intersect.empty()) continue;
+        int device_id =
+            topology_->selectDevice(buffer.second.entry.location, retry_count);
+        if (device_id < 0)
+            device_id = topology_->selectDevice(kWildcardLocation, retry_count);
+        if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
+        auto context = context_list_[device_id];
+        auto mem_reg_id = buffer.second.mem_reg_map[context];
+        auto keys = context->queryMemRegKey(mem_reg_id);
+        result.push_back(Result{intersect.addr, intersect.length, keys.first,
+                                keys.second, device_id});
+    }
+    return 0;
+}
+
+const std::string LocalBufferManager::deviceName(int id) {
+    RWSpinlock::ReadGuard guard(lock_);
+    assert(id >= 0 && id < (int)context_list_.size());
+    return context_list_[id]->name();
 }
 
 PeerBuffers::PeerBuffers() : segment_desc_(nullptr) {}

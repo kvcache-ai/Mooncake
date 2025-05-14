@@ -117,6 +117,7 @@ class Transport {
         Location location = kWildcardLocation;
         BufferVisibility visibility = kGlobalReadWrite;
         std::string shm_path = "";
+        size_t shm_offset = 0;
     };
 
     virtual Status registerLocalMemory(
@@ -125,7 +126,8 @@ class Transport {
             "generic transport does not implement registerLocalMemory");
     }
 
-    virtual Status unregisterLocalMemory(const std::vector<void *> &addr_list) {
+    virtual Status unregisterLocalMemory(
+        const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
             "generic transport does not implement unregisterLocalMemory");
     }

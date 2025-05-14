@@ -82,7 +82,8 @@ class RdmaTransport : public Transport {
     virtual Status registerLocalMemory(
         const std::vector<BufferEntry> &buffer_list);
 
-    virtual Status unregisterLocalMemory(const std::vector<void *> &addr_list);
+    virtual Status unregisterLocalMemory(
+        const std::vector<BufferEntry> &buffer_list);
 
     virtual const char *getName() const { return "rdma"; }
 
@@ -101,14 +102,14 @@ class RdmaTransport : public Transport {
 
     int registerSingleLocalMemory(const BufferEntry &buffer, bool update_meta);
 
-    int unregisterSingleLocalMemory(void *addr, bool update_meta);
+    int unregisterSingleLocalMemory(const BufferEntry &buffer, bool update_meta);
 
    private:
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<mooncake::TransferMetadata> metadata_manager_;
-    LocalBufferSet local_buffer_set_;
+    LocalBufferManager local_buffer_manager_;
     RdmaContextSet context_set_;
     std::unordered_map<std::string, int> context_name_lookup_;
     std::shared_ptr<Workers> workers_;

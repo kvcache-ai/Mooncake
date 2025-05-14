@@ -66,7 +66,7 @@ Status RdmaTransport::install(
         }
         context_name_lookup_[device_name] = context_set_.size();
         context_set_.push_back(context);
-        local_buffer_set_.addDevice(context.get());
+        local_buffer_manager_.addDevice(context.get());
     }
     if (local_topology_->empty()) {
         uninstall();
@@ -97,7 +97,7 @@ Status RdmaTransport::uninstall() {
         workers_.reset();
         metadata_manager_->removeSegmentDesc(local_segment_name_);
         metadata_manager_.reset();
-        local_buffer_set_.clear();
+        local_buffer_manager_.clear();
         context_set_.clear();
         context_name_lookup_.clear();
         installed_ = false;
@@ -189,33 +189,40 @@ Status RdmaTransport::registerLocalMemory(
                          << buffer_list[i].length;
         }
     }
-    int ret = metadata_manager_->updateLocalSegmentDesc();
+    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    local_buffer_manager_.fillBufferDesc(segment_desc);
+    int ret = metadata_manager_->updateSegmentDesc(segment_desc->name,
+                                                   *segment_desc.get());
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
 
 Status RdmaTransport::unregisterLocalMemory(
-    const std::vector<void *> &addr_list) {
-    if (addr_list.empty()) return Status::OK();
-    if (addr_list.size() == 1) {
-        int ret = unregisterSingleLocalMemory(addr_list[0], true);
+    const std::vector<BufferEntry> &buffer_list) {
+    if (buffer_list.empty()) return Status::OK();
+    if (buffer_list.size() == 1) {
+        int ret = unregisterSingleLocalMemory(buffer_list[0], true);
         return ret == 0 ? Status::OK()
-                        : Status::Context("register local memory error");
+                        : Status::Context("unregister local memory error");
     }
     std::vector<std::future<int>> results;
-    for (auto &addr : addr_list) {
+    for (auto &buffer : buffer_list) {
         results.emplace_back(
-            std::async(std::launch::async, [this, addr]() -> int {
-                return unregisterSingleLocalMemory(addr, false);
+            std::async(std::launch::async, [this, buffer]() -> int {
+                return unregisterSingleLocalMemory(buffer, false);
             }));
     }
-    for (size_t i = 0; i < addr_list.size(); ++i) {
+    for (size_t i = 0; i < buffer_list.size(); ++i) {
         if (results[i].get()) {
             LOG(WARNING) << "unregister local memory error: addr "
-                         << addr_list[i];
+                         << buffer_list[i].addr << " length "
+                         << buffer_list[i].length;
         }
     }
-    int ret = metadata_manager_->updateLocalSegmentDesc();
+    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    local_buffer_manager_.fillBufferDesc(segment_desc);
+    int ret = metadata_manager_->updateSegmentDesc(segment_desc->name,
+                                                   *segment_desc.get());
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
@@ -239,46 +246,25 @@ void RdmaTransport::allocateLocalSegmentID() {
 
 int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
                                              bool update_meta) {
-    BufferDesc buffer_desc;
-    int ret = local_buffer_set_.addBuffer(buffer);
-    if (ret) return ret;
-    for (auto &context : context_set_) {
-        uint32_t lkey, rkey;
-        local_buffer_set_.findBufferLegacy(buffer.addr, context.get(), lkey,
-                                           rkey);
-        buffer_desc.lkey.push_back(lkey);
-        buffer_desc.rkey.push_back(rkey);
-    }
-
-    // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation ("*").
-    if (buffer.location == kWildcardLocation) {
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(buffer.addr, buffer.length);
-        for (auto &entry : entries) {
-            buffer_desc.location = entry.location;
-            buffer_desc.addr = entry.start;
-            buffer_desc.length = entry.len;
-            int rc = metadata_manager_->addLocalMemoryBuffer(buffer_desc,
-                                                             update_meta);
-            if (rc) return rc;
-        }
-    } else {
-        buffer_desc.location = buffer.location;
-        buffer_desc.addr = (uint64_t)buffer.addr;
-        buffer_desc.length = buffer.length;
-        int rc =
-            metadata_manager_->addLocalMemoryBuffer(buffer_desc, update_meta);
-        if (rc) return rc;
-    }
-    return 0;
+    int ret = local_buffer_manager_.addBuffer(buffer);
+    if (!update_meta || ret) return ret;
+    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    local_buffer_manager_.fillBufferDesc(segment_desc);
+    return metadata_manager_->updateSegmentDesc(segment_desc->name,
+                                                *segment_desc.get());
 }
 
-int RdmaTransport::unregisterSingleLocalMemory(void *addr, bool update_meta) {
-    int rc = metadata_manager_->removeLocalMemoryBuffer(addr, update_meta);
-    if (rc) return rc;
-    local_buffer_set_.removeBufferLegacy(addr);
-    return 0;
+int RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
+                                               bool update_meta) {
+    AddressRange range;
+    range.addr = buffer.addr;
+    range.length = buffer.length;
+    int ret = local_buffer_manager_.removeBuffer(range);
+    if (!update_meta || ret) return ret;
+    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    local_buffer_manager_.fillBufferDesc(segment_desc);
+    return metadata_manager_->updateSegmentDesc(segment_desc->name,
+                                                *segment_desc.get());
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,

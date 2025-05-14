@@ -124,7 +124,7 @@ int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
 void Workers::asyncPostSend(int thread_id) {
     const static size_t kMaxSlicesToSend = 32;
-    
+
     PeerBuffers local_buffer_;
     std::unordered_map<SegmentID, PeerBuffers> remote_buffers_;
 
@@ -140,7 +140,8 @@ void Workers::asyncPostSend(int thread_id) {
     }
 
     if (!local_buffer_.valid()) {
-        auto segment_desc = transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        auto segment_desc =
+            transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         local_buffer_.reload(segment_desc);
     }
     for (int i = 0; i < count_slices; ++i) {
@@ -161,12 +162,13 @@ void Workers::asyncPostSend(int thread_id) {
         auto &slice = slice_to_send[i];
         auto target_id = slice->task->request.target_id;
         std::vector<PeerBuffers::Result> local_result, remote_result;
-        int ret = local_buffer_.query(AddressRange{slice->source_addr, slice->length}, 
-            local_result, slice->retry_count);
+        int ret =
+            local_buffer_.query(AddressRange{slice->source_addr, slice->length},
+                                local_result, slice->retry_count);
         auto &remote_item = remote_buffers_[target_id];
         if (!ret) {
             ret = remote_item.query(
-                AddressRange{(void *)slice->target_addr, slice->length}, 
+                AddressRange{(void *)slice->target_addr, slice->length},
                 remote_result, slice->retry_count);
         }
         assert(!ret);
@@ -174,13 +176,15 @@ void Workers::asyncPostSend(int thread_id) {
         assert(remote_result.size() == 1);
         auto context = transport_->context_set_[local_result[0].device_id];
         auto peer_segment_name = remote_item.segmentName();
-        auto peer_device_name = remote_item.deviceName(remote_result[0].device_id);
+        auto peer_device_name =
+            remote_item.deviceName(remote_result[0].device_id);
         auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
         auto endpoint = context->endpoint(peer_name);
         if (endpoint->status() != RdmaEndPoint::EP_READY) {
             mutex_.lock();
             if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                if (doHandshake(endpoint, peer_segment_name, peer_device_name)) {
+                if (doHandshake(endpoint, peer_segment_name,
+                                peer_device_name)) {
                     __sync_fetch_and_add(&slice->task->finish_slices, 1);
                     slice->task->status.s = Transport::FAILED;
                 }

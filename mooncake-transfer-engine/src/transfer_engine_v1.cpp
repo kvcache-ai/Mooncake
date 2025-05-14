@@ -117,22 +117,16 @@ SegmentHandle TransferEngine::openSegment(const std::string &segment_name) {
 
 int TransferEngine::closeSegment(SegmentHandle handle) { return 0; }
 
-int TransferEngine::registerLocalMemory(void *addr, size_t length,
-                                        const std::string &location,
-                                        bool remote_accessible,
-                                        bool update_metadata,
-                                        const std::string &shm_path) {
-    BufferEntry entry;
-    entry.addr = addr;
-    entry.length = length;
-    entry.location = location;
-    entry.shm_path = shm_path;
-    entry.visibility = Transport::BufferVisibility::kGlobalReadWrite;
-    return registerLocalMemoryBatch({entry}, location);
+int TransferEngine::registerLocalMemory(BufferEntry &buffer) {
+    std::vector<BufferEntry> buffer_list;
+    buffer_list.push_back(buffer);
+    return registerLocalMemoryBatch(buffer_list);
 }
 
-int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return unregisterLocalMemoryBatch({addr});
+int TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
+    std::vector<BufferEntry> buffer_list;
+    buffer_list.push_back(buffer);
+    return unregisterLocalMemoryBatch(buffer_list);
 }
 
 BatchID TransferEngine::allocateBatchID(size_t batch_size) {
@@ -179,14 +173,14 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 int TransferEngine::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list, const std::string &location) {
+    const std::vector<BufferEntry> &buffer_list) {
     auto status = transport_->registerLocalMemory(buffer_list);
     return (int)status.code();
 }
 
 int TransferEngine::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
-    auto status = transport_->unregisterLocalMemory(addr_list);
+    const std::vector<BufferEntry> &buffer_list) {
+    auto status = transport_->unregisterLocalMemory(buffer_list);
     return (int)status.code();
 }
 }  // namespace v1

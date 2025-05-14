@@ -308,6 +308,7 @@ int initiator() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
+    BufferEntry entries[NR_SOCKETS];
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
@@ -315,16 +316,20 @@ int initiator() {
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+        entries[i].addr = addr[i];
+        entries[i].length = FLAGS_buffer_size;
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
+        entries[i].location = name_prefix + std::to_string(i);
+        int rc = engine->registerLocalMemory(entries[i]);
         LOG_ASSERT(!rc);
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
+        entries[i].addr = addr[i];
+        entries[i].length = FLAGS_buffer_size;
+        entries[i].location = "cpu:" + std::to_string(i);
+        int rc = engine->registerLocalMemory(entries[i]);
         LOG_ASSERT(!rc);
     }
 #endif
@@ -360,7 +365,7 @@ int initiator() {
                      duration);
 
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
+        engine->unregisterLocalMemory(entries[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 
@@ -386,28 +391,27 @@ int target() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
+    BufferEntry entries[NR_SOCKETS];
     for (int i = 0; i < NR_SOCKETS; ++i) {
         if (FLAGS_protocol == "shm") {
             addr[i] = allocateMemoryPool(FLAGS_buffer_size, FLAGS_shm_path);
-            memset(addr[i], 'x', FLAGS_buffer_size);
-            int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                                 "cpu:" + std::to_string(i),
-                                                 true, true, FLAGS_shm_path);
-            LOG_ASSERT(!rc);
+            entries[i].shm_path = FLAGS_shm_path;
         } else {
             addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
-            memset(addr[i], 'x', FLAGS_buffer_size);
-            int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                                 "cpu:" + std::to_string(i));
-            LOG_ASSERT(!rc);
         }
+        memset(addr[i], 'x', FLAGS_buffer_size);
+        entries[i].addr = addr[i];
+        entries[i].length = FLAGS_buffer_size;
+        entries[i].location = "cpu:" + std::to_string(i);
+        int rc = engine->registerLocalMemory(entries[i]);
+        LOG_ASSERT(!rc);
     }
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
     for (int i = 0; i < NR_SOCKETS; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
+        engine->unregisterLocalMemory(entries[i]);
         if (FLAGS_protocol == "shm") {
             munmap(addr[i], FLAGS_buffer_size);
             shm_unlink(FLAGS_shm_path.c_str());

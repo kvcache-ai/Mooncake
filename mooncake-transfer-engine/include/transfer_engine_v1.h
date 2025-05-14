@@ -76,18 +76,13 @@ class TransferEngine {
 
     int closeSegment(SegmentHandle handle);
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location = kWildcardLocation,
-                            bool remote_accessible = true,
-                            bool update_metadata = true,
-                            const std::string &shm_path = "");
+    int registerLocalMemory(BufferEntry &buffer);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true);
+    int unregisterLocalMemory(BufferEntry &buffer);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location);
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list);
 
-    int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+    int unregisterLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list);
 
     BatchID allocateBatchID(size_t batch_size);
 

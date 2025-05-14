@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "transport_v1/transport.h"
@@ -61,30 +62,52 @@ struct AddressRange {
     }
 };
 
-class LocalBufferSet {
+class AddressRangeManager {
+   private:
+    struct AddressRangeRC {
+        void *addr;
+        size_t length;
+        int ref_cnt;
+        AddressRangeRC(void *addr = nullptr, size_t length = 0, int ref_cnt = 0)
+            : addr(addr), length(length), ref_cnt(ref_cnt) {}
+    };
+
+    std::vector<AddressRangeRC> addr_list;
+
+    // Helper function to find the position where a range would be inserted
+    std::vector<AddressRangeRC>::iterator findInsertPosition(
+        const AddressRange &range);
+
+    // Helper function to check if two ranges overlap
+    bool rangesOverlap(const AddressRangeRC &a, const AddressRange &b);
+
    public:
-    LocalBufferSet();
+    void add(const AddressRange &range, std::vector<AddressRange> &reg_parts);
 
-    ~LocalBufferSet();
+    void remove(const AddressRange &range,
+                std::vector<AddressRange> &dereg_parts);
+};
 
-    int addBuffer(const Transport::BufferEntry &entry);
+class LocalBufferManager {
+   public:
+    LocalBufferManager();
+
+    ~LocalBufferManager();
+
+    void setTopology(std::shared_ptr<Topology> &topology) {
+        topology_ = topology;
+    }
+
+    int addBuffer(const Transport::BufferEntry &buffer_entry);
 
     int removeBuffer(const AddressRange &range);
-
-    int removeBufferLegacy(void *addr);
 
     struct Result {
         void *addr;
         size_t length;
         uint32_t lkey, rkey;
+        int device_id;
     };
-
-    int findBuffer(const AddressRange &range, RdmaContext *context,
-                   Transport::BufferVisibility visibility,
-                   std::vector<Result> &result);
-
-    int findBufferLegacy(void *addr, RdmaContext *context, uint32_t &lkey,
-                         uint32_t &rkey);
 
     int addDevice(RdmaContext *context);
 
@@ -92,23 +115,25 @@ class LocalBufferSet {
 
     int clear();
 
+    int fillBufferDesc(std::shared_ptr<SegmentDesc> &segment_desc);
+
+    int query(const AddressRange &range, std::vector<Result> &result,
+              int retry_count = 0);
+
+    const std::string deviceName(int id);
+
    private:
-    struct BufferItem {
-        int ref_cnt;
+    struct BufferEntry {
         Transport::BufferEntry entry;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
     };
 
-    int registerMemReg(BufferItem &item);
-
-    int unregisterMemReg(BufferItem &item,
-                         RdmaContext *context_filter = nullptr);
-
    private:
     RWSpinlock lock_;
-    std::map<AddressRange, BufferItem>
-        buffer_lists_[3];  // each represents one visibility level
-    std::unordered_set<RdmaContext *> context_list_;
+    AddressRangeManager manager_;
+    std::vector<RdmaContext *> context_list_;
+    std::map<AddressRange, BufferEntry> buffer_list_;
+    std::shared_ptr<Topology> topology_;
 };
 
 class PeerBuffers {
@@ -130,7 +155,7 @@ class PeerBuffers {
 
     int query(const AddressRange &range, std::vector<Result> &result,
               int retry_count = 0);
-    
+
     const std::string &segmentName() const { return segment_desc_->name; }
 
     const std::string &deviceName(int id);
