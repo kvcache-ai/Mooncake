@@ -92,6 +92,9 @@ void MasterMetricManager::dec_total_capacity(int64_t val) {
 double MasterMetricManager::get_global_used_ratio(void) {
     double allocated = allocated_size_.value();
     double capacity = total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
     return allocated / capacity;
 }
 

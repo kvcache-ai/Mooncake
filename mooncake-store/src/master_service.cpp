@@ -79,7 +79,9 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
+#ifdef USE_LRU_MASTER
     eviction_strategy_ -> CleanUp();
+#endif
 }
 
 MasterService::~MasterService() {
@@ -97,9 +99,10 @@ MasterService::~MasterService() {
         }
     }
 
+#ifdef USE_LRU_MASTER
     LOG(INFO) << "### LRU cleared ###";
     eviction_strategy_ -> CleanUp();
-
+#endif
 }
 
 ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
@@ -169,11 +172,15 @@ ErrorCode MasterService::GetReplicaList(
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+        #ifdef USE_LRU_MASTER
         // If the object is not found, we should synchronize the EvictionStrategy
         eviction_strategy_->RemoveKey(key);
+        #endif
         return ErrorCode::OBJECT_NOT_FOUND;
     }
+    #ifdef USE_LRU_MASTER
     eviction_strategy_->UpdateKey(key);
+    #endif
     auto& metadata = accessor.Get();
     for (const auto& replica : metadata.replicas) {
         auto status = replica.status();
@@ -209,8 +216,10 @@ ErrorCode MasterService::PutStart(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    #ifdef USE_LRU_MASTER
     LOG(INFO) << "### LRU Update in Put() ###";
     eviction_strategy_->AddKey(key);
+    #endif
 
     // Validate slice lengths
     uint64_t total_length = 0;
@@ -311,12 +320,14 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
         replica.mark_complete();
     }
 
+    #ifdef USE_LRU_MASTER
     // if globally used storage ratio >= 80%, evict some of them
     if(MasterMetricManager::instance().get_global_used_ratio() >= 0.8) {
         std::string evicted_key = eviction_strategy_->EvictKey();
         LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
         Remove(evicted_key);
     }
+    #endif
 
     return ErrorCode::OK;
 }
