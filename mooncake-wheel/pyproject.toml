@@ -10,6 +10,7 @@ authors = [
     { name = "Mooncake Authors" }
 ]
 requires-python = ">=3.8"
+dependencies = ["aiohttp", "requests"]
 keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -26,6 +27,7 @@ Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
+mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 
 [tool.setuptools]
 zip-safe = false
