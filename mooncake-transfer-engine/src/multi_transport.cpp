@@ -23,6 +23,8 @@
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
 
+#include <cassert>
+
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string &local_server_name)
@@ -81,6 +83,7 @@ Status MultiTransport::submitTransfer(
         Transport *transport = nullptr;
         auto status = selectTransport(request, transport);
         if (!status.ok()) return status;
+        assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         ++task_id;
