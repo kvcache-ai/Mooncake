@@ -46,6 +46,16 @@ option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 
+
+option(USE_LRU_MASTER "option for using LRU in master service" OFF)
+set(LRU_MAX_CAPACITY 1000)
+
+if (USE_LRU_MASTER)
+  add_compile_definitions(USE_LRU_MASTER)
+  add_compile_definitions(LRU_MAX_CAPACITY)
+endif()
+
+
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
@@ -83,3 +93,9 @@ if (WITH_METRICS)
   add_compile_definitions(WITH_METRICS)
   message(STATUS "metrics is enabled")
 endif()
+
+
+set(GFLAGS_USE_TARGET_NAMESPACE "true")
+find_package(gflags REQUIRED)
+find_package(glog REQUIRED)
+find_package(yalantinglibs CONFIG REQUIRED)

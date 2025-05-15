@@ -269,14 +269,17 @@ Status RdmaTransport::submitTransferTask(
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     for (size_t index = 0; index < request_list.size(); ++index) {
+        assert(request_list[index] && task_list[index]);
         auto &request = *request_list[index];
         auto &task = *task_list[index];
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
+            assert(slice);
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -294,8 +297,12 @@ Status RdmaTransport::submitTransferTask(
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
+                assert(device_id >= 0 && device_id < context_list_.size());
                 auto &context = context_list_[device_id];
+                assert(context.get());
                 if (!context->active()) continue;
+                assert(buffer_id >= 0 && buffer_id < local_segment_desc->buffers.size());
+                assert(local_segment_desc->buffers[buffer_id].lkey.size() == context_list_.size());
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
@@ -438,6 +445,7 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {
+    assert(desc);
     for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
         auto &buffer_desc = desc->buffers[buffer_id];
         if (buffer_desc.addr > offset ||

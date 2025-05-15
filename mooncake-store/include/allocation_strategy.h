@@ -65,19 +65,24 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return nullptr;
         }
 
-        // Randomly select one from eligible allocators
-        std::uniform_int_distribution<size_t> dist(0, eligible.size() - 1);
-        size_t randomIndex = dist(rng_);
-        const size_t max_try = 10;
-        size_t try_count = 0;
+        const size_t max_try_limit = 10;
+        size_t max_try = std::min(max_try_limit, eligible.size());
         // Due to allocator fragmentation, we may fail to allocate memory even
-        while (try_count < max_try) {
+        // if there is enough free memory.
+        for (size_t try_count = 0; try_count < max_try; try_count++) {
+            // Randomly select one from eligible allocators
+            std::uniform_int_distribution<size_t> dist(0, eligible.size() - 1);
+            size_t randomIndex = dist(rng_);
             auto& allocator = eligible[randomIndex];
             auto bufHandle = allocator->allocate(objectSize);
             if (bufHandle) {
                 return bufHandle;
             }
-            try_count++;
+            // If allocation failed, try other allocators
+            if (randomIndex + 1 != eligible.size()) {
+                eligible[randomIndex].swap(eligible.back());
+            }
+            eligible.pop_back();
         }
         return nullptr;
     }
