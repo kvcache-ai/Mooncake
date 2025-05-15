@@ -26,6 +26,7 @@ Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:main"
 
 [tool.setuptools]
 zip-safe = false
