@@ -5,7 +5,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cstdlib>  // for atexit
+#include <algorithm>  // for std::transform
+#include <cstdlib>    // for atexit
 #include <random>
 
 #include "types.h"
@@ -149,6 +150,47 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
                                   const std::string &master_server_addr) {
+    // Configure logging based on MC_LOG_LEVEL environment variable
+    const char *log_level_env = std::getenv("MC_LOG_LEVEL");
+
+    // Always log to stderr by default
+    FLAGS_logtostderr = 1;
+
+    // Set default log level to INFO if not specified
+    if (!log_level_env) {
+        FLAGS_minloglevel = google::INFO;
+        LOG(INFO) << "Using default log level: INFO";
+    } else {
+        std::string log_level(log_level_env);
+        // Convert to uppercase for case-insensitive comparison
+        std::transform(log_level.begin(), log_level.end(), log_level.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+
+        if (log_level == "TRACE") {
+            // For trace level, set INFO level and enable vlog
+            FLAGS_minloglevel = google::INFO;
+            // Enable verbose logging for all modules at different levels
+            google::SetVLOGLevel("*",
+                                 1);  // Enable up to VLOG(1) for all modules
+            FLAGS_v = 1;
+            LOG(INFO)
+                << "Log level set to TRACE (INFO + vlog enabled at level 1)";
+        } else if (log_level == "INFO") {
+            FLAGS_minloglevel = google::INFO;
+            LOG(INFO) << "Log level set to INFO";
+        } else if (log_level == "WARNING") {
+            FLAGS_minloglevel = google::WARNING;
+            LOG(INFO) << "Log level set to WARNING";
+        } else if (log_level == "ERROR") {
+            FLAGS_minloglevel = google::ERROR;
+            LOG(INFO) << "Log level set to ERROR";
+        } else {
+            LOG(WARNING) << "Unknown log level: " << log_level
+                         << ". Using default (INFO)";
+            FLAGS_minloglevel = google::INFO;
+        }
+    }
+
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
