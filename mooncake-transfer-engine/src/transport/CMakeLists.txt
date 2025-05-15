@@ -8,6 +8,9 @@ if (USE_TCP)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:tcp_transport>)
 endif()
 
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
+
 if (USE_NVMEOF)
   add_subdirectory(nvmeof_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)

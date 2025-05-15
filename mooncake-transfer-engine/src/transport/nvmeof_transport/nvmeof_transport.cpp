@@ -26,9 +26,9 @@
 #include <memory>
 #include <tuple>
 
-#include "common.h"
+#include "common/common.h"
 #include "transfer_engine.h"
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/nvmeof_transport/cufile_context.h"
 #include "transport/nvmeof_transport/cufile_desc_pool.h"
 #include "transport/transport.h"
@@ -151,7 +151,8 @@ Status NVMeoFTransport::submitTransfer(
         uint64_t segment_start = request.target_offset;
         uint64_t segment_end = request.target_offset + request.length;
         uint64_t current_offset = 0;
-        for (auto &buffer_desc : desc->nvmeof_buffers) {
+        auto &detail = std::get<FileSegmentDesc>(desc->detail);
+        for (auto &buffer_desc : detail.buffers) {
             bool is_overlap = overlap(
                 (void *)segment_start, request.length, (void *)current_offset,
                 buffer_desc
@@ -164,7 +165,7 @@ Status NVMeoFTransport::submitTransfer(
                     std::min(segment_end, current_offset + buffer_desc.length);
                 // 3. init slice and put into TransferTask
                 const char *file_path =
-                    buffer_desc.local_path_map[local_server_name_].c_str();
+                    buffer_desc.mounted_path_map[local_server_name_].c_str();
                 void *source_addr =
                     (char *)request.source + slice_start - segment_start;
                 uint64_t file_offset = slice_start - current_offset;

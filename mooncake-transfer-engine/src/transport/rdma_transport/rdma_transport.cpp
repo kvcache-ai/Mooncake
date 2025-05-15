@@ -23,10 +23,10 @@
 #include <future>
 #include <set>
 
-#include "common.h"
-#include "config.h"
-#include "memory_location.h"
-#include "topology.h"
+#include "common/common.h"
+#include "common/config.h"
+#include "utility/memory_location.h"
+#include "utility/topology.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -84,7 +84,7 @@ int RdmaTransport::install(std::string &local_server_name,
 }
 
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
-                                       const std::string &name,
+                                       const std::string &location,
                                        bool remote_accessible,
                                        bool update_metadata) {
     (void)remote_accessible;
@@ -100,12 +100,12 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation("*").
-    if (name == kWildcardLocation) {
+    // when the name is kWildcardLocation ("*").
+    if (location == kWildcardLocation) {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         for (auto &entry : entries) {
-            buffer_desc.name = entry.location;
+            buffer_desc.location = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
             int rc =
@@ -113,7 +113,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
             if (rc) return rc;
         }
     } else {
-        buffer_desc.name = name;
+        buffer_desc.location = location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -138,14 +138,15 @@ int RdmaTransport::allocateLocalSegmentID() {
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
     desc->protocol = "rdma";
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : context_list_) {
-        TransferMetadata::DeviceDesc device_desc;
+        DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
         device_desc.lid = entry->lid();
         device_desc.gid = entry->gid();
-        desc->devices.push_back(device_desc);
+        detail.devices.push_back(device_desc);
     }
-    desc->topology = *(local_topology_.get());
+    detail.topology = *(local_topology_.get());
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -237,8 +238,10 @@ Status RdmaTransport::submitTransfer(
                     continue;
                 auto &context = context_list_[device_id];
                 if (!context->active()) continue;
+                auto &detail =
+                    std::get<MemorySegmentDesc>(local_segment_desc->detail);
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                    detail.buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -296,8 +299,10 @@ Status RdmaTransport::submitTransferTask(
                     continue;
                 auto &context = context_list_[device_id];
                 if (!context->active()) continue;
+                auto &detail =
+                    std::get<MemorySegmentDesc>(local_segment_desc->detail);
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                    detail.buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
@@ -371,8 +376,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-RdmaTransport::SegmentID RdmaTransport::getSegmentID(
-    const std::string &segment_name) {
+SegmentID RdmaTransport::getSegmentID(const std::string &segment_name) {
     return metadata_->getSegmentID(segment_name);
 }
 
@@ -438,14 +442,17 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {
-    for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
-        auto &buffer_desc = desc->buffers[buffer_id];
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    for (buffer_id = 0; buffer_id < (int)detail.buffers.size(); ++buffer_id) {
+        auto &buffer_desc = detail.buffers[buffer_id];
         if (buffer_desc.addr > offset ||
             offset + length > buffer_desc.addr + buffer_desc.length)
             continue;
-        device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        device_id =
+            detail.topology.selectDevice(buffer_desc.location, retry_count);
         if (device_id >= 0) return 0;
-        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count);
+        device_id =
+            detail.topology.selectDevice(kWildcardLocation, retry_count);
         if (device_id >= 0) return 0;
     }
 
