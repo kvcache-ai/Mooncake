@@ -89,6 +89,12 @@ void MasterMetricManager::dec_total_capacity(int64_t val) {
     total_capacity_.dec(val);
 }
 
+double MasterMetricManager::get_global_used_ratio(void) {
+    double allocated = allocated_size_.value();
+    double capacity = total_capacity_.value();
+    return allocated / capacity;
+}
+
 // Key/Value Metrics
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }

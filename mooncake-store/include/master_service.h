@@ -12,12 +12,15 @@
 #include <vector>
 
 #include "allocation_strategy.h"
+#include "eviction_strategy.h"
 #include "allocator.h"
 #include "types.h"
+
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
+class EvictionStrategy;
 
 // Structure to store garbage collection tasks
 struct GCTask {
@@ -185,6 +188,8 @@ class MasterService {
     // Buffer allocator management
     std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<EvictionStrategy> eviction_strategy_;
+
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
