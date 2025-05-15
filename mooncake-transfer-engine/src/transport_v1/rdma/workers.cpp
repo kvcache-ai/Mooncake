@@ -37,7 +37,7 @@ int Workers::start() {
         running_ = true;
         stop_flag_ = false;
         num_workers_ = transport_->params_->workers.num_workers;
-        slice_queue_ = new SliceQueue[num_workers_];
+        worker_env_ = new WorkerEnv[num_workers_];
         for (size_t index = 0; index < num_workers_; ++index) {
             workers_.emplace_back([this, index] { workerThread(index); });
         }
@@ -57,8 +57,8 @@ int Workers::stop() {
         worker.join();
     }
     monitor_.join();
-    delete[] slice_queue_;
-    slice_queue_ = nullptr;
+    delete[] worker_env_;
+    worker_env_ = nullptr;
     running_ = false;
     return 0;
 }
@@ -104,7 +104,7 @@ RdmaSlice *Workers::SliceQueue::pop(size_t count) {
 
 int Workers::submit(RdmaSlice *slice) {
     int id = SimpleRandom::Get().next(num_workers_);
-    slice_queue_[id].push(slice, slice, 1);
+    worker_env_[id].slice_queue.push(slice, slice, 1);
     auto prev_inflight_slices = inflight_slices_.fetch_add(1);
     if (!prev_inflight_slices) cv_.notify_all();
     return 0;
@@ -112,8 +112,8 @@ int Workers::submit(RdmaSlice *slice) {
 
 int Workers::submit(RdmaSliceList &slice_list) {
     int id = SimpleRandom::Get().next(num_workers_);
-    slice_queue_[id].push(slice_list.first, slice_list.last,
-                          slice_list.num_slices);
+    worker_env_[id].slice_queue.push(slice_list.first, slice_list.last,
+                                     slice_list.num_slices);
     auto prev_inflight_slices =
         inflight_slices_.fetch_add(slice_list.num_slices);
     if (!prev_inflight_slices) cv_.notify_all();
@@ -122,57 +122,61 @@ int Workers::submit(RdmaSliceList &slice_list) {
 
 int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
+static inline void markSliceFailed(RdmaSlice *slice) {
+    auto task = slice->task;
+    __sync_fetch_and_add(&task->finish_slices, 1);
+    task->status.s = Transport::FAILED;
+}
+
 void Workers::asyncPostSend(int thread_id) {
     const static size_t kMaxSlicesToSend = 32;
-
-    std::unordered_map<SegmentID, PeerBuffers> remote_buffers_;
-
-    auto slice = slice_queue_[thread_id].pop(kMaxSlicesToSend);
+    auto &env = worker_env_[thread_id];
+    auto &remote_buffer = env.remote_buffer;
+    auto slice = env.slice_queue.pop(kMaxSlicesToSend);
     if (!slice) return;
 
-    RdmaSlice *slice_to_send[kMaxSlicesToSend];
+    std::unordered_map<std::shared_ptr<RdmaEndPoint>, std::vector<RdmaSlice *>>
+        slice_to_send;
     int count_slices = 0;
-    while (slice) {
-        slice_to_send[count_slices] = slice;
-        count_slices++;
-        slice = slice->queue_next;
-    }
 
-    for (int i = 0; i < count_slices; ++i) {
-        auto &slice = slice_to_send[i];
+    for (; slice != nullptr; slice = slice->queue_next) {
         auto target_id = slice->task->request.target_id;
-        if (remote_buffers_.count(target_id)) continue;
-        auto segment_desc =
-            transport_->metadata_manager_->getSegmentDescByID(target_id);
-        if (!segment_desc) {
-            __sync_fetch_and_add(&slice->task->finish_slices, 1);
-            slice->task->status.s = Transport::FAILED;
+        std::vector<BufferQueryResult> local, remote;
+        int ret = transport_->local_buffer_manager_.query(
+            AddressRange{slice->source_addr, slice->length}, local,
+            slice->retry_count);
+        if (ret) {
+            markSliceFailed(slice);
             continue;
         }
-        remote_buffers_[target_id].reload(segment_desc);
-    }
 
-    for (int i = 0; i < count_slices; ++i) {
-        auto &slice = slice_to_send[i];
-        auto target_id = slice->task->request.target_id;
-        std::vector<BufferQueryResult> local_result, remote_result;
-        int ret = transport_->local_buffer_manager_.query(
-            AddressRange{slice->source_addr, slice->length}, local_result,
-            slice->retry_count);
-        auto &remote_item = remote_buffers_[target_id];
-        if (!ret) {
-            ret = remote_item.query(
-                AddressRange{(void *)slice->target_addr, slice->length},
-                remote_result, slice->retry_count);
+        if (!remote_buffer.valid(target_id)) {
+            auto desc =
+                transport_->metadata_manager_->getSegmentDescByID(target_id);
+            if (!desc) {
+                markSliceFailed(slice);
+                continue;
+            }
+            remote_buffer.reload(target_id, desc);
         }
-        assert(!ret);
-        assert(local_result.size() == 1);
-        assert(remote_result.size() == 1);
-        auto context = transport_->context_set_[local_result[0].device_id];
-        auto peer_segment_name = remote_item.segmentName();
+
+        ret = remote_buffer.query(
+            target_id, AddressRange{(void *)slice->target_addr, slice->length},
+            remote, slice->retry_count);
+        if (ret) {
+            markSliceFailed(slice);
+            continue;
+        }
+
+        // TODO we assume that each request covers one contingous area
+        assert(local.size() == 1 && remote.size() == 1);
+        auto context = transport_->context_set_[local[0].device_id].get();
+
+        auto peer_segment_name = remote_buffer.segmentName(target_id);
         auto peer_device_name =
-            remote_item.deviceName(remote_result[0].device_id);
+            remote_buffer.deviceName(target_id, remote[0].device_id);
         auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
+
         auto endpoint = context->endpoint(peer_name);
         if (endpoint->status() != RdmaEndPoint::EP_READY) {
             mutex_.lock();
@@ -185,18 +189,29 @@ void Workers::asyncPostSend(int thread_id) {
             }
             mutex_.unlock();
         }
-        slice->source_lkey = local_result[0].lkey;
-        slice->target_rkey = remote_result[0].rkey;
-        ret = endpoint->submitSlices(slice, 1);
-        if (ret != 1 || slice->failed) {
-            slice->retry_count++;
-            if (slice->retry_count >=
-                transport_->params_->workers.max_retry_count) {
-                __sync_fetch_and_add(&slice->task->finish_slices, 1);
-                slice->task->status.s = Transport::FAILED;
-            } else {
+
+        slice->source_lkey = local[0].lkey;
+        slice->target_rkey = remote[0].rkey;
+        slice_to_send[endpoint].push_back(slice);
+        count_slices++;
+    }
+
+    for (auto entry : slice_to_send) {
+        int ret = entry.first->submitSlices(entry.second);
+        int slice_index = 0;
+        for (auto slice : entry.second) {
+            if (slice_index >= ret) {
                 submit(slice);
+            } else if (slice->failed) {
+                slice->retry_count++;
+                if (slice->retry_count >=
+                    transport_->params_->workers.max_retry_count) {
+                    markSliceFailed(slice);
+                } else {
+                    submit(slice);
+                }
             }
+            slice_index++;
         }
     }
 }

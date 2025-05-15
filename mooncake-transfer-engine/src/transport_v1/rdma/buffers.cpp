@@ -385,22 +385,25 @@ const std::string LocalBufferManager::deviceName(int id) {
     return context_list_[id] ? context_list_[id]->name() : "unknown";
 }
 
-PeerBuffers::PeerBuffers() : segment_desc_(nullptr) {}
+RemoteBufferManager::RemoteBufferManager() {}
 
-PeerBuffers::~PeerBuffers() {}
+RemoteBufferManager::~RemoteBufferManager() {}
 
-int PeerBuffers::reload(const std::shared_ptr<SegmentDesc> &segment_desc) {
-    lock_.lock();
-    segment_desc_ = segment_desc;
-    lock_.unlock();
+int RemoteBufferManager::reload(SegmentID id,
+                                const std::shared_ptr<SegmentDesc> &desc) {
+    segment_desc_[id] = desc;
     return 0;
 }
 
-int PeerBuffers::query(const AddressRange &range,
-                       std::vector<BufferQueryResult> &result,
-                       int retry_count) {
-    RWSpinlock::ReadGuard guard(lock_);
-    auto &detail = std::get<MemorySegmentDesc>(segment_desc_->detail);
+bool RemoteBufferManager::valid(SegmentID id) {
+    return segment_desc_.count(id);
+}
+
+int RemoteBufferManager::query(SegmentID id, const AddressRange &range,
+                               std::vector<BufferQueryResult> &result,
+                               int retry_count) {
+    if (!segment_desc_.count(id)) return ERR_INVALID_ARGUMENT;
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc_[id]->detail);
     auto &topo = detail.topology;
     result.clear();
     for (auto &entry : detail.buffers) {
@@ -418,11 +421,16 @@ int PeerBuffers::query(const AddressRange &range,
     return 0;
 }
 
-const std::string &PeerBuffers::deviceName(int id) {
-    RWSpinlock::ReadGuard guard(lock_);
-    auto &detail = std::get<MemorySegmentDesc>(segment_desc_->detail);
-    assert(id >= 0 && id < (int)detail.devices.size());
-    return detail.devices[id].name;
+const std::string RemoteBufferManager::segmentName(SegmentID id) {
+    if (!segment_desc_.count(id)) return "<invalid>";
+    return segment_desc_[id]->name;
+}
+
+const std::string RemoteBufferManager::deviceName(SegmentID id, int device_id) {
+    if (!segment_desc_.count(id)) return "<invalid>";
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc_[id]->detail);
+    assert(device_id >= 0 && device_id < (int)detail.devices.size());
+    return detail.devices[device_id].name;
 }
 }  // namespace v1
 }  // namespace mooncake

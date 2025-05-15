@@ -79,7 +79,6 @@ class Workers {
 
     std::vector<std::thread> workers_;
     std::thread monitor_;
-    SliceQueue *slice_queue_;
 
     std::atomic<int64_t> inflight_slices_;
 
@@ -87,6 +86,11 @@ class Workers {
     std::condition_variable cv_;
     std::atomic<bool> running_;
     bool stop_flag_;
+    struct WorkerEnv {
+        SliceQueue slice_queue;
+        RemoteBufferManager remote_buffer;
+    };
+    WorkerEnv *worker_env_;
 };
 }  // namespace v1
 }  // namespace mooncake

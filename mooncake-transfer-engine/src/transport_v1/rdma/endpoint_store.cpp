@@ -50,8 +50,8 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         return nullptr;
     }
     int cq_index = SimpleRandom::Get().next(context->cqCount());
-    int ret =
-        endpoint->construct(context->cq(cq_index), &context->params().endpoint);
+    int ret = endpoint->construct(context->cq(cq_index),
+                                  &context->params().endpoint, key);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -139,8 +139,8 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         return nullptr;
     }
     int cq_index = SimpleRandom::Get().next(context->cqCount());
-    int ret =
-        endpoint->construct(context->cq(cq_index), &context->params().endpoint);
+    int ret = endpoint->construct(context->cq(cq_index),
+                                  &context->params().endpoint, key);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();

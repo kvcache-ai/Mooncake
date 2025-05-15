@@ -27,7 +27,7 @@ class RdmaEndPoint {
 
     ~RdmaEndPoint();
 
-    int construct(RdmaCQ *cq, EndPointParams *params);
+    int construct(RdmaCQ *cq, EndPointParams *params, const std::string &endpoint_name);
 
    public:
     enum EndPointStatus {
@@ -71,7 +71,7 @@ class RdmaEndPoint {
         bool failed;
     };
 
-    int submitSlices(RdmaSlice *slices, int count);
+    int submitSlices(std::vector<RdmaSlice *> &slice_list);
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 

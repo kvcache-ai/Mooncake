@@ -66,10 +66,12 @@ RdmaEndPoint::~RdmaEndPoint() {
     if (status_ != EP_UNINIT) disable();
 }
 
-int RdmaEndPoint::construct(RdmaCQ *cq, EndPointParams *params) {
+int RdmaEndPoint::construct(RdmaCQ *cq, EndPointParams *params,
+                            const std::string &endpoint_name) {
     CHECK_STATUS(EP_UNINIT);
     cq_ = cq;
     params_ = params;
+    endpoint_name_ = endpoint_name;
     status_ = EP_DISABLED;
     return enable();
 }
@@ -154,8 +156,12 @@ int RdmaEndPoint::reset() {
 int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
                                 std::vector<uint32_t> peer_qp_num_list,
                                 std::string *reply_msg) {
+    if (status_ == EP_READY) {
+        LOG(WARNING) << "Received a new handshake request, reset endpoint "
+                     << endpoint_name_;
+        if (reset()) return ERR_ENDPOINT;
+    }
     RWSpinlock::WriteGuard guard(ep_lock_);
-    CHECK_STATUS(EP_INPROGRESS);
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "[ERR-01] Inconsistent qp_mul_factor detected: local (expected) " +
@@ -187,32 +193,24 @@ static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
     }
 }
 
-int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
+int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
     RWSpinlock::ReadGuard guard(ep_lock_);
     CHECK_STATUS(EP_READY);
-    int sge_count = 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
-    int wr_count = 0;
 
-    // TODO for some slices, they can be combined to one WR w/ multiple SGEs
     const static int kSgeEntries = 1;
-    auto current = slices;
-    while (current && wr_count < count) {
-        wr_count++;
-        current->failed = false;
-        sge_count += kSgeEntries;
-        if (params_->max_sge < kSgeEntries) {
-            LOG(ERROR)
-                << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
-            return ERR_INVALID_ARGUMENT;
-        }
-        current = current->queue_next;
-    }
 
-    wr_count = std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
-        wr_count);
-    wr_count =
-        std::min(int(globalConfig().max_cqe) - cq_->getQuota(), wr_count);
+    // if (params_->max_sge < kSgeEntries) {
+    //     LOG(ERROR)
+    //         << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
+    //     return ERR_INVALID_ARGUMENT;
+    // }
+
+    int wr_count =
+        std::min(int(globalConfig().max_cqe) - cq_->getQuota(),
+                 std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
+                          (int)slice_list.size()));
+    int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
 
@@ -220,8 +218,9 @@ int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
     ibv_sge sge_list[sge_count];
     memset(wr_list, 0, sizeof(ibv_send_wr) * wr_count);
     int sge_idx = 0;
-    current = slices;
+
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
+        auto current = slice_list[wr_idx];
         auto &wr = wr_list[wr_idx];
         for (int sge_off = 0; sge_off < kSgeEntries; ++sge_off) {
             auto &sge = sge_list[sge_idx + sge_off];
@@ -236,24 +235,17 @@ int RdmaEndPoint::submitSlices(RdmaSlice *slices, int count) {
         wr.sg_list = &sge_list[sge_idx];
         wr.send_flags = IBV_SEND_SIGNALED;  // TODO remove it for performance
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
-        wr.imm_data = 0;                    // TODO notification signal for remote
+        wr.imm_data = 0;  // TODO notification signal for remote
         wr.wr.rdma.remote_addr = current->target_addr;
         wr.wr.rdma.rkey = current->target_rkey;
         sge_idx += wr.num_sge;
-        current = current->queue_next;
     }
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
         PLOG(ERROR) << "ibv_post_send";
         while (bad_wr) {
-            int index = bad_wr - wr_list;
-            current = slices;
-            while (index) {
-                current = current->queue_next;
-                index--;
-            }
-            current->failed = true;
+            slice_list[bad_wr - wr_list]->failed = true;
             cancelQuota(qp_index, 1);
             bad_wr = bad_wr->next;
         }
@@ -315,7 +307,6 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
                                        const std::string &peer_gid,
                                        uint16_t peer_lid, uint32_t peer_qp_num,
                                        std::string *reply_msg) {
-    CHECK_STATUS(EP_INPROGRESS);
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
 
     auto &qp = qp_list_[qp_index];

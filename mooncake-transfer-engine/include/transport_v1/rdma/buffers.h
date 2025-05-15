@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -137,26 +138,25 @@ class LocalBufferManager {
     std::shared_ptr<Topology> topology_;
 };
 
-class PeerBuffers {
+class RemoteBufferManager {
    public:
-    PeerBuffers();
+    RemoteBufferManager();
 
-    ~PeerBuffers();
+    ~RemoteBufferManager();
 
-    int reload(const std::shared_ptr<SegmentDesc> &segment_desc);
+    int reload(SegmentID id, const std::shared_ptr<SegmentDesc> &desc);
 
-    bool valid() const { return segment_desc_ != nullptr; }
+    bool valid(SegmentID id);
 
-    int query(const AddressRange &range, std::vector<BufferQueryResult> &result,
-              int retry_count = 0);
+    int query(SegmentID id, const AddressRange &range,
+              std::vector<BufferQueryResult> &result, int retry_count = 0);
 
-    const std::string &segmentName() const { return segment_desc_->name; }
+    const std::string segmentName(SegmentID id);
 
-    const std::string &deviceName(int id);
+    const std::string deviceName(SegmentID id, int device_id);
 
    private:
-    RWSpinlock lock_;
-    std::shared_ptr<SegmentDesc> segment_desc_;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>> segment_desc_;
 };
 }  // namespace v1
 }  // namespace mooncake
