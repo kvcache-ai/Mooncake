@@ -103,6 +103,7 @@ class LocalBufferManager {
 
     void setTopology(std::shared_ptr<Topology> &topology) {
         topology_ = topology;
+        context_list_.resize(topology->getHcaList().size(), nullptr);
     }
 
     int addBuffer(const Transport::BufferEntry &buffer_entry);
@@ -111,7 +112,7 @@ class LocalBufferManager {
 
     int addDevice(RdmaContext *context);
 
-    int removeDevice(RdmaContext *context);
+    int removeDevice(RdmaContext *context, bool do_unreg = true);
 
     int clear();
 

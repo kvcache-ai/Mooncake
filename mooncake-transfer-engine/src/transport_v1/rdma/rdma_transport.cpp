@@ -53,6 +53,7 @@ Status RdmaTransport::install(
     metadata_manager_ = metadata_manager;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
+    local_buffer_manager_.setTopology(local_topology);
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getHcaList();
@@ -85,7 +86,6 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to upload local segment descriptor");
     }
 
-    local_buffer_manager_.setTopology(local_topology);
     workers_ = std::make_shared<Workers>(this);
     workers_->start();
 

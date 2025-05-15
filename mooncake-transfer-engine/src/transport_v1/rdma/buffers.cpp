@@ -228,6 +228,7 @@ int LocalBufferManager::addBuffer(const Transport::BufferEntry &buffer_entry) {
     for (auto &to_reg : reg_parts) {
         auto &item = buffer_list_[range];
         for (auto &context : context_list_) {
+            if (!context) continue;
             auto mem_reg =
                 context->registerMemReg(to_reg.addr, to_reg.length, access);
             if (!mem_reg) return ERR_CONTEXT;
@@ -268,10 +269,20 @@ int LocalBufferManager::removeBuffer(const AddressRange &range) {
 
 int LocalBufferManager::addDevice(RdmaContext *context) {
     RWSpinlock::WriteGuard guard(lock_);
-    assert(topology_);
-    auto iter = std::find(context_list_.begin(), context_list_.end(), context);
-    if (iter != context_list_.end()) return 0;
-    context_list_.push_back(context);
+    assert(topology_ && context);
+    int index = 0;
+    bool found = false;
+    for (auto &device : topology_->getHcaList()) {
+        if (device == context->name()) {
+            if (context_list_[index]) return ERR_CONTEXT;  // has added
+            context_list_[index] = context;
+            found = true;
+            break;
+        } else {
+            index++;
+        }
+    }
+    if (!found) return ERR_CONTEXT;  // not matched item
     for (auto &buffer : buffer_list_) {
         auto &to_reg = buffer.second.entry;
         auto access = getAccessFlags(to_reg.visibility);
@@ -284,17 +295,18 @@ int LocalBufferManager::addDevice(RdmaContext *context) {
     return 0;
 }
 
-int LocalBufferManager::removeDevice(RdmaContext *context) {
+int LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
     RWSpinlock::WriteGuard guard(lock_);
-    assert(topology_);
+    assert(topology_ && context);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter == context_list_.end()) return 0;
     for (auto &buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
-        context->unregisterMemReg(buffer.second.mem_reg_map[context]);
+        if (do_unreg)
+            context->unregisterMemReg(buffer.second.mem_reg_map[context]);
         buffer.second.mem_reg_map.erase(context);
     }
-    context_list_.erase(iter);
+    *iter = nullptr;
     return 0;
 }
 
@@ -358,6 +370,7 @@ int LocalBufferManager::query(const AddressRange &range,
             device_id = topology_->selectDevice(kWildcardLocation, retry_count);
         if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
         auto context = context_list_[device_id];
+        if (!context) return ERR_ADDRESS_NOT_REGISTERED;
         auto mem_reg_id = buffer.second.mem_reg_map[context];
         auto keys = context->queryMemRegKey(mem_reg_id);
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
@@ -369,7 +382,7 @@ int LocalBufferManager::query(const AddressRange &range,
 const std::string LocalBufferManager::deviceName(int id) {
     RWSpinlock::ReadGuard guard(lock_);
     assert(id >= 0 && id < (int)context_list_.size());
-    return context_list_[id]->name();
+    return context_list_[id] ? context_list_[id]->name() : "unknown";
 }
 
 PeerBuffers::PeerBuffers() : segment_desc_(nullptr) {}
