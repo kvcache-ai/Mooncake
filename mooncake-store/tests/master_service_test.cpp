@@ -756,6 +756,54 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     }
 }
 
+TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
+    std::string segment_name = "concurrent_segment";
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer, size, segment_name));
+
+    // Pre-populate with test data
+    constexpr int num_objects = 1000000;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    }
+
+    std::atomic<int> remove_all_count(0);
+
+    // Two RemoveAll threads
+    std::vector<std::thread> remove_threads;
+    for (int i = 0; i < 2; ++i) {
+        remove_threads.emplace_back([&]() {
+            long removed = service_->RemoveAll();
+            LOG(INFO) << "RemoveAll removed " << removed << " objects";
+            remove_all_count += removed;
+        });
+    }
+
+    // Join all threads
+    for (auto& t : remove_threads) {
+        t.join();
+    }
+
+    // Verify results - one RemoveAll should return num_objects, the other 0
+    EXPECT_EQ(num_objects, remove_all_count);
+
+    // Verify all objects were removed
+    std::vector<Replica::Descriptor> replica_list;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "pre_key_" + std::to_string(i);
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
+    }
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -850,54 +898,6 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Keys created: " << kNumKeys << "\n"
               << "Creation time: " << total_create_duration.count() << "ms\n"
               << "Unmount time: " << unmount_duration.count() << "ms\n";
-}
-
-TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
-    std::string segment_name = "concurrent_segment";
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer, size, segment_name));
-
-    // Pre-populate with test data
-    constexpr int num_objects = 1000000;
-    for (int i = 0; i < num_objects; ++i) {
-        std::string key = "pre_key_" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {1024};
-        ReplicateConfig config;
-        config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-    }
-
-    std::atomic<int> remove_all_count(0);
-
-    // Two RemoveAll threads
-    std::vector<std::thread> remove_threads;
-    for (int i = 0; i < 2; ++i) {
-        remove_threads.emplace_back([&]() {
-            long removed = service_->RemoveAll();
-            LOG(INFO) << "RemoveAll removed " << removed << " objects";
-            remove_all_count += removed;
-        });
-    }
-
-    // Join all threads
-    for (auto& t : remove_threads) {
-        t.join();
-    }
-
-    // Verify results - one RemoveAll should return num_objects, the other 0
-    EXPECT_EQ(num_objects, remove_all_count);
-
-    // Verify all objects were removed
-    std::vector<Replica::Descriptor> replica_list;
-    for (int i = 0; i < num_objects; ++i) {
-        std::string key = "pre_key_" + std::to_string(i);
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
-    }
 }
 
 TEST_F(MasterServiceTest, RemoveLeasedObject) {
