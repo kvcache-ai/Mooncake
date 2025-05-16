@@ -24,6 +24,7 @@ class MasterMetricManager {
     void dec_allocated_size(int64_t val = 1.0);
     void inc_total_capacity(int64_t val = 1.0);
     void dec_total_capacity(int64_t val = 1.0);
+    double get_global_used_ratio(void);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1.0);

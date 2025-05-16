@@ -25,6 +25,39 @@ class MasterServiceTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
+                                 const std::string& segment_name) {
+    static std::atomic<uint64_t> counter(0);
+
+    while (true) {
+        std::string key = "key_" + std::to_string(counter.fetch_add(1));
+        std::vector<Replica::Descriptor> replica_list;
+
+        // Check if the key already exists.
+        if (service->ExistKey(key) == ErrorCode::OK) {
+            continue; // Retry if the key already exists
+        }
+
+        // Attempt to put the key.
+        ErrorCode code = service->PutStart(key, 1024, {1024},
+                                         {.replica_num=1}, replica_list);
+
+        if (code == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            continue;  // Retry if the key already exists
+        }
+        if (code != ErrorCode::OK) {
+            throw std::runtime_error("PutStart failed with code: " +
+                                     std::to_string(static_cast<int>(code)));
+        }
+        service->PutEnd(key);
+        if (replica_list[0].buffer_descriptors[0].segment_name_ == segment_name) {
+            return key;
+        }
+        // Clean up failed attempt
+        service->Remove(key);
+    }
+}
+
 TEST_F(MasterServiceTest, MountUnmountSegment) {
     // Create a MasterService instance for testing.
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -721,6 +754,102 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         std::string key = "pre_key_" + std::to_string(i);
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
     }
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount two segments for testing
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment1 = "segment1";
+    std::string segment2 = "segment2";
+
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer1, size, segment1));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(buffer2, size, segment2));
+
+    // Create two objects in the two segments
+    std::string key1 = GenerateKeyForSegment(service_, segment1);
+    std::string key2 = GenerateKeyForSegment(service_, segment2);
+    std::vector<uint64_t> slice_lengths = {1024};
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Unmount segment1
+    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment1));
+    // Umount will remove all objects in the segment, include the key1
+    ASSERT_EQ(1, service_->GetKeyCount());
+    // Verify objects in segment1 is gone
+    std::vector<Replica::Descriptor> retrieved;
+    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+              service_->GetReplicaList(key1, retrieved));
+
+    // Verify objects in segment2 is still there
+    ASSERT_EQ(ErrorCode::OK,
+              service_->GetReplicaList(key2, retrieved));
+
+    // Verify put key1 will put into segment2 rather than segment1
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key1, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key1));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->GetReplicaList(key1, retrieved));
+    ASSERT_EQ(replica_list[0].buffer_descriptors[0].segment_name_, segment2);
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 256; // 256MB
+    std::string segment_name = "perf_test_segment";
+
+    // Mount a segment for testing
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(kBufferAddress, kSegmentSize, segment_name));
+
+    // Create 10000 keys for testing
+    constexpr int kNumKeys = 1000;
+    std::vector<std::string> keys;
+    keys.reserve(kNumKeys);
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Create `kNumKeys` keys
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::string key = GenerateKeyForSegment(service_, segment_name);
+        keys.push_back(key);
+    }
+
+    auto create_end = std::chrono::steady_clock::now();
+
+    // Execute unmount operation and record operation time
+    auto unmount_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment_name));
+    auto unmount_end = std::chrono::steady_clock::now();
+
+    auto unmount_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        unmount_end - unmount_start);
+
+    // Unmount operation should be very fast, so we set 1s limit
+    EXPECT_LE(unmount_duration.count(), 1000)
+        << "Unmount operation took " << unmount_duration.count()
+        << "ms which exceeds 1 second limit";
+
+    // Verify all keys are gone
+    std::vector<Replica::Descriptor> retrieved;
+    for (const auto& key : keys) {
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+                  service_->GetReplicaList(key, retrieved));
+    }
+
+    // Output performance report
+    auto total_create_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        create_end - start);
+    std::cout << "\nPerformance Metrics:\n"
+              << "Keys created: " << kNumKeys << "\n"
+              << "Creation time: " << total_create_duration.count() << "ms\n"
+              << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
 
 TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
