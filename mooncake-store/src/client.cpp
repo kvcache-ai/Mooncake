@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdint>
 
+#include "file_storage_backend.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -22,9 +23,19 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::string& storage_root_path)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring),
+      storage_root_path_(storage_root_path),
+      background_writer_(2) {
+    if (!storage_root_path_.empty()) {
+        PrepareStorageRoot(storage_root_path_);
+        LOG(INFO) << "Initialized storage backend: " << storage_root_path_;
+    } else {
+        LOG(WARNING) << "storage_root_path not set, persistent storage will be disabled.";
+    }
+}
 
 Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
@@ -42,6 +53,9 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
+
+    // Exit back ground writer thread pool
+    background_writer_.exit();
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
@@ -144,9 +158,9 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_addr) {
+    const std::string& master_addr, const std::string& storage_root_path) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, storage_root_path));
 
     // Connect to master service
     ErrorCode err = client->ConnectToMaster(master_addr);
@@ -172,8 +186,21 @@ ErrorCode Client::Get(const std::string& object_key,
                       std::vector<Slice>& slices) {
     ObjectInfo object_info;
     auto err = Query(object_key, object_info);
-    if (err != ErrorCode::OK) return err;
-    return Get(object_key, object_info, slices);
+    if (err == ErrorCode::OK) {
+        return Get(object_key, object_info, slices);
+    }
+
+    if (err == ErrorCode::NOT_FOUND) {
+        if (storage_backend_) {
+            ErrorCode local_err = storage_backend_->Read(object_key, slices);
+            if (local_err == ErrorCode::OK) {
+                LOG(INFO) << "Read key=" << object_key << " from persistent storage.";
+                return ErrorCode::OK;
+            }
+            LOG(WARNING) << "Key=" << object_key << " not found in persistent storage.";
+        }
+    }
+    return err;
 }
 
 ErrorCode Client::Query(const std::string& object_key,
@@ -291,7 +318,24 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
+    SaveToPersistentStorage(key, slices);
+
     return ErrorCode::OK;
+}
+
+void Client::PrepareStorageRoot(const std::string& path) {
+    if (!std::filesystem::exists(storage_root_path_)) {
+        std::filesystem::create_directories(storage_root_path_);
+    }
+    storage_backend_ = std::make_shared<FileStorageBackend>(storage_root_path_);
+}
+
+void Client::SaveToPersistentStorage(const ObjectKey& key, const std::vector<Slice>& slices) {
+    if (!storage_backend_) return;
+    background_writer_.enqueue([backend = storage_backend_, key, slices] {
+        backend->Write(key, slices);
+    });
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
