@@ -196,6 +196,8 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname,
     }
 
     auto batch_id = engine_->allocateBatchID(1);
+    assert(batch_id != 0);
+    assert(batch_id != ERR_MEMORY);
     TransferRequest entry;
     entry.opcode = TransferRequest::WRITE;
     entry.length = length;
@@ -274,7 +276,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     }
 
     // TODO this is just a workaround
-    // When transfer engine submits one task, it will be dispatch to a worker 
+    // When transfer engine submits one task, it will be dispatch to a worker
     // associated with one local RNIC. If the local RNIC fails to connect to any
     // remote RNIC, it will eventually fail. This allows selecting multiple local 
     // RNIC in one transferSync call. Will be fixed in the next revision.
@@ -396,8 +398,10 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite)
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
-            .def("transfer_submit_write", &TransferEnginePy::transferSubmitWrite)
-            .def("transfer_check_status", &TransferEnginePy::transferCheckStatus)
+            .def("transfer_submit_write",
+                 &TransferEnginePy::transferSubmitWrite)
+            .def("transfer_check_status",
+                 &TransferEnginePy::transferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)

@@ -35,8 +35,8 @@ set_target_properties(mooncake_vllm_adaptor PROPERTIES
 
 target_link_libraries(mooncake_vllm_adaptor PUBLIC 
     transfer_engine 
-    glog 
-    gflags 
+    glog::glog
+    gflags::gflags
     mooncake_store 
     cachelib_memory_allocator
 )
@@ -49,16 +49,16 @@ pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
 )
 target_link_libraries(engine PUBLIC 
     transfer_engine 
-    glog 
-    gflags 
+    glog::glog
+    gflags::gflags
 )
 pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     store/store_py.cpp 
 )
 target_link_libraries(store PUBLIC 
     transfer_engine 
-    glog 
-    gflags 
+    glog::glog
+    gflags::gflags
     mooncake_store 
     cachelib_memory_allocator
 )

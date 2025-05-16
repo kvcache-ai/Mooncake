@@ -69,6 +69,7 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 MasterService::MasterService(bool enable_gc)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      eviction_strategy_(std::make_shared<LRUEvictionStrategy>()),
       enable_gc_(enable_gc) {
     // Start the GC thread if enabled
     if (enable_gc_) {
@@ -78,6 +79,9 @@ MasterService::MasterService(bool enable_gc)
     } else {
         VLOG(1) << "action=gc_disabled";
     }
+#ifdef USE_LRU_MASTER
+    eviction_strategy_ -> CleanUp();
+#endif
 }
 
 MasterService::~MasterService() {
@@ -94,6 +98,11 @@ MasterService::~MasterService() {
             delete task;
         }
     }
+
+#ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU cleared ###";
+    eviction_strategy_ -> CleanUp();
+#endif
 }
 
 ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
@@ -108,7 +117,34 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
-    return buffer_allocator_manager_->RemoveSegment(segment_name);
+    // 1. Remove the segment from the allocator
+    auto ret = buffer_allocator_manager_->RemoveSegment(segment_name);
+    if (ret != ErrorCode::OK) return ret;
+
+    // 2. Remove the metadata of the related objects
+    for (auto& shard : metadata_shards_) {
+        std::unique_lock lock(shard.mutex);
+        auto it = shard.metadata.begin();
+        while (it != shard.metadata.end()) {
+            // Check if the object has any invalid replicas
+            bool has_invalid = false;
+            for (auto& replica : it->second.replicas) {
+                if (replica.has_invalid_handle()) {
+                    has_invalid = true;
+                    break;
+                }
+            }
+
+            // Remove the object if it has no valid replicas
+            if (has_invalid || CleanupStaleHandles(it->second)) {
+                it = shard.metadata.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    return ErrorCode::OK;
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -136,9 +172,15 @@ ErrorCode MasterService::GetReplicaList(
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+        #ifdef USE_LRU_MASTER
+        // If the object is not found, we should synchronize the EvictionStrategy
+        eviction_strategy_->RemoveKey(key);
+        #endif
         return ErrorCode::OBJECT_NOT_FOUND;
     }
-
+    #ifdef USE_LRU_MASTER
+    eviction_strategy_->UpdateKey(key);
+    #endif
     auto& metadata = accessor.Get();
     for (const auto& replica : metadata.replicas) {
         auto status = replica.status();
@@ -173,6 +215,11 @@ ErrorCode MasterService::PutStart(
                    << ", error=invalid_params";
         return ErrorCode::INVALID_PARAMS;
     }
+
+    #ifdef USE_LRU_MASTER
+    LOG(INFO) << "### LRU Update in Put() ###";
+    eviction_strategy_->AddKey(key);
+    #endif
 
     // Validate slice lengths
     uint64_t total_length = 0;
@@ -272,6 +319,16 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     for (auto& replica : metadata.replicas) {
         replica.mark_complete();
     }
+
+    #ifdef USE_LRU_MASTER
+    // if globally used storage ratio >= 80%, evict some of them
+    if(MasterMetricManager::instance().get_global_used_ratio() >= 0.8) {
+        std::string evicted_key = eviction_strategy_->EvictKey();
+        LOG(INFO) << "### LRU action! Evicted key = " << evicted_key << " ###";
+        Remove(evicted_key);
+    }
+    #endif
+
     return ErrorCode::OK;
 }
 
@@ -371,6 +428,16 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     // Return true if no valid replicas remain after cleanup
     return metadata.replicas.empty();
 }
+
+size_t MasterService::GetKeyCount() const {
+    size_t total = 0;
+    for (const auto& shard : metadata_shards_) {
+        std::unique_lock lock(shard.mutex);
+        total += shard.metadata.size();
+    }
+    return total;
+}
+
 
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";
