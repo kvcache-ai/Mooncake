@@ -138,7 +138,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
     if (rc) return rc;
-    if (peer_desc.reply_msg) {
+    if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Reject the handshake request by peer "
                    << local_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;

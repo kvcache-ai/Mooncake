@@ -278,9 +278,10 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     // TODO this is just a workaround
     // When transfer engine submits one task, it will be dispatch to a worker
     // associated with one local RNIC. If the local RNIC fails to connect to any
-    // remote RNIC, it will eventually fail. This allows selecting multiple local 
-    // RNIC in one transferSync call. Will be fixed in the next revision.
-    const int max_retry = engine_->numContexts() + 1; // Iter all possible local contexts
+    // remote RNIC, it will eventually fail. This allows selecting multiple
+    // local RNIC in one transferSync call. Will be fixed in the next revision.
+    const int max_retry =
+        engine_->numContexts() + 1;  // Iter all possible local contexts
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;
@@ -300,6 +301,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 
         TransferStatus status;
         bool completed = false;
+        auto start_ts = getCurrentTimeInNano();
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -309,6 +311,17 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
+            }
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+            const int64_t timeout =
+                (10 + length / 5000000000) * kNanosPerSecond;
+            if (current_ts - start_ts > timeout) {
+                LOG(INFO) << "Sync data transfer timeout, local buffer "
+                          << (void *)buffer << " remote buffer "
+                          << (void *)peer_buffer_address << " length "
+                          << length;
+                return -1;
             }
         }
     }
