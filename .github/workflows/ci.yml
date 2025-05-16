@@ -127,9 +127,8 @@ jobs:
 
     - name: Start metadata server
       run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
+        source test_env/bin/activate
+        mooncake_http_metadata_server --port 8080 &
       shell: bash
 
     - name: Run tests
