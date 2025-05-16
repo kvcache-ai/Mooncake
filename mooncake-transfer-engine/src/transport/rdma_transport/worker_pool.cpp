@@ -228,6 +228,13 @@ void WorkerPool::performPostSend(int thread_id) {
                        << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
+            context_.traceFailure();
+            if (context_.failedCount() >= 8) {
+                LOG(WARNING) << "Failed to establish peer endpoints for "
+                                "multiple times, disable device "
+                             << context_.nicPath();
+                context_.set_active(false);
+            }
             entry.second.clear();
             continue;
         }
