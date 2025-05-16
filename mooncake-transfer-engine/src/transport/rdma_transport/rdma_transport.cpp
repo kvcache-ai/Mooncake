@@ -281,14 +281,15 @@ Status RdmaTransport::submitTransferTask(
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = 0;
+            slice->rdma.retry_cnt = request.advise_retry_cnt;
             slice->rdma.max_retry_cnt = kMaxRetryCount;
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             task.slice_list.push_back(slice);
 
-            int buffer_id = -1, device_id = -1, retry_cnt = 0;
+            int buffer_id = -1, device_id = -1,
+                retry_cnt = request.advise_retry_cnt;
             while (retry_cnt < kMaxRetryCount) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,

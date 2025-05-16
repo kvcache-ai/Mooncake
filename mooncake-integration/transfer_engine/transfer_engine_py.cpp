@@ -278,7 +278,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     // associated with one local RNIC. If the local RNIC fails to connect to any
     // remote RNIC, it will eventually fail. This allows selecting multiple local 
     // RNIC in one transferSync call. Will be fixed in the next revision.
-    const int max_retry = 3;
+    const int max_retry = engine_->numContexts() + 1; // Iter all possible local contexts
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;
@@ -291,6 +291,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.source = (void *)buffer;
         entry.target_id = handle;
         entry.target_offset = peer_buffer_address;
+        entry.advise_retry_cnt = retry;
 
         Status s = engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) return -1;

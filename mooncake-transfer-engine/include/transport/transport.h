@@ -58,6 +58,7 @@ class Transport {
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
+        int advise_retry_cnt = 0;
     };
 
     enum TransferStatusEnum {
