@@ -324,7 +324,8 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
 }
 
 TEST_F(MasterServiceTest, RemoveAll) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
     // Mount segment and put 10 objects
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -343,6 +344,8 @@ TEST_F(MasterServiceTest, RemoveAll) {
         ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
         ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
     }
+    // wait for all the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     ASSERT_EQ(10, service_->RemoveAll());
     times = 10;
     while (times--) {
@@ -647,7 +650,9 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
 
 
 TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    // set a large kv_lease_ttl so the granted lease will not quickly expire 
+    const uint64_t kv_lease_ttl = 200;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
@@ -705,6 +710,11 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     EXPECT_GT(success_reads, 0);
     EXPECT_NE(success_reads, num_objects);
 
+    // wait for all the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    long removed = service_->RemoveAll();
+    LOG(INFO) << "Removed " << removed << " objects after kv lease expired";
+
     // Verify all objects were removed
     std::vector<Replica::Descriptor> replica_list;
     for (int i = 0; i < num_objects; ++i) {
@@ -759,6 +769,172 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
         std::string key = "pre_key_" + std::to_string(i);
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
     }
+}
+
+TEST_F(MasterServiceTest, RemoveLeasedObject) {
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
+
+    std::string key = "test_key";
+    std::vector<uint64_t> slice_lengths = {1024};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    std::vector<Replica::Descriptor> replica_list;
+
+    // Verify lease is granted on ExistsKey
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+
+    // Verify lease is extended on successive ExistsKey
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+
+    // Verify lease is granted on GetReplicaList
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+
+    // Verify lease is extended on successive GetReplicaList
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+
+    // Verify object is removed
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+              service_->GetReplicaList(key, replica_list));
+}
+
+TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    // Mount segment and put 10 objects, with 5 of them having lease
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                    config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        if (i >= 5) {
+            ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+        }
+    }
+    ASSERT_EQ(5, service_->RemoveAll());
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+    }
+    // wait for all the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    ASSERT_EQ(5, service_->RemoveAll());
+    for (int i = 5; i < 10; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+    }
+}
+
+TEST_F(MasterServiceTest, ObjectEviction) {
+    // set a large kv_lease_ttl so the granted lease will not quickly expire
+    const uint64_t kv_lease_ttl = 2000;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    // Mount a segment that can hold about 1024 * 16 objects.
+    // As the eviction is processed separately for each shard,
+    // we need to fill each shard with enough objects to thoroughly
+    // test the eviction process.
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16 * 15;
+    constexpr size_t object_size = 1024 * 15;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
+
+    // Verify if we can put objects more than the segment can hold
+    // and the last added object is accessible
+    int success_puts = 0;
+    std::string last_success_key;
+    for (int i = 0; i < 1024 * 16 + 10; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {object_size};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+        if (ErrorCode::OK == service_->PutStart(key, object_size,
+            slice_lengths, config, replica_list)) {
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+            success_puts++;
+            last_success_key = key;
+        } else {
+            // wait for gc thread to evict some objects
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_GT(success_puts, 1024 * 16);
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(last_success_key, replica_list));
+    service_->RemoveAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    ASSERT_EQ(service_->RemoveAll(), 1);
+
+    // Verify leased object will not be evicted.
+    // 10 failed puts are enough to trigger the eviction.
+    // Too many failed puts will cause the master service to print too many logs.
+    success_puts = 0;
+    int failed_puts = 0;
+    for (int i = 0; i < 1024 * 16 + 10 && failed_puts < 10; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {object_size};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<Replica::Descriptor> replica_list;
+        if (ErrorCode::OK == service_->PutStart(key, object_size,
+            slice_lengths, config, replica_list)) {
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+            // the object is leased
+            ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+            success_puts++;
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(success_puts, 0);
+    // wait for gc thread to do eviction
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // No object should be removed as all objects are leased
+    ASSERT_EQ(0, service_->RemoveAll());
 }
 
 }  // namespace mooncake::test

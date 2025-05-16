@@ -66,18 +66,14 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
     return ErrorCode::OK;
 }
 
-MasterService::MasterService(bool enable_gc)
+MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
-      enable_gc_(enable_gc) {
-    // Start the GC thread if enabled
-    if (enable_gc_) {
+      enable_gc_(enable_gc),
+      default_kv_lease_ttl_(default_kv_lease_ttl) {
         gc_running_ = true;
         gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
         VLOG(1) << "action=start_gc_thread";
-    } else {
-        VLOG(1) << "action=gc_disabled";
-    }
 }
 
 MasterService::~MasterService() {
@@ -128,6 +124,12 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
         }
     }
 
+    // Grant a lease to the object as it may be further used by the client.
+    metadata.lease_timeout = std::max(
+        metadata.lease_timeout,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(default_kv_lease_ttl_)
+    );
+
     return ErrorCode::OK;
 }
 
@@ -158,6 +160,13 @@ ErrorCode MasterService::GetReplicaList(
     // Only mark for GC if enabled
     if (enable_gc_) {
         MarkForGC(key, 1000);  // After 1 second, the object will be removed
+    } else {
+        // Grant a lease to the object so it will not be removed
+        // when the client is reading it.
+        metadata.lease_timeout = std::max(
+            metadata.lease_timeout,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(default_kv_lease_ttl_)
+        );
     }
 
     return ErrorCode::OK;
@@ -237,6 +246,9 @@ ErrorCode MasterService::PutStart(
                            << ", slice_index=" << j
                            << ", error=allocation_failed";
                 replica_list.clear();
+                // If the allocation failed, we need to evict some objects
+                // to free up space for future allocations.
+                need_eviction_ = true;
                 return ErrorCode::NO_AVAILABLE_HANDLE;
             }
 
@@ -256,6 +268,10 @@ ErrorCode MasterService::PutStart(
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
+
+    // Set lease timeout to now, indicating that the object has no lease
+    // at beginning
+    metadata.lease_timeout = std::chrono::steady_clock::now();
 
     metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
     return ErrorCode::OK;
@@ -304,6 +320,12 @@ ErrorCode MasterService::Remove(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
+
+    if (metadata.lease_timeout > std::chrono::steady_clock::now()) {
+        VLOG(1) << "key=" << key << ", error=object_has_lease";
+        return ErrorCode::OBJECT_HAS_LEASE;
+    }
+
     for (auto& replica : metadata.replicas) {
         auto status = replica.status();
         if (status != ReplicaStatus::COMPLETE) {
@@ -321,21 +343,33 @@ ErrorCode MasterService::Remove(const std::string& key) {
 long MasterService::RemoveAll() {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
+    auto now = std::chrono::steady_clock::now();
+
     for (auto& shard : metadata_shards_) {
         std::unique_lock lock(shard.mutex);
-        std::size_t object_count = shard.metadata.size();
-        if (object_count == 0)
+        if (shard.metadata.empty()) {
             continue;
-        for (const auto& [key, metadata] : shard.metadata) {
-            // Calculate the total freed size of the object
-            total_freed_size += metadata.size * metadata.replicas.size();
         }
-        removed_count += object_count;
-        // Reset related metrics on successful removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-        shard.metadata.clear();
+
+        // Only remove objects with expired leases
+        auto it = shard.metadata.begin();
+        while (it != shard.metadata.end()) {
+            if (it->second.lease_timeout <= now) {
+                total_freed_size += it->second.size * it->second.replicas.size();
+                it = shard.metadata.erase(it);
+                removed_count++;
+            } else {
+                ++it;
+            }
+        }
     }
-    VLOG(1) << "action=remove_all_objects" << ", removed_count=" << removed_count
+
+    if (removed_count > 0) {
+        // Update metrics only if objects were actually removed
+        MasterMetricManager::instance().dec_key_count(removed_count);
+    }
+    VLOG(1) << "action=remove_all_objects"
+            << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
@@ -380,6 +414,7 @@ void MasterService::GCThreadFunc() {
 
     while (gc_running_) {
         GCTask* task = nullptr;
+        long gc_count = 0;
         while (gc_queue_.pop(task)) {
             if (task) {
                 local_pq.push(task);
@@ -396,12 +431,71 @@ void MasterService::GCThreadFunc() {
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
             ErrorCode result = Remove(task->key);
             if (result != ErrorCode::OK &&
-                result != ErrorCode::OBJECT_NOT_FOUND) {
+                result != ErrorCode::OBJECT_NOT_FOUND &&
+                result != ErrorCode::OBJECT_HAS_LEASE) {
                 LOG(WARNING)
                     << "key=" << task->key
                     << ", error=gc_remove_failed, error_code=" << result;
             }
+            if (result == ErrorCode::OK) {
+                gc_count++;
+            }
             delete task;
+        }
+        if (gc_count > 0) {
+            MasterMetricManager::instance().dec_key_count(gc_count);
+        }
+
+        if (need_eviction_) {
+            auto now = std::chrono::steady_clock::now();
+            long evicted_count = 0;
+            long object_count = 0;
+            uint64_t total_freed_size = 0;
+            for (auto& shard : metadata_shards_) {
+                std::unique_lock lock(shard.mutex);
+                object_count += shard.metadata.size();
+                std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
+                for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
+                    if (it->second.lease_timeout <= now) {
+                        candidates.push_back(it->second.lease_timeout);
+                    }
+                }
+                if (!candidates.empty()) {
+                    // Evict about 10% of the objects
+                    // but at least 1 object and at most the candidates.size()
+                    const size_t kMinEvictionSize = 1;
+                    const size_t kMaxEvictionSize = candidates.size();
+                    size_t evict_num = std::max(shard.metadata.size() / 10, kMinEvictionSize);
+                    evict_num = std::min(evict_num, kMaxEvictionSize);
+                    std::nth_element(candidates.begin(),
+                                   candidates.begin() + (evict_num - 1),
+                                   candidates.end());
+                    auto target = candidates[evict_num - 1];
+                    // Evict objects with lease timeout less than or equal to target.
+                    // The actual evicted number may not be exactly evict_num.
+                    auto it = shard.metadata.begin();
+                    while (it != shard.metadata.end()) {
+                        if (it->second.lease_timeout <= target) {
+                            total_freed_size += it->second.size * it->second.replicas.size();
+                            it = shard.metadata.erase(it);
+                            evicted_count++;
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+
+            if (evicted_count > 0) {
+                need_eviction_ = false;
+                MasterMetricManager::instance().dec_key_count(evicted_count);
+            } else if (object_count == 0) {
+                // No objects to evict, no need to check again
+                need_eviction_ = false;
+            }
+            VLOG(1) << "action=evict_objects"
+                    << ", evicted_count=" << evicted_count
+                    << ", total_freed_size=" << total_freed_size;
         }
 
         std::this_thread::sleep_for(
