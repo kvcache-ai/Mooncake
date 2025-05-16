@@ -89,7 +89,7 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true);
+    MasterService(bool enable_gc = true, uint64_t default_kv_lease_ttl = DEFAULT_KV_LEASE_TTL);
     ~MasterService();
 
     /**
@@ -183,12 +183,12 @@ class MasterService {
     struct ObjectMetadata {
         std::vector<Replica> replicas;
         size_t size;
+        std::chrono::steady_clock::time_point lease_timeout;
     };
 
     // Buffer allocator management
     std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    std::shared_ptr<EvictionStrategy> eviction_strategy_;
 
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -214,8 +214,10 @@ class MasterService {
     std::thread gc_thread_;
     std::atomic<bool> gc_running_{false};
     bool enable_gc_{true};  // Flag to enable/disable garbage collection
+    bool need_eviction_{false}; // Set to trigger eviction when not enough space left
     static constexpr uint64_t kGCThreadSleepMs =
         10;  // 10 ms sleep between GC checks
+    uint64_t default_kv_lease_ttl_; // in milliseconds
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
