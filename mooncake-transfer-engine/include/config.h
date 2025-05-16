@@ -40,7 +40,7 @@ struct GlobalConfig {
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
-    int retry_cnt = 8;
+    int retry_cnt = 9;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;
