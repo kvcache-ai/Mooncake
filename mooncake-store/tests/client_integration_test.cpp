@@ -151,6 +151,7 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     slices.clear();
     slices.emplace_back(Slice{buffer, test_data.size()});
     ASSERT_EQ(client_->Put(key, slices, config), ErrorCode::OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(DEFAULT_KV_LEASE_TTL));
     ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
@@ -291,6 +292,7 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
     }
 
     // Remove the key
+    std::this_thread::sleep_for(std::chrono::milliseconds(DEFAULT_KV_LEASE_TTL));
     ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
 }
 

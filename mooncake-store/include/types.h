@@ -19,6 +19,7 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
+static constexpr uint64_t DEFAULT_KV_LEASE_TTL = 200; // in milliseconds
 
 // Forward declarations
 class BufferAllocator;

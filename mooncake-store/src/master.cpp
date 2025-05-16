@@ -6,7 +6,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "rpc_service.h"
-
+#include "types.h"
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
@@ -16,7 +16,6 @@ DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
 DEFINE_bool(enable_gc, false, "Enable garbage collection");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
-DEFINE_int32(default_kv_lease_ttl, 200, "Default kv lease TTL in milliseconds");
 
 int main(int argc, char* argv[]) {
     // Initialize gflags
@@ -34,10 +33,10 @@ int main(int argc, char* argv[]) {
               << ", max_threads=" << FLAGS_max_threads
               << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting
               << ", metrics_port=" << FLAGS_metrics_port
-              << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl;
+              << ", default_kv_lease_ttl=" << mooncake::DEFAULT_KV_LEASE_TTL;
 
     mooncake::WrappedMasterService wrapped_master_service(
-        FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
+        FLAGS_enable_gc, mooncake::DEFAULT_KV_LEASE_TTL,
         FLAGS_enable_metric_reporting, FLAGS_metrics_port);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);

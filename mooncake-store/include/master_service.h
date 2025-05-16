@@ -89,7 +89,7 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true, uint64_t default_kv_lease_ttl = 200);
+    MasterService(bool enable_gc = true, uint64_t default_kv_lease_ttl = DEFAULT_KV_LEASE_TTL);
     ~MasterService();
 
     /**
