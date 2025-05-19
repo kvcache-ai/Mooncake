@@ -42,7 +42,6 @@ static inline void markSliceFailed(RdmaSlice *slice) {
 Workers::Workers(RdmaTransport *transport)
     : transport_(transport),
       num_workers_(0),
-      inflight_slices_(0),
       running_(false) {}
 
 Workers::~Workers() {
@@ -81,15 +80,57 @@ int Workers::stop() {
     return 0;
 }
 
-static std::atomic<int> gNextThreadId(0);
-thread_local int tlThreadId =
-    gNextThreadId.fetch_add(1, std::memory_order_relaxed);
+struct UserThreadContext {
+    std::unordered_map<Workers *, RemoteBufferManager> remote_buffer;
+};
+
+static std::atomic<int> g_next_tid(0);
+thread_local UserThreadContext tl_context;
+thread_local int tl_tid = g_next_tid.fetch_add(1);
 
 int Workers::submit(RdmaSliceList &slice_list) {
-    int id = tlThreadId % kNumSliceQueue;
-    slice_queue_[id].push(slice_list);
+    auto &remote_buffer = tl_context.remote_buffer[this];
+    auto &worker = worker_context_[tl_tid % num_workers_];
+    RdmaSlice *slice = slice_list.first;
+
+    for (int slice_id = 0; slice_id < slice_list.num_slices;
+         ++slice_id, slice = slice->next) {
+        auto target_id = slice->task->request.target_id;
+        std::vector<BufferQueryResult> local, remote;
+        int ret = transport_->local_buffer_manager_.query(
+            AddressRange{slice->source_addr, slice->length}, local,
+            slice->retry_count);
+        if (ret) {
+            markSliceFailed(slice);
+            continue;
+        }
+        if (!remote_buffer.valid(target_id)) {
+            auto desc = transport_->metadata_manager_->getSegmentDescByID(
+                target_id, true);
+            if (!desc) {
+                markSliceFailed(slice);
+                continue;
+            }
+            remote_buffer.reload(target_id, desc);
+        }
+        ret = remote_buffer.query(
+            target_id, AddressRange{(void *)slice->target_addr, slice->length},
+            remote, slice->retry_count);
+        if (ret) {
+            markSliceFailed(slice);
+            continue;
+        }
+
+        assert(local.size() == 1 && remote.size() == 1);
+        slice->source_lkey = local[0].lkey;
+        slice->target_rkey = remote[0].rkey;
+        slice->source_dev_id = local[0].device_id;
+        slice->target_dev_id = remote[0].device_id;
+    }
+
+    worker.queue.push(slice_list);
     auto prev_inflight_slices =
-        inflight_slices_.fetch_add(slice_list.num_slices);
+        worker.inflight_slices.fetch_add(slice_list.num_slices);
     if (!prev_inflight_slices) cv_.notify_all();
     return 0;
 }
@@ -103,100 +144,53 @@ int Workers::submit(RdmaSlice *slice) {
 
 int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
-void Workers::dispatchSendRequests(int thread_id) {
-    const static size_t kMaxSlicesToSend = 128;
-    const static int kMaxProbeCount = 8;
-    std::vector<RdmaSlice *> slice_list;
-
-    auto &remote_buffer = worker_context_[thread_id].remote_buffer;
-    auto &requests = worker_context_[thread_id].requests;
-    auto &queue_id = worker_context_[thread_id].queue_id;
-
-    int probe_count = 0;
-    if (queue_id < 0) queue_id = thread_id;
-    while (slice_list.size() < kMaxSlicesToSend &&
-           probe_count < kMaxProbeCount) {
-        slice_queue_[queue_id].pop(kMaxSlicesToSend, slice_list);
-        queue_id += num_workers_;
-        if (queue_id >= kNumSliceQueue) queue_id = thread_id;
-        probe_count++;
-    }
-
-    for (auto slice : slice_list) {
-        auto target_id = slice->task->request.target_id;
-        std::vector<BufferQueryResult> local, remote;
-        int ret = transport_->local_buffer_manager_.query(
-            AddressRange{slice->source_addr, slice->length}, local,
-            slice->retry_count);
-        if (ret) {
-            markSliceFailed(slice);
-            continue;
-        }
-
-        if (!remote_buffer.valid(target_id)) {
-            auto desc =
-                transport_->metadata_manager_->getSegmentDescByID(target_id);
-            if (!desc) {
-                markSliceFailed(slice);
-                continue;
-            }
-            remote_buffer.reload(target_id, desc);
-        }
-
-        ret = remote_buffer.query(
-            target_id, AddressRange{(void *)slice->target_addr, slice->length},
-            remote, slice->retry_count);
-        if (ret) {
-            markSliceFailed(slice);
-            continue;
-        }
-
-        assert(local.size() == 1 && remote.size() == 1);
-        auto path = PostPath{.local_device_id = local[0].device_id,
-                             .remote_segment_id = target_id,
-                             .remote_device_id = remote[0].device_id};
-        slice->source_lkey = local[0].lkey;
-        slice->target_rkey = remote[0].rkey;
-        requests[path].slices.push_back(slice);
-    }
-}
-
 void Workers::asyncPostSend(int thread_id) {
-    auto &remote_buffer = worker_context_[thread_id].remote_buffer;
-    auto &requests = worker_context_[thread_id].requests;
-    dispatchSendRequests(thread_id);
+    auto &worker = worker_context_[thread_id];
+    while (true) {
+        auto slice_list = worker.queue.pop();
+        if (slice_list.num_slices == 0) break;
+        auto slice = slice_list.first;
+        for (int id = 0; id < slice_list.num_slices; ++id) {
+            PostPath path{.local_device_id = slice->source_dev_id,
+                          .remote_segment_id = slice->task->request.target_id,
+                          .remote_device_id = slice->target_dev_id};
+            worker.requests[path].push_back(slice);
+            slice = slice->next;
+        }
+    }
 
-    for (auto &entry : requests) {
+    for (auto &entry : worker.requests) {
         auto &path = entry.first;
-        auto &endpoint = entry.second.endpoint;
-        auto &slices = entry.second.slices;
-        if (!endpoint) {
-            auto context = transport_->context_set_[path.local_device_id].get();
-            auto peer_name = std::to_string(path.local_device_id) + "/" +
-                             std::to_string(path.remote_segment_id) + "/" +
-                             std::to_string(path.remote_device_id);
-            endpoint = context->endpoint(peer_name);
+        auto &slices = entry.second;
+        if (slices.empty()) continue;
+
+        auto context = transport_->context_set_[path.local_device_id].get();
+        auto peer_name = std::to_string(path.local_device_id) + "/" +
+                         std::to_string(path.remote_segment_id) + "/" +
+                         std::to_string(path.remote_device_id);
+        auto endpoint = context->endpoint(peer_name);
+        if (endpoint->status() != RdmaEndPoint::EP_READY) {
+            mutex_.lock();
             if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                mutex_.lock();
-                if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                    auto peer_segment_name =
-                        remote_buffer.segmentName(path.remote_segment_id);
-                    auto peer_device_name = remote_buffer.deviceName(
-                        path.remote_segment_id, path.remote_device_id);
-                    if (doHandshake(endpoint, peer_segment_name,
-                                    peer_device_name)) {
-                        for (auto slice : slices) {
-                            __sync_fetch_and_add(&slice->task->finish_slices,
-                                                 1);
-                            slice->task->status.s = Transport::FAILED;
-                        }
-                    }
+                auto desc = transport_->metadata_manager_->getSegmentDescByID(
+                    path.remote_segment_id);
+                if (!desc) {
+                    for (auto slice : slices) markSliceFailed(slice);
+                    continue;
                 }
-                mutex_.unlock();
+                auto peer_segment_name = desc->name;
+                auto peer_device_name =
+                    std::get<MemorySegmentDesc>(desc->detail)
+                        .devices[path.remote_device_id]
+                        .name;
+                if (doHandshake(endpoint, peer_segment_name,
+                                peer_device_name)) {
+                    for (auto slice : slices) markSliceFailed(slice);
+                }
             }
+            mutex_.unlock();
         }
 
-        if (slices.empty()) continue;
         int num_submitted = endpoint->submitSlices(slices);
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
@@ -210,6 +204,7 @@ void Workers::asyncPostSend(int thread_id) {
                 }
             }
         }
+
         if (num_submitted)
             slices.erase(slices.begin(), slices.begin() + num_submitted);
     }
@@ -247,6 +242,7 @@ void Workers::asyncPollCq(int thread_id) {
     const static size_t kPollCount = 64;
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
+    int nr_poll_total = 0;
     for (int index = thread_id; index < num_contexts * num_cq_list;
          index += num_workers_) {
         auto &context = transport_->context_set_[index % num_contexts];
@@ -283,23 +279,28 @@ void Workers::asyncPollCq(int thread_id) {
             }
         }
         if (nr_poll > 0) {
-            inflight_slices_.fetch_sub(nr_poll);
+            nr_poll_total += nr_poll;
         }
+    }
+    if (nr_poll_total) {
+        worker_context_[thread_id].inflight_slices.fetch_sub(nr_poll_total);
     }
 }
 
 void Workers::workerThread(int thread_id) {
+    auto &inflight_slices = worker_context_[thread_id].inflight_slices;
     while (!stop_flag_) {
         bool executed = true;
-        if (inflight_slices_ == 0) {
+        if (inflight_slices.load(std::memory_order_relaxed) == 0) {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::microseconds(100), [this]() {
-                return inflight_slices_ > 0 || stop_flag_;
-            });
+            cv_.wait_for(lock, std::chrono::microseconds(100),
+                         [this, &inflight_slices]() {
+                             return inflight_slices > 0 || stop_flag_;
+                         });
             if (stop_flag_) {
                 break;
             }
-            executed = (inflight_slices_ > 0);
+            executed = (inflight_slices > 0);
         }
         if (executed) {
             asyncPostSend(thread_id);

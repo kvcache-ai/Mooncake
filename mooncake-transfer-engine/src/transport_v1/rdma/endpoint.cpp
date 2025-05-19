@@ -195,17 +195,10 @@ static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
     // RWSpinlock::ReadGuard guard(ep_lock_);
-    CHECK_STATUS(EP_READY);
-    int qp_index = SimpleRandom::Get().next(qp_list_.size());
-
     const static int kSgeEntries = 1;
 
-    // if (params_->max_sge < kSgeEntries) {
-    //     LOG(ERROR)
-    //         << "RdmaEndPoint Failure: scatter/gather entry count exceeded";
-    //     return ERR_INVALID_ARGUMENT;
-    // }
-
+    CHECK_STATUS(EP_READY);
+    int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count =
         std::min(int(globalConfig().max_cqe) - cq_->getQuota(),
                  std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,

@@ -57,6 +57,8 @@ struct RdmaSlice {
 
     uint32_t source_lkey = 0;
     uint32_t target_rkey = 0;
+    int source_dev_id = -1;
+    int target_dev_id = -1;
 
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;

@@ -54,9 +54,8 @@ class Workers {
             }
         }
 
-        void pop(size_t advise_count, std::vector<RdmaSlice *> &result) {
-            result.reserve(advise_count);
-            while (result.size() < advise_count) {
+        void pop(std::vector<RdmaSlice *> &result) {
+            while (true) {
                 auto slice_list = pop();
                 if (slice_list.num_slices == 0) return;
                 auto slice = slice_list.first;
@@ -105,8 +104,6 @@ class Workers {
 
     void asyncPollCq(int thread_id);
 
-    void dispatchSendRequests(int thread_id);
-
     int doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                     const std::string &peer_server_name,
                     const std::string &peer_nic_name);
@@ -118,10 +115,7 @@ class Workers {
    private:
     RdmaTransport *transport_;
     size_t num_workers_;
-
     std::thread monitor_;
-
-    std::atomic<int64_t> inflight_slices_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -149,22 +143,17 @@ class Workers {
         }
     };
 
-    struct PostSendRequest {
-        std::shared_ptr<RdmaEndPoint> endpoint;
-        std::vector<RdmaSlice *> slices;
-    };
+    using GroupedRequests =
+        std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;
 
     struct WorkerContext {
         std::thread thread;
-        int queue_id = -1;
-        RemoteBufferManager remote_buffer;
-        std::unordered_map<PostPath, PostSendRequest, PostPathHash> requests;
+        BoundedSliceQueue queue;
+        GroupedRequests requests;
+        std::atomic<int64_t> inflight_slices = 0;
     };
 
     WorkerContext *worker_context_;
-
-    const static int kNumSliceQueue = 32;
-    BoundedSliceQueue slice_queue_[kNumSliceQueue];
 };
 }  // namespace v1
 }  // namespace mooncake
