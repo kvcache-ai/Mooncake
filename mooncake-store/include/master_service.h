@@ -246,7 +246,7 @@ class MasterService {
     std::atomic<bool> gc_running_{false};
     bool enable_gc_{true};  // Flag to enable/disable garbage collection
     static constexpr uint64_t kGCThreadSleepMs =
-        2;  // 2 ms sleep between GC and eviction checks
+        10;  // 10 ms sleep between GC and eviction checks
 
     // Eviction related members
     std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left

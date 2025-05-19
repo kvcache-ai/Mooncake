@@ -513,9 +513,13 @@ void MasterService::GCThreadFunc() {
             if (evicted_count > 0) {
                 need_eviction_ = false;
                 MasterMetricManager::instance().dec_key_count(evicted_count);
-            } else if (object_count == 0) {
-                // No objects to evict, no need to check again
-                need_eviction_ = false;
+                MasterMetricManager::instance().inc_eviction_success(evicted_count, total_freed_size);
+            } else {
+                if (object_count == 0) {
+                    // No objects to evict, no need to check again
+                    need_eviction_ = false;
+                }
+                MasterMetricManager::instance().inc_eviction_fail();
             }
             VLOG(1) << "action=evict_objects"
                     << ", evicted_count=" << evicted_count

@@ -997,7 +997,7 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     }
 }
 
-TEST_F(MasterServiceTest, ObjectEviction) {
+TEST_F(MasterServiceTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
     std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
@@ -1037,13 +1037,24 @@ TEST_F(MasterServiceTest, ObjectEviction) {
     service_->RemoveAll();
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     ASSERT_EQ(service_->RemoveAll(), 1);
+}
+
+TEST_F(MasterServiceTest, TryEvictLeasedObject) {
+    // set a large kv_lease_ttl so the granted lease will not quickly expire
+    const uint64_t kv_lease_ttl = 500;
+    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    ASSERT_EQ(ErrorCode::OK,
+              service_->MountSegment(buffer, size, segment_name));
 
     // Verify leased object will not be evicted.
-    // 10 failed puts are enough to trigger the eviction.
-    // Too many failed puts will cause the master service to print too many logs.
-    success_puts = 0;
+    int success_puts = 0;
     int failed_puts = 0;
-    for (int i = 0; i < 1024 * 16 + 10 && failed_puts < 10; ++i) {
+    std::vector<std::string> leased_keys;
+    for (int i = 0; i < 16 + 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
@@ -1054,16 +1065,23 @@ TEST_F(MasterServiceTest, ObjectEviction) {
             ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
             // the object is leased
             ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+            leased_keys.push_back(key);
             success_puts++;
         } else {
             failed_puts++;
         }
     }
     ASSERT_GT(success_puts, 0);
+    ASSERT_GT(failed_puts, 0);
     // wait for gc thread to do eviction
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    // No object should be removed as all objects are leased
-    ASSERT_EQ(0, service_->RemoveAll());
+    // All leased objects should be accessible
+    for (const auto& key : leased_keys) {
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    service_->RemoveAll();
 }
 
 }  // namespace mooncake::test
