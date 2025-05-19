@@ -273,6 +273,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                  print(record)
              raise e
          # Cleanup: ensure all remaining keys are removed
+         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
          for key in list(reference.keys()):
              self.store.remove(key)
              

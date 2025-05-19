@@ -494,7 +494,16 @@ void MasterService::GCThreadFunc() {
                 std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
                 for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
                     if (it->second.lease_timeout <= now) {
-                        candidates.push_back(it->second.lease_timeout);
+                        bool is_complete = true;
+                        for (auto& replica : it->second.replicas) {
+                            if (replica.status() != ReplicaStatus::COMPLETE) {
+                                is_complete = false;
+                                break;
+                            }
+                        }
+                        if (is_complete) {
+                            candidates.push_back(it->second.lease_timeout);
+                        }
                     }
                 }
                 if (!candidates.empty()) {
@@ -513,9 +522,20 @@ void MasterService::GCThreadFunc() {
                     auto it = shard.metadata.begin();
                     while (it != shard.metadata.end()) {
                         if (it->second.lease_timeout <= target) {
-                            total_freed_size += it->second.size * it->second.replicas.size();
-                            it = shard.metadata.erase(it);
-                            evicted_count++;
+                            bool is_complete = true;
+                            for (auto& replica : it->second.replicas) {
+                                if (replica.status() != ReplicaStatus::COMPLETE) {
+                                    is_complete = false;
+                                    break;
+                                }
+                            }
+                            if (is_complete) {
+                                total_freed_size += it->second.size * it->second.replicas.size();
+                                it = shard.metadata.erase(it);
+                                evicted_count++;
+                            } else {
+                                ++it;
+                            }
                         } else {
                             ++it;
                         }
