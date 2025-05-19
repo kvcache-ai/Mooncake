@@ -10,6 +10,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <optional>
 
 #include "allocation_strategy.h"
 #include "eviction_strategy.h"
@@ -89,7 +90,7 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true, uint64_t default_kv_lease_ttl = DEFAULT_KV_LEASE_TTL);
+    MasterService(bool enable_gc = true, uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL);
     ~MasterService();
 
     /**
@@ -183,7 +184,37 @@ class MasterService {
     struct ObjectMetadata {
         std::vector<Replica> replicas;
         size_t size;
+        // Default constructor, creates a time_point representing
+        // the Clock's epoch (i.e., time_since_epoch() is zero).
         std::chrono::steady_clock::time_point lease_timeout;
+
+        // Check if there is some replica with a different status than the given value.
+        // If there is, return the status of the first replica that is not equal to
+        // the given value. Otherwise, return false.
+        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
+            for (const auto& replica : replicas) {
+                if (replica.status() != status) {
+                    return replica.status();
+                }
+            }
+            return {};
+        }
+
+        // Grant a lease with timeout as now() + ttl, only update if the new timeout is larger
+        void GrantLease(const uint64_t ttl) {
+            lease_timeout = std::max(lease_timeout,
+                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl));
+        }
+
+        // Check if the lease has expired
+        bool IsLeaseExpired() const {
+            return std::chrono::steady_clock::now() >= lease_timeout;
+        }
+
+        // Check if the lease has expired
+        bool IsLeaseExpired(std::chrono::steady_clock::time_point &now) const {
+            return now >= lease_timeout;
+        }
     };
 
     // Buffer allocator management
@@ -214,10 +245,12 @@ class MasterService {
     std::thread gc_thread_;
     std::atomic<bool> gc_running_{false};
     bool enable_gc_{true};  // Flag to enable/disable garbage collection
-    bool need_eviction_{false}; // Set to trigger eviction when not enough space left
     static constexpr uint64_t kGCThreadSleepMs =
-        10;  // 10 ms sleep between GC checks
-    uint64_t default_kv_lease_ttl_; // in milliseconds
+        2;  // 2 ms sleep between GC and eviction checks
+
+    // Eviction related members
+    std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
+    const uint64_t default_kv_lease_ttl_; // in milliseconds
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

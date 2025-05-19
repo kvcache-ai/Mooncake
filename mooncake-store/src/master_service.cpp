@@ -142,20 +142,14 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
-    for (const auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "key=" << key << ", status=" << status
-                         << ", error=replica_not_ready";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(WARNING) << "key=" << key << ", status=" << *status
+                     << ", error=replica_not_ready";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     // Grant a lease to the object as it may be further used by the client.
-    metadata.lease_timeout = std::max(
-        metadata.lease_timeout,
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(default_kv_lease_ttl_)
-    );
+    metadata.GrantLease(default_kv_lease_ttl_);
 
     return ErrorCode::OK;
 }
@@ -168,13 +162,10 @@ ErrorCode MasterService::GetReplicaList(
         return ErrorCode::OBJECT_NOT_FOUND;
     }
     auto& metadata = accessor.Get();
-    for (const auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "key=" << key << ", status=" << status
-                         << ", error=replica_not_ready";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(WARNING) << "key=" << key << ", status=" << *status
+                     << ", error=replica_not_ready";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     replica_list.clear();
@@ -189,10 +180,7 @@ ErrorCode MasterService::GetReplicaList(
     } else {
         // Grant a lease to the object so it will not be removed
         // when the client is reading it.
-        metadata.lease_timeout = std::max(
-            metadata.lease_timeout,
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(default_kv_lease_ttl_)
-        );
+        metadata.GrantLease(default_kv_lease_ttl_);
     }
 
     return ErrorCode::OK;
@@ -295,10 +283,8 @@ ErrorCode MasterService::PutStart(
         replica_list.emplace_back(replica.get_descriptor());
     }
 
-    // Set lease timeout to now, indicating that the object has no lease
-    // at beginning
-    metadata.lease_timeout = std::chrono::steady_clock::now();
-
+    // No need to set lease here. The object will not be evicted until
+    // PutEnd is called.
     metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
     return ErrorCode::OK;
 }
@@ -314,7 +300,9 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     for (auto& replica : metadata.replicas) {
         replica.mark_complete();
     }
-
+    // Set lease timeout to now, indicating that the object has no lease
+    // at beginning
+    metadata.GrantLease(0);
     return ErrorCode::OK;
 }
 
@@ -326,13 +314,10 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
-    for (auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::PROCESSING) {
-            LOG(ERROR) << "key=" << key << ", status=" << status
-                       << ", error=invalid_replica_status";
-            return ErrorCode::INVALID_WRITE;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
+        LOG(ERROR) << "key=" << key << ", status=" << *status
+            << ", error=invalid_replica_status";
+        return ErrorCode::INVALID_WRITE;
     }
 
     accessor.Erase();
@@ -348,18 +333,15 @@ ErrorCode MasterService::Remove(const std::string& key) {
 
     auto& metadata = accessor.Get();
 
-    if (metadata.lease_timeout > std::chrono::steady_clock::now()) {
+    if (!metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return ErrorCode::OBJECT_HAS_LEASE;
     }
 
-    for (auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(ERROR) << "key=" << key << ", status=" << status
-                       << ", error=invalid_replica_status";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(ERROR) << "key=" << key << ", status=" << *status
+            << ", error=invalid_replica_status";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     // Remove object metadata
@@ -370,6 +352,8 @@ ErrorCode MasterService::Remove(const std::string& key) {
 long MasterService::RemoveAll() {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
+    // Store the current time to avoid repeatedly
+    // calling std::chrono::steady_clock::now()
     auto now = std::chrono::steady_clock::now();
 
     for (auto& shard : metadata_shards_) {
@@ -381,7 +365,7 @@ long MasterService::RemoveAll() {
         // Only remove objects with expired leases
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            if (it->second.lease_timeout <= now) {
+            if (it->second.IsLeaseExpired(now)) {
                 total_freed_size += it->second.size * it->second.replicas.size();
                 it = shard.metadata.erase(it);
                 removed_count++;
@@ -493,17 +477,10 @@ void MasterService::GCThreadFunc() {
                 object_count += shard.metadata.size();
                 std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
                 for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
-                    if (it->second.lease_timeout <= now) {
-                        bool is_complete = true;
-                        for (auto& replica : it->second.replicas) {
-                            if (replica.status() != ReplicaStatus::COMPLETE) {
-                                is_complete = false;
-                                break;
-                            }
-                        }
-                        if (is_complete) {
-                            candidates.push_back(it->second.lease_timeout);
-                        }
+                    // Only evict objects that have not expired and are complete
+                    if (it->second.IsLeaseExpired(now)
+                        && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                        candidates.push_back(it->second.lease_timeout);
                     }
                 }
                 if (!candidates.empty()) {
@@ -521,21 +498,11 @@ void MasterService::GCThreadFunc() {
                     // The actual evicted number may not be exactly evict_num.
                     auto it = shard.metadata.begin();
                     while (it != shard.metadata.end()) {
-                        if (it->second.lease_timeout <= target) {
-                            bool is_complete = true;
-                            for (auto& replica : it->second.replicas) {
-                                if (replica.status() != ReplicaStatus::COMPLETE) {
-                                    is_complete = false;
-                                    break;
-                                }
-                            }
-                            if (is_complete) {
-                                total_freed_size += it->second.size * it->second.replicas.size();
-                                it = shard.metadata.erase(it);
-                                evicted_count++;
-                            } else {
-                                ++it;
-                            }
+                        if (it->second.lease_timeout <= target
+                        && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                            total_freed_size += it->second.size * it->second.replicas.size();
+                            it = shard.metadata.erase(it);
+                            evicted_count++;
                         } else {
                             ++it;
                         }
