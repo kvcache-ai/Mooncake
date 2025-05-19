@@ -295,6 +295,7 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
 void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
+    cq_->cancelQuota(num_entries);
 }
 
 int RdmaEndPoint::setupSingleQueuePair(int qp_index,

@@ -40,9 +40,7 @@ static inline void markSliceFailed(RdmaSlice *slice) {
 }
 
 Workers::Workers(RdmaTransport *transport)
-    : transport_(transport),
-      num_workers_(0),
-      running_(false) {}
+    : transport_(transport), num_workers_(0), running_(false) {}
 
 Workers::~Workers() {
     if (running_) stop();
@@ -144,6 +142,29 @@ int Workers::submit(RdmaSlice *slice) {
 
 int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
+std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
+    auto context = transport_->context_set_[path.local_device_id].get();
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    auto desc = transport_->metadata_manager_->getSegmentDescByID(
+        path.remote_segment_id);
+    if (!desc) return nullptr;
+    auto peer_segment_name = desc->name;
+    auto peer_device_name = std::get<MemorySegmentDesc>(desc->detail)
+                                .devices[path.remote_device_id]
+                                .name;
+    auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
+    endpoint = context->endpoint(peer_name);
+    if (endpoint->status() != RdmaEndPoint::EP_READY) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (endpoint->status() != RdmaEndPoint::EP_READY &&
+            doHandshake(endpoint, peer_segment_name,
+                        peer_device_name)) {
+            return nullptr;
+        }
+    }
+    return endpoint;
+}
+
 void Workers::asyncPostSend(int thread_id) {
     auto &worker = worker_context_[thread_id];
     while (true) {
@@ -164,31 +185,10 @@ void Workers::asyncPostSend(int thread_id) {
         auto &slices = entry.second;
         if (slices.empty()) continue;
 
-        auto context = transport_->context_set_[path.local_device_id].get();
-        auto peer_name = std::to_string(path.local_device_id) + "/" +
-                         std::to_string(path.remote_segment_id) + "/" +
-                         std::to_string(path.remote_device_id);
-        auto endpoint = context->endpoint(peer_name);
-        if (endpoint->status() != RdmaEndPoint::EP_READY) {
-            mutex_.lock();
-            if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                auto desc = transport_->metadata_manager_->getSegmentDescByID(
-                    path.remote_segment_id);
-                if (!desc) {
-                    for (auto slice : slices) markSliceFailed(slice);
-                    continue;
-                }
-                auto peer_segment_name = desc->name;
-                auto peer_device_name =
-                    std::get<MemorySegmentDesc>(desc->detail)
-                        .devices[path.remote_device_id]
-                        .name;
-                if (doHandshake(endpoint, peer_segment_name,
-                                peer_device_name)) {
-                    for (auto slice : slices) markSliceFailed(slice);
-                }
-            }
-            mutex_.unlock();
+        auto endpoint = getEndpoint(path);
+        if (!endpoint) {
+            for (auto slice : slices) markSliceFailed(slice);
+            continue;
         }
 
         int num_submitted = endpoint->submitSlices(slices);
@@ -243,6 +243,7 @@ void Workers::asyncPollCq(int thread_id) {
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
     int nr_poll_total = 0;
+    std::unordered_map<volatile int *, int> endpoint_quota_map;
     for (int index = thread_id; index < num_contexts * num_cq_list;
          index += num_workers_) {
         auto &context = transport_->context_set_[index % num_contexts];
@@ -255,7 +256,10 @@ void Workers::asyncPollCq(int thread_id) {
         }
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice *)wc[i].wr_id;
-            __sync_fetch_and_sub(slice->endpoint_quota, 1);
+            if (endpoint_quota_map.count(slice->endpoint_quota))
+                endpoint_quota_map[slice->endpoint_quota]++;
+            else
+                endpoint_quota_map[slice->endpoint_quota] = 1;
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     LOG(ERROR)
@@ -281,6 +285,9 @@ void Workers::asyncPollCq(int thread_id) {
         if (nr_poll > 0) {
             nr_poll_total += nr_poll;
         }
+    }
+    for (auto &entry : endpoint_quota_map) {
+        __sync_fetch_and_sub(entry.first, entry.second);
     }
     if (nr_poll_total) {
         worker_context_[thread_id].inflight_slices.fetch_sub(nr_poll_total);

@@ -54,18 +54,6 @@ class Workers {
             }
         }
 
-        void pop(std::vector<RdmaSlice *> &result) {
-            while (true) {
-                auto slice_list = pop();
-                if (slice_list.num_slices == 0) return;
-                auto slice = slice_list.first;
-                for (int id = 0; id < slice_list.num_slices; ++id) {
-                    result.push_back(slice);
-                    slice = slice->next;
-                }
-            }
-        }
-
         RdmaSliceList pop() {
             uint64_t current_head = head.load(std::memory_order_relaxed);
             if (current_head != tail.load(std::memory_order_acquire)) {
@@ -142,6 +130,8 @@ class Workers {
             return (h1 * 10007 + h2) * 10007 + h3;
         }
     };
+
+    std::shared_ptr<RdmaEndPoint> getEndpoint(Workers::PostPath path);
 
     using GroupedRequests =
         std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;
