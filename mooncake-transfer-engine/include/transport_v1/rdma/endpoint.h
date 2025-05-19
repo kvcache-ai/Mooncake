@@ -22,20 +22,21 @@
 namespace mooncake {
 namespace v1 {
 class RdmaEndPoint {
+    struct WrDepthBlock {
+        volatile int value;
+        uint64_t padding[7];
+    };
+
    public:
     RdmaEndPoint();
 
     ~RdmaEndPoint();
 
-    int construct(RdmaCQ *cq, EndPointParams *params, const std::string &endpoint_name);
+    int construct(RdmaCQ *cq, EndPointParams *params,
+                  const std::string &endpoint_name);
 
    public:
-    enum EndPointStatus {
-        EP_UNINIT,
-        EP_DISABLED,
-        EP_INPROGRESS,
-        EP_READY
-    };
+    enum EndPointStatus { EP_UNINIT, EP_DISABLED, EP_INPROGRESS, EP_READY };
 
     int enable();
 
@@ -76,14 +77,14 @@ class RdmaEndPoint {
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
     volatile int *getQuotaCounter(int qp_index) const {
-        return &wr_depth_list_[qp_index];
+        return &wr_depth_list_[qp_index].value;
     }
 
    private:
     int setupSingleQueuePair(int qp_index, const std::string &peer_gid,
                              uint16_t peer_lid, uint32_t peer_qp_num,
                              std::string *reply_msg = nullptr);
-    
+
     bool reserveQuota(int qp_index, int num_entries);
 
     void cancelQuota(int qp_index, int num_entries);
@@ -97,7 +98,7 @@ class RdmaEndPoint {
     std::string endpoint_name_;
 
     std::vector<ibv_qp *> qp_list_;
-    volatile int *wr_depth_list_;
+    WrDepthBlock *wr_depth_list_;
 };
 }  // namespace v1
 }  // namespace mooncake

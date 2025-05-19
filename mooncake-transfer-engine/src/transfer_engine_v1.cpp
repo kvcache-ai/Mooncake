@@ -130,45 +130,41 @@ int TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
 }
 
 BatchID TransferEngine::allocateBatchID(size_t batch_size) {
-    Transport::SubBatchRef batch;
-    auto status = transport_->allocateSubBatch(batch, batch_size);
-    if (!status.ok()) return (BatchID)(-1);
-    auto batch_id = next_batch_id_.fetch_add(1);
+    Batch *batch = new Batch();
+    auto status = transport_->allocateSubBatch(batch->rdma, batch_size);
+    if (!status.ok()) {
+        delete batch;
+        return 0;
+    }
     mutex_.lock();
-    batch_mapping_[batch_id] = batch;
+    batch_set_.insert(batch);
     mutex_.unlock();
-    return batch_id;
+    return (BatchID)batch;
 }
 
 Status TransferEngine::freeBatchID(BatchID batch_id) {
+    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    Batch *batch = (Batch *)(batch_id);
+    transport_->freeSubBatch(batch->rdma);
     mutex_.lock();
-    batch_mapping_.erase(batch_id);
+    batch_set_.erase(batch);
     mutex_.unlock();
+    delete batch;
     return Status::OK();
 }
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    mutex_.lock_shared();
-    if (!batch_mapping_.count(batch_id)) {
-        mutex_.unlock_shared();
-        return Status::InvalidArgument("invalid batch id");
-    }
-    auto batch = batch_mapping_[batch_id];
-    mutex_.unlock_shared();
-    return transport_->submitTransferTasks(batch, entries);
+    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    Batch *batch = (Batch *)(batch_id);
+    return transport_->submitTransferTasks(batch->rdma, entries);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
-    mutex_.lock_shared();
-    if (!batch_mapping_.count(batch_id)) {
-        mutex_.unlock_shared();
-        return Status::InvalidArgument("invalid batch id");
-    }
-    auto batch = batch_mapping_[batch_id];
-    mutex_.unlock_shared();
-    status = transport_->getTransferStatus(batch, task_id);
+    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    Batch *batch = (Batch *)(batch_id);
+    status = transport_->getTransferStatus(batch->rdma, task_id);
     return Status::OK();
 }
 

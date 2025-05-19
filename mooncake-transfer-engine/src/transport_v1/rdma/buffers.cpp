@@ -359,9 +359,12 @@ int LocalBufferManager::fillBufferDesc(
 int LocalBufferManager::query(const AddressRange &range,
                               std::vector<BufferQueryResult> &result,
                               int retry_count) {
-    RWSpinlock::ReadGuard guard(lock_);
+    // TODO Read-friendly lock
     result.clear();
-    for (auto &buffer : buffer_list_) {
+    auto lower = buffer_list_.begin();
+    auto upper = buffer_list_.end();
+    for (auto it = lower; it != upper; ++it) {
+        const auto &buffer = *it;
         auto intersect = buffer.first.intersect(range);
         if (intersect.empty()) continue;
         int device_id =
@@ -371,12 +374,12 @@ int LocalBufferManager::query(const AddressRange &range,
         if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
         auto context = context_list_[device_id];
         if (!context) return ERR_ADDRESS_NOT_REGISTERED;
-        auto mem_reg_id = buffer.second.mem_reg_map[context];
+        auto mem_reg_id = buffer.second.mem_reg_map.at(context);
         auto keys = context->queryMemRegKey(mem_reg_id);
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
                                            keys.first, keys.second, device_id});
     }
-    return 0;
+    return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 
 const std::string LocalBufferManager::deviceName(int id) {
@@ -418,7 +421,7 @@ int RemoteBufferManager::query(SegmentID id, const AddressRange &range,
                                            entry.lkey[device_id],
                                            entry.rkey[device_id], device_id});
     }
-    return 0;
+    return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 
 const std::string RemoteBufferManager::segmentName(SegmentID id) {

@@ -21,15 +21,6 @@ namespace v1 {
 
 thread_local RdmaSliceStorage::ThreadLocal tl_slice;
 
-RdmaTask::~RdmaTask() {
-    auto slice = slice_list.first;
-    while (slice) {
-        auto next_slice = slice->next;
-        RdmaSliceStorage::Get().deallocate(slice);
-        slice = next_slice;
-    }
-}
-
 RdmaSliceStorage& RdmaSliceStorage::Get() {
     static RdmaSliceStorage g_slice;
     return g_slice;
@@ -73,13 +64,13 @@ RdmaSlice* RdmaSliceStorage::allocate() {
 
 void RdmaSliceStorage::deallocate(RdmaSlice* slice) {
     tl_slice.free_list.push_back(slice);
-    if (tl_slice.free_list.size() > kMaxFreeListSizeInThread) {
-        std::lock_guard<std::mutex> global_lock(mutex_);
-        while (tl_slice.free_list.size() > kMaxFreeListSizeInThread) {
+    if (tl_slice.free_list.size() > kMaxFreeListSizeInThread && mutex_.try_lock()) {
+        while (!tl_slice.free_list.empty()) {
             RdmaSlice* slice = tl_slice.free_list.back();
             tl_slice.free_list.pop_back();
             free_list_.push_back(slice);
         }
+        mutex_.unlock();
     }
 }
 

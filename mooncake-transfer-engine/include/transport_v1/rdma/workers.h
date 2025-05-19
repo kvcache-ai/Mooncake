@@ -29,16 +29,56 @@ namespace v1 {
 class RdmaTransport;
 class Workers {
    public:
-    struct SliceQueue {
-        RdmaSlice *head, *tail;
-        RWSpinlock lock;
-        std::atomic<size_t> num_entries;
+    struct BoundedSliceQueue {
+        const static size_t kCapacity = 1024 * 64;
+        std::atomic<uint64_t> head, tail;
+        std::mutex mutex;
+        RdmaSliceList *entries;
+        uint64_t padding[8];
 
-        SliceQueue() : head(nullptr), tail(nullptr), num_entries(0) {}
+        BoundedSliceQueue() { entries = new RdmaSliceList[kCapacity]; }
 
-        void push(RdmaSlice *first, RdmaSlice *last, size_t count);
+        ~BoundedSliceQueue() { delete[] entries; }
 
-        RdmaSlice *pop(size_t max_count);
+        void push(RdmaSliceList &slice_list) {
+            if (slice_list.num_slices == 0) return;
+            std::lock_guard<std::mutex> lock(mutex);
+            while (true) {
+                uint64_t current_tail = tail.load(std::memory_order_relaxed);
+                uint64_t next_tail = (current_tail + 1) % kCapacity;
+                if (next_tail != head.load(std::memory_order_relaxed)) {
+                    entries[current_tail] = slice_list;
+                    tail.store(next_tail, std::memory_order_release);
+                    return;
+                }
+            }
+        }
+
+        void pop(size_t advise_count, std::vector<RdmaSlice *> &result) {
+            result.reserve(advise_count);
+            while (result.size() < advise_count) {
+                auto slice_list = pop();
+                if (slice_list.num_slices == 0) return;
+                auto slice = slice_list.first;
+                for (int id = 0; id < slice_list.num_slices; ++id) {
+                    result.push_back(slice);
+                    slice = slice->next;
+                }
+            }
+        }
+
+        RdmaSliceList pop() {
+            uint64_t current_head = head.load(std::memory_order_relaxed);
+            if (current_head != tail.load(std::memory_order_acquire)) {
+                RdmaSliceList result = entries[current_head];
+                head.store((current_head + 1) % kCapacity,
+                           std::memory_order_release);
+                return result;
+            } else {
+                RdmaSliceList empty_result;
+                return empty_result;
+            }
+        }
     };
 
    public:
@@ -65,6 +105,8 @@ class Workers {
 
     void asyncPollCq(int thread_id);
 
+    void dispatchSendRequests(int thread_id);
+
     int doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                     const std::string &peer_server_name,
                     const std::string &peer_nic_name);
@@ -77,7 +119,6 @@ class Workers {
     RdmaTransport *transport_;
     size_t num_workers_;
 
-    std::vector<std::thread> workers_;
     std::thread monitor_;
 
     std::atomic<int64_t> inflight_slices_;
@@ -86,11 +127,44 @@ class Workers {
     std::condition_variable cv_;
     std::atomic<bool> running_;
     bool stop_flag_;
-    struct WorkerEnv {
-        SliceQueue slice_queue;
-        RemoteBufferManager remote_buffer;
+
+    struct PostPath {
+        int local_device_id;
+        SegmentID remote_segment_id;
+        int remote_device_id;
+
+        bool operator==(const PostPath &rhs) const {
+            return local_device_id == rhs.local_device_id &&
+                   remote_segment_id == rhs.remote_segment_id &&
+                   remote_device_id == rhs.remote_device_id;
+        }
     };
-    WorkerEnv *worker_env_;
+
+    struct PostPathHash {
+        size_t operator()(const PostPath &postPath) const {
+            size_t h1 = std::hash<int>{}(postPath.local_device_id);
+            size_t h2 = std::hash<SegmentID>{}(postPath.remote_segment_id);
+            size_t h3 = std::hash<int>{}(postPath.remote_device_id);
+            return (h1 * 10007 + h2) * 10007 + h3;
+        }
+    };
+
+    struct PostSendRequest {
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        std::vector<RdmaSlice *> slices;
+    };
+
+    struct WorkerContext {
+        std::thread thread;
+        int queue_id = -1;
+        RemoteBufferManager remote_buffer;
+        std::unordered_map<PostPath, PostSendRequest, PostPathHash> requests;
+    };
+
+    WorkerContext *worker_context_;
+
+    const static int kNumSliceQueue = 32;
+    BoundedSliceQueue slice_queue_[kNumSliceQueue];
 };
 }  // namespace v1
 }  // namespace mooncake

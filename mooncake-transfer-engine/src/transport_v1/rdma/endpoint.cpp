@@ -80,14 +80,14 @@ int RdmaEndPoint::enable() {
     RWSpinlock::WriteGuard guard(ep_lock_);
     CHECK_STATUS_NOT(EP_UNINIT);
     qp_list_.resize(params_->qp_mul_factor);
-    wr_depth_list_ = new volatile int[params_->qp_mul_factor];
+    wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor];
     if (!wr_depth_list_) {
         disable();
         return ERR_MEMORY;
     }
 
     for (int i = 0; i < params_->qp_mul_factor; ++i) {
-        wr_depth_list_[i] = 0;
+        wr_depth_list_[i].value = 0;
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.send_cq = cq_->cq();
@@ -113,7 +113,7 @@ int RdmaEndPoint::disable() {
     CHECK_STATUS_NOT(EP_UNINIT);
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         // TODO force cancel these work requests
-        if (wr_depth_list_[i] != 0)
+        if (wr_depth_list_[i].value != 0)
             LOG(WARNING)
                 << "Outstanding work requests found, CQ will not be generated";
         if (ibv_destroy_qp(qp_list_[i])) {
@@ -133,7 +133,7 @@ int RdmaEndPoint::reset() {
     CHECK_STATUS_NOT(EP_UNINIT);
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         // TODO force cancel these work requests
-        if (wr_depth_list_[i] != 0)
+        if (wr_depth_list_[i].value != 0)
             LOG(WARNING)
                 << "Outstanding work requests found, CQ will not be generated";
     }
@@ -148,7 +148,7 @@ int RdmaEndPoint::reset() {
             return ERR_ENDPOINT;
         }
     }
-    for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
+    for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i].value = 0;
     status_ = EP_INPROGRESS;
     return 0;
 }
@@ -194,7 +194,7 @@ static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
 }
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
-    RWSpinlock::ReadGuard guard(ep_lock_);
+    // RWSpinlock::ReadGuard guard(ep_lock_);
     CHECK_STATUS(EP_READY);
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
 
@@ -208,7 +208,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
 
     int wr_count =
         std::min(int(globalConfig().max_cqe) - cq_->getQuota(),
-                 std::min(params_->max_qp_wr - wr_depth_list_[qp_index],
+                 std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,
                           (int)slice_list.size()));
     int sge_count = wr_count * kSgeEntries;
 
@@ -228,7 +228,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
             sge.length = current->length;
             sge.lkey = current->source_lkey;
         }
-        current->endpoint_quota = &wr_depth_list_[qp_index];
+        current->endpoint_quota = &wr_depth_list_[qp_index].value;
         wr.wr_id = (uint64_t)current;
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
@@ -282,7 +282,8 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() {
 
 int RdmaEndPoint::outstandingSlices() const {
     int sum = 0;
-    for (int i = 0; i < (int)qp_list_.size(); ++i) sum += wr_depth_list_[i];
+    for (int i = 0; i < (int)qp_list_.size(); ++i)
+        sum += wr_depth_list_[i].value;
     return sum;
 }
 
@@ -290,7 +291,7 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     if (!cq_->reserveQuota(num_entries)) return false;
     auto prev_depth_list =
-        __sync_fetch_and_add(&wr_depth_list_[qp_index], num_entries);
+        __sync_fetch_and_add(&wr_depth_list_[qp_index].value, num_entries);
     if (prev_depth_list + num_entries > params_->max_qp_wr) {
         cancelQuota(qp_index, num_entries);
         return false;
@@ -300,7 +301,7 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
 
 void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
-    __sync_fetch_and_sub(&wr_depth_list_[qp_index], num_entries);
+    __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
 }
 
 int RdmaEndPoint::setupSingleQueuePair(int qp_index,

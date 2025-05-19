@@ -34,20 +34,17 @@ struct RdmaSlice;
 
 struct RdmaSliceList {
     RdmaSlice *first = nullptr;
-    RdmaSlice *last = nullptr;
     int num_slices = 0;
 };
 
 struct RdmaTask {
-    RdmaTask() = default;
-
-    ~RdmaTask();
-
+    int num_slices;
     Transport::Request request;
     Transport::TransferStatus status;
-    RdmaSliceList slice_list;
+    uint64_t padding1[8];
 
     volatile int finish_slices = 0;  // including success or failed
+    uint64_t padding2[8];
 };
 
 struct RdmaSlice {
@@ -61,7 +58,6 @@ struct RdmaSlice {
     uint32_t source_lkey = 0;
     uint32_t target_rkey = 0;
 
-    RdmaSlice *queue_next = nullptr;
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;
     bool failed = false;

@@ -126,13 +126,13 @@ Status RdmaTransport::submitTransferTasks(
         rdma_batch->max_size)
         return Status::InvalidArgument("too many requests");
     const size_t block_size = params_->workers.block_size;
+    RdmaSliceList slice_list;
+    RdmaSlice *slice_tail = nullptr;
     for (auto &request : request_list) {
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
-        task.slice_list.num_slices =
-            (request.length + block_size - 1) / block_size;
-        RdmaSlice *first_slice = nullptr, *prev_slice = nullptr;
+        task.num_slices = 0;
         for (uint64_t offset = 0; offset < request.length;
              offset += block_size) {
             auto slice = RdmaSliceStorage::Get().allocate();
@@ -140,20 +140,22 @@ Status RdmaTransport::submitTransferTasks(
             slice->target_addr = request.target_offset + offset;
             slice->length = std::min(request.length - offset, block_size);
             slice->task = &task;
-            slice->next = nullptr;
             slice->retry_count = 0;
             slice->endpoint_quota = nullptr;
-            if (prev_slice) {
-                prev_slice->next = slice;
+            slice->next = nullptr;
+            task.num_slices++;
+            slice_list.num_slices++;
+            if (slice_list.first) {
+                assert(slice_tail);
+                slice_tail->next = slice;
+                slice_tail = slice;
             } else {
-                first_slice = slice;
+                slice_list.first = slice_tail = slice;
             }
-            prev_slice = slice;
         }
-        task.slice_list.first = first_slice;
-        task.slice_list.last = prev_slice;
-        workers_->submit(task.slice_list);
     }
+    rdma_batch->slice_chain.push_back(slice_list.first);
+    workers_->submit(slice_list);
     return Status::OK();
 }
 

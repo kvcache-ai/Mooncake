@@ -27,6 +27,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -106,9 +107,11 @@ class TransferEngine {
     std::shared_ptr<Transport> transport_;
     std::shared_ptr<Topology> local_topology_;
     std::vector<std::string> filter_;
-    std::atomic<BatchID> next_batch_id_ = 1;
-    std::unordered_map<BatchID, Transport::SubBatchRef> batch_mapping_;
-    std::shared_mutex mutex_;
+    struct Batch {
+        Transport::SubBatchRef rdma = nullptr;
+    };
+    std::unordered_set<Batch *> batch_set_;
+    std::mutex mutex_;
 };
 }  // namespace v1
 }  // namespace mooncake

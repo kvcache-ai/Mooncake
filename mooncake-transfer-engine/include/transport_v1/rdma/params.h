@@ -59,7 +59,7 @@ struct EndPointParams {
 };
 
 struct WorkerParams {
-    int num_workers = 1;
+    int num_workers = 4;
     int max_retry_count = 8;
     int block_size = 65536;
 };

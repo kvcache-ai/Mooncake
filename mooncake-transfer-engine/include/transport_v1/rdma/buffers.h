@@ -36,7 +36,9 @@ struct AddressRange {
         : addr(addr), length(length) {}
 
     bool operator<(const AddressRange &rhs) const {
-        return (char *)addr < (char *)rhs.addr;
+        if ((char *)addr < (char *)rhs.addr) return true;
+        if ((char *)addr > (char *)rhs.addr) return false;
+        return length < rhs.length;
     }
 
     bool operator==(const AddressRange &rhs) const {
@@ -44,6 +46,11 @@ struct AddressRange {
     }
 
     bool empty() const { return length == 0; }
+
+    bool contains(const AddressRange &rhs) const {
+        return ((char *)addr <= (char *)rhs.addr) &&
+               ((char *)addr + length >= (char *)rhs.addr + rhs.length);
+    }
 
     AddressRange intersect(const AddressRange &rhs) const {
         char *a_start = static_cast<char *>(addr);

@@ -50,7 +50,18 @@ struct RdmaSubBatch : public Transport::SubBatch {
         task_list.reserve(max_size);
     }
 
+    ~RdmaSubBatch() {
+        for (auto &slice : slice_chain) {
+            while (slice) {
+                auto next = slice->next;
+                RdmaSliceStorage::Get().deallocate(slice);
+                slice = next;
+            }
+        }
+    }
+
     std::vector<RdmaTask> task_list;
+    std::vector<RdmaSlice *> slice_chain;
     const size_t max_size;
 };
 

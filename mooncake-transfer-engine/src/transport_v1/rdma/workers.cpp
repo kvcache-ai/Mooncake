@@ -22,6 +22,23 @@
 namespace mooncake {
 namespace v1 {
 
+static inline void markSliceSuccess(RdmaSlice *slice) {
+    auto task = slice->task;
+    __sync_fetch_and_add(&task->status.transferred_bytes, slice->length);
+    auto finish_slices = __sync_fetch_and_add(&task->finish_slices, 1);
+    if (finish_slices + 1 == task->num_slices) {
+        task->status.s = Transport::COMPLETED;
+    }
+    // RdmaSliceStorage::Get().deallocate(slice);
+}
+
+static inline void markSliceFailed(RdmaSlice *slice) {
+    auto task = slice->task;
+    __sync_fetch_and_add(&task->finish_slices, 1);
+    task->status.s = Transport::FAILED;
+    // RdmaSliceStorage::Get().deallocate(slice);
+}
+
 Workers::Workers(RdmaTransport *transport)
     : transport_(transport),
       num_workers_(0),
@@ -36,12 +53,13 @@ int Workers::start() {
     if (!running_) {
         running_ = true;
         stop_flag_ = false;
-        num_workers_ = transport_->params_->workers.num_workers;
-        worker_env_ = new WorkerEnv[num_workers_];
-        for (size_t index = 0; index < num_workers_; ++index) {
-            workers_.emplace_back([this, index] { workerThread(index); });
-        }
         monitor_ = std::thread([this] { monitorThread(); });
+        num_workers_ = transport_->params_->workers.num_workers;
+        worker_context_ = new WorkerContext[num_workers_];
+        for (size_t id = 0; id < num_workers_; ++id) {
+            worker_context_[id].thread =
+                std::thread([this, id] { workerThread(id); });
+        }
     }
     return 0;
 }
@@ -53,93 +71,58 @@ int Workers::stop() {
         stop_flag_ = true;
     }
     cv_.notify_all();
-    for (std::thread &worker : workers_) {
-        worker.join();
+    for (size_t id = 0; id < num_workers_; ++id) {
+        worker_context_[id].thread.join();
     }
     monitor_.join();
-    delete[] worker_env_;
-    worker_env_ = nullptr;
+    delete[] worker_context_;
+    worker_context_ = nullptr;
     running_ = false;
     return 0;
 }
 
-void Workers::SliceQueue::push(RdmaSlice *first, RdmaSlice *last,
-                               size_t count) {
-    RWSpinlock::WriteGuard guard(lock);
-    auto slice = first;
-    for (size_t i = 0; i < count; ++i) {
-        assert(slice);
-        auto next = slice->next;
-        slice->queue_next = (slice == last) ? nullptr : next;
-        slice = next;
-    }
-    if (!num_entries) {
-        head = first;
-        tail = last;
-    } else {
-        assert(head && tail);
-        tail->queue_next = first;
-        tail = last;
-    }
-    num_entries.fetch_add(count);
-}
-
-RdmaSlice *Workers::SliceQueue::pop(size_t count) {
-    if (!num_entries) return nullptr;
-    RWSpinlock::WriteGuard guard(lock);
-    auto slice = head;
-    if (count >= num_entries) {
-        slice = head;
-        head = tail = nullptr;
-        num_entries.store(0);
-        return slice;
-    }
-    auto cursor = slice;
-    for (size_t i = 0; i < count - 1; ++i) cursor = cursor->queue_next;
-    head = cursor->queue_next;
-    cursor->queue_next = nullptr;
-    num_entries.fetch_sub(count);
-    return slice;
-}
-
-int Workers::submit(RdmaSlice *slice) {
-    int id = SimpleRandom::Get().next(num_workers_);
-    worker_env_[id].slice_queue.push(slice, slice, 1);
-    auto prev_inflight_slices = inflight_slices_.fetch_add(1);
-    if (!prev_inflight_slices) cv_.notify_all();
-    return 0;
-}
+static std::atomic<int> gNextThreadId(0);
+thread_local int tlThreadId =
+    gNextThreadId.fetch_add(1, std::memory_order_relaxed);
 
 int Workers::submit(RdmaSliceList &slice_list) {
-    int id = SimpleRandom::Get().next(num_workers_);
-    worker_env_[id].slice_queue.push(slice_list.first, slice_list.last,
-                                     slice_list.num_slices);
+    int id = tlThreadId % kNumSliceQueue;
+    slice_queue_[id].push(slice_list);
     auto prev_inflight_slices =
         inflight_slices_.fetch_add(slice_list.num_slices);
     if (!prev_inflight_slices) cv_.notify_all();
     return 0;
 }
 
-int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
-
-static inline void markSliceFailed(RdmaSlice *slice) {
-    auto task = slice->task;
-    __sync_fetch_and_add(&task->finish_slices, 1);
-    task->status.s = Transport::FAILED;
+int Workers::submit(RdmaSlice *slice) {
+    RdmaSliceList slice_list;
+    slice_list.first = slice;
+    slice_list.num_slices = 1;
+    return submit(slice_list);
 }
 
-void Workers::asyncPostSend(int thread_id) {
-    const static size_t kMaxSlicesToSend = 32;
-    auto &env = worker_env_[thread_id];
-    auto &remote_buffer = env.remote_buffer;
-    auto slice = env.slice_queue.pop(kMaxSlicesToSend);
-    if (!slice) return;
+int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
 
-    std::unordered_map<std::shared_ptr<RdmaEndPoint>, std::vector<RdmaSlice *>>
-        slice_to_send;
-    int count_slices = 0;
+void Workers::dispatchSendRequests(int thread_id) {
+    const static size_t kMaxSlicesToSend = 128;
+    const static int kMaxProbeCount = 8;
+    std::vector<RdmaSlice *> slice_list;
 
-    for (; slice != nullptr; slice = slice->queue_next) {
+    auto &remote_buffer = worker_context_[thread_id].remote_buffer;
+    auto &requests = worker_context_[thread_id].requests;
+    auto &queue_id = worker_context_[thread_id].queue_id;
+
+    int probe_count = 0;
+    if (queue_id < 0) queue_id = thread_id;
+    while (slice_list.size() < kMaxSlicesToSend &&
+           probe_count < kMaxProbeCount) {
+        slice_queue_[queue_id].pop(kMaxSlicesToSend, slice_list);
+        queue_id += num_workers_;
+        if (queue_id >= kNumSliceQueue) queue_id = thread_id;
+        probe_count++;
+    }
+
+    for (auto slice : slice_list) {
         auto target_id = slice->task->request.target_id;
         std::vector<BufferQueryResult> local, remote;
         int ret = transport_->local_buffer_manager_.query(
@@ -168,41 +151,56 @@ void Workers::asyncPostSend(int thread_id) {
             continue;
         }
 
-        // TODO we assume that each request covers one contingous area
         assert(local.size() == 1 && remote.size() == 1);
-        auto context = transport_->context_set_[local[0].device_id].get();
-
-        auto peer_segment_name = remote_buffer.segmentName(target_id);
-        auto peer_device_name =
-            remote_buffer.deviceName(target_id, remote[0].device_id);
-        auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
-
-        auto endpoint = context->endpoint(peer_name);
-        if (endpoint->status() != RdmaEndPoint::EP_READY) {
-            mutex_.lock();
-            if (endpoint->status() != RdmaEndPoint::EP_READY) {
-                if (doHandshake(endpoint, peer_segment_name,
-                                peer_device_name)) {
-                    __sync_fetch_and_add(&slice->task->finish_slices, 1);
-                    slice->task->status.s = Transport::FAILED;
-                }
-            }
-            mutex_.unlock();
-        }
-
+        auto path = PostPath{.local_device_id = local[0].device_id,
+                             .remote_segment_id = target_id,
+                             .remote_device_id = remote[0].device_id};
         slice->source_lkey = local[0].lkey;
         slice->target_rkey = remote[0].rkey;
-        slice_to_send[endpoint].push_back(slice);
-        count_slices++;
+        requests[path].slices.push_back(slice);
     }
+}
 
-    for (auto entry : slice_to_send) {
-        int ret = entry.first->submitSlices(entry.second);
-        int slice_index = 0;
-        for (auto slice : entry.second) {
-            if (slice_index >= ret) {
-                submit(slice);
-            } else if (slice->failed) {
+void Workers::asyncPostSend(int thread_id) {
+    auto &remote_buffer = worker_context_[thread_id].remote_buffer;
+    auto &requests = worker_context_[thread_id].requests;
+    dispatchSendRequests(thread_id);
+
+    for (auto &entry : requests) {
+        auto &path = entry.first;
+        auto &endpoint = entry.second.endpoint;
+        auto &slices = entry.second.slices;
+        if (!endpoint) {
+            auto context = transport_->context_set_[path.local_device_id].get();
+            auto peer_name = std::to_string(path.local_device_id) + "/" +
+                             std::to_string(path.remote_segment_id) + "/" +
+                             std::to_string(path.remote_device_id);
+            endpoint = context->endpoint(peer_name);
+            if (endpoint->status() != RdmaEndPoint::EP_READY) {
+                mutex_.lock();
+                if (endpoint->status() != RdmaEndPoint::EP_READY) {
+                    auto peer_segment_name =
+                        remote_buffer.segmentName(path.remote_segment_id);
+                    auto peer_device_name = remote_buffer.deviceName(
+                        path.remote_segment_id, path.remote_device_id);
+                    if (doHandshake(endpoint, peer_segment_name,
+                                    peer_device_name)) {
+                        for (auto slice : slices) {
+                            __sync_fetch_and_add(&slice->task->finish_slices,
+                                                 1);
+                            slice->task->status.s = Transport::FAILED;
+                        }
+                    }
+                }
+                mutex_.unlock();
+            }
+        }
+
+        if (slices.empty()) continue;
+        int num_submitted = endpoint->submitSlices(slices);
+        for (int id = 0; id < num_submitted; ++id) {
+            auto slice = slices[id];
+            if (slice->failed) {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
@@ -211,8 +209,9 @@ void Workers::asyncPostSend(int thread_id) {
                     submit(slice);
                 }
             }
-            slice_index++;
         }
+        if (num_submitted)
+            slices.erase(slices.begin(), slices.begin() + num_submitted);
     }
 }
 
@@ -245,7 +244,7 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
 }
 
 void Workers::asyncPollCq(int thread_id) {
-    const static size_t kPollCount = 32;
+    const static size_t kPollCount = 64;
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
     for (int index = thread_id; index < num_contexts * num_cq_list;
@@ -275,20 +274,12 @@ void Workers::asyncPollCq(int thread_id) {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    __sync_fetch_and_add(&slice->task->finish_slices, 1);
-                    slice->task->status.s = Transport::FAILED;
+                    markSliceFailed(slice);
                 } else {
                     submit(slice);
                 }
             } else {
-                auto task = slice->task;
-                __sync_fetch_and_add(&task->status.transferred_bytes,
-                                     slice->length);
-                auto finish_slices =
-                    __sync_fetch_and_add(&task->finish_slices, 1);
-                if (finish_slices + 1 == task->slice_list.num_slices) {
-                    task->status.s = Transport::COMPLETED;
-                }
+                markSliceSuccess(slice);
             }
         }
         if (nr_poll > 0) {
