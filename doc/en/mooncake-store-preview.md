@@ -358,6 +358,18 @@ virtual std::shared_ptr<BufHandle> Allocate(
 - Load-based allocation strategy: Prioritizes low-load segments based on current load information of storage segments.
 - Topology-aware strategy: Prioritizes data segments that are physically closer to reduce network overhead.
 
+### Eviction Policy
+
+When the mounted segments are full, i.e., when a `PutStart` request fails due to insufficient memory, an eviction task will be launched to free up space by evicting some objects. Just like `Remove`, evicted objects are simply marked as deleted. No data transfer is needed.
+
+Currently, an approximate LRU policy is adopted, where the least recently used items are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
+
+### Lease
+
+To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
+
+The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
+
 ## Mooncake Store Python API
 
 ### setup
