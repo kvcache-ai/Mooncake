@@ -15,21 +15,28 @@ DistributedObjectStore::~DistributedObjectStore() {
         }
     }
 }
-
 int DistributedObjectStore::setup(const std::string &local_hostname,
                                   const std::string &metadata_server,
                                   size_t global_segment_size,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_addr) {
+                                  const std::string &master_server_addr
+                                  const std::string &storage_root_path) {
     this->protocol = protocol;
     this->local_hostname = local_hostname;  // Save the local hostname
     client_ = std::make_unique<mooncake::Client>();
 
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
-    client_->Init(local_hostname, metadata_server, protocol, args,
-                  master_server_addr);
+    auto client_opt =
+        mooncake::Client::Create(this->local_hostname, metadata_server,
+                                 protocol, args, master_server_addr,
+                                 storage_root_path);
+    if (!client_opt) {
+        LOG(ERROR) << "Failed to create client";
+        return 1;
+    }
+    client_ = *client_opt;
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
@@ -53,10 +60,12 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
 int DistributedObjectStore::initAll(const std::string &protocol_,
                                     const std::string &device_name,
-                                    size_t mount_segment_size) {
+                                    size_t mount_segment_size,
+                                    const std::string &storage_root_path) {
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
     return setup("localhost:12345", "127.0.0.1:2379", mount_segment_size,
-                 buffer_allocator_size, protocol_, device_name);
+                 buffer_allocator_size, protocol_, device_name,
+                 storage_root_path);
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,

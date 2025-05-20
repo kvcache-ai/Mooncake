@@ -18,6 +18,7 @@ DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
 DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8090/metadata",
               "Metadata connection string for transfer engine");
+DEFINE_string(storage_root_path, "", "Storage root path");
 
 namespace mooncake {
 namespace testing {
@@ -72,7 +73,8 @@ class ClientIntegrationTest : public ::testing::Test {
             "localhost:17812",                   // Local hostname
             FLAGS_transfer_engine_metadata_url,  // Metadata connection string
             FLAGS_protocol, args,
-            "localhost:50051"  // Master server address
+            "localhost:50051",  // Master server address
+            FLAGS_storage_root_path
         );
 
         ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
