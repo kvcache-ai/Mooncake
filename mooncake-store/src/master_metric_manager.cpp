@@ -30,7 +30,7 @@ MasterMetricManager::MasterMetricManager()
       // Initialize Counters
       eviction_success_("master_successful_evictions",
                        "Total number of successful eviction operations"),
-      eviction_attempts_("master_attemped_eviction",
+      eviction_attempts_("master_attempted_eviction",
                          "Total number of attempted eviction operations"),
       evicted_key_count_("master_evicted_key_count",
                         "Total number of keys evicted"),
