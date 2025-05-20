@@ -67,7 +67,7 @@ class Transport {
         virtual ~SubBatch() {}
     };
 
-    using SubBatchRef = std::shared_ptr<SubBatch>;
+    using SubBatchRef = SubBatch *;
 
    public:
     Transport() = default;

@@ -64,7 +64,8 @@ RdmaSlice* RdmaSliceStorage::allocate() {
 
 void RdmaSliceStorage::deallocate(RdmaSlice* slice) {
     tl_slice.free_list.push_back(slice);
-    if (tl_slice.free_list.size() > kMaxFreeListSizeInThread && mutex_.try_lock()) {
+    if (tl_slice.free_list.size() > kMaxFreeListSizeInThread &&
+        mutex_.try_lock()) {
         while (!tl_slice.free_list.empty()) {
             RdmaSlice* slice = tl_slice.free_list.back();
             tl_slice.free_list.pop_back();

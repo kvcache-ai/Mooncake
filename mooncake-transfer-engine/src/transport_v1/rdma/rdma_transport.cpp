@@ -86,7 +86,7 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to upload local segment descriptor");
     }
 
-    workers_ = std::make_shared<Workers>(this);
+    workers_ = std::make_unique<Workers>(this);
     workers_->start();
 
     installed_ = true;
@@ -107,20 +107,20 @@ Status RdmaTransport::uninstall() {
 }
 
 Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
-    batch = std::make_shared<RdmaSubBatch>(max_size);
+    batch = new RdmaSubBatch(max_size);
     return Status::OK();
 }
 
 Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
-    auto rdma_batch = std::dynamic_pointer_cast<RdmaSubBatch>(batch);
+    auto rdma_batch = (RdmaSubBatch *)(batch);
     if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
-    rdma_batch.reset();
+    delete rdma_batch;
     return Status::OK();
 }
 
 Status RdmaTransport::submitTransferTasks(
     SubBatchRef &batch, const std::vector<Request> &request_list) {
-    auto rdma_batch = std::dynamic_pointer_cast<RdmaSubBatch>(batch);
+    auto rdma_batch = (RdmaSubBatch *)(batch);
     if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
     if (request_list.size() + rdma_batch->task_list.size() >
         rdma_batch->max_size)
@@ -133,6 +133,8 @@ Status RdmaTransport::submitTransferTasks(
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
         task.num_slices = 0;
+        task.status_word = Transport::WAITING;
+        task.transferred_bytes = 0;
         for (uint64_t offset = 0; offset < request.length;
              offset += block_size) {
             auto slice = RdmaSliceStorage::Get().allocate();
@@ -161,13 +163,14 @@ Status RdmaTransport::submitTransferTasks(
 
 Transport::TransferStatus RdmaTransport::getTransferStatus(SubBatchRef &batch,
                                                            int request_index) {
-    auto rdma_batch = std::dynamic_pointer_cast<RdmaSubBatch>(batch);
+    auto rdma_batch = (RdmaSubBatch *)(batch);
     if (!rdma_batch) return TransferStatus{INVALID, 0};
     if (request_index < 0 ||
         request_index >= (int)rdma_batch->task_list.size()) {
         return TransferStatus{INVALID, 0};
     }
-    return rdma_batch->task_list[request_index].status;
+    auto &task = rdma_batch->task_list[request_index];
+    return TransferStatus{task.status_word, task.transferred_bytes};
 }
 
 Status RdmaTransport::registerLocalMemory(

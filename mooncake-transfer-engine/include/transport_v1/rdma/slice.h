@@ -40,7 +40,9 @@ struct RdmaSliceList {
 struct RdmaTask {
     int num_slices;
     Transport::Request request;
-    Transport::TransferStatus status;
+    // Transport::TransferStatus status;
+    volatile Transport::TransferStatusEnum status_word;
+    volatile size_t transferred_bytes;
     uint64_t padding1[8];
 
     volatile int finish_slices = 0;  // including success or failed

@@ -24,10 +24,10 @@ namespace v1 {
 
 static inline void markSliceSuccess(RdmaSlice *slice) {
     auto task = slice->task;
-    __sync_fetch_and_add(&task->status.transferred_bytes, slice->length);
+    __sync_fetch_and_add(&task->transferred_bytes, slice->length);
     auto finish_slices = __sync_fetch_and_add(&task->finish_slices, 1);
     if (finish_slices + 1 == task->num_slices) {
-        task->status.s = Transport::COMPLETED;
+        task->status_word = Transport::COMPLETED;
     }
     // RdmaSliceStorage::Get().deallocate(slice);
 }
@@ -35,7 +35,7 @@ static inline void markSliceSuccess(RdmaSlice *slice) {
 static inline void markSliceFailed(RdmaSlice *slice) {
     auto task = slice->task;
     __sync_fetch_and_add(&task->finish_slices, 1);
-    task->status.s = Transport::FAILED;
+    task->status_word = Transport::FAILED;
     // RdmaSliceStorage::Get().deallocate(slice);
 }
 
@@ -157,8 +157,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (endpoint->status() != RdmaEndPoint::EP_READY &&
-            doHandshake(endpoint, peer_segment_name,
-                        peer_device_name)) {
+            doHandshake(endpoint, peer_segment_name, peer_device_name)) {
             return nullptr;
         }
     }

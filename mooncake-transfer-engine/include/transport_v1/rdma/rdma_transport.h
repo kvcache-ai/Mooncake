@@ -123,7 +123,7 @@ class RdmaTransport : public Transport {
     LocalBufferManager local_buffer_manager_;
     RdmaContextSet context_set_;
     std::unordered_map<std::string, int> context_name_lookup_;
-    std::shared_ptr<Workers> workers_;
+    std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
 };
 }  // namespace v1

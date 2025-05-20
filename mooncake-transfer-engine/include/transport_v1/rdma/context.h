@@ -127,7 +127,7 @@ class RdmaContext {
     std::unordered_set<ibv_mr *> mr_set_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
-    std::vector< std::shared_ptr<RdmaCQ> > cq_list_;
+    std::vector<RdmaCQ *> cq_list_;
 };
 
 }  // namespace v1

@@ -210,7 +210,7 @@ int RdmaContext::enable() {
     }
 
     for (int i = 0; i < params_->device.num_cq_list; ++i) {
-        auto cq = std::make_shared<RdmaCQ>();
+        auto cq = new RdmaCQ();
         int ret = cq->construct(this, params_->device.max_cqe, i);
         if (ret) {
             disable();
@@ -235,6 +235,9 @@ int RdmaContext::disable() {
         if (ret) PLOG(ERROR) << "ibv_dereg_mr";
     }
     mr_set_.clear();
+    for (auto &entry : cq_list_) {
+        delete entry;
+    }
     cq_list_.clear();
 
     if (event_fd_ >= 0) {
@@ -309,7 +312,7 @@ std::string RdmaContext::gid() const {
 RdmaCQ *RdmaContext::cq(int index) {
     CHECK_STATUS(DEVICE_ENABLED);
     if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
-    return cq_list_[index].get();
+    return cq_list_[index];
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
