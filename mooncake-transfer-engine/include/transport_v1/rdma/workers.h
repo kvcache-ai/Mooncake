@@ -31,10 +31,12 @@ class Workers {
    public:
     struct BoundedSliceQueue {
         const static size_t kCapacity = 1024 * 64;
-        std::atomic<uint64_t> head, tail;
+        std::atomic<uint64_t> head;
+        uint64_t padding1[7];
+        std::atomic<uint64_t> tail;
+        uint64_t padding2[7];
         std::mutex mutex;
         RdmaSliceList *entries;
-        uint64_t padding[8];
 
         BoundedSliceQueue() { entries = new RdmaSliceList[kCapacity]; }
 
@@ -65,6 +67,16 @@ class Workers {
                 RdmaSliceList empty_result;
                 return empty_result;
             }
+        }
+
+        void pop(std::vector<RdmaSliceList> &result) {
+            uint64_t current_head = head.load(std::memory_order_relaxed);
+            while (current_head != tail.load(std::memory_order_acquire)) {
+                result.push_back(entries[current_head]);
+                current_head = (current_head + 1) % kCapacity;
+            }
+            if (!result.empty())
+                head.store(current_head, std::memory_order_release);
         }
     };
 
@@ -105,10 +117,8 @@ class Workers {
     size_t num_workers_;
     std::thread monitor_;
 
-    std::mutex mutex_;
-    std::condition_variable cv_;
     std::atomic<bool> running_;
-    bool stop_flag_;
+    std::mutex ep_mutex_;
 
     struct PostPath {
         int local_device_id;
@@ -141,6 +151,18 @@ class Workers {
         BoundedSliceQueue queue;
         GroupedRequests requests;
         std::atomic<int64_t> inflight_slices = 0;
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool in_suspend = false;
+
+        void notifyIfNeeded() {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (in_suspend) {
+                in_suspend = false;
+                cv.notify_all();
+            }
+        }
     };
 
     WorkerContext *worker_context_;

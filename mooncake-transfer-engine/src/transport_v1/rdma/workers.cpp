@@ -29,14 +29,12 @@ static inline void markSliceSuccess(RdmaSlice *slice) {
     if (finish_slices + 1 == task->num_slices) {
         task->status_word = Transport::COMPLETED;
     }
-    // RdmaSliceStorage::Get().deallocate(slice);
 }
 
 static inline void markSliceFailed(RdmaSlice *slice) {
     auto task = slice->task;
     __sync_fetch_and_add(&task->finish_slices, 1);
     task->status_word = Transport::FAILED;
-    // RdmaSliceStorage::Get().deallocate(slice);
 }
 
 Workers::Workers(RdmaTransport *transport)
@@ -49,7 +47,6 @@ Workers::~Workers() {
 int Workers::start() {
     if (!running_) {
         running_ = true;
-        stop_flag_ = false;
         monitor_ = std::thread([this] { monitorThread(); });
         num_workers_ = transport_->params_->workers.num_workers;
         worker_context_ = new WorkerContext[num_workers_];
@@ -63,18 +60,15 @@ int Workers::start() {
 
 int Workers::stop() {
     if (!running_) return 0;
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        stop_flag_ = true;
-    }
-    cv_.notify_all();
+    running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
-        worker_context_[id].thread.join();
+        auto &worker = worker_context_[id];
+        worker.notifyIfNeeded();
+        worker.thread.join();
     }
     monitor_.join();
     delete[] worker_context_;
     worker_context_ = nullptr;
-    running_ = false;
     return 0;
 }
 
@@ -93,6 +87,7 @@ int Workers::submit(RdmaSliceList &slice_list) {
 
     for (int slice_id = 0; slice_id < slice_list.num_slices;
          ++slice_id, slice = slice->next) {
+        // TODO Hotspot Here!!!
         auto target_id = slice->task->request.target_id;
         std::vector<BufferQueryResult> local, remote;
         int ret = transport_->local_buffer_manager_.query(
@@ -127,9 +122,9 @@ int Workers::submit(RdmaSliceList &slice_list) {
     }
 
     worker.queue.push(slice_list);
-    auto prev_inflight_slices =
-        worker.inflight_slices.fetch_add(slice_list.num_slices);
-    if (!prev_inflight_slices) cv_.notify_all();
+    if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
+        worker.notifyIfNeeded();
+    }
     return 0;
 }
 
@@ -155,7 +150,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
     endpoint = context->endpoint(peer_name);
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(ep_mutex_);
         if (endpoint->status() != RdmaEndPoint::EP_READY &&
             doHandshake(endpoint, peer_segment_name, peer_device_name)) {
             return nullptr;
@@ -166,15 +161,16 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 
 void Workers::asyncPostSend(int thread_id) {
     auto &worker = worker_context_[thread_id];
-    while (true) {
-        auto slice_list = worker.queue.pop();
-        if (slice_list.num_slices == 0) break;
+    std::vector<RdmaSliceList> result;
+    worker.queue.pop(result);
+    for (auto &slice_list : result) {
+        if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
             PostPath path{.local_device_id = slice->source_dev_id,
                           .remote_segment_id = slice->task->request.target_id,
                           .remote_device_id = slice->target_dev_id};
-            worker.requests[path].push_back(slice);
+            worker.requests[path].push_back(slice);  // 0.02
             slice = slice->next;
         }
     }
@@ -184,7 +180,7 @@ void Workers::asyncPostSend(int thread_id) {
         auto &slices = entry.second;
         if (slices.empty()) continue;
 
-        auto endpoint = getEndpoint(path);
+        auto endpoint = getEndpoint(path);  // 0.01
         if (!endpoint) {
             for (auto slice : slices) markSliceFailed(slice);
             continue;
@@ -294,23 +290,25 @@ void Workers::asyncPollCq(int thread_id) {
 }
 
 void Workers::workerThread(int thread_id) {
-    auto &inflight_slices = worker_context_[thread_id].inflight_slices;
-    while (!stop_flag_) {
-        bool executed = true;
-        if (inflight_slices.load(std::memory_order_relaxed) == 0) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::microseconds(100),
-                         [this, &inflight_slices]() {
-                             return inflight_slices > 0 || stop_flag_;
-                         });
-            if (stop_flag_) {
-                break;
-            }
-            executed = (inflight_slices > 0);
-        }
-        if (executed) {
+    auto &worker = worker_context_[thread_id];
+    uint64_t grace_ts = 0;
+    while (running_) {
+        auto current_ts = getCurrentTimeInNano();
+        auto inflight_slices =
+            worker.inflight_slices.load(std::memory_order_relaxed);
+        if (inflight_slices ||
+            current_ts - grace_ts <
+                transport_->params_->workers.grace_period_ns) {
             asyncPostSend(thread_id);
             asyncPollCq(thread_id);
+            if (inflight_slices) grace_ts = current_ts;
+        } else {
+            std::unique_lock<std::mutex> lock(worker.mutex);
+            if (worker.inflight_slices.load(std::memory_order_relaxed) ||
+                !running_)
+                continue;
+            worker.in_suspend = true;
+            worker.cv.wait_for(lock, std::chrono::milliseconds(1));
         }
     }
 }
@@ -338,10 +336,9 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext> &context) {
 }
 
 void Workers::monitorThread() {
-    while (true) {
+    while (running_) {
         for (auto &context : transport_->context_set_) {
             struct epoll_event event;
-            if (stop_flag_) return;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
             if (num_events < 0) {
                 PLOG(ERROR) << "Worker: epoll_wait()";
