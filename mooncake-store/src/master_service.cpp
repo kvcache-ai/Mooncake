@@ -468,62 +468,7 @@ void MasterService::GCThreadFunc() {
         }
 
         if (need_eviction_) {
-            auto now = std::chrono::steady_clock::now();
-            long evicted_count = 0;
-            long object_count = 0;
-            uint64_t total_freed_size = 0;
-            for (auto& shard : metadata_shards_) {
-                std::unique_lock lock(shard.mutex);
-                object_count += shard.metadata.size();
-                std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
-                for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
-                    // Only evict objects that have not expired and are complete
-                    if (it->second.IsLeaseExpired(now)
-                        && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                        candidates.push_back(it->second.lease_timeout);
-                    }
-                }
-                if (!candidates.empty()) {
-                    // Evict about 10% of the objects
-                    // but at least 1 object and at most the candidates.size()
-                    const size_t kMinEvictionSize = 1;
-                    const size_t kMaxEvictionSize = candidates.size();
-                    size_t evict_num = std::max(shard.metadata.size() / 10, kMinEvictionSize);
-                    evict_num = std::min(evict_num, kMaxEvictionSize);
-                    std::nth_element(candidates.begin(),
-                                   candidates.begin() + (evict_num - 1),
-                                   candidates.end());
-                    auto target = candidates[evict_num - 1];
-                    // Evict objects with lease timeout less than or equal to target.
-                    // The actual evicted number may not be exactly evict_num.
-                    auto it = shard.metadata.begin();
-                    while (it != shard.metadata.end()) {
-                        if (it->second.lease_timeout <= target
-                        && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                            total_freed_size += it->second.size * it->second.replicas.size();
-                            it = shard.metadata.erase(it);
-                            evicted_count++;
-                        } else {
-                            ++it;
-                        }
-                    }
-                }
-            }
-
-            if (evicted_count > 0) {
-                need_eviction_ = false;
-                MasterMetricManager::instance().dec_key_count(evicted_count);
-                MasterMetricManager::instance().inc_eviction_success(evicted_count, total_freed_size);
-            } else {
-                if (object_count == 0) {
-                    // No objects to evict, no need to check again
-                    need_eviction_ = false;
-                }
-                MasterMetricManager::instance().inc_eviction_fail();
-            }
-            VLOG(1) << "action=evict_objects"
-                    << ", evicted_count=" << evicted_count
-                    << ", total_freed_size=" << total_freed_size;
+            BatchEvict();
         }
 
         std::this_thread::sleep_for(
@@ -536,6 +481,66 @@ void MasterService::GCThreadFunc() {
     }
 
     VLOG(1) << "action=gc_thread_stopped";
+}
+
+void MasterService::BatchEvict() {
+    auto now = std::chrono::steady_clock::now();
+    long evicted_count = 0;
+    long object_count = 0;
+    uint64_t total_freed_size = 0;
+    for (auto& shard : metadata_shards_) {
+        std::unique_lock lock(shard.mutex);
+        object_count += shard.metadata.size();
+        std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
+        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
+            // Only evict objects that have not expired and are complete
+            if (it->second.IsLeaseExpired(now)
+                && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                candidates.push_back(it->second.lease_timeout);
+            }
+        }
+        if (!candidates.empty()) {
+            // Evict about 10% of the objects
+            // but at least 1 object and at most the candidates.size()
+            const long kMinEvictionSize = 1;
+            const long kMaxEvictionSize = candidates.size();
+            long evict_target_num = std::max((long) shard.metadata.size() / 10, kMinEvictionSize);
+            long shard_evicted_count = 0; // number of objects evicted from this shard
+            evict_target_num = std::min(evict_target_num, kMaxEvictionSize);
+            std::nth_element(candidates.begin(),
+                            candidates.begin() + (evict_target_num - 1),
+                            candidates.end());
+            auto target_timeout = candidates[evict_target_num - 1];
+            // Evict objects with lease timeout less than or equal to target.
+            auto it = shard.metadata.begin();
+            while (it != shard.metadata.end() && shard_evicted_count < evict_target_num) {
+                if (it->second.lease_timeout <= target_timeout
+                && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    total_freed_size += it->second.size * it->second.replicas.size();
+                    it = shard.metadata.erase(it);
+                    shard_evicted_count++;
+                } else {
+                    ++it;
+                }
+            }
+            evicted_count += shard_evicted_count;
+        }
+    }
+
+    if (evicted_count > 0) {
+        need_eviction_ = false;
+        MasterMetricManager::instance().dec_key_count(evicted_count);
+        MasterMetricManager::instance().inc_eviction_success(evicted_count, total_freed_size);
+    } else {
+        if (object_count == 0) {
+            // No objects to evict, no need to check again
+            need_eviction_ = false;
+        }
+        MasterMetricManager::instance().inc_eviction_fail();
+    }
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
+            << ", total_freed_size=" << total_freed_size;
 }
 
 }  // namespace mooncake

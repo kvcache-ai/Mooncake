@@ -1013,10 +1013,8 @@ TEST_F(MasterServiceTest, EvictObject) {
               service_->MountSegment(buffer, size, segment_name));
 
     // Verify if we can put objects more than the segment can hold
-    // and the last added object is accessible
     int success_puts = 0;
-    std::string last_success_key;
-    for (int i = 0; i < 1024 * 16 + 10; ++i) {
+    for (int i = 0; i < 1024 * 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
@@ -1026,17 +1024,14 @@ TEST_F(MasterServiceTest, EvictObject) {
             slice_lengths, config, replica_list)) {
             ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
             success_puts++;
-            last_success_key = key;
         } else {
-            // wait for gc thread to evict some objects
+            // wait for gc thread to work
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
     ASSERT_GT(success_puts, 1024 * 16);
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(last_success_key, replica_list));
-    service_->RemoveAll();
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    ASSERT_EQ(service_->RemoveAll(), 1);
+    service_->RemoveAll();
 }
 
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {

@@ -180,6 +180,9 @@ class MasterService {
     // GC thread function
     void GCThreadFunc();
 
+    // Check all shards and try to evict some keys
+    void BatchEvict();
+
     // Internal data structures
     struct ObjectMetadata {
         std::vector<Replica> replicas;

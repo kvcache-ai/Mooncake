@@ -28,9 +28,9 @@ MasterMetricManager::MasterMetricManager()
                                {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
                                 16777216.0, 67108864.0}),
       // Initialize Counters
-      eviction_success_("master_successful_evictions",
+      eviction_success_("master_successful_evictions_total",
                        "Total number of successful eviction operations"),
-      eviction_attempts_("master_attempted_eviction",
+      eviction_attempts_("master_attempted_evictions_total",
                          "Total number of attempted eviction operations"),
       evicted_key_count_("master_evicted_key_count",
                         "Total number of keys evicted"),
