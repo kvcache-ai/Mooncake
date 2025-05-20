@@ -66,7 +66,10 @@ if (USE_CUDA)
   endif()
 
   include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+  link_directories(
+    /usr/local/cuda/lib
+    /usr/local/cuda/lib64
+  )
 elseif(USE_NVMEOF)
   message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
 endif()

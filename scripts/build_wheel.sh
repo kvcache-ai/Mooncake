@@ -91,6 +91,8 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libkeyutils.so* \
 --exclude libresolv.so* \
 --exclude libffi.so* \
+--exclude libcuda.so* \
+--exclude libcudart.so* \
 -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 
