@@ -124,7 +124,7 @@ max_local_cpu_size: 100
 }
 ```
 
-- Launch P endpint using command `bash disagg_vllm_launcher.sh prefiller Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4`
+- Launch P endpoint using command `bash disagg_vllm_launcher.sh prefiller Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4`
 
 6. Launch the LoadBalance endpoint using command
 ```bash
