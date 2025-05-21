@@ -19,6 +19,8 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
+static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL = 200;  // in milliseconds
+static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 
 // Forward declarations
 class BufferAllocator;
@@ -72,6 +74,7 @@ enum class ErrorCode : int32_t {
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
+    OBJECT_HAS_LEASE = -706,       ///< Object has lease.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
