@@ -160,9 +160,10 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
 int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
+    // remove endpoint but leaving it status unchanged
+    // in case it is setting up connection or submitting slice
     if (iter != endpoint_map_.end()) {
         waiting_list_len_++;
-        iter->second.first->set_active(false);
         waiting_list_.insert(iter->second.first);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
