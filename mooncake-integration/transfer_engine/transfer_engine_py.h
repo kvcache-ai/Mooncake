@@ -26,6 +26,7 @@
 
 #include "common/base/status.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"
 
@@ -64,10 +65,10 @@ class TransferEnginePy {
     int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
                           uintptr_t peer_buffer_address, size_t length);
 
-    int64_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
+    batch_id_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
                             uintptr_t peer_buffer_address, size_t length);
 
-    int transferCheckStatus(int64_t batch_id);
+    int transferCheckStatus(batch_id_t batch_id);
 
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length);
