@@ -66,11 +66,18 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
     return ErrorCode::OK;
 }
 
-MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl)
+MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
+                            double eviction_ratio)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
-      default_kv_lease_ttl_(default_kv_lease_ttl) {
+      default_kv_lease_ttl_(default_kv_lease_ttl),
+      eviction_ratio_(eviction_ratio) {
+        if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
+            LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
+                       << "current value: " << eviction_ratio_;
+            throw std::invalid_argument("Invalid eviction ratio");
+        }
         gc_running_ = true;
         gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
         VLOG(1) << "action=start_gc_thread";
@@ -467,7 +474,7 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
-        if (need_eviction_) {
+        if (need_eviction_ && eviction_ratio_ > 0.0) {
             BatchEvict();
         }
 
@@ -488,9 +495,27 @@ void MasterService::BatchEvict() {
     long evicted_count = 0;
     long object_count = 0;
     uint64_t total_freed_size = 0;
-    for (auto& shard : metadata_shards_) {
+
+    // Randomly select a starting shard to avoid inbalance eviction between shards.
+    // No need to use expensive random_device here.
+    size_t start_idx = rand() % metadata_shards_.size();
+    for (size_t i = 0; i < metadata_shards_.size(); i++) {
+        auto& shard = metadata_shards_[(start_idx + i) % metadata_shards_.size()];
         std::unique_lock lock(shard.mutex);
+
+        // object_count must be updated at beginning as it will be used later
+        // to compute ideal_evict_num
         object_count += shard.metadata.size();
+
+        // To achieve evicted_count / object_count = eviction_ration,
+        // ideally how many object should be evicted in this shard
+        const long ideal_evict_num = std::ceil(object_count * eviction_ratio_) - evicted_count;
+
+        if (ideal_evict_num <= 0) {
+            // No need to evict any object in this shard
+            continue;
+        }
+
         std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
             // Only evict objects that have not expired and are complete
@@ -500,20 +525,15 @@ void MasterService::BatchEvict() {
             }
         }
         if (!candidates.empty()) {
-            // Evict about 10% of the objects
-            // but at least 1 object and at most the candidates.size()
-            const long kMinEvictionSize = 1;
-            const long kMaxEvictionSize = candidates.size();
-            long evict_target_num = std::max((long) shard.metadata.size() / 10, kMinEvictionSize);
+            long evict_num = std::min(ideal_evict_num, (long) candidates.size());
             long shard_evicted_count = 0; // number of objects evicted from this shard
-            evict_target_num = std::min(evict_target_num, kMaxEvictionSize);
             std::nth_element(candidates.begin(),
-                            candidates.begin() + (evict_target_num - 1),
+                            candidates.begin() + (evict_num - 1),
                             candidates.end());
-            auto target_timeout = candidates[evict_target_num - 1];
+            auto target_timeout = candidates[evict_num - 1];
             // Evict objects with lease timeout less than or equal to target.
             auto it = shard.metadata.begin();
-            while (it != shard.metadata.end() && shard_evicted_count < evict_target_num) {
+            while (it != shard.metadata.end() && shard_evicted_count < evict_num) {
                 if (it->second.lease_timeout <= target_timeout
                 && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                     total_freed_size += it->second.size * it->second.replicas.size();

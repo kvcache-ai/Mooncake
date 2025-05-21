@@ -362,7 +362,9 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 When the mounted segments are full, i.e., when a `PutStart` request fails due to insufficient memory, an eviction task will be launched to free up space by evicting some objects. Just like `Remove`, evicted objects are simply marked as deleted. No data transfer is needed.
 
-Currently, an approximate LRU policy is adopted, where the least recently used items are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
+Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
+
+Each time the eviction task is triggered, in default it will try to evict about 10% of objects. This ratio is configurable via a startup parameter of `master_service`.
 
 ### Lease
 

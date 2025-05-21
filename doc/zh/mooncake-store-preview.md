@@ -376,6 +376,8 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 目前采用的是一种近似的 LRU 策略，即尽可能优先换出最近最少被访问的对象。为了避免数据竞争和数据损坏，正在被客户端读取或写入的对象不会被换出。因此，拥有租约或尚未被 `PutEnd` 请求标记为 complete 的对象不会被换出。
 
+每次替换任务被触发时，会尝试换出大约 10% 的对象，这个比例可通过 `master_service` 的启动参数进行配置。
+
 ### 租约机制
 
 为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。

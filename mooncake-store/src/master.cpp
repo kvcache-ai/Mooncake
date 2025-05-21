@@ -18,11 +18,19 @@ DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
             "Default lease time for kv objects");
+DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO, "Ratio of objects to evict when storage space is full");
+DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
 
 int main(int argc, char* argv[]) {
+    easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
-    easylog::set_min_severity(easylog::Severity::WARN);
 
     // init rpc server
     coro_rpc_server server(
@@ -35,7 +43,8 @@ int main(int argc, char* argv[]) {
               << ", max_threads=" << FLAGS_max_threads
               << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting
               << ", metrics_port=" << FLAGS_metrics_port
-              << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl;
+              << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
+              << ", eviction_ratio=" << FLAGS_eviction_ratio;
 
     mooncake::WrappedMasterService wrapped_master_service(
         FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
