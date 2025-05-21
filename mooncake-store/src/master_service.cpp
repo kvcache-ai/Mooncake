@@ -496,7 +496,7 @@ void MasterService::BatchEvict() {
     long object_count = 0;
     uint64_t total_freed_size = 0;
 
-    // Randomly select a starting shard to avoid inbalance eviction between shards.
+    // Randomly select a starting shard to avoid imbalance eviction between shards.
     // No need to use expensive random_device here.
     size_t start_idx = rand() % metadata_shards_.size();
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
