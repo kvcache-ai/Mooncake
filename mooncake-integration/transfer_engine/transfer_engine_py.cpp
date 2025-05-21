@@ -328,7 +328,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     return -1;
 }
 
-int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
+int64_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
                                           uintptr_t buffer,
                                           uintptr_t peer_buffer_address,
                                           size_t length) {
@@ -356,7 +356,7 @@ int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
     return batch_id;
 }
 
-int TransferEnginePy::transferCheckStatus(int batch_id) {
+int TransferEnginePy::transferCheckStatus(int64_t batch_id) {
     pybind11::gil_scoped_release release;
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
