@@ -409,7 +409,6 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::initializeRdmaResources() {
-    std::vector<int> device_speed_list;
     auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
@@ -422,7 +421,6 @@ int RdmaTransport::initializeRdmaResources() {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
         } else {
-            device_speed_list.push_back(context->activeSpeed());
             context_list_.push_back(context);
         }
     }
