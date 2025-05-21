@@ -28,6 +28,15 @@ MasterMetricManager::MasterMetricManager()
                                {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
                                 16777216.0, 67108864.0}),
       // Initialize Counters
+      eviction_success_("master_successful_evictions_total",
+                       "Total number of successful eviction operations"),
+      eviction_attempts_("master_attempted_evictions_total",
+                         "Total number of attempted eviction operations"),
+      evicted_key_count_("master_evicted_key_count",
+                        "Total number of keys evicted"),
+      evicted_size_("master_evicted_size_bytes",
+                    "Total bytes of evicted objects"),
+
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
@@ -96,6 +105,18 @@ double MasterMetricManager::get_global_used_ratio(void) {
         return 0.0;
     }
     return allocated / capacity;
+}
+
+// Eviction Metrics
+void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
+    evicted_key_count_.inc(key_count);
+    evicted_size_.inc(size);
+    eviction_success_.inc();
+    eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_eviction_fail() {
+    eviction_attempts_.inc();
 }
 
 // Key/Value Metrics
