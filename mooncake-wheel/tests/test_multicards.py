@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from mooncake_vllm_adaptor import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 class TestMultiCards(unittest.TestCase):
     @classmethod

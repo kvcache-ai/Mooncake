@@ -28,11 +28,10 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
 kill $MASTER_PID || true
 
-echo "Running vllm integration with multicards tests..."
+echo "Running with multicards tests..."
 mooncake_master &
 MASTER_PID=$!
 sleep 1
-cd ../../mooncake-integration/tests
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_multicards.py
 kill $MASTER_PID || true
 
