@@ -128,7 +128,7 @@ max_local_cpu_size: 100
 
 6. Launch the LoadBalance endpoint using command
 ```bash
-python3 disagg_proxy_server.py --host localhost --port 9000 --prefiller-host 192.168.0.147 --prefiller-port 8100 --decoder-host 192.168.0.143 --decoder-port 8200 
+python3 disagg_proxy_server.py --host localhost --port 9000 --prefiller-host IP_of_Machine_B --prefiller-port 8100 --decoder-host IP_of_Machine_B --decoder-port 8200 
 ```
 
 7. Now we can send the requests to LoadBalance to test PD separation.
