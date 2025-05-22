@@ -90,6 +90,7 @@ int RdmaEndPoint::deconstruct() {
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+            wr_depth_list_[i] = 0;
         }
     }
     qp_list_.clear();
@@ -239,6 +240,7 @@ void RdmaEndPoint::disconnectUnlocked() {
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+            wr_depth_list_[i] = 0;
         }
     }
     status_.store(UNCONNECTED, std::memory_order_release);
