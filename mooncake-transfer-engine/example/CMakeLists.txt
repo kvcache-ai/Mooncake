@@ -3,3 +3,6 @@ target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 
 add_executable(memory_pool memory_pool.cpp)
 target_link_libraries(memory_pool PUBLIC transfer_engine)
+
+add_executable(transfer_engine_bench_new transfer_engine_bench_new.cpp)
+target_link_libraries(transfer_engine_bench_new PUBLIC transfer_engine)

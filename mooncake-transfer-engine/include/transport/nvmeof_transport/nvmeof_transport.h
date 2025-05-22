@@ -25,7 +25,7 @@
 
 #include "cufile_context.h"
 #include "cufile_desc_pool.h"
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {

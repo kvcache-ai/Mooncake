@@ -46,13 +46,6 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
-
-DEFINE_string(device_name, "erdma_1",
-              "Device name to use, valid if protocol=rdma");
-DEFINE_string(nic_priority_matrix, "",
-              "Path to RDMA NIC priority matrix file (Advanced)");
-
 // python /workspace/Mooncake/mooncake-transfer-engine/scripts/register.py localhost test_nvmeof /workspace/sample
 DEFINE_string(segment_id, "nvmeof/test_nvmeof", "Segment ID to access data");
 
@@ -71,10 +64,9 @@ class NVMeofTransportTest : public ::testing::Test {
     std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t ram_buffer_size = 1ull << 30;
     Transport *xport;
-    std::string nic_priority_matrix;
     void **args;
-    mooncake::Transport::SegmentID segment_id;
-    std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
+    mooncake::SegmentID segment_id;
+    std::shared_ptr<SegmentDesc> segment_desc;
     uint64_t remote_base;
 
    protected:

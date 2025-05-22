@@ -30,10 +30,10 @@
 #include <thread>
 #include <vector>
 
-#include "memory_location.h"
-#include "multi_transport.h"
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
+#include "transport/multi_transport.h"
 #include "transport/transport.h"
+#include "utility/memory_location.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #endif
@@ -43,7 +43,6 @@ using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentHandle = Transport::SegmentHandle;
-using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
 
@@ -102,7 +101,8 @@ class TransferEngine {
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location = kWildcardLocation,
                             bool remote_accessible = true,
-                            bool update_metadata = true);
+                            bool update_metadata = true,
+                            const std::string &shm_path = "");
 
     int unregisterLocalMemory(void *addr, bool update_metadata = true);
 
@@ -146,9 +146,7 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) {
-        auto_discover_ = auto_discover;
-    }
+    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
     void setWhitelistFilters(std::vector<std::string> &&filters) {
         filter_ = std::move(filters);

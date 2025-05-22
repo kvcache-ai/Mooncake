@@ -27,18 +27,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "transfer_metadata.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
 class TransferMetadata;
 
 class CxlTransport : public Transport {
-   public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
-
    public:
     CxlTransport();
 

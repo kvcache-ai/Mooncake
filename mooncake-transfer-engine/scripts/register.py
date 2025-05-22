@@ -36,7 +36,7 @@ if __name__ == "__main__":
     server_name = socket.gethostname()
     etcd = etcd3.client(host=etcd_host, port=2379)
     value = {}
-    value['server_name'] = server_name
+    value['name'] = server_name
     value['protocol'] = "nvmeof"
     value['buffers'] = []
     for file in files:
