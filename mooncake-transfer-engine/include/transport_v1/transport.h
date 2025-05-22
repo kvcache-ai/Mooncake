@@ -82,26 +82,29 @@ class Transport {
 
     virtual Status uninstall() { return Status::OK(); }
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_batch_size) {
+    virtual Status allocateSubBatch(SubBatchRef batch, size_t max_size) {
         return Status::NotImplemented(
             "generic transport does not implement allocateSubBatch");
     }
 
-    virtual Status freeSubBatch(SubBatchRef &batch) {
+    virtual Status freeSubBatch(SubBatchRef batch) {
         return Status::NotImplemented(
             "generic transport does not implement freeSubBatch");
     }
 
     virtual Status submitTransferTasks(
-        SubBatchRef &batch, const std::vector<Request> &request_list) {
+        SubBatchRef batch, const std::vector<Request> &request_list) {
         return Status::NotImplemented(
             "generic transport does not implement submitTransferTasks");
     }
 
-    virtual TransferStatus getTransferStatus(SubBatchRef &batch,
-                                             int request_index) {
+    virtual TransferStatus getTransferStatus(SubBatchRef batch,
+                                             int task_id) {
         return TransferStatus{TransferStatusEnum::INVALID, 0};
     }
+
+    virtual void queryOutstandingTasks(SubBatchRef batch,
+                                       std::vector<int> &task_id_list) {}
 
     enum BufferVisibility {
         kLocalReadWrite,

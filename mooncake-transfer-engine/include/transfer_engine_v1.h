@@ -45,6 +45,7 @@ using SegmentHandle = SegmentID;
 using TransferRequest = Transport::Request;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
+class Batch;
 
 class TransferEngine {
    public:
@@ -102,15 +103,16 @@ class TransferEngine {
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
    private:
+    void lazyFreeBatch();
+
+   private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<Transport> transport_;
     std::shared_ptr<Topology> local_topology_;
     std::vector<std::string> filter_;
-    struct Batch {
-        Transport::SubBatchRef rdma = nullptr;
-    };
     std::unordered_set<Batch *> batch_set_;
+    std::vector<Batch *> deferred_free_batch_set_;
     std::mutex mutex_;
 };
 }  // namespace v1

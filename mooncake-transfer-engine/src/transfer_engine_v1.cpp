@@ -21,6 +21,12 @@
 
 namespace mooncake {
 namespace v1 {
+
+struct Batch {
+    RdmaSubBatch rdma;
+    size_t max_size;
+};
+
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -131,10 +137,10 @@ int TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
 
 BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     Batch *batch = new Batch();
-    auto status = transport_->allocateSubBatch(batch->rdma, batch_size);
-    if (!status.ok()) {
+    auto ret = transport_->allocateSubBatch(&batch->rdma, batch_size);
+    if (!ret.ok()) {
         delete batch;
-        return 0;
+        return (BatchID)(0);
     }
     mutex_.lock();
     batch_set_.insert(batch);
@@ -145,26 +151,43 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    transport_->freeSubBatch(batch->rdma);
     mutex_.lock();
-    batch_set_.erase(batch);
+    deferred_free_batch_set_.push_back(batch);
     mutex_.unlock();
-    delete batch;
+    lazyFreeBatch();
     return Status::OK();
+}
+
+void TransferEngine::lazyFreeBatch() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = deferred_free_batch_set_.begin();
+         it != deferred_free_batch_set_.end();) {
+        auto &batch = *it;
+        std::vector<int> task_id_list;
+        transport_->queryOutstandingTasks(&batch->rdma, task_id_list);
+        if (task_id_list.empty()) {
+            batch_set_.erase(batch);
+            auto ret = transport_->freeSubBatch(&batch->rdma);
+            delete batch;
+            it = deferred_free_batch_set_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    return transport_->submitTransferTasks(batch->rdma, entries);
+    return transport_->submitTransferTasks(&batch->rdma, entries);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    status = transport_->getTransferStatus(batch->rdma, task_id);
+    status = transport_->getTransferStatus(&batch->rdma, task_id);
     return Status::OK();
 }
 

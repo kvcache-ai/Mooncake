@@ -373,7 +373,7 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
     if (ret) {
         std::string message =
             "[ERR-03] Failed to modify QP to RTR, check mtu, gid, peer lid, "
-            "peer qp num, error code " +
+            "peer qp num, and RDMA connectivity. error code " +
             std::to_string(ret);
         LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
         if (reply_msg) *reply_msg = message;

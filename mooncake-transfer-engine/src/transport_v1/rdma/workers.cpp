@@ -25,15 +25,15 @@ namespace v1 {
 static inline void markSliceSuccess(RdmaSlice *slice) {
     auto task = slice->task;
     __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-    auto finish_slices = __sync_fetch_and_add(&task->finish_slices, 1);
-    if (finish_slices + 1 == task->num_slices) {
+    auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
+    if (success_slices + 1 == task->num_slices) {
         task->status_word = Transport::COMPLETED;
     }
 }
 
 static inline void markSliceFailed(RdmaSlice *slice) {
     auto task = slice->task;
-    __sync_fetch_and_add(&task->finish_slices, 1);
+    __sync_fetch_and_add(&task->failed_slices, 1);
     task->status_word = Transport::FAILED;
 }
 
@@ -208,26 +208,34 @@ void Workers::asyncPostSend(int thread_id) {
 int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                          const std::string &peer_server_name,
                          const std::string &peer_nic_name) {
-    // TODO handling loopback handshake
     HandShakeDesc local_desc, peer_desc;
     local_desc.local_nic_path = MakeNicPath(transport_->local_segment_name_,
                                             endpoint->context().name());
     local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
     local_desc.qp_num = endpoint->qpNum();
-    int rc = transport_->metadata_manager_->sendHandshake(
-        peer_server_name, local_desc, peer_desc);
-    if (rc) return rc;
-    assert(peer_desc.qp_num.size());
 
-    auto segment_desc =
-        transport_->metadata_manager_->getSegmentDescByName(peer_server_name);
+    std::shared_ptr<SegmentDesc> segment_desc;
+    if (local_desc.local_nic_path == local_desc.peer_nic_path) {
+        segment_desc =
+            transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        peer_desc = local_desc;
+    } else {
+        int rc = transport_->metadata_manager_->sendHandshake(
+            peer_server_name, local_desc, peer_desc);
+        if (rc) return rc;
+        assert(peer_desc.qp_num.size());
+        segment_desc =
+            transport_->metadata_manager_->getSegmentDescByName(peer_server_name);
+    }
+
     if (segment_desc) {
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
-        for (auto &nic : detail.devices)
+        for (auto &nic : detail.devices) {
             if (nic.name == peer_nic_name) {
                 return endpoint->configurePeer(nic.gid, nic.lid,
                                                peer_desc.qp_num);
             }
+        }
     }
 
     return ERR_DEVICE_NOT_FOUND;

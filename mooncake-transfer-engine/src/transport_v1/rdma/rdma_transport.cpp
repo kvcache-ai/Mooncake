@@ -106,21 +106,30 @@ Status RdmaTransport::uninstall() {
     return Status::OK();
 }
 
-Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
-    batch = new RdmaSubBatch(max_size);
+Status RdmaTransport::allocateSubBatch(SubBatchRef batch, size_t max_size) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
+    if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
+    rdma_batch->task_list.reserve(max_size);
+    rdma_batch->max_size = max_size;
     return Status::OK();
 }
 
-Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
-    auto rdma_batch = (RdmaSubBatch *)(batch);
+Status RdmaTransport::freeSubBatch(SubBatchRef batch) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
-    delete rdma_batch;
+    for (auto &slice : rdma_batch->slice_chain) {
+        while (slice) {
+            auto next = slice->next;
+            RdmaSliceStorage::Get().deallocate(slice);
+            slice = next;
+        }
+    }
     return Status::OK();
 }
 
 Status RdmaTransport::submitTransferTasks(
-    SubBatchRef &batch, const std::vector<Request> &request_list) {
-    auto rdma_batch = (RdmaSubBatch *)(batch);
+    SubBatchRef batch, const std::vector<Request> &request_list) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
     if (request_list.size() + rdma_batch->task_list.size() >
         rdma_batch->max_size)
@@ -161,17 +170,30 @@ Status RdmaTransport::submitTransferTasks(
     return Status::OK();
 }
 
-Transport::TransferStatus RdmaTransport::getTransferStatus(SubBatchRef &batch,
-                                                           int request_index) {
-    auto rdma_batch = (RdmaSubBatch *)(batch);
+Transport::TransferStatus RdmaTransport::getTransferStatus(SubBatchRef batch,
+                                                           int task_id) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch) return TransferStatus{INVALID, 0};
-    if (request_index < 0 ||
-        request_index >= (int)rdma_batch->task_list.size()) {
+    if (task_id < 0 ||
+        task_id >= (int)rdma_batch->task_list.size()) {
         return TransferStatus{INVALID, 0};
     }
-    auto &task = rdma_batch->task_list[request_index];
+    auto &task = rdma_batch->task_list[task_id];
     return TransferStatus{task.status_word, task.transferred_bytes};
 }
+
+void RdmaTransport::queryOutstandingTasks(SubBatchRef batch, 
+                                          std::vector<int> &task_id_list) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
+    if (!rdma_batch) return;
+    for (int task_id = 0; task_id < (int)rdma_batch->task_list.size(); ++task_id) {
+        auto &task = rdma_batch->task_list[task_id];
+        if (task.success_slices + task.failed_slices < task.num_slices) {
+            task_id_list.push_back(task_id);
+        }
+    }
+}
+
 
 Status RdmaTransport::registerLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {

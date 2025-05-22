@@ -46,23 +46,9 @@ class LocalBuffers;
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
 struct RdmaSubBatch : public Transport::SubBatch {
-    RdmaSubBatch(size_t max_size) : max_size(max_size) {
-        task_list.reserve(max_size);
-    }
-
-    ~RdmaSubBatch() {
-        for (auto &slice : slice_chain) {
-            while (slice) {
-                auto next = slice->next;
-                RdmaSliceStorage::Get().deallocate(slice);
-                slice = next;
-            }
-        }
-    }
-
     std::vector<RdmaTask> task_list;
     std::vector<RdmaSlice *> slice_chain;
-    const size_t max_size;
+    size_t max_size;
 };
 
 class RdmaTransport : public Transport {
@@ -80,15 +66,18 @@ class RdmaTransport : public Transport {
 
     virtual Status uninstall();
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
+    virtual Status allocateSubBatch(SubBatchRef batch, size_t max_size);
 
-    virtual Status freeSubBatch(SubBatchRef &batch);
+    virtual Status freeSubBatch(SubBatchRef batch);
 
     virtual Status submitTransferTasks(
-        SubBatchRef &batch, const std::vector<Request> &request_list);
+        SubBatchRef batch, const std::vector<Request> &request_list);
 
-    virtual TransferStatus getTransferStatus(SubBatchRef &batch,
-                                             int request_index);
+    virtual TransferStatus getTransferStatus(SubBatchRef batch,
+                                             int task_id);
+    
+    virtual void queryOutstandingTasks(SubBatchRef batch, 
+                                       std::vector<int> &task_id_list);
 
     virtual Status registerLocalMemory(
         const std::vector<BufferEntry> &buffer_list);
