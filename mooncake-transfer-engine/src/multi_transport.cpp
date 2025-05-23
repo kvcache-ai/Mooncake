@@ -96,8 +96,8 @@ Status MultiTransport::submitTransfer(
         auto status = entry.first->submitTransferTask(entry.second.request_list,
                                                       entry.second.task_list);
         if (!status.ok()) {
-            LOG(ERROR) << "Failed to submit transfer task to "
-                       << entry.first->getName();
+            // LOG(ERROR) << "Failed to submit transfer task to "
+            //            << entry.first->getName();
             overall_status = status;
         }
     }
@@ -115,6 +115,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
+    assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
