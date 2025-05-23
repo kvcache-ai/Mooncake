@@ -282,6 +282,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     // local RNIC in one transferSync call. Will be fixed in the next revision.
     const int max_retry =
         engine_->numContexts() + 1;  // Iter all possible local contexts
+    auto start_ts = getCurrentTimeInNano();
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;
@@ -301,7 +302,6 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 
         TransferStatus status;
         bool completed = false;
-        auto start_ts = getCurrentTimeInNano();
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
