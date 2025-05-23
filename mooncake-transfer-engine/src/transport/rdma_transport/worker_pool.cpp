@@ -412,7 +412,13 @@ int WorkerPool::doProcessContextEvents() {
 
 void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
+    auto last_reset_ts = getCurrentTimeInNano();
     while (workers_running_) {
+        auto current_ts = getCurrentTimeInNano();
+        if (current_ts - last_reset_ts > 1ull * 1000 * 1000 * 1000) {
+            context_.set_active(true);
+            last_reset_ts = current_ts;
+        }
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {
