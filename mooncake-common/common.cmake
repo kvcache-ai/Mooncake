@@ -15,7 +15,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_C_FLAGS_DEBUG "-O0")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0")
 
-set(CMAKE_BUILD_TYPE "Release")
+# keep debuginfo by default
+if (NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+endif()
+
+message(CMAKE_BUILD_TYPE ": ${CMAKE_BUILD_TYPE}")
 
 # Necessary if you are using Alibaba Cloud eRDMA
 add_definitions(-DCONFIG_ERDMA)
