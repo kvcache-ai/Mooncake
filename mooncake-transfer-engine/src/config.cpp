@@ -181,8 +181,9 @@ void loadGlobalConfig(GlobalConfig &config) {
 
     const char *handshake_lsn_backlog = std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_lsn_backlog) {
-        int val = std::stoi(handshake_lsn_backlog);
-        if (val > 0) {
+        int val = 0;
+        auto [ptr, ec] = std::from_chars(handshake_lsn_backlog, handshake_lsn_backlog + strlen(handshake_lsn_backlog), val);
+        if (ec == std::errc() && val > 0) {
             config.handshake_lsn_backlog = val;
         } else {
             LOG(WARNING)
