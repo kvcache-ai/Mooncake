@@ -116,11 +116,9 @@ int WorkerPool::submitPostSend(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 slice->markFailed();
-                if (peer_segment_desc) {
-                    context_.engine().meta()->dumpMetadataContent(
-                        peer_segment_desc->name, slice->rdma.dest_addr,
-                        slice->length);
-                }
+                context_.engine().meta()->dumpMetadataContent(
+                    peer_segment_desc->name, slice->rdma.dest_addr,
+                    slice->length);
                 continue;
             }
         }
