@@ -252,7 +252,7 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
     // TODO: save to local cache
     // auto peer_desc = decodeSegmentDesc(peer_json,
     // peer_json["name"].asString());
-    auto local_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+    auto local_desc = getSegmentDescByID(LOCAL_SEGMENT_ID);
     int ret = encodeSegmentDesc(*local_desc.get(), local_json);
     return ret;
 }
@@ -264,7 +264,7 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     if (p2p_handshake_mode_) {
         auto [ip, port] = parseHostNameWithPort(segment_name);
         Json::Value local_json;
-        auto desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        auto desc = getSegmentDescByID(LOCAL_SEGMENT_ID);
         int ret = encodeSegmentDesc(*desc.get(), local_json);
         if (ret) {
             return nullptr;

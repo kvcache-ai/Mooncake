@@ -92,10 +92,6 @@ int WorkerPool::submitPostSend(
         if (!segment_desc_map.count(target_id))
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id);
-        if (!segment_desc_map[target_id]) {
-            LOG(ERROR) << "Cannot get target segment #" << target_id;
-            return ERR_INVALID_ARGUMENT;
-        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
@@ -120,12 +116,17 @@ int WorkerPool::submitPostSend(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, buffer_id, device_id)) {
                 slice->markFailed();
-
-                context_.engine().meta()->dumpMetadataContent(
-                    peer_segment_desc->name, slice->rdma.dest_addr,
-                    slice->length);
+                if (peer_segment_desc) {
+                    context_.engine().meta()->dumpMetadataContent(
+                        peer_segment_desc->name, slice->rdma.dest_addr,
+                        slice->length);
+                }
                 continue;
             }
+        }
+        if (!peer_segment_desc) {
+            slice->markFailed();
+            continue;
         }
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
