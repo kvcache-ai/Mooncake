@@ -466,7 +466,10 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 }
 
 struct SocketHandShakePlugin : public HandShakePlugin {
-    SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {}
+    SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
+        auto &config = globalConfig();
+        listen_backlog_ = config.handshake_lsn_backlog;
+    }
 
     void closeListen() {
         if (listen_fd_ >= 0) {
@@ -541,7 +544,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             }
         }
 
-        if (listen(listen_fd_, 5)) {
+        if (listen(listen_fd_, listen_backlog_)) {
             PLOG(ERROR) << "SocketHandShakePlugin: listen()";
             closeListen();
             return ERR_SOCKET;
@@ -834,6 +837,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::atomic<bool> listener_running_;
     std::thread listener_;
     int listen_fd_;
+    int listen_backlog_;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
