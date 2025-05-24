@@ -273,12 +273,15 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
                                                  size_t length) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     auto batch_id = engine_->allocateBatchID(1);
