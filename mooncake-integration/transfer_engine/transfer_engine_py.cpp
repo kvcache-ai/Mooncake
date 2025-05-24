@@ -185,16 +185,16 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
                                         size_t length) {
-    return transferSync(target_hostname, buffer, peer_buffer_address, 
-        length, TransferOpcode::WRITE);
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::WRITE);
 }
 
 int TransferEnginePy::transferSyncRead(const char *target_hostname,
                                        uintptr_t buffer,
                                        uintptr_t peer_buffer_address,
                                        size_t length) {
-    return transferSync(target_hostname, buffer, peer_buffer_address, 
-        length, TransferOpcode::READ);
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::READ);
 }
 
 int TransferEnginePy::transferSync(const char *target_hostname,
@@ -203,12 +203,15 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                                    TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     // TODO this is just a workaround
@@ -265,17 +268,20 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 }
 
 batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
-                                          uintptr_t buffer,
-                                          uintptr_t peer_buffer_address,
-                                          size_t length) {
+                                                 uintptr_t buffer,
+                                                 uintptr_t peer_buffer_address,
+                                                 size_t length) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     auto batch_id = engine_->allocateBatchID(1);
