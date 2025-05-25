@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dirent.h>
+#include <unistd.h>
+
+#include "common.h"
 #include "config.h"
 
 namespace mooncake {
@@ -203,6 +207,22 @@ void loadGlobalConfig(GlobalConfig &config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
+
+    const char *log_dir_path = std::getenv("MC_LOG_DIR");
+    if (log_dir_path) {
+        google::InitGoogleLogging("mooncake-transfer-engine");
+        if (opendir(log_dir_path) == NULL) {
+            LOG(WARNING) << "Path [" << log_dir_path <<
+                "] is not a valid directory path. Still logging to stderr.";
+        } else if (access(log_dir_path, W_OK) != 0) {
+            LOG(WARNING) << "Path [" << log_dir_path <<
+                "] is not a permitted directory path for the current user. \
+                Still logging to stderr.";
+        } else {
+            FLAGS_log_dir = log_dir_path;
+            FLAGS_logtostderr = 0;
+            FLAGS_stop_logging_if_full_disk = true;
+        }
     }
 }
 

@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstdint>
 #include <ctime>
+#include <mutex>
 #include <thread>
 #include <iostream>
 #include <chrono>
