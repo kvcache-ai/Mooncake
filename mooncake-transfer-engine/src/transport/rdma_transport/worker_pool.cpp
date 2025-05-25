@@ -218,7 +218,7 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->active()) {
-            context_.deleteEndpoint(entry.first);
+            // context_.deleteEndpoint(entry.first);
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
