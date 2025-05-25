@@ -20,10 +20,10 @@
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     if (getenv("MC_TRANSFER_TIMEOUT")) {
-        int timeout_sec = std::max(10, atoi(getenv("MC_TRANSFER_TIMEOUT")));
+        int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
         transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
     } else {
-        transfer_timeout_nsec_ = 60 * kNanosPerSecond;
+        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
     }
 }
 
