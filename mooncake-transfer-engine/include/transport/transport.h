@@ -90,7 +90,6 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
-        uint64_t ts;
 
         union {
             struct {
