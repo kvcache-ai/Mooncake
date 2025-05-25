@@ -218,6 +218,7 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->active()) {
+            context_.deleteEndpoint(entry.first);
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -391,7 +392,10 @@ int WorkerPool::doProcessContextEvents() {
     LOG(WARNING) << "Worker: Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context_.deviceName();
-    if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
+    if (event.event_type == IBV_EVENT_QP_FATAL) {
+        auto endpoint = (RdmaEndPoint *) event.element.qp->qp_context;
+        endpoint->set_active(false);
+    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
         event.event_type == IBV_EVENT_CQ_ERR ||
         event.event_type == IBV_EVENT_WQ_FATAL ||
         event.event_type == IBV_EVENT_PORT_ERR ||

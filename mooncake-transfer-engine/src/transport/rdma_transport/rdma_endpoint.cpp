@@ -61,6 +61,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         attr.recv_cq = cq;
         attr.sq_sig_all = false;
         attr.qp_type = IBV_QPT_RC;
+        attr.qp_context = this;
         attr.cap.max_send_wr = attr.cap.max_recv_wr = max_wr_depth;
         attr.cap.max_send_sge = attr.cap.max_recv_sge = max_sge_per_wr;
         attr.cap.max_inline_data = max_inline_bytes;
@@ -296,6 +297,7 @@ int RdmaEndPoint::submitPostSend(
         wr.imm_data = 0;
         wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
+        slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->rdma.qp_depth = &wr_depth_list_[qp_index];
     }

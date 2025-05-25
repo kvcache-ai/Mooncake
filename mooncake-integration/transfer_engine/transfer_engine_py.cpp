@@ -17,7 +17,15 @@
 #include <cassert>
 #include <fstream>
 
-TransferEnginePy::TransferEnginePy() {}
+TransferEnginePy::TransferEnginePy() {
+    const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+    if (getenv("MC_TRANSFER_TIMEOUT")) {
+        int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
+        transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
+    } else {
+        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+    }
+}
 
 TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
@@ -250,11 +258,11 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
-            const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
-            const int64_t timeout =
-                (10 + length / 5000000000) * kNanosPerSecond;
+            const int64_t timeout = transfer_timeout_nsec_ + length; // 1GiB per second
             if (current_ts - start_ts > timeout) {
                 LOG(INFO) << "Sync data transfer timeout, local buffer "
                           << (void *)buffer << " remote buffer "
@@ -309,6 +317,8 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     } else if (status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(batch_id);
         return -1;
+    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        return -2;
     } else {
         return 0;
     }
