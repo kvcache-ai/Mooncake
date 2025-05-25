@@ -259,6 +259,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                 engine_->freeBatchID(batch_id);
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
                 completed = true;
             }
             auto current_ts = getCurrentTimeInNano();

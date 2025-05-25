@@ -226,6 +226,7 @@ Status RdmaTransport::submitTransfer(
             slice->rdma.max_retry_cnt = kMaxRetryCount;
             slice->task = &task;
             slice->target_id = request.target_id;
+            slice->ts = 0;
             slice->status = Slice::PENDING;
             slice->ts = 0;
             task.slice_list.push_back(slice);
