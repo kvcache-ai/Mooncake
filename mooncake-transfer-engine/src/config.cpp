@@ -194,6 +194,16 @@ void loadGlobalConfig(GlobalConfig &config) {
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
+
+    const char *slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
+    if (slice_timeout_env) {
+        int val = atoi(slice_timeout_env);
+        if (val > 0 && val < 65536)
+            config.slice_timeout = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_SLICE_TIMEOUT";
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

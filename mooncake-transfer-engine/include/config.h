@@ -44,6 +44,7 @@ struct GlobalConfig {
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;
+    int64_t slice_timeout = -1;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
