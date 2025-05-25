@@ -115,4 +115,6 @@ class TransferEnginePy {
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
+
+    uint64_t transfer_timeout_nsec_;
 };
