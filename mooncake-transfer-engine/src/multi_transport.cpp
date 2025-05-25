@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+#include "config.h"
 
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
@@ -124,13 +125,16 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         task.is_finished = true;
     } else {
-        auto current_ts = getCurrentTimeInNano();
-        const int64_t kPacketDeliveryTimeout = 10ull * 1000000000;
-        for (auto &slice : task.slice_list) {
-            if (slice->status == Transport::Slice::POSTED && slice->ts > 0 &&
-                current_ts - slice->ts > kPacketDeliveryTimeout) {
-                status.s = Transport::TransferStatusEnum::TIMEOUT;
-                return Status::OK();
+        if (globalConfig().slice_timeout) {
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t kPacketDeliveryTimeout = 
+                globalConfig().slice_timeout * 1000000000;
+            for (auto &slice : task.slice_list) {
+                if (slice->status == Transport::Slice::POSTED && slice->ts > 0 &&
+                    current_ts - slice->ts > kPacketDeliveryTimeout) {
+                    status.s = Transport::TransferStatusEnum::TIMEOUT;
+                    return Status::OK();
+                }
             }
         }
         status.s = Transport::TransferStatusEnum::WAITING;

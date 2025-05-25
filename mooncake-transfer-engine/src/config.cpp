@@ -194,6 +194,11 @@ void loadGlobalConfig(GlobalConfig &config) {
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
+
+    const char *slice_timeout = std::getenv("MC_SLICE_TIMEOUT");
+    if (slice_timeout) {
+        config.slice_timeout = std::atoi(slice_timeout);
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
