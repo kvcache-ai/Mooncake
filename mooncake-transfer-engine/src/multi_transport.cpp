@@ -129,7 +129,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         for (auto &slice : task.slice_list) {
             if (slice->status == Transport::Slice::POSTED && slice->ts > 0 &&
                 current_ts - slice->ts > kPacketDeliveryTimeout) {
-                status.s = Transport::TransferStatusEnum::FAILED;
+                status.s = Transport::TransferStatusEnum::TIMEOUT;
                 return Status::OK();
             }
         }

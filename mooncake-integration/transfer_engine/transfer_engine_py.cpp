@@ -258,6 +258,8 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout = transfer_timeout_nsec_ + length; // 1GiB per second
@@ -315,6 +317,8 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     } else if (status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(batch_id);
         return -1;
+    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        return -2;
     } else {
         return 0;
     }
