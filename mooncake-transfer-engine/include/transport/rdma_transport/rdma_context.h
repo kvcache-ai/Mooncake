@@ -127,10 +127,6 @@ class RdmaContext {
 
     int socketId();
 
-    uint64_t failedCount() { return failed_count_.load(); }
-
-    void traceFailure() { failed_count_.fetch_add(1); }
-
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
                        int gid_index);
@@ -179,7 +175,6 @@ class RdmaContext {
     std::shared_ptr<WorkerPool> worker_pool_;
 
     volatile bool active_;
-    std::atomic<uint64_t> failed_count_ { 0 };
 };
 
 }  // namespace mooncake

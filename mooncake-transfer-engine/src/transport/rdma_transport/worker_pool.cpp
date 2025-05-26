@@ -238,7 +238,6 @@ void WorkerPool::performPostSend(int thread_id) {
                        << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
-            context_.traceFailure();
             failed_nr_polls++;
             if (context_.active() && failed_nr_polls > 32 &&
                 !success_nr_polls) {
@@ -433,7 +432,7 @@ void WorkerPool::monitorWorker() {
     auto last_reset_ts = getCurrentTimeInNano();
     while (workers_running_) {
         auto current_ts = getCurrentTimeInNano();
-        if (current_ts - last_reset_ts > 1ull * 1000 * 1000 * 1000) {
+        if (current_ts - last_reset_ts > 1000000000ll) {
             context_.set_active(true);
             last_reset_ts = current_ts;
         }
