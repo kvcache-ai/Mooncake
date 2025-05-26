@@ -207,6 +207,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
+    }
 
     const char *log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
