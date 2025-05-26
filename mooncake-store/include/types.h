@@ -21,6 +21,7 @@ static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL = 200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
 
 // Forward declarations
 class BufferAllocator;

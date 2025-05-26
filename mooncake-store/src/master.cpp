@@ -19,6 +19,7 @@ DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
             "Default lease time for kv objects");
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO, "Ratio of objects to evict when storage space is full");
+DEFINE_double(eviction_high_watermark_ratio, mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO, "Ratio of high watermark trigger eviction");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -44,11 +45,13 @@ int main(int argc, char* argv[]) {
               << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting
               << ", metrics_port=" << FLAGS_metrics_port
               << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
-              << ", eviction_ratio=" << FLAGS_eviction_ratio;
+              << ", eviction_ratio=" << FLAGS_eviction_ratio
+              << ", eviction_high_watermark_ratio=" << FLAGS_eviction_high_watermark_ratio;
 
     mooncake::WrappedMasterService wrapped_master_service(
         FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
-        FLAGS_enable_metric_reporting, FLAGS_metrics_port, FLAGS_eviction_ratio);
+        FLAGS_enable_metric_reporting, FLAGS_metrics_port,
+        FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(

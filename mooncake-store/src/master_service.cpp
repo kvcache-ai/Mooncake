@@ -67,16 +67,23 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 }
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                            double eviction_ratio)
+                             double eviction_ratio,
+                             double eviction_high_watermark_ratio)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
-      eviction_ratio_(eviction_ratio) {
+      eviction_ratio_(eviction_ratio),
+      eviction_high_water_mark_ratio_(eviction_high_watermark_ratio) {
         if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
             LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                        << "current value: " << eviction_ratio_;
             throw std::invalid_argument("Invalid eviction ratio");
+        }
+        if (eviction_high_water_mark_ratio_ < 0.0 || eviction_high_water_mark_ratio_ > 1.0) {
+            LOG(ERROR) << "Eviction high watermark ratio must be between 0.0 and 1.0, "
+                       << "current value: " << eviction_high_water_mark_ratio_;
+            throw std::invalid_argument("Invalid eviction high watermark ratio");
         }
         gc_running_ = true;
         gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
@@ -474,7 +481,8 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
-        if (need_eviction_ && eviction_ratio_ > 0.0) {
+        if (MasterMetricManager::instance().get_global_used_ratio() > eviction_high_water_mark_ratio_
+            || (need_eviction_ && eviction_ratio_ > 0.0)) {
             BatchEvict();
         }
 
