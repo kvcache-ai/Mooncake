@@ -239,12 +239,14 @@ void WorkerPool::performPostSend(int thread_id) {
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
             context_.traceFailure();
-            // if (context_.failedCount() >= 8) {
-            //     LOG(WARNING) << "Failed to establish peer endpoints for "
-            //                     "multiple times, disable device "
-            //                  << context_.nicPath();
-            //     context_.set_active(false);
-            // }
+            failed_nr_polls++;
+            if (context_.active() && failed_nr_polls > 32 &&
+                !success_nr_polls) {
+                LOG(WARNING)
+                    << "Failed to establish peer endpoints in local RNIC "
+                    << context_.nicPath() << ", mark it inactive";
+                context_.set_active(false);
+            }
             entry.second.clear();
             continue;
         }
@@ -296,12 +298,13 @@ void WorkerPool::performPollCq(int thread_id) {
                         << ", dest_rkey: " << slice->rdma.dest_rkey
                         << ", retry_cnt: " << slice->rdma.retry_cnt
                         << "): " << ibv_wc_status_str(wc[i].status);
-                context_.traceFailure();
-                // if (context_.failedCount() > 16) {
-                //     LOG(WARNING) << "Too many errors found in local RNIC "
-                //                  << context_.nicPath() << ", mark it inactive";
-                //     context_.set_active(false);
-                // }
+                failed_nr_polls++;
+                if (context_.active() && failed_nr_polls > 32 &&
+                    !success_nr_polls) {
+                    LOG(WARNING) << "Too many errors found in local RNIC "
+                                 << context_.nicPath() << ", mark it inactive";
+                    context_.set_active(false);
+                }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
@@ -317,6 +320,7 @@ void WorkerPool::performPollCq(int thread_id) {
             } else {
                 slice->markSuccess();
                 processed_slice_count++;
+                success_nr_polls++;
             }
         }
         if (nr_poll)
