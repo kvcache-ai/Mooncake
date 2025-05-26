@@ -63,8 +63,9 @@ class WrappedMasterService {
    public:
     WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                          bool enable_metric_reporting = true,
-                         uint16_t http_port = 9003)
-        : master_service_(enable_gc, default_kv_lease_ttl),
+                         uint16_t http_port = 9003,
+                         double eviction_ratio = DEFAULT_EVICTION_RATIO)
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
