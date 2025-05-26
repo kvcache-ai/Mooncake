@@ -20,36 +20,36 @@ class MasterMetricManager {
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
     // Storage Metrics
-    void inc_allocated_size(int64_t val = 1.0);
-    void dec_allocated_size(int64_t val = 1.0);
-    void inc_total_capacity(int64_t val = 1.0);
-    void dec_total_capacity(int64_t val = 1.0);
+    void inc_allocated_size(int64_t val = 1);
+    void dec_allocated_size(int64_t val = 1);
+    void inc_total_capacity(int64_t val = 1);
+    void dec_total_capacity(int64_t val = 1);
     double get_global_used_ratio(void);
 
     // Key/Value Metrics
-    void inc_key_count(int64_t val = 1.0);
-    void dec_key_count(int64_t val = 1.0);
+    void inc_key_count(int64_t val = 1);
+    void dec_key_count(int64_t val = 1);
     void observe_value_size(int64_t size);
 
     // Operation Statistics (Counters)
-    void inc_put_start_requests(int64_t val = 1.0);
-    void inc_put_start_failures(int64_t val = 1.0);
-    void inc_put_end_requests(int64_t val = 1.0);
-    void inc_put_end_failures(int64_t val = 1.0);
-    void inc_put_revoke_requests(int64_t val = 1.0);
-    void inc_put_revoke_failures(int64_t val = 1.0);
-    void inc_get_replica_list_requests(int64_t val = 1.0);
-    void inc_get_replica_list_failures(int64_t val = 1.0);
-    void inc_exist_key_requests(int64_t val = 1.0);
-    void inc_exist_key_failures(int64_t val = 1.0);
-    void inc_remove_requests(int64_t val = 1.0);
-    void inc_remove_failures(int64_t val = 1.0);
-    void inc_remove_all_requests(int64_t val = 1.0);
-    void inc_remove_all_failures(int64_t val = 1.0);
-    void inc_mount_segment_requests(int64_t val = 1.0);
-    void inc_mount_segment_failures(int64_t val = 1.0);
-    void inc_unmount_segment_requests(int64_t val = 1.0);
-    void inc_unmount_segment_failures(int64_t val = 1.0);
+    void inc_put_start_requests(int64_t val = 1);
+    void inc_put_start_failures(int64_t val = 1);
+    void inc_put_end_requests(int64_t val = 1);
+    void inc_put_end_failures(int64_t val = 1);
+    void inc_put_revoke_requests(int64_t val = 1);
+    void inc_put_revoke_failures(int64_t val = 1);
+    void inc_get_replica_list_requests(int64_t val = 1);
+    void inc_get_replica_list_failures(int64_t val = 1);
+    void inc_exist_key_requests(int64_t val = 1);
+    void inc_exist_key_failures(int64_t val = 1);
+    void inc_remove_requests(int64_t val = 1);
+    void inc_remove_failures(int64_t val = 1);
+    void inc_remove_all_requests(int64_t val = 1);
+    void inc_remove_all_failures(int64_t val = 1);
+    void inc_mount_segment_requests(int64_t val = 1);
+    void inc_mount_segment_failures(int64_t val = 1);
+    void inc_unmount_segment_requests(int64_t val = 1);
+    void inc_unmount_segment_failures(int64_t val = 1);
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
@@ -76,32 +76,32 @@ class MasterMetricManager {
     // --- Metric Members ---
 
     // Storage Metrics
-    ylt::metric::gauge_d allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_d total_capacity_;  // Use update for gauge
+    ylt::metric::gauge_t allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_t total_capacity_;  // Use update for gauge
 
     // Key/Value Metrics
-    ylt::metric::gauge_d key_count_;
-    ylt::metric::histogram_d value_size_distribution_;
+    ylt::metric::gauge_t key_count_;
+    ylt::metric::histogram_t value_size_distribution_;
 
     // Operation Statistics
-    ylt::metric::counter_d put_start_requests_;
-    ylt::metric::counter_d put_start_failures_;
-    ylt::metric::counter_d put_end_requests_;
-    ylt::metric::counter_d put_end_failures_;
-    ylt::metric::counter_d put_revoke_requests_;
-    ylt::metric::counter_d put_revoke_failures_;
-    ylt::metric::counter_d get_replica_list_requests_;
-    ylt::metric::counter_d get_replica_list_failures_;
-    ylt::metric::counter_d exist_key_requests_;
-    ylt::metric::counter_d exist_key_failures_;
-    ylt::metric::counter_d remove_requests_;
-    ylt::metric::counter_d remove_failures_;
-    ylt::metric::counter_d remove_all_requests_;
-    ylt::metric::counter_d remove_all_failures_;
-    ylt::metric::counter_d mount_segment_requests_;
-    ylt::metric::counter_d mount_segment_failures_;
-    ylt::metric::counter_d unmount_segment_requests_;
-    ylt::metric::counter_d unmount_segment_failures_;
+    ylt::metric::counter_t put_start_requests_;
+    ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_end_requests_;
+    ylt::metric::counter_t put_end_failures_;
+    ylt::metric::counter_t put_revoke_requests_;
+    ylt::metric::counter_t put_revoke_failures_;
+    ylt::metric::counter_t get_replica_list_requests_;
+    ylt::metric::counter_t get_replica_list_failures_;
+    ylt::metric::counter_t exist_key_requests_;
+    ylt::metric::counter_t exist_key_failures_;
+    ylt::metric::counter_t remove_requests_;
+    ylt::metric::counter_t remove_failures_;
+    ylt::metric::counter_t remove_all_requests_;
+    ylt::metric::counter_t remove_all_failures_;
+    ylt::metric::counter_t mount_segment_requests_;
+    ylt::metric::counter_t mount_segment_failures_;
+    ylt::metric::counter_t unmount_segment_requests_;
+    ylt::metric::counter_t unmount_segment_failures_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;

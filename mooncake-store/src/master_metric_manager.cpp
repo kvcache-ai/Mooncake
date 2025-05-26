@@ -25,8 +25,8 @@ MasterMetricManager::MasterMetricManager()
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_("master_value_size_bytes",
                                "Distribution of object value sizes",
-                               {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
-                                16777216.0, 67108864.0}),
+                               {4096, 65536, 262144, 1048576, 4194304,
+                                16777216, 67108864}),
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
@@ -287,22 +287,17 @@ std::string MasterMetricManager::get_summary_string() {
         ss << " (" << std::fixed << std::setprecision(1)
            << (allocated / capacity * 100.0) << "%)";
     }
-    ss << " | Keys: " << static_cast<int64_t>(keys);
+    ss << " | Keys: " << keys;
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
     ss << "Put="
-       << static_cast<int64_t>(put_starts - put_start_fails + put_ends -
-                               put_end_fails)
-       << "/" << static_cast<int64_t>(put_starts + put_ends) << ", ";
-    ss << "Get=" << static_cast<int64_t>(get_replicas - get_replica_fails)
-       << "/" << static_cast<int64_t>(get_replicas) << ", ";
-    ss << "Exist=" << static_cast<int64_t>(exist_keys - exist_key_fails)
-       << "/" << static_cast<int64_t>(exist_keys) << ", ";
-    ss << "Del=" << static_cast<int64_t>(removes - remove_fails) << "/"
-       << static_cast<int64_t>(removes) << ", ";
-    ss << "DelAll=" << static_cast<int64_t>(remove_all - remove_all_fails) << "/"
-       << static_cast<int64_t>(remove_all);
+       << put_starts - put_start_fails + put_ends - put_end_fails
+       << "/" << put_starts + put_ends << ", ";
+    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas << ", ";
+    ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
+    ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
+    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all;
 
     // Eviction summary
     ss << " | Eviction: "
