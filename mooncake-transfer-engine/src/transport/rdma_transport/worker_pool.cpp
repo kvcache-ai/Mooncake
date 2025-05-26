@@ -297,11 +297,11 @@ void WorkerPool::performPollCq(int thread_id) {
                         << ", retry_cnt: " << slice->rdma.retry_cnt
                         << "): " << ibv_wc_status_str(wc[i].status);
                 context_.traceFailure();
-                if (context_.failedCount() > 16) {
-                    LOG(WARNING) << "Too many errors found in local RNIC "
-                                 << context_.nicPath() << ", mark it inactive";
-                    context_.set_active(false);
-                }
+                // if (context_.failedCount() > 16) {
+                //     LOG(WARNING) << "Too many errors found in local RNIC "
+                //                  << context_.nicPath() << ", mark it inactive";
+                //     context_.set_active(false);
+                // }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
