@@ -15,7 +15,6 @@
 #include <dirent.h>
 #include <unistd.h>
 
-#include "common.h"
 #include "config.h"
 
 namespace mooncake {
