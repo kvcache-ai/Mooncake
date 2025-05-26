@@ -83,7 +83,7 @@ class MooncakeStoreService:
             return False
 
     async def start_http_service(self, port: int = 8080):
-        app = web.Application()
+        app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
         app.add_routes([
             web.put('/api/put', self.handle_put),
             web.get('/api/get/{key}', self.handle_get),
