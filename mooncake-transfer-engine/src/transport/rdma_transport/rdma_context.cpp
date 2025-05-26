@@ -258,12 +258,12 @@ uint32_t RdmaContext::lkey(void *addr) {
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
     if (!active_) {
-        LOG(ERROR) << "Endpoint is not active";
+        LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
     }
 
     if (peer_nic_path.empty()) {
-        LOG(ERROR) << "Invalid peer NIC path";
+        LOG(ERROR) << "Invalid peer NIC path: " << deviceName();
         return nullptr;
     }
 

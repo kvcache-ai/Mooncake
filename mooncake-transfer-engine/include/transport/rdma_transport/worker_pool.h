@@ -67,6 +67,8 @@ class WorkerPool {
         collective_slice_queue_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
+
+    uint64_t success_nr_polls = 0, failed_nr_polls = 0;
 };
 }  // namespace mooncake
 
