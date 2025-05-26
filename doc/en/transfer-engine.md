@@ -434,4 +434,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
+- `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.
 
