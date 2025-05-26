@@ -31,10 +31,6 @@ class MasterMetricManager {
     void dec_key_count(int64_t val = 1.0);
     void observe_value_size(int64_t size);
 
-    // Eviction Metrics
-    void inc_eviction_success(int64_t key_count, int64_t size);
-    void inc_eviction_fail(); // not a single object is evicted
-
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1.0);
     void inc_put_start_failures(int64_t val = 1.0);
@@ -54,6 +50,10 @@ class MasterMetricManager {
     void inc_mount_segment_failures(int64_t val = 1.0);
     void inc_unmount_segment_requests(int64_t val = 1.0);
     void inc_unmount_segment_failures(int64_t val = 1.0);
+
+    // Eviction Metrics
+    void inc_eviction_success(int64_t key_count, int64_t size);
+    void inc_eviction_fail(); // not a single object is evicted
 
     // --- Serialization ---
     /**
@@ -83,12 +83,6 @@ class MasterMetricManager {
     ylt::metric::gauge_d key_count_;
     ylt::metric::histogram_d value_size_distribution_;
 
-    // Eviction Metrics
-    ylt::metric::counter_t eviction_success_;
-    ylt::metric::counter_t eviction_attempts_;
-    ylt::metric::counter_t evicted_key_count_;
-    ylt::metric::counter_t evicted_size_;
-
     // Operation Statistics
     ylt::metric::counter_d put_start_requests_;
     ylt::metric::counter_d put_start_failures_;
@@ -108,6 +102,12 @@ class MasterMetricManager {
     ylt::metric::counter_d mount_segment_failures_;
     ylt::metric::counter_d unmount_segment_requests_;
     ylt::metric::counter_d unmount_segment_failures_;
+
+    // Eviction Metrics
+    ylt::metric::counter_t eviction_success_;
+    ylt::metric::counter_t eviction_attempts_;
+    ylt::metric::counter_t evicted_key_count_;
+    ylt::metric::counter_t evicted_size_;
 };
 
 }  // namespace mooncake

@@ -27,16 +27,7 @@ MasterMetricManager::MasterMetricManager()
                                "Distribution of object value sizes",
                                {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
                                 16777216.0, 67108864.0}),
-      // Initialize Counters
-      eviction_success_("master_successful_evictions_total",
-                       "Total number of successful eviction operations"),
-      eviction_attempts_("master_attempted_evictions_total",
-                         "Total number of attempted eviction operations"),
-      evicted_key_count_("master_evicted_key_count",
-                        "Total number of keys evicted"),
-      evicted_size_("master_evicted_size_bytes",
-                    "Total bytes of evicted objects"),
-
+      // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
@@ -79,7 +70,17 @@ MasterMetricManager::MasterMetricManager()
           "Total number of UnmountSegment requests received"),
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
-          "Total number of failed UnmountSegment requests") {}
+          "Total number of failed UnmountSegment requests"),
+
+      // Initialize Eviction Counters
+      eviction_success_("master_successful_evictions_total",
+                       "Total number of successful eviction operations"),
+      eviction_attempts_("master_attempted_evictions_total",
+                         "Total number of attempted eviction operations"),
+      evicted_key_count_("master_evicted_key_count",
+                        "Total number of keys evicted"),
+      evicted_size_("master_evicted_size_bytes",
+                    "Total bytes of evicted objects") {}
 
 // --- Metric Interface Methods ---
 
@@ -105,18 +106,6 @@ double MasterMetricManager::get_global_used_ratio(void) {
         return 0.0;
     }
     return allocated / capacity;
-}
-
-// Eviction Metrics
-void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
-    evicted_key_count_.inc(key_count);
-    evicted_size_.inc(size);
-    eviction_success_.inc();
-    eviction_attempts_.inc();
-}
-
-void MasterMetricManager::inc_eviction_fail() {
-    eviction_attempts_.inc();
 }
 
 // Key/Value Metrics
@@ -183,6 +172,18 @@ void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
 
+// Eviction Metrics
+void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
+    evicted_key_count_.inc(key_count);
+    evicted_size_.inc(size);
+    eviction_success_.inc();
+    eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_eviction_fail() {
+    eviction_attempts_.inc();
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -205,7 +206,7 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
 
-    // Serialize Counters
+    // Serialize Request Counters
     serialize_metric(exist_key_requests_);
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
@@ -224,6 +225,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
     serialize_metric(unmount_segment_failures_);
+
+    // Serialize Eviction Counters
+    serialize_metric(eviction_success_);
+    serialize_metric(eviction_attempts_);
+    serialize_metric(evicted_key_count_);
+    serialize_metric(evicted_size_);
 
     return ss.str();
 }
@@ -267,6 +274,12 @@ std::string MasterMetricManager::get_summary_string() {
     double remove_all = remove_all_requests_.value();
     double remove_all_fails = remove_all_failures_.value();
 
+    // Eviction counters
+    uint64_t eviction_success = eviction_success_.value();
+    uint64_t eviction_attempts = eviction_attempts_.value();
+    uint64_t evicted_key_count = evicted_key_count_.value();
+    uint64_t evicted_size = evicted_size_.value();
+
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
        << format_bytes(capacity);
@@ -290,6 +303,12 @@ std::string MasterMetricManager::get_summary_string() {
        << static_cast<int64_t>(removes) << ", ";
     ss << "DelAll=" << static_cast<int64_t>(remove_all - remove_all_fails) << "/"
        << static_cast<int64_t>(remove_all);
+
+    // Eviction summary
+    ss << " | Eviction: "
+        << "Success/Attempts=" << eviction_success << "/" << eviction_attempts << ", "
+        << "keys=" << evicted_key_count << ", "
+        << "size=" << format_bytes(evicted_size);
 
     return ss.str();
 }
