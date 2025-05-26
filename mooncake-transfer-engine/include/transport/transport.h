@@ -132,7 +132,7 @@ class Transport {
             __sync_fetch_and_add(&task->failed_slice_count, 1);
         }
 
-        uint64_t ts;
+        volatile uint64_t ts;
     };
 
     struct ThreadLocalSliceCache {
