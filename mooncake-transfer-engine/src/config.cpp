@@ -179,11 +179,11 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.metacache = false;
     }
 
-    const char *handshake_lsn_backlog = std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
-    if (handshake_lsn_backlog) {
-        int val = std::stoi(handshake_lsn_backlog);
+    const char *handshake_listen_backlog = std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
+    if (handshake_listen_backlog) {
+        int val = std::stoi(handshake_listen_backlog);
         if (val > 0) {
-            config.handshake_lsn_backlog = val;
+            config.handshake_listen_backlog = val;
         } else {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_HANDSHAKE_LISTEN_BACKLOG";

@@ -468,7 +468,7 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
         auto &config = globalConfig();
-        listen_backlog_ = config.handshake_lsn_backlog;
+        listen_backlog_ = config.handshake_listen_backlog;
     }
 
     void closeListen() {
