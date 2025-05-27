@@ -384,18 +384,31 @@ int target() {
     }
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
-        memset(addr[i], 'x', FLAGS_buffer_size);
+    int buffer_num = NR_SOCKETS;
+
+#ifdef USE_CUDA
+    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
+    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
+    for (int i = 0; i < buffer_num; ++i) {
+        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+                                             name_prefix + std::to_string(i));
+        LOG_ASSERT(!rc);
+    }
+#else
+    for (int i = 0; i < buffer_num; ++i) {
+       addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
     }
+#endif
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
+    for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
