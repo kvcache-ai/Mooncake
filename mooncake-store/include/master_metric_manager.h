@@ -24,12 +24,15 @@ class MasterMetricManager {
     void dec_allocated_size(int64_t val = 1);
     void inc_total_capacity(int64_t val = 1);
     void dec_total_capacity(int64_t val = 1);
+    int64_t get_allocated_size();
+    int64_t get_total_capacity();
     double get_global_used_ratio(void);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
     void observe_value_size(int64_t size);
+    int64_t get_key_count();
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -51,9 +54,35 @@ class MasterMetricManager {
     void inc_unmount_segment_requests(int64_t val = 1);
     void inc_unmount_segment_failures(int64_t val = 1);
 
+    // Operation Statistics Getters
+    int64_t get_put_start_requests();
+    int64_t get_put_start_failures();
+    int64_t get_put_end_requests();
+    int64_t get_put_end_failures();
+    int64_t get_put_revoke_requests();
+    int64_t get_put_revoke_failures();
+    int64_t get_get_replica_list_requests();
+    int64_t get_get_replica_list_failures();
+    int64_t get_exist_key_requests();
+    int64_t get_exist_key_failures();
+    int64_t get_remove_requests();
+    int64_t get_remove_failures();
+    int64_t get_remove_all_requests();
+    int64_t get_remove_all_failures();
+    int64_t get_mount_segment_requests();
+    int64_t get_mount_segment_failures();
+    int64_t get_unmount_segment_requests();
+    int64_t get_unmount_segment_failures();
+
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
     void inc_eviction_fail(); // not a single object is evicted
+
+    // Eviction Metrics Getters
+    int64_t get_eviction_success();
+    int64_t get_eviction_attempts();
+    int64_t get_evicted_key_count();
+    int64_t get_evicted_size();
 
     // --- Serialization ---
     /**

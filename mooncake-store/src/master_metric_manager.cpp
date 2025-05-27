@@ -99,6 +99,14 @@ void MasterMetricManager::dec_total_capacity(int64_t val) {
     total_capacity_.dec(val);
 }
 
+int64_t MasterMetricManager::get_allocated_size() {
+    return allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_capacity() {
+    return total_capacity_.value();
+}
+
 double MasterMetricManager::get_global_used_ratio(void) {
     double allocated = allocated_size_.value();
     double capacity = total_capacity_.value();
@@ -114,6 +122,10 @@ void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
+}
+
+int64_t MasterMetricManager::get_key_count() {
+    return key_count_.value();
 }
 
 // Operation Statistics (Counters)
@@ -172,6 +184,78 @@ void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
 
+int64_t MasterMetricManager::get_put_start_requests() {
+    return put_start_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_failures() {
+    return put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_end_requests() {
+    return put_end_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_end_failures() {
+    return put_end_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_revoke_requests() {
+    return put_revoke_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_revoke_failures() {
+    return put_revoke_failures_.value();
+}
+
+int64_t MasterMetricManager::get_get_replica_list_requests() {
+    return get_replica_list_requests_.value();
+}
+
+int64_t MasterMetricManager::get_get_replica_list_failures() {
+    return get_replica_list_failures_.value();
+}
+
+int64_t MasterMetricManager::get_exist_key_requests() {
+    return exist_key_requests_.value();
+}
+
+int64_t MasterMetricManager::get_exist_key_failures() {
+    return exist_key_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remove_requests() {
+    return remove_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remove_failures() {
+    return remove_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remove_all_requests() {
+    return remove_all_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remove_all_failures() {
+    return remove_all_failures_.value();
+}
+
+int64_t MasterMetricManager::get_mount_segment_requests() {
+    return mount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_mount_segment_failures() {
+    return mount_segment_failures_.value();
+}
+
+int64_t MasterMetricManager::get_unmount_segment_requests() {
+    return unmount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_unmount_segment_failures() {
+    return unmount_segment_failures_.value();
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
     evicted_key_count_.inc(key_count);
@@ -182,6 +266,22 @@ void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) 
 
 void MasterMetricManager::inc_eviction_fail() {
     eviction_attempts_.inc();
+}
+
+int64_t MasterMetricManager::get_eviction_success() {
+    return eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_attempts() {
+    return eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_evicted_key_count() {
+    return evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_evicted_size() {
+    return evicted_size_.value();
 }
 
 // --- Serialization ---
@@ -256,29 +356,29 @@ std::string MasterMetricManager::get_summary_string() {
     };
 
     // --- Get current values ---
-    double allocated = allocated_size_.value();
-    double capacity = total_capacity_.value();
-    double keys = key_count_.value();
+    int64_t allocated = allocated_size_.value();
+    int64_t capacity = total_capacity_.value();
+    int64_t keys = key_count_.value();
 
     // Request counters
-    double exist_keys = exist_key_requests_.value();
-    double exist_key_fails = exist_key_failures_.value();
-    double put_starts = put_start_requests_.value();
-    double put_start_fails = put_start_failures_.value();
-    double put_ends = put_end_requests_.value();
-    double put_end_fails = put_end_failures_.value();
-    double get_replicas = get_replica_list_requests_.value();
-    double get_replica_fails = get_replica_list_failures_.value();
-    double removes = remove_requests_.value();
-    double remove_fails = remove_failures_.value();
-    double remove_all = remove_all_requests_.value();
-    double remove_all_fails = remove_all_failures_.value();
+    int64_t exist_keys = exist_key_requests_.value();
+    int64_t exist_key_fails = exist_key_failures_.value();
+    int64_t put_starts = put_start_requests_.value();
+    int64_t put_start_fails = put_start_failures_.value();
+    int64_t put_ends = put_end_requests_.value();
+    int64_t put_end_fails = put_end_failures_.value();
+    int64_t get_replicas = get_replica_list_requests_.value();
+    int64_t get_replica_fails = get_replica_list_failures_.value();
+    int64_t removes = remove_requests_.value();
+    int64_t remove_fails = remove_failures_.value();
+    int64_t remove_all = remove_all_requests_.value();
+    int64_t remove_all_fails = remove_all_failures_.value();
 
     // Eviction counters
-    uint64_t eviction_success = eviction_success_.value();
-    uint64_t eviction_attempts = eviction_attempts_.value();
-    uint64_t evicted_key_count = evicted_key_count_.value();
-    uint64_t evicted_size = evicted_size_.value();
+    int64_t eviction_success = eviction_success_.value();
+    int64_t eviction_attempts = eviction_attempts_.value();
+    int64_t evicted_key_count = evicted_key_count_.value();
+    int64_t evicted_size = evicted_size_.value();
 
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
