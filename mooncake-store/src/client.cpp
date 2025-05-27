@@ -454,8 +454,8 @@ ErrorCode Client::TransferData(
     while (try_num < max_try_num) {
         has_err = false;
         all_ready = true;
-        if (getCurrentTimeInNano() - start_ts > 60 * kOneSecondInNano) {
-            LOG(ERROR) << "Failed to complete transfers after 60 seconds";
+        if (getCurrentTimeInNano() - start_ts > 10 * kOneSecondInNano) {
+            LOG(ERROR) << "Failed to complete transfers after 10 seconds";
             return ErrorCode::TRANSFER_FAIL;
         }
         for (size_t i = 0; i < batch_size; ++i) {
@@ -468,8 +468,12 @@ ErrorCode Client::TransferData(
                 return ErrorCode::TRANSFER_FAIL;
             }
             if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
-            if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Transfer failed for task" << i;
+            if (status.s == TransferStatusEnum::FAILED ||
+                status.s == TransferStatusEnum::INVALID ||
+                status.s == TransferStatusEnum::CANCELED ||
+                status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(ERROR) << "Transfer failed for task " << i
+                           << " with status: " << static_cast<int>(status.s);
                 has_err = true;
             }
         }
