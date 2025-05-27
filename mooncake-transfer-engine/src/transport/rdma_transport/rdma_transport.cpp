@@ -228,7 +228,6 @@ Status RdmaTransport::submitTransfer(
             slice->target_id = request.target_id;
             slice->ts = 0;
             slice->status = Slice::PENDING;
-            slice->ts = 0;
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1, retry_cnt = 0;

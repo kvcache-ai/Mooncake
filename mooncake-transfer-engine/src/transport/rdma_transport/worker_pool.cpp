@@ -97,7 +97,17 @@ int WorkerPool::submitPostSend(
 
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
+    thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto &slice : slice_list) {
+        if (failed_target_ids.count(slice->target_id)) {
+            auto ts = failed_target_ids[slice->target_id];
+            if (getCurrentTimeInNano() - ts < 100000000ull) {
+                slice->markFailed();
+                continue;
+            } else {
+                failed_target_ids.erase(slice->target_id);
+            }
+        }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
@@ -109,6 +119,7 @@ int WorkerPool::submitPostSend(
                 LOG(ERROR) << "Cannot reload target segment #"
                            << slice->target_id;
                 slice->markFailed();
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 continue;
             }
 
@@ -212,7 +223,6 @@ void WorkerPool::performPostSend(int thread_id) {
         auto endpoint = context_.endpoint(entry.first);
 #endif
         if (!endpoint) {
-            LOG(ERROR) << "Worker: Cannot allocate endpoint: " << entry.first;
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -228,11 +238,12 @@ void WorkerPool::performPostSend(int thread_id) {
                        << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
-            context_.traceFailure();
-            if (context_.failedCount() >= 8) {
-                LOG(WARNING) << "Failed to establish peer endpoints for "
-                                "multiple times, disable device "
-                             << context_.nicPath();
+            failed_nr_polls++;
+            if (context_.active() && failed_nr_polls > 32 &&
+                !success_nr_polls) {
+                LOG(WARNING)
+                    << "Failed to establish peer endpoints in local RNIC "
+                    << context_.nicPath() << ", mark it inactive";
                 context_.set_active(false);
             }
             entry.second.clear();
@@ -275,18 +286,20 @@ void WorkerPool::performPollCq(int thread_id) {
                 // in work_request_flushed_error, we hide this by default
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
                     show_work_request_flushed_error)
-                    LOG(ERROR) << "Worker: Process failed for slice (opcode: "
-                               << slice->opcode
-                               << ", source_addr: " << slice->source_addr
-                               << ", length: " << slice->length
-                               << ", dest_addr: " << (void *) slice->rdma.dest_addr
-                               << ", local_nic: " << context_.deviceName()
-                               << ", peer_nic: " << slice->peer_nic_path
-                               << ", dest_rkey: " << slice->rdma.dest_rkey
-                               << ", retry_cnt: " << slice->rdma.retry_cnt
-                               << "): " << ibv_wc_status_str(wc[i].status);
-                context_.traceFailure();
-                if (context_.failedCount() > 16) {
+                    LOG(ERROR)
+                        << "Worker: Process failed for slice (opcode: "
+                        << slice->opcode
+                        << ", source_addr: " << slice->source_addr
+                        << ", length: " << slice->length
+                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
+                        << ", local_nic: " << context_.deviceName()
+                        << ", peer_nic: " << slice->peer_nic_path
+                        << ", dest_rkey: " << slice->rdma.dest_rkey
+                        << ", retry_cnt: " << slice->rdma.retry_cnt
+                        << "): " << ibv_wc_status_str(wc[i].status);
+                failed_nr_polls++;
+                if (context_.active() && failed_nr_polls > 32 &&
+                    !success_nr_polls) {
                     LOG(WARNING) << "Too many errors found in local RNIC "
                                  << context_.nicPath() << ", mark it inactive";
                     context_.set_active(false);
@@ -306,6 +319,7 @@ void WorkerPool::performPollCq(int thread_id) {
             } else {
                 slice->markSuccess();
                 processed_slice_count++;
+                success_nr_polls++;
             }
         }
         if (nr_poll)
@@ -393,13 +407,13 @@ int WorkerPool::doProcessContextEvents() {
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context_.deviceName();
     if (event.event_type == IBV_EVENT_QP_FATAL) {
-        auto endpoint = (RdmaEndPoint *) event.element.qp->qp_context;
+        auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
         endpoint->set_active(false);
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-        event.event_type == IBV_EVENT_CQ_ERR ||
-        event.event_type == IBV_EVENT_WQ_FATAL ||
-        event.event_type == IBV_EVENT_PORT_ERR ||
-        event.event_type == IBV_EVENT_LID_CHANGE) {
+               event.event_type == IBV_EVENT_CQ_ERR ||
+               event.event_type == IBV_EVENT_WQ_FATAL ||
+               event.event_type == IBV_EVENT_PORT_ERR ||
+               event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
@@ -418,7 +432,7 @@ void WorkerPool::monitorWorker() {
     auto last_reset_ts = getCurrentTimeInNano();
     while (workers_running_) {
         auto current_ts = getCurrentTimeInNano();
-        if (current_ts - last_reset_ts > 1ull * 1000 * 1000 * 1000) {
+        if (current_ts - last_reset_ts > 1000000000ll) {
             context_.set_active(true);
             last_reset_ts = current_ts;
         }
