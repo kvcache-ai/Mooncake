@@ -500,7 +500,7 @@ void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_stopped";
 }
 
-void MasterService::BatchEvict(int eviction_ratio) {
+void MasterService::BatchEvict(double eviction_ratio) {
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
     long object_count = 0;

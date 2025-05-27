@@ -184,7 +184,7 @@ class MasterService {
     void GCThreadFunc();
 
     // Check all shards and try to evict some keys
-    void BatchEvict(int eviction_ratio);
+    void BatchEvict(double eviction_ratio);
 
     // Internal data structures
     struct ObjectMetadata {
