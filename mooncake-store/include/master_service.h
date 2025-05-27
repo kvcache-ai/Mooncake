@@ -184,7 +184,7 @@ class MasterService {
     void GCThreadFunc();
 
     // Check all shards and try to evict some keys
-    void BatchEvict();
+    void BatchEvict(int eviction_ratio);
 
     // Internal data structures
     struct ObjectMetadata {
@@ -260,7 +260,7 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
     const double eviction_ratio_; // in range [0.0, 1.0]
-    const double eviction_high_water_mark_ratio_; // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_; // in range [0.0, 1.0]
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

@@ -74,15 +74,15 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
-      eviction_high_water_mark_ratio_(eviction_high_watermark_ratio) {
+      eviction_high_watermark_ratio_(eviction_high_watermark_ratio) {
         if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
             LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                        << "current value: " << eviction_ratio_;
             throw std::invalid_argument("Invalid eviction ratio");
         }
-        if (eviction_high_water_mark_ratio_ < 0.0 || eviction_high_water_mark_ratio_ > 1.0) {
+        if (eviction_high_watermark_ratio_ < 0.0 || eviction_high_watermark_ratio_ > 1.0) {
             LOG(ERROR) << "Eviction high watermark ratio must be between 0.0 and 1.0, "
-                       << "current value: " << eviction_high_water_mark_ratio_;
+                       << "current value: " << eviction_high_watermark_ratio_;
             throw std::invalid_argument("Invalid eviction high watermark ratio");
         }
         gc_running_ = true;
@@ -481,9 +481,11 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
-        if (MasterMetricManager::instance().get_global_used_ratio() > eviction_high_water_mark_ratio_
+        double used_ratio = MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratio > eviction_high_watermark_ratio_
             || (need_eviction_ && eviction_ratio_ > 0.0)) {
-            BatchEvict();
+            BatchEvict(std::max(eviction_ratio_,
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
         }
 
         std::this_thread::sleep_for(
@@ -498,7 +500,7 @@ void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_stopped";
 }
 
-void MasterService::BatchEvict() {
+void MasterService::BatchEvict(int eviction_ratio) {
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
     long object_count = 0;
@@ -517,7 +519,7 @@ void MasterService::BatchEvict() {
 
         // To achieve evicted_count / object_count = eviction_ration,
         // ideally how many object should be evicted in this shard
-        const long ideal_evict_num = std::ceil(object_count * eviction_ratio_) - evicted_count;
+        const long ideal_evict_num = std::ceil(object_count * eviction_ratio) - evicted_count;
 
         if (ideal_evict_num <= 0) {
             // No need to evict any object in this shard
