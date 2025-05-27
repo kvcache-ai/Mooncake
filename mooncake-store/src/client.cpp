@@ -60,6 +60,42 @@ static bool get_auto_discover() {
     return false;
 }
 
+static int64_t get_transfer_timeout_seconds() {
+    static const int64_t timeout_value = []() -> int64_t {
+        const char* env_name = "MC_STORE_TRANSFER_TIMEOUT";
+        const char* env_value_cstr = std::getenv(env_name);
+
+        constexpr int64_t default_seconds = 10;
+        constexpr int min_val = 1;
+        constexpr int max_val = 600;  // Max 10 minutes
+
+        if (env_value_cstr) {
+            try {
+                int parsed_val = std::stoi(env_value_cstr);
+                if (parsed_val >= min_val && parsed_val <= max_val) {
+                    LOG(INFO) << "Transfer timeout set to " << parsed_val
+                              << " seconds by env " << env_name;
+                    return parsed_val;
+                } else {
+                    LOG(WARNING)
+                        << "Invalid value for " << env_name << ": "
+                        << parsed_val << ". Must be between " << min_val
+                        << " and " << max_val
+                        << ". Using default: " << default_seconds << " seconds";
+                }
+            } catch (const std::exception&) {
+                LOG(WARNING)
+                    << "Failed to parse value for " << env_name
+                    << ". Using default: " << default_seconds << " seconds";
+            }
+        }
+
+        LOG(INFO) << "Using default timeout: " << default_seconds;
+        return default_seconds;
+    }();
+    return timeout_value;
+}
+
 static inline void ltrim(std::string& s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
                 return !std::isspace(ch);
@@ -480,12 +516,15 @@ ErrorCode Client::TransferData(
     const uint32_t max_try_num = 3;
     int64_t start_ts = getCurrentTimeInNano();
     const static int64_t kOneSecondInNano = 1000 * 1000 * 1000;
+    const int64_t timeout_seconds = get_transfer_timeout_seconds();
 
     while (try_num < max_try_num) {
         has_err = false;
         all_ready = true;
-        if (getCurrentTimeInNano() - start_ts > 10 * kOneSecondInNano) {
-            LOG(ERROR) << "Failed to complete transfers after 10 seconds";
+        if (getCurrentTimeInNano() - start_ts >
+            timeout_seconds * kOneSecondInNano) {
+            LOG(ERROR) << "Failed to complete transfers after "
+                       << timeout_seconds << " seconds";
             return ErrorCode::TRANSFER_FAIL;
         }
         for (size_t i = 0; i < batch_size; ++i) {
