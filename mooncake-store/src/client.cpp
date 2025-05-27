@@ -395,6 +395,36 @@ ErrorCode Client::IsExist(const std::string& key) {
     return response.error_code;
 }
 
+// Helper function to check if a transfer status indicates an error condition
+static bool IsTransferStatusError(TransferStatusEnum status) {
+    return status == TransferStatusEnum::FAILED ||
+           status == TransferStatusEnum::INVALID ||
+           status == TransferStatusEnum::CANCELED ||
+           status == TransferStatusEnum::TIMEOUT;
+}
+
+// Helper function to get a human-readable string for transfer status
+static const char* TransferStatusToString(TransferStatusEnum status) {
+    switch (status) {
+        case TransferStatusEnum::WAITING:
+            return "WAITING";
+        case TransferStatusEnum::PENDING:
+            return "PENDING";
+        case TransferStatusEnum::INVALID:
+            return "INVALID";
+        case TransferStatusEnum::CANCELED:
+            return "CANCELED";
+        case TransferStatusEnum::COMPLETED:
+            return "COMPLETED";
+        case TransferStatusEnum::TIMEOUT:
+            return "TIMEOUT";
+        case TransferStatusEnum::FAILED:
+            return "FAILED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
@@ -468,12 +498,10 @@ ErrorCode Client::TransferData(
                 return ErrorCode::TRANSFER_FAIL;
             }
             if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
-            if (status.s == TransferStatusEnum::FAILED ||
-                status.s == TransferStatusEnum::INVALID ||
-                status.s == TransferStatusEnum::CANCELED ||
-                status.s == TransferStatusEnum::TIMEOUT) {
+            if (IsTransferStatusError(status.s)) {
                 LOG(ERROR) << "Transfer failed for task " << i
-                           << " with status: " << static_cast<int>(status.s);
+                           << " with status: "
+                           << TransferStatusToString(status.s);
                 has_err = true;
             }
         }
