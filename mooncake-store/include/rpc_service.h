@@ -57,6 +57,11 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct PingResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(PingResponse, error_code)
+
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
@@ -315,6 +320,20 @@ class WrappedMasterService {
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_unmount_segment_failures();
         }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    PingResponse Ping(const std::string& segment_name) {
+        ScopedVLogTimer timer(1, "Ping");
+        timer.LogRequest("segment_name=", segment_name);
+
+        // TODO: Increment request metric
+        // MasterMetricManager::instance().inc_ping_requests();
+
+        PingResponse response;
+        response.error_code = ErrorCode::OK;
 
         timer.LogResponseJson(response);
         return response;

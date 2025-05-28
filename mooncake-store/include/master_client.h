@@ -108,6 +108,13 @@ class MasterClient {
     [[nodiscard]] UnmountSegmentResponse UnmountSegment(
         const std::string& segment_name);
 
+    /**
+     * @brief Pings master to check its availability
+     * @param segment_name Name of the segment this client has registered
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] PingResponse Ping(const std::string& segment_name);
+
    private:
     coro_rpc_client client_;
 };

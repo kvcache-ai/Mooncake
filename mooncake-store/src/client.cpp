@@ -42,10 +42,39 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
+
+    // Stop ping thread only after no need to contact master anymore
+    if (ping_running_) {
+        ping_running_ = false;
+        if (ping_thread_.joinable()) {
+            ping_thread_.join();
+        }
+    }
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
-    return master_client_.Connect(master_addr);
+    auto err = client_ha_helper_.ConnectToEtcd(metadata_connstring_);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to etcd";
+        return err;
+    }
+    std::string master_address;
+    err = client_ha_helper_.GetMasterAddress(master_address);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to get master address";
+        return err;
+    }
+    err = master_client_.Connect(master_address);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to master";
+        return err;
+    }
+
+    // Start ping thread
+    ping_running_ = true;
+    ping_thread_ = std::thread(&Client::PingThreadFunc, this);
+
+    return ErrorCode::OK;
 }
 
 static bool get_auto_discover() {
@@ -515,6 +544,48 @@ ErrorCode Client::TransferRead(
     }
 
     return TransferData(handles, slices, TransferRequest::READ);
+}
+
+void Client::PingThreadFunc() {
+    const int max_ping_fail_count = 3;
+    const int success_ping_interval_ms = 1000;
+    const int fail_ping_interval_ms = 300;
+    int ping_fail_count = 0;
+
+    while (ping_running_) {
+        if (master_client_.Ping("").error_code == ErrorCode::OK) {
+            ping_fail_count = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(success_ping_interval_ms));
+            continue;
+        }
+
+        ping_fail_count++;        
+        if (ping_fail_count < max_ping_fail_count) {
+            LOG(ERROR) << "Failed to ping master";
+            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+
+        LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                    << " times, reconnecting to master";
+        std::string master_address;
+        auto err = client_ha_helper_.GetMasterAddress(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get master address: " << toString(err);
+            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master " << master_address << ": " << toString(err);
+            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+        ping_fail_count = 0;
+        LOG(INFO) << "Reconnected to master " << master_address;
+        std::this_thread::sleep_for(std::chrono::milliseconds(success_ping_interval_ms));
+    }
 }
 
 }  // namespace mooncake

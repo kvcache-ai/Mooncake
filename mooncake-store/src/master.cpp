@@ -6,7 +6,9 @@
 #include <ylt/easylog/record.hpp>
 
 #include "rpc_service.h"
+#include "ha_helper.h"
 #include "types.h"
+
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
@@ -31,6 +33,13 @@ int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    // Initialize leader election helper
+    mooncake::LeaderElectionHelper leader_election_helper("0.0.0.0:2379", "localhost:" + std::to_string(FLAGS_port));
+    while (true) {
+        leader_election_helper.ElectSelfAsLeader();
+        leader_election_helper.KeepSelfAsLeader();
+    }
 
     // init rpc server
     coro_rpc_server server(
@@ -66,6 +75,8 @@ int main(int argc, char* argv[]) {
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
 
     // Metric reporting is now handled by WrappedMasterService

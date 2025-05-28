@@ -1,5 +1,12 @@
 project(MooncakeStore)
 
+if (USE_ETCD)
+    if (USE_ETCD_LEGACY)
+        message(WARNING "Mooncake-store does not support etcd-cpp-api-v3")
+    else()
+        add_compile_definitions(MOONCAKE_STORE_USE_ETCD)
+    endif()
+endif()
 
 # Add include directories
 include_directories(

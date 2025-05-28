@@ -10,6 +10,7 @@
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "ha_helper.h"
 
 namespace mooncake {
 
@@ -176,6 +177,12 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // Helper for high availability
+    ClientHaHelper client_ha_helper_;
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void PingThreadFunc();
 };
 
 }  // namespace mooncake

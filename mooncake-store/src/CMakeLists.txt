@@ -16,7 +16,6 @@ include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_link_libraries(mooncake_store PUBLIC transfer_engine glog::glog gflags::gflags)
 
-
 # Master binary
 add_executable(mooncake_master master.cpp)
 target_link_libraries(mooncake_master PRIVATE
@@ -24,5 +23,11 @@ target_link_libraries(mooncake_master PRIVATE
     cachelib_memory_allocator
     pthread
 )
+
+if (MOONCAKE_STORE_USE_ETCD)
+    add_dependencies(mooncake_master build_etcd_wrapper)
+    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
+    target_link_libraries(mooncake_master PRIVATE ${ETCD_WRAPPER_LIB})
+endif()
 
 install(TARGETS mooncake_master DESTINATION bin)

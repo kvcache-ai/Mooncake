@@ -81,6 +81,8 @@ enum class ErrorCode : int32_t {
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
+    ETCD_CONNECT_FAIL = -901,  ///< ETCD connection failed.
+    MASTER_CONNECT_FAIL = -902,  ///< Master connection failed.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
