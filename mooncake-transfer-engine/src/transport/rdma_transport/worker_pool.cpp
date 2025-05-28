@@ -347,7 +347,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 
     for (auto &slice : slice_list) {
-        if (slice->rdma.retry_cnt == slice->rdma.max_retry_cnt) {
+        if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
