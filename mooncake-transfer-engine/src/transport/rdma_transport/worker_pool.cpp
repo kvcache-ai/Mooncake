@@ -408,6 +408,7 @@ int WorkerPool::doProcessContextEvents() {
                  << context_.deviceName();
     if (event.event_type == IBV_EVENT_QP_FATAL) {
         auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
+        context_.set_active(false);
         context_.deleteEndpoint(endpoint->getPeerNicPath());
         endpoint->disconnect();
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
