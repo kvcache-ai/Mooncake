@@ -1,10 +1,10 @@
-#include "topology.h"
+#include "utility/topology.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "transfer_metadata.h"
-#include "memory_location.h"
+#include "metadata/metadata.h"
+#include "utility/memory_location.h"
 
 TEST(ToplogyTest, GetTopologyMatrix) {
     mooncake::Topology topology;

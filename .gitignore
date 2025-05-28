@@ -17,6 +17,7 @@ __pycache__/
 
 # C extensions
 *.so
+go.mod
 
 # Distribution / packaging
 .Python

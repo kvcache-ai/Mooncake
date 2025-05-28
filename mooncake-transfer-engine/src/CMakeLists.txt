@@ -1,30 +1,22 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
+add_subdirectory(metadata)
 add_subdirectory(transport)
+add_subdirectory(utility)
+add_subdirectory(transport_v1)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport> $<TARGET_OBJECTS:metadata>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
 if (USE_ETCD)
-  if (USE_ETCD_LEGACY)
-    if (USE_STATIC_ETCD_CPP_API)
-      find_package(PkgConfig REQUIRED)
-      pkg_check_modules(GRPCPP REQUIRED grpc++)
-      pkg_check_modules(GRPC REQUIRED grpc)
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
-    else()
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
-    endif()
-  else ()
-    add_dependencies(transfer_engine build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
-    target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
-  endif()
+  add_dependencies(transfer_engine build_etcd_wrapper)
+  set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
+  target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
 endif()
 if (USE_REDIS)
   target_link_libraries(transfer_engine PUBLIC hiredis)
@@ -36,7 +28,7 @@ endif()
 target_link_libraries(
     transfer_engine
     PUBLIC
-    base transport rdma_transport ibverbs glog gflags pthread jsoncpp numa
+    common utility transport_v1 transport_rdma_v1 transport rdma_transport ibverbs glog gflags pthread jsoncpp numa boost_thread
     )
 
 if (USE_CUDA)

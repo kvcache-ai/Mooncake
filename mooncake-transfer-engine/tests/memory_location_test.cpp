@@ -1,4 +1,4 @@
-#include "memory_location.h"
+#include "utility/memory_location.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
