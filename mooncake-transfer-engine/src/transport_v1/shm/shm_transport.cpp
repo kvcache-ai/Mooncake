@@ -101,17 +101,19 @@ Status ShmTransport::uninstall() {
     return Status::OK();
 }
 
-Status ShmTransport::allocateSubBatch(SubBatchRef batch, size_t max_size) {
-    auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
-    if (!shm_batch) return Status::InvalidArgument("invalid shm sub batch");
+Status ShmTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+    auto shm_batch = new ShmSubBatch();
+    batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
     return Status::OK();
 }
 
-Status ShmTransport::freeSubBatch(SubBatchRef batch) {
+Status ShmTransport::freeSubBatch(SubBatchRef &batch) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
     if (!shm_batch) return Status::InvalidArgument("invalid shm sub batch");
+    delete shm_batch;
+    batch = nullptr;
     return Status::OK();
 }
 

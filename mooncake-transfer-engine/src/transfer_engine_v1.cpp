@@ -18,12 +18,19 @@
 
 #include "metadata/handshake.h"
 #include "transport_v1/rdma/rdma_transport.h"
+#include "transport_v1/shm/shm_transport.h"
 
 namespace mooncake {
 namespace v1 {
 
 struct Batch {
-    RdmaSubBatch rdma;
+    Batch() { sub_batch.resize(kSupportedTransportTypes, nullptr); }
+    ~Batch() {
+        for (auto &entry : sub_batch) delete entry;
+    }
+
+    std::vector<Transport::SubBatchRef> sub_batch;
+    std::vector<std::pair<TransportType, size_t>> task_id_lookup;
     size_t max_size;
 };
 
@@ -39,12 +46,29 @@ static std::string loadTopologyJsonFile(const std::string &path) {
     return content;
 }
 
-int TransferEngine::init(const std::string &metadata_conn_string,
-                         const std::string &local_server_name) {
-    local_server_name_ = local_server_name;
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-    transport_ = std::make_shared<RdmaTransport>();
+int TransferEngine::registerRdmaTransport() {
+    auto transport = std::make_shared<RdmaTransport>();
+    auto status =
+        transport->install(local_server_name_, metadata_, local_topology_);
+    if (!status.ok()) {
+        return (int)status.code();
+    }
+    transport_list_[RDMA] = transport;
+    return 0;
+}
 
+int TransferEngine::registerShmTransport() {
+    auto transport = std::make_shared<ShmTransport>();
+    auto status =
+        transport->install(local_server_name_, metadata_, local_topology_);
+    if (!status.ok()) {
+        return (int)status.code();
+    }
+    transport_list_[SHM] = transport;
+    return 0;
+}
+
+int TransferEngine::registerLocalSegment() {
     RpcMetaDesc desc;
     auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
     if (ip_address)
@@ -69,9 +93,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << " and port " << desc.rpc_port
               << " for serving local TCP service";
 
-    int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
-    if (ret) return ret;
+    return metadata_->addRpcMetaEntry(local_server_name_, desc);
+}
 
+int TransferEngine::buildTopology() {
     if (getenv("MC_CUSTOM_TOPO_JSON")) {
         auto path = getenv("MC_CUSTOM_TOPO_JSON");
         auto topo_json = loadTopologyJsonFile(path);
@@ -85,14 +110,27 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     } else {
         local_topology_->discover(filter_);
     }
+    return 0;
+}
+
+int TransferEngine::init(const std::string &metadata_conn_string,
+                         const std::string &local_server_name) {
+    transport_list_.resize(kSupportedTransportTypes, nullptr);
+    local_server_name_ = local_server_name;
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    int rc = registerLocalSegment();
+    if (rc) return rc;
+
+    rc = buildTopology();
+    if (rc) return rc;
 
     if (local_topology_->getHcaList().size() > 0) {
-        auto status =
-            transport_->install(local_server_name_, metadata_, local_topology_);
-        if (!status.ok()) {
-            return (int)status.code();
-        }
+        rc = registerRdmaTransport();
+        if (rc) return rc;
     }
+
+    // rc = registerShmTransport();
+    // if (rc) return rc;
 
     return 0;
 }
@@ -102,6 +140,7 @@ int TransferEngine::freeEngine() {
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();
     }
+    transport_list_.clear();
     return 0;
 }
 
@@ -137,11 +176,7 @@ int TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
 
 BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     Batch *batch = new Batch();
-    auto ret = transport_->allocateSubBatch(&batch->rdma, batch_size);
-    if (!ret.ok()) {
-        delete batch;
-        return (BatchID)(0);
-    }
+    batch->max_size = batch_size;
     mutex_.lock();
     batch_set_.insert(batch);
     mutex_.unlock();
@@ -163,11 +198,21 @@ void TransferEngine::lazyFreeBatch() {
     for (auto it = deferred_free_batch_set_.begin();
          it != deferred_free_batch_set_.end();) {
         auto &batch = *it;
-        std::vector<int> task_id_list;
-        transport_->queryOutstandingTasks(&batch->rdma, task_id_list);
-        if (task_id_list.empty()) {
+        bool has_task = false;
+        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+            auto &transport = transport_list_[type];
+            auto &sub_batch = batch->sub_batch[type];
+            if (!transport || !sub_batch) continue;
+            std::vector<int> task_id_list;
+            transport->queryOutstandingTasks(sub_batch, task_id_list);
+            if (task_id_list.empty()) {
+                transport->freeSubBatch(sub_batch);
+            } else {
+                has_task = true;
+            }
+        }
+        if (!has_task) {
             batch_set_.erase(batch);
-            auto ret = transport_->freeSubBatch(&batch->rdma);
             delete batch;
             it = deferred_free_batch_set_.erase(it);
         } else {
@@ -177,30 +222,68 @@ void TransferEngine::lazyFreeBatch() {
 }
 
 Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
+    BatchID batch_id, const std::vector<TransferRequest> &request_list) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    return transport_->submitTransferTasks(&batch->rdma, entries);
+
+    std::vector<TransferRequest>
+        classified_request_list[kSupportedTransportTypes];
+
+    for (auto &request : request_list) {
+        classified_request_list[RDMA].push_back(request);
+        batch->task_id_lookup.push_back(
+            std::make_pair(RDMA, batch->task_id_lookup.size()));
+    }
+
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (classified_request_list[type].empty()) continue;
+        auto &transport = transport_list_[type];
+        auto &sub_batch = batch->sub_batch[type];
+        if (!sub_batch) {
+            auto ret = transport->allocateSubBatch(sub_batch, batch->max_size);
+            if (!ret.ok()) return ret;
+        }
+        auto ret = transport->submitTransferTasks(
+            sub_batch, classified_request_list[type]);
+        if (!ret.ok()) return ret;
+    }
+    return Status::OK();
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    status = transport_->getTransferStatus(&batch->rdma, task_id);
+    if (task_id >= batch->task_id_lookup.size())
+        return Status::InvalidArgument("invalid task id");
+    auto [type, sub_task_id] = batch->task_id_lookup[task_id];
+    auto transport = transport_list_[type];
+    auto sub_batch = batch->sub_batch[type];
+    if (!transport || !sub_batch) {
+        return Status::InvalidArgument("transport not available");
+    }
+    status = transport->getTransferStatus(sub_batch, sub_task_id);
     return Status::OK();
 }
 
 int TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list) {
-    auto status = transport_->registerLocalMemory(buffer_list);
-    return (int)status.code();
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (!transport_list_[type]) continue;
+        auto status = transport_list_[type]->registerLocalMemory(buffer_list);
+        if (!status.ok()) return (int)status.code();
+    }
+    return 0;
 }
 
 int TransferEngine::unregisterLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list) {
-    auto status = transport_->unregisterLocalMemory(buffer_list);
-    return (int)status.code();
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (!transport_list_[type]) continue;
+        auto status = transport_list_[type]->unregisterLocalMemory(buffer_list);
+        if (!status.ok()) return (int)status.code();
+    }
+    return 0;
 }
 }  // namespace v1
 }  // namespace mooncake

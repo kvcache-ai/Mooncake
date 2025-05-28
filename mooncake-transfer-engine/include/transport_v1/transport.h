@@ -82,12 +82,12 @@ class Transport {
 
     virtual Status uninstall() { return Status::OK(); }
 
-    virtual Status allocateSubBatch(SubBatchRef batch, size_t max_size) {
+    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::NotImplemented(
             "generic transport does not implement allocateSubBatch");
     }
 
-    virtual Status freeSubBatch(SubBatchRef batch) {
+    virtual Status freeSubBatch(SubBatchRef &batch) {
         return Status::NotImplemented(
             "generic transport does not implement freeSubBatch");
     }

@@ -88,9 +88,9 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
     }
 }
 
-Status GdsTransport::allocateSubBatch(SubBatchRef batch, size_t max_size) {
-    auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
-    if (!gds_batch) return Status::InvalidArgument("invalid gds sub batch");
+Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+    auto gds_batch = new GdsSubBatch();
+    batch = gds_batch;
     gds_batch->task_list.reserve(max_size);
     gds_batch->max_size = max_size;
     gds_batch->desc_idx = desc_pool_->allocCUfileDesc(max_size);
@@ -99,10 +99,12 @@ Status GdsTransport::allocateSubBatch(SubBatchRef batch, size_t max_size) {
     return Status::OK();
 }
 
-Status GdsTransport::freeSubBatch(SubBatchRef batch) {
+Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (!gds_batch) return Status::InvalidArgument("invalid gds sub batch");
     desc_pool_->freeCUfileDesc(gds_batch->desc_idx);
+    delete gds_batch;
+    batch = nullptr;
     return Status::OK();
 }
 

@@ -55,9 +55,9 @@ class GdsTransport : public Transport {
 
     virtual Status uninstall();
 
-    virtual Status allocateSubBatch(SubBatchRef batch, size_t max_size);
+    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
-    virtual Status freeSubBatch(SubBatchRef batch);
+    virtual Status freeSubBatch(SubBatchRef &batch);
 
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list);

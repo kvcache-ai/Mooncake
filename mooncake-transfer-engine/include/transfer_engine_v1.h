@@ -47,6 +47,10 @@ using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
 class Batch;
 
+enum TransportType { RDMA = 0, SHM, GDS };
+
+const static int kSupportedTransportTypes = 3;
+
 class TransferEngine {
    public:
     TransferEngine(bool auto_discover = false)
@@ -91,7 +95,7 @@ class TransferEngine {
     Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries);
+                          const std::vector<TransferRequest> &request_list);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
@@ -105,12 +109,21 @@ class TransferEngine {
    private:
     void lazyFreeBatch();
 
+    int registerLocalSegment();
+
+    int registerRdmaTransport();
+
+    int registerShmTransport();
+
+    int buildTopology();
+
    private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
-    std::shared_ptr<Transport> transport_;
     std::shared_ptr<Topology> local_topology_;
     std::vector<std::string> filter_;
+
+    std::vector<std::shared_ptr<Transport>> transport_list_;
     std::unordered_set<Batch *> batch_set_;
     std::vector<Batch *> deferred_free_batch_set_;
     std::mutex mutex_;
