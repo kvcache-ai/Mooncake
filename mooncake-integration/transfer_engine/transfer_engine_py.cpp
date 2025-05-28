@@ -17,7 +17,15 @@
 #include <cassert>
 #include <fstream>
 
-TransferEnginePy::TransferEnginePy() {}
+TransferEnginePy::TransferEnginePy() {
+    const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+    if (getenv("MC_TRANSFER_TIMEOUT")) {
+        int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
+        transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
+    } else {
+        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+    }
+}
 
 TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
@@ -185,80 +193,16 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
                                         size_t length) {
-    pybind11::gil_scoped_release release;
-    Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
-    }
-
-    auto batch_id = engine_->allocateBatchID(1);
-    assert(batch_id != 0);
-    assert(batch_id != ERR_MEMORY);
-    TransferRequest entry;
-    entry.opcode = TransferRequest::WRITE;
-    entry.length = length;
-    entry.source = (void *)buffer;
-    entry.target_id = handle;
-    entry.target_offset = peer_buffer_address;
-
-    Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
-
-    TransferStatus status;
-    while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(s.ok());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(batch_id);
-            return -1;
-        }
-    }
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::WRITE);
 }
 
 int TransferEnginePy::transferSyncRead(const char *target_hostname,
                                        uintptr_t buffer,
                                        uintptr_t peer_buffer_address,
                                        size_t length) {
-    pybind11::gil_scoped_release release;
-    Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
-    }
-
-    auto batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
-    entry.opcode = TransferRequest::READ;
-    entry.length = length;
-    entry.source = (void *)buffer;
-    entry.target_id = handle;
-    entry.target_offset = peer_buffer_address;
-
-    Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
-
-    TransferStatus status;
-    while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(s.ok());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(batch_id);
-            return -1;
-        }
-    }
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::READ);
 }
 
 int TransferEnginePy::transferSync(const char *target_hostname,
@@ -267,12 +211,15 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                                    TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     // TODO this is just a workaround
@@ -282,6 +229,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
     // local RNIC in one transferSync call. Will be fixed in the next revision.
     const int max_retry =
         engine_->numContexts() + 1;  // Iter all possible local contexts
+    auto start_ts = getCurrentTimeInNano();
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;
@@ -301,7 +249,6 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 
         TransferStatus status;
         bool completed = false;
-        auto start_ts = getCurrentTimeInNano();
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -311,11 +258,12 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
-            const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
-            const int64_t timeout =
-                (10 + length / 5000000000) * kNanosPerSecond;
+            const int64_t timeout = transfer_timeout_nsec_ + length; // 1GiB per second
             if (current_ts - start_ts > timeout) {
                 LOG(INFO) << "Sync data transfer timeout, local buffer "
                           << (void *)buffer << " remote buffer "
@@ -329,17 +277,20 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 }
 
 batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
-                                          uintptr_t buffer,
-                                          uintptr_t peer_buffer_address,
-                                          size_t length) {
+                                                 uintptr_t buffer,
+                                                 uintptr_t peer_buffer_address,
+                                                 size_t length) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     auto batch_id = engine_->allocateBatchID(1);
@@ -367,6 +318,8 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     } else if (status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(batch_id);
         return -1;
+    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        return -2;
     } else {
         return 0;
     }

@@ -61,6 +61,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         attr.recv_cq = cq;
         attr.sq_sig_all = false;
         attr.qp_type = IBV_QPT_RC;
+        attr.qp_context = this;
         attr.cap.max_send_wr = attr.cap.max_recv_wr = max_wr_depth;
         attr.cap.max_send_sge = attr.cap.max_recv_sge = max_sge_per_wr;
         attr.cap.max_inline_data = max_inline_bytes;
@@ -77,13 +78,20 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 
 int RdmaEndPoint::deconstruct() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i] != 0)
-            LOG(WARNING)
-                << "Outstanding work requests found, CQ will not be generated";
-
         if (ibv_destroy_qp(qp_list_[i])) {
             PLOG(ERROR) << "Failed to destroy QP";
             return ERR_ENDPOINT;
+        }
+        // After destroying QP, the wr_depth_list_ won't change
+        bool displayed = false;
+        if (wr_depth_list_[i] != 0) {
+            if (!displayed) {
+                LOG(WARNING)
+                    << "Outstanding work requests found, CQ will not be generated";
+                displayed = true;
+            }
+            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+            wr_depth_list_[i] = 0;
         }
     }
     qp_list_.clear();
@@ -218,18 +226,24 @@ void RdmaEndPoint::disconnect() {
 }
 
 void RdmaEndPoint::disconnectUnlocked() {
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i] != 0)
-            LOG(WARNING) << "Outstanding work requests will be dropped";
-    }
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) PLOG(ERROR) << "Failed to modify QP to RESET";
+        // After resetting QP, the wr_depth_list_ won't change
+        bool displayed = false;
+        if (wr_depth_list_[i] != 0) {
+            if (!displayed) {
+                LOG(WARNING)
+                    << "Outstanding work requests found, CQ will not be generated";
+                displayed = true;
+            }
+            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+            wr_depth_list_[i] = 0;
+        }
     }
-    for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i] = 0;
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
@@ -283,6 +297,7 @@ int RdmaEndPoint::submitPostSend(
         wr.imm_data = 0;
         wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
+        slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->rdma.qp_depth = &wr_depth_list_[qp_index];
     }

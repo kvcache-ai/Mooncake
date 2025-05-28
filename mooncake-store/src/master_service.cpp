@@ -128,10 +128,10 @@ ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
                     break;
                 }
             }
-
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
                 it = shard.metadata.erase(it);
+                MasterMetricManager::instance().dec_key_count(1);
             } else {
                 ++it;
             }

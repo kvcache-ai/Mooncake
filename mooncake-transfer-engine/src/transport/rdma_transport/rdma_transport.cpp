@@ -226,6 +226,7 @@ Status RdmaTransport::submitTransfer(
             slice->rdma.max_retry_cnt = kMaxRetryCount;
             slice->task = &task;
             slice->target_id = request.target_id;
+            slice->ts = 0;
             slice->status = Slice::PENDING;
             task.slice_list.push_back(slice);
 
@@ -289,10 +290,12 @@ Status RdmaTransport::submitTransferTask(
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
+            slice->ts = 0;
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
+            bool found_device = false;
             while (retry_cnt < kMaxRetryCount) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
@@ -310,18 +313,18 @@ Status RdmaTransport::submitTransferTask(
                 task.total_bytes += slice->length;
                 // task.slices.push_back(slice);
                 __sync_fetch_and_add(&task.slice_count, 1);
+                found_device = true;
                 break;
             }
-            if (device_id < 0) {
+            if (!found_device) {
                 auto source_addr = slice->source_addr;
                 for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) delete s;
+                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 LOG(ERROR)
-                    << "RdmaTransport: Address not registered by any device(s) "
+                    << "Memory region not registered by any active device(s): "
                     << source_addr;
                 return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), "
-                    "address: " +
+                    "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
@@ -444,7 +447,7 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
                                 int retry_count) {
-    assert(desc);
+    if (!desc) return ERR_ADDRESS_NOT_REGISTERED;
     for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
         auto &buffer_desc = desc->buffers[buffer_id];
         if (buffer_desc.addr > offset ||

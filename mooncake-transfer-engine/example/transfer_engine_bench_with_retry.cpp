@@ -55,7 +55,7 @@ static std::string getHostname();
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
-DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
+DEFINE_string(metadata_server, "P2PHANDSHAKE", "etcd server host address");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
@@ -202,26 +202,27 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         }
 
         s = engine->submitTransfer(batch_id, requests);
-        LOG_ASSERT(s.ok());
-        for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
-            bool completed = false;
-            TransferStatus status;
-            while (!completed) {
-                Status s = engine->getTransferStatus(batch_id, task_id, status);
-                LOG_ASSERT(s.ok());
-                if (status.s == TransferStatusEnum::COMPLETED)
-                    completed = true;
-                else if (status.s == TransferStatusEnum::FAILED) {
-                    LOG(INFO) << "FAILED";
-                    completed = true;
-                    exit(EXIT_FAILURE);
+        if (!s.ok()) 
+            LOG(INFO) << "Found Failed Requests";
+        else {
+            for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
+                bool completed = false;
+                TransferStatus status;
+                while (!completed) {
+                    Status s = engine->getTransferStatus(batch_id, task_id, status);
+                    LOG_ASSERT(s.ok());
+                    if (status.s == TransferStatusEnum::COMPLETED)
+                        completed = true;
+                    else if (status.s == TransferStatusEnum::FAILED) {
+                        LOG(INFO) << "Found Failed Requests";
+                        completed = true;
+                    }
                 }
             }
+            s = engine->freeBatchID(batch_id);
+            LOG_ASSERT(s.ok());
+            batch_count++;
         }
-
-        s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
-        batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
@@ -313,21 +314,27 @@ int initiator() {
     }
 #endif
 
-    auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
-
     std::thread workers[FLAGS_threads];
 
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
 
-    for (int i = 0; i < FLAGS_threads; ++i)
-        workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
-                                 addr[i % buffer_num]);
+    while (true) {
+        LOG(INFO) << "Please input the port from peer node: ";
+        int port = 0;
+        std::cin >> port;
+        std::string segment_name = "localhost:" + std::to_string(port);
+        auto segment_id = engine->openSegment(segment_name.c_str());
+        running = true;
+        for (int i = 0; i < FLAGS_threads; ++i)
+            workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
+                                    addr[i % buffer_num]);
 
-    sleep(FLAGS_duration);
-    running = false;
+        sleep(FLAGS_duration);
+        running = false;
 
-    for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
+        for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
+    }
 
     gettimeofday(&stop_tv, nullptr);
     auto duration = (stop_tv.tv_sec - start_tv.tv_sec) +
@@ -384,31 +391,18 @@ int target() {
     }
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
-    int buffer_num = NR_SOCKETS;
-
-#ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
-    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
-    for (int i = 0; i < buffer_num; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
-        LOG_ASSERT(!rc);
-    }
-#else
-    for (int i = 0; i < buffer_num; ++i) {
-       addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
+    for (int i = 0; i < NR_SOCKETS; ++i) {
+        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
+        memset(addr[i], 'x', FLAGS_buffer_size);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
     }
-#endif
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
-    for (int i = 0; i < buffer_num; ++i) {
+    for (int i = 0; i < NR_SOCKETS; ++i) {
         engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
