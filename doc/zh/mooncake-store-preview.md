@@ -378,6 +378,9 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 每次替换任务被触发时，会尝试换出大约 10% 的对象，这个比例可通过 `master_service` 的启动参数进行配置。
 
+为了尽力避免 Put 失败，还可以通过 `master_service` 的启动参数 `-eviction_high_watermark_ratio=<RATIO>`(默认为 1) 来设定 eviction 的高水位触发条件。当清理线程发现当前空间使用量达到了设定的高水位，
+则开始进行清理工作，清理的目标在高水位基础上再多清理 `-eviction_ratio` 指定的清理比例，从而达到空间低水位。
+
 ### 租约机制
 
 为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。
