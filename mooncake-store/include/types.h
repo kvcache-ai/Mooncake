@@ -19,7 +19,8 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
-static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL = 200;  // in milliseconds
+static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
+    200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 
 // Forward declarations
@@ -157,10 +158,13 @@ inline std::ostream& operator<<(std::ostream& os,
  */
 struct ReplicateConfig {
     size_t replica_num{0};
+    std::string preferred_segment{};  // Preferred segment for allocation,
+                                      // defaults to client's local hostname
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         return os << "ReplicateConfig: { replica_num: " << config.replica_num
+                  << ", preferred_segment: " << config.preferred_segment
                   << " }";
     }
 };
