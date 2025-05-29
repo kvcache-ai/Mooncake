@@ -24,6 +24,13 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replica_list, error_code)
 
+struct BatchGetReplicaListResponse {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchGetReplicaListResponse, batch_replica_list, error_code)
+
 struct PutStartResponse {
     std::vector<Replica::Descriptor> replica_list;
     ErrorCode error_code = ErrorCode::OK;
@@ -38,6 +45,22 @@ struct PutRevokeResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(PutRevokeResponse, error_code)
+struct BatchPutStartResponse {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutStartResponse, batch_replica_list, error_code)
+
+struct BatchPutEndResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutEndResponse, error_code)
+
+struct BatchPutRevokeResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutRevokeResponse, error_code)
 
 struct RemoveResponse {
     ErrorCode error_code = ErrorCode::OK;
@@ -170,6 +193,19 @@ class WrappedMasterService {
         return response;
     }
 
+    BatchGetReplicaListResponse BatchGetReplicaList(
+        const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchGetReplicaList");
+        timer.LogRequest("action=get_batch_replica_list");
+
+        BatchGetReplicaListResponse response;
+        response.error_code = master_service_.BatchGetReplicaList(
+            keys, response.batch_replica_list);
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
     PutStartResponse PutStart(const std::string& key, uint64_t value_length,
                               const std::vector<uint64_t>& slice_lengths,
                               const ReplicateConfig& config) {
@@ -236,6 +272,53 @@ class WrappedMasterService {
             MasterMetricManager::instance().dec_key_count();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutStartResponse BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config) {
+        ScopedVLogTimer timer(1, "BatchPutStart");
+        timer.LogRequest("xrrkeys_count=", keys.size());
+
+        BatchPutStartResponse response;
+        response.error_code =
+            master_service_.BatchPutStart(keys, value_lengths, slice_lengths,
+                                          config, response.batch_replica_list);
+
+        // Track failures if needed
+        if (response.error_code == ErrorCode::OK) {
+            MasterMetricManager::instance().inc_key_count(keys.size());
+        }
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutEndResponse BatchPutEnd(const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchPutEnd");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchPutEndResponse response;
+        response.error_code = master_service_.BatchPutEnd(keys);
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutRevokeResponse BatchPutRevoke(
+        const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchPutRevoke");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchPutRevokeResponse response;
+        response.error_code = master_service_.BatchPutRevoke(keys);
+        // Track failures if needed
+        if (response.error_code == ErrorCode::OK) {
+            MasterMetricManager::instance().dec_key_count(keys.size());
+        }
         timer.LogResponseJson(response);
         return response;
     }

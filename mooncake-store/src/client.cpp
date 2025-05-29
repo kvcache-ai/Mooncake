@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <unordered_set>
 
 #include "rpc_service.h"
 #include "transfer_engine.h"
@@ -176,6 +177,25 @@ ErrorCode Client::Get(const std::string& object_key,
     return Get(object_key, object_info, slices);
 }
 
+ErrorCode Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::unordered_set<std::string> seen;
+    for (const auto& key : object_keys) {
+        if (!seen.insert(key).second) {
+            LOG(ERROR) << "Duplicate key not supportted for Batch API, key: "
+                       << key;
+            return ErrorCode::INVALID_PARAMS;
+        };
+    }
+    BatchObjectInfo batched_object_info;
+    auto err = BatchQuery(object_keys, batched_object_info);
+    if (err == ErrorCode::OK) {
+        return BatchGet(object_keys, batched_object_info, slices);
+    }
+    return ErrorCode::OBJECT_NOT_FOUND;
+}
+
 ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) {
     auto response = master_client_.GetReplicaList(object_key);
@@ -183,6 +203,30 @@ ErrorCode Client::Query(const std::string& object_key,
     object_info.replica_list.resize(response.replica_list.size());
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
         object_info.replica_list[i] = response.replica_list[i];
+    }
+    return response.error_code;
+}
+
+ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
+                             BatchObjectInfo& batched_object_info) {
+    auto response = master_client_.BatchGetReplicaList(object_keys);
+    // copy vec
+    if (response.batch_replica_list.size() != object_keys.size()) {
+        LOG(ERROR) << "QueryBatch failed, response size is not equal to "
+                      "request size";
+        LOG(ERROR) << "clear batched_object_info.batch_replica_list";
+        batched_object_info.batch_replica_list.clear();
+        return ErrorCode::INVALID_PARAMS;
+    }
+    for (const auto& key : object_keys) {
+        auto it = response.batch_replica_list.find(key);
+        if (it == response.batch_replica_list.end()) {
+            LOG(ERROR) << "QueryBatch failed, key: " << key
+                       << " not found in response";
+            batched_object_info.batch_replica_list.clear();
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+        batched_object_info.batch_replica_list.emplace(key, it->second);
     }
     return response.error_code;
 }
@@ -229,6 +273,32 @@ ErrorCode Client::Get(const std::string& object_key,
 
     LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
     return ErrorCode::INVALID_REPLICA;
+}
+
+ErrorCode Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    BatchObjectInfo& batched_object_info,
+    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    for (const auto& key : object_keys) {
+        auto object_info_it = batched_object_info.batch_replica_list.find(key);
+        auto slices_it = slices.find(key);
+        if (object_info_it == batched_object_info.batch_replica_list.end() ||
+            slices_it == slices.end()) {
+            LOG(ERROR) << "Key not found: " << key;
+            slices.clear();
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        ObjectInfo object_info;
+        object_info.replica_list = object_info_it->second;
+        object_info.error_code = ErrorCode::OK;
+        if (Get(key, object_info, slices_it->second) != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get key: " << key;
+            slices.clear();
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
@@ -287,6 +357,93 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
 
     // End put operation
     err = master_client_.PutEnd(key).error_code;
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to end put operation: " << err;
+        return err;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode Client::BatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    ReplicateConfig& config) {
+    std::unordered_map<std::string, std::vector<size_t>> batched_slice_lengths;
+    std::unordered_map<std::string, size_t> batched_value_lengths;
+    for (const auto& key : keys) {
+        auto slices = batched_slices.find(key);
+        if (slices == batched_slices.end()) {
+            LOG(ERROR) << "Cannot find slices for key: " << key;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        size_t slice_size = 0;
+        std::vector<size_t> slice_lengths;
+        for (const auto& slice : slices->second) {
+            slice_lengths.push_back(slice.size);
+            slice_size += slice.size;
+        }
+        batched_slice_lengths.emplace(key, std::move(slice_lengths));
+        batched_value_lengths.emplace(key, slice_size);
+    }
+    BatchPutStartResponse start_response = master_client_.BatchPutStart(
+        keys, batched_value_lengths, batched_slice_lengths, config);
+    ErrorCode err = start_response.error_code;
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            LOG(INFO) << "object_already_exists key count " << keys.size();
+            return ErrorCode::OK;
+        }
+        LOG(ERROR) << "Failed to start batch put operation: " << err;
+        return err;
+    }
+
+    // Transfer data using allocated handles from all replicas
+    for (const auto& key : keys) {
+        const auto& slices_it = batched_slices.find(key);
+        if (slices_it == batched_slices.end()) {
+            LOG(ERROR) << "Cannot find slices for key: " << key;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        const auto& replica_list = start_response.batch_replica_list.find(key);
+        if (replica_list == start_response.batch_replica_list.end()) {
+            LOG(ERROR) << "Cannot find replica_list for key: " << key;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        for (auto& replica : replica_list->second) {
+            std::vector<AllocatedBuffer::Descriptor> handles;
+            for (const auto& handle : replica.buffer_descriptors) {
+                CHECK(handle.buffer_address_ != 0)
+                    << "buffer_address_ is nullptr";
+                handles.push_back(handle);
+            }
+
+            // Fast path: if segment is on local host and we have single slice
+            // and handle, use memcpy instead of going through the transfer
+            // engine
+            std::vector<Slice>& slices = slices_it->second;
+            if (slices.size() == 1 && handles.size() == 1 &&
+                handles[0].size_ == slices[0].size &&
+                handles[0].segment_name_ == this->local_hostname_) {
+                VLOG(1) << "Using fast path (memcpy) for local transfer";
+                memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
+                       handles[0].size_);
+            } else {
+                // Normal path: use transfer engine
+                ErrorCode transfer_err = TransferWrite(handles, slices);
+                if (transfer_err != ErrorCode::OK) {
+                    // Revoke put operation
+                    auto revoke_err = master_client_.BatchPutRevoke(keys);
+                    if (revoke_err.error_code != ErrorCode::OK) {
+                        LOG(ERROR) << "Failed to revoke put operation";
+                        return revoke_err.error_code;
+                    }
+                    return transfer_err;
+                }
+            }
+        }
+    }
+    // End put operation
+    err = master_client_.BatchPutEnd(keys).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
