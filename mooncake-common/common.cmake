@@ -43,6 +43,7 @@ option(BUILD_UNIT_TESTS "Build uint tests" ON)
 option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
+option(USE_NVLINK "option for using NVLINKtransport" OFF)
 option(USE_CXL "option for using cxl protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
@@ -70,6 +71,11 @@ if (USE_CUDA)
     message(STATUS "NVMe-oF support is enabled")
   endif()
 
+  if (USE_NVLINK)
+    add_compile_definitions(USE_NVLINK)
+    message(STATUS "NVLINK support is enabled")
+  endif()
+
   include_directories(/usr/local/cuda/include)
   link_directories(
     /usr/local/cuda/lib
@@ -77,7 +83,10 @@ if (USE_CUDA)
   )
 elseif(USE_NVMEOF)
   message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
+elseif(USE_NVLINK)
+  message(FATAL_ERROR "Cannot enable USE_NVLINK without USE_CUDA")
 endif()
+
 
 if (USE_TCP)
   add_compile_definitions(USE_TCP)

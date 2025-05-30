@@ -23,6 +23,9 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
+#ifdef USE_NVLINK
+#include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 
 #include <cassert>
 
