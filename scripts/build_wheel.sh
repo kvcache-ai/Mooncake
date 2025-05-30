@@ -37,7 +37,7 @@ echo "Building wheel package..."
 cd mooncake-wheel
 
 echo "Cleaning up previous build artifacts..."
-rm -rf ${OUTPUT_DIR}/ 
+rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
@@ -48,57 +48,73 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_$(uname -m)"}
-
-echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+echo "Building wheel..."
 python -m build --wheel --outdir ${OUTPUT_DIR}
-auditwheel repair ${OUTPUT_DIR}/*.whl \
---exclude libcurl.so* \
---exclude libibverbs.so* \
---exclude libnuma.so* \
---exclude libstdc++.so* \
---exclude libgcc_s.so* \
---exclude libc.so* \
---exclude libnghttp2.so* \
---exclude libidn2.so* \
---exclude librtmp.so* \
---exclude libssh.so* \
---exclude libpsl.so* \
---exclude libssl.so* \
---exclude libcrypto.so* \
---exclude libgssapi_krb5.so* \
---exclude libldap.so* \
---exclude liblber.so* \
---exclude libbrotlidec.so* \
---exclude libz.so* \
---exclude libnl-route-3.so* \
---exclude libnl-3.so* \
---exclude libm.so* \
---exclude liblzma.so* \
---exclude libunistring.so* \
---exclude libgnutls.so* \
---exclude libhogweed.so* \
---exclude libnettle.so* \
---exclude libgmp.so* \
---exclude libkrb5.so* \
---exclude libk5crypto.so* \
---exclude libcom_err.so* \
---exclude libkrb5support.so* \
---exclude libsasl2.so* \
---exclude libbrotlicommon.so* \
---exclude libp11-kit.so* \
---exclude libtasn1.so* \
---exclude libkeyutils.so* \
---exclude libresolv.so* \
---exclude libffi.so* \
---exclude libcuda.so* \
---exclude libcudart.so* \
--w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
+# Extract platform tag from the generated wheel filename
+WHEEL_FILE=$(ls ${OUTPUT_DIR}/*.whl | head -1)
+WHEEL_BASENAME=$(basename "$WHEEL_FILE")
+echo "Generated wheel: $WHEEL_BASENAME"
 
-# Replace original wheel with repaired wheel
-rm -f ${OUTPUT_DIR}/*.whl
-mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+# Extract platform tag from wheel filename (e.g., manylinux_2_35_x86_64)
+# Wheel filename format: name-version-python-abi-platform.whl
+# We want only the platform part (last segment before .whl)
+PLATFORM_TAG=$(echo "$WHEEL_BASENAME" | sed -E 's/.*-([^-]+)\.whl$/\1/')
+echo "Detected platform tag: $PLATFORM_TAG"
+
+# Only run auditwheel on Linux wheels (manylinux)
+if [[ "$PLATFORM_TAG" == manylinux* ]]; then
+    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+    auditwheel repair ${OUTPUT_DIR}/*.whl \
+    --exclude libcurl.so* \
+    --exclude libibverbs.so* \
+    --exclude libnuma.so* \
+    --exclude libstdc++.so* \
+    --exclude libgcc_s.so* \
+    --exclude libc.so* \
+    --exclude libnghttp2.so* \
+    --exclude libidn2.so* \
+    --exclude librtmp.so* \
+    --exclude libssh.so* \
+    --exclude libpsl.so* \
+    --exclude libssl.so* \
+    --exclude libcrypto.so* \
+    --exclude libgssapi_krb5.so* \
+    --exclude libldap.so* \
+    --exclude liblber.so* \
+    --exclude libbrotlidec.so* \
+    --exclude libz.so* \
+    --exclude libnl-route-3.so* \
+    --exclude libnl-3.so* \
+    --exclude libm.so* \
+    --exclude liblzma.so* \
+    --exclude libunistring.so* \
+    --exclude libgnutls.so* \
+    --exclude libhogweed.so* \
+    --exclude libnettle.so* \
+    --exclude libgmp.so* \
+    --exclude libkrb5.so* \
+    --exclude libk5crypto.so* \
+    --exclude libcom_err.so* \
+    --exclude libkrb5support.so* \
+    --exclude libsasl2.so* \
+    --exclude libbrotlicommon.so* \
+    --exclude libp11-kit.so* \
+    --exclude libtasn1.so* \
+    --exclude libkeyutils.so* \
+    --exclude libresolv.so* \
+    --exclude libffi.so* \
+    --exclude libcuda.so* \
+    --exclude libcudart.so* \
+    --plat ${PLATFORM_TAG} \
+    -w ${REPAIRED_DIR}/
+
+    # Replace original wheel with repaired wheel
+    rm -f ${OUTPUT_DIR}/*.whl
+    mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+else
+    echo "Skipping auditwheel repair for non-Linux platform: $PLATFORM_TAG"
+fi
 
 cd ..
 

@@ -60,6 +60,42 @@ static bool get_auto_discover() {
     return false;
 }
 
+static int64_t get_transfer_timeout_seconds() {
+    static const int64_t timeout_value = []() -> int64_t {
+        const char* env_name = "MC_STORE_TRANSFER_TIMEOUT";
+        const char* env_value_cstr = std::getenv(env_name);
+
+        constexpr int64_t default_seconds = 10;
+        constexpr int min_val = 1;
+        constexpr int max_val = 600;  // Max 10 minutes
+
+        if (env_value_cstr) {
+            try {
+                int parsed_val = std::stoi(env_value_cstr);
+                if (parsed_val >= min_val && parsed_val <= max_val) {
+                    LOG(INFO) << "Transfer timeout set to " << parsed_val
+                              << " seconds by env " << env_name;
+                    return parsed_val;
+                } else {
+                    LOG(WARNING)
+                        << "Invalid value for " << env_name << ": "
+                        << parsed_val << ". Must be between " << min_val
+                        << " and " << max_val
+                        << ". Using default: " << default_seconds << " seconds";
+                }
+            } catch (const std::exception&) {
+                LOG(WARNING)
+                    << "Failed to parse value for " << env_name
+                    << ". Using default: " << default_seconds << " seconds";
+            }
+        }
+
+        LOG(INFO) << "Using default timeout: " << default_seconds;
+        return default_seconds;
+    }();
+    return timeout_value;
+}
+
 static inline void ltrim(std::string& s) {
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
                 return !std::isspace(ch);
@@ -395,6 +431,36 @@ ErrorCode Client::IsExist(const std::string& key) {
     return response.error_code;
 }
 
+// Helper function to check if a transfer status indicates an error condition
+static bool IsTransferStatusError(TransferStatusEnum status) {
+    return status == TransferStatusEnum::FAILED ||
+           status == TransferStatusEnum::INVALID ||
+           status == TransferStatusEnum::CANCELED ||
+           status == TransferStatusEnum::TIMEOUT;
+}
+
+// Helper function to get a human-readable string for transfer status
+static const char* TransferStatusToString(TransferStatusEnum status) {
+    switch (status) {
+        case TransferStatusEnum::WAITING:
+            return "WAITING";
+        case TransferStatusEnum::PENDING:
+            return "PENDING";
+        case TransferStatusEnum::INVALID:
+            return "INVALID";
+        case TransferStatusEnum::CANCELED:
+            return "CANCELED";
+        case TransferStatusEnum::COMPLETED:
+            return "COMPLETED";
+        case TransferStatusEnum::TIMEOUT:
+            return "TIMEOUT";
+        case TransferStatusEnum::FAILED:
+            return "FAILED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
@@ -450,12 +516,15 @@ ErrorCode Client::TransferData(
     const uint32_t max_try_num = 3;
     int64_t start_ts = getCurrentTimeInNano();
     const static int64_t kOneSecondInNano = 1000 * 1000 * 1000;
+    const int64_t timeout_seconds = get_transfer_timeout_seconds();
 
     while (try_num < max_try_num) {
         has_err = false;
         all_ready = true;
-        if (getCurrentTimeInNano() - start_ts > 60 * kOneSecondInNano) {
-            LOG(ERROR) << "Failed to complete transfers after 60 seconds";
+        if (getCurrentTimeInNano() - start_ts >
+            timeout_seconds * kOneSecondInNano) {
+            LOG(ERROR) << "Failed to complete transfers after "
+                       << timeout_seconds << " seconds";
             return ErrorCode::TRANSFER_FAIL;
         }
         for (size_t i = 0; i < batch_size; ++i) {
@@ -468,8 +537,10 @@ ErrorCode Client::TransferData(
                 return ErrorCode::TRANSFER_FAIL;
             }
             if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
-            if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Transfer failed for task" << i;
+            if (IsTransferStatusError(status.s)) {
+                LOG(ERROR) << "Transfer failed for task " << i
+                           << " with status: "
+                           << TransferStatusToString(status.s);
                 has_err = true;
             }
         }

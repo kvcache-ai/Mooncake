@@ -29,21 +29,63 @@ def _detect_manylinux_tag() -> str:
     Falls back to 'manylinux_2_17' if detection fails for maximum compatibility.
     """
     if glibc_version_string is not None:
-        ver = glibc_version_string()
-    else:
-        import ctypes
-
         try:
-            ver = (
-                ctypes.CDLL("libc.so.6")
-                .gnu_get_libc_version()
-                .decode("ascii", "replace")
-            )
+            ver = glibc_version_string()
+            if ver:
+                major, minor, *_ = ver.split(".")
+                return f"manylinux_{major}_{minor}"
         except Exception:
-            ver = "2.17"  # conservative baseline
+            pass
 
-    major, minor, *_ = ver.split(".")
-    return f"manylinux_{major}_{minor}"
+    # Fallback methods for glibc version detection
+    import ctypes
+    import subprocess
+    import os
+
+    # Method 1: Try ctypes approach
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        ver = libc.gnu_get_libc_version().decode("ascii", "replace")
+        if ver:
+            major, minor, *_ = ver.split(".")
+            return f"manylinux_{major}_{minor}"
+    except Exception:
+        pass
+
+    # Method 2: Try ldd --version
+    try:
+        result = subprocess.run(['ldd', '--version'],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Parse output like "ldd (GNU libc) 2.31"
+            for line in result.stdout.split('\n'):
+                if 'libc' in line.lower() and '.' in line:
+                    # Extract version number
+                    import re
+                    match = re.search(r'(\d+)\.(\d+)', line)
+                    if match:
+                        major, minor = match.groups()
+                        return f"manylinux_{major}_{minor}"
+    except Exception:
+        pass
+
+    # Method 3: Check /lib64/libc.so.6 or /lib/x86_64-linux-gnu/libc.so.6
+    try:
+        for libc_path in ["/lib64/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"]:
+            if os.path.exists(libc_path):
+                result = subprocess.run([libc_path],
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    import re
+                    match = re.search(r'(\d+)\.(\d+)', result.stdout)
+                    if match:
+                        major, minor = match.groups()
+                        return f"manylinux_{major}_{minor}"
+    except Exception:
+        pass
+
+    # Conservative fallback
+    return "manylinux_2_17"
 
 
 # ---------------------------------------------------------------------------
