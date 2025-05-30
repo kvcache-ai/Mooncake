@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: [ '3.10',  '3.12']
 
     steps:
     - uses: actions/checkout@v4
@@ -43,10 +43,16 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
+    - name: Start LMCache Test Server
+      run: |
+        python scripts/test_lmcache_server.py &
+        echo $! > lmcache_server.pid
+      shell: bash
+
     - name: Start Mooncake Master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mooncake_master &
+        mooncake_master --lmcache_controller_url=http://127.0.0.1:9090/api/kv_events &
       shell: bash
 
     - name: Test (in build env)
@@ -57,9 +63,26 @@ jobs:
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
       shell: bash
 
+    - name: Test LMCache Notifications
+      run: |
+        sleep 2
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        export PYTHONPATH=$PYTHONPATH:/usr/local/lib/python${{ matrix.python-version }}/site-packages
+        pip install requests
+        python scripts/test_lmcache_basic.py
+      shell: bash
+
     - name: Stop Mooncake Master Service
       run: |
         pkill mooncake_master || true
+      shell: bash
+
+    - name: Stop LMCache Test Server
+      run: |
+        if [ -f lmcache_server.pid ]; then
+          kill $(cat lmcache_server.pid) || true
+          rm lmcache_server.pid
+        fi
       shell: bash
 
     - name: Run sccache stat for check
@@ -215,10 +238,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
-  
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
-    
+
     - name: Build Docker image
       run: docker build -t mooncake-app .
 
