@@ -3,10 +3,10 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "master_metric_manager.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
@@ -38,7 +38,10 @@ namespace mooncake {
  */
 class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
    public:
-    BufferAllocator(std::string segment_name, size_t base, size_t size);
+    BufferAllocator(std::string segment_name, size_t base, size_t size,
+                    LocationType location_type = LocationType::CPU_RAM,
+                    std::optional<std::string> instance_id = std::nullopt,
+                    std::optional<int> worker_id = std::nullopt);
 
     ~BufferAllocator();
 
@@ -49,6 +52,9 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
     size_t capacity() const { return total_size_; }
     size_t size() const { return cur_size_.load(); }
     std::string getSegmentName() const { return segment_name_; }
+    LocationType getLocationType() const { return location_type_; }
+    std::optional<std::string> getInstanceId() const { return instance_id_; }
+    std::optional<int> getWorkerId() const { return worker_id_; }
 
    private:
     // metadata
@@ -56,6 +62,9 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    LocationType location_type_{LocationType::CPU_RAM};
+    std::optional<std::string> instance_id_;
+    std::optional<int> worker_id_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -70,11 +79,11 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
 // BufferAllocator allocates an address
 class SimpleAllocator {
    public:
-    SimpleAllocator(size_t size);
+    explicit SimpleAllocator(size_t size);
     ~SimpleAllocator();
-    void* allocate(size_t size);
+    [[nodiscard]] void* allocate(size_t size);
     void deallocate(void* ptr, size_t size);
-    void* getBase() const { return base_; }
+    [[nodiscard]] void* getBase() const { return base_; }
 
    private:
     void* base_{nullptr};

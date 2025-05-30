@@ -16,21 +16,28 @@ AllocatedBuffer::~AllocatedBuffer() {
         VLOG(1) << "buf_handle_deallocated segment_name=" << segment_name_
                 << " size=" << size_;
     } else {
-        MasterMetricManager::instance().dec_allocated_size(size_);
         LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
 
 // Removed allocated_bytes parameter and member initialization
 BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
-                                 size_t size)
+                                 size_t size, LocationType location_type,
+                                 std::optional<std::string> instance_id,
+                                 std::optional<int> worker_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      location_type_(location_type),
+      instance_id_(std::move(instance_id)),
+      worker_id_(worker_id) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " location_type=" << location_type
+            << " instance_id=" << (instance_id_ ? *instance_id_ : "n/a")
+            << " worker_id="
+            << (worker_id_ ? std::to_string(*worker_id_) : "n/a");
 
     // Calculate the size of the header region.
     header_region_size_ =

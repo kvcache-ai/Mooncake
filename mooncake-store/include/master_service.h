@@ -5,18 +5,18 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <optional>
 
 #include "allocation_strategy.h"
-#include "eviction_strategy.h"
 #include "allocator.h"
+#include "kv_cache_publisher.h"
+#include "object_metadata.h"
 #include "types.h"
-
 
 namespace mooncake {
 // Forward declarations
@@ -45,11 +45,19 @@ class BufferAllocatorManager {
 
     /**
      * @brief Register a new buffer for allocation
+     * @param segment_name Name of the memory segment
+     * @param base Base address of the memory segment
+     * @param size Size of the memory segment
+     * @param location_type Type of storage location for the segment
+     * @param instance_id Optional LMCache instance ID for notifications
+     * @param worker_id Optional LMCache worker ID for notifications
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * exists
      */
     ErrorCode AddSegment(const std::string& segment_name, uint64_t base,
-                         uint64_t size);
+                         uint64_t size, LocationType location_type,
+                         std::optional<std::string> instance_id = std::nullopt,
+                         std::optional<int> worker_id = std::nullopt);
 
     /**
      * @brief Unregister a buffer
@@ -70,7 +78,7 @@ class BufferAllocatorManager {
     /**
      * @brief Get the mutex for thread-safe access
      */
-    std::shared_mutex& GetMutex() { return allocator_mutex_; }
+    std::shared_mutex& GetMutex() const { return allocator_mutex_; }
 
    private:
     // Protects the buffer allocator map (BufferAllocator is thread-safe by
@@ -93,7 +101,9 @@ class MasterService {
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
+                  double eviction_high_watermark_ratio =
+                      DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                  const std::string& lmcache_controller_url = "");
     ~MasterService();
 
     /**
@@ -160,6 +170,11 @@ class MasterService {
      */
     ErrorCode PutRevoke(const std::string& key);
 
+    // Helper to send LMCache notifications
+    void send_lmcache_notification_internal_(
+        const std::string& key, const ObjectMetadata& metadata,
+        LMCacheNotifier::NotificationEventType event_type);
+
     /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
@@ -171,7 +186,6 @@ class MasterService {
      * @return return the number of objects removed
      */
     long RemoveAll();
-
 
     /**
      * @brief Get the count of keys
@@ -187,46 +201,10 @@ class MasterService {
     void BatchEvict(double eviction_ratio);
 
     // Internal data structures
-    struct ObjectMetadata {
-        std::vector<Replica> replicas;
-        size_t size;
-        // Default constructor, creates a time_point representing
-        // the Clock's epoch (i.e., time_since_epoch() is zero).
-        std::chrono::steady_clock::time_point lease_timeout;
-
-        // Check if there is some replica with a different status than the given value.
-        // If there is, return the status of the first replica that is not equal to
-        // the given value. Otherwise, return false.
-        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
-            for (const auto& replica : replicas) {
-                if (replica.status() != status) {
-                    return replica.status();
-                }
-            }
-            return {};
-        }
-
-        // Grant a lease with timeout as now() + ttl, only update if the new timeout is larger
-        void GrantLease(const uint64_t ttl) {
-            lease_timeout = std::max(lease_timeout,
-                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl));
-        }
-
-        // Check if the lease has expired
-        bool IsLeaseExpired() const {
-            return std::chrono::steady_clock::now() >= lease_timeout;
-        }
-
-        // Check if the lease has expired
-        bool IsLeaseExpired(std::chrono::steady_clock::time_point &now) const {
-            return now >= lease_timeout;
-        }
-    };
 
     // Buffer allocator management
     std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
@@ -255,12 +233,16 @@ class MasterService {
         10;  // 10 ms sleep between GC and eviction checks
 
     // Lease related members
-    const uint64_t default_kv_lease_ttl_; // in milliseconds
+    const uint64_t default_kv_lease_ttl_;  // in milliseconds
+
+    // LMCache notification
+    std::optional<LMCacheNotifier> lmcache_notifier_;
 
     // Eviction related members
-    std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
-    const double eviction_ratio_; // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_; // in range [0.0, 1.0]
+    std::atomic<bool> need_eviction_{
+        false};  // Set to trigger eviction when not enough space left
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
