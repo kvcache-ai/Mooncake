@@ -163,6 +163,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new NVMeoFTransport();
     }
 #endif
+#ifdef USE_NVLINK
+    else if (std::string(proto) == "nvlink") {
+        transport = new NvlinkTransport();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
