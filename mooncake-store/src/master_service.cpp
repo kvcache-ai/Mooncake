@@ -10,8 +10,10 @@
 
 namespace mooncake {
 
-ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
-                                             uint64_t base, uint64_t size) {
+ErrorCode BufferAllocatorManager::AddSegment(
+    const std::string& segment_name, uint64_t base, uint64_t size,
+    LocationType location_type, std::optional<std::string> instance_id,
+    std::optional<int> worker_id) {
     // Check if parameters are valid before allocating memory.
     if (base == 0 || size == 0 ||
         reinterpret_cast<uintptr_t>(base) % facebook::cachelib::Slab::kSize ||
@@ -24,7 +26,7 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
     std::unique_lock<std::shared_mutex> lock(allocator_mutex_);
 
     // Check if segment already exists
-    if (buf_allocators_.find(segment_name) != buf_allocators_.end()) {
+    if (!buf_allocators_.contains(segment_name)) {
         LOG(WARNING) << "segment_name=" << segment_name
                      << ", error=segment_already_exists";
         return ErrorCode::INVALID_PARAMS;
@@ -34,7 +36,8 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
     try {
         // SlabAllocator may throw an exception if the size or base is invalid
         // for the slab allocator.
-        allocator = std::make_shared<BufferAllocator>(segment_name, base, size);
+        allocator = std::make_shared<BufferAllocator>(
+            segment_name, base, size, location_type, instance_id, worker_id);
         if (!allocator) {
             LOG(ERROR) << "segment_name=" << segment_name
                        << ", error=failed_to_create_allocator";
@@ -68,26 +71,33 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
-                             double eviction_high_watermark_ratio)
+                             double eviction_high_watermark_ratio,
+                             const std::string& lmcache_controller_url)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio) {
-        if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
-            LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
-                       << "current value: " << eviction_ratio_;
-            throw std::invalid_argument("Invalid eviction ratio");
-        }
-        if (eviction_high_watermark_ratio_ < 0.0 || eviction_high_watermark_ratio_ > 1.0) {
-            LOG(ERROR) << "Eviction high watermark ratio must be between 0.0 and 1.0, "
-                       << "current value: " << eviction_high_watermark_ratio_;
-            throw std::invalid_argument("Invalid eviction high watermark ratio");
-        }
-        gc_running_ = true;
-        gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-        VLOG(1) << "action=start_gc_thread";
+    if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
+        LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
+                   << "current value: " << eviction_ratio_;
+        throw std::invalid_argument("Invalid eviction ratio");
+    }
+    if (eviction_high_watermark_ratio_ < 0.0 ||
+        eviction_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR)
+            << "Eviction high watermark ratio must be between 0.0 and 1.0, "
+            << "current value: " << eviction_high_watermark_ratio_;
+        throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+    gc_running_ = true;
+    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+    VLOG(1) << "action=start_gc_thread";
+    if (!lmcache_controller_url.empty()) {
+        lmcache_notifier_.emplace(lmcache_controller_url);
+        VLOG(1) << "action=lmcache_notifier_started";
+    }
 }
 
 MasterService::~MasterService() {
@@ -114,7 +124,8 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
+    return buffer_allocator_manager_->AddSegment(segment_name, buffer, size,
+                                                 LocationType::CPU_RAM);
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
@@ -317,6 +328,10 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     // Set lease timeout to now, indicating that the object has no lease
     // at beginning
     metadata.GrantLease(0);
+    // Send notification for KVAdmitMsg
+    send_lmcache_notification_internal_(
+        key, metadata, LMCacheNotifier::NotificationEventType::ADMIT);
+
     return ErrorCode::OK;
 }
 
@@ -330,7 +345,7 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
-            << ", error=invalid_replica_status";
+                   << ", error=invalid_replica_status";
         return ErrorCode::INVALID_WRITE;
     }
 
@@ -354,12 +369,17 @@ ErrorCode MasterService::Remove(const std::string& key) {
 
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
-            << ", error=invalid_replica_status";
+                   << ", error=invalid_replica_status";
         return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     // Remove object metadata
     accessor.Erase();
+
+    // Send notification for KVEvictMsg before removing metadata
+    send_lmcache_notification_internal_(
+        key, metadata, LMCacheNotifier::NotificationEventType::EVICT);
+
     return ErrorCode::OK;
 }
 
@@ -380,7 +400,8 @@ long MasterService::RemoveAll() {
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
             if (it->second.IsLeaseExpired(now)) {
-                total_freed_size += it->second.size * it->second.replicas.size();
+                total_freed_size +=
+                    it->second.size * it->second.replicas.size();
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -440,7 +461,6 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";
 
@@ -481,10 +501,12 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
-        double used_ratio = MasterMetricManager::instance().get_global_used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_
-            || (need_eviction_ && eviction_ratio_ > 0.0)) {
-            BatchEvict(std::max(eviction_ratio_,
+        double used_ratio =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratio > eviction_high_watermark_ratio_ ||
+            (need_eviction_ && eviction_ratio_ > 0.0)) {
+            BatchEvict(std::max(
+                eviction_ratio_,
                 used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
         }
 
@@ -506,11 +528,12 @@ void MasterService::BatchEvict(double eviction_ratio) {
     long object_count = 0;
     uint64_t total_freed_size = 0;
 
-    // Randomly select a starting shard to avoid imbalance eviction between shards.
-    // No need to use expensive random_device here.
+    // Randomly select a starting shard to avoid imbalance eviction between
+    // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % metadata_shards_.size();
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        auto& shard = metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+        auto& shard =
+            metadata_shards_[(start_idx + i) % metadata_shards_.size()];
         std::unique_lock lock(shard.mutex);
 
         // object_count must be updated at beginning as it will be used later
@@ -519,7 +542,8 @@ void MasterService::BatchEvict(double eviction_ratio) {
 
         // To achieve evicted_count / object_count = eviction_ration,
         // ideally how many object should be evicted in this shard
-        const long ideal_evict_num = std::ceil(object_count * eviction_ratio) - evicted_count;
+        const long ideal_evict_num =
+            std::ceil(object_count * eviction_ratio) - evicted_count;
 
         if (ideal_evict_num <= 0) {
             // No need to evict any object in this shard
@@ -538,8 +562,9 @@ void MasterService::BatchEvict(double eviction_ratio) {
         }
 
         if (!candidates.empty()) {
-            long evict_num = std::min(ideal_evict_num, (long) candidates.size());
-            long shard_evicted_count = 0; // number of objects evicted from this shard
+            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
+            long shard_evicted_count =
+                0;  // number of objects evicted from this shard
             std::nth_element(candidates.begin(),
                             candidates.begin() + (evict_num - 1),
                             candidates.end(),
@@ -559,7 +584,8 @@ void MasterService::BatchEvict(double eviction_ratio) {
     if (evicted_count > 0) {
         need_eviction_ = false;
         MasterMetricManager::instance().dec_key_count(evicted_count);
-        MasterMetricManager::instance().inc_eviction_success(evicted_count, total_freed_size);
+        MasterMetricManager::instance().inc_eviction_success(evicted_count,
+                                                             total_freed_size);
     } else {
         if (object_count == 0) {
             // No objects to evict, no need to check again
@@ -570,6 +596,41 @@ void MasterService::BatchEvict(double eviction_ratio) {
     VLOG(1) << "action=evict_objects"
             << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
+}
+
+void MasterService::send_lmcache_notification_internal_(
+    const std::string& key, const ObjectMetadata& metadata,
+    LMCacheNotifier::NotificationEventType event_type) {
+    if (!lmcache_notifier_) {
+        return;
+    }
+
+    std::optional<std::string> segment_name_opt =
+        metadata.get_primary_segment_name();
+    if (!segment_name_opt) {
+        LOG(WARNING) << "key=" << key
+                     << ", event_type=" << static_cast<int>(event_type)
+                     << ", error=cannot_get_segment_name_for_notification";
+        return;
+    }
+    const std::string& segment_name = *segment_name_opt;
+
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    auto it = allocators.find(segment_name);
+
+    if (it != allocators.end() && it->second) {
+        auto allocator = it->second;
+        std::string location_str = ToString(allocator->getLocationType());
+        lmcache_notifier_.value().EnqueueTask(event_type, key, location_str,
+                                              allocator->getInstanceId(),
+                                              allocator->getWorkerId());
+    } else {
+        LOG(WARNING) << "key=" << key << ", segment_name=" << segment_name
+                     << ", event_type=" << static_cast<int>(event_type)
+                     << ", error=allocator_not_found_for_notification";
+    }
 }
 
 }  // namespace mooncake

@@ -65,8 +65,11 @@ class WrappedMasterService {
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                         double eviction_low_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_low_watermark_ratio),
+                         double eviction_low_watermark_ratio =
+                             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                         const std::string& lmcache_controller_url = "")
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
+                          eviction_low_watermark_ratio, lmcache_controller_url),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics

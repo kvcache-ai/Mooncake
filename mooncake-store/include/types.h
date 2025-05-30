@@ -19,7 +19,8 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
-static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL = 200;  // in milliseconds
+static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
+    200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
 
@@ -118,6 +119,40 @@ inline std::ostream& operator<<(std::ostream& os,
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
+    return os;
+}
+
+/**
+ * @brief Type of storage location for buffer allocators
+ */
+enum class LocationType {
+    UNKNOWN = 0,  // Unknown or unspecified location
+    CPU_RAM = 1,  // CPU memory (RAM)
+    // Future location types can be added here as needed
+    // DISK_SSD = 2,          // SSD storage
+};
+
+/**
+ * @brief Convert LocationType to string representation for LMCache
+ * notifications
+ */
+inline std::string ToString(LocationType type) {
+    switch (type) {
+        case LocationType::CPU_RAM:
+            return "mooncake_cpu_ram";
+        // Add cases for future location types
+        case LocationType::UNKNOWN:
+        default:
+            return "mooncake_unknown";
+    }
+}
+
+/**
+ * @brief Stream operator for LocationType
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const LocationType& type) noexcept {
+    os << ToString(type);
     return os;
 }
 
