@@ -526,31 +526,34 @@ void MasterService::BatchEvict(double eviction_ratio) {
             continue;
         }
 
-        std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
+        std::vector<decltype(shard.metadata)::iterator> candidates;
+        candidates.reserve(ideal_evict_num);
+
         for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
             // Only evict objects that have not expired and are complete
             if (it->second.IsLeaseExpired(now)
                 && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                candidates.push_back(it->second.lease_timeout);
+                candidates.push_back(it);
             }
         }
+
         if (!candidates.empty()) {
             long evict_num = std::min(ideal_evict_num, (long) candidates.size());
             long shard_evicted_count = 0; // number of objects evicted from this shard
             std::nth_element(candidates.begin(),
                             candidates.begin() + (evict_num - 1),
-                            candidates.end());
-            auto target_timeout = candidates[evict_num - 1];
+                            candidates.end(),
+                            [](const auto& a, const auto& b) {
+                                return a->second.lease_timeout < b->second.lease_timeout;
+                            });
+            auto target_timeout = candidates[evict_num - 1]->second.lease_timeout;
             // Evict objects with lease timeout less than or equal to target.
-            auto it = shard.metadata.begin();
-            while (it != shard.metadata.end() && shard_evicted_count < evict_num) {
-                if (it->second.lease_timeout <= target_timeout
-                && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+            for (auto it : candidates) {
+                if (shard_evicted_count >= evict_num) break;
+                if (it->second.lease_timeout <= target_timeout) {
                     total_freed_size += it->second.size * it->second.replicas.size();
-                    it = shard.metadata.erase(it);
+                    shard.metadata.erase(it);
                     shard_evicted_count++;
-                } else {
-                    ++it;
                 }
             }
             evicted_count += shard_evicted_count;
