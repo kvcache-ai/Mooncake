@@ -175,6 +175,10 @@ class MasterService {
         const std::string& key, const ObjectMetadata& metadata,
         LMCacheNotifier::NotificationEventType event_type);
 
+    // Helper to send evict notifications
+    void SendEvictNotification(const std::string& key,
+                               const ObjectMetadata& metadata);
+
     /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
@@ -276,13 +280,10 @@ class MasterService {
             it_ = service_->metadata_shards_[shard_idx_].metadata.end();
         }
 
-        // Create new metadata (only call when !Exists())
-        ObjectMetadata& Create() {
-            auto result =
-                service_->metadata_shards_[shard_idx_].metadata.emplace(
-                    key_, ObjectMetadata());
-            it_ = result.first;
-            return it_->second;
+        // Create new metadata with replicas and size (only call when !Exists())
+        void Create(std::vector<Replica> replicas, size_t size) {
+            service_->metadata_shards_[shard_idx_].metadata.try_emplace(
+                key_, std::move(replicas), size);
         }
 
        private:

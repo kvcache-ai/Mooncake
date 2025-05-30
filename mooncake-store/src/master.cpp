@@ -30,8 +30,10 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
-DEFINE_string(lmcache_controller_url, "http://localhost:8000/api/kv_events",
-              "URL of the LMCache Controller for notifications. If empty, "
+
+DEFINE_string(lmcache_controller_url, "",
+              "URL of the LMCache Controller for notifications(e.g. "
+              "http://localhost:8000/api/kv_events).  If empty,"
               "notifications are disabled.");
 
 int main(int argc, char* argv[]) {
