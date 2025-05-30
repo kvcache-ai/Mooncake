@@ -143,7 +143,8 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_addr) {
+                                  const std::string &master_server_addr,
+                                  const std::string &storage_root_dir) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -165,7 +166,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
     auto client_opt =
         mooncake::Client::Create(this->local_hostname, metadata_server,
-                                 protocol, args, master_server_addr);
+                                 protocol, args, master_server_addr, storage_root_dir);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return 1;
@@ -203,14 +204,15 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
 int DistributedObjectStore::initAll(const std::string &protocol_,
                                     const std::string &device_name,
-                                    size_t mount_segment_size) {
+                                    size_t mount_segment_size,
+                                    const std::string &storage_root_dir) {
     if (client_) {
         LOG(ERROR) << "Client is already initialized";
         return 1;
     }
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
     return setup("localhost:12345", "127.0.0.1:2379", mount_segment_size,
-                 buffer_allocator_size, protocol_, device_name);
+                 buffer_allocator_size, protocol_, device_name, storage_root_dir);
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
@@ -325,7 +327,21 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
     const auto kNullString = pybind11::bytes("\0", 0);
     ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK) return kNullString;
+    if (error_code != ErrorCode::OK){
+    #ifdef USE_CLIENT_PERSISTENCE
+        std::string str;
+        error_code=client_->Get_From_Local_File(key, str);
+        if(error_code!= ErrorCode::OK) {
+            return kNullString;
+        }else{
+            // If the query is successful, return the string as bytes
+            LOG(INFO) << "Get_From_Local_File successful for key: " << key;
+            return pybind11::bytes(str);
+        }
+    #else
+        return kNullString;
+    #endif
+    }
 
     uint64_t str_length = 0;
     int ret = allocateSlices(slices, object_info, str_length);

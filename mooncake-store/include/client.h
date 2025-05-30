@@ -10,6 +10,8 @@
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "thread_pool.h"
+#include "file_storage_backend.h"
 
 namespace mooncake {
 
@@ -34,7 +36,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_addr = kDefaultMasterAddress,
+        const std::string& storage_root_dir = "");
 
     /**
      * @brief Retrieves data for a given key
@@ -69,6 +72,11 @@ class Client {
     ErrorCode Get(const std::string& object_key, const ObjectInfo& object_info,
                   std::vector<Slice>& slices);
 
+    ErrorCode Get_From_Local_File(const std::string& object_key,
+                             std::string& data);
+
+    // ErrorCode Put_To_Local_File(const std::string& object_key,
+    //                          std::string& data);
     /**
      * @brief Stores data with replication
      * @param key Object key
@@ -145,7 +153,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::string& storage_root_dir);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -165,6 +174,14 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    /**
+     * @brief Prepare and use the storage backend for persisting data
+     */
+
+    void PrepareStorageBackend(const std::string& storage_root_dir);
+    void PersistStoreBackend(const ObjectKey& key,
+                             const std::vector<Slice>& slices);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
@@ -176,6 +193,11 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+    const std::string storage_root_dir_; 
+
+    // client persistent thread pool for async operations
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 };
 
 }  // namespace mooncake

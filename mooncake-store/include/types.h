@@ -81,6 +81,17 @@ enum class ErrorCode : int32_t {
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
+
+    // FILE errors (Range: -1000 to -1099)
+    FILE_NOT_FOUND = -1000,  ///< File not found.
+    FILE_OPEN_FAIL = -1001,  ///< Error open file.
+    FILE_READ_FAIL = -1002,  ///< Error reading file.
+    FILE_WRITE_FAIL = -1003,  ///< Error writing file.
+    FILE_BUFFER_INVALID = -1004,  ///< File buffer is wrong.
+    FILE_SYSTEM_UNINITIALIZED = -1005,  ///< File system is not initialized.
+    FILE_LOCK_FAIL = -1006,  ///< File lock operation failed.
+    FILE_ALREADY_EXISTS = -1007,  ///< File already exists.
+    FILE_INVALID_HANDLE = -1008,  ///< Invalid file handle.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
