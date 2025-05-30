@@ -26,7 +26,7 @@ ErrorCode BufferAllocatorManager::AddSegment(
     std::unique_lock<std::shared_mutex> lock(allocator_mutex_);
 
     // Check if segment already exists
-    if (!buf_allocators_.contains(segment_name)) {
+    if (buf_allocators_.contains(segment_name)) {
         LOG(WARNING) << "segment_name=" << segment_name
                      << ", error=segment_already_exists";
         return ErrorCode::INVALID_PARAMS;
@@ -148,8 +148,9 @@ ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
             }
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
+                // Send evict notification before removing metadata
+                SendEvictNotification(it->first, it->second);
                 it = shard.metadata.erase(it);
-                MasterMetricManager::instance().dec_key_count(1);
             } else {
                 ++it;
             }
@@ -257,10 +258,6 @@ ErrorCode MasterService::PutStart(
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
 
-    // Initialize object metadata
-    ObjectMetadata metadata;
-    metadata.size = value_length;
-
     // Allocate replicas
     std::vector<Replica> replicas;
     replicas.reserve(config.replica_num);
@@ -300,17 +297,17 @@ ErrorCode MasterService::PutStart(
         replicas.emplace_back(std::move(handles), ReplicaStatus::PROCESSING);
     }
 
-    metadata.replicas = std::move(replicas);
-
     replica_list.clear();
-    replica_list.reserve(metadata.replicas.size());
-    for (const auto& replica : metadata.replicas) {
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
 
+    // Create object metadata using MetadataAccessor with proper constructor
+    accessor.Create(std::move(replicas), value_length);
+
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
     return ErrorCode::OK;
 }
 
@@ -346,10 +343,13 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::INVALID_WRITE;
+        return ErrorCode::INVALID_REPLICA;
     }
 
+    // Send evict notification before erasing
+    SendEvictNotification(key, metadata);
     accessor.Erase();
+
     return ErrorCode::OK;
 }
 
@@ -373,12 +373,11 @@ ErrorCode MasterService::Remove(const std::string& key) {
         return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
+    // Send evict notification
+    SendEvictNotification(key, metadata);
+
     // Remove object metadata
     accessor.Erase();
-
-    // Send notification for KVEvictMsg before removing metadata
-    send_lmcache_notification_internal_(
-        key, metadata, LMCacheNotifier::NotificationEventType::EVICT);
 
     return ErrorCode::OK;
 }
@@ -402,6 +401,7 @@ long MasterService::RemoveAll() {
             if (it->second.IsLeaseExpired(now)) {
                 total_freed_size +=
                     it->second.size * it->second.replicas.size();
+                SendEvictNotification(it->first, it->second);
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -410,10 +410,6 @@ long MasterService::RemoveAll() {
         }
     }
 
-    if (removed_count > 0) {
-        // Update metrics only if objects were actually removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-    }
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
@@ -469,7 +465,6 @@ void MasterService::GCThreadFunc() {
 
     while (gc_running_) {
         GCTask* task = nullptr;
-        long gc_count = 0;
         while (gc_queue_.pop(task)) {
             if (task) {
                 local_pq.push(task);
@@ -484,6 +479,11 @@ void MasterService::GCThreadFunc() {
 
             local_pq.pop();
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
+            // Get metadata before removing
+            MetadataAccessor accessor(this, task->key);
+            if (accessor.Exists()) {
+                SendEvictNotification(task->key, accessor.Get());
+            }
             ErrorCode result = Remove(task->key);
             if (result != ErrorCode::OK &&
                 result != ErrorCode::OBJECT_NOT_FOUND &&
@@ -492,13 +492,7 @@ void MasterService::GCThreadFunc() {
                     << "key=" << task->key
                     << ", error=gc_remove_failed, error_code=" << result;
             }
-            if (result == ErrorCode::OK) {
-                gc_count++;
-            }
             delete task;
-        }
-        if (gc_count > 0) {
-            MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
         double used_ratio =
@@ -583,7 +577,6 @@ void MasterService::BatchEvict(double eviction_ratio) {
 
     if (evicted_count > 0) {
         need_eviction_ = false;
-        MasterMetricManager::instance().dec_key_count(evicted_count);
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {
@@ -631,6 +624,12 @@ void MasterService::send_lmcache_notification_internal_(
                      << ", event_type=" << static_cast<int>(event_type)
                      << ", error=allocator_not_found_for_notification";
     }
+}
+
+void MasterService::SendEvictNotification(const std::string& key,
+                                          const ObjectMetadata& metadata) {
+    send_lmcache_notification_internal_(
+        key, metadata, LMCacheNotifier::NotificationEventType::EVICT);
 }
 
 }  // namespace mooncake

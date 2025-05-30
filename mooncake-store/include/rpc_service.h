@@ -183,9 +183,6 @@ class WrappedMasterService {
         // Increment request metric
         MasterMetricManager::instance().inc_put_start_requests();
 
-        // Track value size in histogram
-        MasterMetricManager::instance().observe_value_size(value_length);
-
         PutStartResponse response;
         response.error_code = master_service_.PutStart(
             key, value_length, slice_lengths, config, response.replica_list);
@@ -193,9 +190,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_put_start_failures();
-        } else {
-            // Increment key count on successful put start
-            MasterMetricManager::instance().inc_key_count();
         }
 
         timer.LogResponseJson(response);
@@ -234,9 +228,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_put_revoke_failures();
-        } else {
-            // Decrement key count on successful revoke
-            MasterMetricManager::instance().dec_key_count();
         }
 
         timer.LogResponseJson(response);
@@ -256,9 +247,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_remove_failures();
-        } else {
-            // Decrement key count on successful remove
-            MasterMetricManager::instance().dec_key_count();
         }
 
         timer.LogResponseJson(response);

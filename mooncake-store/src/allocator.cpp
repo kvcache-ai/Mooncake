@@ -16,7 +16,7 @@ AllocatedBuffer::~AllocatedBuffer() {
         VLOG(1) << "buf_handle_deallocated segment_name=" << segment_name_
                 << " size=" << size_;
     } else {
-        LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
+        VLOG(1) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
 
@@ -89,7 +89,6 @@ std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
     cur_size_.fetch_add(size);
-    MasterMetricManager::instance().inc_allocated_size(size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
                                              buffer, size);
 }
@@ -102,7 +101,6 @@ void BufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         cur_size_.fetch_sub(freed_size);
-        MasterMetricManager::instance().dec_allocated_size(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {

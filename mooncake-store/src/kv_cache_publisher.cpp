@@ -62,6 +62,8 @@ void LMCacheNotifier::WorkerLoop() {
     cinatra::coro_http_client client{};
     async_simple::coro::syncAwait(client.connect(lmcache_controller_url_));
 
+    LOG(INFO) << "LMCacheNotifier::WorkerLoop started, connected to "
+              << lmcache_controller_url_;
     while (running_) {
         NotificationTask* task = nullptr;
         bool has_task = notification_queue_.pop(task);
@@ -78,6 +80,7 @@ void LMCacheNotifier::WorkerLoop() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kWorkerThreadSleepMs));
     }
+    LOG(INFO) << "LMCacheNotifier::WorkerLoop stopped";
 
     VLOG(1) << "action=notification_thread_stopped";
 }
@@ -117,9 +120,15 @@ void LMCacheNotifier::SendNotificationInternal(
 
     auto resp = async_simple::coro::syncAwait(client.async_post(
         lmcache_controller_url_, json_str, cinatra::req_content_type::text));
-    VLOG(1) << "action=lmcache_notification_sent, "
-               "url="
-            << lmcache_controller_url_ << ", status=" << resp.status;
+    if (resp.status != 200) {
+        LOG(WARNING) << "action=lmcache_notification_failed, "
+                        "url="
+                     << lmcache_controller_url_ << ", status=" << resp.status;
+    } else {
+        VLOG(1) << "action=lmcache_notification_sent, "
+                   "url="
+                << lmcache_controller_url_ << ", status=" << resp.status;
+    }
 }
 
 }  // namespace mooncake
