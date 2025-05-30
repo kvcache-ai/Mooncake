@@ -126,6 +126,36 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "ascend"){
+        Json::Value devicesJSON(Json::arrayValue);
+        for (const auto &device : desc.devices) {
+            Json::Value deviceJSON;
+            deviceJSON["name"] = device.name;
+            deviceJSON["lid"] = device.lid;
+            devicesJSON.append(deviceJSON);
+        }
+        segmentJSON["devices"] = devicesJSON;
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+
+        Json::Value rankInfoJSON;
+        rankInfoJSON["rankId"] = static_cast<Json::UInt64>(desc.rank_info.rankId);
+        rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
+        rankInfoJSON["hostPort"] = static_cast<Json::UInt64>(desc.rank_info.hostPort);
+        rankInfoJSON["deviceLogicId"] = static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
+        rankInfoJSON["devicePhyId"] = static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
+        rankInfoJSON["deviceType"] = static_cast<Json::UInt64>(desc.rank_info.deviceType);
+        rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
+        rankInfoJSON["devicePort"] = static_cast<Json::UInt64>(desc.rank_info.devicePort);
+
+        segmentJSON["rank_info"] = rankInfoJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -239,6 +269,41 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->nvmeof_buffers.push_back(buffer);
         }
+    } else if (desc->protocol == "ascend") {
+        for (const auto &deviceJSON : segmentJSON["devices"]) {
+            DeviceDesc device;
+            device.name = deviceJSON["name"].asString();
+            device.lid = deviceJSON["lid"].asUInt();
+            if (device.name.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->devices.push_back(device);
+        }
+
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+
+        Json::Value rankInfoJSON = segmentJSON["rank_info"];
+        desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
+        desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
+        desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
+        desc->rank_info.deviceLogicId = rankInfoJSON["deviceLogicId"].asUInt64();
+        desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt64();
+        desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
+        desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
+        desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
