@@ -44,6 +44,7 @@ option(USE_CUDA "option for using gpu direct" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_CXL "option for using cxl protocol" OFF)
+option(USE_ASCEND "option for using npu" ON)
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
@@ -81,6 +82,22 @@ endif()
 
 if (USE_TCP)
   add_compile_definitions(USE_TCP)
+endif()
+
+if (USE_ASCEND)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
+
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
+
+  message(STATUS "Found lib64 directories: ${ASCEND_LIB_DIR}")
+  message(STATUS "Found include directories: ${ASCEND_INCLUDE_DIR}")
+
+  add_compile_definitions(USE_ASCEND)
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR} /usr/include/jsoncpp)
+  link_directories(${ASCEND_LIB_DIR})
 endif()
 
 if (USE_REDIS)
