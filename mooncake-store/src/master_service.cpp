@@ -546,15 +546,11 @@ void MasterService::BatchEvict(double eviction_ratio) {
                             [](const auto& a, const auto& b) {
                                 return a->second.lease_timeout < b->second.lease_timeout;
                             });
-            auto target_timeout = candidates[evict_num - 1]->second.lease_timeout;
-            // Evict objects with lease timeout less than or equal to target.
-            for (auto it : candidates) {
-                if (shard_evicted_count >= evict_num) break;
-                if (it->second.lease_timeout <= target_timeout) {
-                    total_freed_size += it->second.size * it->second.replicas.size();
-                    shard.metadata.erase(it);
-                    shard_evicted_count++;
-                }
+            // Evict objects for [0, evict_num) from candidates
+            for (size_t j = 0; j < evict_num && j < candidates.size(); ++j) {
+                total_freed_size += candidates[j]->second.size * candidates[j]->second.replicas.size();
+                shard.metadata.erase(candidates[j]);
+                shard_evicted_count++;
             }
             evicted_count += shard_evicted_count;
         }
