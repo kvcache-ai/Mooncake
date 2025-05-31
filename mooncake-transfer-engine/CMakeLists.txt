@@ -1,4 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
+
+execute_process(
+  COMMAND bash -c "command -v python3 >/dev/null && python3 -c 'import sys; print(sys.prefix if hasattr(sys, \"base_prefix\") and sys.base_prefix != sys.prefix else \"\")' || echo ''"
+  OUTPUT_VARIABLE AUTO_DETECTED_VENV
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if(AUTO_DETECTED_VENV)
+  message(STATUS "Automatically detected virtual environment: ${AUTO_DETECTED_VENV}")
+  set(CMAKE_INSTALL_PREFIX "${AUTO_DETECTED_VENV}" CACHE PATH "Install path prefix" FORCE)
+elseif(DEFINED ENV{VIRTUAL_ENV})
+  message(STATUS "Using VIRTUAL_ENV environment variable: $ENV{VIRTUAL_ENV}")
+  set(CMAKE_INSTALL_PREFIX "$ENV{VIRTUAL_ENV}" CACHE PATH "Install path prefix" FORCE)
+else()
+  message(WARNING "No virtual environment detected! Using default install prefix.")
+  set(DEFAULT_USER_PREFIX "$ENV{HOME}/.local")
+  set(CMAKE_INSTALL_PREFIX "${DEFAULT_USER_PREFIX}" CACHE PATH "Install path prefix" FORCE)
+endif()
+
 project(mooncake-transfer-engine)
 
 if (NOT GLOBAL_CONFIG)
