@@ -127,6 +127,16 @@ class MasterService {
                              std::vector<Replica::Descriptor>& replica_list);
 
     /**
+     * @brief Get list of replicas for a batch of objects
+     * @param[out] batch_replica_list Vector to store replicas information for
+     * slices
+     */
+    ErrorCode BatchGetReplicaList(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
+
+    /**
      * @brief Mark a key for garbage collection after specified delay
      * @param key The key to be garbage collected
      * @param delay_ms Delay in milliseconds before removing the key
@@ -161,11 +171,42 @@ class MasterService {
     ErrorCode PutRevoke(const std::string& key);
 
     /**
+     * @brief Start a batch of put operations for N objects
+     * @param[out] replica_list Vector to store replica information for slices
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
+     *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
+     *         ErrorCode::INVALID_PARAMS if slice size is invalid
+     */
+    ErrorCode BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
+
+    /**
+     * @brief Complete a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutEnd(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Revoke a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutRevoke(const std::vector<std::string>& keys);
+
+    /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
     ErrorCode Remove(const std::string& key);
+
     /**
      * @brief Remove all objects and their replicas
      * @return return the number of objects removed

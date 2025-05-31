@@ -86,6 +86,33 @@ GetReplicaListResponse MasterClient::GetReplicaList(
     return result.value();
 }
 
+BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
+    timer.LogRequest("action=get_batch_replica_list");
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchGetReplicaList>(
+            object_keys);
+    std::optional<BatchGetReplicaListResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<BatchGetReplicaListResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to get batch replica list: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = BatchGetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 PutStartResponse MasterClient::PutStart(
     const std::string& key, const std::vector<size_t>& slice_lengths,
     size_t value_length, const ReplicateConfig& config) {
@@ -121,6 +148,36 @@ PutStartResponse MasterClient::PutStart(
     return result.value();
 }
 
+BatchPutStartResponse MasterClient::BatchPutStart(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, uint64_t>& value_lengths,
+    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
+    timer.LogRequest("keys_count=", keys.size());
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchPutStart>(
+            keys, value_lengths, slice_lengths, config);
+    std::optional<BatchPutStartResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<BatchPutStartResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to start batch put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = BatchPutStartResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 PutEndResponse MasterClient::PutEnd(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
@@ -146,6 +203,32 @@ PutEndResponse MasterClient::PutEnd(const std::string& key) {
     return result.value();
 }
 
+BatchPutEndResponse MasterClient::BatchPutEnd(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
+    timer.LogRequest("keys_count=", keys.size());
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchPutEnd>(keys);
+    std::optional<BatchPutEndResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<BatchPutEndResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to end batch put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = BatchPutEndResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
@@ -164,6 +247,32 @@ PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
         }());
     if (!result) {
         auto response = PutRevokeResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+BatchPutRevokeResponse MasterClient::BatchPutRevoke(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
+    timer.LogRequest("keys_count=", keys.size());
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchPutRevoke>(keys);
+    std::optional<BatchPutRevokeResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<BatchPutRevokeResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to revoke batch put operation: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = BatchPutRevokeResponse{ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }
