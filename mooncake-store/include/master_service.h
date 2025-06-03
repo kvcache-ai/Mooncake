@@ -54,10 +54,11 @@ class BufferAllocatorManager {
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * exists
      */
-    ErrorCode AddSegment(const std::string& segment_name, uint64_t base,
-                         uint64_t size, LocationType location_type,
-                         std::optional<std::string> instance_id = std::nullopt,
-                         std::optional<int> worker_id = std::nullopt);
+    ErrorCode AddSegment(
+        const std::string& segment_name, uint64_t base, uint64_t size,
+        LocationType location_type,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt);
 
     /**
      * @brief Unregister a buffer
@@ -108,11 +109,18 @@ class MasterService {
 
     /**
      * @brief Mount a memory segment for buffer allocation
+     * @param buffer Memory buffer address
+     * @param size Size of the buffer
+     * @param segment_name Name of the segment
+     * @param instance_id Optional LMCache instance ID
+     * @param worker_id Optional LMCache worker ID
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * exists or params invalid, ErrorCode::INTERNAL_ERROR if allocation fails
      */
-    ErrorCode MountSegment(uint64_t buffer, uint64_t size,
-                           const std::string& segment_name);
+    ErrorCode MountSegment(
+        uint64_t buffer, uint64_t size, const std::string& segment_name,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt);
 
     /**
      * @brief Unmount a memory segment

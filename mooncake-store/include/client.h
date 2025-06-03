@@ -103,6 +103,20 @@ class Client {
                            size_t size);
 
     /**
+     * @brief Registers a memory segment to master for allocation with LMCache
+     * parameters
+     * @param segment_name Unique identifier for the segment
+     * @param buffer Memory buffer to register
+     * @param size Size of the buffer in bytes
+     * @param instance_id LMCache instance ID
+     * @param worker_id LMCache worker ID
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
+                           size_t size, const std::string& instance_id,
+                           const std::string& worker_id);
+
+    /**
      * @brief Unregisters a memory segment from master
      * @param segment_name Name of the segment to unregister
      * @param addr Memory address to unregister
@@ -164,6 +178,40 @@ class Client {
     ErrorCode TransferRead(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
+
+    /**
+     * @brief Try local memory copy first, fallback to transfer engine
+     * @param handles Buffer descriptors for the transfer
+     * @param slices Data slices to transfer
+     * @param is_write true for write operations (Put), false for read
+     * operations (Get)
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode TryLocalOrTransfer(
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        std::vector<Slice>& slices, bool is_write);
+
+    /**
+     * @brief Check if local memory copy can be used instead of transfer engine
+     * @param handles Buffer descriptors for the transfer
+     * @param slices Data slices to transfer
+     * @return true if local copy is possible, false otherwise
+     */
+    bool IsLocalTransfer(
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const std::vector<Slice>& slices);
+
+    /**
+     * @brief Perform local memory copy between handles and slices
+     * @param handles Buffer descriptors for the transfer
+     * @param slices Data slices to transfer
+     * @param is_write true for write operations (Put), false for read
+     * operations (Get)
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode LocalMemoryCopy(
+        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        std::vector<Slice>& slices, bool is_write);
 
     // Core components
     TransferEngine transfer_engine_;

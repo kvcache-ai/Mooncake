@@ -142,13 +142,12 @@ DistributedObjectStore::~DistributedObjectStore() {
     ResourceTracker::getInstance().unregisterInstance(this);
 }
 
-int DistributedObjectStore::setup(const std::string &local_hostname,
-                                  const std::string &metadata_server,
-                                  size_t global_segment_size,
-                                  size_t local_buffer_size,
-                                  const std::string &protocol,
-                                  const std::string &rdma_devices,
-                                  const std::string &master_server_addr) {
+int DistributedObjectStore::setup_common(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr, const std::string &instance_id,
+    const std::string &worker_id) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -197,13 +196,44 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    error_code = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
-                                       global_segment_size);
+
+    if (instance_id.empty() && worker_id.empty()) {
+        error_code = client_->MountSegment(
+            this->local_hostname, segment_ptr_.get(), global_segment_size);
+    } else {
+        error_code =
+            client_->MountSegment(this->local_hostname, segment_ptr_.get(),
+                                  global_segment_size, instance_id, worker_id);
+    }
+
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
         return 1;
     }
     return 0;
+}
+
+int DistributedObjectStore::setup(const std::string &local_hostname,
+                                  const std::string &metadata_server,
+                                  size_t global_segment_size,
+                                  size_t local_buffer_size,
+                                  const std::string &protocol,
+                                  const std::string &rdma_devices,
+                                  const std::string &master_server_addr) {
+    return setup_common(local_hostname, metadata_server, global_segment_size,
+                        local_buffer_size, protocol, rdma_devices,
+                        master_server_addr, "", "");
+}
+
+int DistributedObjectStore::setup_lmcache(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr, const std::string &instance_id,
+    const std::string &worker_id) {
+    return setup_common(local_hostname, metadata_server, global_segment_size,
+                        local_buffer_size, protocol, rdma_devices,
+                        master_server_addr, instance_id, worker_id);
 }
 
 int DistributedObjectStore::initAll(const std::string &protocol_,
@@ -643,6 +673,7 @@ PYBIND11_MODULE(store, m) {
     py::class_<DistributedObjectStore>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def("setup", &DistributedObjectStore::setup)
+        .def("setup_lmcache", &DistributedObjectStore::setup_lmcache)
         .def("init_all", &DistributedObjectStore::initAll)
         .def("get", &DistributedObjectStore::get)
         .def("get_buffer", &DistributedObjectStore::get_buffer,

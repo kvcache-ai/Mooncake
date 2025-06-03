@@ -38,8 +38,7 @@ class MasterClient {
      * @param object_key Key to query
      * @return ErrorCode indicating exist or not
      */
-    [[nodiscard]] ExistKeyResponse ExistKey(
-        const std::string& object_key);
+    [[nodiscard]] ExistKeyResponse ExistKey(const std::string& object_key);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -99,6 +98,21 @@ class MasterClient {
      */
     [[nodiscard]] MountSegmentResponse MountSegment(
         const std::string& segment_name, const void* buffer, size_t size);
+
+    /**
+     * @brief Registers a segment to master for allocation with LMCache
+     * parameters
+     * @param segment_name hostname:port of the segment
+     * @param buffer Buffer address of the segment
+     * @param size Size of the segment in bytes
+     * @param instance_id LMCache instance ID
+     * @param worker_id LMCache worker ID
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] MountSegmentResponse MountSegment(
+        const std::string& segment_name, const void* buffer, size_t size,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt);
 
     /**
      * @brief Unregisters a memory segment from master

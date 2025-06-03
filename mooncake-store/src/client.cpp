@@ -207,19 +207,8 @@ ErrorCode Client::Get(const std::string& object_key,
                 }
                 handles.push_back(handle);
             }
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine to improve performance and save bandwidth
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
-                       handles[0].size_);
-                return ErrorCode::OK;
-            }
-
-            if (TransferRead(handles, slices) != ErrorCode::OK) {
+            ErrorCode transfer_err = TryLocalOrTransfer(handles, slices, false);
+            if (transfer_err != ErrorCode::OK) {
                 LOG(ERROR) << "transfer_read_failed key=" << object_key;
                 return ErrorCode::INVALID_PARAMS;
             }
@@ -262,26 +251,15 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             handles.push_back(handle);
         }
 
-        // Fast path: if segment is on local host and we have single slice and
-        // handle, use memcpy instead of going through the transfer engine
-        if (slices.size() == 1 && handles.size() == 1 &&
-            handles[0].size_ == slices[0].size &&
-            handles[0].segment_name_ == this->local_hostname_) {
-            VLOG(1) << "Using fast path (memcpy) for local transfer";
-            memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
-                   handles[0].size_);
-        } else {
-            // Normal path: use transfer engine
-            ErrorCode transfer_err = TransferWrite(handles, slices);
-            if (transfer_err != ErrorCode::OK) {
-                // Revoke put operation
-                auto revoke_err = master_client_.PutRevoke(key);
-                if (revoke_err.error_code != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    return revoke_err.error_code;
-                }
-                return transfer_err;
+        ErrorCode transfer_err = TryLocalOrTransfer(handles, slices, true);
+        if (transfer_err != ErrorCode::OK) {
+            // Revoke put operation
+            auto revoke_err = master_client_.PutRevoke(key);
+            if (revoke_err.error_code != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err.error_code;
             }
+            return transfer_err;
         }
     }
 
@@ -302,6 +280,13 @@ long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
+    return MountSegment(segment_name, buffer, size, "", "");
+}
+
+ErrorCode Client::MountSegment(const std::string& segment_name,
+                               const void* buffer, size_t size,
+                               const std::string& instance_id,
+                               const std::string& worker_id) {
     if (buffer == nullptr || size == 0 ||
         reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
@@ -327,8 +312,16 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    ErrorCode err =
-        master_client_.MountSegment(segment_name, buffer, size).error_code;
+    // Convert empty strings to std::nullopt for proper optional handling
+    std::optional<std::string> opt_instance_id =
+        instance_id.empty() ? std::nullopt : std::make_optional(instance_id);
+    std::optional<std::string> opt_worker_id =
+        worker_id.empty() ? std::nullopt : std::make_optional(worker_id);
+
+    ErrorCode err = master_client_
+                        .MountSegment(segment_name, buffer, size,
+                                      opt_instance_id, opt_worker_id)
+                        .error_code;
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -393,6 +386,26 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 ErrorCode Client::IsExist(const std::string& key) {
     auto response = master_client_.ExistKey(key);
     return response.error_code;
+}
+
+ErrorCode Client::TryLocalOrTransfer(
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
+    std::vector<Slice>& slices, bool is_write) {
+    // Use local memory copy for local transfers to improve performance
+    // and save bandwidth
+    if (IsLocalTransfer(handles, slices)) {
+        VLOG(1) << "Using local memory copy for transfer with "
+                << handles.size() << " handles and " << slices.size()
+                << " slices";
+        return LocalMemoryCopy(handles, slices, is_write);
+    }
+
+    // Fallback to transfer engine
+    if (is_write) {
+        return TransferWrite(handles, slices);
+    } else {
+        return TransferRead(handles, slices);
+    }
 }
 
 ErrorCode Client::TransferData(
@@ -515,6 +528,61 @@ ErrorCode Client::TransferRead(
     }
 
     return TransferData(handles, slices, TransferRequest::READ);
+}
+
+bool Client::IsLocalTransfer(
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
+    const std::vector<Slice>& slices) {
+    if (handles.empty() || slices.empty()) {
+        return false;
+    }
+
+    // Check if all handles are on the local host
+    for (const auto& handle : handles) {
+        if (handle.segment_name_ != this->local_hostname_) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+ErrorCode Client::LocalMemoryCopy(
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
+    std::vector<Slice>& slices, bool is_write) {
+    if (handles.size() > slices.size()) {
+        LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
+                   << " slices_size=" << slices.size();
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    // Perform local memory copy for each handle-slice pair
+    for (uint64_t idx = 0; idx < handles.size(); ++idx) {
+        const auto& handle = handles[idx];
+        auto& slice = slices[idx];
+
+        if (is_write) {
+            // Write operation: copy from slice to handle
+            if (handle.size_ > slice.size) {
+                LOG(ERROR) << "Handle size " << handle.size_
+                           << " larger than slice size " << slice.size;
+                return ErrorCode::TRANSFER_FAIL;
+            }
+            memcpy(reinterpret_cast<char*>(handle.buffer_address_), slice.ptr,
+                   handle.size_);
+        } else {
+            // Read operation: copy from handle to slice
+            if (slice.size < handle.size_) {
+                LOG(ERROR) << "Slice size " << slice.size
+                           << " smaller than handle size " << handle.size_;
+                return ErrorCode::TRANSFER_FAIL;
+            }
+            memcpy(slice.ptr, reinterpret_cast<char*>(handle.buffer_address_),
+                   handle.size_);
+        }
+    }
+
+    return ErrorCode::OK;
 }
 
 }  // namespace mooncake

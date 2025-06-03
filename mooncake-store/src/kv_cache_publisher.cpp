@@ -35,7 +35,7 @@ void LMCacheNotifier::EnqueueTask(NotificationEventType event_type,
                                   const std::string& key,
                                   const std::string& location_str,
                                   const std::optional<std::string>& instance_id,
-                                  const std::optional<int>& worker_id) {
+                                  const std::optional<std::string>& worker_id) {
     // Create a new notification task
     auto* task = new NotificationTask();
     task->type = event_type;
@@ -58,7 +58,7 @@ void LMCacheNotifier::EnqueueTask(NotificationEventType event_type,
 }
 
 void LMCacheNotifier::WorkerLoop() {
-    VLOG(1) << "action=notification_thread_started";
+    LOG(INFO) << "action=notification_thread_started";
     cinatra::coro_http_client client{};
     async_simple::coro::syncAwait(client.connect(lmcache_controller_url_));
 
@@ -80,19 +80,12 @@ void LMCacheNotifier::WorkerLoop() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kWorkerThreadSleepMs));
     }
-    LOG(INFO) << "LMCacheNotifier::WorkerLoop stopped";
 
-    VLOG(1) << "action=notification_thread_stopped";
+    LOG(INFO) << "action=notification_thread_stopped";
 }
 
 void LMCacheNotifier::SendNotificationInternal(
     cinatra::coro_http_client& client, NotificationTask* task) const {
-    // if (!task->instance_id || !task->worker_id) {
-    //     LOG(WARNING) << "action=lmcache_notification_skipped, "
-    //                     "error=missing_instance_id_or_worker_id";
-    //     return;
-    // }
-
     // Create the appropriate message based on event type
     std::string json_str;
     if (task->type == NotificationEventType::ADMIT) {
@@ -100,7 +93,7 @@ void LMCacheNotifier::SendNotificationInternal(
         msg.key = task->key;
         msg.location = task->location_str;
         msg.instance_id = (task->instance_id ? task->instance_id.value() : "");
-        msg.worker_id = (task->worker_id ? task->worker_id.value() : 0);
+        msg.worker_id = (task->worker_id ? task->worker_id.value() : "");
 
         struct_json::to_json(msg, json_str);
 
@@ -109,7 +102,7 @@ void LMCacheNotifier::SendNotificationInternal(
         msg.key = task->key;
         msg.location = task->location_str;
         msg.instance_id = (task->instance_id ? task->instance_id.value() : "");
-        msg.worker_id = (task->worker_id ? task->worker_id.value() : 0);
+        msg.worker_id = (task->worker_id ? task->worker_id.value() : "");
 
         struct_json::to_json(msg, json_str);
     } else {

@@ -41,7 +41,7 @@ class LMCacheNotifier {
         NotificationEventType event_type, const std::string& key,
         const std::string& location_str,
         const std::optional<std::string>& instance_id = std::nullopt,
-        const std::optional<int>& worker_id = std::nullopt);
+        const std::optional<std::string>& worker_id = std::nullopt);
 
    private:
     // Structure to hold notification task details
@@ -50,7 +50,7 @@ class LMCacheNotifier {
         std::string key;
         std::string location_str;
         std::optional<std::string> instance_id;
-        std::optional<int> worker_id;
+        std::optional<std::string> worker_id;
     };
 
     // Constants

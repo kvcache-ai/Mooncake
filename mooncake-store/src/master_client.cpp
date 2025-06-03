@@ -39,8 +39,8 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
 
     auto request_result =
         client_.send_request<&WrappedMasterService::ExistKey>(object_key);
-    std::optional<ExistKeyResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
+    std::optional<ExistKeyResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to check key existence: "
@@ -206,7 +206,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to remove all objects: "
-                          << result.error().msg;
+                           << result.error().msg;
                 co_return std::nullopt;
             }
             co_return result->result();
@@ -225,9 +225,18 @@ RemoveAllResponse MasterClient::RemoveAll() {
 MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                                                 const void* buffer,
                                                 size_t size) {
+    return MountSegment(segment_name, buffer, size, std::nullopt, std::nullopt);
+}
+
+MountSegmentResponse MasterClient::MountSegment(
+    const std::string& segment_name, const void* buffer, size_t size,
+    const std::optional<std::string>& instance_id,
+    const std::optional<std::string>& worker_id) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
-                     ", size=", size);
+                     ", size=", size,
+                     ", instance_id=", instance_id.value_or("null"),
+                     ", worker_id=", worker_id.value_or("null"));
 
     std::optional<MountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
@@ -235,7 +244,8 @@ MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
                 co_await client_
                     .send_request<&WrappedMasterService::MountSegment>(
                         reinterpret_cast<uint64_t>(buffer),
-                        static_cast<uint64_t>(size), segment_name);
+                        static_cast<uint64_t>(size), segment_name, instance_id,
+                        worker_id);
             async_rpc_result<MountSegmentResponse> result = co_await handler;
             if (!result) {
                 co_return std::nullopt;

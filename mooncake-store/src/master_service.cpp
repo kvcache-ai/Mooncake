@@ -12,8 +12,8 @@ namespace mooncake {
 
 ErrorCode BufferAllocatorManager::AddSegment(
     const std::string& segment_name, uint64_t base, uint64_t size,
-    LocationType location_type, std::optional<std::string> instance_id,
-    std::optional<int> worker_id) {
+    LocationType location_type, const std::optional<std::string>& instance_id,
+    const std::optional<std::string>& worker_id) {
     // Check if parameters are valid before allocating memory.
     if (base == 0 || size == 0 ||
         reinterpret_cast<uintptr_t>(base) % facebook::cachelib::Slab::kSize ||
@@ -93,10 +93,8 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     }
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-    VLOG(1) << "action=start_gc_thread";
     if (!lmcache_controller_url.empty()) {
         lmcache_notifier_.emplace(lmcache_controller_url);
-        VLOG(1) << "action=lmcache_notifier_started";
     }
 }
 
@@ -116,16 +114,23 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+ErrorCode MasterService::MountSegment(
+    uint64_t buffer, uint64_t size, const std::string& segment_name,
+    const std::optional<std::string>& instance_id,
+    const std::optional<std::string>& worker_id) {
     if (buffer == 0 || size == 0) {
         LOG(ERROR) << "buffer=" << buffer << ", size=" << size
                    << ", error=invalid_buffer_params";
         return ErrorCode::INVALID_PARAMS;
     }
+    if (instance_id.has_value() != worker_id.has_value()) {
+        LOG(ERROR) << "instance_id and worker_id must be set in same time";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     return buffer_allocator_manager_->AddSegment(segment_name, buffer, size,
-                                                 LocationType::CPU_RAM);
+                                                 LocationType::CPU_RAM,
+                                                 instance_id, worker_id);
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
@@ -248,12 +253,9 @@ ErrorCode MasterService::PutStart(
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = getShardIndex(key);
-    std::unique_lock<std::mutex> lock(metadata_shards_[shard_idx].mutex);
+    auto accessor = MetadataAccessor(this, key);
 
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it != metadata_shards_[shard_idx].metadata.end() &&
-        !CleanupStaleHandles(it->second)) {
+    if (accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
@@ -458,7 +460,7 @@ size_t MasterService::GetKeyCount() const {
 }
 
 void MasterService::GCThreadFunc() {
-    VLOG(1) << "action=gc_thread_started";
+    LOG(INFO) << "action=gc_thread_started";
 
     std::priority_queue<GCTask*, std::vector<GCTask*>, GCTaskComparator>
         local_pq;
@@ -476,14 +478,8 @@ void MasterService::GCThreadFunc() {
             if (!task->is_ready()) {
                 break;
             }
-
             local_pq.pop();
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
-            // Get metadata before removing
-            MetadataAccessor accessor(this, task->key);
-            if (accessor.Exists()) {
-                SendEvictNotification(task->key, accessor.Get());
-            }
             ErrorCode result = Remove(task->key);
             if (result != ErrorCode::OK &&
                 result != ErrorCode::OBJECT_NOT_FOUND &&
@@ -513,7 +509,7 @@ void MasterService::GCThreadFunc() {
         local_pq.pop();
     }
 
-    VLOG(1) << "action=gc_thread_stopped";
+    LOG(INFO) << "action=gc_thread_stopped";
 }
 
 void MasterService::BatchEvict(double eviction_ratio) {
@@ -547,27 +543,31 @@ void MasterService::BatchEvict(double eviction_ratio) {
         std::vector<decltype(shard.metadata)::iterator> candidates;
         candidates.reserve(ideal_evict_num);
 
-        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
+        for (auto it = shard.metadata.begin(); it != shard.metadata.end();
+             it++) {
             // Only evict objects that have not expired and are complete
-            if (it->second.IsLeaseExpired(now)
-                && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+            if (it->second.IsLeaseExpired(now) &&
+                !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                 candidates.push_back(it);
             }
         }
 
         if (!candidates.empty()) {
-            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
+            size_t evict_num =
+                std::min(ideal_evict_num, (long)candidates.size());
             long shard_evicted_count =
                 0;  // number of objects evicted from this shard
-            std::nth_element(candidates.begin(),
-                            candidates.begin() + (evict_num - 1),
-                            candidates.end(),
-                            [](const auto& a, const auto& b) {
-                                return a->second.lease_timeout < b->second.lease_timeout;
-                            });
+            std::nth_element(
+                candidates.begin(), candidates.begin() + (evict_num - 1),
+                candidates.end(), [](const auto& a, const auto& b) {
+                    return a->second.lease_timeout < b->second.lease_timeout;
+                });
             // Evict objects for [0, evict_num) from candidates
             for (size_t j = 0; j < evict_num && j < candidates.size(); ++j) {
-                total_freed_size += candidates[j]->second.size * candidates[j]->second.replicas.size();
+                total_freed_size += candidates[j]->second.size *
+                                    candidates[j]->second.replicas.size();
+                SendEvictNotification(candidates[j]->first,
+                                      candidates[j]->second);
                 shard.metadata.erase(candidates[j]);
                 shard_evicted_count++;
             }

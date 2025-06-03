@@ -61,7 +61,7 @@ int main(int argc, char* argv[]) {
     mooncake::WrappedMasterService wrapped_master_service(
         FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
         FLAGS_enable_metric_reporting, FLAGS_metrics_port, FLAGS_eviction_ratio,
-        FLAGS_eviction_high_watermark_ratio);
+        FLAGS_eviction_high_watermark_ratio, FLAGS_lmcache_controller_url);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(

@@ -38,10 +38,11 @@ namespace mooncake {
  */
 class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
    public:
-    BufferAllocator(std::string segment_name, size_t base, size_t size,
-                    LocationType location_type = LocationType::CPU_RAM,
-                    std::optional<std::string> instance_id = std::nullopt,
-                    std::optional<int> worker_id = std::nullopt);
+    BufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        LocationType location_type = LocationType::CPU_RAM,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt);
 
     ~BufferAllocator();
 
@@ -54,7 +55,7 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
     std::string getSegmentName() const { return segment_name_; }
     LocationType getLocationType() const { return location_type_; }
     std::optional<std::string> getInstanceId() const { return instance_id_; }
-    std::optional<int> getWorkerId() const { return worker_id_; }
+    std::optional<std::string> getWorkerId() const { return worker_id_; }
 
    private:
     // metadata
@@ -64,7 +65,7 @@ class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
     std::atomic_size_t cur_size_;
     LocationType location_type_{LocationType::CPU_RAM};
     std::optional<std::string> instance_id_;
-    std::optional<int> worker_id_;
+    std::optional<std::string> worker_id_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};

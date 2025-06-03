@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -269,18 +270,22 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+    MountSegmentResponse MountSegment(
+        uint64_t buffer, uint64_t size, const std::string& segment_name,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt) {
         ScopedVLogTimer timer(1, "MountSegment");
         timer.LogRequest("buffer=", buffer, ", size=", size,
-                         ", segment_name=", segment_name);
+                         ", segment_name=", segment_name,
+                         ", instance_id=", instance_id.value_or("null"),
+                         ", worker_id=", worker_id.value_or("null"));
 
         // Increment request metric
         MasterMetricManager::instance().inc_mount_segment_requests();
 
         MountSegmentResponse response;
-        response.error_code =
-            master_service_.MountSegment(buffer, size, segment_name);
+        response.error_code = master_service_.MountSegment(
+            buffer, size, segment_name, instance_id, worker_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
