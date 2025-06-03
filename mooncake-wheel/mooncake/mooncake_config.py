@@ -22,7 +22,6 @@ class MooncakeConfig:
         protocol (str): The communication protocol to use.
         device_name (Optional[str]): The name of the device to use.
         master_server_address (str): The address of the master server.
-        storage_root_path (str): The root path for storage (optional).
 
     Example of configuration file:
         {
@@ -32,8 +31,7 @@ class MooncakeConfig:
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
             "device_name": "",
-            "master_server_address": "localhost:8081",
-            "storage_root_path": "/path/to/storage"
+            "master_server_address": "localhost:8081"
         }
     """
     local_hostname: str
@@ -43,7 +41,6 @@ class MooncakeConfig:
     protocol: str
     device_name: Optional[str]
     master_server_address: str
-    storage_root_path: Optional[str]
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -68,7 +65,6 @@ class MooncakeConfig:
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
-            storage_root_path=config.get("storage_root_path", ""),
         )
 
     @staticmethod

@@ -17,15 +17,13 @@ class TestMultiCards(unittest.TestCase):
         global_segment_size = 3200 * 1024 * 1024
         local_buffer_size = 512 * 1024 * 1024
         master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-        storage_root_path = os.getenv("STORAGE_ROOT_PATH", "")
         retcode = cls.store.setup(local_hostname,
                                   metadata_server,
                                   global_segment_size,
                                   local_buffer_size,
                                   protocol,
                                   device_name,
-                                  master_server_address,
-                                  storage_root_path)
+                                  master_server_address)
         
         if retcode:
             raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
