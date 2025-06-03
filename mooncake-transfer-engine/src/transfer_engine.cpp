@@ -38,13 +38,9 @@ static std::string loadTopologyJsonFile(const std::string &path) {
 }
 
 int TransferEngine::init(const std::string &metadata_conn_string,
-                         const std::string &local_server_name,
-                         const std::string &ip_or_host_name,
-                         uint64_t rpc_port) {
+                         const std::string &local_server_name) {
     LOG(INFO) << "Transfer Engine starting. Server: " << local_server_name
-              << ", Metadata: " << metadata_conn_string
-              << ", ip_or_host_name: " << ip_or_host_name
-              << ", rpc_port: " << rpc_port;
+              << ", Metadata: " << metadata_conn_string;
 
     local_server_name_ = local_server_name;
     TransferMetadata::RpcMetaDesc desc;
@@ -73,7 +69,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         }
     } else {
         rpc_binding_method = "new RPC mapping";
-        (void)(ip_or_host_name);
         auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
         if (ip_address)
             desc.ip_or_host_name = ip_address;
@@ -89,7 +84,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
         // In the new rpc port mapping, it is randomly selected to prevent
         // port conflict
-        (void)(rpc_port);
         desc.rpc_port = findAvailableTcpPort(desc.sockfd);
         if (desc.rpc_port == 0) {
             LOG(ERROR) << "not valid port for serving local TCP service";

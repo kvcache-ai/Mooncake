@@ -97,7 +97,6 @@ class RDMATransportTest : public ::testing::Test {
    public:
     std::shared_ptr<mooncake::TransferMetadata> metadata_client;
     void *addr = nullptr;
-    std::pair<std::string, uint16_t> hostname_port;
     std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t ram_buffer_size = 1ull << 30;
     Transport *xport;
@@ -115,10 +114,7 @@ class RDMATransportTest : public ::testing::Test {
         FLAGS_logtostderr = 1;
         // disable topology auto discovery for testing.
         engine = std::make_unique<TransferEngine>(false);
-        hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                     hostname_port.first.c_str(),
-                     hostname_port.second + offset++);
+        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
         xport = nullptr;
         nic_priority_matrix = loadNicPriorityMatrix();
         args = (void **)malloc(2 * sizeof(void *));
