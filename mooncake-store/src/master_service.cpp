@@ -80,6 +80,13 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                    << "current value: " << eviction_ratio_;
         throw std::invalid_argument("Invalid eviction ratio");
     }
+    if (eviction_high_watermark_ratio_ < 0.0 ||
+        eviction_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR)
+            << "Eviction high watermark ratio must be between 0.0 and 1.0, "
+            << "current value: " << eviction_high_watermark_ratio_;
+        throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
     VLOG(1) << "action=start_gc_thread";
