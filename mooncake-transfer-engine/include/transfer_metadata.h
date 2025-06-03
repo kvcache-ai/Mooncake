@@ -27,6 +27,10 @@
 #include <thread>
 #include <unordered_map>
 
+#ifdef USE_NVLINK
+#include <cuda_runtime.h>
+#endif
+
 #include "common.h"
 #include "topology.h"
 
@@ -52,6 +56,32 @@ class TransferMetadata {
         std::vector<uint32_t> rkey;
     };
 
+
+#ifdef USE_NVLINK
+    struct NVLinkBufferDesc {
+        std::string name;
+        uint64_t addr;                        // Local device pointer (for server)
+        uint64_t length;                     // Buffer size in bytes
+        int device_id;                     // CUDA device ID
+        uint8_t cuda_ipc_handle[sizeof(cudaIpcMemHandle_t)]; // IPC handle for sharing
+
+        NVLinkBufferDesc() : addr(0), length(0), device_id(0) {
+            std::memset(cuda_ipc_handle, 0, sizeof(cuda_ipc_handle));
+        }
+
+        // Helper to set the handle from a cudaIpcMemHandle_t
+        void setIpcHandle(const cudaIpcMemHandle_t& handle) {
+            std::memcpy(cuda_ipc_handle, &handle, sizeof(cuda_ipc_handle));
+        }
+
+        // Helper to get the handle as cudaIpcMemHandle_t
+        cudaIpcMemHandle_t getIpcHandle() const {
+            cudaIpcMemHandle_t handle;
+            std::memcpy(&handle, cuda_ipc_handle, sizeof(cuda_ipc_handle));
+            return handle;
+        }
+    };
+#endif
     struct NVMeoFBufferDesc {
         std::string file_path;
         uint64_t length;
@@ -69,6 +99,10 @@ class TransferMetadata {
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+
+#ifdef USE_NVLINK
+        std::vector<NVLinkBufferDesc> nvlink_buffers;
+#endif
         // TODO : make these two a union or a std::variant
         std::string timestamp;
 
@@ -126,6 +160,10 @@ class TransferMetadata {
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
+
+#ifdef USE_NVLINK
+    NVLinkBufferDesc getRemoteNVLinkBufferDesc(SegmentID segment_id);
+#endif
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
