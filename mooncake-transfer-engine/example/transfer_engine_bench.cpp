@@ -14,9 +14,9 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <signal.h>
 #include <sys/time.h>
 
-#include <signal.h>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -25,10 +25,10 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "common.h"
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#include "common.h"
 
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
@@ -49,8 +49,12 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
+#ifdef USE_CUDA
+const static int NR_SOCKETS = 1;
+#else
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
+#endif
 
 DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
@@ -152,8 +156,8 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
-                    void *addr) {
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
+                       int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
@@ -192,6 +196,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         }
 
         s = engine->submitTransfer(batch_id, requests);
+        if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
@@ -275,6 +280,8 @@ int initiator() {
             xport = engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "nvlink") {
+            xport = engine->installTransport("nvlink", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -345,7 +352,7 @@ volatile bool target_running = true;
 
 void signalHandler(int signum) {
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    target_running = false;  
+    target_running = false;
 }
 
 int target() {
@@ -368,6 +375,8 @@ int target() {
             engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "nvlink") {
+            engine->installTransport("nvlink", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -388,7 +397,7 @@ int target() {
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
-       addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
+        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);

@@ -2,7 +2,7 @@ file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
 add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>)
-target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread)
+target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread boost_thread)
 
 if (USE_TCP)
   add_subdirectory(tcp_transport)
@@ -17,4 +17,9 @@ endif()
 if (USE_CXL)
   add_subdirectory(cxl_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
+endif()
+
+if (USE_NVLINK)
+  add_subdirectory(nvlink_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
