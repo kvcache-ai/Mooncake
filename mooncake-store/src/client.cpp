@@ -183,7 +183,7 @@ ErrorCode Client::BatchGet(
     std::unordered_set<std::string> seen;
     for (const auto& key : object_keys) {
         if (!seen.insert(key).second) {
-            LOG(ERROR) << "Duplicate key not supportted for Batch API, key: "
+            LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
                        << key;
             return ErrorCode::INVALID_PARAMS;
         };
