@@ -17,9 +17,7 @@ DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
-DEFINE_string(storage_root_dir, "",
-              "Storage root directory for persisting data, if empty, "
-              "data will not be persisted");
+
 
 namespace mooncake {
 namespace testing {
@@ -139,7 +137,7 @@ class ClientIntegrationTest : public ::testing::Test {
         auto client_opt =
             Client::Create("localhost:12345",  // Local hostname
                            "127.0.0.1:2379",   // Metadata connection string
-                           FLAGS_protocol, args, FLAGS_master_address, FLAGS_storage_root_dir);
+                           FLAGS_protocol, args, FLAGS_master_address);
 
         ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
         client_ = *client_opt;

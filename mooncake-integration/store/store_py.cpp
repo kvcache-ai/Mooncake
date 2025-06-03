@@ -148,12 +148,15 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_addr,
-                                  const std::string &storage_root_dir) {
+                                  const std::string &master_server_addr) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
+    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
+    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
+        std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
+
     size_t colon_pos = hostname.find(":");
     if (colon_pos == std::string::npos) {
         // Get a random available port
@@ -209,15 +212,14 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
 int DistributedObjectStore::initAll(const std::string &protocol_,
                                     const std::string &device_name,
-                                    size_t mount_segment_size,
-                                    const std::string &storage_root_dir) {
+                                    size_t mount_segment_size) {
     if (client_) {
         LOG(ERROR) << "Client is already initialized";
         return 1;
     }
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
     return setup("localhost:12345", "127.0.0.1:2379", mount_segment_size,
-                 buffer_allocator_size, protocol_, device_name, storage_root_dir);
+                 buffer_allocator_size, protocol_, device_name);
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,

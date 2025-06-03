@@ -1,4 +1,5 @@
 #include "distributed_object_store.h"
+#include <cstdlib>
 
 using namespace mooncake;
 
@@ -22,10 +23,12 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_addr,
-                                  const std::string &storage_root_dir) {
+                                  const std::string &master_server_addr) {
     this->protocol = protocol;
     this->local_hostname = local_hostname;  // Save the local hostname
+    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
+    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
+        std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
     client_ = std::make_unique<mooncake::Client>();
 
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
@@ -54,11 +57,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
 int DistributedObjectStore::initAll(const std::string &protocol_,
                                     const std::string &device_name,
-                                    size_t mount_segment_size,
-                                    const std::string &storage_root_dir) {
+                                    size_t mount_segment_size) {
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
     return setup("localhost:12345", "127.0.0.1:2379", mount_segment_size,
-                 buffer_allocator_size, protocol_, device_name,storage_root_dir);
+                 buffer_allocator_size, protocol_, device_name);
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
