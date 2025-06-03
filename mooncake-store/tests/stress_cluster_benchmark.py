@@ -21,7 +21,6 @@ class TestInstance:
         master_server_address = os.getenv("MASTER_SERVER", "10.1.101.3:50051")
         cls.value_length = 1 * 1024 * 1024
         cls.max_requests = 10000
-
         retcode = cls.store.setup(local_hostname, 
                                   metadata_server, 
                                   global_segment_size,

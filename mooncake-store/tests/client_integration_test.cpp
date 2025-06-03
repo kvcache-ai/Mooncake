@@ -22,7 +22,6 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
               "same as the master's default_kv_lease_ttl");
 
-
 namespace mooncake {
 namespace testing {
 

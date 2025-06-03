@@ -69,6 +69,14 @@ public:
      */
     ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset);
 
+    /**
+     * @brief Gets the current error code
+     * @return Current error code
+     */
+    ErrorCode get_error_code(){
+        return error_code_;
+    }
+
 private:
     /**
      * @brief file locking mechanism
