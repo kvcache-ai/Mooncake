@@ -565,6 +565,8 @@ global_segment_size = 3200 * 1024 * 1024
 local_buffer_size = 512 * 1024 * 1024
 # Address of the Master Service of Mooncake Store
 master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
+# Storage root path for client kvcache persistence
+storage_root_path = os.getenv("STORAGE_ROOT_PATH", "")
 # Data length for each put()
 value_length = 1 * 1024 * 1024
 # Total number of requests sent
@@ -578,6 +580,7 @@ retcode = store.setup(
     protocol,
     device_name,
     master_server_address,
+    storage_root_path,
 )
 ```
 

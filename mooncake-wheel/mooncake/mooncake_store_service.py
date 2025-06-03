@@ -21,7 +21,8 @@ class MooncakeStoreService:
         "local_buffer_size": 1073741824,
         "protocol": "tcp",
         "device_name": "",
-        "master_server_address": "localhost:8081"
+        "master_server_address": "localhost:8081",
+        "storage_root_path": "/path/to/storage"
     }
 
     Explanation of Key Fields:
@@ -32,6 +33,7 @@ class MooncakeStoreService:
     - protocol: Communication protocol (tcp or rdma).
     - device_name: The name of the device to use.
     - master_server_address: The address of the master server.
+    - storage_root_path: Optional root path for client kvcache storage.
     """
 
     def __init__(self, config_path: str = None, cli_config: dict = None):
@@ -72,7 +74,8 @@ class MooncakeStoreService:
                 self.config.local_buffer_size,
                 self.config.protocol,
                 self.config.device_name,
-                self.config.master_server_address
+                self.config.master_server_address,
+                self.config.storage_root_path
             )
             if ret != 0:
                 raise RuntimeError("Store initialization failed")
