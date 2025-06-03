@@ -9,34 +9,20 @@
 #include "local_file.h"
 
 namespace mooncake {
-LocalFile::LocalFile(const std::string& filename,FILE *file,ErrorCode ec) : filename_(filename),file_(file),error_code_(ec) {}
+LocalFile::LocalFile(const std::string& filename,FILE *file,ErrorCode ec) : filename_(filename),file_(file),error_code_(ec) {
+    if (!file_ || ferror(file_)) {
+        error_code_ = ErrorCode::FILE_INVALID_HANDLE;  
+    } else if (ec != ErrorCode::OK) {
+        error_code_ = ec;  
+    }
+}
 
 LocalFile::~LocalFile() {
     if (file_) {
+        release_lock();
         fclose(file_);
     }
     file_ = nullptr;
-}
-
-int LocalFile::acquire_write_lock(){
-    if (flock(fileno(file_), LOCK_EX) == -1) {
-        return -1;
-    }
-    return 0;
-}
-
-int LocalFile::acquire_read_lock(){
-    if (flock(fileno(file_), LOCK_SH) == -1) {
-        return -1;
-    }
-    return 0;
-}
-
-int LocalFile::release_lock(){
-    if (flock(fileno(file_), LOCK_UN) == -1) {
-        return -1;
-    }
-    return 0;
 }
 
 ssize_t LocalFile::write(std::string &buffer, size_t length){
@@ -59,7 +45,22 @@ ssize_t LocalFile::write(std::string &buffer, size_t length){
         return -1;
     }
 
-    size_t written_bytes = fwrite(buffer.data(), 1, length, file_);
+    size_t remaining = length;
+    size_t written_bytes = 0;
+    const char* ptr = buffer.data();
+
+    while (remaining > 0) {
+        size_t written = fwrite(ptr, 1, remaining, file_);
+        if (written == 0) break;  
+        remaining -= written;
+        ptr += written;
+        written_bytes += written;
+    }
+
+    if (remaining > 0) {
+        error_code_ = ErrorCode::FILE_WRITE_FAIL;
+        return -1;
+    }   
 
     if (release_lock() == -1) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
@@ -112,61 +113,6 @@ ssize_t LocalFile::read(std::string &buffer, size_t length){
     return read_bytes;
 }
 
-// ssize_t LocalFile::read(void *buffer, size_t length){
-//     if (file_ == NULL) 
-//     {
-//         error_code_ = ErrorCode::FILE_NOT_FOUND;
-//         return -1;  
-//     }
-
-//     if(buffer == NULL || length == 0)
-//     {
-//         error_code_ = ErrorCode::FILE_BUFFER_INVALID;
-//         return -1;  
-//     }
-
-//     // 尝试从文件中读取指定长度的数据
-//     size_t read_bytes = fread(buffer, 1, length, file_);
-
-//     // 检查是否发生读取错误
-//     if (ferror(file_))
-//     {
-//         error_code_ = ErrorCode::FILE_READ_FAIL;
-//         return -1;  // 出错，返回读取的字节数为 0
-//     }
-
-//     // 返回实际读取的字节数
-//     return read_bytes;
-// }
-
-
-// ssize_t LocalFile::write(const void *buffer, size_t length){
-//     if (file_ == NULL) 
-//     {
-//         error_code_ = ErrorCode::FILE_NOT_FOUND;
-//         return -1;  
-//     }
-
-//     if(buffer == NULL || length == 0)
-//     {
-//         error_code_ = ErrorCode::FILE_BUFFER_INVALID;
-//         return -1;  
-//     }
-
-//     // 尝试向文件中写入指定长度的数据
-//     size_t written_bytes = fwrite(buffer, 1, length, file_);
-
-//     // 检查是否发生写入错误
-//     if (ferror(file_))
-//     {
-//         error_code_ = ErrorCode::FILE_WRITE_FAIL;
-//         return -1;  // 出错，返回写入的字节数为 0
-//     }
-
-//     // 返回实际写入的字节数
-//     return written_bytes;
-// }
-
 ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
     if(!file_){
         error_code_ = ErrorCode::FILE_NOT_FOUND;
@@ -174,6 +120,7 @@ ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
     }
 
     int fd=fileno(file_);
+
     if (fd == -1) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         LOG(ERROR) << "Invalid file handle for: " << filename_;
@@ -201,25 +148,6 @@ ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
         return -1;
     }
 
-    // // 检查写入的数据是否正确
-    // std::vector<char> buffer(total_length);
-    // ssize_t read_ret = pread(fd, buffer.data(), total_length, offset);
-
-    // if (read_ret != ret) {
-    //     error_code_ = ErrorCode::FILE_READ_FAIL;
-    //     LOG(ERROR) << "Read verification failed: expected " << ret << " bytes, got " << read_ret << " bytes.";
-    //     return -1;
-    // }
-
-    // // 比较写入的数据和读取的数据
-    // size_t pos = 0;
-    // for (int i = 0; i < iovcnt; ++i) {
-    //     if (std::memcmp(buffer.data() + pos, iov[i].iov_base, iov[i].iov_len) != 0) {
-    //         LOG(ERROR) << "Data mismatch after write operation.";
-    //         return -1;
-    //     }
-    //     pos += iov[i].iov_len;
-    // }
     return ret;
 }
 
@@ -231,6 +159,12 @@ ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
     }
 
     int fd=fileno(file_);
+
+    if (fd == -1) {
+        error_code_ = ErrorCode::FILE_INVALID_HANDLE;
+        LOG(ERROR) << "Invalid file handle for: " << filename_;
+        return -1;
+    }
 
     if (acquire_read_lock() == -1) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
@@ -251,9 +185,25 @@ ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
     return ret;
 }
 
-
-
-
-
+int LocalFile::acquire_write_lock(){
+    if (flock(fileno(file_), LOCK_EX) == -1) {
+        return -1;
+    }
+    return 0;
 }
 
+int LocalFile::acquire_read_lock(){
+    if (flock(fileno(file_), LOCK_SH) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+int LocalFile::release_lock(){
+    if (flock(fileno(file_), LOCK_UN) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+}

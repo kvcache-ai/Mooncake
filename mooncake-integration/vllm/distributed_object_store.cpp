@@ -334,8 +334,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
         if(error_code!= ErrorCode::OK) {
             return kNullString;
         }else{
-            // If the query is successful, return the string as bytes
-            LOG(INFO) << "Get_From_Local_File successful for key: " << key;
+            // LOG(INFO) << "Get_From_Local_File successful for key: " << key;
             return pybind11::bytes(str);
         }
     #else

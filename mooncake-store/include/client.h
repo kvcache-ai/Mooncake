@@ -72,6 +72,12 @@ class Client {
     ErrorCode Get(const std::string& object_key, const ObjectInfo& object_info,
                   std::vector<Slice>& slices);
 
+    /**
+     * @brief Retrieves data from a local file
+     * @param object_key Key of the object to retrieve
+     * @param data Output string to store the retrieved data
+     * @return ErrorCode indicating success/failure
+     */
     ErrorCode Get_From_Local_File(const std::string& object_key,
                              std::string& data);
 
@@ -195,7 +201,7 @@ class Client {
     const std::string metadata_connstring_;
     const std::string storage_root_dir_; 
 
-    // client persistent thread pool for async operations
+    // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 };
