@@ -108,7 +108,6 @@ class RDMATransportTest : public ::testing::Test {
 
    protected:
     void SetUp() override {
-        static int offset = 0;
         LOG(INFO) << "HERE \n";
         google::InitGoogleLogging("RDMATransportTest");
         FLAGS_logtostderr = 1;
