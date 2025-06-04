@@ -94,7 +94,7 @@ typedef void *transport_t;
 */
 
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
-                                       const char *local_server_name
+                                       const char *local_server_name,
                                        int auto_discover);
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len);
