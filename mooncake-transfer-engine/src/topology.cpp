@@ -51,8 +51,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     std::vector<InfinibandDevice> devices;
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
-    if (!device_list || num_devices <= 0) {
+    if (!device_list) {
         LOG(WARNING) << "No RDMA devices found, check your device installation";
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        ibv_free_device_list(device_list);
         return {};
     }
 
@@ -82,6 +87,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
                                            .pci_bus_id = std::move(pci_bus_id),
                                            .numa_node = numa_node});
     }
+    ibv_free_device_list(device_list);
     return devices;
 }
 

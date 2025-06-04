@@ -106,6 +106,7 @@ public:
     MasterServiceSupervisor(int port, int server_thread_num, bool enable_gc,
                           bool enable_metric_reporting, int metrics_port,
                           int64_t default_kv_lease_ttl, double eviction_ratio,
+                          double eviction_high_watermark_ratio,
                           const std::string& etcd_endpoints = "0.0.0.0:2379")
         : port_(port),
           server_thread_num_(server_thread_num),
@@ -114,6 +115,7 @@ public:
           metrics_port_(metrics_port),
           default_kv_lease_ttl_(default_kv_lease_ttl),
           eviction_ratio_(eviction_ratio),
+          eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
           etcd_endpoints_(etcd_endpoints) {}
 
     int Start() {
@@ -137,7 +139,8 @@ public:
             });
             mooncake::WrappedMasterService wrapped_master_service(
             enable_gc_, default_kv_lease_ttl_,
-            enable_metric_reporting_, metrics_port_, eviction_ratio_, version);
+            enable_metric_reporting_, metrics_port_, eviction_ratio_,
+            eviction_high_watermark_ratio_, version);
 
             mooncake::RegisterRpcService(server, wrapped_master_service);
 
@@ -170,6 +173,7 @@ private:
     int metrics_port_;
     int64_t default_kv_lease_ttl_;
     double eviction_ratio_;
+    double eviction_high_watermark_ratio_;
 
     // Server thread
     std::thread server_thread_;

@@ -73,8 +73,9 @@ class WrappedMasterService {
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
+                         double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                          ViewVersion view_version = 0)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio),
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_high_watermark_ratio),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
           view_version_(view_version) {

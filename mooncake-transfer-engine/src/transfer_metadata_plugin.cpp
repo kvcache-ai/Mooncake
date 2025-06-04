@@ -466,7 +466,10 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 }
 
 struct SocketHandShakePlugin : public HandShakePlugin {
-    SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {}
+    SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
+        auto &config = globalConfig();
+        listen_backlog_ = config.handshake_listen_backlog;
+    }
 
     void closeListen() {
         if (listen_fd_ >= 0) {
@@ -541,7 +544,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             }
         }
 
-        if (listen(listen_fd_, 5)) {
+        if (listen(listen_fd_, listen_backlog_)) {
             PLOG(ERROR) << "SocketHandShakePlugin: listen()";
             closeListen();
             return ERR_SOCKET;
@@ -834,6 +837,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::atomic<bool> listener_running_;
     std::thread listener_;
     int listen_fd_;
+    int listen_backlog_;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
@@ -863,9 +867,18 @@ std::vector<std::string> findLocalIpAddresses() {
                 continue;
             }
 
+            // Check if interface is UP and RUNNING
+            if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) {
+                LOG(INFO) << "Skipping interface " << ifa->ifa_name
+                          << " (not UP or not RUNNING)";
+                continue;
+            }
+
             char host[NI_MAXHOST];
             if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
                             NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+                LOG(INFO) << "Found active interface " << ifa->ifa_name
+                          << " with IP " << host;
                 ips.push_back(host);
             }
         }

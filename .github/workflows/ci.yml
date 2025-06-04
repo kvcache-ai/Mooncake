@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
 
     steps:
     - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         sudo make install -j
       shell: bash
 
@@ -78,18 +78,12 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
-
   test-wheel-ubuntu:
-    needs: build
+    needs: build-flags
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -142,7 +136,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
 
     steps:
     - uses: actions/checkout@v4
@@ -187,6 +181,13 @@ jobs:
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
 
+    - name: Configure and build project
+      run: |
+        cd build
+        cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
+        sudo make install -j
+      shell: bash
+
     - name: Generate Python version tag
       id: generate_tag_flags
       run: |
@@ -198,6 +199,12 @@ jobs:
         # Build wheel with specific Python version
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
+
+    - name: Upload Python wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
     - name: Run sccache stat for check
       shell: bash

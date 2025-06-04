@@ -67,16 +67,23 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 }
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                            double eviction_ratio)
+                             double eviction_ratio,
+                             double eviction_high_watermark_ratio)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
-      eviction_ratio_(eviction_ratio) {
+      eviction_ratio_(eviction_ratio),
+      eviction_high_watermark_ratio_(eviction_high_watermark_ratio) {
         if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
             LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                        << "current value: " << eviction_ratio_;
             throw std::invalid_argument("Invalid eviction ratio");
+        }
+        if (eviction_high_watermark_ratio_ < 0.0 || eviction_high_watermark_ratio_ > 1.0) {
+            LOG(ERROR) << "Eviction high watermark ratio must be between 0.0 and 1.0, "
+                       << "current value: " << eviction_high_watermark_ratio_;
+            throw std::invalid_argument("Invalid eviction high watermark ratio");
         }
         gc_running_ = true;
         gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
@@ -474,8 +481,11 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
-        if (need_eviction_ && eviction_ratio_ > 0.0) {
-            BatchEvict();
+        double used_ratio = MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratio > eviction_high_watermark_ratio_
+            || (need_eviction_ && eviction_ratio_ > 0.0)) {
+            BatchEvict(std::max(eviction_ratio_,
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
         }
 
         std::this_thread::sleep_for(
@@ -490,7 +500,7 @@ void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_stopped";
 }
 
-void MasterService::BatchEvict() {
+void MasterService::BatchEvict(double eviction_ratio) {
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
     long object_count = 0;
@@ -509,39 +519,38 @@ void MasterService::BatchEvict() {
 
         // To achieve evicted_count / object_count = eviction_ration,
         // ideally how many object should be evicted in this shard
-        const long ideal_evict_num = std::ceil(object_count * eviction_ratio_) - evicted_count;
+        const long ideal_evict_num = std::ceil(object_count * eviction_ratio) - evicted_count;
 
         if (ideal_evict_num <= 0) {
             // No need to evict any object in this shard
             continue;
         }
 
-        std::vector<std::chrono::steady_clock::time_point> candidates; // can be removed
+        std::vector<decltype(shard.metadata)::iterator> candidates;
+        candidates.reserve(ideal_evict_num);
+
         for (auto it = shard.metadata.begin(); it != shard.metadata.end(); it++) {
             // Only evict objects that have not expired and are complete
             if (it->second.IsLeaseExpired(now)
                 && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                candidates.push_back(it->second.lease_timeout);
+                candidates.push_back(it);
             }
         }
+
         if (!candidates.empty()) {
             long evict_num = std::min(ideal_evict_num, (long) candidates.size());
             long shard_evicted_count = 0; // number of objects evicted from this shard
             std::nth_element(candidates.begin(),
                             candidates.begin() + (evict_num - 1),
-                            candidates.end());
-            auto target_timeout = candidates[evict_num - 1];
-            // Evict objects with lease timeout less than or equal to target.
-            auto it = shard.metadata.begin();
-            while (it != shard.metadata.end() && shard_evicted_count < evict_num) {
-                if (it->second.lease_timeout <= target_timeout
-                && !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                    total_freed_size += it->second.size * it->second.replicas.size();
-                    it = shard.metadata.erase(it);
-                    shard_evicted_count++;
-                } else {
-                    ++it;
-                }
+                            candidates.end(),
+                            [](const auto& a, const auto& b) {
+                                return a->second.lease_timeout < b->second.lease_timeout;
+                            });
+            // Evict objects for [0, evict_num) from candidates
+            for (size_t j = 0; j < evict_num && j < candidates.size(); ++j) {
+                total_freed_size += candidates[j]->second.size * candidates[j]->second.replicas.size();
+                shard.metadata.erase(candidates[j]);
+                shard_evicted_count++;
             }
             evicted_count += shard_evicted_count;
         }
