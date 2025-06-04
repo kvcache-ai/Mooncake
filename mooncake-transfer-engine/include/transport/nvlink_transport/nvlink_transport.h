@@ -107,7 +107,7 @@ class NvlinkTransport : public Transport {
     };
 
     std::unordered_map<uint64_t, OpenedShmEntry> remap_entries_;
-    std::mutex remap_mutex_;
+    RWSpinlock remap_lock_;
 };
 
 }  // namespace mooncake

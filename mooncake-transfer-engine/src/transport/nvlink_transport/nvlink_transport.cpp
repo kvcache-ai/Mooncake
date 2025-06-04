@@ -247,14 +247,21 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     for (auto &entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
-            std::lock_guard<std::mutex> lock(remap_mutex_);
+            remap_lock_.lockShared();
+            if (remap_entries_.count(entry.addr)) {
+                auto shm_addr = remap_entries_[entry.addr].shm_addr;
+                remap_lock_.unlockShared();
+                dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+                return 0;
+            }
+            remap_lock_.unlockShared();
+            RWSpinlock::WriteGuard lock_guard(remap_lock_);
             if (!remap_entries_.count(entry.addr)) {
                 std::vector<unsigned char> output_buffer;
                 cudaIpcMemHandle_t handle;
                 deserializeBinaryData(entry.shm_name, output_buffer);
                 assert(output_buffer.size() == sizeof(handle));
                 memcpy(&handle, output_buffer.data(), sizeof(handle));
-
                 void *shm_addr = nullptr;
                 cudaError_t err = cudaIpcOpenMemHandle(
                     &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
