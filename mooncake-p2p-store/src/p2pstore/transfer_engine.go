@@ -33,17 +33,12 @@ type TransferEngine struct {
 	engine C.transfer_engine_t
 }
 
-func NewTransferEngine(metadataConnString string,
-	localServerName string,
-	localIpAddress string,
-	rpcPort int) (*TransferEngine, error) {
+func NewTransferEngine(metadataConnString string, localServerName string) (*TransferEngine, error) {
 	metadataConnStringCStr := C.CString(metadataConnString)
 	localServerNameCStr := C.CString(localServerName)
-	localIpAddressCStr := C.CString(localIpAddress)
 	defer C.free(unsafe.Pointer(metadataConnStringCStr))
 	defer C.free(unsafe.Pointer(localServerNameCStr))
-	defer C.free(unsafe.Pointer(localIpAddressCStr))
-	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, localIpAddressCStr, C.uint64_t(rpcPort), 0)
+	native_engine := C.createTransferEngine(metadataConnStringCStr, localServerNameCStr, 0)
 	if native_engine == nil {
 		return nil, ErrTransferEngine
 	}

@@ -60,8 +60,7 @@ func NewP2PStore(metadataConnString string, localServerName string, nicPriorityM
 		return nil, err
 	}
 
-	localIpAddressCStr, rpcPort := parseServerName(localServerName)
-	transfer, err := NewTransferEngine(metadataConnString, localServerName, localIpAddressCStr, rpcPort)
+	transfer, err := NewTransferEngine(metadataConnString, localServerName)
 	if err != nil {
 		metadata.Close()
 		return nil, err
