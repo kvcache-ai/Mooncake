@@ -118,6 +118,26 @@ class MasterService {
     ErrorCode ExistKey(const std::string& key);
 
     /**
+     * @brief Fetch all keys
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllKeys(std::vector<std::string> & all_keys);
+
+    /**
+     * @brief Fetch all segments, each node has a unique real client with fixed segment
+     * name : segment name, preferred format : {ip}:{port}, bad format : localhost:{port}
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllSegments(std::vector<std::string> & all_segments);
+
+    /**
+     * @brief Query a segment's capacity and used size in bytes.
+     * Conductor should use these information to schedule new requests. 
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode QuerySegments(const std::string & segment, size_t & used, size_t & capacity);
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
