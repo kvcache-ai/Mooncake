@@ -10,6 +10,8 @@
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "thread_pool.h"
+#include "file_storage_backend.h"
 
 namespace mooncake {
 
@@ -34,7 +36,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_addr = kDefaultMasterAddress,
+        const std::string& storage_root_dir = "");
 
     /**
      * @brief Retrieves data for a given key
@@ -69,6 +72,31 @@ class Client {
     ErrorCode Get(const std::string& object_key, const ObjectInfo& object_info,
                   std::vector<Slice>& slices);
 
+    /**
+     * @brief Retrieves data from a local file
+     * @param object_key Key of the object to retrieve
+     * @param data Output string to store the retrieved data
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode Get_From_Local_File(const std::string& object_key,
+                             std::string& data);
+                             
+    /**
+     * @brief Stores data to a local file
+     * @param object_key Key of the object to store
+     * @param data Data to store in the file
+     */
+    void Put_To_Local_File(const std::string& object_key,
+                             const std::string& data);
+
+    /**
+     * @brief Stores data to a local file
+     * @param object_key Key of the object to store
+     * @param data Data to store in the file
+     */
+    void Put_To_Local_File(const std::string& object_key,
+                             std::span<const char> &data);
+                             
     /**
      * @brief Stores data with replication
      * @param key Object key
@@ -145,7 +173,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::string& storage_root_dir);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -165,6 +194,12 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    /**
+     * @brief Prepare the storage backend for persisting data
+     */
+
+    void PrepareStorageBackend(const std::string& storage_root_dir);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
@@ -176,6 +211,11 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+    const std::string storage_root_dir_; 
+
+    // Client persistent thread pool for async operations
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 };
 
 }  // namespace mooncake

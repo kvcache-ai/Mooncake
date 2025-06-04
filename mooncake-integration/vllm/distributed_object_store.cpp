@@ -148,6 +148,10 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
+    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
+    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
+        std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
+
     size_t colon_pos = hostname.find(":");
     if (colon_pos == std::string::npos) {
         // Get a random available port
@@ -165,7 +169,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
     auto client_opt =
         mooncake::Client::Create(this->local_hostname, metadata_server,
-                                 protocol, args, master_server_addr);
+                                 protocol, args, master_server_addr, storage_root_dir);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return 1;
@@ -312,6 +316,9 @@ int DistributedObjectStore::put(const std::string &key,
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return toInt(error_code);
+    #ifdef USE_CLIENT_PERSISTENCE
+        client_->Put_To_Local_File(key, value);
+    #endif
     return 0;
 }
 
@@ -325,7 +332,20 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
     const auto kNullString = pybind11::bytes("\0", 0);
     ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK) return kNullString;
+    if (error_code != ErrorCode::OK){
+    #ifdef USE_CLIENT_PERSISTENCE
+        std::string str;
+        error_code=client_->Get_From_Local_File(key, str);
+        if(error_code!= ErrorCode::OK) {
+            return kNullString;
+        }else{
+            // LOG(INFO) << "Get_From_Local_File successful for key: " << key;
+            return pybind11::bytes(str);
+        }
+    #else
+        return kNullString;
+    #endif
+    }
 
     uint64_t str_length = 0;
     int ret = allocateSlices(slices, object_info, str_length);

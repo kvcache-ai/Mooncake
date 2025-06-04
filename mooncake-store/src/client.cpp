@@ -22,9 +22,20 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::string& storage_root_dir)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring),
+      storage_root_dir_(storage_root_dir),
+      write_thread_pool_(2){
+        if(storage_root_dir_.empty()) {
+            LOG(INFO) << "Storage root directory is not set. persisting data is disabled.";
+        }else{
+            LOG(INFO) << "Storage root directory is: " << storage_root_dir_;
+            // Initialize storage backend
+            PrepareStorageBackend(storage_root_dir_);
+        }
+      }
 
 Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
@@ -42,6 +53,8 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
+
+    write_thread_pool_.stop();
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
@@ -144,9 +157,9 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_addr) {
+    const std::string& master_addr, const std::string& storage_root_dir) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, storage_root_dir));
 
     // Connect to master service
     ErrorCode err = client->ConnectToMaster(master_addr);
@@ -167,12 +180,24 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     return client;
 }
-
+// At present, this function is not directly called by any external interface.
 ErrorCode Client::Get(const std::string& object_key,
                       std::vector<Slice>& slices) {
     ObjectInfo object_info;
     auto err = Query(object_key, object_info);
-    if (err != ErrorCode::OK) return err;
+
+    if (err != ErrorCode::OK){
+        if(storage_backend_){
+            // If storage backend is available, try to load from it
+            if (storage_backend_->LoadObject(object_key, slices) == ErrorCode::OK) {
+                return ErrorCode::OK;
+            } else {
+                return err;
+            }
+        } else{
+            return err;
+        }
+    } 
     return Get(object_key, object_info, slices);
 }
 
@@ -229,6 +254,47 @@ ErrorCode Client::Get(const std::string& object_key,
 
     LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
     return ErrorCode::INVALID_REPLICA;
+}
+
+ErrorCode Client::Get_From_Local_File(
+    const std::string& object_key, std::string& str) {
+    if (!storage_backend_) {
+        // LOG(INFO) << "Storage backend is not initialized";
+        return ErrorCode::FILE_SYSTEM_UNINITIALIZED;
+    }
+
+    ErrorCode err=storage_backend_->LoadObject(object_key, str);
+    if (err != ErrorCode::OK) {
+        // LOG(INFO) << "Failed to load object from storage backend: "
+                //    << object_key;
+        return err;
+    }
+
+    return ErrorCode::OK;
+}
+
+void Client::Put_To_Local_File(
+    const std::string& key, const std::string& value){
+    if (!storage_backend_) {
+        return;
+    }
+    // Store the object in the backend
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value]{
+        backend->StoreObject(key, value);
+        // LOG(INFO)  << "Stored object in storage backend: " << key;
+    });
+}
+
+void Client::Put_To_Local_File(
+    const std::string& key, std::span<const char> &value){
+    if (!storage_backend_) {
+        return;
+    }
+    // Store the object in the backend
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value_=std::string(value.data(), value.size())]{
+        backend->StoreObject(key, value_);
+        // LOG(INFO)  << "Stored object in storage backend: " << key;
+    });
 }
 
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
@@ -291,6 +357,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
     return ErrorCode::OK;
 }
 
@@ -394,6 +461,15 @@ ErrorCode Client::IsExist(const std::string& key) {
     auto response = master_client_.ExistKey(key);
     return response.error_code;
 }
+
+void Client::PrepareStorageBackend(const std::string& storage_root_dir) {
+    // Initialize storage backend
+    storage_backend_ = FileStorageBackend::Create(storage_root_dir);
+    if (!storage_backend_) {
+        LOG(INFO) << "Failed to initialize storage backend";
+    }
+}
+
 
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
