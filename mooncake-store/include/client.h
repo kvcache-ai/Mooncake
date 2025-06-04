@@ -80,9 +80,23 @@ class Client {
      */
     ErrorCode Get_From_Local_File(const std::string& object_key,
                              std::string& data);
+                             
+    /**
+     * @brief Stores data to a local file
+     * @param object_key Key of the object to store
+     * @param data Data to store in the file
+     */
+    void Put_To_Local_File(const std::string& object_key,
+                             const std::string& data);
 
-    // ErrorCode Put_To_Local_File(const std::string& object_key,
-    //                          std::string& data);
+    /**
+     * @brief Stores data to a local file
+     * @param object_key Key of the object to store
+     * @param data Data to store in the file
+     */
+    void Put_To_Local_File(const std::string& object_key,
+                             std::span<const char> &data);
+                             
     /**
      * @brief Stores data with replication
      * @param key Object key
@@ -181,12 +195,10 @@ class Client {
         std::vector<Slice>& slices);
 
     /**
-     * @brief Prepare and use the storage backend for persisting data
+     * @brief Prepare the storage backend for persisting data
      */
 
     void PrepareStorageBackend(const std::string& storage_root_dir);
-    void PersistStoreBackend(const ObjectKey& key,
-                             const std::vector<Slice>& slices);
 
     // Core components
     TransferEngine transfer_engine_;

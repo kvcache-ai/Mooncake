@@ -58,6 +58,43 @@ ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
+ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
+                                    const std::string& str) {
+    std::string path = ResolvePath(key);
+
+    if(std::filesystem::exists(path) == true) {
+        return ErrorCode::FILE_ALREADY_EXISTS;
+    }
+    
+    FILE* file = fopen(path.c_str(), "wb");
+    size_t file_total_size=str.size();
+
+    if (!file) {
+        LOG(INFO) << "Failed to open file for reading: " << path;
+        return ErrorCode::FILE_OPEN_FAIL;
+    }
+
+    LocalFile local_file(path,file,ErrorCode::OK);
+
+    ssize_t ret = local_file.write(str, file_total_size);
+
+    if (ret < 0) {
+        LOG(INFO) << "pwritev failed for: " << path;
+
+        return ErrorCode::FILE_WRITE_FAIL;
+    }
+    if (ret != static_cast<ssize_t>(file_total_size)) {
+        LOG(INFO) << "Write size mismatch for: " << path
+                   << ", expected: " << file_total_size
+                   << ", got: " << ret;
+
+        return ErrorCode::FILE_WRITE_FAIL;
+    }
+    // Note: fclose is not necessary here as LocalFile destructor will handle it
+
+    return ErrorCode::OK;
+}
+
 ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
                                     std::vector<Slice>& slices) {
     std::string path = ResolvePath(key);
@@ -129,43 +166,6 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
         return ErrorCode::FILE_READ_FAIL;
     }
 
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
-
-    return ErrorCode::OK;
-}
-
-ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
-                                    std::string& str) {
-    std::string path = ResolvePath(key);
-
-    if(std::filesystem::exists(path) == true) {
-        return ErrorCode::FILE_ALREADY_EXISTS;
-    }
-    
-    FILE* file = fopen(path.c_str(), "wb");
-    size_t file_total_size=str.size();
-
-    if (!file) {
-        LOG(INFO) << "Failed to open file for reading: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
-    }
-
-    LocalFile local_file(path,file,ErrorCode::OK);
-
-    ssize_t ret = local_file.write(str, file_total_size);
-
-    if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
-
-        return ErrorCode::FILE_WRITE_FAIL;
-    }
-    if (ret != static_cast<ssize_t>(file_total_size)) {
-        LOG(INFO) << "Write size mismatch for: " << path
-                   << ", expected: " << file_total_size
-                   << ", got: " << ret;
-
-        return ErrorCode::FILE_WRITE_FAIL;
-    }
     // Note: fclose is not necessary here as LocalFile destructor will handle it
 
     return ErrorCode::OK;

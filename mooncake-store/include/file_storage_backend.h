@@ -58,7 +58,7 @@ class FileStorageBackend : public StorageBackend {
      * @param str String containing object data
      * @return ErrorCode indicating operation status
      */
-    ErrorCode StoreObject(const ObjectKey& key, std::string& str) override;
+    ErrorCode StoreObject(const ObjectKey& key, const std::string& str) override;
     
     /**
      * @brief Loads an object into slices

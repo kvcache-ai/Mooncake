@@ -377,6 +377,11 @@ int DistributedObjectStore::put(const std::string &key,
         return toInt(error_code);
     }
 
+    // Optionally persist to local file if needed
+    #ifdef USE_CLIENT_PERSISTENCE
+        client_->Put_To_Local_File(key, value);
+    #endif
+
     return 0;
 }
 

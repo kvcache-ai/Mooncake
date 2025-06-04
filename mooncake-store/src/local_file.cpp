@@ -20,12 +20,23 @@ LocalFile::LocalFile(const std::string& filename,FILE *file,ErrorCode ec) : file
 LocalFile::~LocalFile() {
     if (file_) {
         release_lock();
-        fclose(file_);
+        if (fclose(file_) != 0) {
+            LOG(WARNING) << "Failed to close file: " << filename_;
+        }
+        // If the file was opened with an error code indicating a write failure,
+        // attempt to delete the file to prevent corruption.
+        if (error_code_ == ErrorCode::FILE_WRITE_FAIL) {
+            if (::unlink(filename_.c_str()) == -1) {
+                LOG(ERROR) << "Failed to delete corrupted file: " << filename_;
+            } else {
+                LOG(INFO) << "Deleted corrupted file: " << filename_;
+            }
+        } 
     }
     file_ = nullptr;
 }
 
-ssize_t LocalFile::write(std::string &buffer, size_t length){
+ssize_t LocalFile::write(const std::string &buffer, size_t length){
     if (file_ == nullptr) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -189,6 +200,7 @@ int LocalFile::acquire_write_lock(){
     if (flock(fileno(file_), LOCK_EX) == -1) {
         return -1;
     }
+    is_locked_ = true;
     return 0;
 }
 
@@ -196,13 +208,16 @@ int LocalFile::acquire_read_lock(){
     if (flock(fileno(file_), LOCK_SH) == -1) {
         return -1;
     }
+    is_locked_ = true;
     return 0;
 }
 
 int LocalFile::release_lock(){
+    if (!is_locked_) return 0;
     if (flock(fileno(file_), LOCK_UN) == -1) {
         return -1;
     }
+    is_locked_ = false;
     return 0;
 }
 

@@ -273,6 +273,30 @@ ErrorCode Client::Get_From_Local_File(
     return ErrorCode::OK;
 }
 
+void Client::Put_To_Local_File(
+    const std::string& key, const std::string& value){
+    if (!storage_backend_) {
+        return;
+    }
+    // Store the object in the backend
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value]{
+        backend->StoreObject(key, value);
+        // LOG(INFO)  << "Stored object in storage backend: " << key;
+    });
+}
+
+void Client::Put_To_Local_File(
+    const std::string& key, std::span<const char> &value){
+    if (!storage_backend_) {
+        return;
+    }
+    // Store the object in the backend
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value_=std::string(value.data(), value.size())]{
+        backend->StoreObject(key, value_);
+        // LOG(INFO)  << "Stored object in storage backend: " << key;
+    });
+}
+
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                       const ReplicateConfig& config) {
     // Prepare slice lengths
@@ -333,10 +357,6 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
-
-#ifdef USE_CLIENT_PERSISTENCE
-    PersistStoreBackend(key, slices);
-#endif
 
     return ErrorCode::OK;
 }
@@ -450,20 +470,6 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir) {
     }
 }
 
-void Client::PersistStoreBackend(
-    const ObjectKey& key, const std::vector<Slice>& slices) {
-    if (!storage_backend_) {
-        return;
-    }
-
-    // Store the object in the backend
-
-    // write_thread_pool_.enqueue([backend = storage_backend_,key,slices]{
-    //     backend->StoreObject(key, slices);
-    //     // LOG(INFO)  << "Stored object in storage backend: " << key;
-    // });
-    storage_backend_->StoreObject(key, slices);
-}
 
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,

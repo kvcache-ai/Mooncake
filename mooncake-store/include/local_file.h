@@ -4,6 +4,7 @@
 #include <sys/uio.h>
 #include <cstdio>
 #include "types.h"
+#include <atomic>
 
 namespace mooncake {
 
@@ -47,7 +48,7 @@ public:
      * @return Number of bytes written on success, -1 on error
      * @note Thread-safe operation with write locking
      */
-    ssize_t write(std::string &buffer, size_t length);
+    ssize_t write(const std::string &buffer, size_t length);
 
     /**
      * @brief Scattered read from specified file offset
@@ -88,6 +89,7 @@ private:
     std::string filename_;
     FILE *file_;
     ErrorCode error_code_;
+    std::atomic<bool> is_locked_{false};
 };
 
 } // namespace mooncake

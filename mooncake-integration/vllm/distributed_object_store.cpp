@@ -316,6 +316,9 @@ int DistributedObjectStore::put(const std::string &key,
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return toInt(error_code);
+    #ifdef USE_CLIENT_PERSISTENCE
+        client_->Put_To_Local_File(key, value);
+    #endif
     return 0;
 }
 
