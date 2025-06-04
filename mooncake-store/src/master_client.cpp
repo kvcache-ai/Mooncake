@@ -27,7 +27,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     auto result = coro::syncAwait(client_.connect(master_addr));
     if (result.val() != 0) {
         LOG(ERROR) << "Failed to connect to master: " << result.message();
-        return ErrorCode::MASTER_CONNECT_FAIL;
+        return ErrorCode::RPC_FAIL;
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
@@ -279,12 +279,12 @@ UnmountSegmentResponse MasterClient::UnmountSegment(
     return result.value();
 }
 
-PingResponse MasterClient::Ping(const std::string& segment_name) {
+PingResponse MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
-    timer.LogRequest("segment_name=", segment_name);
+    timer.LogRequest("action=ping");
 
     auto request_result =
-        client_.send_request<&WrappedMasterService::Ping>(segment_name);
+        client_.send_request<&WrappedMasterService::Ping>();
     std::optional<PingResponse> result =
         coro::syncAwait([&]() -> coro::Lazy<std::optional<PingResponse>> {
             auto result = co_await co_await request_result;
@@ -296,7 +296,7 @@ PingResponse MasterClient::Ping(const std::string& segment_name) {
         }());
 
     if (!result) {
-        auto response = PingResponse{ErrorCode::RPC_FAIL};
+        auto response = PingResponse{0, ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

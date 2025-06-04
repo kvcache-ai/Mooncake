@@ -26,7 +26,6 @@ target_link_libraries(mooncake_master PRIVATE
 
 if (MOONCAKE_STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
     target_link_libraries(mooncake_master PRIVATE ${ETCD_WRAPPER_LIB})
 endif()
 

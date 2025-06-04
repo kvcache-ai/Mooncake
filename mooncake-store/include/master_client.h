@@ -110,10 +110,11 @@ class MasterClient {
 
     /**
      * @brief Pings master to check its availability
-     * @param segment_name Name of the segment this client has registered
+     * @param No parameters
+     * @return current master view version
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] PingResponse Ping(const std::string& segment_name);
+    [[nodiscard]] PingResponse Ping();
 
    private:
     coro_rpc_client client_;

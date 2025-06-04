@@ -75,7 +75,8 @@ class ClientIntegrationTest : public ::testing::Test {
             "localhost:17812",                   // Local hostname
             FLAGS_transfer_engine_metadata_url,  // Metadata connection string
             FLAGS_protocol, args,
-            "localhost:50051"  // Master server address
+            // "localhost:50051"  // Master server address
+            "0.0.0.0:2379" // etcd address
         );
 
         ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";

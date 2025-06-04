@@ -2,11 +2,14 @@ package main
 
 /*
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 */
 import "C"
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,13 +124,28 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
 	if storeClient != nil {
-		// return 0 since the goal is achieved
-		return 0
+		*errMsg = C.CString("etcd client can be initialized only once")
+		return -2
 	}
 
-	endpoint := C.GoString(endpoints)
+	endpointStr := C.GoString(endpoints)
+	endpointList := strings.Split(endpointStr, ";")
+	
+	// Filter out any empty strings that might result from splitting
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{endpoint},
+		Endpoints:   validEndpoints,
 		DialTimeout: 5 * time.Second,
 	})
 
@@ -141,12 +159,12 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 }
 
 //export EtcdStoreGetWrapper
-func EtcdStoreGetWrapper(key *C.char, value **C.char, errMsg **C.char) int {
+func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char, valueSize *C.int, revisionId *int64, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
-	k := C.GoString(key)
+	k := C.GoStringN(key, keySize)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resp, err := storeClient.Get(ctx, k)
@@ -159,13 +177,14 @@ func EtcdStoreGetWrapper(key *C.char, value **C.char, errMsg **C.char) int {
 	} else {
 		kv := resp.Kvs[0]
 		*value = C.CString(string(kv.Value))
+		*valueSize = C.int(len(kv.Value))
+		*revisionId = kv.CreateRevision
 	}
 	return 0
 }
 
 //export EtcdStoreGrantLeaseWrapper
-func EtcdStoreGrantLeaseWrapper(ttl int64, leaseID *int64, errMsg **C.char) int {
-	// TODO: make timeout a configurable parameter
+func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
@@ -177,18 +196,18 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseID *int64, errMsg **C.char) int 
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
-	*leaseID = int64(resp.ID)
+	*leaseId = int64(resp.ID)
 	return 0
 }
 
 //export EtcdStoreCreateWithLeaseWrapper
-func EtcdStoreCreateWithLeaseWrapper(key *C.char, value *C.char, leaseID int64, tx_success *int, errMsg **C.char) int {
+func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, leaseId int64, txSuccess *C.int, revisionId *int64, errMsg **C.char) int {
     if storeClient == nil {
         *errMsg = C.CString("etcd client not initialized")
         return -1
     }
-    k := C.GoString(key)
-    v := C.GoString(value)
+    k := C.GoStringN(key, keySize)
+    v := C.GoStringN(value, valueSize)
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
 
@@ -197,7 +216,7 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, value *C.char, leaseID int64, 
 
     // First check if the key exists
     resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
-        Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseID)))).
+        Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
         Commit()
 
     if err != nil {
@@ -207,21 +226,23 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, value *C.char, leaseID int64, 
 
     // If the key already existed, resp.Succeeded will be false
     // If we created the key, resp.Succeeded will be true
-	if resp.Succeeded {
-		*tx_success = 1
-	} else {
-		*tx_success = 0
-	}
+    if resp.Succeeded {
+        *txSuccess = 1
+        *revisionId = resp.Header.Revision
+    } else {
+        *txSuccess = 0
+        *revisionId = 0
+    }
     return 0
 }
 
 //export EtcdStoreWatchUntilDeletedWrapper
-func EtcdStoreWatchUntilDeletedWrapper(key *C.char, errMsg **C.char) int {
+func EtcdStoreWatchUntilDeletedWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
-	k := C.GoString(key)
+	k := C.GoStringN(key, keySize)
 	ctx := context.Background()
 	
 	// Start watching the key
@@ -241,7 +262,7 @@ func EtcdStoreWatchUntilDeletedWrapper(key *C.char, errMsg **C.char) int {
 }
 
 //export EtcdStoreKeepAliveWrapper
-func EtcdStoreKeepAliveWrapper(leaseID int64, errMsg **C.char) int {
+func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
     if storeClient == nil {
         *errMsg = C.CString("etcd client not initialized")
         return -1
@@ -251,7 +272,7 @@ func EtcdStoreKeepAliveWrapper(leaseID int64, errMsg **C.char) int {
     ctx := context.Background()
     
     // Start keep alive
-    keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseID))
+    keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseId))
     if err != nil {
         *errMsg = C.CString(err.Error())
         return -1

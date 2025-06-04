@@ -35,7 +35,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& etcd_addr = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key
@@ -170,19 +170,24 @@ class Client {
     TransferEngine transfer_engine_;
     MasterClient master_client_;
 
+    // Client local segments
+    struct Segment{
+        void* buffer;
+        size_t size;
+    };
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, void*> mounted_segments_;
+    std::unordered_map<std::string, Segment> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
 
-    // Helper for high availability
-    ClientHaHelper client_ha_helper_;
+    // For high availability
+    MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
+    void PingThreadFunc(int current_version);
 };
 
 }  // namespace mooncake

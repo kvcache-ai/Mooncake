@@ -71,6 +71,8 @@ MasterMetricManager::MasterMetricManager()
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
           "Total number of failed UnmountSegment requests"),
+      ping_requests_("master_ping_requests_total",
+                     "Total number of ping requests received"),
 
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
@@ -81,6 +83,7 @@ MasterMetricManager::MasterMetricManager()
                         "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects") {}
+
 
 // --- Metric Interface Methods ---
 
@@ -183,6 +186,9 @@ void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_ping_requests(int64_t val) {
+    ping_requests_.inc(val);
+}
 
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
@@ -256,6 +262,10 @@ int64_t MasterMetricManager::get_unmount_segment_failures() {
     return unmount_segment_failures_.value();
 }
 
+int64_t MasterMetricManager::get_ping_requests() {
+    return ping_requests_.value();
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
     evicted_key_count_.inc(key_count);
@@ -325,6 +335,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
     serialize_metric(unmount_segment_failures_);
+    serialize_metric(ping_requests_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);
@@ -373,6 +384,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
+    int64_t pings = ping_requests_.value();
 
     // Eviction counters
     int64_t eviction_success = eviction_success_.value();
@@ -397,7 +409,8 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
-    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all;
+    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all << ", ";
+    ss << "Ping=" << pings;
 
     // Eviction summary
     ss << " | Eviction: "

@@ -5,12 +5,14 @@
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+
 namespace mooncake {
 
 struct ExistKeyResponse {
@@ -58,9 +60,10 @@ struct UnmountSegmentResponse {
 YLT_REFL(UnmountSegmentResponse, error_code)
 
 struct PingResponse {
+    ViewVersion view_version = 0;
     ErrorCode error_code = ErrorCode::OK;
 };
-YLT_REFL(PingResponse, error_code)
+YLT_REFL(PingResponse, view_version, error_code)
 
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
@@ -69,10 +72,12 @@ class WrappedMasterService {
     WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
-                         double eviction_ratio = DEFAULT_EVICTION_RATIO)
+                         double eviction_ratio = DEFAULT_EVICTION_RATIO,
+                         ViewVersion view_version = 0)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio),
           http_server_(4, http_port),
-          metric_report_running_(enable_metric_reporting) {
+          metric_report_running_(enable_metric_reporting),
+          view_version_(view_version) {
         // Initialize HTTP server for metrics
         init_http_server();
 
@@ -326,16 +331,14 @@ class WrappedMasterService {
         return response;
     }
 
-    PingResponse Ping(const std::string& segment_name) {
+    PingResponse Ping() {
         ScopedVLogTimer timer(1, "Ping");
-        timer.LogRequest("segment_name=", segment_name);
+        timer.LogRequest("action=ping");
 
-        // TODO: Increment request metric
-        // MasterMetricManager::instance().inc_ping_requests();
-
-        PingResponse response;
-        response.error_code = ErrorCode::OK;
-
+        MasterMetricManager::instance().inc_ping_requests();
+        
+        PingResponse response(view_version_, ErrorCode::OK);
+        
         timer.LogResponseJson(response);
         return response;
     }
@@ -345,6 +348,32 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    ViewVersion view_version_;
 };
 
+inline void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Remove>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+}
+
 }  // namespace mooncake
+
