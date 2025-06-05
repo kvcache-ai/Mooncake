@@ -31,9 +31,7 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-const static size_t kDefaultThreadPoolSize = 4;
-
-NvlinkTransport::NvlinkTransport() : thread_pool_(kDefaultThreadPoolSize) {}
+NvlinkTransport::NvlinkTransport() {}
 
 NvlinkTransport::~NvlinkTransport() {
     for (auto &entry : remap_entries_) {
@@ -91,7 +89,13 @@ Status NvlinkTransport::submitTransfer(
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
         __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
+        if (slice->opcode == TransferRequest::READ)
+            cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+                       slice->length, cudaMemcpyDefault);
+        else
+            cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+                       slice->length, cudaMemcpyDefault);
+        slice->markSuccess();
     }
 
     return Status::OK();
@@ -146,13 +150,6 @@ Status NvlinkTransport::submitTransferTask(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
-    }
-    return Status::OK();
-}
-
-void NvlinkTransport::startTransfer(Slice *slice) {
-    thread_pool_.submit([slice]() {
         if (slice->opcode == TransferRequest::READ)
             cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
                        slice->length, cudaMemcpyDefault);
@@ -160,7 +157,8 @@ void NvlinkTransport::startTransfer(Slice *slice) {
             cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
                        slice->length, cudaMemcpyDefault);
         slice->markSuccess();
-    });
+    }
+    return Status::OK();
 }
 
 int hexCharToValue(char c) {

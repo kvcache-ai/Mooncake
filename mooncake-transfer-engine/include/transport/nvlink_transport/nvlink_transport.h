@@ -5,8 +5,6 @@
 
 #include <cuda_runtime.h>
 
-#include <boost/asio.hpp>
-#include <boost/thread.hpp>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -22,40 +20,6 @@
 namespace mooncake {
 
 class TransferMetadata;
-
-class ThreadPool {
-   public:
-    ThreadPool(size_t threadCount)
-        : ioService_(),
-          work_(boost::asio::make_work_guard(ioService_)),
-          stopped_(false) {
-        for (size_t i = 0; i < threadCount; ++i) {
-            threads_.create_thread(
-                boost::bind(&boost::asio::io_service::run, &ioService_));
-        }
-    }
-
-    ~ThreadPool() { stop(); }
-
-    void submit(std::function<void()> task) {
-        ioService_.post(std::move(task));
-    }
-
-    void stop() {
-        if (!stopped_) {
-            stopped_ = true;
-            ioService_.stop();
-            threads_.join_all();
-        }
-    }
-
-   private:
-    boost::asio::io_service ioService_;
-    boost::asio::executor_work_guard<boost::asio::io_service::executor_type>
-        work_;
-    boost::thread_group threads_;
-    bool stopped_;
-};
 
 class NvlinkTransport : public Transport {
    public:
@@ -78,8 +42,6 @@ class NvlinkTransport : public Transport {
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
 
-    void startTransfer(Slice* slice);
-
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location, bool remote_accessible,
                             bool update_metadata = true) override;
@@ -99,7 +61,6 @@ class NvlinkTransport : public Transport {
 
    private:
     std::atomic_bool running_;
-    ThreadPool thread_pool_;
 
     struct OpenedShmEntry {
         void* shm_addr;
