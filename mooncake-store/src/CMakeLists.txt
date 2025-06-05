@@ -16,7 +16,8 @@ set(MOONCAKE_STORE_SOURCES
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_link_libraries(mooncake_store PUBLIC transfer_engine glog::glog gflags::gflags)
+target_link_libraries(mooncake_store PUBLIC transfer_engine ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags)
+add_dependencies(mooncake_store build_etcd_wrapper)
 
 # Master binary
 add_executable(mooncake_master master.cpp)
@@ -24,11 +25,8 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    ${ETCD_WRAPPER_LIB}
 )
-
-if (MOONCAKE_STORE_USE_ETCD)
-    add_dependencies(mooncake_master build_etcd_wrapper)
-    target_link_libraries(mooncake_master PRIVATE ${ETCD_WRAPPER_LIB})
-endif()
+add_dependencies(mooncake_master build_etcd_wrapper)
 
 install(TARGETS mooncake_master DESTINATION bin)

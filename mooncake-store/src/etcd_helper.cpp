@@ -34,7 +34,7 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(const std::string& etcd_endpoints
     }
 }
 
-ErrorCode EtcdHelper::EtcdGet(const char* key, const size_t key_size, std::string& value, GoInt64& revision_id) {
+ErrorCode EtcdHelper::EtcdGet(const char* key, const size_t key_size, std::string& value, EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
     char* value_ptr = nullptr;
     int value_size = 0;

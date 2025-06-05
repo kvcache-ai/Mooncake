@@ -159,7 +159,8 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 }
 
 //export EtcdStoreGetWrapper
-func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char, valueSize *C.int, revisionId *int64, errMsg **C.char) int {
+func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
+	valueSize *C.int, revisionId *int64, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
@@ -201,7 +202,8 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int 
 }
 
 //export EtcdStoreCreateWithLeaseWrapper
-func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, leaseId int64, txSuccess *C.int, revisionId *int64, errMsg **C.char) int {
+func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
+	leaseId int64, txSuccess *C.int, revisionId *int64, errMsg **C.char) int {
     if storeClient == nil {
         *errMsg = C.CString("etcd client not initialized")
         return -1

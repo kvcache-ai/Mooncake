@@ -33,7 +33,7 @@ public:
      * @return: Error code.
      */
     static ErrorCode EtcdGet(const char* key, const size_t key_size,
-        std::string& value, GoInt64& revision_id);
+        std::string& value, EtcdRevisionId& revision_id);
 
     /*
      * @brief Create a key-value pair that binds to a given lease.
