@@ -82,6 +82,7 @@ message BatchGetReplicaListResponse {
 // Replication configuration.
 message ReplicateConfig {
   required int32 replica_num = 1;
+  optional string preferred_segment = 2; // Preferred segment for allocation
   // Future replication settings.
 }
 
