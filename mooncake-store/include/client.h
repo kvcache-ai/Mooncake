@@ -49,11 +49,27 @@ class Client {
     ErrorCode Get(const std::string& object_key, std::vector<Slice>& slices);
 
     /**
+     * @brief Gets object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param slices Output parameter for the retrieved data
+     */
+    ErrorCode BatchGet(
+        const std::vector<std::string>& object_keys,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
      * @brief Two-step data retrieval process
      * 1. Query object information
      * 2. Transfer data based on the information
      */
     using ObjectInfo = GetReplicaListResponse;
+
+    /**
+     * @brief Two-step data retrieval process
+     * 1. BatchQuery object information
+     * 2. Transfer data based on the information
+     */
+    using BatchObjectInfo = BatchGetReplicaListResponse;
 
     /**
      * @brief Gets object metadata without transferring data
@@ -62,6 +78,14 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     ErrorCode Query(const std::string& object_key, ObjectInfo& object_info);
+
+    /**
+     * @brief Batch query object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param object_infos Output parameter for object metadata
+     */
+    ErrorCode BatchQuery(const std::vector<std::string>& object_keys,
+                         BatchObjectInfo& object_infos);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -74,6 +98,18 @@ class Client {
                   std::vector<Slice>& slices);
 
     /**
+     * @brief Transfers data using pre-queried object information
+     * @param object_keys Keys of the objects
+     * @param object_infos Previously queried object metadata
+     * @param slices Vector of slices to store the data
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode BatchGet(
+        const std::vector<std::string>& object_keys,
+        BatchObjectInfo& object_infos,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -82,6 +118,17 @@ class Client {
      */
     ErrorCode Put(const ObjectKey& key, std::vector<Slice>& slices,
                   const ReplicateConfig& config);
+
+    /**
+     * @brief Batch put data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of data slices to store
+     * @param config Replication configuration
+     */
+    ErrorCode BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        ReplicateConfig& config);
 
     /**
      * @brief Removes an object and all its replicas

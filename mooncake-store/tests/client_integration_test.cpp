@@ -300,6 +300,69 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
     ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
 }
 
+// Test batch Put/Get operations through the client
+TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
+    int batch_sz = 10;
+    std::vector<std::string> keys;
+    std::vector<std::string> test_data_list;
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    for (int i = 0; i < batch_sz; i++) {
+        keys.push_back("test_key_batch_put_" + std::to_string(i));
+        test_data_list.push_back("test_data_" + std::to_string(i));
+    }
+    void* buffer = nullptr;
+    void* target_buffer = nullptr;
+    for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
+        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
+        batched_slices.emplace(keys[i], slices);
+    }
+    // Test Batch Put operation
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(client_->BatchPut(keys, batched_slices, config), ErrorCode::OK);
+
+    // Allocate slice buffers for GetBatch
+    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
+    for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> target_slices;
+        target_buffer =
+            client_buffer_allocator_->allocate(test_data_list[i].size());
+        target_slices.emplace_back(
+            Slice{target_buffer, test_data_list[i].size()});
+        target_batched_slices.emplace(keys[i], target_slices);
+    }
+
+    ErrorCode error_code = client_->BatchGet(keys, target_batched_slices);
+    ASSERT_EQ(error_code, ErrorCode::OK);
+    for (int i = 0; i < batch_sz; i++) {
+        const auto& slices = target_batched_slices[keys[i]];
+        memcmp(static_cast<char*>(slices[0].ptr), test_data_list[i].data(),
+               test_data_list[i].size());
+        std::cout << "Key: " << keys[i] << std::endl;
+        for (const auto& slice : slices) {
+            std::cout << "Value: "
+                      << std::string(static_cast<char*>(slices[0].ptr),
+                                     slice.size)
+                      << std::endl;
+        }
+    }
+
+    error_code = client_->BatchGet({keys[0], keys[0]}, target_batched_slices);
+    ASSERT_NE(error_code, ErrorCode::OK);
+
+    for (int i = 0; i < batch_sz; i++) {
+        for (auto& slice : target_batched_slices[keys[i]]) {
+            client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+        }
+        for (auto& slice : batched_slices[keys[i]]) {
+            client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+        }
+    }
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
