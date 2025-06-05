@@ -108,30 +108,36 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     return whitelst_filters;
 }
 
-ErrorCode Client::ConnectToMaster(const std::string& etcd_addr) {
-    auto err = master_view_helper_.ConnectToEtcd(etcd_addr);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to etcd";
-        return err;
-    }
-    std::string master_address;
-    ViewVersion master_version = 0;
-    err = master_view_helper_.GetMasterView(master_address, master_version);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to get master address";
-        return err;
-    }
-    err = master_client_.Connect(master_address);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to master";
-        return err;
-    }
+ErrorCode Client::ConnectToMaster(const std::string& master_entries, bool enable_ha) {
+    if (enable_ha) {
+        // Get master address from ETCD
+        auto err = master_view_helper_.ConnectToEtcd(master_entries);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd";
+            return err;
+        }
+        std::string master_address;
+        ViewVersion master_version = 0;
+        err = master_view_helper_.GetMasterView(master_address, master_version);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get master address";
+            return err;
+        }
 
-    // Start ping thread
-    ping_running_ = true;
-    ping_thread_ = std::thread(&Client::PingThreadFunc, this, master_version);
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master";
+            return err;
+        }
 
-    return ErrorCode::OK;
+        // Start Ping thread to monitor master view changes and remount segments if needed
+        ping_running_ = true;
+        ping_thread_ = std::thread(&Client::PingThreadFunc, this, master_version);
+
+        return ErrorCode::OK;
+    } else {
+        return master_client_.Connect(master_entries);
+    }
 }
 
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
@@ -174,19 +180,18 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    //const std::string& master_addr) {
-    const std::string& etcd_addr) {
+    const std::string& master_entries, bool enable_ha) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
-    ErrorCode err = client->ConnectToMaster(etcd_addr);
+    ErrorCode err = client->ConnectToMaster(master_entries, enable_ha);
     if (err != ErrorCode::OK) {
         return std::nullopt;
     }
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                     protocol, protocol_args);
+                                    protocol, protocol_args);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;

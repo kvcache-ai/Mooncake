@@ -27,7 +27,9 @@ class Client {
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
      * @param protocol_args Protocol-specific arguments
-     * @param master_addr Master server address
+     * @param master_entries Master server entries (IP:Port of master address for
+     *        non-HA mode, IP:Port;IP:Port;...IP:Port of ETCD endpoints for HA mode)
+     * @param enable_ha Whether to enable high availability
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -35,7 +37,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& etcd_addr = kDefaultMasterAddress);
+        const std::string& master_entries = kDefaultMasterAddress,
+        bool enable_ha = false);
 
     /**
      * @brief Retrieves data for a given key
@@ -151,7 +154,7 @@ class Client {
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
-    ErrorCode ConnectToMaster(const std::string& master_addr);
+    ErrorCode ConnectToMaster(const std::string& master_entries, bool enable_ha);
     ErrorCode InitTransferEngine(const std::string& local_hostname,
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,

@@ -397,7 +397,7 @@ std::string MasterMetricManager::get_summary_string() {
        << format_bytes(capacity);
     if (capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
-           << (allocated / capacity * 100.0) << "%)";
+           << ((double) allocated / (double)capacity * 100.0) << "%)";
     }
     ss << " | Keys: " << keys;
 
