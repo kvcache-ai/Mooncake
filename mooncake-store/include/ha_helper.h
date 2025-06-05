@@ -2,12 +2,10 @@
 #define MOONCAKE_HA_HELPER_H_
 
 #include <glog/logging.h>
-
 #include <string>
 #include <thread>
 #include <chrono>
 #include <cstdint>
-
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "rpc_service.h"
@@ -16,153 +14,70 @@
 
 namespace mooncake {
 
+// The key to store the master view in etcd
 inline const char* const MASTER_VIEW_KEY = "mooncake-store/master_view";
 
+/*
+ * @brief A helper class for maintain and monitor the master view change.
+ *        The cluster is assumed to have multiple master servers, but only
+ *        one master can be elected as leader to serve client requests.
+ *        Each master view is associated with a unique version id, which
+ *        is incremented monotonically each time the master view is changed.
+*/
 class MasterViewHelper {
 public:
     MasterViewHelper(const MasterViewHelper&) = delete;
     MasterViewHelper& operator=(const MasterViewHelper&) = delete;
     MasterViewHelper() = default;
 
-    ErrorCode ConnectToEtcd(const std::string& etcd_address) {
-        return EtcdHelper::ConnectToEtcdStoreClient(etcd_address);
-    }
+    /*
+     * @brief Connect to the etcd cluster. This function should be called at first
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     *        Multiple endpoints are separated by semicolons.
+     * @return: Error code.
+     */
+    ErrorCode ConnectToEtcd(const std::string& etcd_endpoints);
 
-    void ElectLeader(const std::string& master, ViewVersion& version, EtcdLeaseId& lease_id) {
-        while (true) {
-            // Check if there is already a leader
-            ViewVersion current_version = 0;
-            std::string current_master;
-            auto ret = EtcdHelper::EtcdGet(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY), current_master, current_version);
-            if (ret != ErrorCode::OK && ret != ErrorCode::ETCD_KEY_NOT_EXIST) {
-                LOG(ERROR) << "Failed to get current leader: " << ret;
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            } else if (ret != ErrorCode::ETCD_KEY_NOT_EXIST) {
-                LOG(INFO) << "CurrentLeader=" << current_master << ", CurrentVersion=" << current_version;
-                // In rare cases, the leader may be ourselves, but it does not matter.
-                // We will watch the key until it's deleted.
-                LOG(INFO) << "Waiting for leadership change...";
-                auto ret = EtcdHelper::EtcdWatchUntilDeleted(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY));
-                if (ret != ErrorCode::OK) {
-                    LOG(ERROR) << "Etcd error when waiting for leadership change: " << ret;
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    continue;
-                }
-            } else {
-                LOG(INFO) << "No leader found, trying to elect self as leader";
-            }
+    /*
+     * @brief Elect the master to be the leader. This is a blocking function.
+     * @param master_address: The ip:port address of the master to be elected.
+     * @param version: Output param, the version of the new master view.
+     * @param lease_id: Output param, the lease id of the leader.
+     */
+    void ElectLeader(const std::string& master_address, ViewVersion& version, EtcdLeaseId& lease_id);
 
-            // Here, the key is either deleted or not set. We can 
-            // try to elect ourselves as the leader. We vote ourselfves
-            // as the leader by trying to creating the key in a transaction.
-            // The one who successfully creates the key is the leader.
-            ret = EtcdHelper::EtcdGrantLease(ETCD_MASTER_VIEW_LEASE_TTL, lease_id);
-            if (ret != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to grant lease: " << ret;
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            }
+    /*
+     * @brief Keep the master to be the leader. This function blocks until the master is
+     *        no longer the leader.
+     * @param lease_id: The lease id of the leader.
+     */
+    void KeepLeader(EtcdLeaseId lease_id);
 
-            ret = EtcdHelper::EtcdCreateWithLease(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY),
-                master.c_str(), master.size(), lease_id, version);
-            if (ret == ErrorCode::ETCD_TRANSACTION_FAIL) {
-                LOG(INFO) << "Failed to elect self as leader";
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            } else if (ret != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to create key with lease: " << ret;
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            } else {
-                LOG(INFO) << "Successfully elected self as leader";
-                return;
-            } 
-        }
-    }
-    void KeepLeader(EtcdLeaseId lease_id) {
-        EtcdHelper::EtcdKeepAlive(lease_id);
-    }
-
-    ErrorCode GetMasterView(std::string& master, ViewVersion& version) {
-        auto ret = EtcdHelper::EtcdGet(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY), master, version);
-        if (ret != ErrorCode::OK) {
-            if (ret == ErrorCode::ETCD_KEY_NOT_EXIST) {
-                LOG(ERROR) << "No master is available";
-                return ErrorCode::ETCD_KEY_NOT_EXIST;
-            } else {
-                LOG(ERROR) << "Failed to get master address due to ETCD error";
-                return ErrorCode::ETCD_OPERATION_ERROR;
-            }
-        } else {
-            LOG(INFO) << "Get master address: " << master << ", version: " << version;
-            return ErrorCode::OK;
-        }
-    }
+    /*
+     * @brief Get the current master view.
+     * @param master: Output param, the ip:port address of the master.
+     * @param version: Output param, the version of the master view.
+     * @return: Error code.
+     */
+    ErrorCode GetMasterView(std::string& master_address, ViewVersion& version);
 };
 
+/*
+ * @brief A supervisor class for the master service, only used in HA mode.
+ *        This class will continuously do the following procedures:
+ *        1. Elect local master to be the leader.
+ *        2. Start the master service when it is elected as leader.
+ *        3. Stop the master service when it is no longer the leader.
+*/
 class MasterServiceSupervisor {
 public:
     MasterServiceSupervisor(int port, int server_thread_num, bool enable_gc,
                           bool enable_metric_reporting, int metrics_port,
                           int64_t default_kv_lease_ttl, double eviction_ratio,
                           double eviction_high_watermark_ratio,
-                          const std::string& etcd_endpoints = "0.0.0.0:2379")
-        : port_(port),
-          server_thread_num_(server_thread_num),
-          enable_gc_(enable_gc),
-          enable_metric_reporting_(enable_metric_reporting),
-          metrics_port_(metrics_port),
-          default_kv_lease_ttl_(default_kv_lease_ttl),
-          eviction_ratio_(eviction_ratio),
-          eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
-          etcd_endpoints_(etcd_endpoints) {}
-
-    int Start() {
-        while (true) {
-            LOG(INFO) << "Init master service...";
-            coro_rpc::coro_rpc_server server(server_thread_num_, port_);
-            LOG(INFO) << "Init leader election helper...";
-            MasterViewHelper mv_helper;
-            if (mv_helper.ConnectToEtcd(etcd_endpoints_) != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to ETCD endpoints: " << etcd_endpoints_;
-                return -1;
-            }
-            LOG(INFO) << "Trying to elect self as leader...";
-            ViewVersion version = 0;
-            EtcdLeaseId lease_id = 0;
-            mv_helper.ElectLeader("localhost:" + std::to_string(port_), version, lease_id);
-            auto leader_watch_thread = std::thread([&server, &mv_helper, lease_id]() {            
-                mv_helper.KeepLeader(lease_id);
-                LOG(INFO) << "Trying to stop server...";
-                server.stop();
-            });
-            mooncake::WrappedMasterService wrapped_master_service(
-            enable_gc_, default_kv_lease_ttl_,
-            enable_metric_reporting_, metrics_port_, eviction_ratio_,
-            eviction_high_watermark_ratio_, version);
-
-            mooncake::RegisterRpcService(server, wrapped_master_service);
-
-            // Metric reporting is now handled by WrappedMasterService.
-            async_simple::Future<coro_rpc::err_code> ec = server.async_start();  /*won't block here */
-            if (ec.hasResult()) {
-                LOG(ERROR) << "Failed to start master service: " << ec.result().value();
-                return -1;
-            }
-            // Block until the server is stopped
-            auto err = std::move(ec).get();
-            LOG(ERROR) << "Master service stopped: " << err;
-            leader_watch_thread.join();
-        }
-        return 0;
-    }
-
-    ~MasterServiceSupervisor() {
-        if (server_thread_.joinable()) {
-            server_thread_.join();
-        }
-    }
+                          const std::string& etcd_endpoints = "0.0.0.0:2379");
+    int Start();
+    ~MasterServiceSupervisor();
 
 private:
     // Master service parameters

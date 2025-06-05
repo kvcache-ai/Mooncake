@@ -10,6 +10,7 @@ set(MOONCAKE_STORE_SOURCES
     utils.cpp
     master_metric_manager.cpp
     etcd_helper.cpp
+    ha_helper.cpp
 )
 
 # The cache_allocator library
