@@ -1,94 +1,81 @@
 #pragma once
 
 #include <glog/logging.h>
-#include <ylt/struct_pack.hpp>
 
 #include "libetcd_wrapper.h"
 #include "types.h"
 
 namespace mooncake {
 
-inline ErrorCode ConnectToEtcdStoreClient(const std::string& etcd_address) {
-    char* err_msg = nullptr;
-    int ret = NewStoreEtcdClient((char*)etcd_address.c_str(), &err_msg);
-    // ret == -2 means the etcd client has already been initialized
-    if (ret != 0 && ret != -2) {
-        LOG(ERROR) << "Failed to initialize etcd client: " << err_msg;
-        free(err_msg);
-        err_msg = nullptr;
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-}
+/*
+ * @brief A helper class for etcd operations.
+ *        This class is used to handle the requests to the etcd cluster.
+ *        All methods of this class are thread-safe.
+*/
+class EtcdHelper {
+public:
+    /*
+     * @brief Connect to the etcd store client. There is a global etcd client in libetcd.
+     *        It is used for all the etcd operations for mooncake-store. This function
+     *        ensures the client is only connected once.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     *        Multiple endpoints are separated by semicolons.
+     * @return: Error code.
+     */
+    static ErrorCode ConnectToEtcdStoreClient(const std::string& etcd_endpoints);
 
-inline ErrorCode EtcdGet(const char* key, const size_t key_size, std::string& value, GoInt64& revision_id) {
-    char* err_msg = nullptr;
-    char* value_ptr = nullptr;
-    int value_size = 0;
-    int ret = EtcdStoreGetWrapper((char*)key, (int)key_size, &value_ptr, &value_size, &revision_id, &err_msg);
-    if (ret != 0) {
-        LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (value_ptr == nullptr) {
-        VLOG(1) << "key=" << std::string(key, key_size) << ", error=etcd_key_not_exist";
-        return ErrorCode::ETCD_KEY_NOT_EXIST;
-    }
-    value = std::string(value_ptr, value_size);
-    free(value_ptr);
-    return ErrorCode::OK;
-}
+    /*
+     * @brief Get the value of a key from the etcd.
+     * @param key: The key to get the value of.
+     * @param key_size: The size of the key in bytes.
+     * @param value: Output param, the value of the key.
+     * @param revision_id: Output param, the create revision id of the key.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdGet(const char* key, const size_t key_size,
+        std::string& value, GoInt64& revision_id);
 
-inline ErrorCode EtcdCreateWithLease(const char* key, const size_t key_size,
-     const char* value, const size_t value_size, GoInt64 lease_id, GoInt64& revision_id) {
-    char* err_msg = nullptr;
-    int tx_success = 0; // transaction success or not
-    int ret = EtcdStoreCreateWithLeaseWrapper((char*)key, (int)key_size,
-        (char*)value, (int)value_size, lease_id, &tx_success, &revision_id, &err_msg);
-    if (ret != 0) {
-        LOG(ERROR) << "key=" << std::string(key, key_size)
-             << ", lease_id=" << lease_id << ", error=" << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    } else if (tx_success == 0) {
-        VLOG(1) << "key=" << std::string(key, key_size)
-             << ", lease_id=" << lease_id << ", error=etcd_transaction_fail";
-        return ErrorCode::ETCD_TRANSACTION_FAIL;
-    } else {
-        return ErrorCode::OK;
-    } 
-}
+    /*
+     * @brief Create a key-value pair that binds to a given lease.
+     * @param key: The key to create.
+     * @param key_size: The size of the key in bytes.
+     * @param value: The value to create.
+     * @param value_size: The size of the value in bytes.
+     * @param lease_id: The lease id to bind to the key.
+     * @param revision_id: Output param, the create revision id of the key.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdCreateWithLease(const char* key, const size_t key_size,
+        const char* value, const size_t value_size, GoInt64 lease_id, GoInt64& revision_id);
 
-inline ErrorCode EtcdGrantLease(int64_t lease_ttl, GoInt64& lease_id) {
-    char* err_msg = nullptr;
-    if (0 != EtcdStoreGrantLeaseWrapper(lease_ttl, &lease_id, &err_msg)) {
-        LOG(ERROR) << "lease_ttl=" << lease_ttl << ", error=" << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-}
+    /*
+     * @brief Grant a lease from the etcd.
+     * @param lease_ttl: The ttl of the lease.
+     * @param lease_id: Output param, the lease id.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdGrantLease(int64_t lease_ttl, GoInt64& lease_id);
 
-inline ErrorCode EtcdWatchUntilDeleted(const char* key, const size_t key_size) {
-    char* err_msg = nullptr;
-    if (0 != EtcdStoreWatchUntilDeletedWrapper(
-        (char*)key, (int)key_size, &err_msg)) {
-        LOG(ERROR) << "Error watching key: " << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-}
-
-inline ErrorCode EtcdKeepAlive(int64_t lease_id) {
-    char* err_msg = nullptr;
-    if (0 != EtcdStoreKeepAliveWrapper(lease_id, &err_msg)) {
-        LOG(ERROR) << "Failed to keep lease: " << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-}
+    /*
+     * @brief Watch a key until it is deleted. This is blocking function.
+     * @param key: The key to watch.
+     * @param key_size: The size of the key in bytes.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdWatchUntilDeleted(const char* key, const size_t key_size);
+    
+    /*
+     * @brief Keep a lease alive. This is blocking function.
+     * @param lease_id: The lease id to keep alive.
+     * @return: Error code.
+    */
+    static ErrorCode EtcdKeepAlive(int64_t lease_id);
+private:
+    // Variables that are used to ensure the etcd client
+    // is only connected once.
+    static std::string connected_endpoints_;
+    static std::mutex etcd_mutex_;
+    static bool etcd_connected_;
+};
 
 }  // namespace mooncake

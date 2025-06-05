@@ -53,11 +53,11 @@ int main(int argc, char* argv[]) {
             static_cast<int>(std::thread::hardware_concurrency()));
 
     if (FLAGS_enable_ha && FLAGS_etcd_endpoints.empty()) {
-        LOG(FATAL) << "ETCD endpoints must be set when enable_ha is true";
+        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
         return 1;
     }
     if (!FLAGS_enable_ha && !FLAGS_etcd_endpoints.empty()) {
-        LOG(WARNING) << "ETCD endpoints are set but will not be used because high availability is disabled";
+        LOG(WARNING) << "Etcd endpoints are set but will not be used because high availability is disabled";
     }
 
     if (FLAGS_enable_ha) {
