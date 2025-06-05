@@ -13,10 +13,10 @@
 #include "types.h"
 #include "utils.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(device_name, "erdma0",
               "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8090/metadata",
+DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
               "Metadata connection string for transfer engine");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
