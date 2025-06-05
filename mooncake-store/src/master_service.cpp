@@ -200,6 +200,19 @@ ErrorCode MasterService::GetReplicaList(
     return ErrorCode::OK;
 }
 
+ErrorCode MasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        batch_replica_list) {
+    for (const auto& key : keys) {
+        if (GetReplicaList(key, batch_replica_list[key]) != ErrorCode::OK) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            return ErrorCode::OBJECT_NOT_FOUND;
+        };
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::PutStart(
     const std::string& key, uint64_t value_length,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
@@ -335,6 +348,59 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     }
 
     accessor.Erase();
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutStart(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, uint64_t>& value_lengths,
+    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>& batch_replica_list) {
+    if (config.replica_num == 0 || keys.empty()) {
+        LOG(ERROR) << "replica_num=" << config.replica_num
+                   << ", keys_size=" << keys.size() << ", error=invalid_params";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    for (const auto& key : keys) {
+        auto value_length_it = value_lengths.find(key);
+        auto slice_length_it = slice_lengths.find(key);
+        if (value_length_it == value_lengths.end() ||
+            slice_length_it == slice_lengths.end()) {
+            LOG(ERROR) << "Key not found in value_lengths or slice_lengths: "
+                       << key;
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+
+        auto result =
+            PutStart(key, value_length_it->second, slice_length_it->second,
+                     config, batch_replica_list[key]);
+        if (result != ErrorCode::OK &&
+            result != ErrorCode::OBJECT_ALREADY_EXISTS) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutEnd(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutEnd(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutRevoke(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutRevoke(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
     return ErrorCode::OK;
 }
 
