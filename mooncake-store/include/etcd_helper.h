@@ -46,15 +46,15 @@ public:
      * @return: Error code.
      */
     static ErrorCode EtcdCreateWithLease(const char* key, const size_t key_size,
-        const char* value, const size_t value_size, GoInt64 lease_id, GoInt64& revision_id);
+        const char* value, const size_t value_size, EtcdLeaseId lease_id, EtcdRevisionId& revision_id);
 
     /*
      * @brief Grant a lease from the etcd.
-     * @param lease_ttl: The ttl of the lease.
+     * @param lease_ttl: The ttl of the lease, in seconds.
      * @param lease_id: Output param, the lease id.
      * @return: Error code.
      */
-    static ErrorCode EtcdGrantLease(int64_t lease_ttl, GoInt64& lease_id);
+    static ErrorCode EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
      * @brief Watch a key until it is deleted. This is blocking function.
@@ -69,7 +69,7 @@ public:
      * @param lease_id: The lease id to keep alive.
      * @return: Error code.
     */
-    static ErrorCode EtcdKeepAlive(int64_t lease_id);
+    static ErrorCode EtcdKeepAlive(EtcdLeaseId lease_id);
 private:
     // Variables that are used to ensure the etcd client
     // is only connected once.

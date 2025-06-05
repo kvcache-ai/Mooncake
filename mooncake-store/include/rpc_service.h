@@ -60,7 +60,7 @@ struct UnmountSegmentResponse {
 YLT_REFL(UnmountSegmentResponse, error_code)
 
 struct PingResponse {
-    ViewVersion view_version = 0;
+    ViewVersionId view_version = 0;
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(PingResponse, view_version, error_code)
@@ -74,7 +74,7 @@ class WrappedMasterService {
                          uint16_t http_port = 9003,
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
                          double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                         ViewVersion view_version = 0)
+                         ViewVersionId view_version = 0)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_high_watermark_ratio),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
@@ -349,7 +349,7 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
-    ViewVersion view_version_;
+    ViewVersionId view_version_;
 };
 
 inline void RegisterRpcService(coro_rpc::coro_rpc_server& server,

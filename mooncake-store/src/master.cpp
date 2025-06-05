@@ -75,7 +75,7 @@ int main(int argc, char* argv[]) {
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value
-        mooncake::ViewVersion version = 0;
+        mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(server_thread_num, FLAGS_port);
         mooncake::WrappedMasterService wrapped_master_service(
             FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,

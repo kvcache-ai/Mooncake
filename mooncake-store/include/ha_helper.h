@@ -44,7 +44,7 @@ public:
      * @param version: Output param, the version of the new master view.
      * @param lease_id: Output param, the lease id of the leader.
      */
-    void ElectLeader(const std::string& master_address, ViewVersion& version, EtcdLeaseId& lease_id);
+    void ElectLeader(const std::string& master_address, ViewVersionId& version, EtcdLeaseId& lease_id);
 
     /*
      * @brief Keep the master to be the leader. This function blocks until the master is
@@ -59,7 +59,7 @@ public:
      * @param version: Output param, the version of the master view.
      * @return: Error code.
      */
-    ErrorCode GetMasterView(std::string& master_address, ViewVersion& version);
+    ErrorCode GetMasterView(std::string& master_address, ViewVersionId& version);
 };
 
 /*

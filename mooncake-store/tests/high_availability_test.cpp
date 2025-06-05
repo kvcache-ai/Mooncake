@@ -6,7 +6,6 @@
 #include <string>
 
 #include "types.h"
-#include "utils.h"
 #include "ha_helper.h"
 #include "etcd_helper.h"
 
@@ -27,11 +26,7 @@ class HighAvailabilityTest : public ::testing::Test {
         FLAGS_logtostderr = 1;
 
         // Initialize etcd client
-        char* err_msg = nullptr;
-        auto ret = NewStoreEtcdClient((char*)FLAGS_etcd_endpoints.c_str(), &err_msg);
-        ASSERT_EQ(0, ret) << err_msg;
-        free(err_msg);
-        err_msg = nullptr;
+        ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints));
     }
 
     static void TearDownTestSuite() {
@@ -40,33 +35,38 @@ class HighAvailabilityTest : public ::testing::Test {
 };
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
-    std::map<std::string, std::string> kvs;
-    std::string prefix(FLAGS_etcd_test_key_prefix);
-/*
-    // Create and get a ordinary key-value pair
-    std::string key(prefix + "test_key");
-    std::string value("test_value");
-    ASSERT_EQ(ErrorCode::OK, EtcdPut(key.c_str(), key.size(), value.c_str(), value.size()));
-    std::string get_value;
-    ASSERT_EQ(ErrorCode::OK, EtcdGet(key.c_str(), key.size(), get_value));
-    ASSERT_EQ(value, get_value);
-    kvs[key] = value;
+    // Test grant lease, create kv and get kv
+    const int64_t lease_ttl = 10;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    // Ordinary key-value pair
+    keys.push_back(FLAGS_etcd_test_key_prefix + std::string("test_key1"));
+    values.push_back("test_value1");
+    // Key-value pair with null bytes in the middle
+    keys.push_back(FLAGS_etcd_test_key_prefix + std::string("test_\0\0key2"));
+    values.push_back("test_\0\0value2");
+    // Key-value pair with null bytes at the end
+    keys.push_back(FLAGS_etcd_test_key_prefix + std::string("test_key3\0\0"));
+    values.push_back("test_value3\0\0");
+    // Key-value pair with null bytes at the beginning
+    keys.push_back(FLAGS_etcd_test_key_prefix + std::string("\0\0test_key4"));
+    values.push_back("\0\0test_value4");
 
-    // Create and get a key-value pair with null bytes
-    key = std::string(prefix + "test_\0\0key2", 11);
-    value = std::string("test_\0\0value2", 13);
-    ASSERT_EQ(ErrorCode::OK, EtcdPut(key.c_str(), key.size(), value.c_str(), value.size()));
-    ASSERT_EQ(ErrorCode::OK, EtcdGet(key.c_str(), key.size(), get_value));
-    ASSERT_EQ(value, get_value);
-    kvs[key] = value;
-*/
-}
+    for (size_t i = 0; i < keys.size(); i++) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        EtcdLeaseId lease_id;
+        EtcdRevisionId version = 0;
 
-TEST_F(HighAvailabilityTest, EtcdPutGetMeta) {
-    std::string key1("test_meta_segment");
-    std::string segment_name1("test_segment");
-    uint64_t base1 = 300000000;
-    uint64_t size1 = 1024 * 1024 * 32;
+        ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGrantLease(lease_ttl, lease_id));
+        ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCreateWithLease(key.c_str(), key.size(),
+            value.c_str(), value.size(), lease_id, version));
+        std::string get_value;
+        EtcdRevisionId get_version;
+        ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGet(key.c_str(), key.size(), get_value, get_version));
+        ASSERT_EQ(value, get_value);
+        ASSERT_EQ(version, get_version);
+    }
 }
 
 // Test leader election and master address discovery
@@ -74,7 +74,7 @@ TEST_F(HighAvailabilityTest, LeaderElectionAndMasterAddressDiscovery) {
     MasterViewHelper mv_helper;
     mv_helper.ConnectToEtcd(FLAGS_etcd_endpoints);
     std::string master_address;
-    ViewVersion version = 0;
+    ViewVersionId version = 0;
     mv_helper.GetMasterView(master_address, version);
     LOG(INFO) << "Master address: " << master_address << ", version: " << version;
 }

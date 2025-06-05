@@ -6,10 +6,10 @@ ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
     return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
 }
 
-void MasterViewHelper::ElectLeader(const std::string& master_address, ViewVersion& version, EtcdLeaseId& lease_id) {
+void MasterViewHelper::ElectLeader(const std::string& master_address, ViewVersionId& version, EtcdLeaseId& lease_id) {
     while (true) {
         // Check if there is already a leader
-        ViewVersion current_version = 0;
+        ViewVersionId current_version = 0;
         std::string current_master;
         auto ret = EtcdHelper::EtcdGet(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY), current_master, current_version);
         if (ret != ErrorCode::OK && ret != ErrorCode::ETCD_KEY_NOT_EXIST) {
@@ -63,7 +63,7 @@ void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
     EtcdHelper::EtcdKeepAlive(lease_id);
 }
 
-ErrorCode MasterViewHelper::GetMasterView(std::string& master_address, ViewVersion& version) {
+ErrorCode MasterViewHelper::GetMasterView(std::string& master_address, ViewVersionId& version) {
     auto ret = EtcdHelper::EtcdGet(MASTER_VIEW_KEY, strlen(MASTER_VIEW_KEY), master_address, version);
     if (ret != ErrorCode::OK) {
         if (ret == ErrorCode::ETCD_KEY_NOT_EXIST) {
@@ -105,7 +105,7 @@ int MasterServiceSupervisor::Start() {
             return -1;
         }
         LOG(INFO) << "Trying to elect self as leader...";
-        ViewVersion version = 0;
+        ViewVersionId version = 0;
         EtcdLeaseId lease_id = 0;
         mv_helper.ElectLeader("localhost:" + std::to_string(port_), version, lease_id);
         auto leader_watch_thread = std::thread([&server, &mv_helper, lease_id]() {            

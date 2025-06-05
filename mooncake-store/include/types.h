@@ -41,7 +41,8 @@ using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
 // Mapping between c++ and go types
-using ViewVersion = GoInt64;
+using EtcdRevisionId = GoInt64;
+using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = GoInt64;
 
 /**

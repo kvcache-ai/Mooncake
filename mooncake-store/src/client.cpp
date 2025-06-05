@@ -117,7 +117,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_entries, bool enable
             return err;
         }
         std::string master_address;
-        ViewVersion master_version = 0;
+        ViewVersionId master_version = 0;
         err = master_view_helper_.GetMasterView(master_address, master_version);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to get master address";
@@ -610,7 +610,7 @@ void Client::PingThreadFunc(int current_version) {
         LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                     << " times, try to get latest master view and reconnect";
         std::string master_address;
-        ViewVersion next_version = 0;
+        ViewVersionId next_version = 0;
         auto err = master_view_helper_.GetMasterView(master_address, next_version);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to get new master view: " << toString(err);
