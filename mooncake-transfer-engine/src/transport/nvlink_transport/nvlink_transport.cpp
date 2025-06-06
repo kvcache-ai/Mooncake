@@ -375,7 +375,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                     accessDesc.location.id = 0;
                     result = cuMemSetAccess((CUdeviceptr)shm_addr,
-                                            kMemoryPoolSize, &accessDesc, 1);
+                                            entry.length, &accessDesc, 1);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
