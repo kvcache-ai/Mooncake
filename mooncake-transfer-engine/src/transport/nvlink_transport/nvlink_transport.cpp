@@ -15,6 +15,7 @@
 #include "transport/nvlink_transport/nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
@@ -32,7 +33,7 @@
 
 namespace mooncake {
 NvlinkTransport::NvlinkTransport() : use_fabric_mem_(false) {
-    if (getenv("MC_USE_FABRIC")) use_fabric_mem_ == true;
+    if (getenv("MC_USE_FABRIC")) use_fabric_mem_ = true;
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
     if (err != cudaSuccess) {
