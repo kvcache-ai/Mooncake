@@ -32,7 +32,7 @@ public:
      * @param revision_id: Output param, the create revision id of the key.
      * @return: Error code.
      */
-    static ErrorCode EtcdGet(const char* key, const size_t key_size,
+    static ErrorCode Get(const char* key, const size_t key_size,
         std::string& value, EtcdRevisionId& revision_id);
 
     /*
@@ -45,7 +45,7 @@ public:
      * @param revision_id: Output param, the create revision id of the key.
      * @return: Error code.
      */
-    static ErrorCode EtcdCreateWithLease(const char* key, const size_t key_size,
+    static ErrorCode CreateWithLease(const char* key, const size_t key_size,
         const char* value, const size_t value_size, EtcdLeaseId lease_id, EtcdRevisionId& revision_id);
 
     /*
@@ -54,7 +54,7 @@ public:
      * @param lease_id: Output param, the lease id.
      * @return: Error code.
      */
-    static ErrorCode EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
+    static ErrorCode GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
      * @brief Watch a key until it is deleted. This is a blocking function.
@@ -62,7 +62,7 @@ public:
      * @param key_size: The size of the key in bytes.
      * @return: Error code.
      */
-    static ErrorCode EtcdWatchUntilDeleted(const char* key, const size_t key_size);
+    static ErrorCode WatchUntilDeleted(const char* key, const size_t key_size);
 
     /*
      * @brief Cancel watching a key
@@ -70,14 +70,14 @@ public:
      * @param key_size: The size of the key in bytes.
      * @return: Error code.
      */
-    static ErrorCode EtcdCancelWatch(const char* key, const size_t key_size);
+    static ErrorCode CancelWatch(const char* key, const size_t key_size);
     
     /*
      * @brief Keep a lease alive. This is a blocking function.
      * @param lease_id: The lease id to keep alive.
      * @return: Error code.
     */
-    static ErrorCode EtcdKeepAlive(EtcdLeaseId lease_id);
+    static ErrorCode KeepAlive(EtcdLeaseId lease_id);
 
     /*
      * @brief Cancel a lease keep alive. Returning error means
@@ -86,7 +86,7 @@ public:
      * @param lease_id: The lease id to cancel keep alive.
      * @return: Error code.
      */
-    static ErrorCode EtcdCancelKeepAlive(EtcdLeaseId lease_id);
+    static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
 private:
     // Variables that are used to ensure the etcd client
     // is only connected once.

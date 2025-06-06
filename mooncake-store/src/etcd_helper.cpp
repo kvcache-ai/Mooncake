@@ -34,7 +34,7 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(const std::string& etcd_endpoints
     }
 }
 
-ErrorCode EtcdHelper::EtcdGet(const char* key, const size_t key_size, std::string& value, EtcdRevisionId& revision_id) {
+ErrorCode EtcdHelper::Get(const char* key, const size_t key_size, std::string& value, EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
     char* value_ptr = nullptr;
     int value_size = 0;
@@ -53,27 +53,27 @@ ErrorCode EtcdHelper::EtcdGet(const char* key, const size_t key_size, std::strin
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::EtcdCreateWithLease(const char* key, const size_t key_size,
+ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
      const char* value, const size_t value_size, EtcdLeaseId lease_id, EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
-    int tx_success = 0; // transaction success or not
     int ret = EtcdStoreCreateWithLeaseWrapper((char*)key, (int)key_size,
-        (char*)value, (int)value_size, lease_id, &tx_success, &revision_id, &err_msg);
-    if (ret != 0) {
+        (char*)value, (int)value_size, lease_id, &revision_id, &err_msg);
+    if (ret == -2) {
+        VLOG(1) << "key=" << std::string(key, key_size)
+             << ", lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    } else if (ret != 0) {
         LOG(ERROR) << "key=" << std::string(key, key_size)
              << ", lease_id=" << lease_id << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
-    } else if (tx_success == 0) {
-        VLOG(1) << "key=" << std::string(key, key_size)
-             << ", lease_id=" << lease_id << ", error=etcd_transaction_fail";
-        return ErrorCode::ETCD_TRANSACTION_FAIL;
     } else {
         return ErrorCode::OK;
     } 
 }
 
-ErrorCode EtcdHelper::EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
+ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     char* err_msg = nullptr;
     if (0 != EtcdStoreGrantLeaseWrapper(lease_ttl, &lease_id, &err_msg)) {
         LOG(ERROR) << "lease_ttl=" << lease_ttl << ", error=" << err_msg;
@@ -83,7 +83,7 @@ ErrorCode EtcdHelper::EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::EtcdWatchUntilDeleted(const char* key, const size_t key_size) {
+ErrorCode EtcdHelper::WatchUntilDeleted(const char* key, const size_t key_size) {
     char* err_msg = nullptr;
     int err_code = EtcdStoreWatchUntilDeletedWrapper(
         (char*)key, (int)key_size, &err_msg);
@@ -99,7 +99,7 @@ ErrorCode EtcdHelper::EtcdWatchUntilDeleted(const char* key, const size_t key_si
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::EtcdCancelWatch(const char* key, const size_t key_size) {
+ErrorCode EtcdHelper::CancelWatch(const char* key, const size_t key_size) {
     char* err_msg = nullptr;
     if (0 != EtcdStoreCancelWatchWrapper((char*)key, (int)key_size, &err_msg)) {
         LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
@@ -109,7 +109,7 @@ ErrorCode EtcdHelper::EtcdCancelWatch(const char* key, const size_t key_size) {
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::EtcdKeepAlive(EtcdLeaseId lease_id) {
+ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
     int err_code = EtcdStoreKeepAliveWrapper(lease_id, &err_msg);
     if (err_code != 0) {
@@ -124,7 +124,7 @@ ErrorCode EtcdHelper::EtcdKeepAlive(EtcdLeaseId lease_id) {
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::EtcdCancelKeepAlive(EtcdLeaseId lease_id) {
+ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
     if (0 != EtcdStoreCancelKeepAliveWrapper(lease_id, &err_msg)) {
         LOG(ERROR) << "Failed to cancel keep lease: " << err_msg;

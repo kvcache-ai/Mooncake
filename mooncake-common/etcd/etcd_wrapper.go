@@ -180,14 +180,15 @@ func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 		return -1
 	}
 	if len(resp.Kvs) == 0 {
-		*value = nil
+		*errMsg = C.CString("key not found in etcd")
+		return -1
 	} else {
 		kv := resp.Kvs[0]
 		*value = C.CString(string(kv.Value))
 		*valueSize = C.int(len(kv.Value))
 		*revisionId = kv.CreateRevision
+		return 0
 	}
-	return 0
 }
 
 //export EtcdStoreGrantLeaseWrapper
@@ -209,7 +210,7 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int 
 
 //export EtcdStoreCreateWithLeaseWrapper
 func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
-	leaseId int64, txSuccess *C.int, revisionId *int64, errMsg **C.char) int {
+	leaseId int64, revisionId *int64, errMsg **C.char) int {
     if storeClient == nil {
         *errMsg = C.CString("etcd client not initialized")
         return -1
@@ -222,7 +223,7 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
     // Create a transaction
     txn := storeClient.Txn(ctx)
 
-    // First check if the key exists
+    // Only put the key if it does not exist
     resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
         Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
         Commit()
@@ -235,18 +236,17 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
     // If the key already existed, resp.Succeeded will be false
     // If we created the key, resp.Succeeded will be true
     if resp.Succeeded {
-        *txSuccess = 1
         *revisionId = resp.Header.Revision
+		return 0;
     } else {
-        *txSuccess = 0
-        *revisionId = 0
+        *errMsg = C.CString("etcd transaction failed")
+        return -2
     }
-    return 0
 }
 
 /*
 * @brief First cancel the watch context, then delete it from the map.
-*        Cancel must be called before deleting in case this is a new context
+*        Cancel must be called before delete in case this is a new context
 *        other than the one we want to delete. In that case, that context will
 *        be deleted before being cancelled and will not be able to be cancelled
 *        anymore.
@@ -283,6 +283,8 @@ func EtcdStoreWatchUntilDeletedWrapper(key *C.char, keySize C.int, errMsg **C.ch
     }
     storeWatchCtx[k] = cancel
     storeWatchMutex.Unlock()
+
+	// Make sure to delete from the map before returning
 	defer cancelAndDeleteWatch(k)
 
     // Start watching the key
@@ -359,6 +361,7 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
     }
     storeKeepAliveCtx[leaseId] = cancel
     storeKeepAliveMutex.Unlock()
+	// Make sure to delete from the map before returning
     defer cancelAndDeleteKeepAlive(leaseId)
 
     // Start keep alive
