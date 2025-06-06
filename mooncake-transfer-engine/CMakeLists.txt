@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 
-execute_process(
-  COMMAND bash -c "command -v python3 >/dev/null && python3 -c 'import sys; print(sys.prefix if hasattr(sys, \"base_prefix\") and sys.base_prefix != sys.prefix else \"\")' || echo ''"
-  OUTPUT_VARIABLE AUTO_DETECTED_VENV
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+find_program(PYTHON3_EXECUTABLE python3)
+if(PYTHON3_EXECUTABLE)
+  execute_process(
+    COMMAND ${PYTHON3_EXECUTABLE} -c "import sys; print(sys.prefix if hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix else '')"
+    OUTPUT_VARIABLE AUTO_DETECTED_VENV
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+else()
+  set(AUTO_DETECTED_VENV "")
+endif()
 
 if(AUTO_DETECTED_VENV)
   message(STATUS "Automatically detected virtual environment: ${AUTO_DETECTED_VENV}")
