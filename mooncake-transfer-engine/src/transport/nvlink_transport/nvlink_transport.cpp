@@ -32,8 +32,8 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(false) {
-    if (getenv("MC_USE_FABRIC")) use_fabric_mem_ = true;
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(true) {
+    if (getenv("MC_USE_NVLINK_IPC")) use_fabric_mem_ = false;
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
     if (err != cudaSuccess) {
@@ -374,8 +374,8 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                     accessDesc.location.id = 0;
-                    result = cuMemSetAccess((CUdeviceptr)shm_addr,
-                                            entry.length, &accessDesc, 1);
+                    result = cuMemSetAccess((CUdeviceptr)shm_addr, entry.length,
+                                            &accessDesc, 1);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
@@ -495,13 +495,10 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
         return;
     }
     result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
-    if (result != CUDA_SUCCESS) {
-        LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange failed: "
-                   << result;
-        return;
+    if (result == CUDA_SUCCESS) {
+        cuMemUnmap((CUdeviceptr)ptr, size);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
     }
-    cuMemUnmap((CUdeviceptr)ptr, size);
     cuMemRelease(handle);
-    cuMemAddressFree((CUdeviceptr)ptr, size);
 }
 }  // namespace mooncake
