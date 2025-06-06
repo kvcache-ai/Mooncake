@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <vector>
 #include <mutex>
@@ -75,6 +77,14 @@ class FileStorageBackend : public StorageBackend {
      * @return ErrorCode indicating operation status
      */
     ErrorCode LoadObject(const ObjectKey& key, std::string& str) override;
+    
+    void Querykey(const ObjectKey& key, bool& hasFile_, std::string& filePath_, size_t& fileLength_) override;
+
+    ErrorCode Existkey(const ObjectKey& key) override;
+
+    void RemoveFile(const ObjectKey& key) override;
+
+    void RemoveAll() override;
 
     /// Root directory path for storage
     std::string root_dir_;

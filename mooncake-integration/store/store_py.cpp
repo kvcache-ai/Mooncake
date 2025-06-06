@@ -223,6 +223,21 @@ int DistributedObjectStore::initAll(const std::string &protocol_,
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
+                                           size_t length) {
+    uint64_t offset = 0;
+    while (offset < length) {
+        auto chunk_size = std::min(length - offset, kMaxSliceSize);
+        auto ptr = client_buffer_allocator_->allocate(chunk_size);
+        if (!ptr) {
+            return 1;  // SliceGuard will handle cleanup
+        }
+        slices.emplace_back(Slice{ptr, chunk_size});
+        offset += chunk_size;
+    }
+    return 0;
+}
+
+int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
                                            const std::string &value) {
     uint64_t offset = 0;
     while (offset < value.size()) {
@@ -303,9 +318,16 @@ int DistributedObjectStore::allocateSlicesPacked(
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
+    #ifdef USE_CLIENT_PERSISTENCE
+        if(object_info.hasFile){
+            length=object_info.fileLength;
+            return allocateSlices(slices, length);
+        }
+    #endif    
+
     length = 0;
-    if (object_info.replica_list.empty()) return -1;
-    auto &replica = object_info.replica_list[0];
+    if (object_info.replicaInfo.replica_list.empty()) return -1;
+    auto &replica = object_info.replicaInfo.replica_list[0];
     for (auto &handle : replica.buffer_descriptors) {
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
@@ -377,11 +399,6 @@ int DistributedObjectStore::put(const std::string &key,
         return toInt(error_code);
     }
 
-    // Optionally persist to local file if needed
-    #ifdef USE_CLIENT_PERSISTENCE
-        client_->Put_To_Local_File(key, value);
-    #endif
-
     return 0;
 }
 
@@ -429,20 +446,8 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
         error_code = client_->Query(key, object_info);
         if (error_code != ErrorCode::OK) {
-        #ifdef USE_CLIENT_PERSISTENCE
-            std::string str;
-            error_code=client_->Get_From_Local_File(key, str);
-            py::gil_scoped_acquire acquire_gil;
-            if(error_code!= ErrorCode::OK) {
-                return kNullString;
-            }else{
-                // LOG(INFO) << "Get_From_Local_File successful for key: " << key;
-                return pybind11::bytes(str);
-            }
-        #else
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
-        #endif
         }
 
         int ret = allocateSlices(guard.slices(), object_info, str_length);
@@ -527,10 +532,17 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
         return toInt(error_code);
     }
 
+    #ifdef USE_CLIENT_PERSISTENCE
+    if (object_info.hasFile) {
+        // If the object is stored in a file, return its length
+        return object_info.fileLength;
+    }
+    #endif
+
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (!object_info.replica_list.empty()) {
-        auto &replica = object_info.replica_list[0];
+    if (!object_info.replicaInfo.replica_list.empty()) {
+        auto &replica = object_info.replicaInfo.replica_list[0];
         for (auto &handle : replica.buffer_descriptors) {
             total_size += handle.size_;
         }

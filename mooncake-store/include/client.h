@@ -52,7 +52,14 @@ class Client {
      * 1. Query object information
      * 2. Transfer data based on the information
      */
-    using ObjectInfo = GetReplicaListResponse;
+    struct ObjectInfo{
+        GetReplicaListResponse replicaInfo{};
+        bool hasFile = false;
+        std::string filePath = "";
+        size_t fileLength = 0;
+
+        ObjectInfo() = default;
+    }; 
 
     /**
      * @brief Gets object metadata without transferring data
@@ -69,33 +76,8 @@ class Client {
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode Get(const std::string& object_key, const ObjectInfo& object_info,
+    ErrorCode Get(const std::string& object_key, ObjectInfo& object_info,
                   std::vector<Slice>& slices);
-
-    /**
-     * @brief Retrieves data from a local file
-     * @param object_key Key of the object to retrieve
-     * @param data Output string to store the retrieved data
-     * @return ErrorCode indicating success/failure
-     */
-    ErrorCode Get_From_Local_File(const std::string& object_key,
-                             std::string& data);
-                             
-    /**
-     * @brief Stores data to a local file
-     * @param object_key Key of the object to store
-     * @param data Data to store in the file
-     */
-    void Put_To_Local_File(const std::string& object_key,
-                             const std::string& data);
-
-    /**
-     * @brief Stores data to a local file
-     * @param object_key Key of the object to store
-     * @param data Data to store in the file
-     */
-    void Put_To_Local_File(const std::string& object_key,
-                             std::span<const char> &data);
                              
     /**
      * @brief Stores data with replication
@@ -195,10 +177,15 @@ class Client {
         std::vector<Slice>& slices);
 
     /**
-     * @brief Prepare the storage backend for persisting data
+     * @brief Prepare  and use the storage backend for persisting data
      */
-
     void PrepareStorageBackend(const std::string& storage_root_dir);
+
+    ErrorCode Get_From_Local_File(const std::string& object_key,
+                             std::vector<Slice>& slices, ObjectInfo& object_info);
+                             
+    void Put_To_Local_File(const std::string& object_key,
+                             std::vector<Slice>& slices);
 
     // Core components
     TransferEngine transfer_engine_;

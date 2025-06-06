@@ -205,20 +205,36 @@ ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) {
     auto response = master_client_.GetReplicaList(object_key);
     // copy vec
-    object_info.replica_list.resize(response.replica_list.size());
+    object_info.replicaInfo.replica_list.resize(response.replica_list.size());
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
-        object_info.replica_list[i] = response.replica_list[i];
+        object_info.replicaInfo.replica_list[i] = response.replica_list[i];
     }
+    #ifdef USE_CLIENT_PERSISTENCE
+        if(response.error_code!= ErrorCode::OK && storage_backend_){
+            storage_backend_->Querykey(object_key, object_info.hasFile,
+                                       object_info.filePath, object_info.fileLength);
+            if(object_info.hasFile){
+                return ErrorCode::OK;
+            }
+        }
+    #endif
     return response.error_code;
 }
 
 ErrorCode Client::Get(const std::string& object_key,
-                      const ObjectInfo& object_info,
+                      ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
+
+    #ifdef USE_CLIENT_PERSISTENCE
+        if(object_info.hasFile) {
+            // If the object is stored in a local file, load it directly
+            return Get_From_Local_File(object_key, slices, object_info);
+        }
+    #endif
     // Get the first complete replica
-    for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
-        if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
-            const auto& replica = object_info.replica_list[i];
+    for (size_t i = 0; i < object_info.replicaInfo.replica_list.size(); ++i) {
+        if (object_info.replicaInfo.replica_list[i].status == ReplicaStatus::COMPLETE) {
+            const auto& replica = object_info.replicaInfo.replica_list[i];
 
             std::vector<AllocatedBuffer::Descriptor> handles;
             for (const auto& handle : replica.buffer_descriptors) {
@@ -257,13 +273,14 @@ ErrorCode Client::Get(const std::string& object_key,
 }
 
 ErrorCode Client::Get_From_Local_File(
-    const std::string& object_key, std::string& str) {
+    const std::string& object_key, std::vector<Slice>& slices, ObjectInfo& object_info) {
     if (!storage_backend_) {
         // LOG(INFO) << "Storage backend is not initialized";
         return ErrorCode::FILE_SYSTEM_UNINITIALIZED;
     }
 
-    ErrorCode err=storage_backend_->LoadObject(object_key, str);
+    ErrorCode err=storage_backend_->LoadObject(object_key, slices);
+    //TODO： add path in parameter
     if (err != ErrorCode::OK) {
         // LOG(INFO) << "Failed to load object from storage backend: "
                 //    << object_key;
@@ -274,26 +291,22 @@ ErrorCode Client::Get_From_Local_File(
 }
 
 void Client::Put_To_Local_File(
-    const std::string& key, const std::string& value){
-    if (!storage_backend_) {
-        return;
-    }
-    // Store the object in the backend
-    write_thread_pool_.enqueue([backend = storage_backend_, key, value]{
-        backend->StoreObject(key, value);
-        // LOG(INFO)  << "Stored object in storage backend: " << key;
-    });
-}
+    const std::string& key, std::vector<Slice>& slices){
+    if (!storage_backend_) return;
 
-void Client::Put_To_Local_File(
-    const std::string& key, std::span<const char> &value){
-    if (!storage_backend_) {
-        return;
+    size_t total_size = 0;
+    for (const auto& slice : slices) {
+        total_size += slice.size;
     }
-    // Store the object in the backend
-    write_thread_pool_.enqueue([backend = storage_backend_, key, value_=std::string(value.data(), value.size())]{
-        backend->StoreObject(key, value_);
-        // LOG(INFO)  << "Stored object in storage backend: " << key;
+
+    std::string value;
+    value.reserve(total_size); 
+    for (const auto& slice : slices) {
+        value.append(static_cast<char*>(slice.ptr), slice.size);
+    }
+
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value = std::move(value)] {
+        backend->StoreObject(key, value);
     });
 }
 
@@ -358,14 +371,32 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         return err;
     }
 
+    #ifdef USE_CLIENT_PERSISTENCE
+       Put_To_Local_File(key, slices);
+    #endif  
+
     return ErrorCode::OK;
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
+    #ifdef USE_CLIENT_PERSISTENCE
+    if (storage_backend_) {
+        // Remove from storage backend
+        storage_backend_->RemoveFile(key);
+    }
+    #endif
     return master_client_.Remove(key).error_code;
 }
 
-long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
+long Client::RemoveAll() { 
+    #ifdef USE_CLIENT_PERSISTENCE
+    if (storage_backend_) {
+        // Remove from storage backend
+        storage_backend_->RemoveAll();
+    }
+    #endif
+    return master_client_.RemoveAll().removed_count; 
+}
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
@@ -459,6 +490,14 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 
 ErrorCode Client::IsExist(const std::string& key) {
     auto response = master_client_.ExistKey(key);
+    #ifdef USE_CLIENT_PERSISTENCE
+    if ( response.error_code!=ErrorCode::OK && storage_backend_) {
+        // Check if the key exists in the storage backend
+        if (storage_backend_->Existkey(key) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+    }
+    #endif
     return response.error_code;
 }
 

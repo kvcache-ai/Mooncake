@@ -171,6 +171,65 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
+void FileStorageBackend::Querykey(const ObjectKey& key, bool& hasFile_, std::string& filePath_, size_t& fileLength_) {
+    std::string path = ResolvePath(key);
+    namespace fs = std::filesystem;
+
+    // Check if the file exists
+    if (!fs::exists(path)) {
+        return;
+    }
+
+    // Populate object_info with file metadata
+    hasFile_=true;
+    filePath_ = path;
+    fileLength_ = fs::file_size(path);
+    
+}
+
+ErrorCode FileStorageBackend::Existkey(const ObjectKey& key) {
+    std::string path = ResolvePath(key);
+    namespace fs = std::filesystem;
+
+    // Check if the file exists
+    if (fs::exists(path)) {
+        return ErrorCode::OK;
+    } else {
+        return ErrorCode::FILE_NOT_FOUND;
+    }
+}
+
+void FileStorageBackend::RemoveFile(const ObjectKey& key) {
+    std::string path = ResolvePath(key);
+    namespace fs = std::filesystem;
+    //TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
+    // Check if the file exists before attempting to remove it
+    if (fs::exists(path)) {
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to delete file: " << path << ", error: " << ec.message();
+        }
+    } else {
+        LOG(INFO) << "File does not exist: " << path;
+    }
+}
+
+void FileStorageBackend::RemoveAll() {
+    namespace fs = std::filesystem;
+    // Iterate through the root directory and remove all files
+    for (const auto& entry : fs::directory_iterator(root_dir_)) {
+        if (fs::is_regular_file(entry.status())) {
+            std::error_code ec;
+            fs::remove(entry.path(),ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to delete file: " << entry.path() << ", error: " << ec.message();
+            }
+        }
+    }
+
+}
+
 std::string FileStorageBackend::SanitizeKey(const ObjectKey& key) const {
     // Set of invalid filesystem characters to be replaced
     constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";

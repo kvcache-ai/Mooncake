@@ -242,8 +242,8 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (object_info.replica_list.empty()) return -1;
-    auto &replica = object_info.replica_list[0];
+    if (object_info.replicaInfo.replica_list.empty()) return -1;
+    auto &replica = object_info.replicaInfo.replica_list[0];
     for (auto &handle : replica.buffer_descriptors) {
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
@@ -316,9 +316,6 @@ int DistributedObjectStore::put(const std::string &key,
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return toInt(error_code);
-    #ifdef USE_CLIENT_PERSISTENCE
-        client_->Put_To_Local_File(key, value);
-    #endif
     return 0;
 }
 
@@ -332,20 +329,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
     const auto kNullString = pybind11::bytes("\0", 0);
     ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK){
-    #ifdef USE_CLIENT_PERSISTENCE
-        std::string str;
-        error_code=client_->Get_From_Local_File(key, str);
-        if(error_code!= ErrorCode::OK) {
-            return kNullString;
-        }else{
-            // LOG(INFO) << "Get_From_Local_File successful for key: " << key;
-            return pybind11::bytes(str);
-        }
-    #else
-        return kNullString;
-    #endif
-    }
+    if (error_code != ErrorCode::OK) return kNullString;
 
     uint64_t str_length = 0;
     int ret = allocateSlices(slices, object_info, str_length);
@@ -416,8 +400,8 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (!object_info.replica_list.empty()) {
-        auto &replica = object_info.replica_list[0];
+    if (!object_info.replicaInfo.replica_list.empty()) {
+        auto &replica = object_info.replicaInfo.replica_list[0];
         for (auto &handle : replica.buffer_descriptors) {
             total_size += handle.size_;
         }

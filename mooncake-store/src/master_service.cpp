@@ -163,7 +163,7 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
 
 ErrorCode MasterService::GetReplicaList(
     const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
-    MetadataAccessor accessor(this, key);
+    MetadataAcce1ssor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;

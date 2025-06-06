@@ -88,8 +88,8 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (!object_info.replica_list_size()) return -1;
-    auto &replica = object_info.replica_list(0);
+    if (!object_info.replicaInfo.replica_list_size()) return -1;
+    auto &replica = object_info.replicaInfo.replica_list(0);
     for (auto &handle : replica.handles()) {
         auto chunk_size = handle.size();
         assert(chunk_size <= kMaxSliceSize);
@@ -132,10 +132,7 @@ int DistributedObjectStore::put(const std::string &key,
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return 1;
-    
-    #ifdef USE_CLIENT_PERSISTENCE
-        client_->Put_To_Local_File(key, value);
-    #endif    
+      
     return 0;
 }
 
@@ -145,21 +142,8 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
     const auto kNullString = pybind11::bytes("\0", 0);
     ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK){
-    #ifdef USE_CLIENT_PERSISTENCE
-        std::string str;
-        error_code=client_->Get_From_Local_File(key, str);
-        if(error_code!= ErrorCode::OK) {
-            return kNullString;
-        }else{
-            // If the query is successful, return the string as bytes
-            LOG(INFO) << "Get_From_Local_File successful for key: " << key;
-            return pybind11::bytes(str);
-        }
-    #else
-        return kNullString;
-    #endif
-    }
+    if (error_code != ErrorCode::OK) return kNullString;
+    
     uint64_t str_length = 0;
     int ret = allocateSlices(slices, object_info, str_length);
     if (ret) return kNullString;
