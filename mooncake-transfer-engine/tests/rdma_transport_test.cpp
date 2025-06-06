@@ -234,10 +234,7 @@ int initiator() {
     const size_t ram_buffer_size = 1ull << 30;
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(false);
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
 
     Transport *xport = nullptr;
     if (FLAGS_protocol == "rdma") {
@@ -280,10 +277,7 @@ int target() {
     const size_t ram_buffer_size = 1ull << 30;
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(false);
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
 
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix();

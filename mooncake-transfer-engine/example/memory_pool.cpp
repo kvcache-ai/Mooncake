@@ -75,9 +75,7 @@ int target() {
     args[0] = (void *)nic_priority_matrix.c_str();
     args[1] = nullptr;
 
-    const std::string &connectable_name = FLAGS_local_server_name;
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 connectable_name.c_str(), 12345);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
     engine->installTransport("rdma", args);
 
     LOG_ASSERT(engine);

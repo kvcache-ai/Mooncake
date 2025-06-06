@@ -76,13 +76,7 @@ impl TransferEngine {
             CString::new(local_server_name).map_err(|_| anyhow!("CString::new failed"))?;
 
         let engine = unsafe {
-            bindings::createTransferEngine(
-                metadata_uri_c.as_ptr(),
-                local_server_name_c.as_ptr(),
-                local_server_name_c.as_ptr(),
-                rpc_port,
-                0, // disable auto_discover
-            )
+            bindings::createTransferEngine(metadata_uri_c.as_ptr(), local_server_name_c.as_ptr())
         };
         if engine.is_null() {
             bail!("Failed to create TransferEngine")
