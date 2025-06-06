@@ -414,11 +414,6 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
-    if (!use_fabric_mem_) {
-        void *dev_buf = nullptr;
-        cudaMalloc(&dev_buf, size);
-        return dev_buf;
-    }
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
@@ -491,10 +486,6 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
 }
 
 void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
-    if (!use_fabric_mem_) {
-        cudaFree(ptr);
-        return;
-    }
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     auto result = cuMemRetainAllocationHandle(&handle, ptr);

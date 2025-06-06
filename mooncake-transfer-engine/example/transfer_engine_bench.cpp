@@ -38,6 +38,10 @@
 #include <cufile.h>
 #endif
 
+#ifdef USE_NVLINK
+#include <transport/nvlink_transport/nvlink_transport.h>
+#endif
+
 #include <cassert>
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -295,7 +299,12 @@ int initiator() {
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
+#ifdef USE_NVLINK
+        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
+            FLAGS_buffer_size);
+#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
@@ -342,7 +351,11 @@ int initiator() {
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+#ifdef USE_NVLINK
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
+#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;
@@ -389,7 +402,12 @@ int target() {
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
+#ifdef USE_NVLINK
+        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
+            FLAGS_buffer_size);
+#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
@@ -409,7 +427,11 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+#ifdef USE_NVLINK
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
+#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;

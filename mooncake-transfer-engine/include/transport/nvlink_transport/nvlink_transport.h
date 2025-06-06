@@ -37,9 +37,9 @@ class NvlinkTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override;
 
-    void *allocatePinnedLocalMemory(size_t length);
+    static void *allocatePinnedLocalMemory(size_t length);
 
-    void freePinnedLocalMemory(void *addr);
+    static void freePinnedLocalMemory(void *addr);
 
    protected:
     int install(std::string& local_server_name,

@@ -233,10 +233,6 @@ class Transport {
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
-    virtual void *allocatePinnedLocalMemory(size_t length) { return nullptr; }
-
-    virtual void freePinnedLocalMemory(void *addr) {}
-
     struct BufferEntry {
         void *addr;
         size_t length;
