@@ -37,6 +37,10 @@ class NvlinkTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override;
 
+    void *allocatePinnedLocalMemory(size_t length);
+
+    void freePinnedLocalMemory(void *addr);
+
    protected:
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
@@ -69,6 +73,7 @@ class NvlinkTransport : public Transport {
 
     std::unordered_map<uint64_t, OpenedShmEntry> remap_entries_;
     RWSpinlock remap_lock_;
+    bool use_fabric_mem_;
 };
 
 }  // namespace mooncake

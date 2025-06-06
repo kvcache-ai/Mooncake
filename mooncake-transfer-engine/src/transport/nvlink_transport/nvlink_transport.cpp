@@ -31,11 +31,43 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-NvlinkTransport::NvlinkTransport() {}
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(false) {
+    if (getenv("MC_USE_FABRIC")) use_fabric_mem_ == true;
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
+                   << cudaGetErrorString(err);
+        return;
+    }
+    if (num_devices == 0) {
+        LOG(ERROR) << "NvlinkTransport: not device found";
+        return;
+    }
+    for (int device_id = 0; device_id < num_devices; ++device_id) {
+        int device_support_fabric_mem = 0;
+        cuDeviceGetAttributes(&device_support_fabric_mem,
+                              CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                              device);
+        if (!device_support_fabric_mem) {
+            if (use_fabric_mem_) {
+                LOG(WARNING)
+                    << "NvlinkTransport: fallback to legacy IPC transfer";
+            }
+            use_fabric_mem_ = false;
+        }
+    }
+}
 
 NvlinkTransport::~NvlinkTransport() {
-    for (auto &entry : remap_entries_) {
-        cudaIpcCloseMemHandle(entry.second.shm_addr);
+    if (use_fabric_mem_) {
+        for (auto &entry : remap_entries_) {
+            freePinnedLocalMemory(entry.second.shm_addr);
+        }
+    } else {
+        for (auto &entry : remap_entries_) {
+            cudaIpcCloseMemHandle(entry.second.shm_addr);
+        }
     }
     remap_entries_.clear();
 }
@@ -205,32 +237,65 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          const std::string &location,
                                          bool remote_accessible,
                                          bool update_metadata) {
-    cudaPointerAttributes attr;
-    cudaError_t err = cudaPointerGetAttributes(&attr, addr);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaPointerGetAttributes failed";
-        return -1;
-    }
+    if (!use_fabric_mem_) {
+        cudaPointerAttributes attr;
+        cudaError_t err = cudaPointerGetAttributes(&attr, addr);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaPointerGetAttributes failed";
+            return -1;
+        }
 
-    if (attr.type != cudaMemoryTypeDevice) {
-        LOG(ERROR) << "Unsupported memory type, " << addr << " " << attr.type;
-        return -1;
-    }
+        if (attr.type != cudaMemoryTypeDevice) {
+            LOG(ERROR) << "Unsupported memory type, " << addr << " "
+                       << attr.type;
+            return -1;
+        }
 
-    cudaIpcMemHandle_t handle;
-    err = cudaIpcGetMemHandle(&handle, addr);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaIpcGetMemHandle failed";
-        return -1;
-    }
+        cudaIpcMemHandle_t handle;
+        err = cudaIpcGetMemHandle(&handle, addr);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaIpcGetMemHandle failed";
+            return -1;
+        }
 
-    (void)remote_accessible;
-    BufferDesc desc;
-    desc.addr = (uint64_t)addr;
-    desc.length = length;
-    desc.name = location;
-    desc.shm_name = serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-    return metadata_->addLocalMemoryBuffer(desc, true);
+        (void)remote_accessible;
+        BufferDesc desc;
+        desc.addr = (uint64_t)addr;
+        desc.length = length;
+        desc.name = location;
+        desc.shm_name =
+            serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+        return metadata_->addLocalMemoryBuffer(desc, true);
+    } else {
+        CUmemGenericAllocationHandle handle;
+        size_t size = 0;
+        auto result = cuMemRetainAllocationHandle(&handle, addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: cuMemRetainAllocationHandle failed: "
+                << result;
+            return -1;
+        }
+
+        CUmemFabricHandle export_handle;
+        result = cuMemExportToShareableHandle(&export_handle, handle,
+                                              CU_MEM_HANDLE_TYPE_FABRIC, 0);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: cuMemExportToShareableHandle failed: "
+                << result;
+            return -1;
+        }
+
+        (void)remote_accessible;
+        BufferDesc desc;
+        desc.addr = (uint64_t)addr;
+        desc.length = length;
+        desc.name = location;
+        desc.shm_name =
+            serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+        return metadata_->addLocalMemoryBuffer(desc, true);
+    }
 }
 
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
@@ -256,24 +321,74 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             RWSpinlock::WriteGuard lock_guard(remap_lock_);
             if (!remap_entries_.count(entry.addr)) {
                 std::vector<unsigned char> output_buffer;
-                cudaIpcMemHandle_t handle;
                 deserializeBinaryData(entry.shm_name, output_buffer);
-                assert(output_buffer.size() == sizeof(handle));
-                memcpy(&handle, output_buffer.data(), sizeof(handle));
-                void *shm_addr = nullptr;
-                cudaError_t err = cudaIpcOpenMemHandle(
-                    &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
-                if (err != cudaSuccess) {
-                    LOG(ERROR)
-                        << "NvlinkTransport: cudaIpcOpenMemHandle failed: "
-                        << cudaGetErrorString(err);
+                if (output_buffer.size() == sizeof(cudaIpcMemHandle_t) &&
+                    !use_fabric_mem_) {
+                    cudaIpcMemHandle_t handle;
+                    memcpy(&handle, output_buffer.data(), sizeof(handle));
+                    void *shm_addr = nullptr;
+                    cudaError_t err = cudaIpcOpenMemHandle(
+                        &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
+                    if (err != cudaSuccess) {
+                        LOG(ERROR)
+                            << "NvlinkTransport: cudaIpcOpenMemHandle failed: "
+                            << cudaGetErrorString(err);
+                        return -1;
+                    }
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_addr = shm_addr;
+                    shm_entry.length = length;
+                    remap_entries_[entry.addr] = shm_entry;
+                } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
+                           use_fabric_mem_) {
+                    CUmemFabricHandle export_handle;
+                    memcpy(&export_handle, output.data(),
+                           sizeof(export_handle));
+                    void *shm_addr = nullptr;
+                    CUmemGenericAllocationHandle handle;
+                    auto result = cuMemImportFromShareableHandle(
+                        &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR) << "NvlinkTransport: "
+                                      "cuMemImportFromShareableHandle failed: "
+                                   << result;
+                        return -1;
+                    }
+                    result = cuMemAddressReserve((CUdeviceptr *)&shm_addr,
+                                                 kMemoryPoolSize, 0, 0, 0);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR)
+                            << "NvlinkTransport: cuMemAddressReserve failed: "
+                            << result;
+                        return -1;
+                    }
+                    result = cuMemMap((CUdeviceptr)shm_addr, kMemoryPoolSize, 0,
+                                      handle, 0);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR)
+                            << "NvlinkTransport: cuMemMap failed: " << result;
+                        return -1;
+                    }
+
+                    CUmemAccessDesc accessDesc = {};
+                    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                    accessDesc.location.id = 0;
+                    result = cuMemSetAccess((CUdeviceptr)shm_addr,
+                                            kMemoryPoolSize, &accessDesc, 1);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
+                                   << result;
+                        return -1;
+                    }
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_addr = shm_addr;
+                    shm_entry.length = length;
+                    remap_entries_[entry.addr] = shm_entry;
+                } else {
+                    LOG(ERROR) << "Mismatched NVLink data transfer method";
                     return -1;
                 }
-
-                OpenedShmEntry shm_entry;
-                shm_entry.shm_addr = shm_addr;
-                shm_entry.length = length;
-                remap_entries_[entry.addr] = shm_entry;
             }
             auto shm_addr = remap_entries_[entry.addr].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
@@ -296,5 +411,104 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
     return metadata_->updateLocalSegmentDesc();
+}
+
+void *NvlinkTransport::allocatePinnedLocalMemory(size_t length) {
+    if (!use_fabric_mem_) {
+        return cudaMalloc(length);
+    }
+    size_t granularity = 0;
+    CUdevice currentDev;
+    CUmemAllocationProp prop = {};
+    CUmemAccessDesc accessDesc = {};
+    CUmemGenericAllocationHandle handle;
+    void *ptr = nullptr;
+    int cudaDev;
+    int flag = 0;
+    cudaError_t err = cudaGetDevice(&cudaDev);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NvlinkTransport: cudaGetDevice failed: "
+                   << cudaGetErrorString(err);
+        return nullptr;
+    }
+    CUresult result = cuDeviceGet(&currentDev, cudaDev);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuDeviceGet failed: " << result;
+        return nullptr;
+    }
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    prop.location.id = currentDev;
+    result = cuDeviceGetAttribute(
+        &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+        currentDev);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuDeviceGetAttribute failed: "
+                   << result;
+        return nullptr;
+    }
+    if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
+    result = cuMemGetAllocationGranularity(&granularity, &prop,
+                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemGetAllocationGranularity failed: "
+                   << result;
+        return nullptr;
+    }
+    result = cuMemCreate(&handle, size, &prop, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemCreate failed: " << result;
+        return nullptr;
+    }
+    result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemAddressReserve failed: " << result;
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemMap failed: " << result;
+        cuMemAddressFree((CUdeviceptr)ptr, size);
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = currentDev;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    result = cuMemSetAccess((CUdeviceptr)ptr, size, &accessDesc, 1);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: " << result;
+        cuMemUnmap((CUdeviceptr)ptr, size);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    return ptr;
+}
+
+void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
+    if (!use_fabric_mem_) {
+        cudaFree(ptr);
+        return;
+    }
+    CUmemGenericAllocationHandle handle;
+    size_t size = 0;
+    auto result = cuMemRetainAllocationHandle(&handle, ptr);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemRetainAllocationHandle failed: "
+                   << result;
+        return;
+    }
+    result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange failed: "
+                   << result;
+        return;
+    }
+    cuMemUnmap((CUdeviceptr)ptr, size);
+    cuMemRelease(handle);
+    cuMemAddressFree((CUdeviceptr)ptr, size);
 }
 }  // namespace mooncake
