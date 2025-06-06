@@ -126,6 +126,20 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+#ifdef USE_NVLINK
+    } else if (segmentJSON["protocol"] == "nvlink") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.nvlink_buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["device_id"] = buffer.device_id;
+            bufferJSON["ipc_handle"] = buffer.cuda_ipc_handle;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -239,12 +253,54 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->nvmeof_buffers.push_back(buffer);
         }
+#ifdef USE_NVLINK
+    } else if (desc->protocol == "nvlink") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            NVLinkBufferDesc buffer;
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON["device_id"].asUInt();
+            auto str = bufferJSON["ipc_handle"].asString();
+            if (str.empty()) {
+                LOG(ERROR) << "NvlinkTransport: Invalid IPC handle: " << str;
+                return nullptr;
+            }
+            memcpy(buffer.cuda_ipc_handle, str.c_str(), str.size());
+        }
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
         return nullptr;
     }
     return desc;
+}
+
+TransferMetadata::NVLinkBufferDesc TransferMetadata::getRemoteNVLinkBufferDesc(SegmentID segment_id) {
+    TransferMetadata::NVLinkBufferDesc buffer_desc;
+    
+    // Get the segment descriptor from metadata
+    auto segment_desc = getSegmentDescByID(segment_id);
+    if (!segment_desc || segment_desc->buffers.empty()) {
+        LOG(ERROR) << "NvlinkTransport: Invalid segment ID or no buffers found: " << segment_id;
+        return buffer_desc;
+    }
+
+    // Get the first buffer from the segment
+    const auto& buffer = segment_desc->nvlink_buffers[0];
+    
+    // Convert the buffer information to NVLinkBufferDesc
+    buffer_desc.addr = buffer.addr;
+    buffer_desc.length = buffer.length;
+    buffer_desc.device_id = 0;  // Default to device 0 if not specified
+    
+    // Copy the IPC handle if available
+    if (buffer_desc.cuda_ipc_handle[0] != 0) {  // Check if handle is not all zeros
+        memcpy(buffer_desc.cuda_ipc_handle, buffer.cuda_ipc_handle, 
+               sizeof(buffer_desc.cuda_ipc_handle));
+    }
+
+    return buffer_desc;
 }
 
 int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
