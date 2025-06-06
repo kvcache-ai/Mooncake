@@ -16,6 +16,7 @@ import (
 var (
 	globalClient *clientv3.Client
 	mutex        sync.Mutex
+	refCount     int
 )
 
 //export NewEtcdClient
@@ -23,8 +24,8 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	mutex.Lock()
 	defer mutex.Unlock()
 	if globalClient != nil {
-		*errMsg = C.CString("etcd client can be initialized only once")
-		return -1
+		refCount++
+		return 0
 	}
 
 	endpoint := C.GoString(endpoints)
@@ -39,6 +40,7 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	globalClient = cli
+	refCount++
 	return 0
 }
 
@@ -105,8 +107,11 @@ func EtcdCloseWrapper() {
 	mutex.Lock()
 	defer mutex.Unlock()
 	if globalClient != nil {
-		globalClient.Close()
-		globalClient = nil
+		refCount--
+		if refCount == 0 {
+			globalClient.Close()
+			globalClient = nil
+		}
 	}
 }
 

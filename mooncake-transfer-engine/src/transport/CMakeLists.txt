@@ -18,3 +18,8 @@ if (USE_CXL)
   add_subdirectory(cxl_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
+
+if (USE_NVLINK)
+  add_subdirectory(nvlink_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
+endif()
