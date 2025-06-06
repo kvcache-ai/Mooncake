@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TRANSFER_ENGINE
-#define TRANSFER_ENGINE
+#ifndef RDMA_TRANSPORT_H_
+#define RDMA_TRANSPORT_H_
 
 #include <infiniband/verbs.h>
 
@@ -124,4 +124,4 @@ using BatchID = Transport::BatchID;
 
 }  // namespace mooncake
 
-#endif  // TRANSFER_ENGINE
+#endif  // RDMA_TRANSPORT_H_

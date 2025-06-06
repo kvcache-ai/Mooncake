@@ -9,6 +9,7 @@
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
 
 namespace mooncake {
@@ -211,10 +212,10 @@ class Client {
     ErrorCode TransferRead(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
-
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
