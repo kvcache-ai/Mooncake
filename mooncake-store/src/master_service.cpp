@@ -170,6 +170,47 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     return ErrorCode::OK;
 }
 
+ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
+    all_keys.clear();
+    for(int i = 0; i < kNumShards; i++) {
+        for(const auto& item : metadata_shards_[i].metadata) {
+            all_keys.push_back(item.first);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::GetAllSegments(std::vector<std::string> & all_segments) {
+    all_segments.clear();
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    for(auto & allocator : allocators) {
+        all_segments.push_back(allocator.first);
+    }
+    alloc_lock.unlock();
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::QuerySegments(const std::string & segment,
+                                       size_t & used,
+                                       size_t & capacity) {
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    auto it = allocators.find(segment);
+    if (it != allocators.end()) {
+        auto& allocator = it -> second;
+        capacity = allocator -> capacity();
+        used = allocator -> size();
+    } else {
+        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment << ") not found!";
+        return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
+    }
+    alloc_lock.unlock();
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::GetReplicaList(
     const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
     MetadataAccessor accessor(this, key);
