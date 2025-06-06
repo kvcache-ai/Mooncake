@@ -21,7 +21,8 @@ class MooncakeConfig:
         local_buffer_size (int): The size of the local buffer in bytes.
         protocol (str): The communication protocol to use.
         device_name (Optional[str]): The name of the device to use.
-        master_server_address (str): The address of the master server.
+        master_server_entries (str): The entries of the master server.
+        enable_ha (bool): Whether to enable high availability mode.
 
     Example of configuration file:
         {
@@ -31,7 +32,8 @@ class MooncakeConfig:
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
             "device_name": "",
-            "master_server_address": "localhost:8081"
+            "master_server_entries": "localhost:8081",
+            "enable_ha": false
         }
     """
     local_hostname: str
@@ -40,7 +42,8 @@ class MooncakeConfig:
     local_buffer_size: int
     protocol: str
     device_name: Optional[str]
-    master_server_address: str
+    master_server_entries: str
+    enable_ha: bool
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -50,7 +53,7 @@ class MooncakeConfig:
         required_fields = [
             "local_hostname",
             "metadata_server",
-            "master_server_address",
+            "master_server_entries",
         ]
         for field in required_fields:
             if field not in config:
@@ -64,7 +67,8 @@ class MooncakeConfig:
                                          DEFAULT_LOCAL_BUFFER_SIZE),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
+            master_server_entries=config.get("master_server_entries"),
+            enable_ha=config.get("enable_ha", False),
         )
 
     @staticmethod
