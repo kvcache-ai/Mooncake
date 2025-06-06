@@ -91,9 +91,10 @@ enum class ErrorCode : int32_t {
     RPC_FAIL = -900,  ///< RPC operation failed.
 
     // ETCD errors (Range: -1000 to -1099)
-    ETCD_OPERATION_ERROR = -1000,  ///< ETCD operation failed.
-    ETCD_KEY_NOT_EXIST = -1001,  ///< Key not found in ETCD.
-    ETCD_TRANSACTION_FAIL = -1002,  ///< Transaction failed.
+    ETCD_OPERATION_ERROR = -1000,  ///< etcd operation failed.
+    ETCD_KEY_NOT_EXIST = -1001,  ///< key not found in etcd.
+    ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
+    ETCD_CTX_CANCELLED = -1003,  ///< etcd context cancelled.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

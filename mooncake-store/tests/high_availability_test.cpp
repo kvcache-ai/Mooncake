@@ -35,8 +35,8 @@ class HighAvailabilityTest : public ::testing::Test {
 };
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
-    // Test grant lease, create kv and get kv
-    const int64_t lease_ttl = 10;
+    // == Test grant lease, create kv and get kv ==
+    int64_t lease_ttl = 10;
     std::vector<std::string> keys;
     std::vector<std::string> values;
     // Ordinary key-value pair
@@ -67,6 +67,83 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
         ASSERT_EQ(value, get_value);
         ASSERT_EQ(version, get_version);
     }
+
+    // == Test keep alive and cancel keep alive ==
+    lease_ttl = 2;
+    EtcdLeaseId lease_id;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGrantLease(lease_ttl, lease_id));
+
+    std::promise<ErrorCode> promise;
+    std::future<ErrorCode> future = promise.get_future();
+
+    std::thread keep_alive_thread([&]() {
+        ErrorCode result = EtcdHelper::EtcdKeepAlive(lease_id);
+        promise.set_value(result);
+    });
+    // Check if keep alive can extend the lease's life time
+    ASSERT_NE(future.wait_for(std::chrono::seconds(lease_ttl * 3)), std::future_status::ready);
+    std::string key = FLAGS_etcd_test_key_prefix + std::string("keep_alive_key");
+    std::string value = "keep_alive_value";
+    EtcdRevisionId version = 0;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCreateWithLease(key.c_str(), key.size(),
+            value.c_str(), value.size(), lease_id, version));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGet(key.c_str(), key.size(), value, version));
+
+    // Test cancel keep alive
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCancelKeepAlive(lease_id));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(future.get(), ErrorCode::ETCD_CTX_CANCELLED);
+    keep_alive_thread.join();
+
+    // == Test watch key and cancel watch ==
+    lease_ttl = 2;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGrantLease(lease_ttl, lease_id));
+    std::string watch_key = FLAGS_etcd_test_key_prefix + std::string("watch_key");
+    std::string watch_value = "watch_value";
+    EtcdRevisionId watch_version = 0;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCreateWithLease(watch_key.c_str(), watch_key.size(),
+            watch_value.c_str(), watch_value.size(), lease_id, watch_version));
+
+    promise = std::promise<ErrorCode>();
+    future = promise.get_future();
+    keep_alive_thread = std::thread([&]() {
+        EtcdHelper::EtcdKeepAlive(lease_id);
+    });
+    std::thread watch_thread([&]() {
+        ErrorCode result = EtcdHelper::EtcdWatchUntilDeleted(watch_key.c_str(), watch_key.size());
+        promise.set_value(result);
+    });
+    // Check the watch thread is blocked if the key is not deleted
+    ASSERT_NE(future.wait_for(std::chrono::seconds(lease_ttl * 3)), std::future_status::ready);
+    // Check the watch thread returns after the key is deleted
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCancelKeepAlive(lease_id));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(lease_ttl * 3)), std::future_status::ready);
+    ASSERT_EQ(future.get(), ErrorCode::OK);
+    watch_thread.join();
+    keep_alive_thread.join();
+
+    // Test cancel watch
+    lease_ttl = 10;
+    int64_t watch_wait_time = 2;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdGrantLease(lease_ttl, lease_id));
+    watch_key = FLAGS_etcd_test_key_prefix + std::string("watch_key2");
+    watch_value = "watch_value2";
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCreateWithLease(watch_key.c_str(), watch_key.size(),
+            watch_value.c_str(), watch_value.size(), lease_id, watch_version));
+
+    promise = std::promise<ErrorCode>();
+    future = promise.get_future();
+    watch_thread = std::thread([&]() {
+        ErrorCode result = EtcdHelper::EtcdWatchUntilDeleted(watch_key.c_str(), watch_key.size());
+        promise.set_value(result);
+    });
+    // Wait for the watch thread to call EtcdWatchUntilDeleted
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    // Cancel the watch
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::EtcdCancelWatch(watch_key.c_str(), watch_key.size()));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(watch_wait_time)), std::future_status::ready);
+    ASSERT_EQ(future.get(), ErrorCode::ETCD_CTX_CANCELLED);
+    watch_thread.join();
 }
 
 // Test leader election and master address discovery

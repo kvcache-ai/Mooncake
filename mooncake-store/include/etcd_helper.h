@@ -57,19 +57,36 @@ public:
     static ErrorCode EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
-     * @brief Watch a key until it is deleted. This is blocking function.
+     * @brief Watch a key until it is deleted. This is a blocking function.
      * @param key: The key to watch.
      * @param key_size: The size of the key in bytes.
      * @return: Error code.
      */
     static ErrorCode EtcdWatchUntilDeleted(const char* key, const size_t key_size);
+
+    /*
+     * @brief Cancel watching a key
+     * @param key: The key to cancel watch.
+     * @param key_size: The size of the key in bytes.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdCancelWatch(const char* key, const size_t key_size);
     
     /*
-     * @brief Keep a lease alive. This is blocking function.
+     * @brief Keep a lease alive. This is a blocking function.
      * @param lease_id: The lease id to keep alive.
      * @return: Error code.
     */
     static ErrorCode EtcdKeepAlive(EtcdLeaseId lease_id);
+
+    /*
+     * @brief Cancel a lease keep alive. Returning error means
+     *        the lease id does not exist or the goroutine to
+     *        keep the lease alive is already closed.
+     * @param lease_id: The lease id to cancel keep alive.
+     * @return: Error code.
+     */
+    static ErrorCode EtcdCancelKeepAlive(EtcdLeaseId lease_id);
 private:
     // Variables that are used to ensure the etcd client
     // is only connected once.

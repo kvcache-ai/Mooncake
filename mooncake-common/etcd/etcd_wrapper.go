@@ -25,6 +25,12 @@ var (
 	// etcd client for store
 	storeClient  *clientv3.Client
 	storeMutex   sync.Mutex
+	// keep alive contexts for store
+	storeKeepAliveCtx = make(map[int64]context.CancelFunc)
+	storeKeepAliveMutex    sync.Mutex
+	// watch contexts for store
+	storeWatchCtx = make(map[string]context.CancelFunc)
+	storeWatchMutex    sync.Mutex
 )
 
 //export NewEtcdClient
@@ -238,28 +244,99 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
     return 0
 }
 
+/*
+* @brief First cancel the watch context, then delete it from the map.
+*        Cancel must be called before deleting in case this is a new context
+*        other than the one we want to delete. In that case, that context will
+*        be deleted before being cancelled and will not be able to be cancelled
+*        anymore.
+*/
+func cancelAndDeleteWatch(k string) int {
+    storeWatchMutex.Lock()
+    defer storeWatchMutex.Unlock()
+
+    if cancel, exists := storeWatchCtx[k]; exists {
+        cancel()
+        delete(storeWatchCtx, k)
+        return 0
+    }
+	return -1
+}
+
 //export EtcdStoreWatchUntilDeletedWrapper
 func EtcdStoreWatchUntilDeletedWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
-	if storeClient == nil {
-		*errMsg = C.CString("etcd client not initialized")
-		return -1
-	}
-	k := C.GoStringN(key, keySize)
-	ctx := context.Background()
-	
-	// Start watching the key
-	watchChan := storeClient.Watch(ctx, k)
-	
-	// Wait for the key to be deleted
-	for watchResp := range watchChan {
-		for _, event := range watchResp.Events {
-			if event.Type == clientv3.EventTypeDelete {
-				return 0
-			}
-		}
-	}
+    if storeClient == nil {
+        *errMsg = C.CString("etcd client not initialized")
+        return -1
+    }
+    k := C.GoStringN(key, keySize)
 
-	*errMsg = C.CString("watch channel closed unexpectedly")
+    // Create a context with cancel function
+    ctx, cancel := context.WithCancel(context.Background())
+
+    // Store the cancel function
+    storeWatchMutex.Lock()
+    if _, exists := storeWatchCtx[k]; exists {
+		storeWatchMutex.Unlock()
+        *errMsg = C.CString("This key is already being watched")
+        return -1
+    }
+    storeWatchCtx[k] = cancel
+    storeWatchMutex.Unlock()
+	defer cancelAndDeleteWatch(k)
+
+    // Start watching the key
+    watchChan := storeClient.Watch(ctx, k)
+
+    // Wait for the key to be deleted
+    for {
+        select {
+        case watchResp, ok := <-watchChan:
+            if !ok {
+                // Channel closed unexpectedly
+                *errMsg = C.CString("watch channel closed unexpectedly")
+                return -1
+            }
+            for _, event := range watchResp.Events {
+                if event.Type == clientv3.EventTypeDelete {
+                    // Clean up the context when done
+                    return 0
+                }
+            }
+        case <-ctx.Done():
+            // Context was cancelled
+			*errMsg = C.CString("watch context cancelled")
+            return -2
+        }
+    }
+}
+
+//export EtcdStoreCancelWatchWrapper
+func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
+    k := C.GoStringN(key, keySize)
+    if cancelAndDeleteWatch(k) == -1 {
+        *errMsg = C.CString("no watch context found for the given key")
+        return -1
+    }
+    return 0
+}
+
+/*
+* @brief First cancel the keep alive context, then delete it from the map.
+*        Cancel must be called before deleting in case this is a new context
+*        other than the one we want to delete. In that case, that context will
+*        be deleted before being cancelled and will not be able to be cancelled
+*        anymore.
+*/
+func cancelAndDeleteKeepAlive(leaseId int64) int {
+    storeKeepAliveMutex.Lock()
+    defer storeKeepAliveMutex.Unlock()
+
+    if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
+        cancel()
+        delete(storeKeepAliveCtx, leaseId)
+        return 0
+    }
 	return -1
 }
 
@@ -270,9 +347,20 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
         return -1
     }
 
-    // Create a context without timeout since we want to keep alive indefinitely
-    ctx := context.Background()
+    // Create a context with cancel function
+    ctx, cancel := context.WithCancel(context.Background())
     
+    // Store the cancel function
+    storeKeepAliveMutex.Lock()
+	if _, exists := storeKeepAliveCtx[leaseId]; exists {
+		storeKeepAliveMutex.Unlock()
+        *errMsg = C.CString("This lease id is already being kept alive")
+        return -1
+    }
+    storeKeepAliveCtx[leaseId] = cancel
+    storeKeepAliveMutex.Unlock()
+    defer cancelAndDeleteKeepAlive(leaseId)
+
     // Start keep alive
     keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseId))
     if err != nil {
@@ -294,10 +382,20 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
             }
             // Keep alive successful, continue
         case <-ctx.Done():
-            *errMsg = C.CString("context cancelled")
-            return -1
+			// Context cancelled
+			*errMsg = C.CString("keep alive context cancelled")
+            return -2
         }
     }
+}
+
+//export EtcdStoreCancelKeepAliveWrapper
+func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
+    if cancelAndDeleteKeepAlive(leaseId) == -1 {
+        *errMsg = C.CString("no keep alive context found for the given lease ID")
+        return -1
+    }
+    return 0
 }
 
 func main() {}

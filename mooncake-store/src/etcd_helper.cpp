@@ -85,9 +85,24 @@ ErrorCode EtcdHelper::EtcdGrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
 
 ErrorCode EtcdHelper::EtcdWatchUntilDeleted(const char* key, const size_t key_size) {
     char* err_msg = nullptr;
-    if (0 != EtcdStoreWatchUntilDeletedWrapper(
-        (char*)key, (int)key_size, &err_msg)) {
-        LOG(ERROR) << "Error watching key: " << err_msg;
+    int err_code = EtcdStoreWatchUntilDeletedWrapper(
+        (char*)key, (int)key_size, &err_msg);
+    if (err_code != 0) {
+        LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
+        free(err_msg);
+        if (err_code == -2) {
+            return ErrorCode::ETCD_CTX_CANCELLED;
+        } else {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::EtcdCancelWatch(const char* key, const size_t key_size) {
+    char* err_msg = nullptr;
+    if (0 != EtcdStoreCancelWatchWrapper((char*)key, (int)key_size, &err_msg)) {
+        LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
@@ -96,8 +111,23 @@ ErrorCode EtcdHelper::EtcdWatchUntilDeleted(const char* key, const size_t key_si
 
 ErrorCode EtcdHelper::EtcdKeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
-    if (0 != EtcdStoreKeepAliveWrapper(lease_id, &err_msg)) {
-        LOG(ERROR) << "Failed to keep lease: " << err_msg;
+    int err_code = EtcdStoreKeepAliveWrapper(lease_id, &err_msg);
+    if (err_code != 0) {
+        LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        if (err_code == -2) {
+            return ErrorCode::ETCD_CTX_CANCELLED;
+        } else {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::EtcdCancelKeepAlive(EtcdLeaseId lease_id) {
+    char* err_msg = nullptr;
+    if (0 != EtcdStoreCancelKeepAliveWrapper(lease_id, &err_msg)) {
+        LOG(ERROR) << "Failed to cancel keep lease: " << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
