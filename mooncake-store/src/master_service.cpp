@@ -217,6 +217,19 @@ ErrorCode MasterService::GetReplicaList(
     return ErrorCode::OK;
 }
 
+ErrorCode MasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        batch_replica_list) {
+    for (const auto& key : keys) {
+        if (GetReplicaList(key, batch_replica_list[key]) != ErrorCode::OK) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            return ErrorCode::OBJECT_NOT_FOUND;
+        };
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::PutStart(
     const std::string& key, uint64_t value_length,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
@@ -275,8 +288,10 @@ ErrorCode MasterService::PutStart(
             std::shared_lock<std::shared_mutex> alloc_lock(
                 buffer_allocator_manager_->GetMutex());
             const auto& allocators = buffer_allocator_manager_->GetAllocators();
+
+            // Use the unified allocation strategy with replica config
             auto handle =
-                allocation_strategy_->Allocate(allocators, chunk_size);
+                allocation_strategy_->Allocate(allocators, chunk_size, config);
             alloc_lock.unlock();
 
             if (!handle) {
@@ -345,13 +360,67 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::INVALID_REPLICA;
+        return ErrorCode::INVALID_WRITE;
     }
 
     // Send evict notification before erasing
     SendEvictNotification(key, metadata);
     accessor.Erase();
 
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutStart(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, uint64_t>& value_lengths,
+    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        batch_replica_list) {
+    if (config.replica_num == 0 || keys.empty()) {
+        LOG(ERROR) << "replica_num=" << config.replica_num
+                   << ", keys_size=" << keys.size() << ", error=invalid_params";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    for (const auto& key : keys) {
+        auto value_length_it = value_lengths.find(key);
+        auto slice_length_it = slice_lengths.find(key);
+        if (value_length_it == value_lengths.end() ||
+            slice_length_it == slice_lengths.end()) {
+            LOG(ERROR) << "Key not found in value_lengths or slice_lengths: "
+                       << key;
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+
+        auto result =
+            PutStart(key, value_length_it->second, slice_length_it->second,
+                     config, batch_replica_list[key]);
+        if (result != ErrorCode::OK &&
+            result != ErrorCode::OBJECT_ALREADY_EXISTS) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutEnd(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutEnd(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutRevoke(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutRevoke(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
     return ErrorCode::OK;
 }
 
@@ -533,43 +602,46 @@ void MasterService::BatchEvict(double eviction_ratio) {
         // To achieve evicted_count / object_count = eviction_ration,
         // ideally how many object should be evicted in this shard
         const long ideal_evict_num =
-            std::ceil(object_count * eviction_ratio) - evicted_count;
+            std::ceil(object_count * eviction_ratio_) - evicted_count;
 
         if (ideal_evict_num <= 0) {
             // No need to evict any object in this shard
             continue;
         }
 
-        std::vector<decltype(shard.metadata)::iterator> candidates;
-        candidates.reserve(ideal_evict_num);
-
+        std::vector<std::chrono::steady_clock::time_point>
+            candidates;  // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end();
              it++) {
             // Only evict objects that have not expired and are complete
             if (it->second.IsLeaseExpired(now) &&
                 !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                candidates.push_back(it);
+                candidates.push_back(it->second.lease_timeout);
             }
         }
 
         if (!candidates.empty()) {
-            size_t evict_num =
-                std::min(ideal_evict_num, (long)candidates.size());
+            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
             long shard_evicted_count =
                 0;  // number of objects evicted from this shard
-            std::nth_element(
-                candidates.begin(), candidates.begin() + (evict_num - 1),
-                candidates.end(), [](const auto& a, const auto& b) {
-                    return a->second.lease_timeout < b->second.lease_timeout;
-                });
-            // Evict objects for [0, evict_num) from candidates
-            for (size_t j = 0; j < evict_num && j < candidates.size(); ++j) {
-                total_freed_size += candidates[j]->second.size *
-                                    candidates[j]->second.replicas.size();
-                SendEvictNotification(candidates[j]->first,
-                                      candidates[j]->second);
-                shard.metadata.erase(candidates[j]);
-                shard_evicted_count++;
+            std::nth_element(candidates.begin(),
+                             candidates.begin() + (evict_num - 1),
+                             candidates.end());
+            auto target_timeout = candidates[evict_num - 1];
+            // Evict objects with lease timeout less than or equal to target.
+            auto it = shard.metadata.begin();
+            while (it != shard.metadata.end() &&
+                   shard_evicted_count < evict_num) {
+                if (it->second.lease_timeout <= target_timeout &&
+                    !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    total_freed_size +=
+                        it->second.size * it->second.replicas.size();
+                    SendEvictNotification(it->first, it->second);
+                    it = shard.metadata.erase(it);
+                    shard_evicted_count++;
+                } else {
+                    ++it;
+                }
             }
             evicted_count += shard_evicted_count;
         }

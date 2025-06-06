@@ -193,10 +193,13 @@ inline std::ostream& operator<<(std::ostream& os,
  */
 struct ReplicateConfig {
     size_t replica_num{0};
+    std::string preferred_segment{};  // Preferred segment for allocation,
+                                      // defaults to client's local hostname
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         return os << "ReplicateConfig: { replica_num: " << config.replica_num
+                  << ", preferred_segment: " << config.preferred_segment
                   << " }";
     }
 };

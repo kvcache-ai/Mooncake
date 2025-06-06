@@ -396,6 +396,7 @@ int DistributedObjectStore::put(const std::string &key,
 
     ReplicateConfig config;
     config.replica_num = 1;  // Make configurable
+    config.preferred_segment = this->local_hostname;
     ErrorCode error_code = client_->Put(key, slices.slices(), config);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Put operation failed with error: "
@@ -421,6 +422,7 @@ int DistributedObjectStore::put_parts(
     }
     ReplicateConfig config;
     config.replica_num = 1;  // Make configurable
+    config.preferred_segment = this->local_hostname;
     ErrorCode error_code = client_->Put(key, slices.slices(), config);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Put operation failed with error: "
