@@ -64,7 +64,7 @@ public:
 
 /*
  * @brief A supervisor class for the master service, only used in HA mode.
- *        This class will continuously do the following procedures:
+ *        This class will continuously do the following procedures after start:
  *        1. Elect local master to be the leader.
  *        2. Start the master service when it is elected as leader.
  *        3. Stop the master service when it is no longer the leader.

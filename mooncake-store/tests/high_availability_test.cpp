@@ -146,14 +146,34 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     watch_thread.join();
 }
 
-// Test leader election and master address discovery
-TEST_F(HighAvailabilityTest, LeaderElectionAndMasterAddressDiscovery) {
+TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     MasterViewHelper mv_helper;
     mv_helper.ConnectToEtcd(FLAGS_etcd_endpoints);
-    std::string master_address;
+    std::string master_address = "0.0.0.0:8888";
     ViewVersionId version = 0;
-    mv_helper.GetMasterView(master_address, version);
-    LOG(INFO) << "Master address: " << master_address << ", version: " << version;
+
+    // Initially, the master view is not set
+    ASSERT_NE(ErrorCode::OK, mv_helper.GetMasterView(master_address, version));
+
+    // Elect and keep leader
+    EtcdLeaseId lease_id = 0;
+    mv_helper.ElectLeader(master_address, version, lease_id);
+    std::thread keep_alive_thread([&]() {
+        mv_helper.KeepLeader(lease_id);
+    });
+
+    // Check the master view is correctly set
+    std::string get_master_address;
+    ASSERT_EQ(ErrorCode::OK, mv_helper.GetMasterView(get_master_address, version));
+    ASSERT_EQ(get_master_address, master_address);
+
+    // Check the master view does not change
+    std::this_thread::sleep_for(std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL + 2));
+    ASSERT_EQ(ErrorCode::OK, mv_helper.GetMasterView(get_master_address, version));
+    ASSERT_EQ(get_master_address, master_address);
+
+    EtcdHelper::CancelKeepAlive(lease_id);
+    keep_alive_thread.join();
 }
 
 }  // namespace testing
