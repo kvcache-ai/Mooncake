@@ -49,7 +49,7 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(false) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttributes(&device_support_fabric_mem,
                               CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                              device);
+                              device_id);
         if (!device_support_fabric_mem) {
             if (use_fabric_mem_) {
                 LOG(WARNING)
@@ -240,9 +240,9 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          bool update_metadata) {
     if (!use_fabric_mem_) {
         cudaPointerAttributes attr;
-        cudaError_t err = cudaPointerGetAttributes(&attr, addr);
+        cudaError_t err = cudaPointerGetAttribute(&attr, addr);
         if (err != cudaSuccess) {
-            LOG(ERROR) << "NvlinkTransport: cudaPointerGetAttributes failed";
+            LOG(ERROR) << "NvlinkTransport: cudaPointerGetAttribute failed";
             return -1;
         }
 
@@ -269,7 +269,6 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         return metadata_->addLocalMemoryBuffer(desc, true);
     } else {
         CUmemGenericAllocationHandle handle;
-        size_t size = 0;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR)
@@ -343,7 +342,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
                            use_fabric_mem_) {
                     CUmemFabricHandle export_handle;
-                    memcpy(&export_handle, output.data(),
+                    memcpy(&export_handle, output_buffer.data(),
                            sizeof(export_handle));
                     void *shm_addr = nullptr;
                     CUmemGenericAllocationHandle handle;
@@ -356,7 +355,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         return -1;
                     }
                     result = cuMemAddressReserve((CUdeviceptr *)&shm_addr,
-                                                 kMemoryPoolSize, 0, 0, 0);
+                                                 entry.length, 0, 0, 0);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR)
                             << "NvlinkTransport: cuMemAddressReserve failed: "
@@ -414,9 +413,11 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-void *NvlinkTransport::allocatePinnedLocalMemory(size_t length) {
+void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!use_fabric_mem_) {
-        return cudaMalloc(length);
+        void *dev_buf = nullptr;
+        cudaMalloc(&dev_buf, size);
+        return dev_buf;
     }
     size_t granularity = 0;
     CUdevice currentDev;
