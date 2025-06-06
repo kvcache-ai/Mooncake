@@ -32,18 +32,18 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(true) {
-    if (getenv("MC_USE_NVLINK_IPC")) use_fabric_mem_ = false;
+static bool supportFabricMem() {
+    if (getenv("MC_USE_NVLINK_IPC")) return false;
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
     if (err != cudaSuccess) {
         LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
                    << cudaGetErrorString(err);
-        return;
+        return false;
     }
     if (num_devices == 0) {
         LOG(ERROR) << "NvlinkTransport: not device found";
-        return;
+        return false;
     }
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
@@ -51,14 +51,13 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(true) {
                              CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                              device_id);
         if (!device_support_fabric_mem) {
-            if (use_fabric_mem_) {
-                LOG(WARNING)
-                    << "NvlinkTransport: fallback to legacy IPC transfer";
-            }
-            use_fabric_mem_ = false;
+            return false;
         }
     }
+    return true;
 }
+
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 
 NvlinkTransport::~NvlinkTransport() {
     if (use_fabric_mem_) {
@@ -414,6 +413,11 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
+    if (!supportFabricMem()) {
+        void *ptr = nullptr;
+        cudaMalloc(&ptr, size);
+        return ptr;
+    }
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
@@ -486,6 +490,10 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
 }
 
 void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
+    if (!supportFabricMem()) {
+        cudaFree(ptr);
+        return;
+    }
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     auto result = cuMemRetainAllocationHandle(&handle, ptr);
