@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -90,8 +91,11 @@ class WrappedMasterService {
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                         double eviction_low_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_low_watermark_ratio),
+                         double eviction_low_watermark_ratio =
+                             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                         const std::string& lmcache_controller_url = "")
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
+                          eviction_low_watermark_ratio, lmcache_controller_url),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
@@ -291,9 +295,6 @@ class WrappedMasterService {
         // Increment request metric
         MasterMetricManager::instance().inc_put_start_requests();
 
-        // Track value size in histogram
-        MasterMetricManager::instance().observe_value_size(value_length);
-
         PutStartResponse response;
         response.error_code = master_service_.PutStart(
             key, value_length, slice_lengths, config, response.replica_list);
@@ -301,9 +302,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_put_start_failures();
-        } else {
-            // Increment key count on successful put start
-            MasterMetricManager::instance().inc_key_count();
         }
 
         timer.LogResponseJson(response);
@@ -342,9 +340,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_put_revoke_failures();
-        } else {
-            // Decrement key count on successful revoke
-            MasterMetricManager::instance().dec_key_count();
         }
 
         timer.LogResponseJson(response);
@@ -411,9 +406,6 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_remove_failures();
-        } else {
-            // Decrement key count on successful remove
-            MasterMetricManager::instance().dec_key_count();
         }
 
         timer.LogResponseJson(response);
@@ -436,18 +428,22 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+    MountSegmentResponse MountSegment(
+        uint64_t buffer, uint64_t size, const std::string& segment_name,
+        const std::optional<std::string>& instance_id = std::nullopt,
+        const std::optional<std::string>& worker_id = std::nullopt) {
         ScopedVLogTimer timer(1, "MountSegment");
         timer.LogRequest("buffer=", buffer, ", size=", size,
-                         ", segment_name=", segment_name);
+                         ", segment_name=", segment_name,
+                         ", instance_id=", instance_id.value_or("null"),
+                         ", worker_id=", worker_id.value_or("null"));
 
         // Increment request metric
         MasterMetricManager::instance().inc_mount_segment_requests();
 
         MountSegmentResponse response;
-        response.error_code =
-            master_service_.MountSegment(buffer, size, segment_name);
+        response.error_code = master_service_.MountSegment(
+            buffer, size, segment_name, instance_id, worker_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {

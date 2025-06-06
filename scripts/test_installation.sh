@@ -19,6 +19,10 @@ echo "Installing the wheel package..."
 # Install the wheel package
 pip install mooncake-wheel/dist/*.whl
 
+echo "Installing additional test dependencies..."
+# Install requests for LMCache testing
+pip install requests
+
 # install dependencies
 SYSTEM_PACKAGES="build-essential \
                   cmake \

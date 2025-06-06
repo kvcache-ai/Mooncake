@@ -107,6 +107,16 @@ class DistributedObjectStore {
               const std::string &rdma_devices = "",
               const std::string &master_server_addr = "127.0.0.1:50051");
 
+    int setup_lmcache(const std::string &local_hostname,
+                      const std::string &metadata_server,
+                      size_t global_segment_size = 1024 * 1024 * 16,
+                      size_t local_buffer_size = 1024 * 1024 * 16,
+                      const std::string &protocol = "tcp",
+                      const std::string &rdma_devices = "",
+                      const std::string &master_server_addr = "127.0.0.1:50051",
+                      const std::string &instance_id = "",
+                      const std::string &worker_id = "");
+
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
@@ -147,6 +157,16 @@ class DistributedObjectStore {
     int64_t getSize(const std::string &key);
 
    private:
+    // Common setup implementation used by both setup and setup_lmcache
+    int setup_common(const std::string &local_hostname,
+                     const std::string &metadata_server,
+                     size_t global_segment_size, size_t local_buffer_size,
+                     const std::string &protocol,
+                     const std::string &rdma_devices,
+                     const std::string &master_server_addr,
+                     const std::string &instance_id,
+                     const std::string &worker_id);
+
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);
 
