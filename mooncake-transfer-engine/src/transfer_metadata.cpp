@@ -126,6 +126,17 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "nvlink") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["shm_name"] = buffer.shm_name;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -224,6 +235,24 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+    } else if (desc->protocol == "nvlink") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.shm_name = bufferJSON["shm_name"].asString();
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.shm_name.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol
+                             << "buffer name " << buffer.name << "buffer addr "
+                             << buffer.addr << "buffer length " << buffer.length
+                             << "buffer shm_name " << buffer.shm_name;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
