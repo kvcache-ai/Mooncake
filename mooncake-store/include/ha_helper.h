@@ -75,7 +75,8 @@ public:
                           bool enable_metric_reporting, int metrics_port,
                           int64_t default_kv_lease_ttl, double eviction_ratio,
                           double eviction_high_watermark_ratio,
-                          const std::string& etcd_endpoints = "0.0.0.0:2379");
+                          const std::string& etcd_endpoints = "0.0.0.0:2379",
+                          const std::string& local_hostname = "0.0.0.0:50051");
     int Start();
     ~MasterServiceSupervisor();
 
@@ -90,11 +91,14 @@ private:
     double eviction_ratio_;
     double eviction_high_watermark_ratio_;
 
-    // Server thread
+    // coro_rpc server thread
     std::thread server_thread_;
 
     // ETCD parameters
     std::string etcd_endpoints_;
+
+    // Local hostname for leader election
+    std::string local_hostname_;
 };
 
 }  // namespace mooncake

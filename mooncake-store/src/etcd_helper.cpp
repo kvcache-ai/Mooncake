@@ -39,14 +39,15 @@ ErrorCode EtcdHelper::Get(const char* key, const size_t key_size, std::string& v
     char* value_ptr = nullptr;
     int value_size = 0;
     int ret = EtcdStoreGetWrapper((char*)key, (int)key_size, &value_ptr, &value_size, &revision_id, &err_msg);
+    if (ret == -2) {
+        LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_KEY_NOT_EXIST;
+    }
     if (ret != 0) {
         LOG(ERROR) << "key=" << std::string(key, key_size) << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (value_ptr == nullptr) {
-        VLOG(1) << "key=" << std::string(key, key_size) << ", error=etcd_key_not_exist";
-        return ErrorCode::ETCD_KEY_NOT_EXIST;
     }
     value = std::string(value_ptr, value_size);
     free(value_ptr);

@@ -84,7 +84,6 @@ MasterMetricManager::MasterMetricManager()
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects") {}
 
-
 // --- Metric Interface Methods ---
 
 // Storage Metrics

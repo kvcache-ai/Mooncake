@@ -30,7 +30,8 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     return true;
 });
 DEFINE_bool(enable_ha, false, "Enable high availability, which depends on ETCD");
-DEFINE_string(etcd_endpoints, "", "Endpoints of ETCD server, separated by semicolon");
+DEFINE_string(etcd_endpoints, "", "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_string(local_hostname, "", "Local host address (IP:Port), required in HA mode");
 
 int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
@@ -46,7 +47,8 @@ int main(int argc, char* argv[]) {
               << ", eviction_ratio=" << FLAGS_eviction_ratio
               << ", eviction_high_watermark_ratio=" << FLAGS_eviction_high_watermark_ratio
               << ", enable_ha=" << FLAGS_enable_ha
-              << ", etcd_endpoints=" << FLAGS_etcd_endpoints;
+              << ", etcd_endpoints=" << FLAGS_etcd_endpoints
+              << ", local_hostname=" << FLAGS_local_hostname;
 
     int server_thread_num = std::min(
             FLAGS_max_threads,
@@ -57,7 +59,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (!FLAGS_enable_ha && !FLAGS_etcd_endpoints.empty()) {
-        LOG(WARNING) << "Etcd endpoints are set but will not be used because high availability is disabled";
+        LOG(WARNING) << "Etcd endpoints are set but will not be used in non-HA mode";
+    }
+
+    if (FLAGS_enable_ha && FLAGS_local_hostname.empty()) {
+        LOG(FATAL) << "Local hostname must be set when enable_ha is true";
+        return 1;
+    }
+    if (!FLAGS_enable_ha && !FLAGS_local_hostname.empty()) {
+        LOG(WARNING) << "Local hostname is set but will not be used in non-HA mode";
     }
 
     if (FLAGS_enable_ha) {
@@ -70,7 +80,8 @@ int main(int argc, char* argv[]) {
             FLAGS_default_kv_lease_ttl,
             FLAGS_eviction_ratio,
             FLAGS_eviction_high_watermark_ratio,
-            FLAGS_etcd_endpoints);
+            FLAGS_etcd_endpoints,
+            FLAGS_local_hostname);
 
         return supervisor.Start();
     } else {

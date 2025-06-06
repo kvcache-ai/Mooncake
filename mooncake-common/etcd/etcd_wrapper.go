@@ -181,7 +181,7 @@ func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 	}
 	if len(resp.Kvs) == 0 {
 		*errMsg = C.CString("key not found in etcd")
-		return -1
+		return -2
 	} else {
 		kv := resp.Kvs[0]
 		*value = C.CString(string(kv.Value))

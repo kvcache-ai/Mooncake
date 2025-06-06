@@ -707,7 +707,7 @@ ErrorCode Client::TransferRead(
 }
 
 void Client::PingThreadFunc(int current_version) {
-    // How many fails to ping master before getting latest master view
+    // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
     const int success_ping_interval_ms = 1000;
