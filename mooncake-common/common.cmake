@@ -49,7 +49,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build uint tests" ON)
-option(USE_CUDA "option for using gpu direct" OFF)
+option(USE_CUDA "option for enabling gpu features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_NVLINK "option for using NVLink transport" OFF)
@@ -71,29 +71,26 @@ if (USE_LRU_MASTER)
 endif()
 
 
+if (USE_NVMEOF)
+  set_option(USE_CUDA ON)
+  add_compile_definitions(USE_NVMEOF)
+  message(STATUS "NVMe-oF support is enabled")
+endif()
+
+if (USE_NVLINK)
+  set_option(USE_CUDA ON)
+  add_compile_definitions(USE_NVLINK)
+  message(STATUS "NVLink support is enabled")
+endif()
+
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
-
-  if (USE_NVMEOF)
-    add_compile_definitions(USE_NVMEOF)
-    message(STATUS "NVMe-oF support is enabled")
-  endif()
-
-  if (USE_NVLINK)
-    add_compile_definitions(USE_NVLINK)
-    message(STATUS "NVLink support is enabled")
-  endif()
-
   include_directories(/usr/local/cuda/include)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
   )
-elseif(USE_NVMEOF)
-  message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
-elseif(USE_NVLINK)
-  message(FATAL_ERROR "Cannot enable USE_NVLINK without USE_CUDA")
 endif()
 
 if (USE_TCP)
