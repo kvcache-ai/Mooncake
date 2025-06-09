@@ -457,6 +457,9 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
                    << result;
         return nullptr;
     }
+    // fix size
+    size = (size + granularity - 1) & ~(granularity - 1);
+    if (size == 0) size = granularity;
     result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemCreate failed: " << result;
