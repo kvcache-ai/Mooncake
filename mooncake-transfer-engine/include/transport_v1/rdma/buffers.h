@@ -114,7 +114,7 @@ class LocalBufferManager {
         context_list_.resize(topology->getHcaList().size(), nullptr);
     }
 
-    int addBuffer(const Transport::BufferEntry &buffer_entry);
+    int addBuffer(const BufferEntry &buffer_entry);
 
     int removeBuffer(const AddressRange &range);
 
@@ -132,8 +132,8 @@ class LocalBufferManager {
     const std::string deviceName(int id);
 
    private:
-    struct BufferEntry {
-        Transport::BufferEntry entry;
+    struct BufferEntryForRdma {
+        BufferEntry entry;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
     };
 
@@ -141,7 +141,7 @@ class LocalBufferManager {
     RWSpinlock lock_;
     AddressRangeManager manager_;
     std::vector<RdmaContext *> context_list_;
-    std::map<AddressRange, BufferEntry> buffer_list_;
+    std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;
 };
 

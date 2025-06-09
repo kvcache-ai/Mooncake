@@ -32,7 +32,7 @@ namespace mooncake {
 namespace v1 {
 
 struct GdsTask {
-    Transport::Request request;
+    Request request;
 };
 
 struct GdsSubBatch : public Transport::SubBatch {

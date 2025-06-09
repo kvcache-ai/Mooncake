@@ -209,17 +209,17 @@ LocalBufferManager::LocalBufferManager() {}
 
 LocalBufferManager::~LocalBufferManager() { clear(); }
 
-static inline int getAccessFlags(Transport::BufferVisibility visibility) {
+static inline int getAccessFlags(BufferVisibility visibility) {
     int access = IBV_ACCESS_LOCAL_WRITE;
-    if (visibility == Transport::kGlobalReadWrite) {
+    if (visibility == kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-    } else if (visibility == Transport::kGlobalReadOnly) {
+    } else if (visibility == kGlobalReadOnly) {
         access |= IBV_ACCESS_REMOTE_READ;
     }
     return access;
 }
 
-int LocalBufferManager::addBuffer(const Transport::BufferEntry &buffer_entry) {
+int LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range(buffer_entry.addr, buffer_entry.length);
     std::vector<AddressRange> reg_parts;

@@ -144,7 +144,7 @@ void ShmTransport::startTransfer(ShmTask *task) {
     workers_->submit([task]() {
 #ifdef USE_CUDA
         if (task->request.target_id == LOCAL_SEGMENT_ID) {
-            if (task->request.opcode == Transport::Request::READ)
+            if (task->request.opcode == Request::READ)
                 cudaMemcpy(slice->source_addr, (void *)task->target_addr,
                            slice->length, cudaMemcpyDefault);
             else
@@ -152,7 +152,7 @@ void ShmTransport::startTransfer(ShmTask *task) {
                            slice->length, cudaMemcpyDefault);
         }
 #else
-        if (task->request.opcode == Transport::Request::READ)
+        if (task->request.opcode == Request::READ)
             memcpy(task->request.source, (void *)task->target_addr,
                    task->request.length);
         else
@@ -164,8 +164,7 @@ void ShmTransport::startTransfer(ShmTask *task) {
     });
 }
 
-Transport::TransferStatus ShmTransport::getTransferStatus(SubBatchRef batch,
-                                                          int task_id) {
+TransferStatus ShmTransport::getTransferStatus(SubBatchRef batch, int task_id) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)shm_batch->task_list.size()) {
         return TransferStatus{INVALID, 0};

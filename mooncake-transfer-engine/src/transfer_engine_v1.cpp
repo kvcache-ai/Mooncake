@@ -142,27 +142,27 @@ std::vector<std::string> getRdmaDeviceList(const TEConfig &conf) {
 
 Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
-    local_server_name_ = generateSegmentName(conf_);
+    segment_name_ = generateSegmentName(conf_);
     metadata_ =
         std::make_shared<TransferMetadata>(getMetadataConnString(conf_));
 
     RpcMetaDesc rpc_desc;
     CHECK_STATUS(getEthIpPort(rpc_desc, conf_));
-    metadata_->addRpcMetaEntry(local_server_name_, rpc_desc);
+    metadata_->addRpcMetaEntry(segment_name_, rpc_desc);
 
     LOG(INFO) << "Transfer Engine uses address " << rpc_desc.ip_or_host_name
               << " and port " << rpc_desc.rpc_port
               << " for serving local TCP service";
 
-    local_topology_ = std::make_shared<Topology>();
+    topology_ = std::make_shared<Topology>();
     if (conf_.count(TEConfigKeyTopology)) {
         auto topology_data = conf_.at(TEConfigKeyTopology);
-        if (!topology_data.empty()) local_topology_->parse(topology_data);
+        if (!topology_data.empty()) topology_->parse(topology_data);
     }
 
     auto rdma_device_list = getRdmaDeviceList(conf_);
-    local_topology_->discover(rdma_device_list);
-    if (local_topology_->getHcaList().size() > 0) {
+    topology_->discover(rdma_device_list);
+    if (topology_->getHcaList().size() > 0) {
         CHECK_STATUS(registerRdmaTransport());
     }
     // TODO other protocols
@@ -171,18 +171,20 @@ Status TransferEngine::construct() {
 
 Status TransferEngine::registerRdmaTransport() {
     auto transport = std::make_shared<RdmaTransport>();
-    CHECK_STATUS(
-        transport->install(local_server_name_, metadata_, local_topology_));
+    CHECK_STATUS(transport->install(segment_name_, metadata_, topology_));
     transport_list_[RDMA] = transport;
     return Status::OK();
 }
 
 Status TransferEngine::deconstruct() {
     if (metadata_) {
-        metadata_->removeRpcMetaEntry(local_server_name_);
+        metadata_->removeRpcMetaEntry(segment_name_);
         metadata_.reset();
     }
     transport_list_.clear();
+    for (auto &batch : batch_set_) delete batch;
+    batch_set_.clear();
+    deferred_free_batch_set_.clear();
     return Status::OK();
 }
 
@@ -248,24 +250,21 @@ Status TransferEngine::unregisterLocalMemoryBatch(
 BatchID TransferEngine::allocateBatch(size_t batch_size) {
     Batch *batch = new Batch();
     batch->max_size = batch_size;
-    mutex_.lock();
+    std::lock_guard<std::mutex> lock(mutex_);
     batch_set_.insert(batch);
-    mutex_.unlock();
     return (BatchID)batch;
 }
 
 Status TransferEngine::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
-    mutex_.lock();
+    std::lock_guard<std::mutex> lock(mutex_);
     deferred_free_batch_set_.push_back(batch);
-    mutex_.unlock();
     lazyFreeBatch();
     return Status::OK();
 }
 
 void TransferEngine::lazyFreeBatch() {
-    std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = deferred_free_batch_set_.begin();
          it != deferred_free_batch_set_.end();) {
         auto &batch = *it;
@@ -292,18 +291,16 @@ void TransferEngine::lazyFreeBatch() {
     }
 }
 
-TransportType TransferEngine::getTransportType(const TransferRequest &request) {
+TransportType TransferEngine::getTransportType(const Request &request) {
     return RDMA;
 }
 
 Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &request_list) {
+    BatchID batch_id, const std::vector<Request> &request_list) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
 
-    std::vector<TransferRequest>
-        classified_request_list[kSupportedTransportTypes];
-
+    std::vector<Request> classified_request_list[kSupportedTransportTypes];
     for (auto &request : request_list) {
         auto transport_type = getTransportType(request);
         auto &sub_task_id = batch->next_sub_task_id[transport_type];

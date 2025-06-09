@@ -27,14 +27,14 @@ static inline void markSliceSuccess(RdmaSlice *slice) {
     __sync_fetch_and_add(&task->transferred_bytes, slice->length);
     auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
     if (success_slices + 1 == task->num_slices) {
-        task->status_word = Transport::COMPLETED;
+        task->status_word = COMPLETED;
     }
 }
 
 static inline void markSliceFailed(RdmaSlice *slice) {
     auto task = slice->task;
     __sync_fetch_and_add(&task->failed_slices, 1);
-    task->status_word = Transport::FAILED;
+    task->status_word = FAILED;
 }
 
 Workers::Workers(RdmaTransport *transport)
@@ -224,8 +224,8 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
             peer_server_name, local_desc, peer_desc);
         if (rc) return rc;
         assert(peer_desc.qp_num.size());
-        segment_desc =
-            transport_->metadata_manager_->getSegmentDescByName(peer_server_name);
+        segment_desc = transport_->metadata_manager_->getSegmentDescByName(
+            peer_server_name);
     }
 
     if (segment_desc) {

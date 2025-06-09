@@ -196,11 +196,11 @@ std::atomic<size_t> total_batch_count(0);
 Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
                        int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
-    TransferRequest::OpCode opcode;
+    Request::OpCode opcode;
     if (FLAGS_operation == "read")
-        opcode = TransferRequest::READ;
+        opcode = Request::READ;
     else if (FLAGS_operation == "write")
-        opcode = TransferRequest::WRITE;
+        opcode = Request::WRITE;
     else {
         LOG(ERROR) << "Unsupported operation: must be 'read' or 'write'";
         exit(EXIT_FAILURE);
@@ -219,9 +219,9 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     while (running) {
         auto batch_id = engine->allocateBatch(FLAGS_batch_size);
         Status s;
-        std::vector<TransferRequest> requests;
+        std::vector<Request> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
-            TransferRequest entry;
+            Request entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
             entry.source = (uint8_t *)(addr) +

@@ -184,9 +184,9 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
 
 static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
     switch (slice->task->request.opcode) {
-        case Transport::Request::READ:
+        case Request::READ:
             return IBV_WR_RDMA_READ;
-        case Transport::Request::WRITE:
+        case Request::WRITE:
             return IBV_WR_RDMA_WRITE;
         default:
             return IBV_WR_RDMA_READ;

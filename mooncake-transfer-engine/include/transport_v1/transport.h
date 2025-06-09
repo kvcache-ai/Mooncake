@@ -27,6 +27,7 @@
 #include <queue>
 #include <string>
 
+#include "common/types.h"
 #include "common/status.h"
 #include "metadata/metadata.h"
 #include "utility/memory_location.h"
@@ -35,33 +36,6 @@ namespace mooncake {
 namespace v1 {
 class Transport {
    public:
-    using BatchID = uint64_t;
-    const static BatchID kInvalidBatchID = UINT64_MAX;
-
-    struct Request {
-        enum OpCode { READ, WRITE };
-        OpCode opcode;
-        void *source;
-        SegmentID target_id;
-        uint64_t target_offset;
-        size_t length;
-    };
-
-    enum TransferStatusEnum {
-        WAITING,
-        PENDING,
-        INVALID,
-        CANCELED,
-        COMPLETED,
-        TIMEOUT,
-        FAILED
-    };
-
-    struct TransferStatus {
-        TransferStatusEnum s;
-        size_t transferred_bytes;
-    };
-
     struct SubBatch {
         SubBatch() {}
         virtual ~SubBatch() {}
@@ -105,23 +79,6 @@ class Transport {
 
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list) {}
-
-    enum BufferVisibility {
-        kLocalReadWrite,
-        kGlobalReadOnly,
-        kGlobalReadWrite,
-    };
-
-    using Location = std::string;
-
-    struct BufferEntry {
-        void *addr;
-        size_t length;
-        Location location = kWildcardLocation;
-        BufferVisibility visibility = kGlobalReadWrite;
-        std::string shm_path = "";
-        size_t shm_offset = 0;
-    };
 
     virtual Status registerLocalMemory(
         const std::vector<BufferEntry> &buffer_list) {

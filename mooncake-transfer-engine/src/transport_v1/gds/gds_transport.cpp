@@ -66,25 +66,24 @@ Status GdsTransport::uninstall() {
     return Status::OK();
 }
 
-Transport::TransferStatusEnum from_cufile_transfer_status(
-    CUfileStatus_t status) {
+TransferStatusEnum from_cufile_transfer_status(CUfileStatus_t status) {
     switch (status) {
         case CUFILE_WAITING:
-            return Transport::WAITING;
+            return WAITING;
         case CUFILE_PENDING:
-            return Transport::PENDING;
+            return PENDING;
         case CUFILE_INVALID:
-            return Transport::INVALID;
+            return INVALID;
         case CUFILE_CANCELED:
-            return Transport::CANCELED;
+            return CANCELED;
         case CUFILE_COMPLETE:
-            return Transport::COMPLETED;
+            return COMPLETED;
         case CUFILE_TIMEOUT:
-            return Transport::TIMEOUT;
+            return TIMEOUT;
         case CUFILE_FAILED:
-            return Transport::FAILED;
+            return FAILED;
         default:
-            return Transport::FAILED;
+            return FAILED;
     }
 }
 
@@ -108,15 +107,13 @@ Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
-Transport::TransferStatus GdsTransport::getTransferStatus(SubBatchRef batch,
-                                                          int task_id) {
+TransferStatus GdsTransport::getTransferStatus(SubBatchRef batch, int task_id) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)gds_batch->task_list.size()) {
         return TransferStatus{INVALID, 0};
     }
     auto &task = gds_batch->task_list[task_id];
-    TransferStatus transfer_status = {.s = Transport::PENDING,
-                                      .transferred_bytes = 0};
+    TransferStatus transfer_status = {.s = PENDING, .transferred_bytes = 0};
     auto [slice_id, slice_num] = gds_batch->task_to_slices[task_id];
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
         auto event =
@@ -246,8 +243,7 @@ void GdsTransport::addSliceToCUFileBatch(void *source_addr,
                                          CUfileHandle_t fh) {
     CUfileIOParams_t params;
     params.mode = CUFILE_BATCH;
-    params.opcode =
-        op == Transport::Request::READ ? CUFILE_READ : CUFILE_WRITE;
+    params.opcode = (op == Request::READ ? CUFILE_READ : CUFILE_WRITE);
     params.cookie = (void *)0;
     params.u.batch.devPtr_base = source_addr;
     params.u.batch.devPtr_offset = 0;

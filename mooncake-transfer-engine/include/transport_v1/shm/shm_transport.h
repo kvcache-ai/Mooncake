@@ -30,8 +30,8 @@ namespace v1 {
 class ShmThreadPool;
 
 struct ShmTask {
-    Transport::Request request;
-    volatile Transport::TransferStatusEnum status_word;
+    Request request;
+    volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
 };

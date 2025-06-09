@@ -15,23 +15,16 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
-#include <asm-generic/errno-base.h>
-#include <bits/stdint-uintn.h>
-#include <limits.h>
-#include <string.h>
-
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
+#include "common/types.h"
 #include "metadata/metadata.h"
 #include "transport/transport.h"
 #include "transport_v1/transport.h"
@@ -39,25 +32,9 @@
 
 namespace mooncake {
 namespace v1 {
-using TransferMetadata = mooncake::TransferMetadata;
-using TransferStatus = Transport::TransferStatus;
-using TransferStatusEnum = Transport::TransferStatusEnum;
-using TransferRequest = Transport::Request;
-using BatchID = Transport::BatchID;
-using BufferEntry = Transport::BufferEntry;
+
 class Batch;
-
-enum TransportType { RDMA = 0, SHM, GDS };
-
-const static int kSupportedTransportTypes = 3;
-
-using TEConfig = std::unordered_map<std::string, std::string>;
-const std::string TEConfigKeyLocalSegmentName = "local_segment_name";
-const std::string TEConfigKeyMetadataConnString = "metadata_conn_string";
-const std::string TEConfigKeyBindEthIP = "bind_eth_ip";
-const std::string TEConfigKeyBindEthPort = "bind_eth_port";
-const std::string TEConfigKeyTopology = "topology";
-const std::string TEConfigKeyRdmaDeviceList = "rdma_device_list";
+using TransferMetadata = mooncake::TransferMetadata;
 
 class TransferEngine {
    public:
@@ -106,7 +83,7 @@ class TransferEngine {
     Status freeBatch(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &request_list);
+                          const std::vector<Request> &request_list);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
@@ -122,13 +99,13 @@ class TransferEngine {
 
     void lazyFreeBatch();
 
-    TransportType getTransportType(const TransferRequest &request);
+    TransportType getTransportType(const Request &request);
 
    private:
     TEConfig conf_;
     std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::shared_ptr<Topology> local_topology_;
+    std::string segment_name_;
+    std::shared_ptr<Topology> topology_;
     bool available_;
 
     std::vector<std::shared_ptr<Transport>> transport_list_;

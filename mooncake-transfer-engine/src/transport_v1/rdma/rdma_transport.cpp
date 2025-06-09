@@ -144,7 +144,7 @@ Status RdmaTransport::submitTransferTasks(
         auto &task = rdma_batch->task_list[rdma_batch->task_list.size() - 1];
         task.request = request;
         task.num_slices = 0;
-        task.status_word = Transport::WAITING;
+        task.status_word = WAITING;
         task.transferred_bytes = 0;
         for (uint64_t offset = 0; offset < request.length;
              offset += block_size) {
@@ -172,7 +172,7 @@ Status RdmaTransport::submitTransferTasks(
     return Status::OK();
 }
 
-Transport::TransferStatus RdmaTransport::getTransferStatus(SubBatchRef batch,
+TransferStatus RdmaTransport::getTransferStatus(SubBatchRef batch,
                                                            int task_id) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch) return TransferStatus{INVALID, 0};
