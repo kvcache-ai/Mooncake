@@ -41,14 +41,27 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install system dependencies and build project
+      - name: Install system dependencies and configure project
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
           cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
+        shell: bash
+
+      - name: Build project
+        run: |
+          cd build
           sudo make install -j
+        shell: bash
+
+      - name: Build hook.so
+        run: |
+          cd mooncake-transfer-engine/nvlink-hook
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
         shell: bash
 
       - name: Run sccache stat for check

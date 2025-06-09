@@ -17,7 +17,6 @@
 
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
-#include <jsoncpp/json/json.h>
 
 #include <cstddef>
 #include <cstdint>

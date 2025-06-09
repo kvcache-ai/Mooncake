@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
 
 #include <fstream>
 #include <iostream>
