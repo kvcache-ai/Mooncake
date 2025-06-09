@@ -24,6 +24,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc"]'
+
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -33,7 +47,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP=ON -DUSE_ETCD=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
           sudo make install -j
         shell: bash
 

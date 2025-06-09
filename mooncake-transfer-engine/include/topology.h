@@ -16,7 +16,7 @@
 #define TOPOLOGY_H
 
 #include <glog/logging.h>
-#include <json/json.h>
+#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>

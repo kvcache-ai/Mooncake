@@ -23,6 +23,20 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -43,7 +57,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON
         make -j
         sudo make install
       shell: bash
@@ -156,6 +170,20 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -181,7 +209,7 @@ jobs:
         cd mooncake-transfer-engine
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON
         make -j
         sudo make install
       shell: bash
@@ -190,16 +218,16 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON
         make -j
         sudo make install
       shell: bash
-      # TODO: lack USE_CUDA and USE_NVMEOF
+      # TODO: lack USE_NVMEOF
 
     - name: Configure and build project with unit tests and examples
       run: |
         cd build
-        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON
         make -j
         sudo make install
       shell: bash
@@ -208,7 +236,7 @@ jobs:
     - name: Configure and build project
       run: |
         cd build
-        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON
         make -j
         sudo make install
       shell: bash
