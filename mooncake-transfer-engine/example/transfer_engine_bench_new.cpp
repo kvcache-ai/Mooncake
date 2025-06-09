@@ -211,7 +211,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
     }
-    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+    auto &detail = std::get<mooncake::v1::MemorySegmentDesc>(segment_desc->detail);
     uint64_t remote_base =
         (uint64_t)detail.buffers[thread_id % NR_SOCKETS].addr;
 

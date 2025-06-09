@@ -39,7 +39,7 @@ RdmaTransport::~RdmaTransport() { uninstall(); }
 
 Status RdmaTransport::install(
     std::string &local_segment_name,
-    std::shared_ptr<mooncake::TransferMetadata> metadata_manager,
+    std::shared_ptr<TransferMetadata> metadata_manager,
     std::shared_ptr<Topology> local_topology) {
     if (installed_) {
         return Status::InvalidArgument("cannot install for multiple times");

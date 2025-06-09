@@ -103,7 +103,7 @@ static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
 
 class RDMATransportTest : public ::testing::Test {
    public:
-    std::shared_ptr<mooncake::TransferMetadata> metadata_client;
+    std::shared_ptr<TransferMetadata> metadata_client;
     void *addr = nullptr;
     std::pair<std::string, uint16_t> hostname_port;
     std::unique_ptr<mooncake::TransferEngine> engine;

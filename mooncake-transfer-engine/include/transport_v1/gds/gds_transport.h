@@ -50,7 +50,7 @@ class GdsTransport : public Transport {
 
     virtual Status install(
         std::string &local_segment_name,
-        std::shared_ptr<mooncake::TransferMetadata> metadata_manager,
+        std::shared_ptr<TransferMetadata> metadata_manager,
         std::shared_ptr<Topology> local_topology);
 
     virtual Status uninstall();
@@ -86,7 +86,7 @@ class GdsTransport : public Transport {
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<mooncake::TransferMetadata> metadata_manager_;
+    std::shared_ptr<TransferMetadata> metadata_manager_;
 
     std::unordered_map<BatchID, int> batch_to_cufile_desc_;
     std::unordered_map<std::pair<SegmentHandle, uint64_t>,

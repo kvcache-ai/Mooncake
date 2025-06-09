@@ -25,8 +25,7 @@
 #include <vector>
 
 #include "common/types.h"
-#include "metadata/metadata.h"
-#include "transport/transport.h"
+#include "metadata/metadata_v1.h"
 #include "transport_v1/transport.h"
 #include "utility/memory_location.h"
 
@@ -34,8 +33,6 @@ namespace mooncake {
 namespace v1 {
 
 class Batch;
-using TransferMetadata = mooncake::TransferMetadata;
-
 class TransferEngine {
    public:
     TransferEngine();

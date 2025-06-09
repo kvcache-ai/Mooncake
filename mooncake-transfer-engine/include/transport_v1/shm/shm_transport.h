@@ -51,7 +51,7 @@ class ShmTransport : public Transport {
 
     virtual Status install(
         std::string &local_segment_name,
-        std::shared_ptr<mooncake::TransferMetadata> metadata_manager,
+        std::shared_ptr<TransferMetadata> metadata_manager,
         std::shared_ptr<Topology> local_topology);
 
     virtual Status uninstall();
@@ -90,7 +90,7 @@ class ShmTransport : public Transport {
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<mooncake::TransferMetadata> metadata_manager_;
+    std::shared_ptr<TransferMetadata> metadata_manager_;
     std::unique_ptr<ShmThreadPool> workers_;
 
     struct OpenedShmEntry {

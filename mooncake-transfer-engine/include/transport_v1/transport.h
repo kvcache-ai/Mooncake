@@ -29,7 +29,7 @@
 
 #include "common/types.h"
 #include "common/status.h"
-#include "metadata/metadata.h"
+#include "metadata/metadata_v1.h"
 #include "utility/memory_location.h"
 
 namespace mooncake {
