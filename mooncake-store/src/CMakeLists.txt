@@ -15,8 +15,7 @@ set(MOONCAKE_STORE_SOURCES
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_link_libraries(mooncake_store PUBLIC transfer_engine glog::glog gflags::gflags)
-
+target_link_libraries(mooncake_store PUBLIC transfer_engine glog::glog gflags::gflags zmq)
 
 # Master binary
 add_executable(mooncake_master master.cpp)

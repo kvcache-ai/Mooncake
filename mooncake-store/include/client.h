@@ -226,40 +226,6 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
-    /**
-     * @brief Try local memory copy first, fallback to transfer engine
-     * @param handles Buffer descriptors for the transfer
-     * @param slices Data slices to transfer
-     * @param is_write true for write operations (Put), false for read
-     * operations (Get)
-     * @return ErrorCode indicating success/failure
-     */
-    ErrorCode TryLocalOrTransfer(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, bool is_write);
-
-    /**
-     * @brief Check if local memory copy can be used instead of transfer engine
-     * @param handles Buffer descriptors for the transfer
-     * @param slices Data slices to transfer
-     * @return true if local copy is possible, false otherwise
-     */
-    bool IsLocalTransfer(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices);
-
-    /**
-     * @brief Perform local memory copy between handles and slices
-     * @param handles Buffer descriptors for the transfer
-     * @param slices Data slices to transfer
-     * @param is_write true for write operations (Put), false for read
-     * operations (Get)
-     * @return ErrorCode indicating success/failure
-     */
-    ErrorCode LocalMemoryCopy(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, bool is_write);
-
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;

@@ -31,10 +31,9 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     return true;
 });
 
-DEFINE_string(lmcache_controller_url, "",
-              "URL of the LMCache Controller for notifications(e.g. "
-              "http://localhost:8000/api/kv_events).  If empty,"
-              "notifications are disabled.");
+DEFINE_string(lmcache_controller_url, "tcp://localhost:9001",
+              "ZMQ URL of the LMCache Controller for notifications (e.g., "
+              "tcp://localhost:5555).  If empty, notifications are disabled.");
 
 int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
@@ -66,8 +65,9 @@ int main(int argc, char* argv[]) {
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

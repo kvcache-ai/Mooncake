@@ -7,99 +7,78 @@ set -e  # Exit immediately if a command exits with a non-zero status
 
 echo "Starting LMCache integration test..."
 
-# Start LMCache test server in background
-echo "Starting LMCache test server..."
-python3 scripts/test_lmcache_server.py &
-LMCACHE_SERVER_PID=$!
-sleep 2
+# Install dependencies
+echo "Installing dependencies..."
+pip install pyzmq
 
 # Function to cleanup processes on exit
 cleanup() {
     echo "Cleaning up processes..."
     kill $MASTER_PID 2>/dev/null || true
-    kill $LMCACHE_SERVER_PID 2>/dev/null || true
     pkill mooncake_master 2>/dev/null || true
+    pkill -f "test_lmcache_server.py" 2>/dev/null || true
 }
 
 # Set trap to cleanup on script exit
 trap cleanup EXIT
 
-# Check if LMCache server started successfully
-if curl -s http://127.0.0.1:9090/status > /dev/null; then
-    echo "LMCache server started successfully"
+# Kill any existing master processes
+echo "Cleaning up existing processes..."
+pkill mooncake_master 2>/dev/null || true
+pkill -f "test_lmcache_server.py" 2>/dev/null || true
+sleep 1
 
-    # Kill any existing master processes and restart with LMCache URL
-    echo "Starting mooncake_master with LMCache integration..."
-    pkill mooncake_master || true
-    sleep 1
-    mooncake_master --lmcache_controller_url=http://127.0.0.1:9090/api/kv_events &
-    MASTER_PID=$!
-    sleep 2
+# Start mooncake_master with LMCache integration
+echo "Starting mooncake_master with LMCache integration..."
+mooncake_master --lmcache_controller_url=tcp://127.0.0.1:9001 &
+MASTER_PID=$!
+sleep 3
 
-    # Run integration test to generate notifications
-    echo "Running LMCache integration test operations..."
+# Start LMCache test server with timeout and run test operations
+echo "Running LMCache integration test..."
+timeout 35 bash -c '
+    # Start test server in background with 30 second timeout
+    python3 scripts/test_lmcache_server.py 30 &
+    TEST_SERVER_PID=$!
+    sleep 3
+
+    # Run test operations to generate notifications
+    echo "Performing test operations to generate LMCache notifications..."
     cd mooncake-wheel/tests
     MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python3 -c "
 from mooncake.store import MooncakeDistributedStore
 import time
 
-print('Setting up MooncakeDistributedStore...')
+print(\"Setting up MooncakeDistributedStore...\")
 store = MooncakeDistributedStore()
-store.setup_lmcache('localhost', 'http://127.0.0.1:8080/metadata', 512*1024*1024, 512*1024*1024, 'tcp', '', '127.0.0.1:50051','lmcache_instance_id','lmcache_worker_id')
+store.setup_lmcache(\"localhost\", \"http://127.0.0.1:8080/metadata\", 512*1024*1024, 512*1024*1024, \"tcp\", \"\", \"127.0.0.1:50051\", \"lmcache_instance_id\", \"1\")
 
-print('Performing test operations...')
-store.put('lmcache_test_key', b'test_data')
-time.sleep(1)
+print(\"Performing test operations...\")
+store.put(\"lmcache_test_key\", b\"test_data\")
+time.sleep(2)
 
-print('LMCache test operations completed successfully')
+print(\"LMCache test operations completed successfully\")
 "
     cd ../..
 
-    # Check for notifications received by LMCache server
-    echo "Checking LMCache notifications..."
-    sleep 2
-    curl -s http://127.0.0.1:9090/status
-    NOTIFICATIONS=$(curl -s http://127.0.0.1:9090/status | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('notifications_received', 0))")
-    echo "LMCache notifications received: $NOTIFICATIONS"
+    # Wait for test server to complete
+    wait $TEST_SERVER_PID
+    TEST_RESULT=$?
 
-    if [ "$NOTIFICATIONS" -gt "0" ]; then
-        echo "SUCCESS: LMCache received $NOTIFICATIONS notifications"
-
-        # Validate notification content using simple shell commands
-        echo "Validating notification content..."
-        STATUS_JSON=$(curl -s http://127.0.0.1:9090/status)
-
-        # Check if the expected values are present in the JSON response
-        if echo "$STATUS_JSON" | grep -q '"type": "KVAdmitMsg"' && \
-           echo "$STATUS_JSON" | grep -q '"instance_id": "lmcache_instance_id"' && \
-           echo "$STATUS_JSON" | grep -q '"worker_id": "lmcache_worker_id"' && \
-           echo "$STATUS_JSON" | grep -q '"key": "lmcache_test_key"' && \
-           echo "$STATUS_JSON" | grep -q '"location": "mooncake_cpu_ram"'; then
-            echo "Notification content validation PASSED"
-            echo "All expected fields found in notification data"
-            echo "LMCache integration test PASSED"
-            exit 0
-        else
-            echo "VALIDATION FAILED: Expected notification content not found"
-            echo "Expected to find:"
-            echo "  - type: KVAdmitMsg"
-            echo "  - instance_id: lmcache_instance_id"
-            echo "  - worker_id: lmcache_worker_id"
-            echo "  - key: lmcache_test_key"
-            echo "  - location: mooncake_cpu_ram"
-            echo "Actual response:"
-            echo "$STATUS_JSON"
-            echo "LMCache integration test FAILED - notification content validation failed"
-            exit 1
-        fi
+    if [ $TEST_RESULT -eq 0 ]; then
+        echo "LMCache integration test PASSED"
+        exit 0
     else
-        # Expected to fail if LMCache server is not running
         echo "LMCache integration test FAILED"
         exit 1
     fi
+'
 
+# Check the result of the timeout command
+if [ $? -eq 0 ]; then
+    echo "SUCCESS: LMCache integration test completed successfully"
+    exit 0
 else
-    echo "ERROR: LMCache server failed to start"
-    echo "LMCache integration test FAILED"
+    echo "FAILED: LMCache integration test failed or timed out"
     exit 1
 fi

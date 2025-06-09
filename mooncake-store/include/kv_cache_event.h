@@ -16,7 +16,7 @@ struct KVAdmitMsg {
     KVAdmitMsg() = default;
 
     std::string instance_id;  // ID of the LMCache instance
-    std::string worker_id;    // Worker ID
+    int worker_id;            // Worker ID
     std::string key;          // Cache key
     std::string location;     // Location identifier
 
@@ -34,7 +34,7 @@ struct KVEvictMsg {
     KVEvictMsg() = default;
 
     std::string instance_id;          // ID of the LMCache instance
-    std::string worker_id;            // Worker ID
+    int worker_id;                    // Worker ID
     std::string key;                  // Cache key
     std::string location;             // Location identifier
     std::string type = "KVEvictMsg";  // Message type identifier

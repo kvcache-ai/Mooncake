@@ -5,7 +5,8 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <ylt/coro_http/coro_http_client.hpp>
+#include <zmq.hpp>
+#include <zmq_addon.hpp>
 
 namespace mooncake {
 
@@ -17,6 +18,8 @@ class LMCacheNotifier {
     /**
      * @brief Construct a new LMCache Notifier
      * @param controller_url The URL of the LMCache controller
+     *                       (for ZMQ, this will be the PULL socket address,
+     * e.g., "tcp://localhost:5555")
      */
     explicit LMCacheNotifier(std::string controller_url);
 
@@ -63,14 +66,16 @@ class LMCacheNotifier {
     void WorkerLoop();
 
     // Internal notification sending function
-    void SendNotificationInternal(cinatra::coro_http_client& client,
-                                  NotificationTask* task) const;
+    void SendNotificationInternal(NotificationTask* task);
 
     // Member variables
-    const std::string lmcache_controller_url_;
+    const std::string controller_address_;
     boost::lockfree::queue<NotificationTask*> notification_queue_{kQueueSize};
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
+
+    zmq::context_t zmq_context_;
+    zmq::socket_t zmq_socket_;
 };
 
 }  // namespace mooncake

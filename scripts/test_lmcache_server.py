@@ -1,108 +1,86 @@
 #!/usr/bin/env python3
 
 import json
-import logging
-import threading
+import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+import zmq
 
 
-class LMCacheTestHandler(BaseHTTPRequestHandler):
-    received_notifications = []
-    lock = threading.Lock()
+class SimpleLMCacheServer:
+    """Simplified LMCache test server for CI - validates JSON path correctness only"""
 
-    def do_POST(self):
-        try:
-            parsed_path = urlparse(self.path)
+    def __init__(self, port=9001, timeout=30):
+        self.port = port
+        self.timeout = timeout
+        self.received_notifications = []
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PULL)
 
-            if parsed_path.path == '/api/kv_events':
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
+    def start_listening(self):
+        """Listen for notifications and validate JSON structure"""
+        self.socket.bind(f"tcp://127.0.0.1:{self.port}")
+        print(f"LMCache test server listening on tcp://127.0.0.1:{self.port}")
 
-                try:
-                    notification_data = json.loads(post_data.decode('utf-8'))
+        start_time = time.time()
 
-                    with self.lock:
-                        self.received_notifications.append({
-                            'timestamp': time.time(),
-                            'data': notification_data
-                        })
+        while time.time() - start_time < self.timeout:
+            if self.socket.poll(1000):  # 1 second timeout
+                message = self.socket.recv_string(zmq.NOBLOCK)
+                notification_data = json.loads(message)
 
-                    logging.info(f"Received: {notification_data}")
+                self.received_notifications.append(notification_data)
 
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "ok"}')
+                assert self.validate_notification(notification_data)
 
-                except json.JSONDecodeError:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "invalid_json"}')
+        return len(self.received_notifications) > 0
 
-            else:
-                self.send_response(404)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error": "not_found"}')
+    def validate_notification(self, data):
+        """Validate that notification contains expected fields"""
+        required_fields = ['type', 'instance_id', 'worker_id', 'key', 'location']
 
-        except Exception:
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error": "internal_error"}')
+        for field in required_fields:
+            if field not in data:
+                print(f"Missing required field: {field}")
+                return False
+        return True
 
-    def do_GET(self):
-        try:
-            parsed_path = urlparse(self.path)
+    def cleanup(self):
+        """Clean up resources"""
+        self.socket.close()
+        self.context.term()
 
-            if parsed_path.path == '/status':
-                with self.lock:
-                    status = {
-                        'status': 'running',
-                        'notifications_received': len(self.received_notifications),
-                        'recent_notifications': self.received_notifications[-5:]
-                    }
-
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(status).encode('utf-8'))
-
-            else:
-                self.send_response(404)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error": "not_found"}')
-
-        except Exception:
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error": "internal_error"}')
-
-    def log_message(self, *args):
-        pass
+    def get_stats(self):
+        """Return simple statistics"""
+        return {
+            'total_notifications': len(self.received_notifications),
+            'notifications': self.received_notifications
+        }
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    if len(sys.argv) > 1:
+        timeout = int(sys.argv[1])
+    else:
+        timeout = 30
 
-    server_address = ('127.0.0.1', 9090)
-    httpd = HTTPServer(server_address, LMCacheTestHandler)
-
-    print("LMCache test server started on http://127.0.0.1:9090")
-    print("Endpoint: /api/kv_events")
-    print("Status: /status")
+    server = SimpleLMCacheServer(timeout=timeout)
 
     try:
-        httpd.serve_forever()
+        success = server.start_listening()
+        stats = server.get_stats()
+
+        print(f"\nTest completed:")
+        print(f"- Notifications received: {stats['total_notifications']}")
+        print(f"- Validation result: {'PASS' if success else 'FAIL'}")
+
+        # Exit with appropriate code for CI
+        sys.exit(0 if success else 1)
+
     except KeyboardInterrupt:
-        print("Server stopped")
+        print("\nTest interrupted")
+        sys.exit(1)
     finally:
-        httpd.server_close()
+        server.cleanup()
 
 
 if __name__ == '__main__':

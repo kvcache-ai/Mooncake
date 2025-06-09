@@ -1,19 +1,21 @@
 #include "kv_cache_publisher.h"
 
-#include <async_simple/coro/SyncAwait.h>
 #include <glog/logging.h>
+#include <zmq.h>
 
 #include <iguana/json_writer.hpp>
 #include <utility>
-#include <ylt/coro_http/coro_http_client.hpp>
 
 #include "kv_cache_event.h"
 
 namespace mooncake {
 
-LMCacheNotifier::LMCacheNotifier(std::string controller_url)
-    : lmcache_controller_url_(std::move(controller_url)) {
+LMCacheNotifier::LMCacheNotifier(std::string controller_zmq_address)
+    : controller_address_(std::move(controller_zmq_address)),
+      zmq_context_(1),
+      zmq_socket_(zmq_context_, zmq::socket_type::push) {
     running_ = true;
+    zmq_socket_.connect(controller_address_);
     worker_thread_ = std::thread(&LMCacheNotifier::WorkerLoop, this);
 }
 
@@ -59,18 +61,15 @@ void LMCacheNotifier::EnqueueTask(NotificationEventType event_type,
 
 void LMCacheNotifier::WorkerLoop() {
     LOG(INFO) << "action=notification_thread_started";
-    cinatra::coro_http_client client{};
-    async_simple::coro::syncAwait(client.connect(lmcache_controller_url_));
-
-    LOG(INFO) << "LMCacheNotifier::WorkerLoop started, connected to "
-              << lmcache_controller_url_;
+    LOG(INFO)
+        << "LMCacheNotifier::WorkerLoop started, PUSH socket connected to "
+        << controller_address_;
     while (running_) {
         NotificationTask* task = nullptr;
         bool has_task = notification_queue_.pop(task);
 
         if (has_task && task) {
-            // Send notification
-            SendNotificationInternal(client, task);
+            SendNotificationInternal(task);
 
             // Clean up task
             delete task;
@@ -84,8 +83,7 @@ void LMCacheNotifier::WorkerLoop() {
     LOG(INFO) << "action=notification_thread_stopped";
 }
 
-void LMCacheNotifier::SendNotificationInternal(
-    cinatra::coro_http_client& client, NotificationTask* task) const {
+void LMCacheNotifier::SendNotificationInternal(NotificationTask* task) {
     // Create the appropriate message based on event type
     std::string json_str;
     if (task->type == NotificationEventType::ADMIT) {
@@ -93,7 +91,8 @@ void LMCacheNotifier::SendNotificationInternal(
         msg.key = task->key;
         msg.location = task->location_str;
         msg.instance_id = (task->instance_id ? task->instance_id.value() : "");
-        msg.worker_id = (task->worker_id ? task->worker_id.value() : "");
+        msg.worker_id =
+            (task->worker_id ? std::stoi(task->worker_id.value()) : 0);
 
         struct_json::to_json(msg, json_str);
 
@@ -102,7 +101,8 @@ void LMCacheNotifier::SendNotificationInternal(
         msg.key = task->key;
         msg.location = task->location_str;
         msg.instance_id = (task->instance_id ? task->instance_id.value() : "");
-        msg.worker_id = (task->worker_id ? task->worker_id.value() : "");
+        msg.worker_id =
+            (task->worker_id ? std::stoi(task->worker_id.value()) : 0);
 
         struct_json::to_json(msg, json_str);
     } else {
@@ -111,17 +111,25 @@ void LMCacheNotifier::SendNotificationInternal(
                    << static_cast<int>(task->type);
     }
 
-    auto resp = async_simple::coro::syncAwait(client.async_post(
-        lmcache_controller_url_, json_str, cinatra::req_content_type::text));
-    if (resp.status != 200) {
-        LOG(WARNING) << "action=lmcache_notification_failed, "
-                        "url="
-                     << lmcache_controller_url_ << ", status=" << resp.status;
-    } else {
-        VLOG(1) << "action=lmcache_notification_sent, "
-                   "url="
-                << lmcache_controller_url_ << ", status=" << resp.status;
+    if (json_str.empty()) {
+        return;
+    }
+
+    zmq::message_t zmq_msg(json_str.begin(), json_str.end());
+    try {
+        auto res = zmq_socket_.send(zmq_msg, zmq::send_flags::none);
+        if (res.has_value()) {
+            VLOG(1) << "action=lmcache_notification_sent, address="
+                    << controller_address_ << ", bytes_sent=" << res.value();
+        } else {
+            LOG(WARNING)
+                << "action=lmcache_notification_failed_to_send, address="
+                << controller_address_;
+        }
+    } catch (const zmq::error_t& e) {
+        LOG(WARNING) << "action=lmcache_notification_zmq_error, address="
+                     << controller_address_ << ", error=" << e.what()
+                     << ", errno=" << e.num();
     }
 }
-
 }  // namespace mooncake
