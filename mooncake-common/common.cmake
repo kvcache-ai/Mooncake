@@ -72,13 +72,13 @@ endif()
 
 
 if (USE_NVMEOF)
-  set_option(USE_CUDA ON)
+  set(USE_CUDA ON)
   add_compile_definitions(USE_NVMEOF)
   message(STATUS "NVMe-oF support is enabled")
 endif()
 
 if (USE_NVLINK)
-  set_option(USE_CUDA ON)
+  set(USE_CUDA ON)
   add_compile_definitions(USE_NVLINK)
   message(STATUS "NVLink support is enabled")
 endif()
