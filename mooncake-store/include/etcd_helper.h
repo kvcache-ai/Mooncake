@@ -11,18 +11,19 @@ namespace mooncake {
  * @brief A helper class for etcd operations.
  *        This class is used to handle the requests to the etcd cluster.
  *        All methods of this class are thread-safe.
-*/
+ */
 class EtcdHelper {
-public:
+   public:
     /*
-     * @brief Connect to the etcd store client. There is a global etcd client in libetcd.
-     *        It is used for all the etcd operations for mooncake-store. This function
-     *        ensures the client is only connected once.
+     * @brief Connect to the etcd store client. There is a global etcd client in
+     * libetcd. It is used for all the etcd operations for mooncake-store. This
+     * function ensures the client is only connected once.
      * @param etcd_endpoints: The endpoints of the etcd store client.
      *        Multiple endpoints are separated by semicolons.
      * @return: Error code.
      */
-    static ErrorCode ConnectToEtcdStoreClient(const std::string& etcd_endpoints);
+    static ErrorCode ConnectToEtcdStoreClient(
+        const std::string& etcd_endpoints);
 
     /*
      * @brief Get the value of a key from the etcd.
@@ -33,7 +34,7 @@ public:
      * @return: Error code.
      */
     static ErrorCode Get(const char* key, const size_t key_size,
-        std::string& value, EtcdRevisionId& revision_id);
+                         std::string& value, EtcdRevisionId& revision_id);
 
     /*
      * @brief Create a key-value pair that binds to a given lease.
@@ -46,7 +47,9 @@ public:
      * @return: Error code.
      */
     static ErrorCode CreateWithLease(const char* key, const size_t key_size,
-        const char* value, const size_t value_size, EtcdLeaseId lease_id, EtcdRevisionId& revision_id);
+                                     const char* value, const size_t value_size,
+                                     EtcdLeaseId lease_id,
+                                     EtcdRevisionId& revision_id);
 
     /*
      * @brief Grant a lease from the etcd.
@@ -71,12 +74,12 @@ public:
      * @return: Error code.
      */
     static ErrorCode CancelWatch(const char* key, const size_t key_size);
-    
+
     /*
      * @brief Keep a lease alive. This is a blocking function.
      * @param lease_id: The lease id to keep alive.
      * @return: Error code.
-    */
+     */
     static ErrorCode KeepAlive(EtcdLeaseId lease_id);
 
     /*
@@ -87,7 +90,8 @@ public:
      * @return: Error code.
      */
     static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
-private:
+
+   private:
     // Variables that are used to ensure the etcd client
     // is only connected once.
     static std::string connected_endpoints_;

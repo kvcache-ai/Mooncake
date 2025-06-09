@@ -1,4 +1,7 @@
 #pragma once
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -7,8 +10,6 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
-#include <ylt/struct_json/json_reader.h>
-#include <ylt/struct_json/json_writer.h>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
@@ -98,9 +99,11 @@ class WrappedMasterService {
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                         double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                         double eviction_high_watermark_ratio =
+                             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                          ViewVersionId view_version = 0)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_high_watermark_ratio),
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
+                          eviction_high_watermark_ratio),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
           view_version_(view_version) {
@@ -162,8 +165,9 @@ class WrappedMasterService {
                 response = GetReplicaList(std::string(key));
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                for(size_t i = 0; i < response.replica_list.size(); i++) {
-                    for(const auto& handle : response.replica_list[i].buffer_descriptors) {
+                for (size_t i = 0; i < response.replica_list.size(); i++) {
+                    for (const auto& handle :
+                         response.replica_list[i].buffer_descriptors) {
                         std::string tmp = "";
                         struct_json::to_json(handle, tmp);
                         ss += tmp;
@@ -179,9 +183,9 @@ class WrappedMasterService {
             [&](coro_http_request& req, coro_http_response& resp) {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                std::vector<std::string>  all_keys;
+                std::vector<std::string> all_keys;
                 master_service_.GetAllKeys(all_keys);
-                for(const auto & key : all_keys) {
+                for (const auto& key : all_keys) {
                     ss += key;
                     ss += "\n";
                 }
@@ -194,9 +198,9 @@ class WrappedMasterService {
             [&](coro_http_request& req, coro_http_response& resp) {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                std::vector<std::string>  all_segments;
+                std::vector<std::string> all_segments;
                 master_service_.GetAllSegments(all_segments);
-                for(const auto & segment: all_segments) {
+                for (const auto& segment : all_segments) {
                     ss += segment;
                     ss += "\n";
                 }
@@ -211,8 +215,8 @@ class WrappedMasterService {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
                 size_t used = 0, capacity = 0;
-                if(master_service_.QuerySegments(std::string(segment), used, capacity) 
-                   == ErrorCode::OK) {
+                if (master_service_.QuerySegments(std::string(segment), used,
+                                                  capacity) == ErrorCode::OK) {
                     ss += segment;
                     ss += "\n";
                     ss += "Used(bytes): ";
@@ -495,9 +499,9 @@ class WrappedMasterService {
         timer.LogRequest("action=ping");
 
         MasterMetricManager::instance().inc_ping_requests();
-        
+
         PingResponse response(view_version_, ErrorCode::OK);
-        
+
         timer.LogResponseJson(response);
         return response;
     }
@@ -510,14 +514,16 @@ class WrappedMasterService {
     ViewVersionId view_version_;
 };
 
-inline void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service) {
+inline void RegisterRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

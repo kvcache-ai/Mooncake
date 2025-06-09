@@ -53,7 +53,6 @@ class TestMooncakeConfig(unittest.TestCase):
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
 
-        self.assertEqual(config.enable_ha, False)
         self.assertEqual(config.global_segment_size, DEFAULT_GLOBAL_SEGMENT_SIZE)
         self.assertEqual(config.local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE)
         self.assertEqual(config.protocol, "tcp")

@@ -2,14 +2,15 @@
 #define MOONCAKE_HA_HELPER_H_
 
 #include <glog/logging.h>
-#include <string>
-#include <thread>
+
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <thread>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "rpc_service.h"
 #include "etcd_helper.h"
+#include "rpc_service.h"
 #include "types.h"
 
 namespace mooncake {
@@ -23,15 +24,16 @@ inline const char* const MASTER_VIEW_KEY = "mooncake-store/master_view";
  *        one master can be elected as leader to serve client requests.
  *        Each master view is associated with a unique version id, which
  *        is incremented monotonically each time the master view is changed.
-*/
+ */
 class MasterViewHelper {
-public:
+   public:
     MasterViewHelper(const MasterViewHelper&) = delete;
     MasterViewHelper& operator=(const MasterViewHelper&) = delete;
     MasterViewHelper() = default;
 
     /*
-     * @brief Connect to the etcd cluster. This function should be called at first
+     * @brief Connect to the etcd cluster. This function should be called at
+     * first
      * @param etcd_endpoints: The endpoints of the etcd store client.
      *        Multiple endpoints are separated by semicolons.
      * @return: Error code.
@@ -44,11 +46,12 @@ public:
      * @param version: Output param, the version of the new master view.
      * @param lease_id: Output param, the lease id of the leader.
      */
-    void ElectLeader(const std::string& master_address, ViewVersionId& version, EtcdLeaseId& lease_id);
+    void ElectLeader(const std::string& master_address, ViewVersionId& version,
+                     EtcdLeaseId& lease_id);
 
     /*
-     * @brief Keep the master to be the leader. This function blocks until the master is
-     *        no longer the leader.
+     * @brief Keep the master to be the leader. This function blocks until the
+     * master is no longer the leader.
      * @param lease_id: The lease id of the leader.
      */
     void KeepLeader(EtcdLeaseId lease_id);
@@ -59,7 +62,8 @@ public:
      * @param version: Output param, the version of the master view.
      * @return: Error code.
      */
-    ErrorCode GetMasterView(std::string& master_address, ViewVersionId& version);
+    ErrorCode GetMasterView(std::string& master_address,
+                            ViewVersionId& version);
 };
 
 /*
@@ -68,19 +72,20 @@ public:
  *        1. Elect local master to be the leader.
  *        2. Start the master service when it is elected as leader.
  *        3. Stop the master service when it is no longer the leader.
-*/
+ */
 class MasterServiceSupervisor {
-public:
-    MasterServiceSupervisor(int port, int server_thread_num, bool enable_gc,
-                          bool enable_metric_reporting, int metrics_port,
-                          int64_t default_kv_lease_ttl, double eviction_ratio,
-                          double eviction_high_watermark_ratio,
-                          const std::string& etcd_endpoints = "0.0.0.0:2379",
-                          const std::string& local_hostname = "0.0.0.0:50051");
+   public:
+    MasterServiceSupervisor(
+        int port, int server_thread_num, bool enable_gc,
+        bool enable_metric_reporting, int metrics_port,
+        int64_t default_kv_lease_ttl, double eviction_ratio,
+        double eviction_high_watermark_ratio,
+        const std::string& etcd_endpoints = "0.0.0.0:2379",
+        const std::string& local_hostname = "0.0.0.0:50051");
     int Start();
     ~MasterServiceSupervisor();
 
-private:
+   private:
     // Master service parameters
     int port_;
     int server_thread_num_;
