@@ -17,8 +17,7 @@ def get_client(store):
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
-    master_server_entries = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    enable_ha = False
+    master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
     retcode = store.setup(
         local_hostname, 
@@ -27,8 +26,7 @@ def get_client(store):
         local_buffer_size, 
         protocol, 
         device_name,
-        master_server_entries,
-        enable_ha
+        master_server_address
     )
     
     if retcode:

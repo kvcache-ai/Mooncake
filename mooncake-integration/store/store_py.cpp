@@ -148,8 +148,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   size_t local_buffer_size,
                                   const std::string &protocol,
                                   const std::string &rdma_devices,
-                                  const std::string &master_server_entries,
-                                  const bool enable_ha) {
+                                  const std::string &master_server_address) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -171,7 +170,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
     auto client_opt =
         mooncake::Client::Create(this->local_hostname, metadata_server,
-                                 protocol, args, master_server_entries, enable_ha);
+                                 protocol, args, master_server_address);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return 1;

@@ -18,8 +18,7 @@ class TestInstance:
         metadata_server = os.getenv("METADATA_ADDR", "10.1.101.3:2379")
         global_segment_size = 3200 * 1024 * 1024
         local_buffer_size = 512 * 1024 * 1024
-        master_server_entries = os.getenv("MASTER_SERVER", "10.1.101.3:50051")
-        enable_ha = False
+        master_server_address = os.getenv("MASTER_SERVER", "10.1.101.3:50051")
         cls.value_length = 1 * 1024 * 1024
         cls.max_requests = 10000
         retcode = cls.store.setup(local_hostname, 
@@ -28,8 +27,7 @@ class TestInstance:
                                   local_buffer_size, 
                                   protocol, 
                                   device_name,
-                                  master_server_entries,
-                                  enable_ha)
+                                  master_server_address)
         if retcode:
             exit(1)
         time.sleep(1)  # Give some time for initialization

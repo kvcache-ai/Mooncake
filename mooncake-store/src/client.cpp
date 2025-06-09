@@ -109,10 +109,12 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     return whitelst_filters;
 }
 
-ErrorCode Client::ConnectToMaster(const std::string& master_entries, bool enable_ha) {
-    if (enable_ha) {
-        // Get master address from ETCD
-        auto err = master_view_helper_.ConnectToEtcd(master_entries);
+ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
+    if (master_server_entry.find("etcd://") == 0) {
+        std::string etcd_entry = master_server_entry.substr(strlen("etcd://"));
+
+        // Get master address from etcd
+        auto err = master_view_helper_.ConnectToEtcd(etcd_entry);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to etcd";
             return err;
@@ -131,13 +133,15 @@ ErrorCode Client::ConnectToMaster(const std::string& master_entries, bool enable
             return err;
         }
 
-        // Start Ping thread to monitor master view changes and remount segments if needed
+        // Start Ping thread to monitor master view changes and remount segments
+        // if needed
         ping_running_ = true;
-        ping_thread_ = std::thread(&Client::PingThreadFunc, this, master_version);
+        ping_thread_ =
+            std::thread(&Client::PingThreadFunc, this, master_version);
 
         return ErrorCode::OK;
     } else {
-        return master_client_.Connect(master_entries);
+        return master_client_.Connect(master_server_entry);
     }
 }
 
@@ -181,11 +185,11 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_entries, bool enable_ha) {
+    const std::string& master_server_entry) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
-    ErrorCode err = client->ConnectToMaster(master_entries, enable_ha);
+    ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
     }
@@ -716,7 +720,7 @@ void Client::PingThreadFunc(int current_version) {
     // Increment after a ping failure, reset after a ping success
     int ping_fail_count = 0;
     // Set to true when there is a view change.
-    // When set true, will try to remount periodically. 
+    // When set true, will try to remount periodically.
     bool need_remount = false;
 
     auto remount_segment = [this]() {
@@ -724,12 +728,15 @@ void Client::PingThreadFunc(int current_version) {
         for (auto it : mounted_segments_) {
             auto& name = it.first;
             auto& segment = it.second;
-            auto err = master_client_.MountSegment(name, segment.buffer, segment.size).error_code;
-            // If err is INVALID_PARAMS, it means the segment is already mounted,
-            // or cannot be mounted with current parameters. Either way, there is
-            // nothing we can do for this segment.
+            auto err =
+                master_client_.MountSegment(name, segment.buffer, segment.size)
+                    .error_code;
+            // If err is INVALID_PARAMS, it means the segment is already
+            // mounted, or cannot be mounted with current parameters. Either
+            // way, there is nothing we can do for this segment.
             if (err != ErrorCode::OK && err != ErrorCode::INVALID_PARAMS) {
-                LOG(ERROR) << "Failed to remount segment " << name << ": " << toString(err);
+                LOG(ERROR) << "Failed to remount segment " << name << ": "
+                           << toString(err);
                 return err;
             }
         }
@@ -743,7 +750,8 @@ void Client::PingThreadFunc(int current_version) {
             if (ping_result.view_version > current_version) {
                 // There is an unknown view change, we need to update
                 // local view version and remount segments.
-                LOG(ERROR) << "Master view version has changed, need to remount segments";
+                LOG(ERROR) << "Master view version has changed, need to "
+                              "remount segments";
                 current_version = ping_result.view_version;
                 need_remount = true;
             }
@@ -752,33 +760,40 @@ void Client::PingThreadFunc(int current_version) {
                 LOG(INFO) << "Successfully remounted all segments";
                 need_remount = false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(success_ping_interval_ms));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(success_ping_interval_ms));
             continue;
         }
 
-        ping_fail_count++;        
+        ping_fail_count++;
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
-            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
             continue;
         }
 
-        // Too many ping failures, we need to check if the master view has changed
+        // Too many ping failures, we need to check if the master view has
+        // changed
         LOG(ERROR) << "Failed to ping master for " << ping_fail_count
-                    << " times, try to get latest master view and reconnect";
+                   << " times, try to get latest master view and reconnect";
         std::string master_address;
         ViewVersionId next_version = 0;
-        auto err = master_view_helper_.GetMasterView(master_address, next_version);
+        auto err =
+            master_view_helper_.GetMasterView(master_address, next_version);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to get new master view: " << toString(err);
-            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
             continue;
         }
 
         err = master_client_.Connect(master_address);
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master " << master_address << ": " << toString(err);
-            std::this_thread::sleep_for(std::chrono::milliseconds(fail_ping_interval_ms));
+            LOG(ERROR) << "Failed to connect to master " << master_address
+                       << ": " << toString(err);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
             continue;
         }
 

@@ -21,8 +21,7 @@ class MooncakeStoreService:
         "local_buffer_size": 1073741824,
         "protocol": "tcp",
         "device_name": "",
-        "master_server_entries": "localhost:8081",
-        "enable_ha": false
+        "master_server_address": "localhost:8081"
     }
 
     Explanation of Key Fields:
@@ -32,8 +31,7 @@ class MooncakeStoreService:
     - local_buffer_size: Size of the local buffer in bytes.
     - protocol: Communication protocol (tcp or rdma).
     - device_name: The name of the device to use.
-    - master_server_entries: The entries of the master server.
-    - enable_ha: Whether to enable high availability.
+    - master_server_address: The address of the master server.
     """
 
     def __init__(self, config_path: str = None, cli_config: dict = None):
@@ -74,8 +72,7 @@ class MooncakeStoreService:
                 self.config.local_buffer_size,
                 self.config.protocol,
                 self.config.device_name,
-                self.config.master_server_entries,
-                self.config.enable_ha
+                self.config.master_server_address
             )
             if ret != 0:
                 raise RuntimeError("Store initialization failed")

@@ -15,8 +15,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.valid_config = {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "master_server_entries": "localhost:8081",
-            "enable_ha": False,
+            "master_server_address": "localhost:8081",
             "global_segment_size": 3355443200,
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
@@ -38,8 +37,7 @@ class TestMooncakeConfig(unittest.TestCase):
 
         self.assertEqual(config.local_hostname, "localhost")
         self.assertEqual(config.metadata_server, "localhost:8080")
-        self.assertEqual(config.master_server_entries, "localhost:8081")
-        self.assertEqual(config.enable_ha, False)
+        self.assertEqual(config.master_server_address, "localhost:8081")
         self.assertEqual(config.global_segment_size, 3355443200)
         self.assertEqual(config.local_buffer_size, 1073741824)
         self.assertEqual(config.protocol, "tcp")
@@ -50,7 +48,7 @@ class TestMooncakeConfig(unittest.TestCase):
         minimal_config = {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "master_server_entries": "localhost:8081"
+            "master_server_address": "localhost:8081"
         }
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
@@ -63,7 +61,7 @@ class TestMooncakeConfig(unittest.TestCase):
 
     def test_missing_required_field(self):
         """Test missing required field"""
-        for field in ["local_hostname", "metadata_server", "master_server_entries"]:
+        for field in ["local_hostname", "metadata_server", "master_server_address"]:
             with self.subTest(field=field):
                 invalid_config = self.valid_config.copy()
                 invalid_config.pop(field)
