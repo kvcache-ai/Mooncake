@@ -15,166 +15,237 @@
 #include "transfer_engine_v1.h"
 
 #include <fstream>
+#include <random>
 
 #include "metadata/handshake.h"
 #include "transport_v1/rdma/rdma_transport.h"
 #include "transport_v1/shm/shm_transport.h"
 
+#define CHECK_STATUS(cmd)                \
+    do {                                 \
+        Status status = cmd;             \
+        if (!status.ok()) return status; \
+    } while (0)
+
 namespace mooncake {
 namespace v1 {
 
 struct Batch {
-    Batch() { sub_batch.resize(kSupportedTransportTypes, nullptr); }
+    Batch() {
+        sub_batch.resize(kSupportedTransportTypes, nullptr);
+        next_sub_task_id.resize(kSupportedTransportTypes, 0);
+    }
+
     ~Batch() {
         for (auto &entry : sub_batch) delete entry;
     }
 
     std::vector<Transport::SubBatchRef> sub_batch;
+    std::vector<int> next_sub_task_id;
     std::vector<std::pair<TransportType, size_t>> task_id_lookup;
     size_t max_size;
 };
 
-static std::string loadTopologyJsonFile(const std::string &path) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return "";
-    }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::string content = buffer.str();
-    file.close();
-    return content;
-}
-
-int TransferEngine::registerRdmaTransport() {
-    auto transport = std::make_shared<RdmaTransport>();
-    auto status =
-        transport->install(local_server_name_, metadata_, local_topology_);
+TransferEngine::TransferEngine() : available_(false) {
+    auto status = construct();
     if (!status.ok()) {
-        return (int)status.code();
+        LOG(ERROR) << "Failed to construct Transfer Engine instance: "
+                   << status.ToString();
+    } else {
+        available_ = true;
     }
-    transport_list_[RDMA] = transport;
-    return 0;
 }
 
-int TransferEngine::registerShmTransport() {
-    auto transport = std::make_shared<ShmTransport>();
-    auto status =
-        transport->install(local_server_name_, metadata_, local_topology_);
+TransferEngine::TransferEngine(TEConfig &conf)
+    : conf_(conf), available_(false) {
+    auto status = construct();
     if (!status.ok()) {
-        return (int)status.code();
+        LOG(ERROR) << "Failed to construct Transfer Engine instance: "
+                   << status.ToString();
+    } else {
+        available_ = true;
     }
-    transport_list_[SHM] = transport;
-    return 0;
 }
 
-int TransferEngine::registerLocalSegment() {
-    RpcMetaDesc desc;
-    auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
-    if (ip_address)
-        desc.ip_or_host_name = ip_address;
-    else {
+TransferEngine::~TransferEngine() { deconstruct(); }
+
+static std::string generateRandomHexString(size_t nbytes) {
+    const std::string kHexCharSet = "0123456789abcdef";
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::string result;
+    result.reserve(nbytes * 2);
+    for (size_t i = 0; i < nbytes; ++i) {
+        unsigned char byte = gen() % 256;
+        result.push_back(kHexCharSet[(byte >> 4) & 0x0f]);
+        result.push_back(kHexCharSet[byte & 0x0f]);
+    }
+    return result;
+}
+
+static std::string generateSegmentName(const TEConfig &conf) {
+    if (conf.count(TEConfigKeyLocalSegmentName)) {
+        return conf.at(TEConfigKeyLocalSegmentName);
+    }
+    return std::string("segment-") + generateRandomHexString(4);
+}
+
+static std::string getMetadataConnString(const TEConfig &conf) {
+    if (conf.count(TEConfigKeyMetadataConnString)) {
+        return conf.at(TEConfigKeyMetadataConnString);
+    }
+    return "P2PHANDSHAKE";
+}
+
+static Status getEthIpPort(RpcMetaDesc &desc, const TEConfig &conf) {
+    if (conf.count(TEConfigKeyBindEthIP)) {
+        desc.ip_or_host_name = conf.at(TEConfigKeyBindEthIP);
+    }
+    if (desc.ip_or_host_name.empty()) {
         auto ip_list = findLocalIpAddresses();
-        if (ip_list.empty()) {
-            LOG(ERROR) << "not valid LAN address found";
-            return -1;
-        } else {
-            desc.ip_or_host_name = ip_list[0];
-        }
+        desc.ip_or_host_name = ip_list.empty() ? "127.0.0.1" : ip_list[0];
     }
 
-    desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+    desc.rpc_port = 0;
+    if (conf.count(TEConfigKeyBindEthPort)) {
+        desc.rpc_port = std::atoi(conf.at(TEConfigKeyBindEthPort).c_str());
+    }
     if (desc.rpc_port == 0) {
-        LOG(ERROR) << "not valid port for serving local TCP service";
-        return -1;
+        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
     }
 
-    LOG(INFO) << "Transfer Engine uses address " << desc.ip_or_host_name
-              << " and port " << desc.rpc_port
+    return desc.rpc_port == 0
+               ? Status::Socket("not ethernet port found for out-of-band comm")
+               : Status::OK();
+}
+
+std::vector<std::string> splitString(const std::string &str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(str);
+    while (std::getline(tokenStream, token, delimiter)) {
+        std::string cleanedToken;
+        for (char c : token) {
+            if (!std::isspace(static_cast<unsigned char>(c))) cleanedToken += c;
+        }
+        tokens.push_back(cleanedToken);
+    }
+    return tokens;
+}
+
+std::vector<std::string> getRdmaDeviceList(const TEConfig &conf) {
+    if (!conf.count(TEConfigKeyRdmaDeviceList)) {
+        return {};
+    }
+    return splitString(conf.at(TEConfigKeyRdmaDeviceList), ',');
+}
+
+Status TransferEngine::construct() {
+    transport_list_.resize(kSupportedTransportTypes, nullptr);
+    local_server_name_ = generateSegmentName(conf_);
+    metadata_ =
+        std::make_shared<TransferMetadata>(getMetadataConnString(conf_));
+
+    RpcMetaDesc rpc_desc;
+    CHECK_STATUS(getEthIpPort(rpc_desc, conf_));
+    metadata_->addRpcMetaEntry(local_server_name_, rpc_desc);
+
+    LOG(INFO) << "Transfer Engine uses address " << rpc_desc.ip_or_host_name
+              << " and port " << rpc_desc.rpc_port
               << " for serving local TCP service";
 
-    return metadata_->addRpcMetaEntry(local_server_name_, desc);
-}
-
-int TransferEngine::buildTopology() {
-    if (getenv("MC_CUSTOM_TOPO_JSON")) {
-        auto path = getenv("MC_CUSTOM_TOPO_JSON");
-        auto topo_json = loadTopologyJsonFile(path);
-        if (!topo_json.empty())
-            local_topology_->parse(topo_json);
-        else {
-            LOG(WARNING) << "Unable to read custom topology file from " << path
-                         << ", fall back to auto-detect";
-            local_topology_->discover(filter_);
-        }
-    } else {
-        local_topology_->discover(filter_);
+    local_topology_ = std::make_shared<Topology>();
+    if (conf_.count(TEConfigKeyTopology)) {
+        auto topology_data = conf_.at(TEConfigKeyTopology);
+        if (!topology_data.empty()) local_topology_->parse(topology_data);
     }
-    return 0;
-}
 
-int TransferEngine::init(const std::string &metadata_conn_string,
-                         const std::string &local_server_name) {
-    transport_list_.resize(kSupportedTransportTypes, nullptr);
-    local_server_name_ = local_server_name;
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-    int rc = registerLocalSegment();
-    if (rc) return rc;
-
-    rc = buildTopology();
-    if (rc) return rc;
-
+    auto rdma_device_list = getRdmaDeviceList(conf_);
+    local_topology_->discover(rdma_device_list);
     if (local_topology_->getHcaList().size() > 0) {
-        rc = registerRdmaTransport();
-        if (rc) return rc;
+        CHECK_STATUS(registerRdmaTransport());
     }
-
-    // rc = registerShmTransport();
-    // if (rc) return rc;
-
-    return 0;
+    // TODO other protocols
+    return Status::OK();
 }
 
-int TransferEngine::freeEngine() {
+Status TransferEngine::registerRdmaTransport() {
+    auto transport = std::make_shared<RdmaTransport>();
+    CHECK_STATUS(
+        transport->install(local_server_name_, metadata_, local_topology_));
+    transport_list_[RDMA] = transport;
+    return Status::OK();
+}
+
+Status TransferEngine::deconstruct() {
     if (metadata_) {
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();
     }
     transport_list_.clear();
-    return 0;
+    return Status::OK();
 }
 
-int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
-
-std::string TransferEngine::getLocalIpAndPort() {
-    return metadata_->localRpcMeta().ip_or_host_name + ":" +
-           std::to_string(metadata_->localRpcMeta().rpc_port);
+const std::string TransferEngine::getEthIP() const {
+    return metadata_->localRpcMeta().ip_or_host_name;
 }
 
-SegmentHandle TransferEngine::openSegment(const std::string &segment_name) {
-    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    std::string trimmed_segment_name = segment_name;
-    while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
-        trimmed_segment_name.erase(0, 1);
-    if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->getSegmentID(trimmed_segment_name);
+uint16_t TransferEngine::getEthPort() const {
+    return metadata_->localRpcMeta().rpc_port;
 }
 
-int TransferEngine::closeSegment(SegmentHandle handle) { return 0; }
+Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
+    return Status::NotImplemented("not implement");
+}
 
-int TransferEngine::registerLocalMemory(BufferEntry &buffer) {
+Status TransferEngine::importRemoteSegment(SegmentID &handle,
+                                           const std::string &shared_handle) {
+    return Status::NotImplemented("not implement");
+}
+
+Status TransferEngine::openRemoteSegment(SegmentID &handle,
+                                         const std::string &segment_name) {
+    if (segment_name.empty())
+        return Status::InvalidArgument("invalid segment name");
+    handle = metadata_->getSegmentID(segment_name);
+    return Status::OK();
+}
+
+Status TransferEngine::closeRemoteSegment(SegmentID handle) {
+    return Status::OK();
+}
+
+Status TransferEngine::registerLocalMemory(BufferEntry &buffer) {
     std::vector<BufferEntry> buffer_list;
     buffer_list.push_back(buffer);
     return registerLocalMemoryBatch(buffer_list);
 }
 
-int TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
+Status TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
     std::vector<BufferEntry> buffer_list;
     buffer_list.push_back(buffer);
     return unregisterLocalMemoryBatch(buffer_list);
 }
 
-BatchID TransferEngine::allocateBatchID(size_t batch_size) {
+Status TransferEngine::registerLocalMemoryBatch(
+    const std::vector<BufferEntry> &buffer_list) {
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (!transport_list_[type]) continue;
+        CHECK_STATUS(transport_list_[type]->registerLocalMemory(buffer_list));
+    }
+    return Status::OK();
+}
+
+Status TransferEngine::unregisterLocalMemoryBatch(
+    const std::vector<BufferEntry> &buffer_list) {
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (!transport_list_[type]) continue;
+        CHECK_STATUS(transport_list_[type]->unregisterLocalMemory(buffer_list));
+    }
+    return Status::OK();
+}
+
+BatchID TransferEngine::allocateBatch(size_t batch_size) {
     Batch *batch = new Batch();
     batch->max_size = batch_size;
     mutex_.lock();
@@ -183,7 +254,7 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     return (BatchID)batch;
 }
 
-Status TransferEngine::freeBatchID(BatchID batch_id) {
+Status TransferEngine::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
     Batch *batch = (Batch *)(batch_id);
     mutex_.lock();
@@ -221,6 +292,10 @@ void TransferEngine::lazyFreeBatch() {
     }
 }
 
+TransportType TransferEngine::getTransportType(const TransferRequest &request) {
+    return RDMA;
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &request_list) {
     if (!batch_id) return Status::InvalidArgument("invalid batch id");
@@ -230,9 +305,12 @@ Status TransferEngine::submitTransfer(
         classified_request_list[kSupportedTransportTypes];
 
     for (auto &request : request_list) {
-        classified_request_list[RDMA].push_back(request);
+        auto transport_type = getTransportType(request);
+        auto &sub_task_id = batch->next_sub_task_id[transport_type];
+        classified_request_list[transport_type].push_back(request);
         batch->task_id_lookup.push_back(
-            std::make_pair(RDMA, batch->task_id_lookup.size()));
+            std::make_pair(transport_type, sub_task_id));
+        sub_task_id++;
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -240,13 +318,13 @@ Status TransferEngine::submitTransfer(
         auto &transport = transport_list_[type];
         auto &sub_batch = batch->sub_batch[type];
         if (!sub_batch) {
-            auto ret = transport->allocateSubBatch(sub_batch, batch->max_size);
-            if (!ret.ok()) return ret;
+            CHECK_STATUS(
+                transport->allocateSubBatch(sub_batch, batch->max_size));
         }
-        auto ret = transport->submitTransferTasks(
-            sub_batch, classified_request_list[type]);
-        if (!ret.ok()) return ret;
+        CHECK_STATUS(transport->submitTransferTasks(
+            sub_batch, classified_request_list[type]));
     }
+
     return Status::OK();
 }
 
@@ -266,24 +344,5 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-int TransferEngine::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list) {
-    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (!transport_list_[type]) continue;
-        auto status = transport_list_[type]->registerLocalMemory(buffer_list);
-        if (!status.ok()) return (int)status.code();
-    }
-    return 0;
-}
-
-int TransferEngine::unregisterLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list) {
-    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (!transport_list_[type]) continue;
-        auto status = transport_list_[type]->unregisterLocalMemory(buffer_list);
-        if (!status.ok()) return (int)status.code();
-    }
-    return 0;
-}
 }  // namespace v1
 }  // namespace mooncake

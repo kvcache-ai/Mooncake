@@ -217,7 +217,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
 
     size_t batch_count = 0;
     while (running) {
-        auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
+        auto batch_id = engine->allocateBatch(FLAGS_batch_size);
         Status s;
         std::vector<TransferRequest> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
@@ -251,7 +251,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             }
         }
 
-        s = engine->freeBatchID(batch_id);
+        s = engine->freeBatch(batch_id);
         LOG_ASSERT(s.ok());
         batch_count++;
     }
@@ -300,13 +300,10 @@ std::string loadNicPriorityMatrix() {
 }
 
 int initiator() {
-    // disable topology auto discovery for testing.
-    auto engine = std::make_unique<TransferEngine>();
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
-
+    TEConfig conf;
+    conf[TEConfigKeyLocalSegmentName] = FLAGS_local_server_name;
+    conf[TEConfigKeyMetadataConnString] = FLAGS_metadata_server;
+    auto engine = std::make_unique<TransferEngine>(conf);
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
     int buffer_num = NR_SOCKETS;
@@ -320,8 +317,8 @@ int initiator() {
         entries[i].length = FLAGS_buffer_size;
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         entries[i].location = name_prefix + std::to_string(i);
-        int rc = engine->registerLocalMemory(entries[i]);
-        LOG_ASSERT(!rc);
+        auto status = engine->registerLocalMemory(entries[i]);
+        LOG_ASSERT(status.ok());
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
@@ -329,12 +326,14 @@ int initiator() {
         entries[i].addr = addr[i];
         entries[i].length = FLAGS_buffer_size;
         entries[i].location = "cpu:" + std::to_string(i);
-        int rc = engine->registerLocalMemory(entries[i]);
-        LOG_ASSERT(!rc);
+        auto status = engine->registerLocalMemory(entries[i]);
+        LOG_ASSERT(status.ok());
     }
 #endif
 
-    auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
+    SegmentID handle;
+    auto status = engine->openRemoteSegment(handle, FLAGS_segment_id.c_str());
+    LOG_ASSERT(status.ok());
 
     std::thread workers[FLAGS_threads];
 
@@ -342,7 +341,7 @@ int initiator() {
     gettimeofday(&start_tv, nullptr);
 
     for (int i = 0; i < FLAGS_threads; ++i)
-        workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
+        workers[i] = std::thread(initiatorWorker, engine.get(), handle, i,
                                  addr[i % buffer_num]);
 
     sleep(FLAGS_duration);
@@ -383,12 +382,10 @@ int target() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    // disable topology auto discovery for testing.
-    auto engine = std::make_unique<TransferEngine>();
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
+    TEConfig conf;
+    conf[TEConfigKeyLocalSegmentName] = FLAGS_local_server_name;
+    conf[TEConfigKeyMetadataConnString] = FLAGS_metadata_server;
+    auto engine = std::make_unique<TransferEngine>(conf);
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
@@ -403,8 +400,8 @@ int target() {
         entries[i].addr = addr[i];
         entries[i].length = FLAGS_buffer_size;
         entries[i].location = "cpu:" + std::to_string(i);
-        int rc = engine->registerLocalMemory(entries[i]);
-        LOG_ASSERT(!rc);
+        auto status = engine->registerLocalMemory(entries[i]);
+        LOG_ASSERT(status.ok());
     }
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;

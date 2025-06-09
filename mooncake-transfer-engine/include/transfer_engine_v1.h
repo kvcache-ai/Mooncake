@@ -27,6 +27,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -41,7 +42,6 @@ namespace v1 {
 using TransferMetadata = mooncake::TransferMetadata;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
-using SegmentHandle = SegmentID;
 using TransferRequest = Transport::Request;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
@@ -51,48 +51,59 @@ enum TransportType { RDMA = 0, SHM, GDS };
 
 const static int kSupportedTransportTypes = 3;
 
+using TEConfig = std::unordered_map<std::string, std::string>;
+const std::string TEConfigKeyLocalSegmentName = "local_segment_name";
+const std::string TEConfigKeyMetadataConnString = "metadata_conn_string";
+const std::string TEConfigKeyBindEthIP = "bind_eth_ip";
+const std::string TEConfigKeyBindEthPort = "bind_eth_port";
+const std::string TEConfigKeyTopology = "topology";
+const std::string TEConfigKeyRdmaDeviceList = "rdma_device_list";
+
 class TransferEngine {
    public:
-    TransferEngine(bool auto_discover = false)
-        : metadata_(nullptr), local_topology_(std::make_shared<Topology>()) {}
+    TransferEngine();
 
-    TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          filter_(filter) {}
+    TransferEngine(TEConfig &conf);
 
-    ~TransferEngine() { freeEngine(); }
+    ~TransferEngine();
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name,
-             const std::string &ip_or_host_name, uint64_t port = 12345) {
-        return init(metadata_conn_string, local_server_name);
-    }
+    TransferEngine(const TransferEngine &) = delete;
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name);
+    TransferEngine &operator=(const TransferEngine &) = delete;
 
-    int freeEngine();
+   public:
+    bool available() const { return available_; }
 
-    std::string getLocalIpAndPort();
+    const std::string getEthIP() const;
 
-    int getRpcPort();
+    uint16_t getEthPort() const;
 
-    SegmentHandle openSegment(const std::string &segment_name);
+   public:
+    Status exportLocalSegment(std::string &shared_handle);
 
-    int closeSegment(SegmentHandle handle);
+    Status importRemoteSegment(SegmentID &handle,
+                               const std::string &shared_handle);
 
-    int registerLocalMemory(BufferEntry &buffer);
+    Status openRemoteSegment(SegmentID &handle,
+                             const std::string &segment_name);
 
-    int unregisterLocalMemory(BufferEntry &buffer);
+    Status closeRemoteSegment(SegmentID handle);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list);
+   public:
+    Status registerLocalMemory(BufferEntry &buffer);
 
-    int unregisterLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list);
+    Status unregisterLocalMemory(BufferEntry &buffer);
 
-    BatchID allocateBatchID(size_t batch_size);
+    Status registerLocalMemoryBatch(
+        const std::vector<BufferEntry> &buffer_list);
 
-    Status freeBatchID(BatchID batch_id);
+    Status unregisterLocalMemoryBatch(
+        const std::vector<BufferEntry> &buffer_list);
+
+   public:
+    BatchID allocateBatch(size_t batch_size);
+
+    Status freeBatch(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &request_list);
@@ -100,28 +111,25 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 
-    int syncSegmentCache(const std::string &segment_name = "") {
-        return metadata_->syncSegmentCache(segment_name);
-    }
-
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
    private:
+    Status construct();
+
+    Status deconstruct();
+
+    Status registerRdmaTransport();
+
     void lazyFreeBatch();
 
-    int registerLocalSegment();
-
-    int registerRdmaTransport();
-
-    int registerShmTransport();
-
-    int buildTopology();
+    TransportType getTransportType(const TransferRequest &request);
 
    private:
+    TEConfig conf_;
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::vector<std::string> filter_;
+    bool available_;
 
     std::vector<std::shared_ptr<Transport>> transport_list_;
     std::unordered_set<Batch *> batch_set_;
