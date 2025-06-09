@@ -22,6 +22,7 @@ var (
 	// etcd client for transform engine
 	globalClient *clientv3.Client
 	globalMutex        sync.Mutex
+	globalRefCount     int
 	// etcd client for store
 	storeClient  *clientv3.Client
 	storeMutex   sync.Mutex
@@ -38,8 +39,8 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 	if globalClient != nil {
-		*errMsg = C.CString("etcd client can be initialized only once")
-		return -1
+		globalRefCount++
+		return 0
 	}
 
 	endpoint := C.GoString(endpoints)
@@ -54,6 +55,7 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	globalClient = cli
+	globalRefCount++
 	return 0
 }
 
@@ -120,8 +122,11 @@ func EtcdCloseWrapper() {
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 	if globalClient != nil {
-		globalClient.Close()
-		globalClient = nil
+		globalRefCount--
+		if globalRefCount == 0 {
+			globalClient.Close()
+			globalClient = nil
+		}
 	}
 }
 

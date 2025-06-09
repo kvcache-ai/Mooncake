@@ -6,14 +6,14 @@ on:
   pull_request:
     branches: [ "main" ]
 
-env:
-  SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
     - uses: actions/checkout@v4
@@ -36,14 +36,26 @@ jobs:
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
     - name: Configure and build project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        make -j
+        sudo make install
       shell: bash
 
     - name: Start Metadata Server
@@ -71,10 +83,6 @@ jobs:
       run: |
         pkill mooncake_master || true
       shell: bash
-
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
 
     - name: Generate Python version tag
       id: generate_tag_build
@@ -147,6 +155,8 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
     - uses: actions/checkout@v4
@@ -159,6 +169,17 @@ jobs:
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
     - name: Install dependencies
       run: |
         sudo apt update -y
@@ -170,32 +191,36 @@ jobs:
         cd mooncake-transfer-engine
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        make -j
+        sudo make install
       shell: bash
 
     - name: Configure and build project with all settings are ON
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        make -j
+        sudo make install
       shell: bash
       # TODO: lack USE_CUDA and USE_NVMEOF
 
     - name: Configure and build project with unit tests and examples
       run: |
         cd build
-        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        make -j
+        sudo make install
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
 
     - name: Configure and build project
       run: |
         cd build
-        cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        make -j
+        sudo make install
       shell: bash
 
     - name: Generate Python version tag
@@ -215,10 +240,6 @@ jobs:
       with:
         name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
-
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
 
   build-docker:
     name: Builcd Docker Image
