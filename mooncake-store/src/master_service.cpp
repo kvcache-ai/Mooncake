@@ -80,6 +80,10 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
         }
         gc_running_ = true;
         gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+        session_id_ = std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
         VLOG(1) << "action=start_gc_thread";
 }
 
@@ -163,7 +167,7 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
 
 ErrorCode MasterService::GetReplicaList(
     const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
-    MetadataAcce1ssor accessor(this, key);
+    MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
@@ -431,6 +435,15 @@ size_t MasterService::GetKeyCount() const {
         total += shard.metadata.size();
     }
     return total;
+}
+
+ErrorCode MasterService::GetSessionId(std::string& session_id) const{
+    if (session_id_.empty()) {
+        LOG(ERROR) << "Session ID is not initialized";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    session_id = session_id_;
+    return ErrorCode::OK;
 }
 
 

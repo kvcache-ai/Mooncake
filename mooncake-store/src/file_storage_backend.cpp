@@ -210,9 +210,7 @@ void FileStorageBackend::RemoveFile(const ObjectKey& key) {
         if (ec) {
             LOG(ERROR) << "Failed to delete file: " << path << ", error: " << ec.message();
         }
-    } else {
-        LOG(INFO) << "File does not exist: " << path;
-    }
+    } 
 }
 
 void FileStorageBackend::RemoveAll() {
@@ -255,7 +253,7 @@ std::string FileStorageBackend::ResolvePath(const ObjectKey& key) const {
     
     // Safely construct path using std::filesystem
     namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(root_dir_) / std::string(1, dir1) / std::string(1, dir2);
+    fs::path dir_path = fs::path(root_dir_) / session_id_ / std::string(1, dir1) / std::string(1, dir2);
 
     // Create directory if not exists
     std::error_code ec;

@@ -29,7 +29,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         LOG(ERROR) << "Failed to connect to master: " << result.message();
         return ErrorCode::INTERNAL_ERROR;
     }
-    timer.LogResponse("error_code=", ErrorCode::OK);
+    timer.LogResponse("error_code=", ErrorCode::OK);   
     return ErrorCode::OK;
 }
 
@@ -275,6 +275,33 @@ UnmountSegmentResponse MasterClient::UnmountSegment(
         timer.LogResponseJson(response);
         return response;
     }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+GetSessionIdResponse MasterClient::GetSessionId() {
+    ScopedVLogTimer timer(1, "MasterClient::GetSessionId");
+    timer.LogRequest("action=get_session_id");
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::GetSessionId>();
+    std::optional<GetSessionIdResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetSessionIdResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to get session id: "
+                          << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        auto response = GetSessionIdResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
     timer.LogResponseJson(result.value());
     return result.value();
 }

@@ -60,13 +60,6 @@ if (USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
-option(USE_CLIENT_PERSISTENCE "option for using client persistence" OFF)
-
-if (USE_CLIENT_PERSISTENCE)
-  add_compile_definitions(USE_CLIENT_PERSISTENCE)
-  message(STATUS "client persistence is enabled")
-endif()
-
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")

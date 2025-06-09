@@ -27,15 +27,7 @@ Client::Client(const std::string& local_hostname,
     : local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       storage_root_dir_(storage_root_dir),
-      write_thread_pool_(2){
-        if(storage_root_dir_.empty()) {
-            LOG(INFO) << "Storage root directory is not set. persisting data is disabled.";
-        }else{
-            LOG(INFO) << "Storage root directory is: " << storage_root_dir_;
-            // Initialize storage backend
-            PrepareStorageBackend(storage_root_dir_);
-        }
-      }
+      write_thread_pool_(2){}
 
 Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
@@ -170,6 +162,16 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     LOG(INFO) << "Connect to Master success";
 
+    // Initialize storage backend if storage_root_dir is provided
+    auto response = client->master_client_.GetSessionId();
+    if(storage_root_dir.empty()) {
+        LOG(INFO) << "Storage root directory is not set. persisting data is disabled.";
+    }else{
+        LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+        // Initialize storage backend
+        client->PrepareStorageBackend(storage_root_dir, response.session_id);
+    }
+
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                      protocol, protocol_args);
@@ -209,15 +211,15 @@ ErrorCode Client::Query(const std::string& object_key,
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
         object_info.replicaInfo.replica_list[i] = response.replica_list[i];
     }
-    #ifdef USE_CLIENT_PERSISTENCE
-        if(response.error_code!= ErrorCode::OK && storage_backend_){
-            storage_backend_->Querykey(object_key, object_info.hasFile,
-                                       object_info.filePath, object_info.fileLength);
-            if(object_info.hasFile){
-                return ErrorCode::OK;
-            }
+
+    if(response.error_code!= ErrorCode::OK && storage_backend_){
+        storage_backend_->Querykey(object_key, object_info.hasFile,
+                                    object_info.filePath, object_info.fileLength);
+        if(object_info.hasFile){
+            return ErrorCode::OK;
         }
-    #endif
+    }
+
     return response.error_code;
 }
 
@@ -225,12 +227,11 @@ ErrorCode Client::Get(const std::string& object_key,
                       ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
 
-    #ifdef USE_CLIENT_PERSISTENCE
-        if(object_info.hasFile) {
-            // If the object is stored in a local file, load it directly
-            return Get_From_Local_File(object_key, slices, object_info);
-        }
-    #endif
+    if(object_info.hasFile) {
+        // If the object is stored in a local file, load it directly
+        return Get_From_Local_File(object_key, slices, object_info);
+    }
+
     // Get the first complete replica
     for (size_t i = 0; i < object_info.replicaInfo.replica_list.size(); ++i) {
         if (object_info.replicaInfo.replica_list[i].status == ReplicaStatus::COMPLETE) {
@@ -371,30 +372,24 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         return err;
     }
 
-    #ifdef USE_CLIENT_PERSISTENCE
-       Put_To_Local_File(key, slices);
-    #endif  
+    Put_To_Local_File(key, slices);
 
     return ErrorCode::OK;
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
-    #ifdef USE_CLIENT_PERSISTENCE
     if (storage_backend_) {
         // Remove from storage backend
         storage_backend_->RemoveFile(key);
     }
-    #endif
     return master_client_.Remove(key).error_code;
 }
 
 long Client::RemoveAll() { 
-    #ifdef USE_CLIENT_PERSISTENCE
     if (storage_backend_) {
         // Remove from storage backend
         storage_backend_->RemoveAll();
     }
-    #endif
     return master_client_.RemoveAll().removed_count; 
 }
 
@@ -490,20 +485,19 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 
 ErrorCode Client::IsExist(const std::string& key) {
     auto response = master_client_.ExistKey(key);
-    #ifdef USE_CLIENT_PERSISTENCE
     if ( response.error_code!=ErrorCode::OK && storage_backend_) {
         // Check if the key exists in the storage backend
         if (storage_backend_->Existkey(key) == ErrorCode::OK) {
             return ErrorCode::OK;
         }
     }
-    #endif
     return response.error_code;
 }
 
-void Client::PrepareStorageBackend(const std::string& storage_root_dir) {
+void Client::PrepareStorageBackend(const std::string& storage_root_dir, 
+                                   const std::string& session_id) {
     // Initialize storage backend
-    storage_backend_ = FileStorageBackend::Create(storage_root_dir);
+    storage_backend_ = FileStorageBackend::Create(storage_root_dir, session_id);
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
     }

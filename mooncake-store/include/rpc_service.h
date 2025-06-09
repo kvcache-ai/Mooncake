@@ -57,6 +57,12 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct GetSessionIdResponse {
+    std::string session_id;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(GetSessionIdResponse, error_code, session_id)
+
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
@@ -316,6 +322,19 @@ class WrappedMasterService {
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_unmount_segment_failures();
         }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    GetSessionIdResponse GetSessionId() {
+        ScopedVLogTimer timer(1, "GetSessionId");
+        timer.LogRequest("action=get_session_id");
+
+        GetSessionIdResponse response;
+        std::string session_id;
+        response.error_code = master_service_.GetSessionId(session_id);
+        response.session_id = std::move(session_id);
 
         timer.LogResponseJson(response);
         return response;

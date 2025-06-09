@@ -67,6 +67,8 @@ int main(int argc, char* argv[]) {
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetSessionId>(
+        &wrapped_master_service);
 
     // Metric reporting is now handled by WrappedMasterService
 

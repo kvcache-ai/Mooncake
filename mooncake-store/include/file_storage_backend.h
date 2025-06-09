@@ -21,20 +21,22 @@ class FileStorageBackend : public StorageBackend {
     /**
      * @brief Constructs a new FileStorageBackend instance
      * @param root_dir Root directory path for object storage
+     * @param session_id Unique session identifier for subdirectory
      * @note Directory existence is not checked in constructor
      */
-    explicit FileStorageBackend(const std::string& root_dir): root_dir_(root_dir) {}
+    explicit FileStorageBackend(const std::string& root_dir, const std::string& session_id): root_dir_(root_dir), session_id_(session_id) {}
 
     /**
      * @brief Factory method to create a FileStorageBackend instance
      * @param root_dir Root directory path for object storage
+     * @param session_id Unique session identifier for subdirectory
      * @return shared_ptr to new instance or nullptr if directory is invalid
      * 
      * Performs validation of the root directory before creating the instance:
      * - Verifies directory exists
      * - Verifies path is actually a directory
      */
-    static std::shared_ptr<FileStorageBackend> Create(const std::string& root_dir) {
+    static std::shared_ptr<FileStorageBackend> Create(const std::string& root_dir, const std::string& session_id) {
         namespace fs = std::filesystem;
         if (!fs::exists(root_dir)) {
             LOG(INFO) << "Root directory does not exist: " << root_dir;
@@ -42,8 +44,12 @@ class FileStorageBackend : public StorageBackend {
         } else if (!fs::is_directory(root_dir)) {
             LOG(INFO) << "Root path is not a directory: " << root_dir;
             return nullptr;
+        } else if (session_id.empty()) {
+            LOG(INFO) << "Session ID cannot be empty";
+            return nullptr;
         }
-        return std::make_shared<FileStorageBackend>(root_dir);
+        std::string real_session_id = "moon_" + session_id;
+        return std::make_shared<FileStorageBackend>(root_dir, real_session_id);
     }  
     
     /**
@@ -86,8 +92,9 @@ class FileStorageBackend : public StorageBackend {
 
     void RemoveAll() override;
 
-    /// Root directory path for storage
+    // Root directory path for storage and session ID for subdirectory
     std::string root_dir_;
+    std::string session_id_;
     
    private:
     /**

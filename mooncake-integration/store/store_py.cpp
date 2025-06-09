@@ -318,12 +318,10 @@ int DistributedObjectStore::allocateSlicesPacked(
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
-    #ifdef USE_CLIENT_PERSISTENCE
-        if(object_info.hasFile){
-            length=object_info.fileLength;
-            return allocateSlices(slices, length);
-        }
-    #endif    
+    if(object_info.hasFile){
+        length=object_info.fileLength;
+        return allocateSlices(slices, length);
+    } 
 
     length = 0;
     if (object_info.replicaInfo.replica_list.empty()) return -1;
@@ -532,12 +530,10 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
         return toInt(error_code);
     }
 
-    #ifdef USE_CLIENT_PERSISTENCE
     if (object_info.hasFile) {
         // If the object is stored in a file, return its length
         return object_info.fileLength;
     }
-    #endif
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;

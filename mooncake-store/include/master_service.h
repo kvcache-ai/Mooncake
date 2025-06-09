@@ -178,6 +178,12 @@ class MasterService {
      */
     size_t GetKeyCount() const;
 
+    /**
+     * @brief Get the master service session ID
+     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if session ID is not set
+     */
+    ErrorCode GetSessionId(std::string& session_id) const; 
+
    private:
     // GC thread function
     void GCThreadFunc();
@@ -259,6 +265,9 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
     const double eviction_ratio_; // in range [0.0, 1.0]
+
+    // session id for persistent sub directory
+    std::string session_id_;
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
