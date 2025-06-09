@@ -7,6 +7,8 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
@@ -143,6 +145,79 @@ class WrappedMasterService {
                     MasterMetricManager::instance().get_summary_string();
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 resp.set_status_and_content(status_type::ok, summary);
+            });
+
+        // Endpoint for query a key's location
+        http_server_.set_http_handler<GET>(
+            "/query_key",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                auto key = req.get_query_value("key");
+                GetReplicaListResponse response;
+                response = GetReplicaList(std::string(key));
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                for(size_t i = 0; i < response.replica_list.size(); i++) {
+                    for(const auto& handle : response.replica_list[i].buffer_descriptors) {
+                        std::string tmp = "";
+                        struct_json::to_json(handle, tmp);
+                        ss += tmp;
+                        ss += "\n";
+                    }
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query all keys
+        http_server_.set_http_handler<GET>(
+            "/get_all_keys",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                std::vector<std::string>  all_keys;
+                master_service_.GetAllKeys(all_keys);
+                for(const auto & key : all_keys) {
+                    ss += key;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query all segments
+        http_server_.set_http_handler<GET>(
+            "/get_all_segments",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                std::vector<std::string>  all_segments;
+                master_service_.GetAllSegments(all_segments);
+                for(const auto & segment: all_segments) {
+                    ss += segment;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query segment details
+        http_server_.set_http_handler<GET>(
+            "/query_segment",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                auto segment = req.get_query_value("segment");
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                size_t used = 0, capacity = 0;
+                if(master_service_.QuerySegments(std::string(segment), used, capacity) 
+                   == ErrorCode::OK) {
+                    ss += segment;
+                    ss += "\n";
+                    ss += "Used(bytes): ";
+                    ss += std::to_string(used);
+                    ss += "\nCapacity(bytes) : ";
+                    ss += std::to_string(capacity);
+                    ss += "\n";
+                    resp.set_status_and_content(status_type::ok, ss);
+                } else {
+                    resp.set_status_and_content(status_type::not_found, ss);
+                }
             });
 
         // Health check endpoint

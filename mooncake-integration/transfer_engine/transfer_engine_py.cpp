@@ -17,6 +17,19 @@
 #include <cassert>
 #include <fstream>
 
+#ifdef USE_NVLINK
+#include "transport/nvlink_transport/nvlink_transport.h"
+static void *allocateMemory(size_t size) {
+    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+}
+static void freeMemory(void *ptr) {
+    mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
+}
+#else
+static void *allocateMemory(size_t size) { return malloc(size); }
+static void freeMemory(void *ptr) { free(ptr); }
+#endif
+
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     if (getenv("MC_TRANSFER_TIMEOUT")) {
@@ -31,9 +44,9 @@ TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
-    for (auto &buffer : buffer_list_) free(buffer);
+    for (auto &buffer : buffer_list_) freeMemory(buffer);
     buffer_list_.clear();
-    for (auto &buffer : large_buffer_list_) free(buffer);
+    for (auto &buffer : large_buffer_list_) freeMemory(buffer);
     large_buffer_list_.clear();
 }
 
@@ -121,11 +134,11 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
-    auto buffer = malloc(capacity);
+    auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
     if (ret) {
-        free(buffer);
+        freeMemory(buffer);
         return nullptr;
     }
     return (char *)buffer;
@@ -182,7 +195,7 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
         engine_->unregisterLocalMemory(buffer);
-        free(buffer);
+        freeMemory(buffer);
         return 0;
     }
     free_list_[class_id].push(buffer);
@@ -263,7 +276,8 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                 completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout = transfer_timeout_nsec_ + length; // 1GiB per second
+            const int64_t timeout =
+                transfer_timeout_nsec_ + length;  // 1GiB per second
             if (current_ts - start_ts > timeout) {
                 LOG(INFO) << "Sync data transfer timeout, local buffer "
                           << (void *)buffer << " remote buffer "
