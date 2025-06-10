@@ -38,8 +38,6 @@ cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
 HOOK_SO_LIB=mooncake-transfer-engine/nvlink-hook/hook.so
 if test -f $HOOK_SO_LIB; then
     cp $HOOK_SO_LIB mooncake-wheel/mooncake/
-else
-    echo sample > mooncake-wheel/mooncake/hook.so
 fi
 
 echo "Building wheel package..."
