@@ -15,6 +15,15 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_C_FLAGS_DEBUG "-O0")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0")
 
+option(ENABLE_ASAN "enable address sanitizer" OFF)
+
+if (ENABLE_ASAN)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=leak")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+endif()
+
 # keep debuginfo by default
 if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo")
@@ -27,12 +36,14 @@ add_definitions(-DCONFIG_ERDMA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ENABLE_CCACHE "Whether to open ccache" OFF)
-find_program(CCACHE_FOUND ccache)
-if(CCACHE_FOUND AND ENABLE_CCACHE)
-  message(STATUS "Building with CCACHE enabled")
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+option(ENABLE_SCCACHE "Whether to open sccache" OFF)
+if (ENABLE_SCCACHE)
+  find_program(SCCACHE sccache REQUIRED)
+endif()
+if(SCCACHE AND ENABLE_SCCACHE)
+  message(STATUS "Building with SCCACHE enabled")
+  set(CMAKE_C_COMPILER_LAUNCHER ${SCCACHE})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${SCCACHE})
 endif()
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
@@ -40,10 +51,11 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build uint tests" ON)
-option(USE_CUDA "option for using gpu direct" OFF)
+option(USE_CUDA "option for enabling gpu features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
-option(USE_CXL "option for using cxl protocol" OFF)
+option(USE_NVLINK "option for using NVLink transport" OFF)
+option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
@@ -61,22 +73,26 @@ if (USE_LRU_MASTER)
 endif()
 
 
+if (USE_NVMEOF)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_NVMEOF)
+  message(STATUS "NVMe-oF support is enabled")
+endif()
+
+if (USE_NVLINK)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_NVLINK)
+  message(STATUS "NVLink support is enabled")
+endif()
+
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
-
-  if (USE_NVMEOF)
-    add_compile_definitions(USE_NVMEOF)
-    message(STATUS "NVMe-oF support is enabled")
-  endif()
-
   include_directories(/usr/local/cuda/include)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
   )
-elseif(USE_NVMEOF)
-  message(FATAL_ERROR "Cannot enable USE_NVMEOF without USE_CUDA")
 endif()
 
 if (USE_TCP)

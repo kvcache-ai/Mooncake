@@ -14,9 +14,9 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <signal.h>
 #include <sys/time.h>
 
-#include <signal.h>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -25,6 +25,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "common.h"
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -35,6 +36,10 @@
 
 #ifdef USE_NVMEOF
 #include <cufile.h>
+#endif
+
+#ifdef USE_NVLINK
+#include <transport/nvlink_transport/nvlink_transport.h>
 #endif
 
 #include <cassert>
@@ -48,12 +53,14 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
+#ifdef USE_CUDA
+const static int NR_SOCKETS = 1;
+#else
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
+#endif
 
-static std::string getHostname();
-
-DEFINE_string(local_server_name, getHostname(),
+DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
 DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
 DEFINE_string(mode, "initiator",
@@ -84,15 +91,6 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
 using namespace mooncake;
-
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
@@ -162,8 +160,8 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
-                    void *addr) {
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
+                       int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
@@ -202,6 +200,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         }
 
         s = engine->submitTransfer(batch_id, requests);
+        if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
@@ -285,6 +284,8 @@ int initiator() {
             xport = engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "nvlink") {
+            xport = engine->installTransport("nvlink", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -298,7 +299,12 @@ int initiator() {
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
+#ifdef USE_NVLINK
+        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
+            FLAGS_buffer_size);
+#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
@@ -345,7 +351,11 @@ int initiator() {
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+#ifdef USE_NVLINK
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
+#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;
@@ -355,7 +365,7 @@ volatile bool target_running = true;
 
 void signalHandler(int signum) {
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    target_running = false;  
+    target_running = false;
 }
 
 int target() {
@@ -378,26 +388,50 @@ int target() {
             engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
+        } else if (FLAGS_protocol == "nvlink") {
+            engine->installTransport("nvlink", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
     }
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
-        memset(addr[i], 'x', FLAGS_buffer_size);
+    int buffer_num = NR_SOCKETS;
+
+#ifdef USE_CUDA
+    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
+    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
+    for (int i = 0; i < buffer_num; ++i) {
+#ifdef USE_NVLINK
+        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
+            FLAGS_buffer_size);
+#else
+        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+#endif
+        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+                                             name_prefix + std::to_string(i));
+        LOG_ASSERT(!rc);
+    }
+#else
+    for (int i = 0; i < buffer_num; ++i) {
+        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
     }
+#endif
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
+    for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+#ifdef USE_NVLINK
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
+#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;

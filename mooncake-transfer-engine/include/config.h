@@ -17,7 +17,6 @@
 
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
-#include <json/json.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +40,7 @@ struct GlobalConfig {
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
     int retry_cnt = 9;
+    int handshake_listen_backlog = 128;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;

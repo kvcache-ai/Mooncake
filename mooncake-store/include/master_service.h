@@ -92,7 +92,8 @@ class MasterService {
    public:
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
-                  double eviction_ratio = DEFAULT_EVICTION_RATIO);
+                  double eviction_ratio = DEFAULT_EVICTION_RATIO,
+                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
     ~MasterService();
 
     /**
@@ -117,6 +118,26 @@ class MasterService {
     ErrorCode ExistKey(const std::string& key);
 
     /**
+     * @brief Fetch all keys
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllKeys(std::vector<std::string> & all_keys);
+
+    /**
+     * @brief Fetch all segments, each node has a unique real client with fixed segment
+     * name : segment name, preferred format : {ip}:{port}, bad format : localhost:{port}
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllSegments(std::vector<std::string> & all_segments);
+
+    /**
+     * @brief Query a segment's capacity and used size in bytes.
+     * Conductor should use these information to schedule new requests. 
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode QuerySegments(const std::string & segment, size_t & used, size_t & capacity);
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
@@ -124,6 +145,16 @@ class MasterService {
      */
     ErrorCode GetReplicaList(const std::string& key,
                              std::vector<Replica::Descriptor>& replica_list);
+
+    /**
+     * @brief Get list of replicas for a batch of objects
+     * @param[out] batch_replica_list Vector to store replicas information for
+     * slices
+     */
+    ErrorCode BatchGetReplicaList(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
 
     /**
      * @brief Mark a key for garbage collection after specified delay
@@ -160,11 +191,42 @@ class MasterService {
     ErrorCode PutRevoke(const std::string& key);
 
     /**
+     * @brief Start a batch of put operations for N objects
+     * @param[out] replica_list Vector to store replica information for slices
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
+     *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
+     *         ErrorCode::INVALID_PARAMS if slice size is invalid
+     */
+    ErrorCode BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
+
+    /**
+     * @brief Complete a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutEnd(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Revoke a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutRevoke(const std::vector<std::string>& keys);
+
+    /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
     ErrorCode Remove(const std::string& key);
+
     /**
      * @brief Remove all objects and their replicas
      * @return return the number of objects removed
@@ -189,7 +251,7 @@ class MasterService {
     void GCThreadFunc();
 
     // Check all shards and try to evict some keys
-    void BatchEvict();
+    void BatchEvict(double eviction_ratio);
 
     // Internal data structures
     struct ObjectMetadata {
@@ -265,6 +327,7 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
     const double eviction_ratio_; // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_; // in range [0.0, 1.0]
 
     // session id for persistent sub directory
     std::string session_id_;

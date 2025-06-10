@@ -6,6 +6,8 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
@@ -24,6 +26,13 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replica_list, error_code)
 
+struct BatchGetReplicaListResponse {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchGetReplicaListResponse, batch_replica_list, error_code)
+
 struct PutStartResponse {
     std::vector<Replica::Descriptor> replica_list;
     ErrorCode error_code = ErrorCode::OK;
@@ -38,6 +47,22 @@ struct PutRevokeResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(PutRevokeResponse, error_code)
+struct BatchPutStartResponse {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutStartResponse, batch_replica_list, error_code)
+
+struct BatchPutEndResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutEndResponse, error_code)
+
+struct BatchPutRevokeResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchPutRevokeResponse, error_code)
 
 struct RemoveResponse {
     ErrorCode error_code = ErrorCode::OK;
@@ -70,8 +95,9 @@ class WrappedMasterService {
     WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                          bool enable_metric_reporting = true,
                          uint16_t http_port = 9003,
-                         double eviction_ratio = DEFAULT_EVICTION_RATIO)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio),
+                         double eviction_ratio = DEFAULT_EVICTION_RATIO,
+                         double eviction_low_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO)
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_low_watermark_ratio),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
@@ -123,6 +149,79 @@ class WrappedMasterService {
                 resp.set_status_and_content(status_type::ok, summary);
             });
 
+        // Endpoint for query a key's location
+        http_server_.set_http_handler<GET>(
+            "/query_key",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                auto key = req.get_query_value("key");
+                GetReplicaListResponse response;
+                response = GetReplicaList(std::string(key));
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                for(size_t i = 0; i < response.replica_list.size(); i++) {
+                    for(const auto& handle : response.replica_list[i].buffer_descriptors) {
+                        std::string tmp = "";
+                        struct_json::to_json(handle, tmp);
+                        ss += tmp;
+                        ss += "\n";
+                    }
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query all keys
+        http_server_.set_http_handler<GET>(
+            "/get_all_keys",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                std::vector<std::string>  all_keys;
+                master_service_.GetAllKeys(all_keys);
+                for(const auto & key : all_keys) {
+                    ss += key;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query all segments
+        http_server_.set_http_handler<GET>(
+            "/get_all_segments",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                std::vector<std::string>  all_segments;
+                master_service_.GetAllSegments(all_segments);
+                for(const auto & segment: all_segments) {
+                    ss += segment;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, ss);
+            });
+
+        // Endpoint for query segment details
+        http_server_.set_http_handler<GET>(
+            "/query_segment",
+            [&](coro_http_request& req, coro_http_response& resp) {
+                auto segment = req.get_query_value("segment");
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                std::string ss = "";
+                size_t used = 0, capacity = 0;
+                if(master_service_.QuerySegments(std::string(segment), used, capacity) 
+                   == ErrorCode::OK) {
+                    ss += segment;
+                    ss += "\n";
+                    ss += "Used(bytes): ";
+                    ss += std::to_string(used);
+                    ss += "\nCapacity(bytes) : ";
+                    ss += std::to_string(capacity);
+                    ss += "\n";
+                    resp.set_status_and_content(status_type::ok, ss);
+                } else {
+                    resp.set_status_and_content(status_type::not_found, ss);
+                }
+            });
+
         // Health check endpoint
         http_server_.set_http_handler<GET>(
             "/health", [](coro_http_request& req, coro_http_response& resp) {
@@ -170,6 +269,19 @@ class WrappedMasterService {
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchGetReplicaListResponse BatchGetReplicaList(
+        const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchGetReplicaList");
+        timer.LogRequest("action=get_batch_replica_list");
+
+        BatchGetReplicaListResponse response;
+        response.error_code = master_service_.BatchGetReplicaList(
+            keys, response.batch_replica_list);
 
         timer.LogResponseJson(response);
         return response;
@@ -241,6 +353,53 @@ class WrappedMasterService {
             MasterMetricManager::instance().dec_key_count();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutStartResponse BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config) {
+        ScopedVLogTimer timer(1, "BatchPutStart");
+        timer.LogRequest("xrrkeys_count=", keys.size());
+
+        BatchPutStartResponse response;
+        response.error_code =
+            master_service_.BatchPutStart(keys, value_lengths, slice_lengths,
+                                          config, response.batch_replica_list);
+
+        // Track failures if needed
+        if (response.error_code == ErrorCode::OK) {
+            MasterMetricManager::instance().inc_key_count(keys.size());
+        }
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutEndResponse BatchPutEnd(const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchPutEnd");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchPutEndResponse response;
+        response.error_code = master_service_.BatchPutEnd(keys);
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchPutRevokeResponse BatchPutRevoke(
+        const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchPutRevoke");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchPutRevokeResponse response;
+        response.error_code = master_service_.BatchPutRevoke(keys);
+        // Track failures if needed
+        if (response.error_code == ErrorCode::OK) {
+            MasterMetricManager::instance().dec_key_count(keys.size());
+        }
         timer.LogResponseJson(response);
         return response;
     }

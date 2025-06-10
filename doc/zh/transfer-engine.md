@@ -50,7 +50,7 @@ BatchTransfer API 使用请求（Request）对象数组传入用户请求，需�
 
 例如，如图所示，要将数据从本地节点分配给 `cpu:0` 的缓冲区0传输到目标节点分配给`cpu:1`的缓冲区1，引擎首先使用本地服务器的拓扑矩阵识别`cpu:0`的首选NIC，并选择一个，如`mlx5_1`，作为本地NIC。同样，根据目标内存地址选择目标NIC，如`mlx5_3`。这种设置允许建立从`mlx5_1@本地`到`mlx5_3@目标`的RDMA连接，以执行RDMA读写操作。
 
-为了进一步最大化带宽利用率，如果单个请求的传输长度超过16KB，则其内部被划分为多个切片。每个切片可能使用不同的路径，使所有RDMA NIC能够协同工作。
+为了进一步最大化带宽利用率，如果单个请求的传输长度超过64KB，则其内部被划分为多个切片。每个切片可能使用不同的路径，使所有RDMA NIC能够协同工作。
 
 ### 端点管理
 Transfer Engine 使用一对端点来表示本地RDMA NIC和远程RDMA NIC之间的连接。实际上，每个端点包括一个或多个RDMA QP对象。
@@ -403,5 +403,5 @@ int init(const std::string &metadata_conn_string,
 - `MC_SLICE_SIZE` Transfer Engine 中用户请求的切分粒度
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
+- `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
 - `MC_LOG_DIR` 该选项指定存放日志重定向文件的目录路径。如果路径无效，glog将回退到向标准错误[stderr]输出日志。
-
