@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/nvlink_transport/nvlink_transport.h"
+#include "config.h"
 
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
@@ -237,6 +238,10 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          const std::string &location,
                                          bool remote_accessible,
                                          bool update_metadata) {
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    if (globalConfig().trace) {
+        LOG(INFO) << "register memory: addr " << addr << ", length " << length;
+    }
     if (!use_fabric_mem_) {
         cudaPointerAttributes attr;
         cudaError_t err = cudaPointerGetAttributes(&attr, addr);
@@ -270,10 +275,10 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
         if (result != CUDA_SUCCESS) {
-            LOG(ERROR)
-                << "NvlinkTransport: cuMemRetainAllocationHandle failed: "
-                << result;
-            return -1;
+            LOG(WARNING)
+                << "Memory region " << addr << " is not allocated by cuMemCreate, " 
+                << "but it can be used as local buffer";
+            return 0;
         }
 
         CUmemFabricHandle export_handle;
@@ -457,6 +462,9 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
                    << result;
         return nullptr;
     }
+    // fix size
+    size = (size + granularity - 1) & ~(granularity - 1);
+    if (size == 0) size = granularity;
     result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemCreate failed: " << result;

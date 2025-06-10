@@ -23,3 +23,7 @@ endif()
 if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
+
+if (USE_NVLINK)
+  add_subdirectory(nvlink-hook)
+endif()
