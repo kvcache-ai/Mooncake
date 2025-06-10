@@ -36,8 +36,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress,
-        const std::string& storage_root_dir = "");
+        const std::string& master_addr = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key

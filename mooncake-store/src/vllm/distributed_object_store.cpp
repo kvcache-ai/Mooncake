@@ -26,14 +26,11 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
                                   const std::string &master_server_addr) {
     this->protocol = protocol;
     this->local_hostname = local_hostname;  // Save the local hostname
-    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
-    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
-        std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
     client_ = std::make_unique<mooncake::Client>();
 
     void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
     client_->Init(local_hostname, metadata_server, protocol, args,
-                  master_server_addr,storage_root_dir);
+                  master_server_addr);
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);

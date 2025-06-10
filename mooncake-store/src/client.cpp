@@ -149,7 +149,12 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_addr, const std::string& storage_root_dir) {
+    const std::string& master_addr) {
+
+    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
+    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
+    std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
+
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring, storage_root_dir));
 
@@ -182,24 +187,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     return client;
 }
-// At present, this function is not directly called by any external interface.
+
 ErrorCode Client::Get(const std::string& object_key,
                       std::vector<Slice>& slices) {
     ObjectInfo object_info;
     auto err = Query(object_key, object_info);
-
-    if (err != ErrorCode::OK){
-        if(storage_backend_){
-            // If storage backend is available, try to load from it
-            if (storage_backend_->LoadObject(object_key, slices) == ErrorCode::OK) {
-                return ErrorCode::OK;
-            } else {
-                return err;
-            }
-        } else{
-            return err;
-        }
-    } 
+    if (err != ErrorCode::OK) return err;
     return Get(object_key, object_info, slices);
 }
 

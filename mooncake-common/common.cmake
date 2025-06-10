@@ -60,6 +60,7 @@ if (USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
+
 if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
