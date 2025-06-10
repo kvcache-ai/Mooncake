@@ -16,7 +16,7 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <json/json.h>
+#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>
@@ -48,9 +48,9 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        std::vector<uint32_t> lkey; // for rdma
-        std::vector<uint32_t> rkey; // for rdma
-        std::string shm_name;       // for nvlink
+        std::vector<uint32_t> lkey;  // for rdma
+        std::vector<uint32_t> rkey;  // for rdma
+        std::string shm_name;        // for nvlink
     };
 
     struct NVMeoFBufferDesc {
@@ -121,7 +121,7 @@ class TransferMetadata {
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
-    
+
     int removeLocalSegment(const std::string &segment_name);
 
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);

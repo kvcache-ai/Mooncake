@@ -1,8 +1,10 @@
-# Currently you have to manually execute makefile in the src subdirectory.
+# Build nvlink hook and output to build directory
 add_custom_target(build_nvlink_hook DEPENDS transfer_engine)
 add_custom_command(
     TARGET build_nvlink_hook
-    COMMAND bash build.sh
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
+    COMMAND bash build.sh ${CMAKE_CURRENT_BINARY_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Building nvlink hook to ${CMAKE_CURRENT_BINARY_DIR}"
 )
 set_property(TARGET build_nvlink_hook PROPERTY EXCLUDE_FROM_ALL FALSE)
