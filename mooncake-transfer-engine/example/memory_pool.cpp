@@ -23,20 +23,12 @@
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "common.h"
 
 #define NR_SOCKETS (1)
 #define BASE_ADDRESS_HINT (0x40000000000)
 
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
-
-DEFINE_string(local_server_name, getHostname(),
+DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
 DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
 DEFINE_string(device_name, "mlx5_2", "Device name to use");

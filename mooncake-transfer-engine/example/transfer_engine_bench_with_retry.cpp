@@ -28,6 +28,7 @@
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "common.h"
 
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
@@ -50,8 +51,6 @@ static void checkCudaError(cudaError_t result, const char *message) {
 
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
-
-static std::string getHostname();
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
@@ -84,15 +83,6 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
 using namespace mooncake;
-
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
