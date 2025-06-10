@@ -33,6 +33,7 @@
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #ifdef USE_NVMEOF
 #include <cufile.h>
@@ -115,7 +116,7 @@ static void freeMemoryPool(void *addr, size_t size) {
 #ifdef USE_CUDA
 #ifdef USE_NVLINK
     CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, ptr);
+    auto result = cuMemRetainAllocationHandle(&handle, addr);
     if (result == CUDA_SUCCESS) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
