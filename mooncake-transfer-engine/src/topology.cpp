@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include <glog/logging.h>
-#include <json/json.h>
 
 #include <fstream>
 #include <iostream>
@@ -74,7 +73,8 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  device_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
-            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path << " failed";
+            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path
+                        << " failed";
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
@@ -98,7 +98,8 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        PLOG(WARNING) << "discoverCpuTopology: open /sys/devices/system/node failed";
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
         return {};
     }
     while ((entry = readdir(dir))) {
