@@ -459,6 +459,13 @@ long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
+    return MountSegment(segment_name, buffer, size, "", "");
+}
+
+ErrorCode Client::MountSegment(const std::string& segment_name,
+                               const void* buffer, size_t size,
+                               const std::string& instance_id,
+                               const std::string& worker_id) {
     if (buffer == nullptr || size == 0 ||
         reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
@@ -484,8 +491,16 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    ErrorCode err =
-        master_client_.MountSegment(segment_name, buffer, size).error_code;
+    // Convert empty strings to std::nullopt for proper optional handling
+    std::optional<std::string> opt_instance_id =
+        instance_id.empty() ? std::nullopt : std::make_optional(instance_id);
+    std::optional<std::string> opt_worker_id =
+        worker_id.empty() ? std::nullopt : std::make_optional(worker_id);
+
+    ErrorCode err = master_client_
+                        .MountSegment(segment_name, buffer, size,
+                                      opt_instance_id, opt_worker_id)
+                        .error_code;
     if (err != ErrorCode::OK) {
         return err;
     }

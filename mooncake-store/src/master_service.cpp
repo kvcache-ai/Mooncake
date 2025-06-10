@@ -10,8 +10,10 @@
 
 namespace mooncake {
 
-ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
-                                             uint64_t base, uint64_t size) {
+ErrorCode BufferAllocatorManager::AddSegment(
+    const std::string& segment_name, uint64_t base, uint64_t size,
+    LocationType location_type, const std::optional<std::string>& instance_id,
+    const std::optional<std::string>& worker_id) {
     // Check if parameters are valid before allocating memory.
     if (base == 0 || size == 0 ||
         reinterpret_cast<uintptr_t>(base) % facebook::cachelib::Slab::kSize ||
@@ -24,7 +26,7 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
     std::unique_lock<std::shared_mutex> lock(allocator_mutex_);
 
     // Check if segment already exists
-    if (buf_allocators_.find(segment_name) != buf_allocators_.end()) {
+    if (buf_allocators_.contains(segment_name)) {
         LOG(WARNING) << "segment_name=" << segment_name
                      << ", error=segment_already_exists";
         return ErrorCode::INVALID_PARAMS;
@@ -34,7 +36,8 @@ ErrorCode BufferAllocatorManager::AddSegment(const std::string& segment_name,
     try {
         // SlabAllocator may throw an exception if the size or base is invalid
         // for the slab allocator.
-        allocator = std::make_shared<BufferAllocator>(segment_name, base, size);
+        allocator = std::make_shared<BufferAllocator>(
+            segment_name, base, size, location_type, instance_id, worker_id);
         if (!allocator) {
             LOG(ERROR) << "segment_name=" << segment_name
                        << ", error=failed_to_create_allocator";
@@ -68,7 +71,8 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
-                             double eviction_high_watermark_ratio)
+                             double eviction_high_watermark_ratio,
+                             const std::string& lmcache_controller_url)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
@@ -89,7 +93,17 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     }
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-    VLOG(1) << "action=start_gc_thread";
+#ifdef USE_KV_EVENT
+    if (!lmcache_controller_url.empty()) {
+        lmcache_notifier_.emplace(lmcache_controller_url);
+    }
+#else
+    if (!lmcache_controller_url.empty()) {
+        throw std::invalid_argument(
+            "LMCache controller URL provided, but "
+            "USE_KV_EVENT is not enabled");
+    }
+#endif
 }
 
 MasterService::~MasterService() {
@@ -108,15 +122,23 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+ErrorCode MasterService::MountSegment(
+    uint64_t buffer, uint64_t size, const std::string& segment_name,
+    const std::optional<std::string>& instance_id,
+    const std::optional<std::string>& worker_id) {
     if (buffer == 0 || size == 0) {
         LOG(ERROR) << "buffer=" << buffer << ", size=" << size
                    << ", error=invalid_buffer_params";
         return ErrorCode::INVALID_PARAMS;
     }
+    if (instance_id.has_value() != worker_id.has_value()) {
+        LOG(ERROR) << "instance_id and worker_id must be set in same time";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
-    return buffer_allocator_manager_->AddSegment(segment_name, buffer, size);
+    return buffer_allocator_manager_->AddSegment(segment_name, buffer, size,
+                                                 LocationType::CPU_RAM,
+                                                 instance_id, worker_id);
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
@@ -139,8 +161,11 @@ ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
             }
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
+                // Send evict notification before removing metadata
+#ifdef USE_KV_EVENT
+                SendEvictNotification(it->first, it->second);
+#endif
                 it = shard.metadata.erase(it);
-                MasterMetricManager::instance().dec_key_count(1);
             } else {
                 ++it;
             }
@@ -170,41 +195,42 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
+ErrorCode MasterService::GetAllKeys(std::vector<std::string>& all_keys) {
     all_keys.clear();
-    for(int i = 0; i < kNumShards; i++) {
-        for(const auto& item : metadata_shards_[i].metadata) {
+    for (size_t i = 0; i < kNumShards; i++) {
+        for (const auto& item : metadata_shards_[i].metadata) {
             all_keys.push_back(item.first);
         }
     }
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::GetAllSegments(std::vector<std::string> & all_segments) {
+ErrorCode MasterService::GetAllSegments(
+    std::vector<std::string>& all_segments) {
     all_segments.clear();
     std::shared_lock<std::shared_mutex> alloc_lock(
         buffer_allocator_manager_->GetMutex());
     const auto& allocators = buffer_allocator_manager_->GetAllocators();
-    for(auto & allocator : allocators) {
+    for (auto& allocator : allocators) {
         all_segments.push_back(allocator.first);
     }
     alloc_lock.unlock();
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::QuerySegments(const std::string & segment,
-                                       size_t & used,
-                                       size_t & capacity) {
+ErrorCode MasterService::QuerySegments(const std::string& segment, size_t& used,
+                                       size_t& capacity) {
     std::shared_lock<std::shared_mutex> alloc_lock(
         buffer_allocator_manager_->GetMutex());
     const auto& allocators = buffer_allocator_manager_->GetAllocators();
     auto it = allocators.find(segment);
     if (it != allocators.end()) {
-        auto& allocator = it -> second;
-        capacity = allocator -> capacity();
-        used = allocator -> size();
+        auto& allocator = it->second;
+        capacity = allocator->capacity();
+        used = allocator->size();
     } else {
-        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment << ") not found!";
+        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
+                << ") not found!";
         return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
     }
     alloc_lock.unlock();
@@ -292,19 +318,12 @@ ErrorCode MasterService::PutStart(
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = getShardIndex(key);
-    std::unique_lock<std::mutex> lock(metadata_shards_[shard_idx].mutex);
+    auto accessor = MetadataAccessor(this, key);
 
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it != metadata_shards_[shard_idx].metadata.end() &&
-        !CleanupStaleHandles(it->second)) {
+    if (accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
-
-    // Initialize object metadata
-    ObjectMetadata metadata;
-    metadata.size = value_length;
 
     // Allocate replicas
     std::vector<Replica> replicas;
@@ -347,17 +366,17 @@ ErrorCode MasterService::PutStart(
         replicas.emplace_back(std::move(handles), ReplicaStatus::PROCESSING);
     }
 
-    metadata.replicas = std::move(replicas);
-
     replica_list.clear();
-    replica_list.reserve(metadata.replicas.size());
-    for (const auto& replica : metadata.replicas) {
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
 
+    // Create object metadata using MetadataAccessor with proper constructor
+    accessor.Create(std::move(replicas), value_length);
+
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
     return ErrorCode::OK;
 }
 
@@ -375,6 +394,12 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     // Set lease timeout to now, indicating that the object has no lease
     // at beginning
     metadata.GrantLease(0);
+    // Send notification for KVAdmitMsg
+#ifdef USE_KV_EVENT
+    send_lmcache_notification_internal_(
+        key, metadata, LMCacheNotifier::NotificationEventType::ADMIT);
+#endif
+
     return ErrorCode::OK;
 }
 
@@ -392,7 +417,12 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
         return ErrorCode::INVALID_WRITE;
     }
 
+    // Send evict notification before erasing
+#ifdef USE_KV_EVENT
+    SendEvictNotification(key, metadata);
+#endif
     accessor.Erase();
+
     return ErrorCode::OK;
 }
 
@@ -401,7 +431,8 @@ ErrorCode MasterService::BatchPutStart(
     const std::unordered_map<std::string, uint64_t>& value_lengths,
     const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config,
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>& batch_replica_list) {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        batch_replica_list) {
     if (config.replica_num == 0 || keys.empty()) {
         LOG(ERROR) << "replica_num=" << config.replica_num
                    << ", keys_size=" << keys.size() << ", error=invalid_params";
@@ -469,8 +500,14 @@ ErrorCode MasterService::Remove(const std::string& key) {
         return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
+    // Send evict notification
+#ifdef USE_KV_EVENT
+    SendEvictNotification(key, metadata);
+#endif
+
     // Remove object metadata
     accessor.Erase();
+
     return ErrorCode::OK;
 }
 
@@ -493,6 +530,9 @@ long MasterService::RemoveAll() {
             if (it->second.IsLeaseExpired(now)) {
                 total_freed_size +=
                     it->second.size * it->second.replicas.size();
+#ifdef USE_KV_EVENT
+                SendEvictNotification(it->first, it->second);
+#endif
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -501,10 +541,6 @@ long MasterService::RemoveAll() {
         }
     }
 
-    if (removed_count > 0) {
-        // Update metrics only if objects were actually removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-    }
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
@@ -553,14 +589,13 @@ size_t MasterService::GetKeyCount() const {
 }
 
 void MasterService::GCThreadFunc() {
-    VLOG(1) << "action=gc_thread_started";
+    LOG(INFO) << "action=gc_thread_started";
 
     std::priority_queue<GCTask*, std::vector<GCTask*>, GCTaskComparator>
         local_pq;
 
     while (gc_running_) {
         GCTask* task = nullptr;
-        long gc_count = 0;
         while (gc_queue_.pop(task)) {
             if (task) {
                 local_pq.push(task);
@@ -572,7 +607,6 @@ void MasterService::GCThreadFunc() {
             if (!task->is_ready()) {
                 break;
             }
-
             local_pq.pop();
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
             ErrorCode result = Remove(task->key);
@@ -583,13 +617,7 @@ void MasterService::GCThreadFunc() {
                     << "key=" << task->key
                     << ", error=gc_remove_failed, error_code=" << result;
             }
-            if (result == ErrorCode::OK) {
-                gc_count++;
-            }
             delete task;
-        }
-        if (gc_count > 0) {
-            MasterMetricManager::instance().dec_key_count(gc_count);
         }
 
         double used_ratio =
@@ -610,7 +638,7 @@ void MasterService::GCThreadFunc() {
         local_pq.pop();
     }
 
-    VLOG(1) << "action=gc_thread_stopped";
+    LOG(INFO) << "action=gc_thread_stopped";
 }
 
 void MasterService::BatchEvict(double eviction_ratio) {
@@ -668,6 +696,9 @@ void MasterService::BatchEvict(double eviction_ratio) {
                     !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                     total_freed_size +=
                         it->second.size * it->second.replicas.size();
+#ifdef USE_KV_EVENT
+                    SendEvictNotification(it->first, it->second);
+#endif
                     it = shard.metadata.erase(it);
                     shard_evicted_count++;
                 } else {
@@ -680,7 +711,6 @@ void MasterService::BatchEvict(double eviction_ratio) {
 
     if (evicted_count > 0) {
         need_eviction_ = false;
-        MasterMetricManager::instance().dec_key_count(evicted_count);
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {
@@ -694,5 +724,48 @@ void MasterService::BatchEvict(double eviction_ratio) {
             << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
+
+#ifdef USE_KV_EVENT
+void MasterService::send_lmcache_notification_internal_(
+    const std::string& key, const ObjectMetadata& metadata,
+    LMCacheNotifier::NotificationEventType event_type) {
+    if (!lmcache_notifier_) {
+        return;
+    }
+
+    std::optional<std::string> segment_name_opt =
+        metadata.get_primary_segment_name();
+    if (!segment_name_opt) {
+        LOG(WARNING) << "key=" << key
+                     << ", event_type=" << static_cast<int>(event_type)
+                     << ", error=cannot_get_segment_name_for_notification";
+        return;
+    }
+    const std::string& segment_name = *segment_name_opt;
+
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    auto it = allocators.find(segment_name);
+
+    if (it != allocators.end() && it->second) {
+        auto allocator = it->second;
+        std::string location_str = ToString(allocator->getLocationType());
+        lmcache_notifier_.value().EnqueueTask(event_type, key, location_str,
+                                              allocator->getInstanceId(),
+                                              allocator->getWorkerId());
+    } else {
+        LOG(WARNING) << "key=" << key << ", segment_name=" << segment_name
+                     << ", event_type=" << static_cast<int>(event_type)
+                     << ", error=allocator_not_found_for_notification";
+    }
+}
+
+void MasterService::SendEvictNotification(const std::string& key,
+                                          const ObjectMetadata& metadata) {
+    send_lmcache_notification_internal_(
+        key, metadata, LMCacheNotifier::NotificationEventType::EVICT);
+}
+#endif
 
 }  // namespace mooncake

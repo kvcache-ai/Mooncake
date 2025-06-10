@@ -120,6 +120,7 @@ SYSTEM_PACKAGES="build-essential \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   pkg-config \
+                  libzmq3-dev \
                   patchelf"
 
 apt-get install -y $SYSTEM_PACKAGES

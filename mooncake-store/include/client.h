@@ -150,6 +150,20 @@ class Client {
                            size_t size);
 
     /**
+     * @brief Registers a memory segment to master for allocation with LMCache
+     * parameters
+     * @param segment_name Unique identifier for the segment
+     * @param buffer Memory buffer to register
+     * @param size Size of the buffer in bytes
+     * @param instance_id LMCache instance ID
+     * @param worker_id LMCache worker ID
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
+                           size_t size, const std::string& instance_id,
+                           const std::string& worker_id);
+
+    /**
      * @brief Unregisters a memory segment from master
      * @param segment_name Name of the segment to unregister
      * @param addr Memory address to unregister

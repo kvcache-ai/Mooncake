@@ -168,6 +168,8 @@ message MountSegmentRequest {
     required uint64 buffer = 1; // Memory address.
     required uint64 size = 2;   // Memory size.
     required string segment_name = 3; // Segment name.
+    optional string instance_id = 4; // LMCache instance ID.
+    optional string worker_id = 5;   // LMCache worker ID.
 }
 
 // Response to mount a segment

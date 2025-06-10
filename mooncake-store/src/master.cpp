@@ -17,9 +17,12 @@ DEFINE_bool(enable_gc, false, "Enable garbage collection");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
-            "Default lease time for kv objects");
-DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO, "Ratio of objects to evict when storage space is full");
-DEFINE_double(eviction_high_watermark_ratio, mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO, "Ratio of high watermark trigger eviction");
+              "Default lease time for kv objects");
+DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
+              "Ratio of objects to evict when storage space is full");
+DEFINE_double(eviction_high_watermark_ratio,
+              mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+              "Ratio of high watermark trigger eviction");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -27,6 +30,10 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+
+DEFINE_string(lmcache_controller_url, "",
+              "ZMQ URL of the LMCache Controller for notifications (e.g., "
+              "tcp://localhost:5555).  If empty, notifications are disabled.");
 
 int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
@@ -46,18 +53,21 @@ int main(int argc, char* argv[]) {
               << ", metrics_port=" << FLAGS_metrics_port
               << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
               << ", eviction_ratio=" << FLAGS_eviction_ratio
-              << ", eviction_high_watermark_ratio=" << FLAGS_eviction_high_watermark_ratio;
+              << ", eviction_high_watermark_ratio="
+              << FLAGS_eviction_high_watermark_ratio
+              << ", lmcache_controller_url=" << FLAGS_lmcache_controller_url;
 
     mooncake::WrappedMasterService wrapped_master_service(
         FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
-        FLAGS_enable_metric_reporting, FLAGS_metrics_port,
-        FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio);
+        FLAGS_enable_metric_reporting, FLAGS_metrics_port, FLAGS_eviction_ratio,
+        FLAGS_eviction_high_watermark_ratio, FLAGS_lmcache_controller_url);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

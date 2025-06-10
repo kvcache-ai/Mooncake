@@ -38,5 +38,8 @@ kill $MASTER_PID || true
 echo "Running CLI entry point tests..."
 python test_cli.py
 
-echo "All tests completed successfully!"
+echo "Running LMCache notification tests..."
 cd ../..
+./scripts/test_lmcache_integration.sh
+
+echo "All tests completed successfully!"

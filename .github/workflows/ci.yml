@@ -55,9 +55,10 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        sudo apt install libzmq3-dev -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DUSE_KV_EVENT=ON 
       shell: bash
 
     - name: Build project

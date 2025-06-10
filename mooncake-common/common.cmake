@@ -66,6 +66,7 @@ option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
+option(USE_KV_EVENT "option for enabling KV event notifications via ZMQ" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
 if (USE_LRU_MASTER)
@@ -122,6 +123,13 @@ endif()
 if (WITH_METRICS)
   add_compile_definitions(WITH_METRICS)
   message(STATUS "metrics is enabled")
+endif()
+
+if (USE_KV_EVENT)
+  add_compile_definitions(USE_KV_EVENT)
+  message(STATUS "KV event notifications via ZMQ is enabled")
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZMQ REQUIRED libzmq)
 endif()
 
 
