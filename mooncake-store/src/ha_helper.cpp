@@ -121,17 +121,25 @@ int MasterServiceSupervisor::Start() {
         ViewVersionId version = 0;
         EtcdLeaseId lease_id = 0;
         mv_helper.ElectLeader(local_hostname_, version, lease_id);
-        auto leader_watch_thread =
+
+        // Start a thread to keep the leader alive
+        auto keep_leader_thread =
             std::thread([&server, &mv_helper, lease_id]() {
                 mv_helper.KeepLeader(lease_id);
                 LOG(INFO) << "Trying to stop server...";
                 server.stop();
             });
+
+        // To prevent potential split-brain, wait long enough for the old leader
+        // to retire.
+        const int waiting_time = ETCD_MASTER_VIEW_LEASE_TTL;
+        std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
+
+        LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
             enable_gc_, default_kv_lease_ttl_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
             version);
-
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 
@@ -140,12 +148,26 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
+            auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+            if (etcd_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to cancel keep leader alive: "
+                           << etcd_err;
+            }
+            // Even if CancelKeepAlive fails, the keep alive context are closed.
+            // We can safely join the keep leader thread.
+            keep_leader_thread.join();
             return -1;
         }
         // Block until the server is stopped
-        auto err = std::move(ec).get();
-        LOG(ERROR) << "Master service stopped: " << err;
-        leader_watch_thread.join();
+        auto server_err = std::move(ec).get();
+        LOG(ERROR) << "Master service stopped: " << server_err;
+
+        // If the server is closed due to internal errors, we need to manually
+        // stop keep leader alive.
+        auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+        // The error here is predicatable, no need to log it as ERROR.
+        LOG(INFO) << "Cancel keep leader alive: " << etcd_err;
+        keep_leader_thread.join();
     }
     return 0;
 }
