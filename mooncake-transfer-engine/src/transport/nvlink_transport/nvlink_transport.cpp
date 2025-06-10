@@ -281,7 +281,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return 0;
         }
 
-        // Find whole physical page for memory registartion
+        // Find whole physical page for memory registration
         void *real_addr;
         size_t real_size;
         result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, 
