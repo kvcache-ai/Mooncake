@@ -93,9 +93,17 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     }
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+#ifdef USE_KV_EVENT
     if (!lmcache_controller_url.empty()) {
         lmcache_notifier_.emplace(lmcache_controller_url);
     }
+#else
+    if (!lmcache_controller_url.empty()) {
+        throw std::invalid_argument(
+            "LMCache controller URL provided, but "
+            "USE_KV_EVENT is not enabled");
+    }
+#endif
 }
 
 MasterService::~MasterService() {
@@ -154,7 +162,9 @@ ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
                 // Send evict notification before removing metadata
+#ifdef USE_KV_EVENT
                 SendEvictNotification(it->first, it->second);
+#endif
                 it = shard.metadata.erase(it);
             } else {
                 ++it;
@@ -385,8 +395,10 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     // at beginning
     metadata.GrantLease(0);
     // Send notification for KVAdmitMsg
+#ifdef USE_KV_EVENT
     send_lmcache_notification_internal_(
         key, metadata, LMCacheNotifier::NotificationEventType::ADMIT);
+#endif
 
     return ErrorCode::OK;
 }
@@ -406,7 +418,9 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     }
 
     // Send evict notification before erasing
+#ifdef USE_KV_EVENT
     SendEvictNotification(key, metadata);
+#endif
     accessor.Erase();
 
     return ErrorCode::OK;
@@ -487,7 +501,9 @@ ErrorCode MasterService::Remove(const std::string& key) {
     }
 
     // Send evict notification
+#ifdef USE_KV_EVENT
     SendEvictNotification(key, metadata);
+#endif
 
     // Remove object metadata
     accessor.Erase();
@@ -514,7 +530,9 @@ long MasterService::RemoveAll() {
             if (it->second.IsLeaseExpired(now)) {
                 total_freed_size +=
                     it->second.size * it->second.replicas.size();
+#ifdef USE_KV_EVENT
                 SendEvictNotification(it->first, it->second);
+#endif
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -678,7 +696,9 @@ void MasterService::BatchEvict(double eviction_ratio) {
                     !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                     total_freed_size +=
                         it->second.size * it->second.replicas.size();
+#ifdef USE_KV_EVENT
                     SendEvictNotification(it->first, it->second);
+#endif
                     it = shard.metadata.erase(it);
                     shard_evicted_count++;
                 } else {
@@ -705,6 +725,7 @@ void MasterService::BatchEvict(double eviction_ratio) {
             << ", total_freed_size=" << total_freed_size;
 }
 
+#ifdef USE_KV_EVENT
 void MasterService::send_lmcache_notification_internal_(
     const std::string& key, const ObjectMetadata& metadata,
     LMCacheNotifier::NotificationEventType event_type) {
@@ -745,5 +766,6 @@ void MasterService::SendEvictNotification(const std::string& key,
     send_lmcache_notification_internal_(
         key, metadata, LMCacheNotifier::NotificationEventType::EVICT);
 }
+#endif
 
 }  // namespace mooncake

@@ -27,6 +27,9 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 
+# Copy nvlink-hook.so to mooncake directory
+cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/

@@ -14,7 +14,9 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#ifdef USE_KV_EVENT
 #include "kv_cache_publisher.h"
+#endif
 #include "object_metadata.h"
 #include "types.h"
 
@@ -139,21 +141,23 @@ class MasterService {
      * @brief Fetch all keys
      * @return ErrorCode::OK if exists
      */
-    ErrorCode GetAllKeys(std::vector<std::string> & all_keys);
+    ErrorCode GetAllKeys(std::vector<std::string>& all_keys);
 
     /**
-     * @brief Fetch all segments, each node has a unique real client with fixed segment
-     * name : segment name, preferred format : {ip}:{port}, bad format : localhost:{port}
+     * @brief Fetch all segments, each node has a unique real client with fixed
+     * segment name : segment name, preferred format : {ip}:{port}, bad format :
+     * localhost:{port}
      * @return ErrorCode::OK if exists
      */
-    ErrorCode GetAllSegments(std::vector<std::string> & all_segments);
+    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
-     * Conductor should use these information to schedule new requests. 
+     * Conductor should use these information to schedule new requests.
      * @return ErrorCode::OK if exists
      */
-    ErrorCode QuerySegments(const std::string & segment, size_t & used, size_t & capacity);
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
 
     /**
      * @brief Get list of replicas for an object
@@ -208,6 +212,7 @@ class MasterService {
      */
     ErrorCode PutRevoke(const std::string& key);
 
+#ifdef USE_KV_EVENT
     // Helper to send LMCache notifications
     void send_lmcache_notification_internal_(
         const std::string& key, const ObjectMetadata& metadata,
@@ -216,6 +221,7 @@ class MasterService {
     // Helper to send evict notifications
     void SendEvictNotification(const std::string& key,
                                const ObjectMetadata& metadata);
+#endif
 
     /**
      * @brief Start a batch of put operations for N objects
@@ -309,7 +315,9 @@ class MasterService {
     const uint64_t default_kv_lease_ttl_;  // in milliseconds
 
     // LMCache notification
+#ifdef USE_KV_EVENT
     std::optional<LMCacheNotifier> lmcache_notifier_;
+#endif
 
     // Eviction related members
     std::atomic<bool> need_eviction_{

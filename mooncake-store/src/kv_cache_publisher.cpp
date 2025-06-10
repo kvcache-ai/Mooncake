@@ -1,5 +1,7 @@
 #include "kv_cache_publisher.h"
 
+#ifdef USE_KV_EVENT
+
 #include <glog/logging.h>
 #include <zmq.h>
 
@@ -133,3 +135,5 @@ void LMCacheNotifier::SendNotificationInternal(NotificationTask* task) {
     }
 }
 }  // namespace mooncake
+
+#endif  // USE_KV_EVENT

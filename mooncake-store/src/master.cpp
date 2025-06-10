@@ -31,7 +31,7 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     return true;
 });
 
-DEFINE_string(lmcache_controller_url, "tcp://localhost:9001",
+DEFINE_string(lmcache_controller_url, "",
               "ZMQ URL of the LMCache Controller for notifications (e.g., "
               "tcp://localhost:5555).  If empty, notifications are disabled.");
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef USE_KV_EVENT
+
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
 #include <optional>
@@ -79,3 +81,5 @@ class LMCacheNotifier {
 };
 
 }  // namespace mooncake
+
+#endif  // USE_KV_EVENT

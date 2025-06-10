@@ -23,6 +23,20 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -37,15 +51,28 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Configure and build project
+    - name: Configure project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        sudo apt install libzmq3-dev -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DUSE_KV_EVENT=ON 
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
         make -j
         sudo make install
+      shell: bash
+
+    - name: Build hook.so
+      run: |
+        mkdir -p build/mooncake-transfer-engine/nvlink-hook
+        cd mooncake-transfer-engine/nvlink-hook
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
       shell: bash
 
     - name: Start Metadata Server
@@ -156,6 +183,20 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -181,36 +222,60 @@ jobs:
         cd mooncake-transfer-engine
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_NVLINK=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
         make -j
         sudo make install
       shell: bash
 
-    - name: Configure and build project with all settings are ON
+    - name: Configure project with all settings are ON
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_NVLINK=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+      shell: bash
+      # TODO: lack USE_NVMEOF,USE_CUDA,USE_NVLINK
+
+    - name: Build project with all settings are ON
+      run: |
+        cd build
         make -j
         sudo make install
       shell: bash
-      # TODO: lack USE_CUDA and USE_NVMEOF
 
-    - name: Configure and build project with unit tests and examples
+    - name: Configure project with unit tests and examples
       run: |
         cd build
         cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
-        make -j
-        sudo make install
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
 
-    - name: Configure and build project
+    - name: Build project with unit tests and examples
+      run: |
+        cd build
+        make -j
+        sudo make install
+      shell: bash
+
+    - name: Configure project
       run: |
         cd build
         cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
         make -j
         sudo make install
+      shell: bash
+
+    - name: Build hook.so
+      run: |
+        mkdir -p build/mooncake-transfer-engine/nvlink-hook
+        cd mooncake-transfer-engine/nvlink-hook
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
       shell: bash
 
     - name: Generate Python version tag
