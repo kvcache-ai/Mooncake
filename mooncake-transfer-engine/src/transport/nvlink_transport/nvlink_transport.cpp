@@ -286,7 +286,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         size_t real_size;
         result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, 
                                       &real_size, 
-                                      (CUdeviceptr)ptr);
+                                      (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR)
                 << "NvlinkTransport: cuMemGetAddressRange failed: "
