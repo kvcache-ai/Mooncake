@@ -87,7 +87,7 @@ class FileStorageBackend : public StorageBackend {
     ErrorCode LoadObject(const ObjectKey& key, std::string& str) override;
 
     /**
-     * @brief Queries fiel metadata for an object key
+     * @brief Queries file metadata for an object key
      * @param key Object identifier
      * @param filePath_ Output file path
      * @param fileLength_ Output file length
