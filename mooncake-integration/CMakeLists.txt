@@ -10,38 +10,40 @@ if("${PYTHON_SYS_PATH}" STREQUAL "")
     message(FATAL_ERROR "Python path is empty! Please check the python env.")
 endif()
 
-include_directories("../mooncake-store/include")
-include_directories("../mooncake-store/include/cachelib_memory_allocator")
+if (WITH_STORE)
+    include_directories("../mooncake-store/include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator")
 
-include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
-include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
 
-include_directories("/usr/include/jsoncpp")
+    include_directories("/usr/include/jsoncpp")
 
-pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    vllm/vllm_adaptor.cpp 
-    vllm/distributed_object_store.cpp
-)
+    pybind11_add_module(mooncake_vllm_adaptor ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        vllm/vllm_adaptor.cpp
+        vllm/distributed_object_store.cpp
+    )
 
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
-set_target_properties(mooncake_vllm_adaptor PROPERTIES
-    INSTALL_RPATH "$ORIGIN/lib_so"
-    BUILD_RPATH "$ORIGIN/lib_so"
-    SKIP_BUILD_RPATH FALSE
-)
- 
+    set_target_properties(mooncake_vllm_adaptor PROPERTIES
+        INSTALL_RPATH "$ORIGIN/lib_so"
+        BUILD_RPATH "$ORIGIN/lib_so"
+        SKIP_BUILD_RPATH FALSE
+    )
 
-target_link_libraries(mooncake_vllm_adaptor PUBLIC 
-    transfer_engine 
-    glog::glog
-    gflags::gflags
-    mooncake_store 
-    cachelib_memory_allocator
-)
-message("${PYTHON_SYS_PATH}")
-install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
+
+    target_link_libraries(mooncake_vllm_adaptor PUBLIC
+        transfer_engine
+        glog::glog
+        gflags::gflags
+        mooncake_store
+        cachelib_memory_allocator
+    )
+    message("${PYTHON_SYS_PATH}")
+    install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
+endif()
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
@@ -52,16 +54,19 @@ target_link_libraries(engine PUBLIC
     glog::glog
     gflags::gflags
 )
-pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp 
-)
-target_link_libraries(store PUBLIC 
-    transfer_engine 
-    glog::glog
-    gflags::gflags
-    mooncake_store 
-    cachelib_memory_allocator
-)
+
+if (WITH_STORE)
+    pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        store/store_py.cpp
+    )
+    target_link_libraries(store PUBLIC
+        transfer_engine
+        glog::glog
+        gflags::gflags
+        mooncake_store
+        cachelib_memory_allocator
+    )
+endif()
 message("${PYTHON_SYS_PATH}")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
@@ -81,5 +86,7 @@ install(
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
     "
 )
-install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+if (WITH_STORE)
+    install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
