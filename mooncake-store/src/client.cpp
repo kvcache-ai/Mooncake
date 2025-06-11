@@ -668,23 +668,6 @@ ErrorCode Client::TransferRead(
     return TransferData(handles, slices, TransferRequest::READ);
 }
 
-ErrorCode Client::FindFirstCompleteReplica(
-    const std::vector<Replica::Descriptor>& replica_list,
-    std::vector<AllocatedBuffer::Descriptor>& handles) {
-    handles.clear();
-
-    // Find the first complete replica
-    for (size_t i = 0; i < replica_list.size(); ++i) {
-        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
-            handles = replica_list[i].buffer_descriptors;
-            return ErrorCode::OK;
-        }
-    }
-
-    // No complete replica found
-    return ErrorCode::INVALID_REPLICA;
-}
-
 void Client::PingThreadFunc(int current_version) {
     // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
@@ -780,6 +763,23 @@ void Client::PingThreadFunc(int current_version) {
             need_remount = true;
         }
     }
+}
+
+ErrorCode Client::FindFirstCompleteReplica(
+    const std::vector<Replica::Descriptor>& replica_list,
+    std::vector<AllocatedBuffer::Descriptor>& handles) {
+    handles.clear();
+
+    // Find the first complete replica
+    for (size_t i = 0; i < replica_list.size(); ++i) {
+        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
+            handles = replica_list[i].buffer_descriptors;
+            return ErrorCode::OK;
+        }
+    }
+
+    // No complete replica found
+    return ErrorCode::INVALID_REPLICA;
 }
 
 }  // namespace mooncake

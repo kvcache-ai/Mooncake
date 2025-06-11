@@ -132,6 +132,8 @@ class TransferEngineOperationState : public OperationState {
             << "Invalid batch ID for transfer engine operation";
     }
 
+    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+
     bool is_completed() override;
 
     void wait_for_completion() override;

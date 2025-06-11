@@ -177,10 +177,6 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
     const int64_t start_ts = getCurrentTimeInNano();
-    // RAII wrapper for batch ID cleanup
-    auto batch_guard = [this](void*) { engine_.freeBatchID(batch_id_); };
-    std::unique_ptr<void, decltype(batch_guard)> guard(
-        reinterpret_cast<void*>(1), batch_guard);
 
     while (true) {
         if (getCurrentTimeInNano() - start_ts >
@@ -343,6 +339,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
+        // Note: batch_id will be freed by TransferEngineOperationState
+        // destructor if we create the state object, otherwise we need to free
+        // it here
         engine_.freeBatchID(batch_id);
         return std::nullopt;
     }
