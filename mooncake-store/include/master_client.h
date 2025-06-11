@@ -148,6 +148,14 @@ class MasterClient {
     [[nodiscard]] UnmountSegmentResponse UnmountSegment(
         const std::string& segment_name);
 
+    /**
+     * @brief Pings master to check its availability
+     * @param No parameters
+     * @return current master view version
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] PingResponse Ping();
+
    private:
     coro_rpc_client client_;
 };
