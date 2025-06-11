@@ -235,9 +235,6 @@ ErrorCode Client::Query(const std::string& object_key,
         if (storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size)) {
             desc.status = ReplicaStatus::COMPLETE;
             object_info.replica_list.emplace_back(std::move(desc));  
-            LOG(INFO) << "Query object_key: " << object_key
-                      << " from local file, file_path: " << disk_desc.file_path
-                      << ", file_size: " << disk_desc.file_size;
             return ErrorCode::OK;
         }
     }
@@ -537,11 +534,13 @@ ErrorCode Client::BatchPut(
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
+
+    auto &error_code = master_client_.Remove(key).error_code;
     if (storage_backend_) {
         // Remove from storage backend
         storage_backend_->RemoveFile(key);
     }
-    return master_client_.Remove(key).error_code;
+    return error_code;
 }
 
 long Client::RemoveAll() { 

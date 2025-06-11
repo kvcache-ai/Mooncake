@@ -174,7 +174,6 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
     config.replica_num = 1;
     ASSERT_EQ(client_->Put(key, slices, config), ErrorCode::OK);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
-
     // Remove the data
     ASSERT_EQ(client_->Remove(key), ErrorCode::OK);
 

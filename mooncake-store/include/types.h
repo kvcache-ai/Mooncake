@@ -259,8 +259,8 @@ struct MemoryDescriptor {
 };
 
 struct DiskDescriptor {
-    std::string file_path;
-    uint64_t file_size;
+    std::string file_path{};
+    uint64_t file_size = 0;
     YLT_REFL(DiskDescriptor, file_path, file_size);
 };
 
