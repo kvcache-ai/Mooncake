@@ -314,23 +314,26 @@ int DistributedObjectStore::allocateSlicesPacked(
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
-    if(object_info.hasFile){
-        length=object_info.fileLength;
-        return allocateSlices(slices, length);
-    } 
 
     length = 0;
-    if (object_info.replicaInfo.replica_list.empty()) return -1;
-    auto &replica = object_info.replicaInfo.replica_list[0];
-    for (auto &handle : replica.buffer_descriptors) {
-        auto chunk_size = handle.size_;
-        assert(chunk_size <= kMaxSliceSize);
-        auto ptr = client_buffer_allocator_->allocate(chunk_size);
-        if (!ptr) {
-            return 1;  // SliceGuard will handle cleanup
+    if (object_info.replica_list.empty()) return -1;
+    auto &replica = object_info.replica_list[0];
+    if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
+        auto &disk_descriptor =replica.get_disk_descriptor();
+        length = disk_descriptor.file_size;
+        return allocateSlices(slices, length);
+    }else{
+        auto &memory_descriptors = replica.get_memory_descriptor();
+        for (auto &handle : memory_descriptors.buffer_descriptors) {
+            auto chunk_size = handle.size_;
+            assert(chunk_size <= kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;  // SliceGuard will handle cleanup
+            }
+            slices.emplace_back(Slice{ptr, chunk_size});
+            length += chunk_size;
         }
-        slices.emplace_back(Slice{ptr, chunk_size});
-        length += chunk_size;
     }
     return 0;
 }
@@ -528,17 +531,18 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
         return toInt(error_code);
     }
 
-    if (object_info.hasFile) {
-        // If the object is stored in a file, return its length
-        return object_info.fileLength;
-    }
-
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (!object_info.replicaInfo.replica_list.empty()) {
-        auto &replica = object_info.replicaInfo.replica_list[0];
-        for (auto &handle : replica.buffer_descriptors) {
-            total_size += handle.size_;
+    if (!object_info.replica_list.empty()) {
+        auto &replica = object_info.replica_list[0];
+        if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
+            auto &disk_descriptor = replica.get_disk_descriptor();
+            total_size = disk_descriptor.file_size;
+        }else{
+            auto &memory_descriptors = replica.get_memory_descriptor();
+            for (auto &handle : memory_descriptors.buffer_descriptors) {
+                total_size += handle.size_;
+            }
         }
     } else {
         LOG(ERROR) << "Internal error: object_info.replica_list_size() is 0";

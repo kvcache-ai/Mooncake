@@ -217,8 +217,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     ErrorCode error_code = client_->Query(key, objectinfo);
     ASSERT_EQ(error_code, ErrorCode::OK);
     ASSERT_EQ(objectinfo.replica_list.size(), 1);
-    ASSERT_EQ(objectinfo.replica_list[0].buffer_descriptors.size(), 1);
-    ASSERT_EQ(objectinfo.replica_list[0].buffer_descriptors[0].segment_name_,
+    ASSERT_EQ(objectinfo.replica_list[0].get_memory_descriptor().buffer_descriptors.size(), 1);
+    ASSERT_EQ(objectinfo.replica_list[0].get_memory_descriptor().buffer_descriptors[0].segment_name_,
               "localhost:17812");
 
     error_code = client_->Get(key, objectinfo, slices);

@@ -220,15 +220,22 @@ ErrorCode Client::Query(const std::string& object_key,
                         ObjectInfo& object_info) {
     auto response = master_client_.GetReplicaList(object_key);
     // copy vec
-    object_info.replicaInfo.replica_list.resize(response.replica_list.size());
+    object_info.replica_list.resize(response.replica_list.size());
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
-        object_info.replicaInfo.replica_list[i] = response.replica_list[i];
+        object_info.replica_list[i] = response.replica_list[i];
     }
 
+    // Currently, it is a client-side query. Manually construct a disk descriptor 
+    // that meets the requirements. In the future, the matching disk replica descriptor 
+    // can be directly obtained from the master.
     if(response.error_code!= ErrorCode::OK && storage_backend_){
-        storage_backend_->Querykey(object_key, object_info.hasFile,
-                                    object_info.filePath, object_info.fileLength);
-        if(object_info.hasFile){
+        Replica::Descriptor desc;
+        auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();  
+        storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size);
+        
+        if (!disk_desc.file_path.empty()) {
+            desc.status = ReplicaStatus::COMPLETE;
+            object_info.replica_list.emplace_back(std::move(desc));  
             return ErrorCode::OK;
         }
     }
@@ -263,46 +270,47 @@ ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
 ErrorCode Client::Get(const std::string& object_key,
                       ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
-
-    if(object_info.hasFile) {
-        // If the object is stored in a local file, load it directly
-        return Get_From_Local_File(object_key, slices, object_info);
-    }
-
     // Get the first complete replica
-    for (size_t i = 0; i < object_info.replicaInfo.replica_list.size(); ++i) {
-        if (object_info.replicaInfo.replica_list[i].status == ReplicaStatus::COMPLETE) {
-            const auto& replica = object_info.replicaInfo.replica_list[i];
+    for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
+        if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
+            const auto& replica = object_info.replica_list[i];
 
-            std::vector<AllocatedBuffer::Descriptor> handles;
-            for (const auto& handle : replica.buffer_descriptors) {
-                VLOG(1) << "handle: segment_name=" << handle.segment_name_
-                        << " buffer=" << handle.buffer_address_
-                        << " size=" << handle.size_;
-                if (handle.status_ != BufStatus::COMPLETE) {
-                    LOG(ERROR) << "incomplete_handle_found segment_name="
-                               << handle.segment_name_;
+            if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
+                // If the replica is a disk descriptor, load it from the local file
+                return Get_From_Local_File(
+                    object_key, slices, object_info);
+            }else{
+                std::vector<AllocatedBuffer::Descriptor> handles;
+                auto& mem_desc =  replica.get_memory_descriptor();
+                for (const auto& handle : mem_desc.buffer_descriptors) {
+                    VLOG(1) << "handle: segment_name=" << handle.segment_name_
+                            << " buffer=" << handle.buffer_address_
+                            << " size=" << handle.size_;
+                    if (handle.status_ != BufStatus::COMPLETE) {
+                        LOG(ERROR) << "incomplete_handle_found segment_name="
+                                << handle.segment_name_;
+                        return ErrorCode::INVALID_PARAMS;
+                    }
+                    handles.push_back(handle);
+                }
+                // Fast path: if segment is on local host and we have single slice
+                // and handle, use memcpy instead of going through the transfer
+                // engine to improve performance and save bandwidth
+                if (slices.size() == 1 && handles.size() == 1 &&
+                    handles[0].size_ == slices[0].size &&
+                    handles[0].segment_name_ == this->local_hostname_) {
+                    VLOG(1) << "Using fast path (memcpy) for local transfer";
+                    memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
+                        handles[0].size_);
+                    return ErrorCode::OK;
+                }
+
+                if (TransferRead(handles, slices) != ErrorCode::OK) {
+                    LOG(ERROR) << "transfer_read_failed key=" << object_key;
                     return ErrorCode::INVALID_PARAMS;
                 }
-                handles.push_back(handle);
-            }
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine to improve performance and save bandwidth
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
-                       handles[0].size_);
                 return ErrorCode::OK;
             }
-
-            if (TransferRead(handles, slices) != ErrorCode::OK) {
-                LOG(ERROR) << "transfer_read_failed key=" << object_key;
-                return ErrorCode::INVALID_PARAMS;
-            }
-            return ErrorCode::OK;
         }
     }
 
@@ -313,15 +321,12 @@ ErrorCode Client::Get(const std::string& object_key,
 ErrorCode Client::Get_From_Local_File(
     const std::string& object_key, std::vector<Slice>& slices, ObjectInfo& object_info) {
     if (!storage_backend_) {
-        // LOG(INFO) << "Storage backend is not initialized";
         return ErrorCode::FILE_SYSTEM_UNINITIALIZED;
     }
 
     ErrorCode err=storage_backend_->LoadObject(object_key, slices);
     //TODO： add path in parameter
     if (err != ErrorCode::OK) {
-        // LOG(INFO) << "Failed to load object from storage backend: "
-                //    << object_key;
         return err;
     }
 
@@ -400,7 +405,8 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     // Transfer data using allocated handles from all replicas
     for (const auto& replica : start_response.replica_list) {
         std::vector<AllocatedBuffer::Descriptor> handles;
-        for (const auto& handle : replica.buffer_descriptors) {
+        auto& mem_desc=replica.get_memory_descriptor();
+        for (const auto& handle : mem_desc.buffer_descriptors) {
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);
         }
@@ -487,7 +493,8 @@ ErrorCode Client::BatchPut(
         }
         for (auto& replica : replica_list->second) {
             std::vector<AllocatedBuffer::Descriptor> handles;
-            for (const auto& handle : replica.buffer_descriptors) {
+            auto& mem_desc = replica.get_memory_descriptor();
+            for (const auto& handle : mem_desc.buffer_descriptors) {
                 CHECK(handle.buffer_address_ != 0)
                     << "buffer_address_ is nullptr";
                 handles.push_back(handle);

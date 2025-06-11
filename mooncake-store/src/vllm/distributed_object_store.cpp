@@ -85,8 +85,8 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (!object_info.replicaInfo.replica_list_size()) return -1;
-    auto &replica = object_info.replicaInfo.replica_list(0);
+    if (!object_info.replica_list_size()) return -1;
+    auto &replica = object_info.replica_list(0);
     for (auto &handle : replica.handles()) {
         auto chunk_size = handle.size();
         assert(chunk_size <= kMaxSliceSize);

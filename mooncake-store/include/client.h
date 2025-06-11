@@ -60,14 +60,7 @@ class Client {
      * 1. Query object information
      * 2. Transfer data based on the information
      */
-    struct ObjectInfo{
-        GetReplicaListResponse replicaInfo{};
-        bool hasFile = false;
-        std::string filePath = "";
-        size_t fileLength = 0;
-
-        ObjectInfo() = default;
-    }; 
+    using ObjectInfo = GetReplicaListResponse;
 
     /**
      * @brief Two-step data retrieval process

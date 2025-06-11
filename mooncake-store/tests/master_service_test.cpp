@@ -50,7 +50,7 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
                                      std::to_string(static_cast<int>(code)));
         }
         service->PutEnd(key);
-        if (replica_list[0].buffer_descriptors[0].segment_name_ == segment_name) {
+        if (replica_list[0].get_memory_descriptor().buffer_descriptors[0].segment_name_ == segment_name) {
             return key;
         }
         // Clean up failed attempt
@@ -434,11 +434,11 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         EXPECT_EQ(ReplicaStatus::PROCESSING, replica.status);
 
         // Verify number of handles matches number of slices
-        ASSERT_EQ(slice_lengths.size(), replica.buffer_descriptors.size());
+        ASSERT_EQ(slice_lengths.size(), replica.get_memory_descriptor().buffer_descriptors.size());
 
         // Verify each handle's properties
-        for (size_t i = 0; i < replica.buffer_descriptors.size(); i++) {
-            const auto& handle = replica.buffer_descriptors[i];
+        for (size_t i = 0; i < replica.get_memory_descriptor().buffer_descriptors.size(); i++) {
+            const auto& handle = replica.get_memory_descriptor().buffer_descriptors[i];
             EXPECT_EQ(BufStatus::INIT, handle.status_);
 
             EXPECT_EQ(slice_lengths[i], handle.size_);
@@ -460,8 +460,8 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Verify final state of all replicas
     for (const auto& replica : retrieved_replicas) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica.status);
-        ASSERT_EQ(slice_lengths.size(), replica.buffer_descriptors.size());
-        for (const auto& handle : replica.buffer_descriptors) {
+        ASSERT_EQ(slice_lengths.size(), replica.get_memory_descriptor().buffer_descriptors.size());
+        for (const auto& handle : replica.get_memory_descriptor().buffer_descriptors) {
             EXPECT_EQ(BufStatus::COMPLETE, handle.status_);
         }
     }
@@ -843,7 +843,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key1));
     ASSERT_EQ(ErrorCode::OK,
               service_->GetReplicaList(key1, retrieved));
-    ASSERT_EQ(replica_list[0].buffer_descriptors[0].segment_name_, segment2);
+    ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors[0].segment_name_, segment2);
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {

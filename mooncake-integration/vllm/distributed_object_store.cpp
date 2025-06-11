@@ -239,9 +239,9 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
     length = 0;
-    if (object_info.replicaInfo.replica_list.empty()) return -1;
-    auto &replica = object_info.replicaInfo.replica_list[0];
-    for (auto &handle : replica.buffer_descriptors) {
+    if (object_info.replica_list.empty()) return -1;
+    auto &replica = object_info.replica_list[0];
+    for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
@@ -397,9 +397,9 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (!object_info.replicaInfo.replica_list.empty()) {
-        auto &replica = object_info.replicaInfo.replica_list[0];
-        for (auto &handle : replica.buffer_descriptors) {
+    if (!object_info.replica_list.empty()) {
+        auto &replica = object_info.replica_list[0];
+        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
             total_size += handle.size_;
         }
     } else {

@@ -84,7 +84,7 @@ class FileStorageBackend : public StorageBackend {
      */
     ErrorCode LoadObject(const ObjectKey& key, std::string& str) override;
     
-    void Querykey(const ObjectKey& key, bool& hasFile_, std::string& filePath_, size_t& fileLength_) override;
+    void Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) override;
 
     ErrorCode Existkey(const ObjectKey& key) override;
 

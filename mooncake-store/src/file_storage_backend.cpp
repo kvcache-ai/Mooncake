@@ -171,7 +171,7 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-void FileStorageBackend::Querykey(const ObjectKey& key, bool& hasFile_, std::string& filePath_, size_t& fileLength_) {
+void FileStorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
 
@@ -181,7 +181,6 @@ void FileStorageBackend::Querykey(const ObjectKey& key, bool& hasFile_, std::str
     }
 
     // Populate object_info with file metadata
-    hasFile_=true;
     filePath_ = path;
     fileLength_ = fs::file_size(path);
     

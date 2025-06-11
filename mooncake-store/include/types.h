@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <variant>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -252,6 +253,17 @@ inline std::ostream& operator<<(std::ostream& os,
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
+struct MemoryDescriptor {
+    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors; 
+    YLT_REFL(MemoryDescriptor, buffer_descriptors);
+};
+
+struct DiskDescriptor {
+    std::string file_path;
+    uint64_t file_size;
+    YLT_REFL(DiskDescriptor, file_path, file_size);
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -289,9 +301,37 @@ class Replica {
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct Descriptor {
-        std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
+        std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, buffer_descriptors, status);
+        YLT_REFL(Descriptor, descriptor_variant, status);
+
+        MemoryDescriptor& get_memory_descriptor() {
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        DiskDescriptor& get_disk_descriptor() {
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
+
+        const MemoryDescriptor& get_memory_descriptor() const{
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        const DiskDescriptor& get_disk_descriptor() const{
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
     };
 
    private:
@@ -302,12 +342,14 @@ class Replica {
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.status = status_;
-    desc.buffer_descriptors.reserve(buffers_.size());
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptors.reserve(buffers_.size());
     for (const auto& buf_ptr : buffers_) {
         if (buf_ptr) {
-            desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
+            mem_desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
         }
     }
+    desc.descriptor_variant = std::move(mem_desc);
     return desc;
 }
 

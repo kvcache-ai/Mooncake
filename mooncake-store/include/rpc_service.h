@@ -159,11 +159,14 @@ class WrappedMasterService {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
                 for(size_t i = 0; i < response.replica_list.size(); i++) {
-                    for(const auto& handle : response.replica_list[i].buffer_descriptors) {
-                        std::string tmp = "";
-                        struct_json::to_json(handle, tmp);
-                        ss += tmp;
-                        ss += "\n";
+                    if(std::holds_alternative<MemoryDescriptor>(response.replica_list[i].descriptor_variant)) {
+                        auto & memory_descriptors = response.replica_list[i].get_memory_descriptor();
+                        for(const auto& handle : memory_descriptors.buffer_descriptors) {
+                            std::string tmp = "";
+                            struct_json::to_json(handle, tmp);
+                            ss += tmp;
+                            ss += "\n";
+                        }
                     }
                 }
                 resp.set_status_and_content(status_type::ok, ss);
