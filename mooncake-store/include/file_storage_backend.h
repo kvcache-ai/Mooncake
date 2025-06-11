@@ -85,13 +85,34 @@ class FileStorageBackend : public StorageBackend {
      * @return ErrorCode indicating operation status
      */
     ErrorCode LoadObject(const ObjectKey& key, std::string& str) override;
-    
+
+    /**
+     * @brief Queries fiel metadata for an object key
+     * @param key Object identifier
+     * @param filePath_ Output file path
+     * @param fileLength_ Output file length
+     * @return true if object exists, false otherwise
+     */    
     bool Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) override;
 
+    /**
+     * @brief Checks if an object with the given key exists
+     * @param key Object identifier
+     * @return ErrorCode::OK if exists, ErrorCode::FILE_NOT_FOUND if not exists, other ErrorCode for errors
+     */
     ErrorCode Existkey(const ObjectKey& key) override;
 
+    /**
+     * @brief Deletes the physical file associated with the given object key
+     * @param key Object identifier
+     */
     void RemoveFile(const ObjectKey& key) override;
 
+    /**
+     * @brief Deletes all objects from the storage backend
+     * 
+     * Removes all files in the session subdirectory.
+     */
     void RemoveAll() override;
 
     // Root directory path for storage and session ID for subdirectory

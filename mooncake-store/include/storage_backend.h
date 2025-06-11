@@ -32,12 +32,16 @@ public:
     /// Loads object as contiguous string
     virtual ErrorCode LoadObject(const ObjectKey& key, std::string& str) = 0;
 
+    /// Retrieves physical file metadata for given object
     virtual bool Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) = 0;
 
+    /// Checks if object with given key exists in storage
     virtual ErrorCode Existkey(const ObjectKey& key) = 0;
 
+    /// Deletes physical file associated with given object key
     virtual void RemoveFile(const ObjectKey& key) = 0;
-
+    
+    /// Deletes all objects from storage backend
     virtual void RemoveAll() = 0;
 };
 
