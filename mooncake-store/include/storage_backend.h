@@ -32,7 +32,7 @@ public:
     /// Loads object as contiguous string
     virtual ErrorCode LoadObject(const ObjectKey& key, std::string& str) = 0;
 
-    virtual void Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) = 0;
+    virtual bool Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) = 0;
 
     virtual ErrorCode Existkey(const ObjectKey& key) = 0;
 

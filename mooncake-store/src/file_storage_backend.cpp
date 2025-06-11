@@ -171,19 +171,19 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-void FileStorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
+bool FileStorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
 
     // Check if the file exists
     if (!fs::exists(path)) {
-        return;
+        return false;
     }
 
     // Populate object_info with file metadata
     filePath_ = path;
     fileLength_ = fs::file_size(path);
-    
+    return true;
 }
 
 ErrorCode FileStorageBackend::Existkey(const ObjectKey& key) {

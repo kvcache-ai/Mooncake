@@ -231,9 +231,8 @@ ErrorCode Client::Query(const std::string& object_key,
     if(response.error_code!= ErrorCode::OK && storage_backend_){
         Replica::Descriptor desc;
         auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();  
-        storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size);
         
-        if (!disk_desc.file_path.empty()) {
+        if (storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size)) {
             desc.status = ReplicaStatus::COMPLETE;
             object_info.replica_list.emplace_back(std::move(desc));  
             LOG(INFO) << "Query object_key: " << object_key
