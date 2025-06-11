@@ -201,8 +201,11 @@ ErrorCode FileStorageBackend::Existkey(const ObjectKey& key) {
 void FileStorageBackend::RemoveFile(const ObjectKey& key) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
-    //TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
+    // TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
     // Check if the file exists before attempting to remove it
+    // TODO: add a sleep to ensure the write thread has time to create the corresponding file
+    // it will be fixed in the next version
+    usleep(50);
     if (fs::exists(path)) {
         std::error_code ec;
         fs::remove(path, ec);
