@@ -1,10 +1,15 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ostream>
+#include <queue>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -17,9 +22,24 @@ namespace mooncake {
  * @brief Transfer strategy enumeration
  */
 enum class TransferStrategy {
-    LOCAL_MEMCPY,    // Local memory copy using memcpy
-    TRANSFER_ENGINE  // Remote transfer using transfer engine
+    LOCAL_MEMCPY = 0,    // Local memory copy using memcpy
+    TRANSFER_ENGINE = 1  // Remote transfer using transfer engine
 };
+
+/**
+ * @brief Stream operator for TransferStrategy
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const TransferStrategy& strategy) noexcept {
+    switch (strategy) {
+        case TransferStrategy::LOCAL_MEMCPY:
+            return os << "LOCAL_MEMCPY";
+        case TransferStrategy::TRANSFER_ENGINE:
+            return os << "TRANSFER_ENGINE";
+        default:
+            return os << "UNKNOWN";
+    }
+}
 
 /**
  * @brief Abstract base class for operation state management
@@ -48,6 +68,9 @@ class OperationState {
      */
     ErrorCode get_result() const {  // lock mutex
         std::lock_guard<std::mutex> lock(mutex_);
+        assert(result_.has_value() &&
+               "get_result() called on an incomplete or failed-to-set "
+               "operation state.");
         return result_.value_or(ErrorCode::INVALID_PARAMS);
     }
 
@@ -190,6 +213,51 @@ struct MemcpyOperation {
 };
 
 /**
+ * @brief Memcpy task for async execution
+ */
+struct MemcpyTask {
+    std::vector<MemcpyOperation> operations;
+    std::shared_ptr<MemcpyOperationState> state;
+
+    MemcpyTask(std::vector<MemcpyOperation> ops,
+               std::shared_ptr<MemcpyOperationState> s)
+        : operations(std::move(ops)), state(std::move(s)) {}
+};
+
+/**
+ * @brief Thread pool for asynchronous memcpy operations
+ *
+ * This class manages a single worker thread that executes memcpy operations
+ * asynchronously.
+ */
+class MemcpyWorkerPool {
+   public:
+    explicit MemcpyWorkerPool();
+    ~MemcpyWorkerPool();
+
+    // Non-copyable, non-movable
+    MemcpyWorkerPool(const MemcpyWorkerPool&) = delete;
+    MemcpyWorkerPool& operator=(const MemcpyWorkerPool&) = delete;
+    MemcpyWorkerPool(MemcpyWorkerPool&&) = delete;
+    MemcpyWorkerPool& operator=(MemcpyWorkerPool&&) = delete;
+
+    /**
+     * @brief Submit a memcpy task for async execution
+     * @param task The memcpy task to execute
+     */
+    void submitTask(MemcpyTask task);
+
+   private:
+    void workerThread();
+
+    std::vector<std::thread> workers_;
+    std::queue<MemcpyTask> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> shutdown_;
+};
+
+/**
  * @brief Submitter class for asynchronous transfer operations
  *
  * This class analyzes transfer requirements, selects optimal strategies, and
@@ -221,6 +289,7 @@ class TransferSubmitter {
    private:
     TransferEngine& engine_;
     const std::string local_hostname_;
+    std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 
     /**
      * @brief Select the optimal transfer strategy

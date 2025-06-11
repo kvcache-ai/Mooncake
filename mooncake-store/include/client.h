@@ -215,6 +215,19 @@ class Client {
     ErrorCode TransferRead(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
+
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param handles Output vector to store the buffer handles of the found
+     * replica
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        std::vector<AllocatedBuffer::Descriptor>& handles);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;

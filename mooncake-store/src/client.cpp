@@ -201,7 +201,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                    protocol, protocol_args);
+                                     protocol, protocol_args);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;
@@ -275,40 +275,34 @@ ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
 ErrorCode Client::Get(const std::string& object_key,
                       const ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
-    // Get the first complete replica
-    for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
-        if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
-            const auto& replica = object_info.replica_list[i];
-
-            std::vector<AllocatedBuffer::Descriptor> handles;
-            for (const auto& handle : replica.buffer_descriptors) {
-                VLOG(1) << "handle: segment_name=" << handle.segment_name_
-                        << " buffer=" << handle.buffer_address_
-                        << " size=" << handle.size_;
-                if (handle.status_ != BufStatus::COMPLETE) {
-                    LOG(ERROR) << "incomplete_handle_found segment_name="
-                               << handle.segment_name_;
-                    return ErrorCode::INVALID_PARAMS;
-                }
-                handles.push_back(handle);
-            }
-
-            if (TransferRead(handles, slices) != ErrorCode::OK) {
-                LOG(ERROR) << "transfer_read_failed key=" << object_key;
-                return ErrorCode::INVALID_PARAMS;
-            }
-            return ErrorCode::OK;
+    // Find the first complete replica
+    std::vector<AllocatedBuffer::Descriptor> handles;
+    ErrorCode err = FindFirstCompleteReplica(object_info.replica_list, handles);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::INVALID_REPLICA) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
+        return err;
     }
 
-    LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
-    return ErrorCode::INVALID_REPLICA;
+    if (TransferRead(handles, slices) != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode Client::BatchGet(
     const std::vector<std::string>& object_keys,
     BatchObjectInfo& batched_object_info,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
+    // Collect all transfer operations for parallel execution
+    std::vector<std::pair<std::string, TransferFuture>> pending_transfers;
+    pending_transfers.reserve(object_keys.size());
+
+    // Submit all transfers in parallel
     for (const auto& key : object_keys) {
         auto object_info_it = batched_object_info.batch_replica_list.find(key);
         auto slices_it = slices.find(key);
@@ -319,15 +313,48 @@ ErrorCode Client::BatchGet(
             return ErrorCode::INVALID_PARAMS;
         }
 
-        ObjectInfo object_info;
-        object_info.replica_list = object_info_it->second;
-        object_info.error_code = ErrorCode::OK;
-        if (Get(key, object_info, slices_it->second) != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get key: " << key;
+        // Find the first complete replica for this key
+        const auto& replica_list = object_info_it->second;
+        std::vector<AllocatedBuffer::Descriptor> handles;
+        ErrorCode err = FindFirstCompleteReplica(replica_list, handles);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            }
             slices.clear();
-            return ErrorCode::INVALID_PARAMS;
+            return err;
         }
+
+        // Submit transfer operation asynchronously
+        auto future = transfer_submitter_->submit(handles, slices_it->second,
+                                                  TransferRequest::READ);
+        if (!future) {
+            LOG(ERROR) << "Failed to submit transfer operation for key: "
+                       << key;
+            slices.clear();
+            return ErrorCode::TRANSFER_FAIL;
+        }
+
+        VLOG(1) << "Submitted transfer for key " << key
+                << " using strategy: " << static_cast<int>(future->strategy());
+
+        pending_transfers.emplace_back(key, std::move(*future));
     }
+
+    // Wait for all transfers to complete
+    for (auto& [key, future] : pending_transfers) {
+        ErrorCode result = future.get();
+        if (result != ErrorCode::OK) {
+            LOG(ERROR) << "Transfer failed for key: " << key
+                       << " with error: " << static_cast<int>(result);
+            slices.clear();
+            return result;
+        }
+        VLOG(1) << "Transfer completed successfully for key: " << key;
+    }
+
+    VLOG(1) << "BatchGet completed successfully for " << object_keys.size()
+            << " keys";
     return ErrorCode::OK;
 }
 
@@ -387,6 +414,8 @@ ErrorCode Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
     ReplicateConfig& config) {
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
     std::unordered_map<std::string, std::vector<size_t>> batched_slice_lengths;
     std::unordered_map<std::string, size_t> batched_value_lengths;
     for (const auto& key : keys) {
@@ -416,7 +445,11 @@ ErrorCode Client::BatchPut(
         return err;
     }
 
-    // Transfer data using allocated handles from all replicas
+    // Collect all transfer operations for parallel execution
+    std::vector<std::tuple<std::string, size_t, TransferFuture>>
+        pending_transfers;
+
+    // Submit all transfers in parallel
     for (const auto& key : keys) {
         const auto& slices_it = batched_slices.find(key);
         if (slices_it == batched_slices.end()) {
@@ -428,7 +461,10 @@ ErrorCode Client::BatchPut(
             LOG(ERROR) << "Cannot find replica_list for key: " << key;
             return ErrorCode::INVALID_PARAMS;
         }
-        for (auto& replica : replica_list->second) {
+
+        for (size_t replica_idx = 0; replica_idx < replica_list->second.size();
+             ++replica_idx) {
+            const auto& replica = replica_list->second[replica_idx];
             std::vector<AllocatedBuffer::Descriptor> handles;
             for (const auto& handle : replica.buffer_descriptors) {
                 CHECK(handle.buffer_address_ != 0)
@@ -436,25 +472,58 @@ ErrorCode Client::BatchPut(
                 handles.push_back(handle);
             }
 
-            std::vector<Slice>& slices = slices_it->second;
-            ErrorCode transfer_err = TransferWrite(handles, slices);
-            if (transfer_err != ErrorCode::OK) {
+            // Submit transfer operation asynchronously
+            auto future = transfer_submitter_->submit(
+                handles, slices_it->second, TransferRequest::WRITE);
+            if (!future) {
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << key << " replica: " << replica_idx;
                 // Revoke put operation
                 auto revoke_err = master_client_.BatchPutRevoke(keys);
                 if (revoke_err.error_code != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to revoke put operation";
                     return revoke_err.error_code;
                 }
-                return transfer_err;
+                return ErrorCode::TRANSFER_FAIL;
             }
+
+            VLOG(1) << "Submitted transfer for key " << key << " replica "
+                    << replica_idx << " using strategy: "
+                    << static_cast<int>(future->strategy());
+
+            pending_transfers.emplace_back(key, replica_idx,
+                                           std::move(*future));
         }
     }
+
+    // Wait for all transfers to complete
+    for (auto& [key, replica_idx, future] : pending_transfers) {
+        ErrorCode result = future.get();
+        if (result != ErrorCode::OK) {
+            LOG(ERROR) << "Transfer failed for key: " << key
+                       << " replica: " << replica_idx
+                       << " with error: " << result;
+            // Revoke put operation
+            auto revoke_err = master_client_.BatchPutRevoke(keys);
+            if (revoke_err.error_code != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err.error_code;
+            }
+            return result;
+        }
+        VLOG(1) << "Transfer completed successfully for key: " << key
+                << " replica: " << replica_idx;
+    }
+
     // End put operation
     err = master_client_.BatchPutEnd(keys).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
+    VLOG(1) << "BatchPut completed successfully for " << keys.size()
+            << " keys with " << pending_transfers.size() << " total transfers";
     return ErrorCode::OK;
 }
 
@@ -570,8 +639,7 @@ ErrorCode Client::TransferData(
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    VLOG(1) << "Using transfer strategy: "
-            << static_cast<int>(future->strategy());
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     return future->get();
 }
@@ -598,6 +666,23 @@ ErrorCode Client::TransferRead(
     }
 
     return TransferData(handles, slices, TransferRequest::READ);
+}
+
+ErrorCode Client::FindFirstCompleteReplica(
+    const std::vector<Replica::Descriptor>& replica_list,
+    std::vector<AllocatedBuffer::Descriptor>& handles) {
+    handles.clear();
+
+    // Find the first complete replica
+    for (size_t i = 0; i < replica_list.size(); ++i) {
+        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
+            handles = replica_list[i].buffer_descriptors;
+            return ErrorCode::OK;
+        }
+    }
+
+    // No complete replica found
+    return ErrorCode::INVALID_REPLICA;
 }
 
 void Client::PingThreadFunc(int current_version) {

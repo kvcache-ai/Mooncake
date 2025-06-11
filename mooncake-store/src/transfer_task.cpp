@@ -9,6 +9,98 @@
 namespace mooncake {
 
 // ============================================================================
+// MemcpyWorkerPool Implementation
+// ============================================================================
+// Since memcpy is bound by memory bandwidth, we only need one worker thread.
+constexpr int kDefaultMemcpyWorkers = 1;
+
+MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
+    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
+            << " workers";
+
+    // Start worker threads
+    workers_.reserve(kDefaultMemcpyWorkers);
+    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+        workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
+    }
+}
+
+MemcpyWorkerPool::~MemcpyWorkerPool() {
+    // Signal shutdown
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        shutdown_.store(true);
+    }
+    queue_cv_.notify_all();
+
+    // Wait for all workers to finish
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    VLOG(1) << "MemcpyWorkerPool destroyed";
+}
+
+void MemcpyWorkerPool::submitTask(MemcpyTask task) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (shutdown_.load()) {
+            LOG(WARNING)
+                << "Attempting to submit task to shutdown MemcpyWorkerPool";
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
+        task_queue_.push(std::move(task));
+    }
+    queue_cv_.notify_one();
+}
+
+void MemcpyWorkerPool::workerThread() {
+    VLOG(2) << "MemcpyWorkerPool worker thread started";
+
+    while (true) {
+        MemcpyTask task({}, nullptr);
+
+        // Wait for task or shutdown signal
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] {
+                return shutdown_.load() || !task_queue_.empty();
+            });
+
+            if (shutdown_.load() && task_queue_.empty()) {
+                break;
+            }
+
+            if (!task_queue_.empty()) {
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+        }
+
+        // Execute the task if we have one
+        if (task.state) {
+            try {
+                for (const auto& op : task.operations) {
+                    std::memcpy(op.dest, op.src, op.size);
+                }
+
+                VLOG(2) << "Memcpy task completed successfully with "
+                        << task.operations.size() << " operations";
+                task.state->set_completed(ErrorCode::OK);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during async memcpy: " << e.what();
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+    }
+
+    VLOG(2) << "MemcpyWorkerPool worker thread exiting";
+}
+
+// ============================================================================
 // TransferEngineOperationState Implementation
 // ============================================================================
 
@@ -143,7 +235,9 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      const std::string& local_hostname)
-    : engine_(engine), local_hostname_(local_hostname) {
+    : engine_(engine),
+      local_hostname_(local_hostname),
+      memcpy_pool_(std::make_unique<MemcpyWorkerPool>()) {
     CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
 }
 
@@ -162,8 +256,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         case TransferStrategy::TRANSFER_ENGINE:
             return submitTransferEngineOperation(handles, slices, op_code);
         default:
-            LOG(ERROR) << "Unknown transfer strategy: "
-                       << static_cast<int>(strategy);
+            LOG(ERROR) << "Unknown transfer strategy: " << strategy;
             return std::nullopt;
     }
 }
@@ -199,19 +292,12 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         operations.emplace_back(dest, src, handle.size_);
     }
 
-    // Execute memcpy operations synchronously
-    // TODO: make this async
-    try {
-        for (const auto& op : operations) {
-            std::memcpy(op.dest, op.src, op.size);
-        }
+    // Submit memcpy operations to worker pool for async execution
+    MemcpyTask task(std::move(operations), state);
+    memcpy_pool_->submitTask(std::move(task));
 
-        VLOG(1) << "Memcpy transfer completed successfully";
-        state->set_completed(ErrorCode::OK);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Exception during memcpy transfer: " << e.what();
-        state->set_completed(ErrorCode::TRANSFER_FAIL);
-    }
+    VLOG(1) << "Memcpy transfer submitted to worker pool with "
+            << handles.size() << " operations";
 
     return TransferFuture(state);
 }
