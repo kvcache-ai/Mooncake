@@ -12,6 +12,7 @@
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "libetcd_wrapper.h"
 
 namespace mooncake {
 
@@ -23,6 +24,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5; // in seconds
 
 // Forward declarations
 class BufferAllocator;
@@ -39,6 +41,10 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
+// Mapping between c++ and go types
+using EtcdRevisionId = GoInt64;
+using ViewVersionId = EtcdRevisionId;
+using EtcdLeaseId = GoInt64;
 
 /**
  * @brief Error codes for various operations in the system
@@ -83,6 +89,12 @@ enum class ErrorCode : int32_t {
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
+
+    // ETCD errors (Range: -1000 to -1099)
+    ETCD_OPERATION_ERROR = -1000,  ///< etcd operation failed.
+    ETCD_KEY_NOT_EXIST = -1001,  ///< key not found in etcd.
+    ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
+    ETCD_CTX_CANCELLED = -1003,  ///< etcd context cancelled.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

@@ -10,6 +10,7 @@
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "ha_helper.h"
 
 namespace mooncake {
 
@@ -26,7 +27,9 @@ class Client {
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
      * @param protocol_args Protocol-specific arguments
-     * @param master_addr Master server address
+     * @param master_server_entry The entry of master server (IP:Port of master
+     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
+     *        HA mode)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -34,7 +37,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key
@@ -197,7 +200,7 @@ class Client {
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
-    ErrorCode ConnectToMaster(const std::string& master_addr);
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
     ErrorCode InitTransferEngine(const std::string& local_hostname,
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,
@@ -216,13 +219,24 @@ class Client {
     TransferEngine transfer_engine_;
     MasterClient master_client_;
 
+    // Client local segments
+    struct Segment{
+        void* buffer;
+        size_t size;
+    };
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, void*> mounted_segments_;
+    std::unordered_map<std::string, Segment> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // For high availability
+    MasterViewHelper master_view_helper_;
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void PingThreadFunc(int current_version);
 };
 
 }  // namespace mooncake
