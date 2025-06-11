@@ -535,7 +535,7 @@ ErrorCode Client::BatchPut(
 
 ErrorCode Client::Remove(const ObjectKey& key) {
 
-    auto &error_code = master_client_.Remove(key).error_code;
+    auto error_code = master_client_.Remove(key).error_code;
     if (storage_backend_) {
         // Remove from storage backend
         storage_backend_->RemoveFile(key);
