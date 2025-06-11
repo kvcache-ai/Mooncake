@@ -236,6 +236,9 @@ ErrorCode Client::Query(const std::string& object_key,
         if (!disk_desc.file_path.empty()) {
             desc.status = ReplicaStatus::COMPLETE;
             object_info.replica_list.emplace_back(std::move(desc));  
+            LOG(INFO) << "Query object_key: " << object_key
+                      << " from local file, file_path: " << disk_desc.file_path
+                      << ", file_size: " << disk_desc.file_size;
             return ErrorCode::OK;
         }
     }
