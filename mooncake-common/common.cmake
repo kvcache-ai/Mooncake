@@ -50,7 +50,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 
 option(BUILD_EXAMPLES "Build examples" OFF)
 
-option(BUILD_UNIT_TESTS "Build uint tests" ON)
+option(BUILD_UNIT_TESTS "Build uint tests" OFF)
 option(USE_CUDA "option for enabling gpu features" ON)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
