@@ -281,6 +281,19 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return 0;
         }
 
+        // Find whole physical page for memory registration
+        void *real_addr;
+        size_t real_size;
+        result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, 
+                                      &real_size, 
+                                      (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: cuMemGetAddressRange failed: "
+                << result;
+            return -1;
+        }
+
         CUmemFabricHandle export_handle;
         result = cuMemExportToShareableHandle(&export_handle, handle,
                                               CU_MEM_HANDLE_TYPE_FABRIC, 0);
@@ -293,8 +306,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)real_addr; // (uint64_t)addr;
+        desc.length = real_size; // length;
         desc.name = location;
         desc.shm_name =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));

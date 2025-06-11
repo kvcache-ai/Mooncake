@@ -13,6 +13,7 @@
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "libetcd_wrapper.h"
 
 namespace mooncake {
 
@@ -24,6 +25,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5; // in seconds
 
 // Forward declarations
 class BufferAllocator;
@@ -40,6 +42,10 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
+// Mapping between c++ and go types
+using EtcdRevisionId = GoInt64;
+using ViewVersionId = EtcdRevisionId;
+using EtcdLeaseId = GoInt64;
 
 /**
  * @brief Error codes for various operations in the system
@@ -85,16 +91,22 @@ enum class ErrorCode : int32_t {
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
 
-    // FILE errors (Range: -1000 to -1099)
-    FILE_NOT_FOUND = -1000,  ///< File not found.
-    FILE_OPEN_FAIL = -1001,  ///< Error open file.
-    FILE_READ_FAIL = -1002,  ///< Error reading file.
-    FILE_WRITE_FAIL = -1003,  ///< Error writing file.
-    FILE_BUFFER_INVALID = -1004,  ///< File buffer is wrong.
-    FILE_SYSTEM_UNINITIALIZED = -1005,  ///< File system is not initialized.
-    FILE_LOCK_FAIL = -1006,  ///< File lock operation failed.
-    FILE_ALREADY_EXISTS = -1007,  ///< File already exists.
-    FILE_INVALID_HANDLE = -1008,  ///< Invalid file handle.
+    // ETCD errors (Range: -1000 to -1099)
+    ETCD_OPERATION_ERROR = -1000,  ///< etcd operation failed.
+    ETCD_KEY_NOT_EXIST = -1001,  ///< key not found in etcd.
+    ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
+    ETCD_CTX_CANCELLED = -1003,  ///< etcd context cancelled.
+
+    // FILE errors (Range: -1100 to -1199)
+    FILE_NOT_FOUND = -1100,  ///< File not found.
+    FILE_OPEN_FAIL = -1101,  ///< Error open file.
+    FILE_READ_FAIL = -1102,  ///< Error reading file.
+    FILE_WRITE_FAIL = -1103,  ///< Error writing file.
+    FILE_BUFFER_INVALID = -1104,  ///< File buffer is wrong.
+    FILE_SYSTEM_UNINITIALIZED = -1105,  ///< File system is not initialized.
+    FILE_LOCK_FAIL = -1106,  ///< File lock operation failed.
+    FILE_ALREADY_EXISTS = -1107,  ///< File already exists.
+    FILE_INVALID_HANDLE = -1108,  ///< Invalid file handle.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
