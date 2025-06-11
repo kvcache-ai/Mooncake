@@ -8,6 +8,8 @@
 #include <storage_backend.h>
 #include <local_file.h>
 #include <filesystem>
+#include <thread>
+#include <chrono>
 
 namespace mooncake {
 /**

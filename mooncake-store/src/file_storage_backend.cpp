@@ -205,7 +205,7 @@ void FileStorageBackend::RemoveFile(const ObjectKey& key) {
     // Check if the file exists before attempting to remove it
     // TODO: add a sleep to ensure the write thread has time to create the corresponding file
     // it will be fixed in the next version
-    usleep(50);
+    std::this_thread::sleep_for(std::chrono::microseconds(50));  //sleep for 50 us
     if (fs::exists(path)) {
         std::error_code ec;
         fs::remove(path, ec);
