@@ -281,6 +281,12 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return 0;
         }
 
+        cudaError_t err = cudaSetDevice(0);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaSetDevice failed";
+            return -1;
+        }
+
         // Find whole physical page for memory registration
         void *real_addr;
         size_t real_size;
