@@ -2,9 +2,9 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "action-test" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "action-test" ]
 
 jobs:
   build:
