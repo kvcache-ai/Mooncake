@@ -9,6 +9,7 @@
 
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "transport/transport.h"
 #include "types.h"
 
@@ -179,6 +180,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     }
     CHECK(transport) << "Failed to install transport";
 
+    // Initialize TransferSubmitter after transfer engine is ready
+    transfer_submitter_ =
+        std::make_unique<TransferSubmitter>(transfer_engine_, local_hostname);
+
     return ErrorCode::OK;
 }
 
@@ -287,17 +292,6 @@ ErrorCode Client::Get(const std::string& object_key,
                 }
                 handles.push_back(handle);
             }
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine to improve performance and save bandwidth
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
-                       handles[0].size_);
-                return ErrorCode::OK;
-            }
 
             if (TransferRead(handles, slices) != ErrorCode::OK) {
                 LOG(ERROR) << "transfer_read_failed key=" << object_key;
@@ -368,26 +362,15 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             handles.push_back(handle);
         }
 
-        // Fast path: if segment is on local host and we have single slice and
-        // handle, use memcpy instead of going through the transfer engine
-        if (slices.size() == 1 && handles.size() == 1 &&
-            handles[0].size_ == slices[0].size &&
-            handles[0].segment_name_ == this->local_hostname_) {
-            VLOG(1) << "Using fast path (memcpy) for local transfer";
-            memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
-                   handles[0].size_);
-        } else {
-            // Normal path: use transfer engine
-            ErrorCode transfer_err = TransferWrite(handles, slices);
-            if (transfer_err != ErrorCode::OK) {
-                // Revoke put operation
-                auto revoke_err = master_client_.PutRevoke(key);
-                if (revoke_err.error_code != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    return revoke_err.error_code;
-                }
-                return transfer_err;
+        ErrorCode transfer_err = TransferWrite(handles, slices);
+        if (transfer_err != ErrorCode::OK) {
+            // Revoke put operation
+            auto revoke_err = master_client_.PutRevoke(key);
+            if (revoke_err.error_code != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err.error_code;
             }
+            return transfer_err;
         }
     }
 
@@ -453,28 +436,16 @@ ErrorCode Client::BatchPut(
                 handles.push_back(handle);
             }
 
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine
             std::vector<Slice>& slices = slices_it->second;
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
-                       handles[0].size_);
-            } else {
-                // Normal path: use transfer engine
-                ErrorCode transfer_err = TransferWrite(handles, slices);
-                if (transfer_err != ErrorCode::OK) {
-                    // Revoke put operation
-                    auto revoke_err = master_client_.BatchPutRevoke(keys);
-                    if (revoke_err.error_code != ErrorCode::OK) {
-                        LOG(ERROR) << "Failed to revoke put operation";
-                        return revoke_err.error_code;
-                    }
-                    return transfer_err;
+            ErrorCode transfer_err = TransferWrite(handles, slices);
+            if (transfer_err != ErrorCode::OK) {
+                // Revoke put operation
+                auto revoke_err = master_client_.BatchPutRevoke(keys);
+                if (revoke_err.error_code != ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return revoke_err.error_code;
                 }
+                return transfer_err;
             }
         }
     }
@@ -591,99 +562,18 @@ ErrorCode Client::IsExist(const std::string& key) {
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
-    CHECK(!handles.empty()) << "handles is empty";
-    std::vector<TransferRequest> transfer_tasks;
-    if (handles.size() > slices.size()) {
-        LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
-                   << " slices_size=" << slices.size();
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
+    auto future = transfer_submitter_->submit(handles, slices, op_code);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    for (uint64_t idx = 0; idx < handles.size(); ++idx) {
-        auto& handle = handles[idx];
-        auto& slice = slices[idx];
-        if (handle.size_ > slice.size) {
-            LOG(ERROR)
-                << "Size of replica partition more than provided buffers";
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        Transport::SegmentHandle seg =
-            transfer_engine_.openSegment(handle.segment_name_);
-        if (seg == (uint64_t)ERR_INVALID_ARGUMENT) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        TransferRequest request;
-        request.opcode = op_code;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = handle.buffer_address_;
-        request.length = handle.size_;
-        transfer_tasks.push_back(request);
-    }
+    VLOG(1) << "Using transfer strategy: "
+            << static_cast<int>(future->strategy());
 
-    const size_t batch_size = transfer_tasks.size();
-    BatchID batch_id = transfer_engine_.allocateBatchID(batch_size);
-    if (batch_id == Transport::INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    Status s = transfer_engine_.submitTransfer(batch_id, transfer_tasks);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        transfer_engine_.freeBatchID(batch_id);
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    bool has_err = false;
-    bool all_ready = true;
-    uint32_t try_num = 0;
-    const uint32_t max_try_num = 3;
-    int64_t start_ts = getCurrentTimeInNano();
-    const static int64_t kOneSecondInNano = 1000 * 1000 * 1000;
-
-    while (try_num < max_try_num) {
-        has_err = false;
-        all_ready = true;
-        if (getCurrentTimeInNano() - start_ts > 60 * kOneSecondInNano) {
-            LOG(ERROR) << "Failed to complete transfers after 60 seconds";
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        for (size_t i = 0; i < batch_size; ++i) {
-            TransferStatus status;
-            s = transfer_engine_.getTransferStatus(batch_id, i, status);
-            if (!s.ok()) {
-                LOG(ERROR) << "Transfer " << i
-                           << " error, error_code=" << s.code();
-                transfer_engine_.freeBatchID(batch_id);
-                return ErrorCode::TRANSFER_FAIL;
-            }
-            if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
-            if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Transfer failed for task" << i;
-                has_err = true;
-            }
-        }
-
-        if (has_err) {
-            LOG(WARNING) << "Transfer incomplete, retrying... (attempt "
-                         << try_num + 1 << "/" << max_try_num << ")";
-            ++try_num;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        if (all_ready) break;
-    }
-
-    if (!all_ready) {
-        LOG(ERROR) << "transfer_incomplete max_attempts=" << max_try_num;
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    transfer_engine_.freeBatchID(batch_id);
-    return ErrorCode::OK;
+    return future->get();
 }
 
 ErrorCode Client::TransferWrite(

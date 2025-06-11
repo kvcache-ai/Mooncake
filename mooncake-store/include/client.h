@@ -9,6 +9,7 @@
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
 #include "ha_helper.h"
 
@@ -214,10 +215,10 @@ class Client {
     ErrorCode TransferRead(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
-
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Client local segments
     struct Segment{

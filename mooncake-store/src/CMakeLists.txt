@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     master_client.cpp
     utils.cpp
     master_metric_manager.cpp
+    transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
 )
