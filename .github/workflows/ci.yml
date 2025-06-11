@@ -2,9 +2,9 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main", "action-test" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main", "action-test" ]
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -186,7 +186,6 @@ jobs:
         deactivate
         rm -rf /tmp/mooncake_test_ssd
       shell: bash
-
 
   build-flags:
     runs-on: ubuntu-22.04

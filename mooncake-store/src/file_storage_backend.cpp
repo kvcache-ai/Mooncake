@@ -209,7 +209,6 @@ void FileStorageBackend::RemoveFile(const ObjectKey& key) {
     if (fs::exists(path)) {
         std::error_code ec;
         fs::remove(path, ec);
-        LOG(INFO) << "Succeed Removing file: " << path;
         if (ec) {
             LOG(ERROR) << "Failed to delete file: " << path << ", error: " << ec.message();
         }
