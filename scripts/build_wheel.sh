@@ -5,10 +5,9 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
-PYTHON=python
 
 # Get Python version from environment variable or argument
-PYTHON_VERSION=${PYTHON_VERSION:-${1:-$((PYTHON)) -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
@@ -57,7 +56,7 @@ mkdir -p ${REPAIRED_DIR}
 PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_$(uname -m)"}
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-$((PYTHON)) -m build --wheel --outdir ${OUTPUT_DIR}
+python -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
 --exclude libibverbs.so* \
