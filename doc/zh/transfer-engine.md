@@ -74,6 +74,8 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
 
    1.1. **`etcd`**
 
+   默认状态下不会使用etcd服务，要在transfer engine中使用etcd服务，需要在`mooncake-common/common.cmake`文件中，把`USE_ETCD`变量的值设为`ON`，就可以使用了。
+
    例如，可使用如下命令行启动 `etcd` 服务：
       ```bash
       etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://10.0.0.1:2379
