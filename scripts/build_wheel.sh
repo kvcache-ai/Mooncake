@@ -5,9 +5,10 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
+PYTHON=python
 
 # Get Python version from environment variable or argument
-PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$((PYTHON)) -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
@@ -28,7 +29,9 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 
 # Copy nvlink-hook.so to mooncake directory
-cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+if [ -f build/mooncake-transfer-engine/nvlink-hook/hook.so ]; then
+    cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+fi
 
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
@@ -54,7 +57,7 @@ mkdir -p ${REPAIRED_DIR}
 PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_$(uname -m)"}
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-python -m build --wheel --outdir ${OUTPUT_DIR}
+$((PYTHON)) -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
 --exclude libibverbs.so* \
