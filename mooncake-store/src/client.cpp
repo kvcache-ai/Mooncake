@@ -157,8 +157,7 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
         get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
-                                   hostname, port);
+    int rc = transfer_engine_.init(metadata_connstring, local_hostname);
     CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
 
     Transport* transport = nullptr;
