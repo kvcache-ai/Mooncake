@@ -1,3 +1,8 @@
+"""
+Test suite for Mooncake Distributed Object Store Python interface.
+
+"""
+
 import unittest
 import os
 import time
@@ -7,10 +12,15 @@ from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_KV_LEASE_TTL = 200 # 200 milliseconds
+DEFAULT_KV_LEASE_TTL = 200  # 200 milliseconds
 
 def get_client(store):
-    """Initialize and setup the distributed store client."""
+    """
+    Initialize and setup the distributed store client.
+
+    This function demonstrates the enhanced parameter documentation and proper
+    argument naming in the Python bindings.
+    """
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
@@ -18,17 +28,17 @@ def get_client(store):
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
-        global_segment_size,
-        local_buffer_size, 
-        protocol, 
-        device_name,
-        master_server_address
+        local_hostname=local_hostname,
+        metadata_server=metadata_server,
+        global_segment_size=global_segment_size,
+        local_buffer_size=local_buffer_size,
+        protocol=protocol,
+        rdma_devices=device_name,
+        master_server_addr=master_server_address
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -105,6 +115,93 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key_2), 0)
         self.assertLess(self.store.get_size(key_2), 0)
         self.assertEqual(self.store.is_exist(key_2), 0)
+
+    def test_pythonic_interface_features(self):
+        """Test improved Pythonic interface features including get_buffer and put_parts."""
+        # Test get_buffer method for efficient memory access
+        test_data = b"Testing SliceBuffer functionality with some data"
+        key = "test_buffer_key"
+
+        # Store data and retrieve as buffer
+        self.assertEqual(self.store.put(key=key, value=test_data), 0)
+
+        # Test get_buffer method
+        buffer = self.store.get_buffer(key=key)
+        self.assertIsNotNone(buffer, "get_buffer should return a valid buffer")
+        self.assertEqual(buffer.size(), len(test_data))
+
+        # Convert buffer to bytes and verify content
+        retrieved_data = bytes(buffer)
+        self.assertEqual(retrieved_data, test_data)
+
+        # Test put_parts method for efficient multi-part storage
+        part1 = b"Hello, "
+        part2 = b"World! "
+        part3 = b"This is a multi-part message."
+        parts_key = "test_parts_key"
+
+        # Store multiple parts as a single object
+        result = self.store.put_parts(parts_key, part1, part2, part3)
+        self.assertEqual(result, 0, "put_parts should succeed")
+
+        # Verify the combined data
+        expected_combined = part1 + part2 + part3
+        retrieved_combined = self.store.get(key=parts_key)
+        self.assertEqual(retrieved_combined, expected_combined)
+        self.assertEqual(self.store.get_size(key=parts_key), len(expected_combined))
+
+        # Test with different data types (bytearray, memoryview)
+        array_data = bytearray(b"ByteArray data")
+        memory_data = memoryview(b"MemoryView data")
+        mixed_key = "test_mixed_types"
+
+        result = self.store.put_parts(mixed_key, array_data, memory_data)
+        self.assertEqual(result, 0, "put_parts should handle different buffer types")
+
+        expected_mixed = bytes(array_data) + bytes(memory_data)
+        retrieved_mixed = self.store.get(key=mixed_key)
+        self.assertEqual(retrieved_mixed, expected_mixed)
+
+        # Cleanup
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.remove(key=key), 0)
+        self.assertEqual(self.store.remove(key=parts_key), 0)
+        self.assertEqual(self.store.remove(key=mixed_key), 0)
+
+    def test_large_object_handling(self):
+        """Test automatic slicing for large objects."""
+        # Test with objects larger than typical slice size
+        large_size = 32 * 1024 * 1024  # 32MB
+        large_data = os.urandom(large_size)
+        large_key = "test_large_object"
+
+        print(f"\nTesting large object storage ({large_size / 1024 / 1024:.1f}MB)")
+
+        # Store large object
+        start_time = time.time()
+        result = self.store.put(key=large_key, value=large_data)
+        put_time = time.time() - start_time
+
+        self.assertEqual(result, 0, "Large object storage should succeed")
+        print(f"Large object put time: {put_time:.2f} seconds")
+
+        # Verify size
+        stored_size = self.store.get_size(key=large_key)
+        self.assertEqual(stored_size, large_size, "Stored size should match original")
+
+        # Retrieve and verify content
+        start_time = time.time()
+        retrieved_data = self.store.get(key=large_key)
+        get_time = time.time() - start_time
+
+        self.assertEqual(len(retrieved_data), large_size, "Retrieved size should match")
+        self.assertEqual(retrieved_data, large_data, "Retrieved content should match")
+        print(f"Large object get time: {get_time:.2f} seconds")
+        print(f"Throughput: {large_size / 1024 / 1024 / max(put_time, get_time):.1f} MB/s")
+
+        # Cleanup
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.remove(key=large_key), 0)
 
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
