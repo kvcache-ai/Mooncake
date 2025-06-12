@@ -100,6 +100,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
    1.1. **`etcd`**
 
+   By default, the use of etcd service is off. To use etcd service in transfer engine, in `mooncake-common/common.cmake`, change the switch of `USE_ETCD` from `OFF` to `ON`.
    For example, the following command line can be used to start the etcd service:
       ```bash
       etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
