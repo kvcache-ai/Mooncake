@@ -314,7 +314,7 @@ ErrorCode Client::Get(const std::string& object_key,
 
             if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
                 // If the replica is a disk descriptor, load it from the local file
-                return Get_From_Local_File(
+                return GetFromLocalFile(
                     object_key, slices, object_info);
             }else{
                 std::vector<AllocatedBuffer::Descriptor> handles;
@@ -355,10 +355,10 @@ ErrorCode Client::Get(const std::string& object_key,
     return ErrorCode::INVALID_REPLICA;
 }
 
-ErrorCode Client::Get_From_Local_File(
+ErrorCode Client::GetFromLocalFile(
     const std::string& object_key, std::vector<Slice>& slices, ObjectInfo& object_info) {
     if (!storage_backend_) {
-        return ErrorCode::FILE_SYSTEM_UNINITIALIZED;
+        return ErrorCode::FILE_READ_FAIL;
     }
 
     ErrorCode err=storage_backend_->LoadObject(object_key, slices);
@@ -370,7 +370,7 @@ ErrorCode Client::Get_From_Local_File(
     return ErrorCode::OK;
 }
 
-void Client::Put_To_Local_File(
+void Client::PutToLocalFile(
     const std::string& key, std::vector<Slice>& slices){
     if (!storage_backend_) return;
 
@@ -478,7 +478,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         return err;
     }
 
-    Put_To_Local_File(key, slices);
+    PutToLocalFile(key, slices);
 
     return ErrorCode::OK;
 }

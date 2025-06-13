@@ -31,10 +31,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},
         {ErrorCode::FILE_WRITE_FAIL, "FILE_WRITE_FAIL"},
-        {ErrorCode::FILE_BUFFER_INVALID, "FILE_BUFFER_INVALID"},
-        {ErrorCode::FILE_SYSTEM_UNINITIALIZED, "FILE_SYSTEM_UNINITIALIZED"},
+        {ErrorCode::FILE_INVALID_BUFFER, "FILE_INVALID_BUFFER"},
         {ErrorCode::FILE_LOCK_FAIL, "FILE_LOCK_FAIL"},
-        {ErrorCode::FILE_ALREADY_EXISTS, "FILE_ALREADY_EXISTS"},
         {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"}
     };
 

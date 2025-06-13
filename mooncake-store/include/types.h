@@ -99,14 +99,12 @@ enum class ErrorCode : int32_t {
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,  ///< File not found.
-    FILE_OPEN_FAIL = -1101,  ///< Error open file.
+    FILE_OPEN_FAIL = -1101,  ///< Error open file or write to a exist file.
     FILE_READ_FAIL = -1102,  ///< Error reading file.
     FILE_WRITE_FAIL = -1103,  ///< Error writing file.
-    FILE_BUFFER_INVALID = -1104,  ///< File buffer is wrong.
-    FILE_SYSTEM_UNINITIALIZED = -1105,  ///< File system is not initialized.
-    FILE_LOCK_FAIL = -1106,  ///< File lock operation failed.
-    FILE_ALREADY_EXISTS = -1107,  ///< File already exists.
-    FILE_INVALID_HANDLE = -1108,  ///< Invalid file handle.
+    FILE_INVALID_BUFFER = -1104,  ///< File buffer is wrong.
+    FILE_LOCK_FAIL = -1105,  ///< File lock operation failed.
+    FILE_INVALID_HANDLE = -1106,  ///< Invalid file handle.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

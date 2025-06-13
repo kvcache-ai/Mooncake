@@ -223,10 +223,10 @@ class Client {
      */
     void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& session_id);
 
-    ErrorCode Get_From_Local_File(const std::string& object_key,
+    ErrorCode GetFromLocalFile(const std::string& object_key,
                              std::vector<Slice>& slices, ObjectInfo& object_info);
                              
-    void Put_To_Local_File(const std::string& object_key,
+    void PutToLocalFile(const std::string& object_key,
                              std::vector<Slice>& slices);
 
     // Core components

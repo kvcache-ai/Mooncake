@@ -15,7 +15,7 @@ ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
     std::string path = ResolvePath(key);
 
     if(std::filesystem::exists(path) == true) {
-        return ErrorCode::FILE_ALREADY_EXISTS;
+        return ErrorCode::FILE_OPEN_FAIL;
     }
 
     FILE* file = fopen(path.c_str(), "wb");
@@ -63,7 +63,7 @@ ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
     std::string path = ResolvePath(key);
 
     if(std::filesystem::exists(path) == true) {
-        return ErrorCode::FILE_ALREADY_EXISTS;
+        return ErrorCode::FILE_OPEN_FAIL;
     }
     
     FILE* file = fopen(path.c_str(), "wb");

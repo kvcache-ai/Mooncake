@@ -42,12 +42,12 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
         return -1;
     }
     if (length == 0 || buffer.empty()) {
-        error_code_ = ErrorCode::FILE_BUFFER_INVALID;
+        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
 
     if(length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
-        error_code_ = ErrorCode::FILE_BUFFER_INVALID;
+        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
 
@@ -92,12 +92,12 @@ ssize_t LocalFile::read(std::string &buffer, size_t length){
         return -1;
     }
     if (length == 0) {
-        error_code_ = ErrorCode::FILE_BUFFER_INVALID;
+        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
 
     if(length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
-        error_code_ = ErrorCode::FILE_BUFFER_INVALID;
+        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
 
