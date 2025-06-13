@@ -110,8 +110,26 @@ class DistributedObjectStore {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
+    /**
+     * @brief Store data in the distributed object store
+     * @param key Unique identifier for the object
+     * @param value Data to store as a span of characters
+     * @return 0 on success, non-zero error code on failure
+     *
+     * @note Large objects are automatically split into slices for efficient
+     * distributed storage and transfer.
+     */
     int put(const std::string &key, std::span<const char> value);
 
+    /**
+     * @brief Store multiple data parts as a single object
+     * @param key Unique identifier for the object
+     * @param values Vector of data parts to store
+     * @return 0 on success, non-zero error code on failure
+     *
+     * @note Data parts are efficiently packed and automatically sliced for
+     * optimal distributed storage.
+     */
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
