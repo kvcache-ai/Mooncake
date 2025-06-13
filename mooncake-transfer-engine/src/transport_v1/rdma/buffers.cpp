@@ -336,7 +336,6 @@ int LocalBufferManager::fillBufferDesc(
             for (auto &elem : buffer.second.mem_reg_map) {
                 if (elem.first->name() == device.name) {
                     auto keys = elem.first->queryMemRegKey(elem.second);
-                    buffer_desc.lkey.push_back(keys.first);
                     buffer_desc.rkey.push_back(keys.second);
                     found = true;
                 }
@@ -346,8 +345,6 @@ int LocalBufferManager::fillBufferDesc(
                     << "Unregistered memory " << (void *)buffer_desc.addr
                     << "--" << (void *)(buffer_desc.addr + buffer_desc.length)
                     << " for device " << device.name;
-                // representing invalid value
-                buffer_desc.lkey.push_back(UINT32_MAX);
                 buffer_desc.rkey.push_back(UINT32_MAX);
             }
         }
@@ -377,7 +374,7 @@ int LocalBufferManager::query(const AddressRange &range,
         auto mem_reg_id = buffer.second.mem_reg_map.at(context);
         auto keys = context->queryMemRegKey(mem_reg_id);
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
-                                           keys.first, keys.second, device_id});
+                                           keys.first, device_id});
     }
     return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
@@ -418,7 +415,6 @@ int RemoteBufferManager::query(SegmentID id, const AddressRange &range,
             device_id = topo.selectDevice(kWildcardLocation, retry_count);
         if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
-                                           entry.lkey[device_id],
                                            entry.rkey[device_id], device_id});
     }
     return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;

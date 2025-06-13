@@ -69,27 +69,6 @@ TransferEngine::TransferEngine(TEConfig &conf)
 
 TransferEngine::~TransferEngine() { deconstruct(); }
 
-static std::string generateRandomHexString(size_t nbytes) {
-    const std::string kHexCharSet = "0123456789abcdef";
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::string result;
-    result.reserve(nbytes * 2);
-    for (size_t i = 0; i < nbytes; ++i) {
-        unsigned char byte = gen() % 256;
-        result.push_back(kHexCharSet[(byte >> 4) & 0x0f]);
-        result.push_back(kHexCharSet[byte & 0x0f]);
-    }
-    return result;
-}
-
-static std::string generateSegmentName(const TEConfig &conf) {
-    if (conf.count(TEConfigKeyLocalSegmentName)) {
-        return conf.at(TEConfigKeyLocalSegmentName);
-    }
-    return std::string("segment-") + generateRandomHexString(4);
-}
-
 static std::string getMetadataConnString(const TEConfig &conf) {
     if (conf.count(TEConfigKeyMetadataConnString)) {
         return conf.at(TEConfigKeyMetadataConnString);
@@ -97,26 +76,17 @@ static std::string getMetadataConnString(const TEConfig &conf) {
     return "P2PHANDSHAKE";
 }
 
-static Status getEthIpPort(RpcMetaDesc &desc, const TEConfig &conf) {
-    if (conf.count(TEConfigKeyBindEthIP)) {
-        desc.ip_or_host_name = conf.at(TEConfigKeyBindEthIP);
-    }
-    if (desc.ip_or_host_name.empty()) {
+static void getEthIpPort(std::string &hostname, uint16_t &port,
+                         const TEConfig &conf) {
+    if (conf.count(TEConfigKeyBindEthIP))
+        hostname = conf.at(TEConfigKeyBindEthIP);
+    if (hostname.empty()) {
         auto ip_list = findLocalIpAddresses();
-        desc.ip_or_host_name = ip_list.empty() ? "127.0.0.1" : ip_list[0];
+        hostname = ip_list.empty() ? "127.0.0.1" : ip_list[0];
     }
-
-    desc.rpc_port = 0;
-    if (conf.count(TEConfigKeyBindEthPort)) {
-        desc.rpc_port = std::atoi(conf.at(TEConfigKeyBindEthPort).c_str());
-    }
-    if (desc.rpc_port == 0) {
-        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-    }
-
-    return desc.rpc_port == 0
-               ? Status::Socket("not ethernet port found for out-of-band comm")
-               : Status::OK();
+    port = 0;
+    if (conf.count(TEConfigKeyBindEthPort))
+        port = std::atoi(conf.at(TEConfigKeyBindEthPort).c_str());
 }
 
 std::vector<std::string> splitString(const std::string &str, char delimiter) {
@@ -142,17 +112,14 @@ std::vector<std::string> getRdmaDeviceList(const TEConfig &conf) {
 
 Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
-    segment_name_ = generateSegmentName(conf_);
+    getEthIpPort(hostname_, port_, conf_);
+
     metadata_ =
         std::make_shared<TransferMetadata>(getMetadataConnString(conf_));
+    metadata_->start(port_);
 
-    RpcMetaDesc rpc_desc;
-    CHECK_STATUS(getEthIpPort(rpc_desc, conf_));
-    metadata_->addRpcMetaEntry(segment_name_, rpc_desc);
-
-    LOG(INFO) << "Transfer Engine uses address " << rpc_desc.ip_or_host_name
-              << " and port " << rpc_desc.rpc_port
-              << " for serving local TCP service";
+    LOG(INFO) << "Segment name of this instance: " << hostname_ << ":"
+              << port_;
 
     topology_ = std::make_shared<Topology>();
     if (conf_.count(TEConfigKeyTopology)) {
@@ -165,22 +132,20 @@ Status TransferEngine::construct() {
     if (topology_->getHcaList().size() > 0) {
         CHECK_STATUS(registerRdmaTransport());
     }
-    // TODO other protocols
+
     return Status::OK();
 }
 
 Status TransferEngine::registerRdmaTransport() {
     auto transport = std::make_shared<RdmaTransport>();
-    CHECK_STATUS(transport->install(segment_name_, metadata_, topology_));
+    auto segment_name = hostname_ + ":" + std::to_string(port_);
+    CHECK_STATUS(transport->install(segment_name, metadata_, topology_));
     transport_list_[RDMA] = transport;
     return Status::OK();
 }
 
 Status TransferEngine::deconstruct() {
-    if (metadata_) {
-        metadata_->removeRpcMetaEntry(segment_name_);
-        metadata_.reset();
-    }
+    metadata_.reset();
     transport_list_.clear();
     for (auto &batch : batch_set_) delete batch;
     batch_set_.clear();
@@ -188,13 +153,9 @@ Status TransferEngine::deconstruct() {
     return Status::OK();
 }
 
-const std::string TransferEngine::getEthIP() const {
-    return metadata_->localRpcMeta().ip_or_host_name;
-}
+const std::string TransferEngine::getEthIP() const { return hostname_; }
 
-uint16_t TransferEngine::getEthPort() const {
-    return metadata_->localRpcMeta().rpc_port;
-}
+uint16_t TransferEngine::getEthPort() const { return port_; }
 
 Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
     return Status::NotImplemented("not implement");

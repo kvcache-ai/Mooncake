@@ -101,7 +101,6 @@ class TransferEngine {
    private:
     TEConfig conf_;
     std::shared_ptr<TransferMetadata> metadata_;
-    std::string segment_name_;
     std::shared_ptr<Topology> topology_;
     bool available_;
 
@@ -109,6 +108,9 @@ class TransferEngine {
     std::unordered_set<Batch *> batch_set_;
     std::vector<Batch *> deferred_free_batch_set_;
     std::mutex mutex_;
+
+    std::string hostname_;
+    uint16_t port_;
 };
 }  // namespace v1
 }  // namespace mooncake

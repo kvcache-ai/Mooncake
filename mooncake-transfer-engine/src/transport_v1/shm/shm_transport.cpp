@@ -94,7 +94,7 @@ Status ShmTransport::uninstall() {
     if (installed_) {
         workers_->stop();
         workers_.reset();
-        metadata_manager_->removeSegmentDesc(local_segment_name_);
+        // metadata_manager_->removeSegmentDesc(local_segment_name_);
         metadata_manager_.reset();
         installed_ = false;
     }
@@ -193,8 +193,9 @@ Status ShmTransport::registerLocalMemory(
         desc.addr = (uint64_t)buffer.addr;
         desc.length = buffer.length;
         desc.location = buffer.location;
-        desc.shm_path = buffer.shm_path;
-        metadata_manager_->addLocalMemoryBuffer(desc, true);
+        desc.shared_handle = buffer.shm_path;
+        // TODO
+        // metadata_manager_->addLocalMemoryBuffer(desc, true);
     }
     return Status::OK();
 }
@@ -202,7 +203,8 @@ Status ShmTransport::registerLocalMemory(
 Status ShmTransport::unregisterLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {
     for (auto &buffer : buffer_list) {
-        metadata_manager_->removeLocalMemoryBuffer(buffer.addr, true);
+        // TODO
+        // metadata_manager_->removeLocalMemoryBuffer(buffer.addr, true);
     }
     return Status::OK();
 }
@@ -210,9 +212,8 @@ Status ShmTransport::unregisterLocalMemory(
 void ShmTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = local_segment_name_;
-    desc->protocol = "shm";
-    metadata_manager_->addLocalSegment(LOCAL_SEGMENT_ID, local_segment_name_,
-                                       std::move(desc));
+    desc->type = SegmentType::Memory;
+    metadata_manager_->updateSegmentDesc(desc);
 }
 
 void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
@@ -247,21 +248,21 @@ int ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : detail.buffers) {
-        if (!entry.shm_path.empty() && entry.addr <= dest_addr &&
+        if (!entry.shared_handle.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             std::lock_guard<std::mutex> lock(relocate_mutex_);
             if (!relocate_map_.count(entry.addr)) {
-                int shm_fd = shm_open(entry.shm_path.c_str(), O_RDWR, 0644);
+                int shm_fd = shm_open(entry.shared_handle.c_str(), O_RDWR, 0644);
                 if (shm_fd < 0) {
                     PLOG(ERROR) << "Failed to open shared memory file: "
-                                << entry.shm_path;
+                                << entry.shared_handle;
                     return ERR_MEMORY;
                 }
                 auto shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
                                      MAP_SHARED, shm_fd, 0);
                 if (shm_addr == MAP_FAILED) {
                     PLOG(ERROR) << "Failed to map shared memory file: "
-                                << entry.shm_path;
+                                << entry.shared_handle;
                     close(shm_fd);
                     return ERR_MEMORY;
                 }

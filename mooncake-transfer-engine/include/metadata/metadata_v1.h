@@ -30,6 +30,7 @@
 
 #include "common/common.h"
 #include "metadata/plugin.h"
+#include "utility/rpc.h"
 #include "utility/topology.h"
 
 namespace mooncake {
@@ -47,45 +48,133 @@ struct DeviceDesc {
     std::string gid;
 };
 
+enum class MemBufferType { DRAM, VRAM };
+
 struct BufferDesc {
-    std::string location;
+    std::string location;  // will be obstacled
     uint64_t addr;
     uint64_t length;
-    std::vector<uint32_t> lkey;  // follow the order of `devices`
-    std::vector<uint32_t> rkey;  // follow the order of `devices`
-    std::string shm_path;
+    MemBufferType type;
+    int device_id;               // numa id for DRAM, GPU device id for VRAM
+    std::vector<uint32_t> rkey;  // rkey for each RDMA device change to map ...
+    std::string shared_handle;   // shm path for IPC/CXL, or serialized shared
+                                 // handle for NVLINK
 };
 
 struct FileBufferDesc {
+    std::string path;
     uint64_t length;
-    std::string original_path;  // file path of the original directory
-    std::unordered_map<std::string, std::string> mounted_path_map;
-    // file path of the mounted directory
+    uint64_t offset;
 };
 
 struct MemorySegmentDesc {
     Topology topology;
-    std::vector<DeviceDesc> devices;
+    std::vector<DeviceDesc> devices;  // TODO: change to map ...
     std::vector<BufferDesc> buffers;
+    std::string handshake_tcp_addr;
+    uint16_t handshake_tcp_port;
 };
 
 struct FileSegmentDesc {
     std::vector<FileBufferDesc> buffers;
 };
 
+enum class SegmentType { Memory, File };
+
 struct SegmentDesc {
     std::string name;
-    std::string protocol;
-    std::string timestamp;
+    SegmentType type;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
-
-    void dump() const;
 };
 
-struct RpcMetaDesc {
-    std::string ip_or_host_name;
-    uint16_t rpc_port;
-    int sockfd;  // local cache
+using SegmentDescRef = std::shared_ptr<SegmentDesc>;
+
+class MetadataStore;
+
+class SegmentManager {
+   public:
+    SegmentManager(std::unique_ptr<MetadataStore> agent);
+
+    ~SegmentManager();
+
+    SegmentManager(const SegmentManager &) = delete;
+    SegmentManager &operator=(const SegmentManager &) = delete;
+
+   public:
+    Status openRemote(SegmentID &handle, const std::string &segment_name);
+
+    Status closeRemote(SegmentID handle);
+
+    Status getRemote(SegmentDescRef &desc, SegmentID handle);
+
+    Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
+
+    Status invalidateRemote(SegmentID handle);
+
+    SegmentDescRef getLocal() { return local_desc_; }
+
+    void setLocal(const SegmentDescRef &desc) { local_desc_ = desc; }
+
+    Status applyLocal();
+
+   private:
+    RWSpinlock lock_;
+    std::unordered_map<SegmentID, SegmentDescRef> id_to_desc_map_;
+    std::unordered_map<SegmentID, std::string> id_to_name_map_;
+    std::unordered_map<std::string, SegmentID> name_to_id_map_;
+    std::atomic<SegmentID> next_id_;
+    SegmentDescRef local_desc_;
+    std::unique_ptr<MetadataStore> store_;
+};
+
+class MetadataStore {
+   public:
+    MetadataStore() {}
+
+    virtual ~MetadataStore() {}
+
+    MetadataStore(const MetadataStore &) = delete;
+    MetadataStore &operator=(const MetadataStore &) = delete;
+
+   public:
+    virtual Status getSegmentDesc(SegmentDescRef &desc,
+                                  const std::string &segment_name) = 0;
+
+    virtual Status putSegmentDesc(SegmentDescRef &desc) = 0;
+};
+
+class CentralMetadataStore : public MetadataStore {
+   public:
+    CentralMetadataStore(const std::string &connection_string);
+
+    virtual ~CentralMetadataStore() {}
+
+   public:
+    virtual Status getSegmentDesc(SegmentDescRef &desc,
+                                  const std::string &segment_name);
+
+    virtual Status putSegmentDesc(SegmentDescRef &desc);
+
+   private:
+    std::shared_ptr<MetadataPlugin> plugin_;
+};
+
+class P2PMetadataStore : public MetadataStore {
+   public:
+    P2PMetadataStore() {}
+
+    virtual ~P2PMetadataStore() {}
+
+   public:
+    virtual Status getSegmentDesc(SegmentDescRef &desc,
+                                  const std::string &segment_name);
+
+    virtual Status putSegmentDesc(SegmentDescRef &desc) {
+        return Status::OK();  // no operation in purpose
+    }
+
+   private:
+    std::unique_ptr<AsioRpcClient> client_;
 };
 
 struct HandShakeDesc {
@@ -95,88 +184,118 @@ struct HandShakeDesc {
     std::string reply_msg;  // on error
 };
 
+using OnReceiveHandShake =
+    std::function<int(const HandShakeDesc &request, HandShakeDesc &response)>;
+
+class BootstrapRdmaClient {
+   public:
+    BootstrapRdmaClient() {}
+
+    ~BootstrapRdmaClient() {}
+
+   public:
+    Status bootstrap(const std::string &segment_name,
+                     const HandShakeDesc &request, HandShakeDesc &response);
+
+   private:
+    std::unique_ptr<AsioRpcClient> client_;
+};
+
+class MetadataService {
+   public:
+    MetadataService(const std::string &conn_string);
+
+    ~MetadataService();
+
+    MetadataService(const MetadataService &) = delete;
+    MetadataService &operator=(const MetadataService &) = delete;
+
+    SegmentManager &segmentManager() { return *manager_.get(); }
+
+    void setBootstrapRdmaCallback(const OnReceiveHandShake &callback) {
+        bootstrap_callback_ = callback;
+    }
+
+    void start(uint16_t &port);
+
+   private:
+    void onGetSegmentDesc(const RpcRawData &request, RpcRawData &response);
+
+    void onBootstrapRdma(const RpcRawData &request, RpcRawData &response);
+
+   private:
+    std::unique_ptr<SegmentManager> manager_;
+    std::shared_ptr<AsioRpcServer> rpc_server_;
+
+    OnReceiveHandShake bootstrap_callback_;
+};
+
+// ----------------------------------------------------------------------------
+
 class TransferMetadata {
    public:
-    TransferMetadata(const std::string &conn_string);
+    TransferMetadata(const std::string &conn_string) {
+        service_ = std::make_shared<MetadataService>(conn_string);
+    }
 
-    ~TransferMetadata();
+    ~TransferMetadata() {}
+
+    SegmentID getSegmentID(const std::string &segment_name) {
+        auto &manager = service_->segmentManager();
+        SegmentID handle;
+        auto status = manager.openRemote(handle, segment_name);
+        assert(status.ok());
+        return handle;
+    }
+
+    std::shared_ptr<SegmentDesc> getLocalSegment() {
+        return service_->segmentManager().getLocal();
+    }
 
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
-        const std::string &segment_name, bool force_update = false);
+        const std::string &segment_name, bool force_update = false) {
+        auto &manager = service_->segmentManager();
+        SegmentID handle;
+        auto status = manager.openRemote(handle, segment_name);
+        assert(status.ok());
+        std::shared_ptr<SegmentDesc> desc;
+        status = manager.getRemote(desc, handle);
+        assert(status.ok());
+        return desc;
+    }
 
-    std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
-                                                    bool force_update = false);
+    std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID handle,
+                                                    bool force_update = false) {
+        auto &manager = service_->segmentManager();
+        std::shared_ptr<SegmentDesc> desc;
+        if (handle == 0) return manager.getLocal();
+        auto status = manager.getRemote(desc, handle);
+        assert(status.ok());
+        return desc;
+    }
 
-    int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
-
-    int updateSegmentDesc(const std::string &segment_name,
-                          const SegmentDesc &desc);
-
-    std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string &segment_name);
-
-    SegmentID getSegmentID(const std::string &segment_name);
-
-    int syncSegmentCache(const std::string &segment_name);
-
-    int removeSegmentDesc(const std::string &segment_name);
-
-    int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
-                             bool update_metadata);
-
-    int removeLocalMemoryBuffer(void *addr, bool update_metadata);
-
-    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
-                        std::shared_ptr<SegmentDesc> &&desc);
-
-    int removeLocalSegment(const std::string &segment_name);
-
-    int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
-
-    int removeRpcMetaEntry(const std::string &server_name);
-
-    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
-
-    const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
-
-    using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
-                                                 HandShakeDesc &local_desc)>;
-    int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                             uint16_t listen_port, int sockfd);
+    int updateSegmentDesc(const std::shared_ptr<SegmentDesc> &desc) {
+        service_->segmentManager().setLocal(desc);
+        service_->segmentManager().applyLocal();
+        return 0;
+    }
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc);
+                      HandShakeDesc &peer_desc) {
+        BootstrapRdmaClient bootstrap_client;
+        bootstrap_client.bootstrap(peer_server_name, local_desc, peer_desc);
+        return 0;
+    }
 
-    void dumpMetadataContentUnlocked();
+    void setBootstrapRdmaCallback(const OnReceiveHandShake &callback) {
+        service_->setBootstrapRdmaCallback(callback);
+    }
 
-    void dumpMetadataContent(const std::string &segment_name, uint64_t offset,
-                             uint64_t length);
-
-    std::shared_ptr<SegmentDesc> praseSegmentDesc(
-        const Json::Value &segmentJSON);
-
-    Json::Value exportSegmentDesc(const SegmentDesc &desc);
+    void start(uint16_t &port) { service_->start(port); }
 
    private:
-    int receivePeerMetadata(const Json::Value &peer_json,
-                            Json::Value &local_json);
-
-    bool p2p_handshake_mode_{false};
-    // local cache
-    RWSpinlock segment_lock_;
-    std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
-        segment_id_to_desc_map_;
-    std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
-
-    RWSpinlock rpc_meta_lock_;
-    std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
-    RpcMetaDesc local_rpc_meta_;
-
-    std::atomic<SegmentID> next_segment_id_;
-
-    std::shared_ptr<HandShakePlugin> handshake_plugin_;
-    std::shared_ptr<MetadataPlugin> storage_plugin_;
+    std::shared_ptr<MetadataService> service_;
 };
 }  // namespace v1
 }  // namespace mooncake

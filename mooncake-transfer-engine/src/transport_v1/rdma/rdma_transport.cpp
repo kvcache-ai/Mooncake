@@ -81,11 +81,6 @@ Status RdmaTransport::install(
         return Status::Metadata("failed to start handshake daemon thread");
     }
 
-    if (metadata_manager_->updateLocalSegmentDesc()) {
-        uninstall();
-        return Status::Metadata("failed to upload local segment descriptor");
-    }
-
     workers_ = std::make_unique<Workers>(this);
     workers_->start();
 
@@ -96,7 +91,7 @@ Status RdmaTransport::install(
 Status RdmaTransport::uninstall() {
     if (installed_) {
         workers_.reset();
-        metadata_manager_->removeSegmentDesc(local_segment_name_);
+        // metadata_manager_->removeSegmentDesc(local_segment_name_);
         metadata_manager_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
@@ -220,8 +215,7 @@ Status RdmaTransport::registerLocalMemory(
     }
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    int ret = metadata_manager_->updateSegmentDesc(segment_desc->name,
-                                                   *segment_desc.get());
+    int ret = metadata_manager_->updateSegmentDesc(segment_desc);
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
@@ -250,8 +244,7 @@ Status RdmaTransport::unregisterLocalMemory(
     }
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    int ret = metadata_manager_->updateSegmentDesc(segment_desc->name,
-                                                   *segment_desc.get());
+    int ret = metadata_manager_->updateSegmentDesc(segment_desc);
     return ret == 0 ? Status::OK()
                     : Status::Context("update local segment descriptor error");
 }
@@ -259,7 +252,7 @@ Status RdmaTransport::unregisterLocalMemory(
 void RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = local_segment_name_;
-    desc->protocol = "rdma";
+    desc->type = SegmentType::Memory;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &context : context_set_) {
         DeviceDesc device_desc;
@@ -269,8 +262,7 @@ void RdmaTransport::allocateLocalSegmentID() {
         detail.devices.push_back(device_desc);
     }
     detail.topology = *(local_topology_.get());
-    metadata_manager_->addLocalSegment(LOCAL_SEGMENT_ID, local_segment_name_,
-                                       std::move(desc));
+    metadata_manager_->updateSegmentDesc(desc);
 }
 
 int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
@@ -279,8 +271,7 @@ int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
     if (!update_meta || ret) return ret;
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    return metadata_manager_->updateSegmentDesc(segment_desc->name,
-                                                *segment_desc.get());
+    return metadata_manager_->updateSegmentDesc(segment_desc);
 }
 
 int RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
@@ -292,8 +283,7 @@ int RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
     if (!update_meta || ret) return ret;
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    return metadata_manager_->updateSegmentDesc(segment_desc->name,
-                                                *segment_desc.get());
+    return metadata_manager_->updateSegmentDesc(segment_desc);
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -335,11 +325,10 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
 }
 
 int RdmaTransport::startHandshakeDaemon() {
-    auto local_rpc_meta = metadata_manager_->localRpcMeta();
-    return metadata_manager_->startHandshakeDaemon(
+    metadata_manager_->setBootstrapRdmaCallback(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
-                  std::placeholders::_1, std::placeholders::_2),
-        local_rpc_meta.rpc_port, local_rpc_meta.sockfd);
+                  std::placeholders::_1, std::placeholders::_2));
+    return 0;
 }
 
 int RdmaTransport::sendHandshake(const std::string &peer_server_name,

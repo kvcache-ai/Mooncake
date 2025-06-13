@@ -99,7 +99,7 @@ class AddressRangeManager {
 struct BufferQueryResult {
     void *addr;
     size_t length;
-    uint32_t lkey, rkey;
+    uint32_t key;
     int device_id;
 };
 

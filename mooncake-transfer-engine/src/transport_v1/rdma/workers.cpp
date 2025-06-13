@@ -115,8 +115,8 @@ int Workers::submit(RdmaSliceList &slice_list) {
         }
 
         assert(local.size() == 1 && remote.size() == 1);
-        slice->source_lkey = local[0].lkey;
-        slice->target_rkey = remote[0].rkey;
+        slice->source_lkey = local[0].key;
+        slice->target_rkey = remote[0].key;
         slice->source_dev_id = local[0].device_id;
         slice->target_dev_id = remote[0].device_id;
     }
