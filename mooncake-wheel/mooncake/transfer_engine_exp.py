@@ -20,6 +20,7 @@ class SimpleTransfer:
         self.config = config
         self.engine = None
         self.session_id = None
+        self.remote_session_id = None
         self._init_engine()
     
     def _init_engine(self):
@@ -105,7 +106,7 @@ class Sender(SimpleTransfer):
             
             # Transfer data
             ret = self.engine.transfer_sync_write(
-                receiver_session_id,
+                receiver_info["session_id"],
                 ptr,
                 receiver_info["ptr"],
                 size
