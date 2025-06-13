@@ -140,6 +140,18 @@ class MasterClient {
         const Segment& segment, const UUID& client_id);
 
     /**
+     * @brief Re-mount segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @param client_id The uuid of the client
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] ReMountSegmentResponse ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id);
+
+    /**
      * @brief Unregisters a memory segment from master
      * @param segment_id ID of the segment to unmount
      * @param client_id The uuid of the client

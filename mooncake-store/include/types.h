@@ -62,8 +62,6 @@ UUID generate_uuid();
 enum class ErrorCode : int32_t {
     OK = 0,               ///< Operation successful.
     INTERNAL_ERROR = -1,  ///< Internal error occurred.
-    UNAVAILABLE_IN_CURRENT_STATUS =
-        -2,  ///< Request cannot be done in current status.
 
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
@@ -102,11 +100,15 @@ enum class ErrorCode : int32_t {
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
 
-    // ETCD errors (Range: -1000 to -1099)
+    // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
     ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    UNAVAILABLE_IN_CURRENT_STATUS =
+        -1010,  ///< Request cannot be done in current status.
+    UNAVAILABLE_IN_CURRENT_MODE =
+        -1011,  ///< Request cannot be done in current mode.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

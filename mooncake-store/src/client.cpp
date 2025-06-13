@@ -146,7 +146,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         // if needed
         ping_running_ = true;
         ping_thread_ =
-            std::thread(&Client::PingThreadFunc, this, master_version);
+            std::thread(&Client::PingThreadFunc, this);
 
         return ErrorCode::OK;
     } else {
@@ -738,7 +738,7 @@ ErrorCode Client::TransferRead(
     return TransferData(handles, slices, TransferRequest::READ);
 }
 
-void Client::PingThreadFunc(int current_version) {
+void Client::PingThreadFunc() {
     // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -747,45 +747,26 @@ void Client::PingThreadFunc(int current_version) {
     const int fail_ping_interval_ms = 1000;
     // Increment after a ping failure, reset after a ping success
     int ping_fail_count = 0;
-    // Set to true when there is a view change.
-    // When set true, will try to remount periodically.
-    bool need_remount = false;
 
     auto remount_segment = [this]() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        std::vector<Segment> segments;
         for (auto it : mounted_segments_) {
             auto& segment = it.second;
-            auto err =
-                master_client_.MountSegment(segment, client_id_)
-                    .error_code;
-            // If err is INVALID_PARAMS, it means the segment is already
-            // mounted, or cannot be mounted with current parameters. Either
-            // way, there is nothing we can do for this segment.
-            if (err != ErrorCode::OK && err != ErrorCode::INVALID_PARAMS) {
-                LOG(ERROR) << "Failed to remount segment " << segment.name << ": "
-                           << toString(err);
-                return err;
-            }
+            segments.push_back(segment);
         }
-        return ErrorCode::OK;
+        ErrorCode err = master_client_.ReMountSegment(segments, client_id_).error_code;
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to remount segments: " << err;
+        }
     };
 
     while (ping_running_) {
         auto ping_result = master_client_.Ping(client_id_);
         if (ping_result.error_code == ErrorCode::OK) {
             ping_fail_count = 0;
-            if (ping_result.view_version > current_version) {
-                // There is an unknown view change, we need to update
-                // local view version and remount segments.
-                LOG(ERROR) << "Master view version has changed, need to "
-                              "remount segments";
-                current_version = ping_result.view_version;
-                need_remount = true;
-            }
-            // Only try to remount if the ping succeeds and need_remount is true
-            if (need_remount && remount_segment() == ErrorCode::OK) {
-                LOG(INFO) << "Successfully remounted all segments";
-                need_remount = false;
+            if (ping_result.client_status == ClientStatus::NEED_REMOUNT) {
+                remount_segment();
             }
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
@@ -826,11 +807,6 @@ void Client::PingThreadFunc(int current_version) {
 
         LOG(INFO) << "Reconnected to master " << master_address;
         ping_fail_count = 0;
-        if (next_version > current_version) {
-            // Master view has changed
-            current_version = next_version;
-            need_remount = true;
-        }
     }
 }
 

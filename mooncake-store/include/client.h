@@ -231,10 +231,10 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc(int current_version);
+    void PingThreadFunc();
 
     // Client identification
-    UUID client_id_;  // 128-bit UUID stored as two 64-bit integers
+    UUID client_id_;
 };
 
 }  // namespace mooncake

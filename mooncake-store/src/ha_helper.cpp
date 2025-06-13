@@ -136,10 +136,11 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
+        bool enable_ha = true;
         mooncake::WrappedMasterService wrapped_master_service(
             enable_gc_, default_kv_lease_ttl_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version);
+            version, enable_ha);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

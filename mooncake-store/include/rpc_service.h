@@ -80,6 +80,11 @@ struct MountSegmentResponse {
 };
 YLT_REFL(MountSegmentResponse, error_code)
 
+struct ReMountSegmentResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(ReMountSegmentResponse, error_code)
+
 struct UnmountSegmentResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
@@ -102,9 +107,10 @@ class WrappedMasterService {
                          double eviction_ratio = DEFAULT_EVICTION_RATIO,
                          double eviction_high_watermark_ratio =
                              DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                         ViewVersionId view_version = 0)
+                         ViewVersionId view_version = 0,
+                         bool enable_ha = false)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
-                          eviction_high_watermark_ratio, view_version),
+                          eviction_high_watermark_ratio, view_version, enable_ha),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
@@ -464,9 +470,25 @@ class WrappedMasterService {
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_mount_segment_failures();
-        } else {
-            // Update total capacity on successful mount
-            MasterMetricManager::instance().inc_total_capacity(segment.size);
+        }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    ReMountSegmentResponse ReMountSegment(const std::vector<Segment>& segments, const UUID& client_id) {
+        ScopedVLogTimer timer(1, "ReMountSegment");
+        timer.LogRequest("segments_count=", segments.size(), ", client_id=", client_id);
+
+        // Increment request metric
+        // MasterMetricManager::instance().inc_mount_segment_requests();
+
+        ReMountSegmentResponse response;
+        response.error_code = master_service_.ReMountSegment(segments, client_id);
+
+        // Track failures if needed
+        if (response.error_code != ErrorCode::OK) {
+           // MasterMetricManager::instance().inc_mount_segment_failures();
         }
 
         timer.LogResponseJson(response);

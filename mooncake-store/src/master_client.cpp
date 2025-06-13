@@ -360,6 +360,33 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
     return result.value();
 }
 
+ReMountSegmentResponse MasterClient::ReMountSegment(
+    const std::vector<Segment>& segments, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
+    timer.LogRequest("segments_count=", segments.size(), ", client_id=", client_id);
+
+    std::optional<ReMountSegmentResponse> result =
+        syncAwait([&]() -> coro::Lazy<std::optional<ReMountSegmentResponse>> {
+            Lazy<async_rpc_result<ReMountSegmentResponse>> handler =
+                co_await client_
+                    .send_request<&WrappedMasterService::ReMountSegment>(
+                        segments, client_id);
+            async_rpc_result<ReMountSegmentResponse> result = co_await handler;
+            if (!result) {
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        LOG(ERROR) << "Failed to remount segment due to rpc error";
+        auto response = ReMountSegmentResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 UnmountSegmentResponse MasterClient::UnmountSegment(const UUID& segment_id,
                                                     const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");

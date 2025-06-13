@@ -10,7 +10,6 @@ const std::string& toString(ErrorCode errorCode) noexcept {
     static const std::unordered_map<ErrorCode, std::string> errorCodeMap = {
         {ErrorCode::OK, "OK"},
         {ErrorCode::INTERNAL_ERROR, "INTERNAL_ERROR"},
-        {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::BUFFER_OVERFLOW, "BUFFER_OVERFLOW"},
         {ErrorCode::SHARD_INDEX_OUT_OF_RANGE, "SHARD_INDEX_OUT_OF_RANGE"},
         {ErrorCode::AVAILABLE_SEGMENT_EMPTY, "AVAILABLE_SEGMENT_EMPTY"},
@@ -32,6 +31,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
+        {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, "UNAVAILABLE_IN_CURRENT_STATUS"},
+        {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
     };
 
     auto it = errorCodeMap.find(errorCode);

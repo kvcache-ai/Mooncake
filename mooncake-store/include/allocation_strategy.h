@@ -129,7 +129,6 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
             allocator_indices.pop_back();
         }
-
         return nullptr;
     }
 };

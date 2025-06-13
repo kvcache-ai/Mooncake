@@ -78,18 +78,37 @@ class MasterService {
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
                   double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                  ViewVersionId view_version = 0);
+                  ViewVersionId view_version = 0,
+                  bool enable_ha = false);
     ~MasterService();
 
     /**
-     * @brief Mount a memory segment for buffer allocation
-     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
-     * exists or params invalid, ErrorCode::INTERNAL_ERROR if allocation fails
+     * @brief Mount a memory segment for buffer allocation. This function is
+     * idempotent.
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::INVALID_PARAMS on invalid parameters,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily,
+     *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
 
     /**
-     * @brief Unmount a memory segment
+     * @brief Re-mount segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @return ErrorCode::OK means either all segments are remounted successfully
+     *         or the fail is not solvable by a new remount request.
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily.
+     *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
+     */
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             const UUID& client_id);
+
+    /**
+     * @brief Unmount a memory segment. This function is idempotent.
      * @return ErrorCode::OK on success,
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
@@ -402,6 +421,9 @@ class MasterService {
     static constexpr size_t kClientPingQueueSize =
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
+
+    // if high availability features enabled
+    bool enable_ha_;
 };
 
 }  // namespace mooncake

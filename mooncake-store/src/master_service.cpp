@@ -13,12 +13,14 @@ namespace mooncake {
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
-                             ViewVersionId view_version)
+                             ViewVersionId view_version,
+                             bool enable_ha)
     : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
-      eviction_high_watermark_ratio_(eviction_high_watermark_ratio) {
+      eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
+      enable_ha_(enable_ha) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -34,6 +36,12 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
     VLOG(1) << "action=start_gc_thread";
+
+    if (enable_ha) {
+        client_monitor_running_ = true;
+        client_monitor_thread_ = std::thread(&MasterService::ClientMonitorFunc, this);
+        VLOG(1) << "action=start_client_monitor_thread";
+    }
 }
 
 MasterService::~MasterService() {
@@ -83,22 +91,24 @@ ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
-    // Tell the client monitor thread to start timing for this client. To avoid
-    // the following undesired situations, this message must be sent before the
-    // segment lock is released:
-    // 1. Sending the message before the lock: the client expires and unmouting
-    // invokes before this mounting are completed, which prevent this segment
-    // being able to be unmounted forever;
-    // 2. Sending the message after mounting the segment: After mounting this
-    // segment, when trying to push id to the queue, the queue is already full,
-    // which may block this request forever.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=client_ping_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+    if (enable_ha_) {
+        // Tell the client monitor thread to start timing for this client. To avoid
+        // the following undesired situations, this message must be sent before the
+        // segment lock is released:
+        // 1. Sending the message before the lock: the client expires and unmouting
+        // invokes before this mounting are completed, which prevent this segment
+        // being able to be unmounted forever;
+        // 2. Sending the message after mounting the segment: After mounting this
+        // segment, when trying to push id to the queue, the queue is already full,
+        // which may block this request forever.
+        PodUUID pod_client_id;
+        pod_client_id.first = client_id.first;
+        pod_client_id.second = client_id.second;
+        if (!client_ping_queue_.push(pod_client_id)) {
+            LOG(ERROR) << "segment_name=" << segment.name
+                    << ", error=client_ping_queue_full";
+            return ErrorCode::INTERNAL_ERROR;
+        }
     }
 
     std::shared_ptr<BufferAllocator> allocator;
@@ -122,11 +132,47 @@ ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client
     client_segments_[client_id].push_back(segment.id);
     mounted_segments_[segment.id] = {segment, SegmentStatus::OK, std::move(allocator)};
 
+    MasterMetricManager::instance().inc_total_capacity(size);
+
     return ErrorCode::OK;
 }
 
-//void MasterService::PrepareUnmountSegment(std::unique_lock<std::shared_mutex>& lock, const UUID& segment_id) {
-//}
+ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
+                                         const UUID& client_id) {
+    if (!enable_ha_) {
+        LOG(ERROR) << "ReMountSegment is only available in HA mode";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(client_mutex_);
+    if (ok_client_.contains(client_id)) {
+        LOG(WARNING) << "client_id=" << client_id
+                    << ", warn=client_already_remounted";
+        // Return OK because this is an idempotent operation
+        return ErrorCode::OK;
+    }
+
+    for (const auto& segment : segments) {
+        ErrorCode err = MountSegment(segment, client_id);
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS || err == ErrorCode::INTERNAL_ERROR) {
+            LOG(ERROR) << "segment_name=" << segment.name
+                       << ", error=fail_to_remount_segment";
+            return err;
+        } else if (err == ErrorCode::INVALID_PARAMS) {
+            // Ignore INVALID_PARAMS. This error cannot be solved by a new remount request.
+            LOG(WARNING) << "segment_name=" << segment.name
+                         << ", warn=invalid_params";
+        } else if (err != ErrorCode::OK) {
+            // Ignore other errors. The error may not be solvable by a new remount request.
+            LOG(ERROR) << "segment_name=" << segment.name
+                       << ", error=unexpected_error (" << err << ")";
+        }
+    }
+
+    // Change the client status to OK
+    ok_client_.insert(client_id);
+    return ErrorCode::OK;
+}
 
 ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
     size_t metrics_dec_capacity = 0; // to update the metrics
@@ -265,33 +311,29 @@ ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::GetAllSegments(std::vector<std::string> & all_segments) {
+ErrorCode MasterService::GetAllSegments(
+    std::vector<std::string>& all_segments) {
     all_segments.clear();
     std::shared_lock<std::shared_mutex> alloc_lock(segment_mutex_);
-    for(auto & segment : mounted_segments_) {
+    for (auto& segment : mounted_segments_) {
         all_segments.push_back(segment.second.segment.name);
     }
-    alloc_lock.unlock();
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::QuerySegments(const std::string & segment,
-                                       size_t & used,
-                                       size_t & capacity) {
-/* todo 
-    std::shared_lock<std::shared_mutex> alloc_lock(
-        allocator_mutex_);
-    const auto& allocators = buf_allocators_;
-    auto it = allocators.find(segment);
-    if (it != allocators.end()) {
-        auto& allocator = it -> second;
-        capacity = allocator -> capacity();
-        used = allocator -> size();
+ErrorCode MasterService::QuerySegments(const std::string& segment, size_t& used,
+                                       size_t& capacity) {
+    std::shared_lock<std::shared_mutex> alloc_lock(segment_mutex_);
+    const auto& allocators = ok_allocators_by_name_.find(segment);
+    if (allocators != ok_allocators_by_name_.end()) {
+        capacity = allocators->second[0]->capacity();
+        used = allocators->second[0]->size();
     } else {
-        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment << ") not found!";
+        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
+                << ") not found!";
         return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
     }
-    alloc_lock.unlock();*/
+    alloc_lock.unlock();
     return ErrorCode::OK;
 }
 
@@ -406,7 +448,6 @@ ErrorCode MasterService::PutStart(
                 // Use the unified allocation strategy with replica config
                 auto handle =
                     allocation_strategy_->Allocate(ok_allocators_, ok_allocators_by_name_, chunk_size, config);
-                alloc_lock.unlock();
 
                 if (!handle) {
                     LOG(ERROR) << "key=" << key << ", replica_id=" << i
@@ -634,7 +675,14 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-ErrorCode MasterService::Ping(const UUID& client_id, ViewVersionId& view_version, ClientStatus& client_status) {
+ErrorCode MasterService::Ping(const UUID& client_id,
+                              ViewVersionId& view_version,
+                              ClientStatus& client_status) {
+    if (!enable_ha_) {
+        LOG(ERROR) << "Ping is only available in HA mode";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     auto it = ok_client_.find(client_id);
     if (it != ok_client_.end()) {
@@ -646,7 +694,8 @@ ErrorCode MasterService::Ping(const UUID& client_id, ViewVersionId& view_version
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {
         // Queue is full
-        LOG(ERROR) << "client_id=" << client_id << ", error=client_ping_queue_full";
+        LOG(ERROR) << "client_id=" << client_id
+                   << ", error=client_ping_queue_full";
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
