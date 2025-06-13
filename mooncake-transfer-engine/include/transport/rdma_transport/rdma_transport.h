@@ -27,8 +27,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "topology.h"
-#include "transfer_metadata.h"
+#include "utility/topology.h"
+#include "metadata/metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -42,11 +42,6 @@ class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
     friend class WorkerPool;
-
-   public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
    public:
     RdmaTransport();
@@ -119,7 +114,6 @@ class RdmaTransport : public Transport {
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
-using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 
 }  // namespace mooncake

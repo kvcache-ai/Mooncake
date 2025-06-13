@@ -14,7 +14,7 @@
 
 #include "transport/transport.h"
 
-#include "error.h"
+#include "common/error.h"
 #include "transfer_engine.h"
 
 namespace mooncake {

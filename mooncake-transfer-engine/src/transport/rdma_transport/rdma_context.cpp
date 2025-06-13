@@ -23,7 +23,7 @@
 #include <memory>
 #include <thread>
 
-#include "config.h"
+#include "common/config.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
