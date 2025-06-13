@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <boost/functional/hash.hpp>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <optional>
 
@@ -38,47 +40,29 @@ struct GCTask {
     }
 };
 
-class BufferAllocatorManager {
-   public:
-    BufferAllocatorManager() = default;
-    ~BufferAllocatorManager() = default;
-
-    /**
-     * @brief Register a new buffer for allocation
-     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
-     * exists
-     */
-    ErrorCode AddSegment(const std::string& segment_name, uint64_t base,
-                         uint64_t size);
-
-    /**
-     * @brief Unregister a buffer
-     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
-     * not found
-     */
-    ErrorCode RemoveSegment(const std::string& segment_name);
-
-    /**
-     * @brief Get the map of buffer allocators
-     * @note Caller must hold the mutex while accessing the map
-     */
-    const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-    GetAllocators() const {
-        return buf_allocators_;
-    }
-
-    /**
-     * @brief Get the mutex for thread-safe access
-     */
-    std::shared_mutex& GetMutex() { return allocator_mutex_; }
-
-   private:
-    // Protects the buffer allocator map (BufferAllocator is thread-safe by
-    // itself)
-    mutable std::shared_mutex allocator_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>
-        buf_allocators_;
+/**
+ * @brief Status of a mounted segment in master
+ */
+enum class SegmentStatus {
+    UNDEFINED = 0,  // Uninitialized
+    OK,             // Segment is mounted and available for allocation
+    UNMOUNTING,     // Segment is under unmounting
 };
+
+/**
+ * @brief Stream operator for SegmentStatus
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const SegmentStatus& status) noexcept {
+    static const std::unordered_map<SegmentStatus, std::string_view>
+        status_strings{{SegmentStatus::UNDEFINED, "UNDEFINED"},
+                       {SegmentStatus::OK, "OK"},
+                       {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
+
+    os << (status_strings.count(status) ? status_strings.at(status)
+                                        : "UNKNOWN");
+    return os;
+}
 
 class MasterService {
    private:
@@ -93,7 +77,8 @@ class MasterService {
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
+                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                  ViewVersionId view_version = 0);
     ~MasterService();
 
     /**
@@ -101,15 +86,15 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
      * exists or params invalid, ErrorCode::INTERNAL_ERROR if allocation fails
      */
-    ErrorCode MountSegment(uint64_t buffer, uint64_t size,
-                           const std::string& segment_name);
+    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
 
     /**
      * @brief Unmount a memory segment
-     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if segment
-     * not found
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
+     *         currently unmounting.
      */
-    ErrorCode UnmountSegment(const std::string& segment_name);
+    ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id);
 
     /**
      * @brief Check if an object exists
@@ -240,6 +225,17 @@ class MasterService {
      */
     size_t GetKeyCount() const;
 
+    /**
+     * @brief Heartbeat from client
+     * @param client_id The uuid of the client
+     * @param[out] view_version The view version of the master
+     * @param[out] client_status The status of the client from the master
+     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
+     *         ping queue is full
+     */
+    ErrorCode Ping(const UUID& client_id, ViewVersionId& view_version,
+              ClientStatus& client_status);
+
    private:
     // GC thread function
     void GCThreadFunc();
@@ -284,10 +280,24 @@ class MasterService {
         }
     };
 
-    // Buffer allocator management
-    std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    struct MountedSegment {
+        Segment segment;
+        SegmentStatus status;
+        std::shared_ptr<BufferAllocator> buf_allocator;
+    };
 
+    // Segment management
+    mutable std::shared_mutex segment_mutex_;
+    std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<BufferAllocator>>>
+        ok_allocators_by_name_;  // segment name -> allocators with status OK
+    std::vector<std::shared_ptr<BufferAllocator>>
+        ok_allocators_;  // allocators with status OK
+    std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
+        mounted_segments_; // segment_id -> mounted segment
+    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
+        client_segments_;  // client_id -> segment_ids
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
@@ -373,6 +383,25 @@ class MasterService {
     };
 
     friend class MetadataAccessor;
+
+    ViewVersionId view_version_;
+
+    // Client related members
+    mutable std::shared_mutex client_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> ok_client_;  // client with ok status
+    void ClientMonitorFunc();
+    std::thread client_monitor_thread_;
+    std::atomic<bool> client_monitor_running_{false};
+    static constexpr uint64_t kClientMonitorSleepMs =
+        1000;  // 1000 ms sleep between client monitor checks
+    // boost lockfree queue requires trivial assignment operator
+    struct PodUUID {
+        uint64_t first;
+        uint64_t second;
+    };
+    static constexpr size_t kClientPingQueueSize =
+        128 * 1024;  // Size of the client ping queue
+    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
 };
 
 }  // namespace mooncake

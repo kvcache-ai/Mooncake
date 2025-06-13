@@ -123,7 +123,7 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void CleanupSegment() {
-        if (client_->UnmountSegment("localhost:12345", segment_ptr_) !=
+        if (client_->UnmountSegment("localhost:12345") !=
             ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment";
         }

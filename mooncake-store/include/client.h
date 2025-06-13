@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <boost/functional/hash.hpp>
 
 #include "master_client.h"
 #include "rpc_service.h"
@@ -155,10 +156,9 @@ class Client {
     /**
      * @brief Unregisters a memory segment from master
      * @param segment_name Name of the segment to unregister
-     * @param addr Memory address to unregister
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode UnmountSegment(const std::string& segment_name, void* addr);
+    ErrorCode UnmountSegment(const std::string& segment_name);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -219,14 +219,9 @@ class Client {
     TransferEngine transfer_engine_;
     MasterClient master_client_;
 
-    // Client local segments
-    struct Segment{
-        void* buffer;
-        size_t size;
-    };
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, Segment> mounted_segments_;
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
@@ -237,6 +232,9 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadFunc(int current_version);
+
+    // Client identification
+    UUID client_id_;  // 128-bit UUID stored as two 64-bit integers
 };
 
 }  // namespace mooncake

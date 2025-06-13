@@ -1,11 +1,16 @@
 #include "types.h"
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+
 namespace mooncake {
 
 const std::string& toString(ErrorCode errorCode) noexcept {
     static const std::unordered_map<ErrorCode, std::string> errorCodeMap = {
         {ErrorCode::OK, "OK"},
         {ErrorCode::INTERNAL_ERROR, "INTERNAL_ERROR"},
+        {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::BUFFER_OVERFLOW, "BUFFER_OVERFLOW"},
         {ErrorCode::SHARD_INDEX_OUT_OF_RANGE, "SHARD_INDEX_OUT_OF_RANGE"},
         {ErrorCode::AVAILABLE_SEGMENT_EMPTY, "AVAILABLE_SEGMENT_EMPTY"},
@@ -40,6 +45,15 @@ int32_t toInt(ErrorCode errorCode) noexcept {
 
 ErrorCode fromInt(int32_t errorCode) noexcept {
     return static_cast<ErrorCode>(errorCode);
+}
+
+UUID generate_uuid() {
+    UUID pair_uuid;
+    boost::uuids::random_generator gen;
+    boost::uuids::uuid uuid = gen();
+    std::memcpy(&pair_uuid.first, uuid.data, sizeof(uint64_t));
+    std::memcpy(&pair_uuid.second, uuid.data + sizeof(uint64_t), sizeof(uint64_t));
+    return pair_uuid;
 }
 
 }  // namespace mooncake

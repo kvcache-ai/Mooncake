@@ -87,6 +87,7 @@ YLT_REFL(UnmountSegmentResponse, error_code)
 
 struct PingResponse {
     ViewVersionId view_version = 0;
+    ClientStatus client_status = ClientStatus::UNDEFINED;
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(PingResponse, view_version, error_code)
@@ -103,10 +104,9 @@ class WrappedMasterService {
                              DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                          ViewVersionId view_version = 0)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
-                          eviction_high_watermark_ratio),
+                          eviction_high_watermark_ratio, view_version),
           http_server_(4, http_port),
-          metric_report_running_(enable_metric_reporting),
-          view_version_(view_version) {
+          metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
         init_http_server();
 
@@ -450,40 +450,38 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+    MountSegmentResponse MountSegment(const Segment& segment, const UUID& client_id) {
         ScopedVLogTimer timer(1, "MountSegment");
-        timer.LogRequest("buffer=", buffer, ", size=", size,
-                         ", segment_name=", segment_name);
+        timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                         ", segment_name=", segment.name, ", id=", segment.id);
 
         // Increment request metric
         MasterMetricManager::instance().inc_mount_segment_requests();
 
         MountSegmentResponse response;
-        response.error_code =
-            master_service_.MountSegment(buffer, size, segment_name);
+        response.error_code = master_service_.MountSegment(segment, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_mount_segment_failures();
         } else {
             // Update total capacity on successful mount
-            MasterMetricManager::instance().inc_total_capacity(size);
+            MasterMetricManager::instance().inc_total_capacity(segment.size);
         }
 
         timer.LogResponseJson(response);
         return response;
     }
 
-    UnmountSegmentResponse UnmountSegment(const std::string& segment_name) {
+    UnmountSegmentResponse UnmountSegment(const UUID& segment_id, const UUID& client_id) {
         ScopedVLogTimer timer(1, "UnmountSegment");
-        timer.LogRequest("segment_name=", segment_name);
+        timer.LogRequest("segment_id=", segment_id);
 
         // Increment request metric
         MasterMetricManager::instance().inc_unmount_segment_requests();
 
         UnmountSegmentResponse response;
-        response.error_code = master_service_.UnmountSegment(segment_name);
+        response.error_code = master_service_.UnmountSegment(segment_id, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
@@ -494,13 +492,15 @@ class WrappedMasterService {
         return response;
     }
 
-    PingResponse Ping() {
+    PingResponse Ping(const UUID& client_id) {
         ScopedVLogTimer timer(1, "Ping");
-        timer.LogRequest("action=ping");
+        timer.LogRequest("client_id=", client_id);
 
         MasterMetricManager::instance().inc_ping_requests();
 
-        PingResponse response(view_version_, ErrorCode::OK);
+        PingResponse response;
+        response.error_code = master_service_.Ping(
+            client_id, response.view_version, response.client_status);
 
         timer.LogResponseJson(response);
         return response;
@@ -511,7 +511,6 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
-    ViewVersionId view_version_;
 };
 
 inline void RegisterRpcService(

@@ -25,24 +25,33 @@ namespace mooncake {
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring) {
+    client_id_ = generate_uuid();
+}
 
 Client::~Client() {
-    // No need for mutex here since the client is being destroyed(protected by
-    // shared_ptr)
     // Make a copy of mounted_segments_ to avoid modifying while iterating
-    std::unordered_map<std::string, Segment> segments_to_unmount =
-        mounted_segments_;
+    std::vector<Segment> segments_to_unmount;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        segments_to_unmount.reserve(mounted_segments_.size());
+        for (auto& entry : mounted_segments_) {
+            segments_to_unmount.push_back(entry.second);
+        }
+    }
 
-    for (auto& entry : segments_to_unmount) {
-        auto err_code = UnmountSegment(entry.first, entry.second.buffer);
+    for (auto& segment : segments_to_unmount) {
+        auto err_code = UnmountSegment(segment.name);
         if (err_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
     }
 
     // Clear any remaining segments
-    mounted_segments_.clear();
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        mounted_segments_.clear();
+    }
 
     // Stop ping thread only after no need to contact master anymore
     if (ping_running_) {
@@ -503,11 +512,12 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        if (mounted_segments_.find(segment_name) != mounted_segments_.end()) {
-            LOG(ERROR) << "segment_already_exists segment_name="
-                       << segment_name;
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+
+    for (auto& it : mounted_segments_) {
+        auto& segment = it.second;
+        if (segment.name == segment_name) {
+            LOG(ERROR) << "segment_already_exists segment_name=" << segment_name;
             return ErrorCode::INVALID_PARAMS;
         }
     }
@@ -516,51 +526,69 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
                                                   true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed segment_name="
-                   << segment_name;
+                   << segment_name << ", error=" << rc;
         return ErrorCode::INVALID_PARAMS;
     }
 
+    Segment segment;
+    segment.name = segment_name;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.size = size;
+    segment.id = generate_uuid();
+
     ErrorCode err =
-        master_client_.MountSegment(segment_name, buffer, size).error_code;
+        master_client_.MountSegment(segment, client_id_).error_code;
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "mount_segment_to_master_failed segment_name="
+                   << segment_name << ", error=" << err;
         return err;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        mounted_segments_[segment_name] = {(void*)buffer, size};
-    }
+    mounted_segments_[segment.id] = segment;
     return ErrorCode::OK;
 }
 
-ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
-    void* segment_addr = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        auto it = mounted_segments_.find(segment_name);
-        if (it == mounted_segments_.end() || it->second.buffer != addr) {
-            LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
-            return ErrorCode::INVALID_PARAMS;
-        }
-        segment_addr = it->second.buffer;
+ErrorCode Client::UnmountSegment(const std::string& segment_name) {
+    auto segment = mounted_segments_.end();
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
-        // Remove from map first to prevent any further access to this segment
-        mounted_segments_.erase(it);
+    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
+         ++it) {
+        if (it->second.name == segment_name) {
+            segment = it;
+            break;
+        }
+    }
+    if (segment == mounted_segments_.end()) {
+        LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
+        return ErrorCode::INVALID_PARAMS;
     }
 
-    ErrorCode err = master_client_.UnmountSegment(segment_name).error_code;
+    ErrorCode err = master_client_.UnmountSegment(segment->second.id, client_id_).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);
-        return err;
+        if (err != ErrorCode::INVALID_PARAMS) {
+            return err;
+        }
+        // Otherwise, the segment is already unmounted from master, we can
+        // continue
     }
-    int rc = transfer_engine_.unregisterLocalMemory(segment_addr);
+
+    int rc = transfer_engine_.unregisterLocalMemory(
+        reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
                    << rc;
-        return ErrorCode::INVALID_PARAMS;
+        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        // Otherwise, the segment is already unregistered from transfer engine,
+        // we can continue
     }
+
+    mounted_segments_.erase(segment);
     return ErrorCode::OK;
 }
 
@@ -726,16 +754,15 @@ void Client::PingThreadFunc(int current_version) {
     auto remount_segment = [this]() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         for (auto it : mounted_segments_) {
-            auto& name = it.first;
             auto& segment = it.second;
             auto err =
-                master_client_.MountSegment(name, segment.buffer, segment.size)
+                master_client_.MountSegment(segment, client_id_)
                     .error_code;
             // If err is INVALID_PARAMS, it means the segment is already
             // mounted, or cannot be mounted with current parameters. Either
             // way, there is nothing we can do for this segment.
             if (err != ErrorCode::OK && err != ErrorCode::INVALID_PARAMS) {
-                LOG(ERROR) << "Failed to remount segment " << name << ": "
+                LOG(ERROR) << "Failed to remount segment " << segment.name << ": "
                            << toString(err);
                 return err;
             }
@@ -744,7 +771,7 @@ void Client::PingThreadFunc(int current_version) {
     };
 
     while (ping_running_) {
-        auto ping_result = master_client_.Ping();
+        auto ping_result = master_client_.Ping(client_id_);
         if (ping_result.error_code == ErrorCode::OK) {
             ping_fail_count = 0;
             if (ping_result.view_version > current_version) {
