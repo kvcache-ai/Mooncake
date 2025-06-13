@@ -5,6 +5,8 @@ import json
 import argparse
 from transfer_engine import MooncakeTransferEngine
 
+CLIENT_HOST_NAME="192.168.0.138"
+
 def format_bytes(bytes_value):
     """Convert bytes to human readable format"""
     for unit in ['B', 'KB', 'MB', 'GB']:

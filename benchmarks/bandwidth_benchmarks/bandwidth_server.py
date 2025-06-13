@@ -4,6 +4,8 @@ import time
 import json
 from transfer_engine import MooncakeTransferEngine
 
+SERVER_HOST_NAME="192.168.0.137"
+
 def main():
     # Initialize ZMQ context and socket
     context = zmq.Context()
@@ -12,7 +14,7 @@ def main():
     
     # Initialize server engine
     server_engine = MooncakeTransferEngine(
-        hostname="localhost:10010",
+        hostname=SERVER_HOST_NAME,
         gpu_id=0,  # Using GPU 0
         ib_device=None  # No specific IB device
     )
