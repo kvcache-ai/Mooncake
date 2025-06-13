@@ -14,6 +14,9 @@ set(MOONCAKE_STORE_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
+    transfer_task.cpp
+    etcd_helper.cpp
+    ha_helper.cpp
 )
 
 # The cache_allocator library

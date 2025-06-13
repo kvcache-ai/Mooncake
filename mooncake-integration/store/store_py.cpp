@@ -318,7 +318,7 @@ int DistributedObjectStore::allocateSlices(
     length = 0;
     if (object_info.replica_list.empty()) return -1;
     auto &replica = object_info.replica_list[0];
-    if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
+    if(replica.is_memory_replica() == false) {
         auto &disk_descriptor =replica.get_disk_descriptor();
         length = disk_descriptor.file_size;
         return allocateSlices(slices, length);
@@ -535,7 +535,7 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     int64_t total_size = 0;
     if (!object_info.replica_list.empty()) {
         auto &replica = object_info.replica_list[0];
-        if(std::holds_alternative<DiskDescriptor>(replica.descriptor_variant)) {
+        if(replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
         }else{
@@ -642,6 +642,7 @@ PYBIND11_MODULE(store, m) {
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
         .def("size", &SliceBuffer::size)
+        .def("__len__", &SliceBuffer::size)
         .def_buffer([](SliceBuffer &self) -> py::buffer_info {
             // SliceBuffer now always contains contiguous memory
             if (self.size() > 0) {

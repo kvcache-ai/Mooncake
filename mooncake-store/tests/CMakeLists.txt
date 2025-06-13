@@ -64,3 +64,14 @@ target_link_libraries(thread_pool_test PUBLIC
     pthread
 )
 add_test(NAME thread_pool_test COMMAND thread_pool_test)
+
+add_executable(transfer_task_test transfer_task_test.cpp)
+target_link_libraries(transfer_task_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME transfer_task_test COMMAND transfer_task_test)

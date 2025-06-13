@@ -9,6 +9,7 @@
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
 #include "ha_helper.h"
 #include "thread_pool.h"
@@ -219,7 +220,7 @@ class Client {
         std::vector<Slice>& slices);
 
     /**
-     * @brief Prepare  and use the storage backend for persisting data
+     * @brief Prepare and use the storage backend for persisting data
      */
     void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& session_id);
 
@@ -229,9 +230,21 @@ class Client {
     void PutToLocalFile(const std::string& object_key,
                              std::vector<Slice>& slices);
 
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param replica the first complete replica (file or memory)
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        Replica::Descriptor& replica);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Client local segments
     struct Segment{

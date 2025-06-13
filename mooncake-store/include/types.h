@@ -315,6 +315,15 @@ class Replica {
         ReplicaStatus status;
         YLT_REFL(Descriptor, descriptor_variant, status);
 
+        bool is_memory_replica() noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        // 判断是否为 MemoryDescriptor (const版本)
+        bool is_memory_replica() const noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
                 return *desc;

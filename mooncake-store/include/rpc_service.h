@@ -172,7 +172,7 @@ class WrappedMasterService {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
                 for(size_t i = 0; i < response.replica_list.size(); i++) {
-                    if(std::holds_alternative<MemoryDescriptor>(response.replica_list[i].descriptor_variant)) {
+                    if(response.replica_list[i].is_memory_replica()) {
                         auto & memory_descriptors = response.replica_list[i].get_memory_descriptor();
                         for(const auto& handle : memory_descriptors.buffer_descriptors) {
                             std::string tmp = "";
