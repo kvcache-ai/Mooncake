@@ -44,7 +44,7 @@ class TestInstance:
             if random.randint(0, 100) < 98:
                 index = index + 1
             if index % 500 == 0:
-                print("completed", index, "entries");
+                print("completed", index, "entries")
         time.sleep(20) # wait for decode
     
     def decode(cls):
@@ -60,7 +60,7 @@ class TestInstance:
                     print("WARNING: get data corrupted, key", key)
             index = index + 1
             if index % 500 == 0:
-                print("completed", index, "entries");
+                print("completed", index, "entries")
         time.sleep(20) # wait for decode
 
 

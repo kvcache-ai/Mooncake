@@ -89,6 +89,10 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     }
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+    session_id_ = std::to_string(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
     VLOG(1) << "action=start_gc_thread";
 }
 
@@ -551,6 +555,16 @@ size_t MasterService::GetKeyCount() const {
     }
     return total;
 }
+
+ErrorCode MasterService::GetSessionId(std::string& session_id) const{
+    if (session_id_.empty()) {
+        LOG(ERROR) << "Session ID is not initialized";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    session_id = session_id_;
+    return ErrorCode::OK;
+}
+
 
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";

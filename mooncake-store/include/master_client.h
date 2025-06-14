@@ -149,6 +149,12 @@ class MasterClient {
         const std::string& segment_name);
 
     /**
+     * @brief Gets the session ID for the current client
+     * @return GetSessionIdResponse containing the session ID
+     */    
+    [[nodiscard]] GetSessionIdResponse GetSessionId();
+
+    /**
      * @brief Pings master to check its availability
      * @param No parameters
      * @return current master view version

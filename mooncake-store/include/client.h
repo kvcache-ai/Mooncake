@@ -12,6 +12,8 @@
 #include "transfer_task.h"
 #include "types.h"
 #include "ha_helper.h"
+#include "thread_pool.h"
+#include "file_storage_backend.h"
 
 namespace mooncake {
 
@@ -94,9 +96,9 @@ class Client {
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode Get(const std::string& object_key, const ObjectInfo& object_info,
+    ErrorCode Get(const std::string& object_key, ObjectInfo& object_info,
                   std::vector<Slice>& slices);
-
+                             
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -196,7 +198,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::string& storage_root_dir);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -217,16 +220,26 @@ class Client {
         std::vector<Slice>& slices);
 
     /**
+     * @brief Prepare and use the storage backend for persisting data
+     */
+    void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& session_id);
+
+    ErrorCode GetFromLocalFile(const std::string& object_key,
+                             std::vector<Slice>& slices, ObjectInfo& object_info);
+                             
+    void PutToLocalFile(const std::string& object_key,
+                             std::vector<Slice>& slices);
+
+    /**
      * @brief Find the first complete replica from a replica list
      * @param replica_list List of replicas to search through
-     * @param handles Output vector to store the buffer handles of the found
-     * replica
+     * @param replica the first complete replica (file or memory)
      * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
      * replica
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<AllocatedBuffer::Descriptor>& handles);
+        Replica::Descriptor& replica);
 
     // Core components
     TransferEngine transfer_engine_;
@@ -245,6 +258,11 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+    const std::string storage_root_dir_; 
+
+    // Client persistent thread pool for async operations
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
     MasterViewHelper master_view_helper_;
