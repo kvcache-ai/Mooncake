@@ -10,7 +10,7 @@ if (BUILD_UNIT_TESTS)
   enable_testing()
 endif()
 
-option(WITH_STORE "build mooncake store library and sample code" ON)
+option(WITH_STORE "build mooncake store library and sample code" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 
