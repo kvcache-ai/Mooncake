@@ -9,22 +9,12 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
-        arch: ['x86_64', 'arm64']
-        include:
-          - arch: x86_64
-            runs-on: ubuntu-22.04
-            cuda-support: true
-            arch-suffix: x86_64
-          - arch: arm64
-            runs-on: ubuntu-22.04-arm
-            cuda-support: false
-            arch-suffix: arm64
-    runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -40,8 +30,7 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
 
-      - name: Install CUDA Toolkit (x86_64)
-        if: matrix.cuda-support
+      - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
           cuda: '12.8.1'
@@ -52,20 +41,15 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Configure project
+      - name: Install system dependencies and configure project
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
         shell: bash
 
       - name: Build project
@@ -75,33 +59,34 @@ jobs:
         shell: bash
 
       - name: Build hook.so
-        if: matrix.cuda-support
         run: |
-          mkdir -p build/mooncake-transfer-engine/nvlink-hook
           cd mooncake-transfer-engine/nvlink-hook
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
         shell: bash
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release
         run: |
           echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-          echo "arch_tag=${{ matrix.arch-suffix }}" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Build Python wheel
         run: |
           # Set LD_LIBRARY_PATH for wheel building
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}-${{ steps.generate_tag_release.outputs.arch_tag }} ./scripts/build_wheel.sh
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}-${{ steps.generate_tag_release.outputs.arch_tag }}
-          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}-${{ steps.generate_tag_release.outputs.arch_tag }}/*.whl
+          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
     needs: build
