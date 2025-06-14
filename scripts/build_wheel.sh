@@ -65,8 +65,8 @@ elif [ "$ARCH" = "x86_64" ]; then
     PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
     echo "Building for x86_64 architecture"
 else
-    echo "Warning: Unknown architecture $ARCH, using default platform tag"
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_$(uname -m)"}
+    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+    exit 1
 fi
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
