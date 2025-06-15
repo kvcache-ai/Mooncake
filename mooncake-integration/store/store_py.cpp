@@ -219,6 +219,21 @@ int DistributedObjectStore::initAll(const std::string &protocol_,
 }
 
 int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
+                                           size_t length) {
+    uint64_t offset = 0;
+    while (offset < length) {
+        auto chunk_size = std::min(length - offset, kMaxSliceSize);
+        auto ptr = client_buffer_allocator_->allocate(chunk_size);
+        if (!ptr) {
+            return 1;  // SliceGuard will handle cleanup
+        }
+        slices.emplace_back(Slice{ptr, chunk_size});
+        offset += chunk_size;
+    }
+    return 0;
+}
+
+int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices,
                                            const std::string &value) {
     uint64_t offset = 0;
     while (offset < value.size()) {
@@ -299,18 +314,26 @@ int DistributedObjectStore::allocateSlicesPacked(
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
+
     length = 0;
     if (object_info.replica_list.empty()) return -1;
     auto &replica = object_info.replica_list[0];
-    for (auto &handle : replica.buffer_descriptors) {
-        auto chunk_size = handle.size_;
-        assert(chunk_size <= kMaxSliceSize);
-        auto ptr = client_buffer_allocator_->allocate(chunk_size);
-        if (!ptr) {
-            return 1;  // SliceGuard will handle cleanup
+    if(replica.is_memory_replica() == false) {
+        auto &disk_descriptor =replica.get_disk_descriptor();
+        length = disk_descriptor.file_size;
+        return allocateSlices(slices, length);
+    }else{
+        auto &memory_descriptors = replica.get_memory_descriptor();
+        for (auto &handle : memory_descriptors.buffer_descriptors) {
+            auto chunk_size = handle.size_;
+            assert(chunk_size <= kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;  // SliceGuard will handle cleanup
+            }
+            slices.emplace_back(Slice{ptr, chunk_size});
+            length += chunk_size;
         }
-        slices.emplace_back(Slice{ptr, chunk_size});
-        length += chunk_size;
     }
     return 0;
 }
@@ -512,8 +535,14 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     int64_t total_size = 0;
     if (!object_info.replica_list.empty()) {
         auto &replica = object_info.replica_list[0];
-        for (auto &handle : replica.buffer_descriptors) {
-            total_size += handle.size_;
+        if(replica.is_memory_replica() == false) {
+            auto &disk_descriptor = replica.get_disk_descriptor();
+            total_size = disk_descriptor.file_size;
+        }else{
+            auto &memory_descriptors = replica.get_memory_descriptor();
+            for (auto &handle : memory_descriptors.buffer_descriptors) {
+                total_size += handle.size_;
+            }
         }
     } else {
         LOG(ERROR) << "Internal error: object_info.replica_list_size() is 0";

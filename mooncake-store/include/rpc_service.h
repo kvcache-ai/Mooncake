@@ -85,6 +85,12 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct GetSessionIdResponse {
+    std::string session_id;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(GetSessionIdResponse, error_code, session_id)
+
 struct PingResponse {
     ViewVersionId view_version = 0;
     ErrorCode error_code = ErrorCode::OK;
@@ -165,13 +171,15 @@ class WrappedMasterService {
                 response = GetReplicaList(std::string(key));
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                for (size_t i = 0; i < response.replica_list.size(); i++) {
-                    for (const auto& handle :
-                         response.replica_list[i].buffer_descriptors) {
-                        std::string tmp = "";
-                        struct_json::to_json(handle, tmp);
-                        ss += tmp;
-                        ss += "\n";
+                for(size_t i = 0; i < response.replica_list.size(); i++) {
+                    if(response.replica_list[i].is_memory_replica()) {
+                        auto & memory_descriptors = response.replica_list[i].get_memory_descriptor();
+                        for(const auto& handle : memory_descriptors.buffer_descriptors) {
+                            std::string tmp = "";
+                            struct_json::to_json(handle, tmp);
+                            ss += tmp;
+                            ss += "\n";
+                        }
                     }
                 }
                 resp.set_status_and_content(status_type::ok, ss);
@@ -494,6 +502,19 @@ class WrappedMasterService {
         return response;
     }
 
+    GetSessionIdResponse GetSessionId() {
+        ScopedVLogTimer timer(1, "GetSessionId");
+        timer.LogRequest("action=get_session_id");
+
+        GetSessionIdResponse response;
+        std::string session_id;
+        response.error_code = master_service_.GetSessionId(session_id);
+        response.session_id = std::move(session_id);
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
     PingResponse Ping() {
         ScopedVLogTimer timer(1, "Ping");
         timer.LogRequest("action=ping");
@@ -545,6 +566,8 @@ inline void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetSessionId>(
         &wrapped_master_service);
 }
 
