@@ -357,7 +357,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     const std::vector<Slice>& slices) const {
-    // Check conditions for local memcpy optimization
+    // Check conditions for local memcpy optimization (currently disabled as
+    // RDMA is faster)
+    // TODO: add a config to disable this optimization
     if (isLocalTransfer(handles)) {
         return TransferStrategy::LOCAL_MEMCPY;
     }
