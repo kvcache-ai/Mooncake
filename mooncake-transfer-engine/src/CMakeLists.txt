@@ -48,3 +48,5 @@ if (USE_CUDA)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
 endif()
+
+add_subdirectory(v1)
