@@ -18,7 +18,7 @@
 #include "eviction_strategy.h"
 #include "allocator.h"
 #include "types.h"
-#include "Segment.h"
+#include "segment.h"
 
 
 namespace mooncake {

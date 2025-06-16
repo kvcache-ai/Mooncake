@@ -63,9 +63,9 @@ class ScopedSegmentAccess {
 
     ErrorCode ReMountSegment(const std::vector<Segment>& segments, const UUID& client_id);
 
-    ErrorCode PrepareUnmountSegment(const UUID& segment_id, const UUID& client_id, size_t& metrics_dec_capacity);
+    ErrorCode PrepareUnmountSegment(const UUID& segment_id, size_t& metrics_dec_capacity);
 
-    ErrorCode CommitUnmountSegment(const UUID& segment_id, const size_t& metrics_dec_capacity);
+    ErrorCode CommitUnmountSegment(const UUID& segment_id, const UUID& client_id, const size_t& metrics_dec_capacity);
 
     ErrorCode GetClientSegments(const UUID& client_id, std::vector<UUID>& segments) const;
 

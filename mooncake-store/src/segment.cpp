@@ -1,4 +1,4 @@
-#include "Segment.h"
+#include "segment.h"
 
 #include "master_metric_manager.h"
 
@@ -81,7 +81,7 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(const std::vector<Segment>& segmen
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, const UUID& client_id, size_t& metrics_dec_capacity) {
+ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, size_t& metrics_dec_capacity) {
     auto it = segment_manager_->mounted_segments_.find(segment_id);
     if (it == segment_manager_->mounted_segments_.end()) {
         // Return OK because this is an idempotent operation
@@ -99,10 +99,10 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, con
     auto& segment = mounted_segment.segment;
     metrics_dec_capacity = segment.size;
 
-    // 1. Remove the allocator
+    // Remove the allocator from the segment manager
     std::shared_ptr<BufferAllocator> allocator = mounted_segment.buf_allocator;
     
-    // 1.1 Remove from allocators
+    // Remove from allocators
     auto alloc_it = std::find(segment_manager_->allocators_.begin(), segment_manager_->allocators_.end(), allocator);
     if (alloc_it != segment_manager_->allocators_.end()) {
         segment_manager_->allocators_.erase(alloc_it);
@@ -111,7 +111,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, con
                     << ", error=alloctor_not_found_in_ok_allocators";
     }
 
-    // 1.2 Remove from allocators_by_name
+    // Remove from allocators_by_name
     bool found_in_allocators_by_name = false;
     auto name_it = segment_manager_->allocators_by_name_.find(segment.name);
     if (name_it != segment_manager_->allocators_by_name_.end()) {
@@ -130,13 +130,17 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, con
                     << ", error=alloctor_not_found_in_ok_allocators_by_name";
     }
 
-    // 1.3 Remove from mounted_segment
+    // Remove from mounted_segment
     mounted_segment.buf_allocator.reset();
 
-    // 1.4 Set the segment status to UNMOUNTING
+    // Set the segment status to UNMOUNTING
     mounted_segment.status = SegmentStatus::UNMOUNTING;
 
-    // 1.5 Remove from client_segments_
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::CommitUnmountSegment(const UUID& segment_id, const UUID& client_id, const size_t& metrics_dec_capacity) {
+    // Remove from client_segments_
     bool found_in_client_segments = false;
     auto client_it = segment_manager_->client_segments_.find(client_id);
     if (client_it != segment_manager_->client_segments_.end()) {
@@ -148,16 +152,14 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(const UUID& segment_id, con
         }
     }
     if (!found_in_client_segments) {
-        LOG(ERROR) << "segment_name=" << segment.name
+        LOG(ERROR) << "segment_id=" << segment_id
                     << ", error=segment_not_found_in_client_segments";
     }
 
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentAccess::CommitUnmountSegment(const UUID& segment_id, const size_t& metrics_dec_capacity) {
-    // 3. Remove segment
+    // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
+
+    // Decrease the total capacity
     MasterMetricManager::instance().dec_total_capacity(metrics_dec_capacity);
 
     return ErrorCode::OK;

@@ -101,6 +101,24 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
         return ErrorCode::OK;
     }
 
+    // Tell the client monitor thread to start timing for this client. To avoid
+    // the following undesired situations, this message must be sent after locking
+    // the segment mutex and before the remounting operation completes:
+    // 1. Sending the message before the lock: the client expires and unmouting
+    // invokes before this remounting are completed, which prevent this segment
+    // being able to be unmounted forever;
+    // 2. Sending the message after remounting the segment: After remounting this
+    // segment, when trying to push id to the queue, the queue is already full,
+    // which may block this request forever.
+    PodUUID pod_client_id;
+    pod_client_id.first = client_id.first;
+    pod_client_id.second = client_id.second;
+    if (!client_ping_queue_.push(pod_client_id)) {
+        LOG(ERROR) << "client_id=" << client_id
+                << ", error=client_ping_queue_full";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     ErrorCode err = segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
@@ -142,7 +160,7 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& clie
     // 1. Prepare to unmount the segment
     {
         ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(segment_id, client_id, metrics_dec_capacity);
+        ErrorCode err = segment_access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
         if (err != ErrorCode::OK) {
             return err;
         }
@@ -153,7 +171,7 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& clie
 
     // 3. Commit the unmount operation
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.CommitUnmountSegment(segment_id, metrics_dec_capacity);
+    return segment_access.CommitUnmountSegment(segment_id, client_id, metrics_dec_capacity);
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -710,10 +728,10 @@ void MasterService::BatchEvict(double eviction_ratio) {
 void MasterService::ClientMonitorFunc() {
     std::unordered_map<UUID, std::chrono::steady_clock::time_point, boost::hash<UUID>> client_ttl;
     while (client_monitor_running_) {
-        PodUUID pod_client_id;
         auto now = std::chrono::steady_clock::now();
 
         // Update the client ttl
+        PodUUID pod_client_id;
         while (client_ping_queue_.pop(pod_client_id)) {
             UUID client_id = {pod_client_id.first, pod_client_id.second};
             auto it = client_ttl.find(client_id);
@@ -735,49 +753,43 @@ void MasterService::ClientMonitorFunc() {
             }
         }
 
-        std::vector<UUID> need_remount_clients;
+        // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
-            std::unique_lock<std::shared_mutex> lock(client_mutex_);
-            for (auto& client_id : expired_clients) {
-                auto it = ok_client_.find(client_id);
-                if (it != ok_client_.end()) {
-                    ok_client_.erase(it);
-                    need_remount_clients.push_back(client_id);
+            // Record which segments are unmounted for the commit phase
+            std::vector<UUID> unmount_segments;
+            std::vector<size_t> dec_capacities;           
+            std::vector<UUID> client_ids;
+            {
+                // Lock client_mutex and segment_mutex
+                std::unique_lock<std::shared_mutex> lock(client_mutex_);
+                for (auto& client_id : expired_clients) {
+                    auto it = ok_client_.find(client_id);
+                    if (it != ok_client_.end()) {
+                        ok_client_.erase(it);
+                    }
                 }
-            }
-            
-            // For soundness, one of the following conditions must be hold:
-            // 1. Changing the client status to NEED_REMOUNT and their segment
-            // status to UNMOUNTING in an atomic way.
-            // 2. Changing the segment status to UNMOUNTING first, then the client
-            // status to NEED_REMOUNT
-            // So we must hold the client_mutex_ here
-            if (!need_remount_clients.empty()) {               
-                std::vector<size_t> metrics_dec_capacity_vec;
-                std::vector<UUID> unmount_segments;
-                {
-                    std::unique_lock<std::shared_mutex> lock(client_mutex_);
-                    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-                    for (auto& client_id : need_remount_clients) {
-                        std::vector<UUID> segments;
-                        segment_access.GetClientSegments(client_id, segments);
-                        for (auto& segment_id : segments) {
-                            size_t metrics_dec_capacity = 0;
-                            if (segment_access.PrepareUnmountSegment(segment_id, client_id, metrics_dec_capacity) == ErrorCode::OK) {
-                                unmount_segments.push_back(segment_id);
-                                metrics_dec_capacity_vec.push_back(metrics_dec_capacity);
-                            }
+       
+                ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();                  
+                for (auto& client_id : expired_clients) {
+                    std::vector<UUID> segments;
+                    segment_access.GetClientSegments(client_id, segments);
+                    for (auto& segment_id : segments) {
+                        size_t metrics_dec_capacity = 0;
+                        if (segment_access.PrepareUnmountSegment(segment_id, metrics_dec_capacity) == ErrorCode::OK) {
+                            unmount_segments.push_back(segment_id);
+                            dec_capacities.push_back(metrics_dec_capacity);
+                            client_ids.push_back(client_id);
                         }
                     }
-                }// Release the mutex before long-running step 2 and avoid deadlocks
+                }
+            } // Release the mutex before long-running step 2 and avoid deadlocks
 
+            if (!unmount_segments.empty()) {
                 ClearInvalidHandles();
 
-                if (!unmount_segments.empty()) {
-                    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-                    for (size_t i = 0; i < unmount_segments.size(); i++) {
-                        segment_access.CommitUnmountSegment(unmount_segments[i], metrics_dec_capacity_vec[i]);
-                    }
+                ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+                for (size_t i = 0; i < unmount_segments.size(); i++) {
+                    segment_access.CommitUnmountSegment(unmount_segments[i], client_ids[i], dec_capacities[i]);
                 }
             }
         }
