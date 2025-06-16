@@ -147,7 +147,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                     retrieved_data = self.store.get(key)
                     if len(retrieved_data) != 0:
                         expected_value = references[key]
-                        self.assertEqual(retrieved_data, expected_value)
+                        self.assertEqual(retrieved_data, expected_value, "Data mismatch for key:" + key)
                     index = index + 1
                     if index % 500 == 0:
                         print("get", "completed", index, "entries")
@@ -156,7 +156,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
-                print("Exception in thread")
+                print("Exception in thread:", str(e))
         
         
         
