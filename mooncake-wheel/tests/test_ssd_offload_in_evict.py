@@ -116,6 +116,14 @@ class TestDistributedObjectStore(unittest.TestCase):
         OPERATIONS_PER_THREAD = 1000
 
         thread_exceptions = []
+        references = {}
+        index = 0
+        while index < OPERATIONS_PER_THREAD:
+            key = "k_" + str(index)
+            value = os.urandom(VALUE_SIZE)
+            references[key] = value
+            index = index + 1
+        
         def worker(thread_id):
             try:
                 print(f"Thread {thread_id} started") 
@@ -125,7 +133,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = "k_" + str(index)
-                    test_data = bytes([index % 256] * VALUE_SIZE)
+                    test_data = references[key]
                     result = self.store.put(key, test_data)
                     index = index + 1
                     if index % 500 == 0:
@@ -138,7 +146,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                     key = "k_" + str(index)
                     retrieved_data = self.store.get(key)
                     if len(retrieved_data) != 0:
-                        expected_value = bytes([index % 256] * VALUE_SIZE)  
+                        expected_value = references[key]
                         self.assertEqual(retrieved_data, expected_value)
                     index = index + 1
                     if index % 500 == 0:
