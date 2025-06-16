@@ -1,5 +1,4 @@
 #include "distributed_object_store.h"
-#include <cstdlib>
 
 using namespace mooncake;
 
@@ -129,7 +128,6 @@ int DistributedObjectStore::put(const std::string &key,
     ErrorCode error_code = client_->Put(std::string(key), slices, config);
     freeSlices(slices);
     if (error_code != ErrorCode::OK) return 1;
-      
     return 0;
 }
 
@@ -140,7 +138,6 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     const auto kNullString = pybind11::bytes("\0", 0);
     ErrorCode error_code = client_->Query(key, object_info);
     if (error_code != ErrorCode::OK) return kNullString;
-    
     uint64_t str_length = 0;
     int ret = allocateSlices(slices, object_info, str_length);
     if (ret) return kNullString;
