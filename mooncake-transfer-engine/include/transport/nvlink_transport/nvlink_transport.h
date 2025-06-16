@@ -12,6 +12,7 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -20,6 +21,15 @@
 namespace mooncake {
 
 class TransferMetadata;
+
+struct PairHash {
+    template <typename T1, typename T2>
+    std::size_t operator()(const std::pair<T1, T2>& p) const {
+        std::size_t h1 = std::hash<T1>{}(p.first);
+        std::size_t h2 = std::hash<T2>{}(p.second);
+        return h1 ^ (h2 << 1);
+    }
+};
 
 class NvlinkTransport : public Transport {
    public:
@@ -71,7 +81,7 @@ class NvlinkTransport : public Transport {
         uint64_t length;
     };
 
-    std::unordered_map<uint64_t, OpenedShmEntry> remap_entries_;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash> remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
 

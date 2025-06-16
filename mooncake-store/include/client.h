@@ -10,6 +10,7 @@
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
 #include "ha_helper.h"
 
@@ -215,9 +216,22 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param handles Output vector to store the buffer handles of the found
+     * replica
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        std::vector<AllocatedBuffer::Descriptor>& handles);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;

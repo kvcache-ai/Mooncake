@@ -112,7 +112,8 @@ class WrappedMasterService {
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
                           eviction_high_watermark_ratio, view_version, enable_ha),
           http_server_(4, http_port),
-          metric_report_running_(enable_metric_reporting) {
+          metric_report_running_(enable_metric_reporting),
+          view_version_(view_version) {
         // Initialize HTTP server for metrics
         init_http_server();
 
@@ -533,6 +534,7 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    ViewVersionId view_version_;
 };
 
 inline void RegisterRpcService(

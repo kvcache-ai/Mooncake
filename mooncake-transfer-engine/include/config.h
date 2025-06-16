@@ -45,6 +45,7 @@ struct GlobalConfig {
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    bool use_ipv6 = false;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

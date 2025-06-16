@@ -5,11 +5,10 @@
 #include <iostream>
 
 extern "C" {
-void *my_malloc(ssize_t size, int device, cudaStream_t stream) {
+void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
-    CUmemAccessDesc accessDesc = {};
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
     int cudaDev;
@@ -58,10 +57,15 @@ void *my_malloc(ssize_t size, int device, cudaStream_t stream) {
         cuMemRelease(handle);
         return nullptr;
     }
-    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    accessDesc.location.id = currentDev;
-    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, &accessDesc, 1);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    CUmemAccessDesc accessDesc[device_count];
+    for (int idx = 0; idx < device_count; ++idx) {
+        accessDesc[idx].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        accessDesc[idx].location.id = idx;
+        accessDesc[idx].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc, device_count);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemSetAccess failed: " << result;
         cuMemUnmap((CUdeviceptr)ptr, size);
@@ -72,7 +76,7 @@ void *my_malloc(ssize_t size, int device, cudaStream_t stream) {
     return ptr;
 }
 
-void my_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
+void mc_nvlink_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     if (!ptr) return;

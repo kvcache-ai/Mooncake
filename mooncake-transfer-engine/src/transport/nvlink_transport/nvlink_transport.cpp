@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "transport/nvlink_transport/nvlink_transport.h"
-#include "config.h"
 
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
@@ -28,6 +27,7 @@
 #include <memory>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -122,13 +122,17 @@ Status NvlinkTransport::submitTransfer(
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
         __sync_fetch_and_add(&task.slice_count, 1);
+        cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                       slice->length, cudaMemcpyDefault);
+            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+                             slice->length, cudaMemcpyDefault);
         else
-            cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                       slice->length, cudaMemcpyDefault);
-        slice->markSuccess();
+            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+                             slice->length, cudaMemcpyDefault);
+        if (err != cudaSuccess)
+            slice->markFailed();
+        else
+            slice->markSuccess();
     }
 
     return Status::OK();
@@ -183,13 +187,17 @@ Status NvlinkTransport::submitTransferTask(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
+        cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                       slice->length, cudaMemcpyDefault);
+            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+                             slice->length, cudaMemcpyDefault);
         else
-            cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                       slice->length, cudaMemcpyDefault);
-        slice->markSuccess();
+            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+                             slice->length, cudaMemcpyDefault);
+        if (err != cudaSuccess)
+            slice->markFailed();
+        else
+            slice->markSuccess();
     }
     return Status::OK();
 }
@@ -275,10 +283,23 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
         if (result != CUDA_SUCCESS) {
-            LOG(WARNING)
-                << "Memory region " << addr << " is not allocated by cuMemCreate, " 
-                << "but it can be used as local buffer";
+            LOG(WARNING) << "Memory region " << addr
+                         << " is not allocated by cuMemCreate, "
+                         << "but it can be used as local buffer";
             return 0;
+        }
+
+        // Find whole physical page for memory registration
+        void *real_addr;
+        size_t real_size;
+        result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
+                                      (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed: "
+                         << result;
+            const uint64_t granularity = 2 * 1024 * 1024;
+            real_addr = addr;
+            real_size = (length + granularity - 1) & ~(granularity - 1);
         }
 
         CUmemFabricHandle export_handle;
@@ -293,11 +314,10 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
+        desc.length = real_size;          // length;
         desc.name = location;
-        desc.shm_name =
-            serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+        desc.shm_name = serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -315,15 +335,15 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             remap_lock_.lockShared();
-            if (remap_entries_.count(entry.addr)) {
-                auto shm_addr = remap_entries_[entry.addr].shm_addr;
+            if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
+                auto shm_addr = remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
                 remap_lock_.unlockShared();
                 dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
             }
             remap_lock_.unlockShared();
             RWSpinlock::WriteGuard lock_guard(remap_lock_);
-            if (!remap_entries_.count(entry.addr)) {
+            if (!remap_entries_.count(std::make_pair(target_id, entry.addr))) {
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
                 if (output_buffer.size() == sizeof(cudaIpcMemHandle_t) &&
@@ -342,7 +362,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
-                    remap_entries_[entry.addr] = shm_entry;
+                    remap_entries_[std::make_pair(target_id, entry.addr)] = shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
                            use_fabric_mem_) {
                     CUmemFabricHandle export_handle;
@@ -373,13 +393,17 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                             << "NvlinkTransport: cuMemMap failed: " << result;
                         return -1;
                     }
-
-                    CUmemAccessDesc accessDesc = {};
-                    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                    accessDesc.location.id = 0;
+                    
+                    int device_count;
+                    cudaGetDeviceCount(&device_count);
+                    CUmemAccessDesc accessDesc[device_count];
+                    for (int device_id = 0; device_id < device_count; ++device_id) {
+                        accessDesc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                        accessDesc[device_id].location.id = device_id;
+                        accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                    }
                     result = cuMemSetAccess((CUdeviceptr)shm_addr, entry.length,
-                                            &accessDesc, 1);
+                                            accessDesc, device_count);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
@@ -388,18 +412,20 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
-                    remap_entries_[entry.addr] = shm_entry;
+                    remap_entries_[std::make_pair(target_id, entry.addr)] = shm_entry;
                 } else {
                     LOG(ERROR) << "Mismatched NVLink data transfer method";
                     return -1;
                 }
             }
-            auto shm_addr = remap_entries_[entry.addr].shm_addr;
+            auto shm_addr = remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
             return 0;
         }
         index++;
     }
+    LOG(ERROR) << "Requested address " << (void *)dest_addr << " to "
+               << (void *)(dest_addr + length) << " not found!";
     return ERR_INVALID_ARGUMENT;
 }
 
@@ -426,7 +452,6 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
-    CUmemAccessDesc accessDesc = {};
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
     int cudaDev;
@@ -483,10 +508,15 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         cuMemRelease(handle);
         return nullptr;
     }
-    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    accessDesc.location.id = currentDev;
-    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, &accessDesc, 1);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    CUmemAccessDesc accessDesc[device_count];
+    for (int idx = 0; idx < device_count; ++idx) {
+        accessDesc[idx].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        accessDesc[idx].location.id = idx;
+        accessDesc[idx].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc, device_count);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: " << result;
         cuMemUnmap((CUdeviceptr)ptr, size);

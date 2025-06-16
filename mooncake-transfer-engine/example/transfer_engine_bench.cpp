@@ -33,6 +33,7 @@
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #ifdef USE_NVMEOF
 #include <cufile.h>
@@ -54,7 +55,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #endif
 
 #ifdef USE_CUDA
-const static int NR_SOCKETS = 1;
+const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
@@ -99,8 +100,12 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
+#ifdef USE_NVLINK
+        d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+#else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
+#endif
         return d_buf;
     }
 #endif
@@ -109,6 +114,14 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #ifdef USE_CUDA
+#ifdef USE_NVLINK
+    CUmemGenericAllocationHandle handle;
+    auto result = cuMemRetainAllocationHandle(&handle, addr);
+    if (result == CUDA_SUCCESS) {
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+        return;
+    }
+#endif
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -296,15 +309,9 @@ int initiator() {
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
-#ifdef USE_NVLINK
-        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
-            FLAGS_buffer_size);
-#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
@@ -351,11 +358,7 @@ int initiator() {
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
-#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
-#endif
     }
 
     return 0;
@@ -399,15 +402,9 @@ int target() {
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
-#ifdef USE_NVLINK
-        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
-            FLAGS_buffer_size);
-#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
