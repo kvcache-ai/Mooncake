@@ -41,32 +41,39 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install system dependencies and configure project
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_NVLINK=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project
         run: |
           cd build
-          sudo make install -j
+          make -j
+          sudo make install
         shell: bash
 
       - name: Build hook.so
         run: |
+          mkdir -p build/mooncake-transfer-engine/nvlink-hook
           cd mooncake-transfer-engine/nvlink-hook
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
         shell: bash
-
-      - name: Run sccache stat for check
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release

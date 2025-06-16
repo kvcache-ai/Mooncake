@@ -9,6 +9,7 @@
 
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "transport/transport.h"
 #include "types.h"
 
@@ -31,11 +32,11 @@ Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
     // shared_ptr)
     // Make a copy of mounted_segments_ to avoid modifying while iterating
-    std::unordered_map<std::string, void*> segments_to_unmount =
+    std::unordered_map<std::string, Segment> segments_to_unmount =
         mounted_segments_;
 
     for (auto& entry : segments_to_unmount) {
-        auto err_code = UnmountSegment(entry.first, entry.second);
+        auto err_code = UnmountSegment(entry.first, entry.second.buffer);
         if (err_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
@@ -43,10 +44,14 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
-}
 
-ErrorCode Client::ConnectToMaster(const std::string& master_addr) {
-    return master_client_.Connect(master_addr);
+    // Stop ping thread only after no need to contact master anymore
+    if (ping_running_) {
+        ping_running_ = false;
+        if (ping_thread_.joinable()) {
+            ping_thread_.join();
+        }
+    }
 }
 
 static bool get_auto_discover() {
@@ -105,6 +110,42 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     return whitelst_filters;
 }
 
+ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
+    if (master_server_entry.find("etcd://") == 0) {
+        std::string etcd_entry = master_server_entry.substr(strlen("etcd://"));
+
+        // Get master address from etcd
+        auto err = master_view_helper_.ConnectToEtcd(etcd_entry);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd";
+            return err;
+        }
+        std::string master_address;
+        ViewVersionId master_version = 0;
+        err = master_view_helper_.GetMasterView(master_address, master_version);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get master address";
+            return err;
+        }
+
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master";
+            return err;
+        }
+
+        // Start Ping thread to monitor master view changes and remount segments
+        // if needed
+        ping_running_ = true;
+        ping_thread_ =
+            std::thread(&Client::PingThreadFunc, this, master_version);
+
+        return ErrorCode::OK;
+    } else {
+        return master_client_.Connect(master_server_entry);
+    }
+}
+
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
                                      const std::string& metadata_connstring,
                                      const std::string& protocol,
@@ -139,24 +180,24 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     }
     CHECK(transport) << "Failed to install transport";
 
+    // Initialize TransferSubmitter after transfer engine is ready
+    transfer_submitter_ =
+        std::make_unique<TransferSubmitter>(transfer_engine_, local_hostname);
+
     return ErrorCode::OK;
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
-    const std::string& master_addr) {
+    const std::string& master_server_entry) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
-    // Connect to master service
-    ErrorCode err = client->ConnectToMaster(master_addr);
+    ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to Master";
         return std::nullopt;
     }
-
-    LOG(INFO) << "Connect to Master success";
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
@@ -234,51 +275,34 @@ ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
 ErrorCode Client::Get(const std::string& object_key,
                       const ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
-    // Get the first complete replica
-    for (size_t i = 0; i < object_info.replica_list.size(); ++i) {
-        if (object_info.replica_list[i].status == ReplicaStatus::COMPLETE) {
-            const auto& replica = object_info.replica_list[i];
-
-            std::vector<AllocatedBuffer::Descriptor> handles;
-            for (const auto& handle : replica.buffer_descriptors) {
-                VLOG(1) << "handle: segment_name=" << handle.segment_name_
-                        << " buffer=" << handle.buffer_address_
-                        << " size=" << handle.size_;
-                if (handle.status_ != BufStatus::COMPLETE) {
-                    LOG(ERROR) << "incomplete_handle_found segment_name="
-                               << handle.segment_name_;
-                    return ErrorCode::INVALID_PARAMS;
-                }
-                handles.push_back(handle);
-            }
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine to improve performance and save bandwidth
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy(slices[0].ptr, (char*)handles[0].buffer_address_,
-                       handles[0].size_);
-                return ErrorCode::OK;
-            }
-
-            if (TransferRead(handles, slices) != ErrorCode::OK) {
-                LOG(ERROR) << "transfer_read_failed key=" << object_key;
-                return ErrorCode::INVALID_PARAMS;
-            }
-            return ErrorCode::OK;
+    // Find the first complete replica
+    std::vector<AllocatedBuffer::Descriptor> handles;
+    ErrorCode err = FindFirstCompleteReplica(object_info.replica_list, handles);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::INVALID_REPLICA) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
+        return err;
     }
 
-    LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
-    return ErrorCode::INVALID_REPLICA;
+    if (TransferRead(handles, slices) != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode Client::BatchGet(
     const std::vector<std::string>& object_keys,
     BatchObjectInfo& batched_object_info,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
+    // Collect all transfer operations for parallel execution
+    std::vector<std::pair<std::string, TransferFuture>> pending_transfers;
+    pending_transfers.reserve(object_keys.size());
+
+    // Submit all transfers in parallel
     for (const auto& key : object_keys) {
         auto object_info_it = batched_object_info.batch_replica_list.find(key);
         auto slices_it = slices.find(key);
@@ -289,15 +313,48 @@ ErrorCode Client::BatchGet(
             return ErrorCode::INVALID_PARAMS;
         }
 
-        ObjectInfo object_info;
-        object_info.replica_list = object_info_it->second;
-        object_info.error_code = ErrorCode::OK;
-        if (Get(key, object_info, slices_it->second) != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get key: " << key;
+        // Find the first complete replica for this key
+        const auto& replica_list = object_info_it->second;
+        std::vector<AllocatedBuffer::Descriptor> handles;
+        ErrorCode err = FindFirstCompleteReplica(replica_list, handles);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            }
             slices.clear();
-            return ErrorCode::INVALID_PARAMS;
+            return err;
         }
+
+        // Submit transfer operation asynchronously
+        auto future = transfer_submitter_->submit(handles, slices_it->second,
+                                                  TransferRequest::READ);
+        if (!future) {
+            LOG(ERROR) << "Failed to submit transfer operation for key: "
+                       << key;
+            slices.clear();
+            return ErrorCode::TRANSFER_FAIL;
+        }
+
+        VLOG(1) << "Submitted transfer for key " << key
+                << " using strategy: " << static_cast<int>(future->strategy());
+
+        pending_transfers.emplace_back(key, std::move(*future));
     }
+
+    // Wait for all transfers to complete
+    for (auto& [key, future] : pending_transfers) {
+        ErrorCode result = future.get();
+        if (result != ErrorCode::OK) {
+            LOG(ERROR) << "Transfer failed for key: " << key
+                       << " with error: " << static_cast<int>(result);
+            slices.clear();
+            return result;
+        }
+        VLOG(1) << "Transfer completed successfully for key: " << key;
+    }
+
+    VLOG(1) << "BatchGet completed successfully for " << object_keys.size()
+            << " keys";
     return ErrorCode::OK;
 }
 
@@ -332,26 +389,15 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             handles.push_back(handle);
         }
 
-        // Fast path: if segment is on local host and we have single slice and
-        // handle, use memcpy instead of going through the transfer engine
-        if (slices.size() == 1 && handles.size() == 1 &&
-            handles[0].size_ == slices[0].size &&
-            handles[0].segment_name_ == this->local_hostname_) {
-            VLOG(1) << "Using fast path (memcpy) for local transfer";
-            memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
-                   handles[0].size_);
-        } else {
-            // Normal path: use transfer engine
-            ErrorCode transfer_err = TransferWrite(handles, slices);
-            if (transfer_err != ErrorCode::OK) {
-                // Revoke put operation
-                auto revoke_err = master_client_.PutRevoke(key);
-                if (revoke_err.error_code != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    return revoke_err.error_code;
-                }
-                return transfer_err;
+        ErrorCode transfer_err = TransferWrite(handles, slices);
+        if (transfer_err != ErrorCode::OK) {
+            // Revoke put operation
+            auto revoke_err = master_client_.PutRevoke(key);
+            if (revoke_err.error_code != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err.error_code;
             }
+            return transfer_err;
         }
     }
 
@@ -368,6 +414,8 @@ ErrorCode Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
     ReplicateConfig& config) {
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
     std::unordered_map<std::string, std::vector<size_t>> batched_slice_lengths;
     std::unordered_map<std::string, size_t> batched_value_lengths;
     for (const auto& key : keys) {
@@ -397,7 +445,11 @@ ErrorCode Client::BatchPut(
         return err;
     }
 
-    // Transfer data using allocated handles from all replicas
+    // Collect all transfer operations for parallel execution
+    std::vector<std::tuple<std::string, size_t, TransferFuture>>
+        pending_transfers;
+
+    // Submit all transfers in parallel
     for (const auto& key : keys) {
         const auto& slices_it = batched_slices.find(key);
         if (slices_it == batched_slices.end()) {
@@ -409,7 +461,10 @@ ErrorCode Client::BatchPut(
             LOG(ERROR) << "Cannot find replica_list for key: " << key;
             return ErrorCode::INVALID_PARAMS;
         }
-        for (auto& replica : replica_list->second) {
+
+        for (size_t replica_idx = 0; replica_idx < replica_list->second.size();
+             ++replica_idx) {
+            const auto& replica = replica_list->second[replica_idx];
             std::vector<AllocatedBuffer::Descriptor> handles;
             for (const auto& handle : replica.buffer_descriptors) {
                 CHECK(handle.buffer_address_ != 0)
@@ -417,37 +472,58 @@ ErrorCode Client::BatchPut(
                 handles.push_back(handle);
             }
 
-            // Fast path: if segment is on local host and we have single slice
-            // and handle, use memcpy instead of going through the transfer
-            // engine
-            std::vector<Slice>& slices = slices_it->second;
-            if (slices.size() == 1 && handles.size() == 1 &&
-                handles[0].size_ == slices[0].size &&
-                handles[0].segment_name_ == this->local_hostname_) {
-                VLOG(1) << "Using fast path (memcpy) for local transfer";
-                memcpy((char*)handles[0].buffer_address_, slices[0].ptr,
-                       handles[0].size_);
-            } else {
-                // Normal path: use transfer engine
-                ErrorCode transfer_err = TransferWrite(handles, slices);
-                if (transfer_err != ErrorCode::OK) {
-                    // Revoke put operation
-                    auto revoke_err = master_client_.BatchPutRevoke(keys);
-                    if (revoke_err.error_code != ErrorCode::OK) {
-                        LOG(ERROR) << "Failed to revoke put operation";
-                        return revoke_err.error_code;
-                    }
-                    return transfer_err;
+            // Submit transfer operation asynchronously
+            auto future = transfer_submitter_->submit(
+                handles, slices_it->second, TransferRequest::WRITE);
+            if (!future) {
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << key << " replica: " << replica_idx;
+                // Revoke put operation
+                auto revoke_err = master_client_.BatchPutRevoke(keys);
+                if (revoke_err.error_code != ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return revoke_err.error_code;
                 }
+                return ErrorCode::TRANSFER_FAIL;
             }
+
+            VLOG(1) << "Submitted transfer for key " << key << " replica "
+                    << replica_idx << " using strategy: "
+                    << static_cast<int>(future->strategy());
+
+            pending_transfers.emplace_back(key, replica_idx,
+                                           std::move(*future));
         }
     }
+
+    // Wait for all transfers to complete
+    for (auto& [key, replica_idx, future] : pending_transfers) {
+        ErrorCode result = future.get();
+        if (result != ErrorCode::OK) {
+            LOG(ERROR) << "Transfer failed for key: " << key
+                       << " replica: " << replica_idx
+                       << " with error: " << result;
+            // Revoke put operation
+            auto revoke_err = master_client_.BatchPutRevoke(keys);
+            if (revoke_err.error_code != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return revoke_err.error_code;
+            }
+            return result;
+        }
+        VLOG(1) << "Transfer completed successfully for key: " << key
+                << " replica: " << replica_idx;
+    }
+
     // End put operation
     err = master_client_.BatchPutEnd(keys).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
+    VLOG(1) << "BatchPut completed successfully for " << keys.size()
+            << " keys with " << pending_transfers.size() << " total transfers";
     return ErrorCode::OK;
 }
 
@@ -492,7 +568,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        mounted_segments_[segment_name] = (void*)buffer;
+        mounted_segments_[segment_name] = {(void*)buffer, size};
     }
     return ErrorCode::OK;
 }
@@ -502,11 +578,11 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name, void* addr) {
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         auto it = mounted_segments_.find(segment_name);
-        if (it == mounted_segments_.end() || it->second != addr) {
+        if (it == mounted_segments_.end() || it->second.buffer != addr) {
             LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
             return ErrorCode::INVALID_PARAMS;
         }
-        segment_addr = it->second;
+        segment_addr = it->second.buffer;
 
         // Remove from map first to prevent any further access to this segment
         mounted_segments_.erase(it);
@@ -555,99 +631,17 @@ ErrorCode Client::IsExist(const std::string& key) {
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
-    CHECK(!handles.empty()) << "handles is empty";
-    std::vector<TransferRequest> transfer_tasks;
-    if (handles.size() > slices.size()) {
-        LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
-                   << " slices_size=" << slices.size();
+    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+
+    auto future = transfer_submitter_->submit(handles, slices, op_code);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    for (uint64_t idx = 0; idx < handles.size(); ++idx) {
-        auto& handle = handles[idx];
-        auto& slice = slices[idx];
-        if (handle.size_ > slice.size) {
-            LOG(ERROR)
-                << "Size of replica partition more than provided buffers";
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        Transport::SegmentHandle seg =
-            transfer_engine_.openSegment(handle.segment_name_);
-        if (seg == (uint64_t)ERR_INVALID_ARGUMENT) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        TransferRequest request;
-        request.opcode = op_code;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = handle.buffer_address_;
-        request.length = handle.size_;
-        transfer_tasks.push_back(request);
-    }
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    const size_t batch_size = transfer_tasks.size();
-    BatchID batch_id = transfer_engine_.allocateBatchID(batch_size);
-    if (batch_id == Transport::INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    Status s = transfer_engine_.submitTransfer(batch_id, transfer_tasks);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        transfer_engine_.freeBatchID(batch_id);
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    bool has_err = false;
-    bool all_ready = true;
-    uint32_t try_num = 0;
-    const uint32_t max_try_num = 3;
-    int64_t start_ts = getCurrentTimeInNano();
-    const static int64_t kOneSecondInNano = 1000 * 1000 * 1000;
-
-    while (try_num < max_try_num) {
-        has_err = false;
-        all_ready = true;
-        if (getCurrentTimeInNano() - start_ts > 60 * kOneSecondInNano) {
-            LOG(ERROR) << "Failed to complete transfers after 60 seconds";
-            return ErrorCode::TRANSFER_FAIL;
-        }
-        for (size_t i = 0; i < batch_size; ++i) {
-            TransferStatus status;
-            s = transfer_engine_.getTransferStatus(batch_id, i, status);
-            if (!s.ok()) {
-                LOG(ERROR) << "Transfer " << i
-                           << " error, error_code=" << s.code();
-                transfer_engine_.freeBatchID(batch_id);
-                return ErrorCode::TRANSFER_FAIL;
-            }
-            if (status.s != TransferStatusEnum::COMPLETED) all_ready = false;
-            if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Transfer failed for task" << i;
-                has_err = true;
-            }
-        }
-
-        if (has_err) {
-            LOG(WARNING) << "Transfer incomplete, retrying... (attempt "
-                         << try_num + 1 << "/" << max_try_num << ")";
-            ++try_num;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        if (all_ready) break;
-    }
-
-    if (!all_ready) {
-        LOG(ERROR) << "transfer_incomplete max_attempts=" << max_try_num;
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    transfer_engine_.freeBatchID(batch_id);
-    return ErrorCode::OK;
+    return future->get();
 }
 
 ErrorCode Client::TransferWrite(
@@ -672,6 +666,120 @@ ErrorCode Client::TransferRead(
     }
 
     return TransferData(handles, slices, TransferRequest::READ);
+}
+
+void Client::PingThreadFunc(int current_version) {
+    // How many failed pings before getting latest master view from etcd
+    const int max_ping_fail_count = 3;
+    // How long to wait for next ping after success
+    const int success_ping_interval_ms = 1000;
+    // How long to wait for next ping after failure
+    const int fail_ping_interval_ms = 1000;
+    // Increment after a ping failure, reset after a ping success
+    int ping_fail_count = 0;
+    // Set to true when there is a view change.
+    // When set true, will try to remount periodically.
+    bool need_remount = false;
+
+    auto remount_segment = [this]() {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (auto it : mounted_segments_) {
+            auto& name = it.first;
+            auto& segment = it.second;
+            auto err =
+                master_client_.MountSegment(name, segment.buffer, segment.size)
+                    .error_code;
+            // If err is INVALID_PARAMS, it means the segment is already
+            // mounted, or cannot be mounted with current parameters. Either
+            // way, there is nothing we can do for this segment.
+            if (err != ErrorCode::OK && err != ErrorCode::INVALID_PARAMS) {
+                LOG(ERROR) << "Failed to remount segment " << name << ": "
+                           << toString(err);
+                return err;
+            }
+        }
+        return ErrorCode::OK;
+    };
+
+    while (ping_running_) {
+        auto ping_result = master_client_.Ping();
+        if (ping_result.error_code == ErrorCode::OK) {
+            ping_fail_count = 0;
+            if (ping_result.view_version > current_version) {
+                // There is an unknown view change, we need to update
+                // local view version and remount segments.
+                LOG(ERROR) << "Master view version has changed, need to "
+                              "remount segments";
+                current_version = ping_result.view_version;
+                need_remount = true;
+            }
+            // Only try to remount if the ping succeeds and need_remount is true
+            if (need_remount && remount_segment() == ErrorCode::OK) {
+                LOG(INFO) << "Successfully remounted all segments";
+                need_remount = false;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(success_ping_interval_ms));
+            continue;
+        }
+
+        ping_fail_count++;
+        if (ping_fail_count < max_ping_fail_count) {
+            LOG(ERROR) << "Failed to ping master";
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+
+        // Too many ping failures, we need to check if the master view has
+        // changed
+        LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                   << " times, try to get latest master view and reconnect";
+        std::string master_address;
+        ViewVersionId next_version = 0;
+        auto err =
+            master_view_helper_.GetMasterView(master_address, next_version);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get new master view: " << toString(err);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master " << master_address
+                       << ": " << toString(err);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+
+        LOG(INFO) << "Reconnected to master " << master_address;
+        ping_fail_count = 0;
+        if (next_version > current_version) {
+            // Master view has changed
+            current_version = next_version;
+            need_remount = true;
+        }
+    }
+}
+
+ErrorCode Client::FindFirstCompleteReplica(
+    const std::vector<Replica::Descriptor>& replica_list,
+    std::vector<AllocatedBuffer::Descriptor>& handles) {
+    handles.clear();
+
+    // Find the first complete replica
+    for (size_t i = 0; i < replica_list.size(); ++i) {
+        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
+            handles = replica_list[i].buffer_descriptors;
+            return ErrorCode::OK;
+        }
+    }
+
+    // No complete replica found
+    return ErrorCode::INVALID_REPLICA;
 }
 
 }  // namespace mooncake

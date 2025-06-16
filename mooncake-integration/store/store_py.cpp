@@ -613,6 +613,7 @@ PYBIND11_MODULE(store, m) {
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
         .def("size", &SliceBuffer::size)
+        .def("__len__", &SliceBuffer::size)
         .def_buffer([](SliceBuffer &self) -> py::buffer_info {
             // SliceBuffer now always contains contiguous memory
             if (self.size() > 0) {

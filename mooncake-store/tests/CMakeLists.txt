@@ -26,15 +26,12 @@ target_link_libraries(client_integration_test PUBLIC
 add_test(NAME client_integration_test COMMAND client_integration_test)
 
 add_executable(master_metrics_test master_metrics_test.cpp)
-target_link_libraries(master_metrics_test PUBLIC
-    mooncake_store
-    cachelib_memory_allocator
-    glog
-    gtest
-    gtest_main
-    pthread
-)
+target_link_libraries(master_metrics_test PUBLIC mooncake_store cachelib_memory_allocator glog gtest gtest_main pthread)
 add_test(NAME master_metrics_test COMMAND master_metrics_test)
+
+add_executable(high_availability_test high_availability_test.cpp)
+target_link_libraries(high_availability_test PUBLIC mooncake_store cachelib_memory_allocator glog gtest gtest_main pthread ${ETCD_WRAPPER_LIB})
+add_test(NAME high_availability_test COMMAND high_availability_test)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(stress_workload_test PUBLIC
@@ -45,3 +42,14 @@ target_link_libraries(stress_workload_test PUBLIC
     gtest_main
     pthread
 )
+
+add_executable(transfer_task_test transfer_task_test.cpp)
+target_link_libraries(transfer_task_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME transfer_task_test COMMAND transfer_task_test)
