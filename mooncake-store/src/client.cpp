@@ -755,18 +755,32 @@ void Client::PingThreadFunc() {
             auto& segment = it.second;
             segments.push_back(segment);
         }
-        ErrorCode err = master_client_.ReMountSegment(segments, client_id_).error_code;
+        ErrorCode err =
+            master_client_.ReMountSegment(segments, client_id_).error_code;
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to remount segments: " << err;
         }
     };
+    // Use another thread to remount segments to avoid blocking the ping thread
+    std::future<void> remount_segment_future;
 
     while (ping_running_) {
+        // Join the remount segment thread if it is ready
+        if (remount_segment_future.valid() &&
+            remount_segment_future.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+            remount_segment_future = std::future<void>();
+        }
+
+        // Ping master
         auto ping_result = master_client_.Ping(client_id_);
         if (ping_result.error_code == ErrorCode::OK) {
             ping_fail_count = 0;
-            if (ping_result.client_status == ClientStatus::NEED_REMOUNT) {
-                remount_segment();
+            if (ping_result.client_status == ClientStatus::NEED_REMOUNT &&
+                !remount_segment_future.valid()) {
+                // Ensure at most one remount segment thread is running
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
             }
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
@@ -807,6 +821,10 @@ void Client::PingThreadFunc() {
 
         LOG(INFO) << "Reconnected to master " << master_address;
         ping_fail_count = 0;
+    }
+    // Explicitly wait for the remount segment thread to finish
+    if (remount_segment_future.valid()) {
+        remount_segment_future.wait();
     }
 }
 

@@ -61,40 +61,12 @@ MasterService::~MasterService() {
 }
 
 ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client_id) {
-    const uintptr_t buffer = segment.base;
-    const size_t size = segment.size;
-
-    // Check if parameters are valid before allocating memory.
-    if (buffer == 0 || size == 0 ||
-        buffer % facebook::cachelib::Slab::kSize ||
-        size % facebook::cachelib::Slab::kSize) {
-        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is not aligned to " << facebook::cachelib::Slab::kSize;
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
-
-    // Check if segment already exists
-    auto exist_segment_it = mounted_segments_.find(segment.id);
-    if (exist_segment_it != mounted_segments_.end()) {
-        auto &exist_segment = exist_segment_it->second;
-        if (exist_segment.status == SegmentStatus::OK) {
-            // Return OK because this is an idempotent operation
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=segment_already_exists";
-            return ErrorCode::OK;
-        }
-        LOG(ERROR) << "segment_name=" << segment.name
-                     << ", error=segment_already_exists_but_not_ok"
-                     << ", status=" << exist_segment.status;
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-    }
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     if (enable_ha_) {
         // Tell the client monitor thread to start timing for this client. To avoid
-        // the following undesired situations, this message must be sent before the
-        // segment lock is released:
+        // the following undesired situations, this message must be sent after locking
+        // the segment mutex and before the mounting operation completes:
         // 1. Sending the message before the lock: the client expires and unmouting
         // invokes before this mounting are completed, which prevent this segment
         // being able to be unmounted forever;
@@ -111,30 +83,7 @@ ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client
         }
     }
 
-    std::shared_ptr<BufferAllocator> allocator;
-    try {
-        // SlabAllocator may throw an exception if the size or base is invalid
-        // for the slab allocator.
-        allocator = std::make_shared<BufferAllocator>(segment.name, buffer, size);
-        if (!allocator) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=unknown_exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    ok_allocators_.push_back(allocator);
-    ok_allocators_by_name_[segment.name].push_back(allocator);
-    client_segments_[client_id].push_back(segment.id);
-    mounted_segments_[segment.id] = {segment, SegmentStatus::OK, std::move(allocator)};
-
-    MasterMetricManager::instance().inc_total_capacity(size);
-
-    return ErrorCode::OK;
+    return segment_access.MountSegment(segment, client_id);
 }
 
 ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
@@ -152,21 +101,10 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
         return ErrorCode::OK;
     }
 
-    for (const auto& segment : segments) {
-        ErrorCode err = MountSegment(segment, client_id);
-        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS || err == ErrorCode::INTERNAL_ERROR) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=fail_to_remount_segment";
-            return err;
-        } else if (err == ErrorCode::INVALID_PARAMS) {
-            // Ignore INVALID_PARAMS. This error cannot be solved by a new remount request.
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=invalid_params";
-        } else if (err != ErrorCode::OK) {
-            // Ignore other errors. The error may not be solvable by a new remount request.
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=unexpected_error (" << err << ")";
-        }
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    ErrorCode err = segment_access.ReMountSegment(segments, client_id);
+    if (err != ErrorCode::OK) {
+        return err;
     }
 
     // Change the client status to OK
@@ -174,82 +112,7 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
-    size_t metrics_dec_capacity = 0; // to update the metrics
-    {
-        std::unique_lock<std::shared_mutex> lock(segment_mutex_);
-        auto it = mounted_segments_.find(segment_id);
-        if (it == mounted_segments_.end()) {
-            // Return OK because this is an idempotent operation
-            LOG(WARNING) << "segment_id=" << segment_id
-                        << ", warn=segment_not_found";
-            return ErrorCode::OK;
-        }
-        if (it->second.status == SegmentStatus::UNMOUNTING) {
-            LOG(ERROR) << "segment_id=" << segment_id
-                       << ", error=segment_is_being_unmounted";
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        }
-
-        auto& mounted_segment = it->second;
-        auto& segment = mounted_segment.segment;
-        metrics_dec_capacity = segment.size;
-
-        // 1. Remove the allocator
-        std::shared_ptr<BufferAllocator> allocator = mounted_segment.buf_allocator;
-        
-        // 1.1 Remove from ok_allocators
-        auto alloc_it = std::find(ok_allocators_.begin(), ok_allocators_.end(), allocator);
-        if (alloc_it != ok_allocators_.end()) {
-            ok_allocators_.erase(alloc_it);
-        } else {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=alloctor_not_found_in_ok_allocators";
-        }
-
-        // 1.2 Remove from ok_allocators_by_name
-        bool found_in_ok_allocators_by_name = false;
-        auto name_it = ok_allocators_by_name_.find(segment.name);
-        if (name_it != ok_allocators_by_name_.end()) {
-            auto& allocators = name_it->second;
-            auto alloc_it = std::find(allocators.begin(), allocators.end(), allocator);
-            if (alloc_it != allocators.end()) {
-                allocators.erase(alloc_it);
-                found_in_ok_allocators_by_name = true;
-            }
-            if (allocators.empty()) {
-                ok_allocators_by_name_.erase(name_it);
-            }
-        }
-        if (!found_in_ok_allocators_by_name) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=alloctor_not_found_in_ok_allocators_by_name";
-        }
-
-        // 1.3 Remove from mounted_segment
-        mounted_segment.buf_allocator.reset();
-
-        // 1.4 Set the segment status to UNMOUNTING
-        mounted_segment.status = SegmentStatus::UNMOUNTING;
-
-        // 1.5 Remove from client_segments_
-        bool found_in_client_segments = false;
-        auto client_it = client_segments_.find(client_id);
-        if (client_it != client_segments_.end()) {
-            auto& segments = client_it->second;
-            auto segment_it = std::find(segments.begin(), segments.end(), segment_id);
-            if (segment_it != segments.end()) {
-                segments.erase(segment_it);
-                found_in_client_segments = true;
-            }
-        }
-        if (!found_in_client_segments) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=segment_not_found_in_client_segments";
-        }
-    }
-
-    // 2. Remove the metadata of the related objects
+void MasterService::ClearInvalidHandles() {
     for (auto& shard : metadata_shards_) {
         std::unique_lock lock(shard.mutex);
         auto it = shard.metadata.begin();
@@ -271,14 +134,26 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& clie
             }
         }
     }
+}
 
-    // 3. Remove segment
+ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
+    size_t metrics_dec_capacity = 0; // to update the metrics
+
+    // 1. Prepare to unmount the segment
     {
-        std::unique_lock<std::shared_mutex> lock(segment_mutex_);
-        mounted_segments_.erase(segment_id);
-        MasterMetricManager::instance().dec_total_capacity(metrics_dec_capacity);
-    }
-    return ErrorCode::OK;
+        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        ErrorCode err = segment_access.PrepareUnmountSegment(segment_id, client_id, metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+    } // Release the segment mutex before long-running step 2 and avoid deadlocks
+
+    // 2. Remove the metadata of the related objects
+    ClearInvalidHandles();
+
+    // 3. Commit the unmount operation
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    return segment_access.CommitUnmountSegment(segment_id, metrics_dec_capacity);
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -313,28 +188,14 @@ ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
 
 ErrorCode MasterService::GetAllSegments(
     std::vector<std::string>& all_segments) {
-    all_segments.clear();
-    std::shared_lock<std::shared_mutex> alloc_lock(segment_mutex_);
-    for (auto& segment : mounted_segments_) {
-        all_segments.push_back(segment.second.segment.name);
-    }
-    return ErrorCode::OK;
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    return segment_access.GetAllSegments(all_segments);
 }
 
 ErrorCode MasterService::QuerySegments(const std::string& segment, size_t& used,
                                        size_t& capacity) {
-    std::shared_lock<std::shared_mutex> alloc_lock(segment_mutex_);
-    const auto& allocators = ok_allocators_by_name_.find(segment);
-    if (allocators != ok_allocators_by_name_.end()) {
-        capacity = allocators->second[0]->capacity();
-        used = allocators->second[0]->size();
-    } else {
-        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
-                << ") not found!";
-        return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
-    }
-    alloc_lock.unlock();
-    return ErrorCode::OK;
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    return segment_access.QuerySegments(segment, used, capacity);
 }
 
 ErrorCode MasterService::GetReplicaList(
@@ -436,7 +297,9 @@ ErrorCode MasterService::PutStart(
     std::vector<Replica> replicas;
     replicas.reserve(config.replica_num);
     {
-        std::shared_lock<std::shared_mutex> alloc_lock(segment_mutex_);
+        ScopedAllocatorAccess allocator_access = segment_manager_.getAllocatorAccess();
+        auto& allocators = allocator_access.getAllocators();
+        auto& allocators_by_name = allocator_access.getAllocatorsByName();
         for (size_t i = 0; i < config.replica_num; ++i) {
             std::vector<std::unique_ptr<AllocatedBuffer>> handles;
             handles.reserve(slice_lengths.size());
@@ -447,7 +310,7 @@ ErrorCode MasterService::PutStart(
 
                 // Use the unified allocation strategy with replica config
                 auto handle =
-                    allocation_strategy_->Allocate(ok_allocators_, ok_allocators_by_name_, chunk_size, config);
+                    allocation_strategy_->Allocate(allocators, allocators_by_name, chunk_size, config);
 
                 if (!handle) {
                     LOG(ERROR) << "key=" << key << ", replica_id=" << i
@@ -889,16 +752,35 @@ void MasterService::ClientMonitorFunc() {
             // 2. Changing the segment status to UNMOUNTING first, then the client
             // status to NEED_REMOUNT
             // So we must hold the client_mutex_ here
-            if (!need_remount_clients.empty()) {
-                std::unique_lock<std::shared_mutex> lock(segment_mutex_);
-                for (auto& client_id : need_remount_clients) {
-                    for (auto& segment_id : client_segments_[client_id]) {
-                        UnmountSegment(segment_id, client_id);
+            if (!need_remount_clients.empty()) {               
+                std::vector<size_t> metrics_dec_capacity_vec;
+                std::vector<UUID> unmount_segments;
+                {
+                    std::unique_lock<std::shared_mutex> lock(client_mutex_);
+                    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+                    for (auto& client_id : need_remount_clients) {
+                        std::vector<UUID> segments;
+                        segment_access.GetClientSegments(client_id, segments);
+                        for (auto& segment_id : segments) {
+                            size_t metrics_dec_capacity = 0;
+                            if (segment_access.PrepareUnmountSegment(segment_id, client_id, metrics_dec_capacity) == ErrorCode::OK) {
+                                unmount_segments.push_back(segment_id);
+                                metrics_dec_capacity_vec.push_back(metrics_dec_capacity);
+                            }
+                        }
+                    }
+                }// Release the mutex before long-running step 2 and avoid deadlocks
+
+                ClearInvalidHandles();
+
+                if (!unmount_segments.empty()) {
+                    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+                    for (size_t i = 0; i < unmount_segments.size(); i++) {
+                        segment_access.CommitUnmountSegment(unmount_segments[i], metrics_dec_capacity_vec[i]);
                     }
                 }
             }
         }
-
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));

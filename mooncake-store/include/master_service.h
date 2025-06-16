@@ -18,6 +18,7 @@
 #include "eviction_strategy.h"
 #include "allocator.h"
 #include "types.h"
+#include "Segment.h"
 
 
 namespace mooncake {
@@ -40,30 +41,13 @@ struct GCTask {
     }
 };
 
-/**
- * @brief Status of a mounted segment in master
- */
-enum class SegmentStatus {
-    UNDEFINED = 0,  // Uninitialized
-    OK,             // Segment is mounted and available for allocation
-    UNMOUNTING,     // Segment is under unmounting
-};
-
-/**
- * @brief Stream operator for SegmentStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const SegmentStatus& status) noexcept {
-    static const std::unordered_map<SegmentStatus, std::string_view>
-        status_strings{{SegmentStatus::UNDEFINED, "UNDEFINED"},
-                       {SegmentStatus::OK, "OK"},
-                       {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
+/*
+ * @brief MasterService is the main class for the master server.
+ * Lock order: To avoid deadlocks, the following lock order should be followed:
+ * 1. client_mutex_
+ * 2. metadata_shards_[shard_idx_].mutex
+ * 3. segment_mutex_
+*/
 class MasterService {
    private:
     // Comparator for GC tasks priority queue
@@ -262,6 +246,9 @@ class MasterService {
     // Check all shards and try to evict some keys
     void BatchEvict(double eviction_ratio);
 
+    // Clear invalid handles in all shards
+    void ClearInvalidHandles();
+
     // Internal data structures
     struct ObjectMetadata {
         std::vector<Replica> replicas;
@@ -299,24 +286,9 @@ class MasterService {
         }
     };
 
-    struct MountedSegment {
-        Segment segment;
-        SegmentStatus status;
-        std::shared_ptr<BufferAllocator> buf_allocator;
-    };
-
     // Segment management
-    mutable std::shared_mutex segment_mutex_;
+    SegmentManager segment_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>
-        ok_allocators_by_name_;  // segment name -> allocators with status OK
-    std::vector<std::shared_ptr<BufferAllocator>>
-        ok_allocators_;  // allocators with status OK
-    std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
-        mounted_segments_; // segment_id -> mounted segment
-    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_;  // client_id -> segment_ids
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
