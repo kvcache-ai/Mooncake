@@ -2,7 +2,7 @@ import os
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 
-class MooncakeNVLinkAllocator:
+class NVLinkAllocator:
     _instances = {}
     
     @classmethod 
