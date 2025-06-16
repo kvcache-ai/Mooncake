@@ -40,8 +40,8 @@ class TestDistributedObjectStore(unittest.TestCase):
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
 
-    @unittest.skipUnless(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
-                         "Skipping test_put_get_in_evict_operations because SSD environment variable is not set")
+    # @unittest.skipUnless(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
+    #                      "Skipping test_put_get_in_evict_operations because SSD environment variable is not set")
     def test_put_get_in_evict_operations(self):
         """Test basic Put/Get operations with eviction scenario
         
@@ -102,8 +102,8 @@ class TestDistributedObjectStore(unittest.TestCase):
             index = index + 1
         print("Cleanup completed")  
 
-    @unittest.skipUnless(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
-                         "Skipping test_concurrent_stress because SSD environment variable is not set")
+    # @unittest.skipUnless(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
+    #                      "Skipping test_concurrent_stress because SSD environment variable is not set")
     def test_concurrent_stress(self):
         """Multi-threaded stress test for Put/Get operations
         
