@@ -52,6 +52,7 @@ class TestMultiCards(unittest.TestCase):
         while index < max_requests:
             key = "k_" + str(index)
             self.store.remove(key)
+            index = index + 1
 
 if __name__ == '__main__':
     unittest.main()
