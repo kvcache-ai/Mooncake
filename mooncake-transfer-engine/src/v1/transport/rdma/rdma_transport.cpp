@@ -23,8 +23,7 @@
 #include <future>
 #include <set>
 
-#include "v1/common/common.h"
-#include "v1/common/config.h"
+#include "v1/common.h"
 #include "v1/transport/rdma/buffers.h"
 #include "v1/transport/rdma/endpoint_store.h"
 #include "v1/transport/rdma/workers.h"

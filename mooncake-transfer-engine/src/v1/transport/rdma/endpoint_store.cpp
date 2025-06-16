@@ -22,7 +22,7 @@
 #include <memory>
 #include <utility>
 
-#include "v1/common/config.h"
+#include "v1/common.h"
 #include "v1/transport/rdma/context.h"
 #include "v1/transport/rdma/endpoint.h"
 

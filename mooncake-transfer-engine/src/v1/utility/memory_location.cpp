@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "v1/utility/memory_location.h"
-#include "v1/common/types.h"
+#include "v1/common.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>

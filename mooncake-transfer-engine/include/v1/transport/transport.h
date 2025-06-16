@@ -27,8 +27,7 @@
 #include <queue>
 #include <string>
 
-#include "v1/common/types.h"
-#include "v1/common/status.h"
+#include "v1/common.h"
 #include "v1/metadata/metadata.h"
 #include "v1/utility/memory_location.h"
 
@@ -72,8 +71,7 @@ class Transport {
             "generic transport does not implement submitTransferTasks");
     }
 
-    virtual TransferStatus getTransferStatus(SubBatchRef batch,
-                                             int task_id) {
+    virtual TransferStatus getTransferStatus(SubBatchRef batch, int task_id) {
         return TransferStatus{TransferStatusEnum::INVALID, 0};
     }
 

@@ -19,9 +19,7 @@
 #include <cassert>
 #include <set>
 
-#include "v1/common/common.h"
-#include "v1/common/config.h"
-#include "v1/common/error.h"
+#include "v1/common.h"
 
 namespace mooncake {
 namespace v1 {

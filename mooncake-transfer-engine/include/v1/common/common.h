@@ -22,13 +22,13 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <ctime>
-#include <iomanip>
-#include <iostream>
-#include <sstream>
 #include <thread>
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 #include "v1/common/error.h"
 
@@ -98,12 +98,9 @@ static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto local_time = *std::localtime(&time_t_now);
-    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                      now.time_since_epoch()) %
-                  1000000;
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
     std::ostringstream oss;
-    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
-        << std::setw(6) << std::setfill('0') << micros.count();
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
     return oss.str();
 }
 
@@ -404,7 +401,6 @@ class SimpleRandom {
         return g_random;
     }
 
-    // 生成下一个伪随机数
     uint32_t next() {
         current = (a * current + c) % m;
         return current;
@@ -418,7 +414,7 @@ class SimpleRandom {
     static const uint32_t c = 1013904223;
     static const uint32_t m = 0xFFFFFFFF;
 };
-}  // namespace v1
+}
 }  // namespace mooncake
 
 #endif  // COMMON_H

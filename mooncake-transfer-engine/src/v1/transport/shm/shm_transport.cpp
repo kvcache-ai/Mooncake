@@ -29,7 +29,7 @@
 #include <cuda_runtime.h>
 #endif
 
-#include "v1/common/common.h"
+#include "v1/common.h"
 #include "v1/metadata/metadata.h"
 
 namespace mooncake {

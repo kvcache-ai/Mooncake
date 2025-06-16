@@ -23,7 +23,7 @@
 #include <memory>
 #include <thread>
 
-#include "v1/common/config.h"
+#include "v1/common.h"
 #include "v1/transport/rdma/endpoint_store.h"
 
 #define MIN(lhs, rhs) lhs = std::min(lhs, rhs)

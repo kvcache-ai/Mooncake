@@ -31,7 +31,7 @@
 #include "cq.h"
 #include "params.h"
 #include "rdma_transport.h"
-#include "v1/common/common.h"
+#include "v1/common.h"
 
 namespace mooncake {
 namespace v1 {

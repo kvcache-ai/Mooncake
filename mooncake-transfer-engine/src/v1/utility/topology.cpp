@@ -37,8 +37,8 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "v1/common.h"
 #include "v1/utility/memory_location.h"
-#include "v1/common/types.h"
 
 namespace mooncake {
 namespace v1 {

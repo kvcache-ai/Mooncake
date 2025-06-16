@@ -24,10 +24,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "v1/common/types.h"
-#include "v1/utility/memory_location.h"
+#include "v1/common.h"
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
+#include "v1/utility/memory_location.h"
 
 namespace mooncake {
 namespace v1 {

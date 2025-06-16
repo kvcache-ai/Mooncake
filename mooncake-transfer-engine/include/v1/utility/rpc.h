@@ -25,8 +25,7 @@
 #include <thread>
 #include <vector>
 
-#include "v1/common/common.h"
-#include "v1/common/status.h"
+#include "v1/common.h"
 #include "ylt/coro_io/coro_io.hpp"
 
 namespace mooncake {

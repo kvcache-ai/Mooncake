@@ -26,7 +26,7 @@
 #include <memory>
 #include <tuple>
 
-#include "v1/common/common.h"
+#include "v1/common.h"
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 
