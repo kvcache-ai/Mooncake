@@ -282,10 +282,7 @@ std::string loadNicPriorityMatrix() {
 int initiator() {
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
 
     if (!FLAGS_auto_discovery) {
         Transport *xport = nullptr;
@@ -377,10 +374,7 @@ int target() {
 
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                 hostname_port.first.c_str(), hostname_port.second);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
 
     if (!FLAGS_auto_discovery) {
         if (FLAGS_protocol == "rdma") {

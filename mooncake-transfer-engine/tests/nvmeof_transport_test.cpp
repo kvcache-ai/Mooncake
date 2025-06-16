@@ -76,10 +76,7 @@ class NVMeofTransportTest : public ::testing::Test {
         FLAGS_logtostderr = 1;
         // disable topology auto discovery for testing.
         engine = std::make_unique<TransferEngine>(false);
-        hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
-                     hostname_port.first.c_str(),
-                     hostname_port.second + offset++);
+        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str());
         xport = nullptr;
         args = (void **)malloc(2 * sizeof(void *));
         args[0] = nullptr;

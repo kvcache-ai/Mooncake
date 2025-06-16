@@ -87,7 +87,7 @@ int VLLMAdaptor::initializeExt(const char *local_hostname,
     // TODO: remove `false` in the feature, it's for keep same API in vllm.
     engine_ = std::make_unique<TransferEngine>(false);
     // the last two params are unused
-    int ret = engine_->init(conn_string, local_hostname, "", 0);
+    int ret = engine_->init(conn_string, local_hostname);
     if (ret) return -1;
 
     xport_ = nullptr;
