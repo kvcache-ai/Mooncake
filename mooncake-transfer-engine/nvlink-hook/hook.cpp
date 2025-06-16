@@ -5,7 +5,7 @@
 #include <iostream>
 
 extern "C" {
-void *my_malloc(ssize_t size, int device, cudaStream_t stream) {
+void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
@@ -76,7 +76,7 @@ void *my_malloc(ssize_t size, int device, cudaStream_t stream) {
     return ptr;
 }
 
-void my_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
+void mc_nvlink_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     if (!ptr) return;
