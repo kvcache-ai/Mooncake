@@ -90,7 +90,7 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
     gc_running_ = true;
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
     session_id_ = std::to_string(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
     VLOG(1) << "action=start_gc_thread";

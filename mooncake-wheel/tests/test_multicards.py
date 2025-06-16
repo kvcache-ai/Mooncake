@@ -45,7 +45,13 @@ class TestMultiCards(unittest.TestCase):
             if retcode:
                 raise RuntimeError("put failed, key", key)
             index += 1
-            print("completed", index, "entries")        
+            print("completed", index, "entries")  
+
+        #remove all keys
+        index = 0
+        while index < max_requests:
+            key = "k_" + str(index)
+            self.store.remove(key)
 
 if __name__ == '__main__':
     unittest.main()
