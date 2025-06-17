@@ -23,15 +23,15 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     if (exist_segment_it != segment_manager_->mounted_segments_.end()) {
         auto& exist_segment = exist_segment_it->second;
         if (exist_segment.status == SegmentStatus::OK) {
-            // Return OK because this is an idempotent operation
             LOG(WARNING) << "segment_name=" << segment.name
                          << ", warn=segment_already_exists";
-            return ErrorCode::OK;
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        } else {
+            LOG(ERROR) << "segment_name=" << segment.name
+                       << ", error=segment_already_exists_but_not_ok"
+                       << ", status=" << exist_segment.status;
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=segment_already_exists_but_not_ok"
-                   << ", status=" << exist_segment.status;
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     std::shared_ptr<BufferAllocator> allocator;
@@ -76,6 +76,10 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
             // remount request.
             LOG(WARNING) << "segment_name=" << segment.name
                          << ", warn=invalid_params";
+        } else if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            // Segment already exists, no need to remount.
+            LOG(WARNING) << "segment_name=" << segment.name
+                         << ", warn=segment_already_exists";
         } else if (err != ErrorCode::OK) {
             // Ignore other errors. The error may not be solvable by a new
             // remount request.
@@ -91,10 +95,9 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     const UUID& segment_id, size_t& metrics_dec_capacity) {
     auto it = segment_manager_->mounted_segments_.find(segment_id);
     if (it == segment_manager_->mounted_segments_.end()) {
-        // Return OK because this is an idempotent operation
         LOG(WARNING) << "segment_id=" << segment_id
                      << ", warn=segment_not_found";
-        return ErrorCode::OK;
+        return ErrorCode::SEGMENT_NOT_FOUND;
     }
     if (it->second.status == SegmentStatus::UNMOUNTING) {
         LOG(ERROR) << "segment_id=" << segment_id
@@ -184,7 +187,7 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     const UUID& client_id, std::vector<UUID>& segments) const {
     auto it = segment_manager_->client_segments_.find(client_id);
     if (it == segment_manager_->client_segments_.end()) {
-        return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
+        return ErrorCode::SEGMENT_NOT_FOUND;
     }
     segments = it->second;
     return ErrorCode::OK;
@@ -213,8 +216,8 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     } else {
         VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
                 << ") not found!";
-        return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
-    }
+        return ErrorCode::SEGMENT_NOT_FOUND;
+        }
     return ErrorCode::OK;
 }
 }  // namespace mooncake

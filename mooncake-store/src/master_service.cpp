@@ -90,7 +90,13 @@ ErrorCode MasterService::MountSegment(const Segment& segment,
         }
     }
 
-    return segment_access.MountSegment(segment, client_id);
+    auto err = segment_access.MountSegment(segment, client_id);
+    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        // Return OK because this is an idempotent operation
+        return ErrorCode::OK;
+    } else {
+        return err;
+    }
 }
 
 ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
@@ -174,6 +180,10 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
             segment_manager_.getSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
+        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+            // Return OK because this is an idempotent operation
+            return ErrorCode::OK;
+        }
         if (err != ErrorCode::OK) {
             return err;
         }

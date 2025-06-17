@@ -177,6 +177,7 @@ class SegmentManager {
         client_segments_;  // client_id -> segment_ids
 
     friend class ScopedSegmentAccess;
+    friend class SegmentTest; // for unit tests
 };
 
 }  // namespace mooncake

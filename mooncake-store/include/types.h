@@ -68,7 +68,8 @@ enum class ErrorCode : int32_t {
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
-    AVAILABLE_SEGMENT_EMPTY = -101,   ///< No available segments found.
+    SEGMENT_NOT_FOUND = -101,   ///< No available segments found.
+    SEGMENT_ALREADY_EXISTS = -102,   ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE = -200,  ///< No available handles.
