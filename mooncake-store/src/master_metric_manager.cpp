@@ -422,6 +422,10 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
 
+    // Ping counters
+    int64_t ping_requests = ping_requests_.value();
+    int64_t ping_failures = ping_failures_.value();
+
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
        << format_bytes(capacity);
@@ -445,7 +449,11 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | Eviction: "
         << "Success/Attempts=" << eviction_success << "/" << eviction_attempts << ", "
         << "keys=" << evicted_key_count << ", "
-        << "size=" << format_bytes(evicted_size);
+        << "size=" << format_bytes(evicted_size) << ", ";
+
+    // Ping summary
+    ss << " | Ping (Success/Total): "
+       << ping_requests - ping_failures << "/" << ping_requests;
 
     return ss.str();
 }

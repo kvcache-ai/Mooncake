@@ -589,8 +589,8 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 }
 
 ErrorCode Client::UnmountSegment(const std::string& segment_name) {
-    auto segment = mounted_segments_.end();
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    auto segment = mounted_segments_.end();
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
@@ -608,11 +608,7 @@ ErrorCode Client::UnmountSegment(const std::string& segment_name) {
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);
-        if (err != ErrorCode::INVALID_PARAMS) {
-            return err;
-        }
-        // Otherwise, the segment is already unmounted from master, we can
-        // continue
+        return err;
     }
 
     int rc = transfer_engine_.unregisterLocalMemory(
@@ -707,6 +703,9 @@ void Client::PingThreadFunc() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
+        // This lock must be held until the remount rpc is finished,
+        // otherwise there will be corner cases, e.g., a segment is unmounted
+        // successfully first, and then remounted again in this thread.
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         std::vector<Segment> segments;
         for (auto it : mounted_segments_) {
@@ -733,6 +732,7 @@ void Client::PingThreadFunc() {
         // Ping master
         auto ping_result = master_client_.Ping(client_id_);
         if (ping_result.error_code == ErrorCode::OK) {
+            // Reset ping failure count
             ping_fail_count = 0;
             if (ping_result.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {

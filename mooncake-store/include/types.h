@@ -366,6 +366,9 @@ struct Segment {
 };
 YLT_REFL(Segment, id, name, base, size);
 
+/**
+ * @brief Client status from the master's perspective
+ */
 enum class ClientStatus {
     UNDEFINED = 0,  // Uninitialized
     OK,             // Client is alive, no need to remount for now
@@ -380,7 +383,8 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ClientStatus& status) noexcept {
     static const std::unordered_map<ClientStatus, std::string_view>
         status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
-                       {ClientStatus::OK, "OK"}};
+                       {ClientStatus::OK, "OK"},
+                       {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");

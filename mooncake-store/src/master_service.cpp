@@ -45,10 +45,14 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
 }
 
 MasterService::~MasterService() {
-    // Stop and join the GC thread
+    // Stop and join the threads
     gc_running_ = false;
+    client_monitor_running_ = false;
     if (gc_thread_.joinable()) {
         gc_thread_.join();
+    }
+    if (client_monitor_thread_.joinable()) {
+        client_monitor_thread_.join();
     }
 
     // Clean up any remaining GC tasks
@@ -60,25 +64,28 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client_id) {
+ErrorCode MasterService::MountSegment(const Segment& segment,
+                                      const UUID& client_id) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     if (enable_ha_) {
-        // Tell the client monitor thread to start timing for this client. To avoid
-        // the following undesired situations, this message must be sent after locking
-        // the segment mutex and before the mounting operation completes:
-        // 1. Sending the message before the lock: the client expires and unmouting
-        // invokes before this mounting are completed, which prevent this segment
-        // being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting this
-        // segment, when trying to push id to the queue, the queue is already full,
-        // which may block this request forever.
+        // Tell the client monitor thread to start timing for this client. To
+        // avoid the following undesired situations, this message must be sent
+        // after locking the segment mutex and before the mounting operation
+        // completes:
+        // 1. Sending the message before the lock: the client expires and
+        // unmouting invokes before this mounting are completed, which prevents
+        // this segment being able to be unmounted forever;
+        // 2. Sending the message after mounting the segment: After mounting
+        // this segment, when trying to push id to the queue, the queue is
+        // already full. However, at this point, the message must be sent,
+        // otherwise this client cannot be monitored and expired.
         PodUUID pod_client_id;
         pod_client_id.first = client_id.first;
         pod_client_id.second = client_id.second;
         if (!client_ping_queue_.push(pod_client_id)) {
             LOG(ERROR) << "segment_name=" << segment.name
-                    << ", error=client_ping_queue_full";
+                       << ", error=client_ping_queue_full";
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -87,7 +94,7 @@ ErrorCode MasterService::MountSegment(const Segment& segment, const UUID& client
 }
 
 ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
-                                         const UUID& client_id) {
+                                        const UUID& client_id) {
     if (!enable_ha_) {
         LOG(ERROR) << "ReMountSegment is only available in HA mode";
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
@@ -96,30 +103,33 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
-                    << ", warn=client_already_remounted";
+                     << ", warn=client_already_remounted";
         // Return OK because this is an idempotent operation
         return ErrorCode::OK;
     }
 
-    // Tell the client monitor thread to start timing for this client. To avoid
-    // the following undesired situations, this message must be sent after locking
-    // the segment mutex and before the remounting operation completes:
-    // 1. Sending the message before the lock: the client expires and unmouting
-    // invokes before this remounting are completed, which prevent this segment
-    // being able to be unmounted forever;
-    // 2. Sending the message after remounting the segment: After remounting this
-    // segment, when trying to push id to the queue, the queue is already full,
-    // which may block this request forever.
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    // Tell the client monitor thread to start timing for this client. To
+    // avoid the following undesired situations, this message must be sent
+    // after locking the segment mutex or client mutex and before the remounting
+    // operation completes:
+    // 1. Sending the message before the lock: the client expires and
+    // unmouting invokes before this remounting are completed, which prevents
+    // this segment being able to be unmounted forever;
+    // 2. Sending the message after remounting the segments: After remounting
+    // these segments, when trying to push id to the queue, the queue is
+    // already full. However, at this point, the message must be sent,
+    // otherwise this client cannot be monitored and expired.
     PodUUID pod_client_id;
     pod_client_id.first = client_id.first;
     pod_client_id.second = client_id.second;
     if (!client_ping_queue_.push(pod_client_id)) {
         LOG(ERROR) << "client_id=" << client_id
-                << ", error=client_ping_queue_full";
+                   << ", error=client_ping_queue_full";
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     ErrorCode err = segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         return err;
@@ -154,24 +164,29 @@ void MasterService::ClearInvalidHandles() {
     }
 }
 
-ErrorCode MasterService::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
-    size_t metrics_dec_capacity = 0; // to update the metrics
+ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
+                                        const UUID& client_id) {
+    size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    // 1. Prepare to unmount the segment
+    // 1. Prepare to unmount the segment by deleting its allocator
     {
-        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        ErrorCode err = segment_access.PrepareUnmountSegment(
+            segment_id, metrics_dec_capacity);
         if (err != ErrorCode::OK) {
             return err;
         }
-    } // Release the segment mutex before long-running step 2 and avoid deadlocks
+    }  // Release the segment mutex before long-running step 2 and avoid
+       // deadlocks
 
     // 2. Remove the metadata of the related objects
     ClearInvalidHandles();
 
     // 3. Commit the unmount operation
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.CommitUnmountSegment(segment_id, client_id, metrics_dec_capacity);
+    return segment_access.CommitUnmountSegment(segment_id, client_id,
+                                               metrics_dec_capacity);
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -726,7 +741,9 @@ void MasterService::BatchEvict(double eviction_ratio) {
 }
 
 void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point, boost::hash<UUID>> client_ttl;
+    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
+                       boost::hash<UUID>>
+        client_ttl;
     while (client_monitor_running_) {
         auto now = std::chrono::steady_clock::now();
 
@@ -734,12 +751,7 @@ void MasterService::ClientMonitorFunc() {
         PodUUID pod_client_id;
         while (client_ping_queue_.pop(pod_client_id)) {
             UUID client_id = {pod_client_id.first, pod_client_id.second};
-            auto it = client_ttl.find(client_id);
-            if (it == client_ttl.end()) {
-                client_ttl[client_id] = now + std::chrono::seconds(CLIENT_LIVE_TTL_SEC);
-            } else {
-                it->second = now + std::chrono::seconds(CLIENT_LIVE_TTL_SEC);
-            }
+            client_ttl[client_id] = now + std::chrono::seconds(CLIENT_LIVE_TTL_SEC);
         }
 
         // Find out expired clients
@@ -755,9 +767,10 @@ void MasterService::ClientMonitorFunc() {
 
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
-            // Record which segments are unmounted for the commit phase
+            // Record which segments are unmounted, will be used in the commit
+            // phase.
             std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;           
+            std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
             {
                 // Lock client_mutex and segment_mutex
@@ -768,28 +781,34 @@ void MasterService::ClientMonitorFunc() {
                         ok_client_.erase(it);
                     }
                 }
-       
-                ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();                  
+
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
                 for (auto& client_id : expired_clients) {
                     std::vector<UUID> segments;
                     segment_access.GetClientSegments(client_id, segments);
                     for (auto& segment_id : segments) {
                         size_t metrics_dec_capacity = 0;
-                        if (segment_access.PrepareUnmountSegment(segment_id, metrics_dec_capacity) == ErrorCode::OK) {
+                        if (segment_access.PrepareUnmountSegment(
+                                segment_id, metrics_dec_capacity) ==
+                            ErrorCode::OK) {
                             unmount_segments.push_back(segment_id);
                             dec_capacities.push_back(metrics_dec_capacity);
                             client_ids.push_back(client_id);
                         }
                     }
                 }
-            } // Release the mutex before long-running step 2 and avoid deadlocks
+            }  // Release the mutex before long-running ClearInvalidHandles and
+               // avoid deadlocks
 
             if (!unmount_segments.empty()) {
                 ClearInvalidHandles();
 
-                ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(unmount_segments[i], client_ids[i], dec_capacities[i]);
+                    segment_access.CommitUnmountSegment(
+                        unmount_segments[i], client_ids[i], dec_capacities[i]);
                 }
             }
         }

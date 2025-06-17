@@ -1,17 +1,17 @@
 #pragma once
 
-#include <ostream>
-#include <unordered_map>
-#include <string>
-#include <vector>
-#include <shared_mutex>
-#include <string_view>
-#include <variant>
 #include <boost/functional/hash.hpp>
+#include <ostream>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <variant>
+#include <vector>
 
-#include "types.h"
-#include "allocator.h"
 #include "allocation_strategy.h"
+#include "allocator.h"
+#include "types.h"
 
 namespace mooncake {
 /**
@@ -56,21 +56,52 @@ class ScopedSegmentAccess {
      * @brief Acquires a lock on the segment mutex
      * @param mutex Reference to the segment mutex
      */
-    explicit ScopedSegmentAccess(SegmentManager* segment_manager, std::shared_mutex& mutex)
+    explicit ScopedSegmentAccess(SegmentManager* segment_manager,
+                                 std::shared_mutex& mutex)
         : segment_manager_(segment_manager), lock_(mutex) {}
 
+    /**
+     * @brief Mount a segment
+     */
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
 
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments, const UUID& client_id);
+    /**
+     * @brief Re-mount a segment. To avoid infinite remount trying, only the
+     * errors that may be solved by subsequent remount tryings are considered as
+     * errors. When encounters unsolvable errors, the segment will not be mounted
+     * while the return value will be OK.
+     */
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             const UUID& client_id);
 
-    ErrorCode PrepareUnmountSegment(const UUID& segment_id, size_t& metrics_dec_capacity);
+    /**
+     * @brief Prepare to unmount a segment by deleting its allocator
+     */
+    ErrorCode PrepareUnmountSegment(const UUID& segment_id,
+                                    size_t& metrics_dec_capacity);
 
-    ErrorCode CommitUnmountSegment(const UUID& segment_id, const UUID& client_id, const size_t& metrics_dec_capacity);
+    /**
+     * @brief Deleting the segment to complete the unmounting operation
+     */
+    ErrorCode CommitUnmountSegment(const UUID& segment_id,
+                                   const UUID& client_id,
+                                   const size_t& metrics_dec_capacity);
 
-    ErrorCode GetClientSegments(const UUID& client_id, std::vector<UUID>& segments) const;
+    /**
+     * @brief Get all the segments of a client
+     */
+    ErrorCode GetClientSegments(const UUID& client_id,
+                                std::vector<UUID>& segments) const;
 
+    /**
+     * @brief Get the names of all the segments
+     */
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
 
+    /**
+     * @brief Get the segment by name. If there are multiple segments with the
+     * same name, return the first one.
+     */
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
 
@@ -84,18 +115,19 @@ class ScopedSegmentAccess {
  */
 class ScopedAllocatorAccess {
    public:
-    explicit ScopedAllocatorAccess(std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>&
-        allocators_by_name,
-        std::vector<std::shared_ptr<BufferAllocator>>&
-        allocators,
+    explicit ScopedAllocatorAccess(
+        std::unordered_map<std::string,
+                           std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators_by_name,
+        std::vector<std::shared_ptr<BufferAllocator>>& allocators,
         std::shared_mutex& mutex)
-        : allocators_by_name_(allocators_by_name), 
+        : allocators_by_name_(allocators_by_name),
           allocators_(allocators),
           lock_(mutex) {}
 
     std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>& getAllocatorsByName() {
+                       std::vector<std::shared_ptr<BufferAllocator>>>&
+    getAllocatorsByName() {
         return allocators_by_name_;
     }
 
@@ -106,7 +138,7 @@ class ScopedAllocatorAccess {
    private:
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocator>>>&
-        allocators_by_name_;
+        allocators_by_name_;  // segment name -> allocators
     std::vector<std::shared_ptr<BufferAllocator>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;
 };
@@ -126,20 +158,21 @@ class SegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocators_by_name_, allocators_, segment_mutex_);
+        return ScopedAllocatorAccess(allocators_by_name_, allocators_,
+                                     segment_mutex_);
     }
 
    private:
-
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    // Each allocator is put into both of allocators_by_name_ and allocators_.
+    // These two containers only contain allocators whose segment status is OK.
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocator>>>
         allocators_by_name_;  // segment name -> allocators
-    std::vector<std::shared_ptr<BufferAllocator>>
-        allocators_;  // allocators
+    std::vector<std::shared_ptr<BufferAllocator>> allocators_;  // allocators
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
-        mounted_segments_; // segment_id -> mounted segment
+        mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
 

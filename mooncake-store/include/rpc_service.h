@@ -477,19 +477,22 @@ class WrappedMasterService {
         return response;
     }
 
-    ReMountSegmentResponse ReMountSegment(const std::vector<Segment>& segments, const UUID& client_id) {
+    ReMountSegmentResponse ReMountSegment(const std::vector<Segment>& segments,
+                                          const UUID& client_id) {
         ScopedVLogTimer timer(1, "ReMountSegment");
-        timer.LogRequest("segments_count=", segments.size(), ", client_id=", client_id);
+        timer.LogRequest("segments_count=", segments.size(),
+                         ", client_id=", client_id);
 
         // Increment request metric
-        // MasterMetricManager::instance().inc_mount_segment_requests();
+        MasterMetricManager::instance().inc_remount_segment_requests();
 
         ReMountSegmentResponse response;
-        response.error_code = master_service_.ReMountSegment(segments, client_id);
+        response.error_code =
+            master_service_.ReMountSegment(segments, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
-           // MasterMetricManager::instance().inc_mount_segment_failures();
+            MasterMetricManager::instance().inc_remount_segment_failures();
         }
 
         timer.LogResponseJson(response);
@@ -524,6 +527,10 @@ class WrappedMasterService {
         PingResponse response;
         response.error_code = master_service_.Ping(
             client_id, response.view_version, response.client_status);
+
+        if (response.error_code != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_ping_failures();
+        }
 
         timer.LogResponseJson(response);
         return response;
