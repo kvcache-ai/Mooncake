@@ -315,6 +315,64 @@ int DistributedObjectStore::allocateSlices(
     return 0;
 }
 
+int DistributedObjectStore::allocateBatchedSlices(
+    std::vector<std::string> &keys,
+    const std::unordered_map<std::string, std::span<const char>> &batches,
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        &batched_slices) {
+    if (batches.empty()) return -1;
+    for (const auto &item : batches) {
+        uint64_t offset = 0;
+        auto key = item.first;
+        auto value = item.second;
+        std::vector<Slice> slices;
+        while (offset < value.size()) {
+            auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;
+            }
+            memcpy(ptr, value.data() + offset, chunk_size);
+            slices.emplace_back(Slice{ptr, chunk_size});
+            offset += chunk_size;
+        }
+        keys.emplace_back(key);
+        batched_slices.emplace(key, std::move(slices));
+    }
+    return 0;
+}
+
+int DistributedObjectStore::allocateBatchedSlices(
+    const std::vector<std::string> &keys,
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        &batched_slices,
+    const mooncake::Client::BatchObjectInfo &batched_object_info,
+    std::unordered_map<std::string, uint64_t> &str_length_map) {
+    if (batched_object_info.batch_replica_list.empty()) return -1;
+    for (const auto &key : keys) {
+        auto object_info_it = batched_object_info.batch_replica_list.find(key);
+        if (object_info_it == batched_object_info.batch_replica_list.end()) {
+            LOG(ERROR) << "Key not found: " << key;
+            return 1;
+        }
+        // Get first replica
+        auto &replica = object_info_it->second[0];
+        uint64_t length = 0;
+        for (auto &handle : replica.buffer_descriptors) {
+            auto chunk_size = handle.size_;
+            assert(chunk_size <= kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;
+            }
+            batched_slices[key].emplace_back(Slice{ptr, chunk_size});
+            length += chunk_size;
+        }
+        str_length_map.emplace(key, length);
+    }
+    return 0;
+}
+
 char *DistributedObjectStore::exportSlices(
     const std::vector<mooncake::Slice> &slices, uint64_t length) {
     char *buf = new char[length + 1];
@@ -374,6 +432,36 @@ int DistributedObjectStore::put(const std::string &key,
         return toInt(error_code);
     }
 
+    return 0;
+}
+
+int DistributedObjectStore::put_batch(
+    const std::unordered_map<std::string, std::span<const char>> &batches) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+    std::vector<std::string> keys;
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        batched_slices;
+    int ret = allocateBatchedSlices(keys, batches, batched_slices);
+    if (ret) {
+        LOG(ERROR) << "Failed to allocate slices for put_batch operation";
+        return ret;
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ErrorCode error_code = client_->BatchPut(keys, batched_slices, config);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "BatchPut operation failed with error: "
+                   << toString(error_code);
+        return toInt(error_code);
+    }
+
+    for (auto &slice : batched_slices) {
+        freeSlices(slice.second);
+    }
     return 0;
 }
 
@@ -466,6 +554,76 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     return result;
 }
 
+std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
+    const std::vector<std::string> &keys) {
+    const auto kNullString = pybind11::bytes("\0", 0);
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return {kNullString};
+    }
+    std::unordered_set<std::string> seen;
+    for (const auto &key : keys) {
+        if (!seen.insert(key).second) {
+            LOG(ERROR) << "Duplicate key not supportted for Batch API, key: "
+                       << key;
+            return {kNullString};
+        }
+    }
+
+    std::vector<pybind11::bytes> results;
+    mooncake::Client::BatchObjectInfo batched_object_info;
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        batched_slices;
+    std::unordered_map<std::string, uint64_t> str_length_map;
+    {
+        py::gil_scoped_release release_gil;
+        ErrorCode error_code = client_->BatchQuery(keys, batched_object_info);
+        if (error_code != ErrorCode::OK) {
+                py::gil_scoped_acquire acquire_gil;
+                return {kNullString};
+        } else {
+            int ret = allocateBatchedSlices(
+                keys, batched_slices, batched_object_info, str_length_map);
+            if (ret) {
+                py::gil_scoped_acquire acquire_gil;
+                return {kNullString};
+            }
+            error_code =
+                client_->BatchGet(keys, batched_object_info, batched_slices);
+            if (error_code != ErrorCode::OK) {
+                py::gil_scoped_acquire acquire_gil;
+                return {kNullString};
+            }
+        }
+        for (const auto &key : keys) {
+            if (batched_slices[key].size() == 1 &&
+                batched_slices[key][0].size == str_length_map[key]) {
+                results.push_back(pybind11::bytes(
+                    static_cast<char *>(batched_slices[key][0].ptr),
+                    str_length_map[key]));
+            } else {
+                char *exported_str_ptr =
+                    exportSlices(batched_slices[key], str_length_map[key]);
+                if (!exported_str_ptr) {
+                    return {kNullString};
+                } else {
+                    results.push_back(
+                        pybind11::bytes(exported_str_ptr, str_length_map[key]));
+                    delete[] exported_str_ptr;
+                }
+            }
+        }
+        if (results.size() != keys.size()) {
+            LOG(ERROR) << "Results size does not match keys size";
+            return {kNullString};
+        }
+        for (auto &slice : batched_slices) {
+            freeSlices(slice.second);
+        }
+        return results;
+    }
+}
+
 int DistributedObjectStore::remove(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -521,6 +679,25 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     }
 
     return total_size;
+}
+
+std::unordered_map<std::string, bool> DistributedObjectStore::BatchIsExist(
+    const std::vector<std::string> &keys) {
+    std::unordered_map<std::string, bool> result_map;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return result_map;
+    }
+    const auto existence_map = client_->BatchIsExist(keys);
+    if (existence_map.size() != keys.size()) {
+        LOG(ERROR) << "Internal error: existence_map.size() is not equal to "
+                      "keys.size()";
+        return result_map;
+    }
+    for (const auto &[key, err] : existence_map) {
+        result_map[key] = (err == ErrorCode::OK);
+    }
+    return result_map;
 }
 
 // SliceBuffer implementation
@@ -648,6 +825,7 @@ PYBIND11_MODULE(store, m) {
         .def("setup", &DistributedObjectStore::setup)
         .def("init_all", &DistributedObjectStore::initAll)
         .def("get", &DistributedObjectStore::get)
+        .def("get_batch", &DistributedObjectStore::get_batch)
         .def("get_buffer", &DistributedObjectStore::get_buffer,
              py::call_guard<py::gil_scoped_release>(),
              py::return_value_policy::take_ownership)
@@ -656,6 +834,8 @@ PYBIND11_MODULE(store, m) {
         .def("remove_all", &DistributedObjectStore::removeAll,
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
+             py::call_guard<py::gil_scoped_release>())
+        .def("is_batch_exist", &DistributedObjectStore::BatchIsExist,
              py::call_guard<py::gil_scoped_release>())
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
@@ -669,27 +849,49 @@ PYBIND11_MODULE(store, m) {
                                           static_cast<char *>(info.ptr),
                                           static_cast<size_t>(info.size)));
              })
-        .def("put_parts", [](DistributedObjectStore &self,
-                             const std::string &key, py::args parts) {
-            // 1) Python buffer → span
-            std::vector<py::buffer_info> infos;
-            std::vector<std::span<const char>> spans;
-            infos.reserve(parts.size());
-            spans.reserve(parts.size());
+        .def("put_parts",
+             [](DistributedObjectStore &self, const std::string &key,
+                py::args parts) {
+                 // 1) Python buffer → span
+                 std::vector<py::buffer_info> infos;
+                 std::vector<std::span<const char>> spans;
+                 infos.reserve(parts.size());
+                 spans.reserve(parts.size());
 
-            for (auto &obj : parts) {
-                py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
-                infos.emplace_back(buf.request(false));
-                const auto &info = infos.back();
-                if (info.ndim != 1 || info.itemsize != 1)
-                    throw std::runtime_error("parts must be 1-D bytes-like");
+                 for (auto &obj : parts) {
+                     py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
+                     infos.emplace_back(buf.request(false));
+                     const auto &info = infos.back();
+                     if (info.ndim != 1 || info.itemsize != 1)
+                         throw std::runtime_error(
+                             "parts must be 1-D bytes-like");
 
-                spans.emplace_back(static_cast<const char *>(info.ptr),
-                                   static_cast<size_t>(info.size));
-            }
+                     spans.emplace_back(static_cast<const char *>(info.ptr),
+                                        static_cast<size_t>(info.size));
+                 }
 
-            // 2) Call C++ function
-            py::gil_scoped_release unlock;
-            return self.put_parts(key, spans);
-        });
+                 // 2) Call C++ function
+                 py::gil_scoped_release unlock;
+                 return self.put_parts(key, spans);
+             })
+        .def(
+            "put_batch",
+            [](DistributedObjectStore &self,
+               const std::unordered_map<std::string, py::bytes> &batches) {
+                std::unordered_map<std::string, std::span<const char>>
+                    batches_c;
+                std::vector<std::vector<char>> temp_buffers;
+                for (auto item : batches) {
+                    const std::string &key = item.first;
+                    const std::string &value = item.second;
+                    temp_buffers.emplace_back(value.begin(), value.end());
+
+                    batches_c.emplace(
+                        key, std::span<const char>(temp_buffers.back().data(),
+                                                   temp_buffers.back().size()));
+                }
+
+                py::gil_scoped_release release;
+                return self.put_batch(batches_c);
+            });
 }

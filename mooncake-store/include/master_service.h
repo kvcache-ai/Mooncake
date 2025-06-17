@@ -118,6 +118,13 @@ class MasterService {
     ErrorCode ExistKey(const std::string& key);
 
     /**
+     * @brief Check if an batch of objects exist
+     * @return existence map, key is the object name, value is the error code
+     */
+    std::unordered_map<std::string, ErrorCode> BatchExistKey(
+        const std::vector<std::string>& key);
+
+    /**
      * @brief Fetch all keys
      * @return ErrorCode::OK if exists
      */

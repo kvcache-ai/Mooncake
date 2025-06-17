@@ -424,6 +424,26 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < batch_sz; i++) {
+        test_client_->IsExist(keys[i]);
+    }
+    end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Time taken for single IsExist: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us";
+    start = std::chrono::high_resolution_clock::now();
+    std::unordered_map<std::string, ErrorCode> batched_existence =
+        test_client_->BatchIsExist(keys);
+    end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Time taken for BatchIsExist: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us";
+
+    start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < batch_sz; i++) {
         std::vector<Slice> slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());

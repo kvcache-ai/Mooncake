@@ -628,6 +628,14 @@ ErrorCode Client::IsExist(const std::string& key) {
     return response.error_code;
 }
 
+std::unordered_map<std::string, ErrorCode> Client::BatchIsExist(
+    const std::vector<std::string>& keys) {
+    const auto& [existence_map, error_code] =
+        master_client_.BatchExistKey(keys);
+    return error_code == ErrorCode::OK ? existence_map
+                                       : decltype(existence_map){};
+}
+
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, TransferRequest::OpCode op_code) {

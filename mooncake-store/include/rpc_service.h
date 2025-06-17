@@ -22,7 +22,11 @@ struct ExistKeyResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(ExistKeyResponse, error_code)
-
+struct BatchExistKeyResponse {
+    std::unordered_map<std::string, ErrorCode> existence_map;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(BatchExistKeyResponse, existence_map, error_code)
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replica_list;
     ErrorCode error_code = ErrorCode::OK;
@@ -258,6 +262,21 @@ class WrappedMasterService {
             MasterMetricManager::instance().inc_exist_key_failures();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchExistKeyResponse BatchExistKey(const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchExistKey");
+        timer.LogRequest("key count=", keys.size());
+        // Increment request metric
+        MasterMetricManager::instance().inc_exist_key_requests(keys.size());
+        BatchExistKeyResponse response;
+        response.existence_map = master_service_.BatchExistKey(keys);
+        // Track failures if needed
+        if (response.error_code != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_exist_key_failures(keys.size());
+        }
         timer.LogResponseJson(response);
         return response;
     }
@@ -518,6 +537,8 @@ inline void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);

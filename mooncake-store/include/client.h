@@ -191,6 +191,14 @@ class Client {
      */
     ErrorCode IsExist(const std::string& key);
 
+    /**
+     * @brief Checks if a batch of objects exist
+     * @param keys Keys to check
+     * @return existence map, true if exists, false if not
+     */
+    std::unordered_map<std::string, ErrorCode> BatchIsExist(
+        const std::vector<std::string>& keys);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method

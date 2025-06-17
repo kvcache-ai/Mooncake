@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <csignal>
 #include <mutex>
@@ -112,11 +113,15 @@ class DistributedObjectStore {
 
     int put(const std::string &key, std::span<const char> value);
 
+    int put_batch(const std::unordered_map<std::string, std::span<const char>> &batches);
+
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
     pybind11::bytes get(const std::string &key);
 
+    std::vector<pybind11::bytes> get_batch(
+        const std::vector<std::string> &keys);
     /**
      * @brief Get a buffer containing the data for a key
      * @param key Key to get data for
@@ -139,6 +144,14 @@ class DistributedObjectStore {
     int isExist(const std::string &key);
 
     /**
+     * @brief Check if a batch of objects exists
+     * @param keys Key to check
+     * @return Map of keys to booleans
+     */
+    std::unordered_map<std::string, bool> BatchIsExist(
+        const std::vector<std::string> &keys);
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't
@@ -159,6 +172,19 @@ class DistributedObjectStore {
 
     int allocateSlicesPacked(std::vector<mooncake::Slice> &slices,
                              const std::vector<std::span<const char>> &parts);
+
+    int allocateBatchedSlices(
+        const std::vector<std::string> &keys,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices,
+        const mooncake::Client::BatchObjectInfo &batched_object_info,
+        std::unordered_map<std::string, uint64_t> &str_length_map);
+
+    int allocateBatchedSlices(
+        std::vector<std::string> &keys,
+        const std::unordered_map<std::string, std::span<const char>> &batches,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices);
 
     char *exportSlices(const std::vector<mooncake::Slice> &slices,
                        uint64_t length);

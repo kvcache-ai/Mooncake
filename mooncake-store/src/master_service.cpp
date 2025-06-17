@@ -170,6 +170,15 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     return ErrorCode::OK;
 }
 
+std::unordered_map<std::string, ErrorCode> MasterService::BatchExistKey(
+    const std::vector<std::string>& keys) {
+    std::unordered_map<std::string, ErrorCode> result;
+    for (const auto& key : keys) {
+        result.emplace(key, ExistKey(key));
+    }
+    return result;
+}
+
 ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
     all_keys.clear();
     for(int i = 0; i < kNumShards; i++) {
