@@ -564,7 +564,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     std::unordered_set<std::string> seen;
     for (const auto &key : keys) {
         if (!seen.insert(key).second) {
-            LOG(ERROR) << "Duplicate key not supportted for Batch API, key: "
+            LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
                        << key;
             return {kNullString};
         }
