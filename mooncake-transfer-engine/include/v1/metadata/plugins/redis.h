@@ -33,16 +33,17 @@ class RedisMetadataPlugin : public MetadataPlugin {
 
     virtual Status connect(const std::string &endpoint) {
         if (connected_) {
-            return Status::Metadata("redis: connection has been established");
+            return Status::MetadataError(
+                "Redis connection already established" MSG_TAIL);
         }
         auto hostname_port = parseHostNameWithPort(endpoint);
         client_ =
             redisConnect(hostname_port.first.c_str(), hostname_port.second);
         if (!client_ || client_->err) {
-            std::string message = "redis: connect \'" + endpoint +
-                                  "\' failed: " + client_->errstr;
+            std::string message =
+                "Redis cannot connect \'" + endpoint + "\': " + client_->errstr;
             client_ = nullptr;
-            return Status::Metadata(message);
+            return Status::MetadataError(message + MSG_TAIL);
         }
         connected_ = true;
         return Status::OK();
@@ -58,18 +59,19 @@ class RedisMetadataPlugin : public MetadataPlugin {
 
     virtual Status get(const std::string &key, std::string &value) {
         if (!connected_) {
-            return Status::Metadata("redis: connection not available");
+            return Status::MetadataError(
+                "Redis connection not available" MSG_TAIL);
         }
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp || resp->type == REDIS_REPLY_ERROR) {
-            std::string message = "redis: get \'" + key + "\' failed: " +
-                                  (resp->str ? resp->str : "n/a");
-            return Status::Metadata(message);
+            std::string message = "Redis failed to get \'" + key + "\'" +
+                                  (resp->str ? resp->str : "");
+            return Status::MetadataError(message + MSG_TAIL);
         }
         if (!resp->str) {
             freeReplyObject(resp);
-            return Status::NotSuchKey();
+            return Status::InvalidEntry(key);
         }
         value = std::string(resp->str);
         freeReplyObject(resp);
@@ -78,28 +80,30 @@ class RedisMetadataPlugin : public MetadataPlugin {
 
     virtual Status set(const std::string &key, const std::string &value) {
         if (!connected_) {
-            return Status::Metadata("redis: connection not available");
+            return Status::MetadataError(
+                "Redis connection not available" MSG_TAIL);
         }
         redisReply *resp = (redisReply *)redisCommand(
             client_, "SET %s %s", key.c_str(), value.c_str());
         if (!resp || resp->type == REDIS_REPLY_ERROR) {
-            std::string message = "redis: set \'" + key + "\' failed: " +
-                                  (resp->str ? resp->str : "n/a");
-            return Status::Metadata(message);
+            std::string message = "Redis failed to set \'" + key + "\'" +
+                                  (resp->str ? resp->str : "");
+            return Status::MetadataError(message + MSG_TAIL);
         }
         return Status::OK();
     }
 
     virtual Status remove(const std::string &key) {
         if (!connected_) {
-            return Status::Metadata("redis: connection not available");
+            return Status::MetadataError(
+                "Redis connection not available" MSG_TAIL);
         }
         redisReply *resp =
             (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
         if (!resp || resp->type == REDIS_REPLY_ERROR) {
-            std::string message = "redis: remove \'" + key + "\' failed: " +
-                                  (resp->str ? resp->str : "n/a");
-            return Status::Metadata(message);
+            std::string message = "Redis failed to remove \'" + key + "\'" +
+                                  (resp->str ? resp->str : "");
+            return Status::MetadataError(message + MSG_TAIL);
         }
         return Status::OK();
     }

@@ -57,38 +57,26 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "TooManyRequests";
         case Code::kAddressNotRegistered:
             return "AddressNotRegistered";
-        case Code::kBatchBusy:
-            return "BatchBusy";
         case Code::kDeviceNotFound:
             return "DeviceNotFound";
-        case Code::kAddressOverlapped:
-            return "AddressOverlapped";
-        case Code::kDns:
-            return "Dns";
-        case Code::kSocket:
-            return "Socket";
+        case Code::kInvalidEntry:
+            return "InvalidEntry";
+        case Code::kInvalidMetadataType:
+            return "InvalidMetadataType";
+        case Code::kRdmaError:
+            return "RdmaError";
+        case Code::kCudaError:
+            return "CudaError";
+        case Code::kMetadataError:
+            return "MetadataError";
+        case Code::kRpcServiceError:
+            return "RpcServiceError";
         case Code::kMalformedJson:
             return "MalformedJson";
-        case Code::kRejectHandshake:
-            return "RejectHandshake";
-        case Code::kMetadata:
-            return "Metadata";
-        case Code::kEndpoint:
-            return "Endpoint";
-        case Code::kContext:
-            return "Context";
-        case Code::kNuma:
-            return "Numa";
-        case Code::kClock:
-            return "Clock";
-        case Code::kMemory:
-            return "Memory";
+        case Code::kInternalError:
+            return "InternalError";
         case Code::kNotImplemented:
             return "NotImplemented";
-        case Code::kNotSupportedTransport:
-            return "NotSupportedTransport";
-        case Code::kNotSuchKey:
-            return "NotSuchKey";
         default:
             LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
             return "UnknownCode";

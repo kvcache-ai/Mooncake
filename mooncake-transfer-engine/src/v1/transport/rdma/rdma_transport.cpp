@@ -41,11 +41,13 @@ Status RdmaTransport::install(
     std::shared_ptr<TransferMetadata> metadata_manager,
     std::shared_ptr<Topology> local_topology) {
     if (installed_) {
-        return Status::InvalidArgument("cannot install for multiple times");
+        return Status::InvalidArgument(
+            "RDMA transport has been installed" MSG_TAIL);
     }
 
     if (local_topology == nullptr || local_topology->getHcaList().empty()) {
-        return Status::DeviceNotFound("no RDMA device found in topology");
+        return Status::DeviceNotFound(
+            "No RDMA device found in topology" MSG_TAIL);
     }
 
     params_ = std::make_shared<RdmaParams>();
@@ -70,15 +72,15 @@ Status RdmaTransport::install(
     }
     if (local_topology_->empty()) {
         uninstall();
-        return Status::DeviceNotFound("no RDMA device detected in active");
+        return Status::DeviceNotFound(
+            "No RDMA device detected in active" MSG_TAIL);
     }
 
     allocateLocalSegmentID();
 
-    if (startHandshakeDaemon()) {
-        uninstall();
-        return Status::Metadata("failed to start handshake daemon thread");
-    }
+    metadata_manager_->setBootstrapRdmaCallback(
+        std::bind(&RdmaTransport::onSetupRdmaConnections, this,
+                  std::placeholders::_1, std::placeholders::_2));
 
     workers_ = std::make_unique<Workers>(this);
     workers_->start();
@@ -110,7 +112,8 @@ Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
 
 Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
-    if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
+    if (!rdma_batch)
+        return Status::InvalidArgument("Invalid RDMA sub-batch" MSG_TAIL);
     for (auto &slice : rdma_batch->slice_chain) {
         while (slice) {
             auto next = slice->next;
@@ -126,10 +129,11 @@ Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
 Status RdmaTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
-    if (!rdma_batch) return Status::InvalidArgument("invalid rdma sub batch");
+    if (!rdma_batch)
+        return Status::InvalidArgument("Invalid RDMA sub-batch" MSG_TAIL);
     if (request_list.size() + rdma_batch->task_list.size() >
         rdma_batch->max_size)
-        return Status::InvalidArgument("too many requests");
+        return Status::TooManyRequests("Exceed batch capacity" MSG_TAIL);
     const size_t block_size = params_->workers.block_size;
     RdmaSliceList slice_list;
     RdmaSlice *slice_tail = nullptr;
@@ -166,15 +170,15 @@ Status RdmaTransport::submitTransferTasks(
     return Status::OK();
 }
 
-TransferStatus RdmaTransport::getTransferStatus(SubBatchRef batch,
-                                                int task_id) {
+Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
+                                        TransferStatus &status) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
-    if (!rdma_batch) return TransferStatus{INVALID, 0};
     if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
-        return TransferStatus{INVALID, 0};
+        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
     }
     auto &task = rdma_batch->task_list[task_id];
-    return TransferStatus{task.status_word, task.transferred_bytes};
+    status = TransferStatus{task.status_word, task.transferred_bytes};
+    return Status::OK();
 }
 
 void RdmaTransport::queryOutstandingTasks(SubBatchRef batch,
@@ -194,58 +198,50 @@ Status RdmaTransport::registerLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {
     if (buffer_list.empty()) return Status::OK();
     if (buffer_list.size() == 1) {
-        int ret = registerSingleLocalMemory(buffer_list[0], true);
-        return ret == 0 ? Status::OK()
-                        : Status::Context("register local memory error");
+        return registerSingleLocalMemory(buffer_list[0], true);
     }
-    std::vector<std::future<int>> results;
+    std::vector<std::future<Status>> results;
     for (auto &buffer : buffer_list) {
         results.emplace_back(
-            std::async(std::launch::async, [this, buffer]() -> int {
+            std::async(std::launch::async, [this, buffer]() -> Status {
                 return registerSingleLocalMemory(buffer, false);
             }));
     }
     for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
-            LOG(WARNING) << "register local memory error: addr "
-                         << buffer_list[i].addr << " length "
-                         << buffer_list[i].length;
-        }
+        auto status = results[i].get();
+        if (!status.ok()) return status;
     }
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
     int ret = metadata_manager_->updateSegmentDesc(segment_desc);
-    return ret == 0 ? Status::OK()
-                    : Status::Context("update local segment descriptor error");
+    return ret == 0
+               ? Status::OK()
+               : Status::InternalError("update local segment descriptor error");
 }
 
 Status RdmaTransport::unregisterLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {
     if (buffer_list.empty()) return Status::OK();
     if (buffer_list.size() == 1) {
-        int ret = unregisterSingleLocalMemory(buffer_list[0], true);
-        return ret == 0 ? Status::OK()
-                        : Status::Context("unregister local memory error");
+        return unregisterSingleLocalMemory(buffer_list[0], true);
     }
-    std::vector<std::future<int>> results;
+    std::vector<std::future<Status>> results;
     for (auto &buffer : buffer_list) {
         results.emplace_back(
-            std::async(std::launch::async, [this, buffer]() -> int {
+            std::async(std::launch::async, [this, buffer]() -> Status {
                 return unregisterSingleLocalMemory(buffer, false);
             }));
     }
     for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
-            LOG(WARNING) << "unregister local memory error: addr "
-                         << buffer_list[i].addr << " length "
-                         << buffer_list[i].length;
-        }
+        auto status = results[i].get();
+        if (!status.ok()) return status;
     }
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
     int ret = metadata_manager_->updateSegmentDesc(segment_desc);
-    return ret == 0 ? Status::OK()
-                    : Status::Context("update local segment descriptor error");
+    return ret == 0
+               ? Status::OK()
+               : Status::InternalError("update local segment descriptor error");
 }
 
 void RdmaTransport::allocateLocalSegmentID() {
@@ -264,25 +260,27 @@ void RdmaTransport::allocateLocalSegmentID() {
     metadata_manager_->updateSegmentDesc(desc);
 }
 
-int RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
-                                             bool update_meta) {
-    int ret = local_buffer_manager_.addBuffer(buffer);
-    if (!update_meta || ret) return ret;
+Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
+                                                bool update_meta) {
+    local_buffer_manager_.addBuffer(buffer);
+    if (!update_meta) return Status::OK();
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    return metadata_manager_->updateSegmentDesc(segment_desc);
+    metadata_manager_->updateSegmentDesc(segment_desc);
+    return Status::OK();
 }
 
-int RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
-                                               bool update_meta) {
+Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
+                                                  bool update_meta) {
     AddressRange range;
     range.addr = buffer.addr;
     range.length = buffer.length;
-    int ret = local_buffer_manager_.removeBuffer(range);
-    if (!update_meta || ret) return ret;
+    local_buffer_manager_.removeBuffer(range);
+    if (!update_meta) return Status::OK();
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
-    return metadata_manager_->updateSegmentDesc(segment_desc);
+    metadata_manager_->updateSegmentDesc(segment_desc);
+    return Status::OK();
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -323,18 +321,5 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     return ERR_DEVICE_NOT_FOUND;
 }
 
-int RdmaTransport::startHandshakeDaemon() {
-    metadata_manager_->setBootstrapRdmaCallback(
-        std::bind(&RdmaTransport::onSetupRdmaConnections, this,
-                  std::placeholders::_1, std::placeholders::_2));
-    return 0;
-}
-
-int RdmaTransport::sendHandshake(const std::string &peer_server_name,
-                                 const HandShakeDesc &local_desc,
-                                 HandShakeDesc &peer_desc) {
-    return metadata_manager_->sendHandshake(peer_server_name, local_desc,
-                                            peer_desc);
-}
 }  // namespace v1
 }  // namespace mooncake

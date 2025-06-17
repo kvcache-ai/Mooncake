@@ -198,7 +198,7 @@ Status SegmentManager::openRemote(SegmentID &handle,
 Status SegmentManager::closeRemote(SegmentID handle) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("Invalid segment handle");
+        return Status::InvalidArgument("Invalid segment handle" MSG_TAIL);
     auto segment_name = id_to_name_map_[handle];
     name_to_id_map_.erase(segment_name);
     id_to_name_map_.erase(handle);
@@ -209,7 +209,7 @@ Status SegmentManager::closeRemote(SegmentID handle) {
 Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
     RWSpinlock::ReadGuard guard(lock_);
     if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("Invalid segment handle");
+        return Status::InvalidArgument("Invalid segment handle" MSG_TAIL);
 
     if (id_to_desc_map_.count(handle)) {
         desc = id_to_desc_map_[handle];
@@ -227,7 +227,7 @@ Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
     RWSpinlock::ReadGuard guard(lock_);
     if (!name_to_id_map_.count(segment_name))
-        return Status::InvalidArgument("Invalid segment handle");
+        return Status::InvalidArgument("Invalid segment handle" MSG_TAIL);
 
     auto handle = name_to_id_map_.at(segment_name);
     if (id_to_desc_map_.count(handle)) {
@@ -244,7 +244,7 @@ Status SegmentManager::getRemote(SegmentDescRef &desc,
 Status SegmentManager::invalidateRemote(SegmentID handle) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("invalid segment handle");
+        return Status::InvalidArgument("invalid segment handle" MSG_TAIL);
     if (id_to_desc_map_.count(handle)) id_to_desc_map_.erase(handle);
     return Status::OK();
 }
@@ -260,7 +260,9 @@ CentralMetadataStore::CentralMetadataStore(
 
 Status CentralMetadataStore::getSegmentDesc(SegmentDescRef &desc,
                                             const std::string &segment_name) {
-    if (!plugin_) return Status::Metadata("CentralMetadataStore not started");
+    if (!plugin_)
+        return Status::MetadataError(
+            "Central metadata store not started" MSG_TAIL);
     std::string value;
     desc = nullptr;
 
@@ -274,16 +276,20 @@ Status CentralMetadataStore::getSegmentDesc(SegmentDescRef &desc,
     }
 
     if (!desc)
-        return Status::MalformedJson("Failed to import segment from json");
+        return Status::MalformedJson(
+            "Failed to parse segment from json" MSG_TAIL);
     else
         return Status::OK();
 }
 
 Status CentralMetadataStore::putSegmentDesc(SegmentDescRef &desc) {
-    if (!plugin_) return Status::Metadata("CentralMetadataStore not started");
+    if (!plugin_)
+        return Status::MetadataError(
+            "CentralMetadataStore not started" MSG_TAIL);
     auto segmentJSON = exportSegmentDesc(*desc);
     if (segmentJSON.empty())
-        return Status::MalformedJson("Failed to import segment from json");
+        return Status::MalformedJson(
+            "Failed to import segment from json" MSG_TAIL);
     const std::string value = Json::FastWriter{}.write(segmentJSON);
     return plugin_->set(getFullMetadataKey(desc->name), value);
 }
@@ -295,11 +301,13 @@ Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
 
     RpcErrorCode err_code = client_->call(GetSegmentDesc, request, response);
     if (err_code) {
-        return Status::Metadata("RPC error found: " + std::to_string(err_code));
+        return Status::MetadataError(
+            "RPC error found: " + std::to_string(err_code) + MSG_TAIL);
     }
     auto value = std::string(response.data(), response.size());
     if (value.empty()) {
-        return Status::NotSuchKey();
+        return Status::InvalidEntry(std::string("Segment ") + segment_name +
+                                    "not found" + MSG_TAIL);
     }
     Json::Value peer_json;
     if (Json::Reader{}.parse(value, peer_json)) {
@@ -308,7 +316,8 @@ Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
     }
 
     if (!desc)
-        return Status::MalformedJson("Failed to import segment from json");
+        return Status::MalformedJson(
+            "Failed to import segment from json" MSG_TAIL);
     else
         return Status::OK();
 }
@@ -340,7 +349,7 @@ static Status importHandShakeDesc(const Json::Value &root,
         return Status::OK();
     } catch (std::exception &ex) {
         return Status::MalformedJson(
-            "Failed to import handshake message from json");
+            "Failed to import handshake message from json" MSG_TAIL);
     }
 }
 
@@ -356,13 +365,13 @@ Status deserializeHandShakeDesc(HandShakeDesc &desc, const RpcRawData &stream) {
     auto value = std::string(stream.data(), stream.size());
     if (value.empty())
         return Status::MalformedJson(
-            "Failed to import handshake message from json");
+            "Failed to import handshake message from json" MSG_TAIL);
     LOG(INFO) << value;
     Json::Value peer_json;
     if (Json::Reader{}.parse(value, peer_json))
         return importHandShakeDesc(peer_json, desc);
     return Status::MalformedJson(
-        "Failed to import handshake message from json");
+        "Failed to import handshake message from json" MSG_TAIL);
 }
 
 Status BootstrapRdmaClient::bootstrap(const std::string &segment_name,
@@ -377,7 +386,8 @@ Status BootstrapRdmaClient::bootstrap(const std::string &segment_name,
     RpcErrorCode err_code =
         client_->call(BootstrapRdma, request_raw, response_raw);
     if (err_code)
-        return Status::Metadata("RPC error found: " + std::to_string(err_code));
+        return Status::MetadataError(
+            "RPC error found: " + std::to_string(err_code) + MSG_TAIL);
 
     return deserializeHandShakeDesc(response, response_raw);
 }

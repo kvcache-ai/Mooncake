@@ -72,7 +72,8 @@ class RdmaTransport : public Transport {
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list);
 
-    virtual TransferStatus getTransferStatus(SubBatchRef batch, int task_id);
+    virtual Status getTransferStatus(SubBatchRef batch, int task_id,
+                                     TransferStatus &status);
 
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
@@ -86,22 +87,17 @@ class RdmaTransport : public Transport {
     virtual const char *getName() const { return "rdma"; }
 
    public:
-    int startHandshakeDaemon();
-
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc);
-
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);
 
    public:
     void allocateLocalSegmentID();
 
-    int registerSingleLocalMemory(const BufferEntry &buffer, bool update_meta);
+    Status registerSingleLocalMemory(const BufferEntry &buffer,
+                                     bool update_meta);
 
-    int unregisterSingleLocalMemory(const BufferEntry &buffer,
-                                    bool update_meta);
+    Status unregisterSingleLocalMemory(const BufferEntry &buffer,
+                                       bool update_meta);
 
    private:
     bool installed_;

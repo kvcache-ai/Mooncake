@@ -45,7 +45,8 @@ Status GdsTransport::install(std::string &local_segment_name,
                              std::shared_ptr<TransferMetadata> metadata_manager,
                              std::shared_ptr<Topology> local_topology) {
     if (installed_) {
-        return Status::InvalidArgument("cannot install for multiple times");
+        return Status::InvalidArgument(
+            "GDS transport has been installed" MSG_TAIL);
     }
 
     metadata_manager_ = metadata_manager;
@@ -100,35 +101,37 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
 
 Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
-    if (!gds_batch) return Status::InvalidArgument("invalid gds sub batch");
+    if (!gds_batch)
+        return Status::InvalidArgument("Invalid GDS sub-batch" MSG_TAIL);
     desc_pool_->freeCUfileDesc(gds_batch->desc_idx);
     delete gds_batch;
     batch = nullptr;
     return Status::OK();
 }
 
-TransferStatus GdsTransport::getTransferStatus(SubBatchRef batch, int task_id) {
+Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
+                                       TransferStatus &status) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)gds_batch->task_list.size()) {
-        return TransferStatus{INVALID, 0};
+        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
     }
     auto &task = gds_batch->task_list[task_id];
-    TransferStatus transfer_status = {.s = PENDING, .transferred_bytes = 0};
+    status = {.s = PENDING, .transferred_bytes = 0};
     auto [slice_id, slice_num] = gds_batch->task_to_slices[task_id];
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
         auto event =
             desc_pool_->getTransferStatus(gds_batch->desc_idx, slice_id);
-        transfer_status.s = from_cufile_transfer_status(event.status);
-        if (transfer_status.s == COMPLETED) {
-            transfer_status.transferred_bytes += event.ret;
+        status.s = from_cufile_transfer_status(event.status);
+        if (status.s == COMPLETED) {
+            status.transferred_bytes += event.ret;
         } else {
             break;
         }
     }
-    if (transfer_status.s == COMPLETED) {
+    if (status.s == COMPLETED) {
         task.is_finished = true;
     }
-    return transfer_status;
+    return Status::OK();
 }
 
 void GdsTransport::queryOutstandingTasks(SubBatchRef batch,
@@ -167,8 +170,7 @@ Status GdsTransport::submitTransferTasks(
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (gds_batch->task_list.size() + request_list.size() >
         gds_batch->max_size) {
-        return Status::InvalidArgument(
-            "GdsTransport: Exceed the limitation of capacity");
+        return Status::TooManyRequests("Exceed batch capacity" MSG_TAIL);
     }
 
     size_t task_id = gds_batch->task_list.size();

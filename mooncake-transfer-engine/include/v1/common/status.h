@@ -25,6 +25,16 @@
 #include <string_view>
 #include <utility>
 
+#define TYPE_CHECK(err)                                                  \
+    [[nodiscard]] bool Is##err() const { return Code::k##err == code_; } \
+    static Status err(std::string_view msg) {                            \
+        return Status(Code::k##err, msg);                                \
+    }
+
+#define STRINGIFY(x) #x
+#define MSG_TAIL \
+    ", called by " STRINGIFY(__func__) " at " __FILE__ ":" STRINGIFY(__LINE__)
+
 namespace mooncake {
 namespace v1 {
 class Status final {
@@ -32,25 +42,22 @@ class Status final {
     // The code of the status.
     enum class Code : uint16_t {
         kOk = 0,
+
         kInvalidArgument = 1,
         kTooManyRequests = 2,
         kAddressNotRegistered = 3,
-        kBatchBusy = 4,
-        kDeviceNotFound = 6,
-        kAddressOverlapped = 7,
-        kNotSupportedTransport = 8,
-        kNotSuchKey = 9,
-        kDns = 101,
-        kSocket = 102,
-        kMalformedJson = 103,
-        kRejectHandshake = 104,
-        kMetadata = 200,
-        kEndpoint = 201,
-        kContext = 202,
-        kNuma = 300,
-        kClock = 301,
-        kMemory = 302,
-        kNotImplemented = 999,
+        kDeviceNotFound = 4,
+        kInvalidEntry = 5,
+        kInvalidMetadataType = 6,
+
+        kRdmaError = 100,
+        kCudaError = 101,
+        kMetadataError = 131,
+        kRpcServiceError = 132,
+        kMalformedJson = 133,
+        kInternalError = 199,
+
+        kNotImplemented = 200,
         kMaxCode
     };
 
@@ -69,6 +76,9 @@ class Status final {
     Status(Status&& s);
     Status& operator=(Status&& s);
 
+    bool operator==(const Status& s) const;
+    bool operator!=(const Status& s) const;
+
     // Returns the stored status code.
     Code code() const { return code_; }
 
@@ -84,144 +94,27 @@ class Status final {
     // Returns true if the Status is OK.
     [[nodiscard]] bool ok() const { return Code::kOk == code_; }
 
-    // Returns true iff the status indicates an InvalidArgument error.
-    [[nodiscard]] bool IsInvalidArgument() const {
-        return Code::kInvalidArgument == code_;
-    }
+    // Return a status of an appropriate type.
+    static Status OK() { return Status(); }
 
-    // Returns true iff the status indicates a TooManyRequests error.
-    [[nodiscard]] bool IsTooManyRequests() const {
-        return Code::kTooManyRequests == code_;
-    }
+    TYPE_CHECK(InvalidArgument);
+    TYPE_CHECK(TooManyRequests);
+    TYPE_CHECK(AddressNotRegistered);
+    TYPE_CHECK(DeviceNotFound);
+    TYPE_CHECK(InvalidEntry);
+    TYPE_CHECK(InvalidMetadataType);
 
-    // Returns true iff the status indicates an AddressNotRegistered error.
-    [[nodiscard]] bool IsAddressNotRegistered() const {
-        return Code::kAddressNotRegistered == code_;
-    }
+    TYPE_CHECK(RdmaError);
+    TYPE_CHECK(CudaError);
+    TYPE_CHECK(MetadataError);
+    TYPE_CHECK(RpcServiceError);
+    TYPE_CHECK(MalformedJson);
+    TYPE_CHECK(InternalError);
 
-    // Returns true iff the status indicates a BatchBusy error.
-    [[nodiscard]] bool IsBatchBusy() const { return Code::kBatchBusy == code_; }
-
-    // Returns true iff the status indicates an DeviceNotFound error.
-    [[nodiscard]] bool IsDeviceNotFound() const {
-        return Code::kDeviceNotFound == code_;
-    }
-
-    // Returns true iff the status indicates an AddressOverlapped error.
-    [[nodiscard]] bool IsAddressOverlapped() const {
-        return Code::kAddressOverlapped == code_;
-    }
-
-    // Returns true iff the status indicates a dns error.
-    [[nodiscard]] bool IsDns() const { return Code::kDns == code_; }
-
-    // Returns true iff the status indicates an Socket error.
-    [[nodiscard]] bool IsSocket() const { return Code::kSocket == code_; }
-
-    // Returns true iff the status indicates a MalformedJson error.
-    [[nodiscard]] bool IsMalformedJson() const {
-        return Code::kMalformedJson == code_;
-    }
-
-    // Returns true iff the status indicates a RejectHandshake error.
-    [[nodiscard]] bool IsRejectHandshake() const {
-        return Code::kRejectHandshake == code_;
-    }
-
-    // Returns true iff the status indicates a Metadata error.
-    [[nodiscard]] bool IsMetadata() const { return Code::kMetadata == code_; }
-
-    // Returns true iff the status indicates an Endpoint error.
-    [[nodiscard]] bool IsEndpoint() const { return Code::kEndpoint == code_; }
-
-    // Returns true iff the status indicates a Context error.
-    [[nodiscard]] bool IsContext() const { return Code::kContext == code_; }
-
-    // Returns true iff the status indicates a Numa error.
-    [[nodiscard]] bool IsNuma() const { return Code::kNuma == code_; }
-
-    // Returns true iff the status indicates a Clock error.
-    [[nodiscard]] bool IsClock() const { return Code::kClock == code_; }
-
-    // Returns true iff the status indicates a Memory error.
-    [[nodiscard]] bool IsMemory() const { return Code::kMemory == code_; }
-
-    // Returns true iff the status indicates a NotImplemented error.
-    [[nodiscard]] bool IsNotImplemented() const {
-        return Code::kNotImplemented == code_;
-    }
-
-    // Returns true iff the status indicates a NotImplemented error.
-    [[nodiscard]] bool IsNotSupportedTransport() const {
-        return Code::kNotSupportedTransport == code_;
-    }
-
-    // Returns true iff the status indicates a NotSuchKey error.
-    [[nodiscard]] bool IsNotSuchKey() const {
-        return Code::kNotSuchKey == code_;
-    }
+    TYPE_CHECK(NotImplemented);
 
     // Return a combination of the error code name and message.
     std::string ToString() const;
-
-    bool operator==(const Status& s) const;
-    bool operator!=(const Status& s) const;
-
-    // Return a status of an appropriate type.
-    static Status OK() { return Status(); }
-    static Status InvalidArgument(std::string_view msg) {
-        return Status(Code::kInvalidArgument, msg);
-    }
-    static Status TooManyRequests(std::string_view msg) {
-        return Status(Code::kTooManyRequests, msg);
-    }
-    static Status AddressNotRegistered(std::string_view msg) {
-        return Status(Code::kAddressNotRegistered, msg);
-    }
-    static Status BatchBusy(std::string_view msg) {
-        return Status(Code::kBatchBusy, msg);
-    }
-    static Status DeviceNotFound(std::string_view msg) {
-        return Status(Code::kDeviceNotFound, msg);
-    }
-    static Status AddressOverlapped(std::string_view msg) {
-        return Status(Code::kAddressOverlapped, msg);
-    }
-    static Status Dns(std::string_view msg) { return Status(Code::kDns, msg); }
-    static Status Socket(std::string_view msg) {
-        return Status(Code::kSocket, msg);
-    }
-    static Status MalformedJson(std::string_view msg) {
-        return Status(Code::kMalformedJson, msg);
-    }
-    static Status RejectHandshake(std::string_view msg) {
-        return Status(Code::kRejectHandshake, msg);
-    }
-    static Status Metadata(std::string_view msg) {
-        return Status(Code::kMetadata, msg);
-    }
-    static Status Endpoint(std::string_view msg) {
-        return Status(Code::kEndpoint, msg);
-    }
-    static Status Context(std::string_view msg) {
-        return Status(Code::kContext, msg);
-    }
-    static Status Numa(std::string_view msg) {
-        return Status(Code::kNuma, msg);
-    }
-    static Status Clock(std::string_view msg) {
-        return Status(Code::kClock, msg);
-    }
-    static Status Memory(std::string_view msg) {
-        return Status(Code::kMemory, msg);
-    }
-    static Status NotImplemented(std::string_view msg) {
-        return Status(Code::kNotImplemented, msg);
-    }
-    static Status NotSupportedTransport(std::string_view msg) {
-        return Status(Code::kNotSupportedTransport, msg);
-    }
-    static Status NotSuchKey() { return Status(Code::kNotSuchKey, ""); }
 
     // Return a human-readable name of the 'code'.
     static std::string_view CodeToString(Code code);

@@ -49,10 +49,9 @@ class ShmTransport : public Transport {
 
     ~ShmTransport();
 
-    virtual Status install(
-        std::string &local_segment_name,
-        std::shared_ptr<TransferMetadata> metadata_manager,
-        std::shared_ptr<Topology> local_topology);
+    virtual Status install(std::string &local_segment_name,
+                           std::shared_ptr<TransferMetadata> metadata_manager,
+                           std::shared_ptr<Topology> local_topology);
 
     virtual Status uninstall();
 
@@ -63,7 +62,8 @@ class ShmTransport : public Transport {
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list);
 
-    virtual TransferStatus getTransferStatus(SubBatchRef batch, int task_id);
+    virtual Status getTransferStatus(SubBatchRef batch, int task_id,
+                                     TransferStatus &status);
 
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
@@ -83,8 +83,8 @@ class ShmTransport : public Transport {
 
     void *createSharedMemory(const std::string &path, size_t size);
 
-    int relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
-                                    uint64_t target_id);
+    Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
+                                       uint64_t target_id);
 
    private:
     bool installed_;

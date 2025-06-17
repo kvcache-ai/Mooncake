@@ -14,12 +14,6 @@
 
 #include "v1/transfer_engine.h"
 
-#include <fstream>
-#include <random>
-
-#include "v1/transport/rdma/rdma_transport.h"
-#include "v1/transport/shm/shm_transport.h"
-
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
 #include <ifaddrs.h>
@@ -27,6 +21,12 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
+
+#include <fstream>
+#include <random>
+
+#include "v1/transport/rdma/rdma_transport.h"
+#include "v1/transport/shm/shm_transport.h"
 
 #define CHECK_STATUS(cmd)                \
     do {                                 \
@@ -195,18 +195,20 @@ const std::string TransferEngine::getEthIP() const { return hostname_; }
 uint16_t TransferEngine::getEthPort() const { return port_; }
 
 Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
-    return Status::NotImplemented("not implement");
+    return Status::NotImplemented(
+        "exportLocalSegment not implemented" MSG_TAIL);
 }
 
 Status TransferEngine::importRemoteSegment(SegmentID &handle,
                                            const std::string &shared_handle) {
-    return Status::NotImplemented("not implement");
+    return Status::NotImplemented(
+        "importRemoteSegment not implemented" MSG_TAIL);
 }
 
 Status TransferEngine::openRemoteSegment(SegmentID &handle,
                                          const std::string &segment_name) {
     if (segment_name.empty())
-        return Status::InvalidArgument("invalid segment name");
+        return Status::InvalidArgument("Invalid segment name" MSG_TAIL);
     handle = metadata_->getSegmentID(segment_name);
     return Status::OK();
 }
@@ -254,7 +256,7 @@ BatchID TransferEngine::allocateBatch(size_t batch_size) {
 }
 
 Status TransferEngine::freeBatch(BatchID batch_id) {
-    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
     Batch *batch = (Batch *)(batch_id);
     std::lock_guard<std::mutex> lock(mutex_);
     deferred_free_batch_set_.push_back(batch);
@@ -295,7 +297,7 @@ TransportType TransferEngine::getTransportType(const Request &request) {
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request> &request_list) {
-    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
     Batch *batch = (Batch *)(batch_id);
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
@@ -325,18 +327,17 @@ Status TransferEngine::submitTransfer(
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
-    if (!batch_id) return Status::InvalidArgument("invalid batch id");
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
     Batch *batch = (Batch *)(batch_id);
     if (task_id >= batch->task_id_lookup.size())
-        return Status::InvalidArgument("invalid task id");
+        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
     auto [type, sub_task_id] = batch->task_id_lookup[task_id];
     auto transport = transport_list_[type];
     auto sub_batch = batch->sub_batch[type];
     if (!transport || !sub_batch) {
-        return Status::InvalidArgument("transport not available");
+        return Status::InvalidArgument("Transport not available" MSG_TAIL);
     }
-    status = transport->getTransferStatus(sub_batch, sub_task_id);
-    return Status::OK();
+    return transport->getTransferStatus(sub_batch, sub_task_id, status);
 }
 
 }  // namespace v1

@@ -57,22 +57,22 @@ class Transport {
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::NotImplemented(
-            "generic transport does not implement allocateSubBatch");
+            "allocateSubBatch not implemented" MSG_TAIL);
     }
 
     virtual Status freeSubBatch(SubBatchRef &batch) {
-        return Status::NotImplemented(
-            "generic transport does not implement freeSubBatch");
+        return Status::NotImplemented("freeSubBatch not implemented" MSG_TAIL);
     }
 
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list) {
         return Status::NotImplemented(
-            "generic transport does not implement submitTransferTasks");
+            "submitTransferTasks not implemented" MSG_TAIL);
     }
 
-    virtual TransferStatus getTransferStatus(SubBatchRef batch, int task_id) {
-        return TransferStatus{TransferStatusEnum::INVALID, 0};
+    virtual Status getTransferStatus(SubBatchRef batch, int task_id, TransferStatus &status) {
+        return Status::NotImplemented(
+            "getTransferStatus not implemented" MSG_TAIL);
     }
 
     virtual void queryOutstandingTasks(SubBatchRef batch,
@@ -81,13 +81,13 @@ class Transport {
     virtual Status registerLocalMemory(
         const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
-            "generic transport does not implement registerLocalMemory");
+            "registerLocalMemory not implemented" MSG_TAIL);
     }
 
     virtual Status unregisterLocalMemory(
         const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
-            "generic transport does not implement unregisterLocalMemory");
+            "unregisterLocalMemory not implemented" MSG_TAIL);
     }
 
     virtual const char *getName() const { return "<generic>"; }
