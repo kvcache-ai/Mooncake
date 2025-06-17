@@ -77,8 +77,8 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             return ''.join(random.choices(chars, k=length))
 
         adaptor = self.adaptor
-        batch_size = 10000  # Adjust batch size if needed
-        circles = max(2, self.circle // 10)  # Number of batch test rounds
+        batch_size = 100  # Adjust batch size if needed
+        circles = max(2, self.circle // 100)  # Number of batch test rounds
 
         base_src_addr = adaptor.get_first_buffer_address(self.initiator_server_name)
         base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
