@@ -21,6 +21,14 @@
 #include <string>
 #include <unordered_map>
 
+// error code of internal components
+#define ERR_DEVICE_NOT_FOUND (-6)
+#define ERR_SOCKET (-102)
+#define ERR_ENDPOINT (-201)
+#define ERR_CONTEXT (-202)
+#define ERR_NUMA (-300)
+#define ERR_CLOCK (-301)
+
 namespace mooncake {
 namespace v1 {
 

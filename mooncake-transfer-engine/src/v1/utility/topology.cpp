@@ -206,7 +206,7 @@ void Topology::clear() {
     resolved_matrix_.clear();
 }
 
-int Topology::discover(const std::vector<std::string> &filter) {
+Status Topology::discover(const std::vector<std::string> &filter) {
     matrix_.clear();
     auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
@@ -220,13 +220,14 @@ int Topology::discover(const std::vector<std::string> &filter) {
     return resolve();
 }
 
-int Topology::parse(const std::string &topology_json) {
+Status Topology::parse(const std::string &topology_json) {
     std::set<std::string> rnic_set;
     Json::Value root;
     Json::Reader reader;
 
     if (topology_json.empty() || !reader.parse(topology_json, root)) {
-        return ERR_MALFORMED_JSON;
+        return Status::MalformedJson(
+            "Unrecognized format of topology json" MSG_TAIL);
     }
 
     matrix_.clear();
@@ -245,7 +246,8 @@ int Topology::parse(const std::string &topology_json) {
             }
             matrix_[key] = topo_entry;
         } else {
-            return ERR_MALFORMED_JSON;
+            return Status::MalformedJson(
+                "Unrecognized format of topology json" MSG_TAIL);
         }
     }
 
@@ -267,30 +269,34 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
-    if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
-
+Status Topology::selectDevice(int &device_id, const std::string storage_type,
+                              int retry_count) {
+    if (resolved_matrix_.count(storage_type) == 0) {
+        auto msg = "No device found in storage type " + storage_type + MSG_TAIL;
+        return Status::DeviceNotFound(msg);
+    }
     auto &entry = resolved_matrix_[storage_type];
     if (retry_count == 0) {
         int rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())
-            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
+            device_id =
+                entry.preferred_hca[rand_value % entry.preferred_hca.size()];
         else
-            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+            device_id = entry.avail_hca[rand_value % entry.avail_hca.size()];
     } else {
         size_t index = (retry_count - 1) %
                        (entry.preferred_hca.size() + entry.avail_hca.size());
         if (index < entry.preferred_hca.size())
-            return entry.preferred_hca[index];
+            device_id = entry.preferred_hca[index];
         else {
             index -= entry.preferred_hca.size();
-            return entry.avail_hca[index];
+            device_id = entry.avail_hca[index];
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int Topology::resolve() {
+Status Topology::resolve() {
     resolved_matrix_.clear();
     hca_list_.clear();
     std::map<std::string, int> hca_id_map;
@@ -320,10 +326,10 @@ int Topology::resolve() {
             resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int Topology::disableDevice(const std::string &device_name) {
+Status Topology::disableDevice(const std::string &device_name) {
     for (auto &record : matrix_) {
         auto &preferred_hca = record.second.preferred_hca;
         auto preferred_hca_iter =

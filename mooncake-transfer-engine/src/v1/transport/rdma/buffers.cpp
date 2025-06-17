@@ -219,7 +219,7 @@ static inline int getAccessFlags(BufferVisibility visibility) {
     return access;
 }
 
-int LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
+Status LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range(buffer_entry.addr, buffer_entry.length);
     std::vector<AddressRange> reg_parts;
@@ -231,7 +231,9 @@ int LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
             if (!context) continue;
             auto mem_reg =
                 context->registerMemReg(to_reg.addr, to_reg.length, access);
-            if (!mem_reg) return ERR_CONTEXT;
+            if (!mem_reg)
+                return Status::RdmaError(
+                    "Failed to register memory region" MSG_TAIL);
             item.mem_reg_map[context] = mem_reg;
         }
         auto location = buffer_entry.location;
@@ -250,10 +252,10 @@ int LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
             buffer_entry.shm_offset +
             ((uint64_t)to_reg.addr - (uint64_t)buffer_entry.addr);
     }
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::removeBuffer(const AddressRange &range) {
+Status LocalBufferManager::removeBuffer(const AddressRange &range) {
     RWSpinlock::WriteGuard guard(lock_);
     std::vector<AddressRange> dereg_parts;
     manager_.remove(range, dereg_parts);
@@ -264,17 +266,19 @@ int LocalBufferManager::removeBuffer(const AddressRange &range) {
         }
         buffer_list_.erase(to_dereg);
     }
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::addDevice(RdmaContext *context) {
+Status LocalBufferManager::addDevice(RdmaContext *context) {
     RWSpinlock::WriteGuard guard(lock_);
     assert(topology_ && context);
     int index = 0;
     bool found = false;
     for (auto &device : topology_->getHcaList()) {
         if (device == context->name()) {
-            if (context_list_[index]) return ERR_CONTEXT;  // has added
+            if (context_list_[index])
+                return Status::InvalidArgument(
+                    "Context existed in local buffer manager" MSG_TAIL);
             context_list_[index] = context;
             found = true;
             break;
@@ -282,24 +286,26 @@ int LocalBufferManager::addDevice(RdmaContext *context) {
             index++;
         }
     }
-    if (!found) return ERR_CONTEXT;  // not matched item
+    if (!found) return Status::DeviceNotFound("Not matched device" MSG_TAIL);
     for (auto &buffer : buffer_list_) {
         auto &to_reg = buffer.second.entry;
         auto access = getAccessFlags(to_reg.visibility);
         if (buffer.second.mem_reg_map.count(context)) continue;
         auto mem_reg =
             context->registerMemReg(to_reg.addr, to_reg.length, access);
-        if (!mem_reg) return ERR_CONTEXT;
+        if (!mem_reg)
+            return Status::RdmaError(
+                "Failed to register memory region" MSG_TAIL);
         buffer.second.mem_reg_map[context] = mem_reg;
     }
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
+Status LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
     RWSpinlock::WriteGuard guard(lock_);
     assert(topology_ && context);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
-    if (iter == context_list_.end()) return 0;
+    if (iter == context_list_.end()) return Status::OK();
     for (auto &buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
         if (do_unreg)
@@ -307,10 +313,10 @@ int LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
         buffer.second.mem_reg_map.erase(context);
     }
     *iter = nullptr;
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::clear() {
+Status LocalBufferManager::clear() {
     RWSpinlock::WriteGuard guard(lock_);
     for (auto &buffer : buffer_list_) {
         for (auto &elem : buffer.second.mem_reg_map)
@@ -318,10 +324,10 @@ int LocalBufferManager::clear() {
     }
     buffer_list_.clear();
     context_list_.clear();
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::fillBufferDesc(
+Status LocalBufferManager::fillBufferDesc(
     std::shared_ptr<SegmentDesc> &segment_desc) {
     RWSpinlock::ReadGuard guard(lock_);
     auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
@@ -350,12 +356,12 @@ int LocalBufferManager::fillBufferDesc(
         }
         detail.buffers.push_back(buffer_desc);
     }
-    return 0;
+    return Status::OK();
 }
 
-int LocalBufferManager::query(const AddressRange &range,
-                              std::vector<BufferQueryResult> &result,
-                              int retry_count) {
+Status LocalBufferManager::query(const AddressRange &range,
+                                 std::vector<BufferQueryResult> &result,
+                                 int retry_count) {
     // TODO Read-friendly lock
     result.clear();
     auto lower = buffer_list_.begin();
@@ -364,19 +370,25 @@ int LocalBufferManager::query(const AddressRange &range,
         const auto &buffer = *it;
         auto intersect = buffer.first.intersect(range);
         if (intersect.empty()) continue;
-        int device_id =
-            topology_->selectDevice(buffer.second.entry.location, retry_count);
-        if (device_id < 0)
-            device_id = topology_->selectDevice(kWildcardLocation, retry_count);
-        if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
+        int device_id;
+        auto status = topology_->selectDevice(
+            device_id, buffer.second.entry.location, retry_count);
+        if (!status.ok())
+            status = topology_->selectDevice(device_id, kWildcardLocation,
+                                             retry_count);
+        if (!status.ok()) return status;
         auto context = context_list_[device_id];
-        if (!context) return ERR_ADDRESS_NOT_REGISTERED;
+        assert(context);
         auto mem_reg_id = buffer.second.mem_reg_map.at(context);
         auto keys = context->queryMemRegKey(mem_reg_id);
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
                                            keys.first, device_id});
     }
-    return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;
+    if (result.empty()) {
+        return Status::AddressNotRegistered(
+            "No matched buffer in given address range" MSG_TAIL);
+    }
+    return Status::OK();
 }
 
 const std::string LocalBufferManager::deviceName(int id) {
@@ -389,20 +401,20 @@ RemoteBufferManager::RemoteBufferManager() {}
 
 RemoteBufferManager::~RemoteBufferManager() {}
 
-int RemoteBufferManager::reload(SegmentID id,
-                                const std::shared_ptr<SegmentDesc> &desc) {
+void RemoteBufferManager::reload(SegmentID id,
+                                 const std::shared_ptr<SegmentDesc> &desc) {
     segment_desc_[id] = desc;
-    return 0;
 }
 
 bool RemoteBufferManager::valid(SegmentID id) {
     return segment_desc_.count(id);
 }
 
-int RemoteBufferManager::query(SegmentID id, const AddressRange &range,
-                               std::vector<BufferQueryResult> &result,
-                               int retry_count) {
-    if (!segment_desc_.count(id)) return ERR_INVALID_ARGUMENT;
+Status RemoteBufferManager::query(SegmentID id, const AddressRange &range,
+                                  std::vector<BufferQueryResult> &result,
+                                  int retry_count) {
+    if (!segment_desc_.count(id))
+        return Status::InvalidArgument("Invalid segment ID" MSG_TAIL);
     auto &detail = std::get<MemorySegmentDesc>(segment_desc_[id]->detail);
     auto &topo = detail.topology;
     result.clear();
@@ -410,14 +422,20 @@ int RemoteBufferManager::query(SegmentID id, const AddressRange &range,
         auto query_range = AddressRange{(void *)entry.addr, entry.length};
         auto intersect = query_range.intersect(range);
         if (intersect.empty()) continue;
-        int device_id = topo.selectDevice(entry.location, retry_count);
-        if (device_id < 0)
-            device_id = topo.selectDevice(kWildcardLocation, retry_count);
-        if (device_id < 0) return ERR_ADDRESS_NOT_REGISTERED;
+        int device_id;
+        auto status = topo.selectDevice(device_id, entry.location, retry_count);
+        if (!status.ok())
+            status =
+                topo.selectDevice(device_id, kWildcardLocation, retry_count);
+        if (!status.ok()) return status;
         result.push_back(BufferQueryResult{intersect.addr, intersect.length,
                                            entry.rkey[device_id], device_id});
     }
-    return result.empty() ? ERR_ADDRESS_NOT_REGISTERED : 0;
+    if (result.empty()) {
+        return Status::AddressNotRegistered(
+            "No matched buffer in given address range" MSG_TAIL);
+    }
+    return Status::OK();
 }
 
 const std::string RemoteBufferManager::segmentName(SegmentID id) {

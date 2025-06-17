@@ -44,7 +44,7 @@ Workers::~Workers() {
     if (running_) stop();
 }
 
-int Workers::start() {
+Status Workers::start() {
     if (!running_) {
         running_ = true;
         monitor_ = std::thread([this] { monitorThread(); });
@@ -55,11 +55,11 @@ int Workers::start() {
                 std::thread([this, id] { workerThread(id); });
         }
     }
-    return 0;
+    return Status::OK();
 }
 
-int Workers::stop() {
-    if (!running_) return 0;
+Status Workers::stop() {
+    if (!running_) return Status::OK();
     running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
         auto &worker = worker_context_[id];
@@ -69,7 +69,7 @@ int Workers::stop() {
     monitor_.join();
     delete[] worker_context_;
     worker_context_ = nullptr;
-    return 0;
+    return Status::OK();
 }
 
 struct UserThreadContext {
@@ -80,7 +80,7 @@ static std::atomic<int> g_next_tid(0);
 thread_local UserThreadContext tl_context;
 thread_local int tl_tid = g_next_tid.fetch_add(1);
 
-int Workers::submit(RdmaSliceList &slice_list) {
+Status Workers::submit(RdmaSliceList &slice_list) {
     auto &remote_buffer = tl_context.remote_buffer[this];
     auto &worker = worker_context_[tl_tid % num_workers_];
     RdmaSlice *slice = slice_list.first;
@@ -90,10 +90,12 @@ int Workers::submit(RdmaSliceList &slice_list) {
         // TODO Hotspot Here!!!
         auto target_id = slice->task->request.target_id;
         std::vector<BufferQueryResult> local, remote;
-        int ret = transport_->local_buffer_manager_.query(
+        auto status = transport_->local_buffer_manager_.query(
             AddressRange{slice->source_addr, slice->length}, local,
             slice->retry_count);
-        if (ret) {
+        if (!status.ok()) {
+            LOG(ERROR) << "[TE Worker] Detected asynchronous error: "
+                       << status.ToString();
             markSliceFailed(slice);
             continue;
         }
@@ -105,11 +107,14 @@ int Workers::submit(RdmaSliceList &slice_list) {
                 continue;
             }
             remote_buffer.reload(target_id, desc);
+        
         }
-        ret = remote_buffer.query(
+        status = remote_buffer.query(
             target_id, AddressRange{(void *)slice->target_addr, slice->length},
             remote, slice->retry_count);
-        if (ret) {
+        if (!status.ok()) {
+            LOG(ERROR) << "[TE Worker] Detected asynchronous error: "
+                       << status.ToString();
             markSliceFailed(slice);
             continue;
         }
@@ -125,17 +130,19 @@ int Workers::submit(RdmaSliceList &slice_list) {
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         worker.notifyIfNeeded();
     }
-    return 0;
+    return Status::OK();
 }
 
-int Workers::submit(RdmaSlice *slice) {
+Status Workers::submit(RdmaSlice *slice) {
     RdmaSliceList slice_list;
     slice_list.first = slice;
     slice_list.num_slices = 1;
     return submit(slice_list);
 }
 
-int Workers::cancel(RdmaSliceList &slice_list) { return ERR_NOT_IMPLEMENTED; }
+Status Workers::cancel(RdmaSliceList &slice_list) {
+    return Status::NotImplemented("cancel not implemented" MSG_TAIL);
+}
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto context = transport_->context_set_[path.local_device_id].get();

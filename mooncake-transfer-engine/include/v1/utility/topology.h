@@ -65,29 +65,29 @@ class Topology {
 
     void clear();
 
-    int discover() {
+    Status discover() {
         std::vector<std::string> filter;
         return discover(filter);
     }
 
-    int discover(const std::vector<std::string> &filter);
+    Status discover(const std::vector<std::string> &filter);
 
-    int parse(const std::string &topology_json);
+    Status parse(const std::string &topology_json);
 
-    int disableDevice(const std::string &device_name);
+    Status disableDevice(const std::string &device_name);
 
     std::string toString() const;
 
     Json::Value toJson() const;
 
-    int selectDevice(const std::string storage_type, int retry_count = 0);
+    Status selectDevice(int &device_id, const std::string storage_type, int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
     const std::vector<std::string> &getHcaList() const { return hca_list_; }
 
    private:
-    int resolve();
+    Status resolve();
 
    private:
     TopologyMatrix matrix_;

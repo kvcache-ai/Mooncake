@@ -262,7 +262,8 @@ void RdmaTransport::allocateLocalSegmentID() {
 
 Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
                                                 bool update_meta) {
-    local_buffer_manager_.addBuffer(buffer);
+    Status status = local_buffer_manager_.addBuffer(buffer);
+    if (!status.ok()) return status;
     if (!update_meta) return Status::OK();
     auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     local_buffer_manager_.fillBufferDesc(segment_desc);
@@ -286,19 +287,26 @@ Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name))
-        return ERR_INVALID_ARGUMENT;
+    if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name)) {
+        local_desc.reply_msg =
+            "Unable to find RDMA device " + peer_desc.peer_nic_path;
+        return ERR_ENDPOINT;
+    }
+
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
-    if (!endpoint) return ERR_ENDPOINT;
+    if (!endpoint) {
+        local_desc.reply_msg = "Unable to create endpoint object";
+        return ERR_ENDPOINT;
+    }
+
     auto peer_nic_path_ = peer_desc.local_nic_path;
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
         local_desc.reply_msg = "Parse peer nic path failed: " + peer_nic_path_;
-        LOG(ERROR) << local_desc.reply_msg;
-        return ERR_INVALID_ARGUMENT;
+        return ERR_ENDPOINT;
     }
 
     local_desc.local_nic_path =
@@ -315,10 +323,8 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                 return endpoint->configurePeer(
                     nic.gid, nic.lid, peer_desc.qp_num, &local_desc.reply_msg);
     }
-    local_desc.reply_msg =
-        "Peer nic not found in that server: " + peer_nic_path_;
-    LOG(ERROR) << local_desc.reply_msg;
-    return ERR_DEVICE_NOT_FOUND;
+    local_desc.reply_msg = "Unable to find RDMA device " + peer_nic_path_;
+    return ERR_ENDPOINT;
 }
 
 }  // namespace v1

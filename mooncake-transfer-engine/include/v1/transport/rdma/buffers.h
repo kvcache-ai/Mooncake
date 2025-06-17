@@ -114,20 +114,20 @@ class LocalBufferManager {
         context_list_.resize(topology->getHcaList().size(), nullptr);
     }
 
-    int addBuffer(const BufferEntry &buffer_entry);
+    Status addBuffer(const BufferEntry &buffer_entry);
 
-    int removeBuffer(const AddressRange &range);
+    Status removeBuffer(const AddressRange &range);
 
-    int addDevice(RdmaContext *context);
+    Status addDevice(RdmaContext *context);
 
-    int removeDevice(RdmaContext *context, bool do_unreg = true);
+    Status removeDevice(RdmaContext *context, bool do_unreg = true);
 
-    int clear();
+    Status clear();
 
-    int fillBufferDesc(std::shared_ptr<SegmentDesc> &segment_desc);
+    Status fillBufferDesc(std::shared_ptr<SegmentDesc> &segment_desc);
 
-    int query(const AddressRange &range, std::vector<BufferQueryResult> &result,
-              int retry_count = 0);
+    Status query(const AddressRange &range,
+                 std::vector<BufferQueryResult> &result, int retry_count = 0);
 
     const std::string deviceName(int id);
 
@@ -151,11 +151,11 @@ class RemoteBufferManager {
 
     ~RemoteBufferManager();
 
-    int reload(SegmentID id, const std::shared_ptr<SegmentDesc> &desc);
+    void reload(SegmentID id, const std::shared_ptr<SegmentDesc> &desc);
 
     bool valid(SegmentID id);
 
-    int query(SegmentID id, const AddressRange &range,
+    Status query(SegmentID id, const AddressRange &range,
               std::vector<BufferQueryResult> &result, int retry_count = 0);
 
     const std::string segmentName(SegmentID id);

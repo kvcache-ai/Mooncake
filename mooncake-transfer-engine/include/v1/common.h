@@ -15,10 +15,9 @@
 #ifndef TEV1_COMMON_H
 #define TEV1_COMMON_H
 
+#include "v1/common/types.h"
 #include "v1/common/common.h"
 #include "v1/common/config.h"
-#include "v1/common/error.h"
 #include "v1/common/status.h"
-#include "v1/common/types.h"
 
 #endif // TEV1_COMMON_H

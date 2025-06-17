@@ -81,10 +81,6 @@ int RdmaEndPoint::enable() {
     CHECK_STATUS_NOT(EP_UNINIT);
     qp_list_.resize(params_->qp_mul_factor);
     wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor];
-    if (!wr_depth_list_) {
-        disable();
-        return ERR_MEMORY;
-    }
 
     for (int i = 0; i < params_->qp_mul_factor; ++i) {
         wr_depth_list_[i].value = 0;
@@ -164,12 +160,13 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
     RWSpinlock::WriteGuard guard(ep_lock_);
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
-            "[ERR-01] Inconsistent qp_mul_factor detected: local (expected) " +
+            "[ERR-01] Inconsistent qp_mul_factor: local (expected) " +
             std::to_string(qp_list_.size()) + ", peer " +
             std::to_string(peer_qp_num_list.size());
-        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
+        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
+                   << message;
         if (reply_msg) *reply_msg = message;
-        return ERR_INVALID_ARGUMENT;
+        return ERR_ENDPOINT;
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
@@ -250,8 +247,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     RWSpinlock::ReadGuard guard(ep_lock_);
     CHECK_STATUS(EP_READY);
-    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
-        return ERR_INVALID_ARGUMENT;
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size()) return 0;
     ibv_recv_wr wr, *bad_wr;
     memset(&wr, 0, sizeof(ibv_recv_wr));
     wr.wr_id = id;
@@ -330,10 +326,11 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         std::string message =
-            "[ERR-02] Failed to modify QP to INIT, check local context port "
-            "num, error code " +
+            "[ERR-02] Failed to modify QP's state to INIT, check local context "
+            "port num. Error code: " +
             std::to_string(ret);
-        LOG(ERROR) << "RdmaEndPoint Handshake: " << message;
+        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
+                   << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -372,10 +369,12 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
         std::string message =
-            "[ERR-03] Failed to modify QP to RTR, check mtu, gid, peer lid, "
-            "peer qp num, and RDMA connectivity. error code " +
+            "[ERR-03] Failed to modify QP to RTR, check the connectivity "
+            "between two NICs and detected value of MTU, GID, LID. "
+            "Error code: " +
             std::to_string(ret);
-        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
+        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
+                   << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }
@@ -394,9 +393,10 @@ int RdmaEndPoint::setupSingleQueuePair(int qp_index,
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         std::string message =
-            "[ERR-04] Failed to modify QP to RTS, error code " +
+            "[ERR-04] Failed to modify QP to RTS. Error code: " +
             std::to_string(ret);
-        LOG(ERROR) << "RdmaEndPoint Failure: Handshake: " << message;
+        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
+                   << message;
         if (reply_msg) *reply_msg = message;
         return ERR_ENDPOINT;
     }

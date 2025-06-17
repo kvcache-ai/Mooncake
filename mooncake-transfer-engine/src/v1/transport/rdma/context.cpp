@@ -352,7 +352,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
     if (!devices || num_devices <= 0) {
         PLOG(ERROR) << "ibv_get_device_list";
-        return ERR_DEVICE_NOT_FOUND;
+        return ERR_CONTEXT;
     }
 
     for (int i = 0; i < num_devices; ++i) {
@@ -368,7 +368,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
     ibv_free_device_list(devices);
     if (!context) {
         LOG(ERROR) << "No matched device found in this server: " << device_name;
-        return ERR_DEVICE_NOT_FOUND;
+        return ERR_CONTEXT;
     }
 
     ibv_port_attr port_attr;

@@ -30,8 +30,6 @@
 #include <iomanip>
 #include <sstream>
 
-#include "v1/common/error.h"
-
 #if defined(__x86_64__)
 #include <immintrin.h>
 #define PAUSE() _mm_pause()

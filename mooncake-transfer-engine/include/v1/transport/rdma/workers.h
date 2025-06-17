@@ -85,15 +85,15 @@ class Workers {
 
     ~Workers();
 
-    int start();
+    Status start();
 
-    int stop();
+    Status stop();
 
-    int submit(RdmaSlice *slice);
+    Status submit(RdmaSlice *slice);
 
-    int submit(RdmaSliceList &slice_list);
+    Status submit(RdmaSliceList &slice_list);
 
-    int cancel(RdmaSliceList &slice_list);
+    Status cancel(RdmaSliceList &slice_list);
 
    private:
     using Task = std::function<void()>;
