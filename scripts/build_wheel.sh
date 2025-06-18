@@ -38,6 +38,7 @@ fi
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
 
 echo "Building wheel package..."
