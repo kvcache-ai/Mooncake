@@ -47,6 +47,11 @@ echo "Verifying mooncake_master entry point..."
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
 echo "Success: mooncake_master entry point found"
 
+echo "Verifying transfer_engine_bench entry point..."
+# Check if the transfer_engine_bench entry point is installed and executable
+which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
+echo "Success: transfer_engine_bench entry point found"
+
 cd ..
 
 echo "Installation test completed successfully!"
