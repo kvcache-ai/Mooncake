@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef MEMORY_POOL_H_
-#define MEMORY_POOL_H_
+#ifndef SLAB_H_
+#define SLAB_H_
 
 #include <list>
 #include <mutex>
@@ -21,40 +21,55 @@
 namespace mooncake {
 namespace v1 {
 
-template <class T>
-class MemoryPool {
+class SlabBase {
    public:
-    static MemoryPool &Get();
+    SlabBase(size_t block_size) : block_size_(block_size) {}
 
-   public:
-    MemoryPool() {}
-
-    ~MemoryPool() {
-        for (auto entry : alloc_list_) delete entry;
+    ~SlabBase() {
+        for (auto entry : alloc_list_) free(entry);
         alloc_list_.clear();
         free_list_.clear();
     }
 
-    T *allocate();
+    void *allocate();
 
-    void deallocate(T *&object);
+    void deallocate(void *object);
 
     struct ThreadLocal {
-        std::list<T> free_list;
+        std::list<void *> free_list;
     };
 
    private:
+    const size_t block_size_;
     std::mutex mutex_;
-    std::list<T *> free_list_;
-    std::list<T *> alloc_list_;
+    std::list<void *> free_list_;
+    std::list<void *> alloc_list_;
 
     static const size_t kMaxFreeListSizeInThread = 128;
     static const size_t kAllocateBatchSize = 128;
+};
 
-    MemoryPool(const MemoryPool &) = delete;
-    MemoryPool &operator=(const MemoryPool &) = delete;
+template <class T>
+class Slab {
+   public:
+    static Slab &Get() {
+        static Slab<T> g_slice;
+        return g_slice;
+    }
+
+   public:
+    Slab() : base(sizeof(T)) {}
+
+    virtual ~Slab() {}
+
+    T *allocate() { return (T *)base.allocate(); }
+
+    void deallocate(T *object) { return base.deallocate(object); }
+
+   private:
+    SlabBase base;
 };
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // MEMORY_POOL_H_
+#endif  // SLAB_H_

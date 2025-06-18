@@ -45,6 +45,8 @@ class RdmaCQ {
 
     int getQuota() const { return cqe_now_; }
 
+    int maxCqe() const { return cqe_limit_; }
+
     bool empty() const { return cqe_now_ == 0; }
 
     int poll(int num_entries, ibv_wc *wc);

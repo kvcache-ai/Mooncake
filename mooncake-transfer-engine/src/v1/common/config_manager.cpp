@@ -36,8 +36,8 @@ Status ConfigManager::loadConfig(const std::filesystem::path& config_path) {
             return Status::InvalidArgument(msg);
         }
     } catch (const std::exception& e) {
-        std::string msg = "Detected C++ exception: " + 
-            std::string(e.what()) + LOC_MARK;
+        std::string msg =
+            "Detected C++ exception: " + std::string(e.what()) + LOC_MARK;
         return Status::InternalError(msg);
     }
 }
@@ -63,27 +63,5 @@ const Json::Value* ConfigManager::findValue(const std::string& key_path) const {
 
     return nullptr;
 }
-
-template <typename T>
-T ConfigManager::get(const std::string& key_path,
-                     const T& default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val->isConvertibleTo(Json::ValueType::intValue)) {
-                return val->asInt();
-            } else if (val->isConvertibleTo(Json::ValueType::realValue)) {
-                return val->asFloat();
-            } else if (val->isConvertibleTo(Json::ValueType::booleanValue)) {
-                return val->asBool();
-            } else if (val->isString()) {
-                return val->asString();
-            }
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-}
-}
+}  // namespace v1
+}  // namespace mooncake

@@ -1,4 +1,4 @@
-// Copyright 2025 KVCache.AI
+// Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,33 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/transport/rdma/slice.h"
+#include "v1/common/slab.h"
 
-#include <cassert>
+#include <unordered_map>
 
 namespace mooncake {
 namespace v1 {
 
-thread_local RdmaSliceStorage::ThreadLocal tl_slice;
+thread_local std::unordered_map<SlabBase *, SlabBase::ThreadLocal> tl_slice_set;
 
-RdmaSliceStorage& RdmaSliceStorage::Get() {
-    static RdmaSliceStorage g_slice;
-    return g_slice;
-}
-
-RdmaSliceStorage::RdmaSliceStorage() {}
-
-RdmaSliceStorage::~RdmaSliceStorage() {
-    for (auto entry : alloc_list_) delete entry;
-    alloc_list_.clear();
-    free_list_.clear();
-}
-
-RdmaSlice* RdmaSliceStorage::allocate() {
+void *SlabBase::allocate() {
+    auto &tl_slice = tl_slice_set[this];
     if (!tl_slice.free_list.empty()) {
-        RdmaSlice* slice = tl_slice.free_list.front();
+        void *object = tl_slice.free_list.front();
         tl_slice.free_list.pop_front();
-        return slice;
+        return object;
     }
 
     std::lock_guard<std::mutex> global_lock(mutex_);
@@ -51,25 +39,27 @@ RdmaSlice* RdmaSliceStorage::allocate() {
     }
 
     if (tl_slice.free_list.empty()) {
-        RdmaSlice* slices = new RdmaSlice[kAllocateBatchSize];
-        alloc_list_.push_back(slices);
+        void *slab = malloc(kAllocateBatchSize * block_size_);
+        if (!slab) return nullptr;
+        alloc_list_.push_back(slab);
         for (size_t i = 0; i < kAllocateBatchSize; ++i)
-            tl_slice.free_list.push_back(&slices[i]);
+            tl_slice.free_list.push_back((char *)slab + i * block_size_);
     }
 
-    RdmaSlice* slice = tl_slice.free_list.front();
+    void *object = tl_slice.free_list.front();
     tl_slice.free_list.pop_front();
-    return slice;
+    return object;
 }
 
-void RdmaSliceStorage::deallocate(RdmaSlice* slice) {
-    tl_slice.free_list.push_back(slice);
+void SlabBase::deallocate(void *object) {
+    auto &tl_slice = tl_slice_set[this];
+    tl_slice.free_list.push_back(object);
     if (tl_slice.free_list.size() > kMaxFreeListSizeInThread &&
         mutex_.try_lock()) {
         while (!tl_slice.free_list.empty()) {
-            RdmaSlice* slice = tl_slice.free_list.back();
+            auto target = tl_slice.free_list.back();
             tl_slice.free_list.pop_back();
-            free_list_.push_back(slice);
+            free_list_.push_back(target);
         }
         mutex_.unlock();
     }

@@ -67,34 +67,8 @@ struct RdmaSlice {
     bool failed = false;
 };
 
-class RdmaSliceStorage {
-   public:
-    static RdmaSliceStorage &Get();
+using RdmaSliceStorage = Slab<RdmaSlice>;
 
-   public:
-    RdmaSliceStorage();
-
-    ~RdmaSliceStorage();
-
-    RdmaSlice *allocate();
-
-    void deallocate(RdmaSlice *slice);
-
-    struct ThreadLocal {
-        std::list<RdmaSlice *> free_list;
-    };
-
-   private:
-    std::mutex mutex_;
-    std::list<RdmaSlice *> free_list_;
-    std::list<RdmaSlice *> alloc_list_;
-
-    static const size_t kMaxFreeListSizeInThread = 128;
-    static const size_t kAllocateBatchSize = 128;
-
-    RdmaSliceStorage(const RdmaSliceStorage &) = delete;
-    RdmaSliceStorage &operator=(const RdmaSliceStorage &) = delete;
-};
 }  // namespace v1
 }  // namespace mooncake
 

@@ -197,7 +197,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list) {
     CHECK_STATUS(EP_READY);
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count =
-        std::min(int(globalConfig().max_cqe) - cq_->getQuota(),
+        std::min(cq_->maxCqe() - cq_->getQuota(),
                  std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,
                           (int)slice_list.size()));
     int sge_count = wr_count * kSgeEntries;
