@@ -35,7 +35,7 @@ Status AsioRpcServer::start(uint16_t &port) {
 
     if (running_)
         return Status::InvalidArgument(
-            "Builtin RPC server is already started" MSG_TAIL);
+            "Builtin RPC server is already started" LOC_MARK);
 
     for (int retry = 0; retry < kMaxRetry; ++retry) {
         if (port == 0) port = kStartPort + SimpleRandom::Get().next(kPortRange);
@@ -63,7 +63,7 @@ Status AsioRpcServer::start(uint16_t &port) {
         }
     }
 
-    return Status::RpcServiceError("No available tcp port" MSG_TAIL);
+    return Status::RpcServiceError("No available tcp port" LOC_MARK);
 }
 
 Status AsioRpcServer::stop() {

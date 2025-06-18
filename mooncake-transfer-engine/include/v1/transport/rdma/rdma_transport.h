@@ -60,7 +60,7 @@ class RdmaTransport : public Transport {
     ~RdmaTransport();
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<TransferMetadata> metadata_manager,
+                           std::shared_ptr<MetadataService> metadata,
                            std::shared_ptr<Topology> local_topology);
 
     virtual Status uninstall();
@@ -87,8 +87,8 @@ class RdmaTransport : public Transport {
     virtual const char *getName() const { return "rdma"; }
 
    public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+    int onSetupRdmaConnections(const BootstrapDesc &peer_desc,
+                               BootstrapDesc &local_desc);
 
    public:
     void allocateLocalSegmentID();
@@ -103,7 +103,7 @@ class RdmaTransport : public Transport {
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<TransferMetadata> metadata_manager_;
+    std::shared_ptr<MetadataService> metadata_;
     LocalBufferManager local_buffer_manager_;
     RdmaContextSet context_set_;
     std::unordered_map<std::string, int> context_name_lookup_;

@@ -227,7 +227,7 @@ Status Topology::parse(const std::string &topology_json) {
 
     if (topology_json.empty() || !reader.parse(topology_json, root)) {
         return Status::MalformedJson(
-            "Unrecognized format of topology json" MSG_TAIL);
+            "Unrecognized format of topology json" LOC_MARK);
     }
 
     matrix_.clear();
@@ -247,7 +247,7 @@ Status Topology::parse(const std::string &topology_json) {
             matrix_[key] = topo_entry;
         } else {
             return Status::MalformedJson(
-                "Unrecognized format of topology json" MSG_TAIL);
+                "Unrecognized format of topology json" LOC_MARK);
         }
     }
 
@@ -272,7 +272,7 @@ Json::Value Topology::toJson() const {
 Status Topology::selectDevice(int &device_id, const std::string storage_type,
                               int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) {
-        auto msg = "No device found in storage type " + storage_type + MSG_TAIL;
+        auto msg = "No device found in storage type " + storage_type + LOC_MARK;
         return Status::DeviceNotFound(msg);
     }
     auto &entry = resolved_matrix_[storage_type];

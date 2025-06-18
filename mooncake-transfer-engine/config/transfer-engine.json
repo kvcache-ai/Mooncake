@@ -1,0 +1,47 @@
+{
+    "log": {
+        "level": "warning"
+    },
+    "transports": {
+        "rdma": {
+            "device": {
+                "num_cq_list": 1,
+                "num_comp_channels": 1,
+                "port": "auto",
+                "gid_index": "auto",
+                "max_cqe": 4096
+            },
+            "endpoint": {
+                "endpoint_store_cap": 256,
+                "qp_mul_factor": 1,
+                "max_sge": 4,
+                "max_qp_wr": 256,
+                "max_inline_bytes": 64,
+                "path_mtu": 4096,
+                "pkey_index": 0,
+                "hop_limit": 16,
+                "flow_label": 0,
+                "traffic_class": 0,
+                "service_level": 0,
+                "src_path_bits": 0,
+                "static_rate": 0,
+                "rq_psn": 0,
+                "max_dest_rd_atomic": 16,
+                "min_rnr_timer": 12,
+                "sq_psn": 0,
+                "send_timeout": 14,
+                "send_retry_count" : 7,
+                "send_rnr_count": 7,
+                "max_rd_atomic": 16
+            },
+            "worker" : {
+                "num_workers": 1,
+                "max_retry_count": 8,
+                "block_size": 65536,
+                "grace_period_ns": 50000
+            }
+        },
+        "gds": {},
+        "shm": {}
+    }
+}

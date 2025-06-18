@@ -206,7 +206,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         exit(EXIT_FAILURE);
     }
 
-    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
+    auto segment_desc = engine->getSegmentDesc(segment_id);
     if (!segment_desc) {
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);

@@ -48,7 +48,7 @@ class Transport {
     virtual ~Transport() = default;
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<TransferMetadata> metadata_manager,
+                           std::shared_ptr<MetadataService> metadata,
                            std::shared_ptr<Topology> local_topology) {
         return Status::OK();
     }
@@ -57,22 +57,22 @@ class Transport {
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::NotImplemented(
-            "allocateSubBatch not implemented" MSG_TAIL);
+            "allocateSubBatch not implemented" LOC_MARK);
     }
 
     virtual Status freeSubBatch(SubBatchRef &batch) {
-        return Status::NotImplemented("freeSubBatch not implemented" MSG_TAIL);
+        return Status::NotImplemented("freeSubBatch not implemented" LOC_MARK);
     }
 
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request> &request_list) {
         return Status::NotImplemented(
-            "submitTransferTasks not implemented" MSG_TAIL);
+            "submitTransferTasks not implemented" LOC_MARK);
     }
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id, TransferStatus &status) {
         return Status::NotImplemented(
-            "getTransferStatus not implemented" MSG_TAIL);
+            "getTransferStatus not implemented" LOC_MARK);
     }
 
     virtual void queryOutstandingTasks(SubBatchRef batch,
@@ -81,13 +81,13 @@ class Transport {
     virtual Status registerLocalMemory(
         const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
-            "registerLocalMemory not implemented" MSG_TAIL);
+            "registerLocalMemory not implemented" LOC_MARK);
     }
 
     virtual Status unregisterLocalMemory(
         const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
-            "unregisterLocalMemory not implemented" MSG_TAIL);
+            "unregisterLocalMemory not implemented" LOC_MARK);
     }
 
     virtual const char *getName() const { return "<generic>"; }

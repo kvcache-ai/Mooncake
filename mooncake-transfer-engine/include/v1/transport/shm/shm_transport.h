@@ -50,7 +50,7 @@ class ShmTransport : public Transport {
     ~ShmTransport();
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<TransferMetadata> metadata_manager,
+                           std::shared_ptr<MetadataService> metadata,
                            std::shared_ptr<Topology> local_topology);
 
     virtual Status uninstall();
@@ -77,7 +77,7 @@ class ShmTransport : public Transport {
     virtual const char *getName() const { return "shm"; }
 
    private:
-    void allocateLocalSegmentID();
+    Status setupLocalSegment();
 
     void startTransfer(ShmTask *task);
 
@@ -90,7 +90,7 @@ class ShmTransport : public Transport {
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<TransferMetadata> metadata_manager_;
+    std::shared_ptr<MetadataService> metadata_;
     std::unique_ptr<ShmThreadPool> workers_;
 
     struct OpenedShmEntry {

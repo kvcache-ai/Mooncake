@@ -100,14 +100,14 @@ Status Workers::submit(RdmaSliceList &slice_list) {
             continue;
         }
         if (!remote_buffer.valid(target_id)) {
-            auto desc = transport_->metadata_manager_->getSegmentDescByID(
-                target_id, true);
-            if (!desc) {
+            SegmentDescRef desc;
+            auto &manager = transport_->metadata_->segmentManager();
+            auto status = manager.getRemote(desc, target_id);
+            if (!status.ok()) {
                 markSliceFailed(slice);
                 continue;
             }
             remote_buffer.reload(target_id, desc);
-        
         }
         status = remote_buffer.query(
             target_id, AddressRange{(void *)slice->target_addr, slice->length},
@@ -141,15 +141,16 @@ Status Workers::submit(RdmaSlice *slice) {
 }
 
 Status Workers::cancel(RdmaSliceList &slice_list) {
-    return Status::NotImplemented("cancel not implemented" MSG_TAIL);
+    return Status::NotImplemented("cancel not implemented" LOC_MARK);
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto context = transport_->context_set_[path.local_device_id].get();
     std::shared_ptr<RdmaEndPoint> endpoint;
-    auto desc = transport_->metadata_manager_->getSegmentDescByID(
-        path.remote_segment_id);
-    if (!desc) return nullptr;
+    SegmentDescRef desc;
+    auto &manager = transport_->metadata_->segmentManager();
+    auto status = manager.getRemote(desc, path.remote_segment_id);
+    if (!status.ok()) return nullptr;
     auto peer_segment_name = desc->name;
     auto peer_device_name = std::get<MemorySegmentDesc>(desc->detail)
                                 .devices[path.remote_device_id]
@@ -215,7 +216,7 @@ void Workers::asyncPostSend(int thread_id) {
 int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                          const std::string &peer_server_name,
                          const std::string &peer_nic_name) {
-    HandShakeDesc local_desc, peer_desc;
+    BootstrapDesc local_desc, peer_desc;
     local_desc.local_nic_path = MakeNicPath(transport_->local_segment_name_,
                                             endpoint->context().name());
     local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
@@ -223,16 +224,18 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
 
     std::shared_ptr<SegmentDesc> segment_desc;
     if (local_desc.local_nic_path == local_desc.peer_nic_path) {
-        segment_desc =
-            transport_->metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        segment_desc = transport_->metadata_->segmentManager().getLocal();
         peer_desc = local_desc;
     } else {
-        int rc = transport_->metadata_manager_->sendHandshake(
-            peer_server_name, local_desc, peer_desc);
-        if (rc) return rc;
+        BootstrapRdmaClient bootstrap_client;
+        auto status =
+            bootstrap_client.bootstrap(peer_server_name, local_desc, peer_desc);
+        if (!status.ok()) return ERR_ENDPOINT;
         assert(peer_desc.qp_num.size());
-        segment_desc = transport_->metadata_manager_->getSegmentDescByName(
-            peer_server_name);
+        
+        auto &manager = transport_->metadata_->segmentManager();
+        status = manager.getRemote(segment_desc, peer_server_name);
+        if (!status.ok()) return ERR_ENDPOINT;
     }
 
     if (segment_desc) {

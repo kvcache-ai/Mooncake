@@ -85,7 +85,7 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 
-    std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
+    std::shared_ptr<SegmentDesc> getSegmentDesc(SegmentID handle);
 
    private:
     Status construct();
@@ -100,7 +100,7 @@ class TransferEngine {
 
    private:
     TEConfig conf_;
-    std::shared_ptr<TransferMetadata> metadata_;
+    std::shared_ptr<MetadataService> metadata_;
     std::shared_ptr<Topology> topology_;
     bool available_;
 

@@ -19,5 +19,6 @@
 #include "v1/common/common.h"
 #include "v1/common/config.h"
 #include "v1/common/status.h"
+#include "v1/common/config_manager.h"
 
 #endif // TEV1_COMMON_H

@@ -36,22 +36,21 @@ RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
-Status RdmaTransport::install(
-    std::string &local_segment_name,
-    std::shared_ptr<TransferMetadata> metadata_manager,
-    std::shared_ptr<Topology> local_topology) {
+Status RdmaTransport::install(std::string &local_segment_name,
+                              std::shared_ptr<MetadataService> metadata,
+                              std::shared_ptr<Topology> local_topology) {
     if (installed_) {
         return Status::InvalidArgument(
-            "RDMA transport has been installed" MSG_TAIL);
+            "RDMA transport has been installed" LOC_MARK);
     }
 
     if (local_topology == nullptr || local_topology->getHcaList().empty()) {
         return Status::DeviceNotFound(
-            "No RDMA device found in topology" MSG_TAIL);
+            "No RDMA device found in topology" LOC_MARK);
     }
 
     params_ = std::make_shared<RdmaParams>();
-    metadata_manager_ = metadata_manager;
+    metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
@@ -73,12 +72,12 @@ Status RdmaTransport::install(
     if (local_topology_->empty()) {
         uninstall();
         return Status::DeviceNotFound(
-            "No RDMA device detected in active" MSG_TAIL);
+            "No RDMA device detected in active" LOC_MARK);
     }
 
     allocateLocalSegmentID();
 
-    metadata_manager_->setBootstrapRdmaCallback(
+    metadata_->setBootstrapRdmaCallback(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2));
 
@@ -92,8 +91,8 @@ Status RdmaTransport::install(
 Status RdmaTransport::uninstall() {
     if (installed_) {
         workers_.reset();
-        // metadata_manager_->removeSegmentDesc(local_segment_name_);
-        metadata_manager_.reset();
+        metadata_->segmentManager().deleteLocal();
+        metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
         context_name_lookup_.clear();
@@ -113,7 +112,7 @@ Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
 Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch)
-        return Status::InvalidArgument("Invalid RDMA sub-batch" MSG_TAIL);
+        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
     for (auto &slice : rdma_batch->slice_chain) {
         while (slice) {
             auto next = slice->next;
@@ -130,10 +129,10 @@ Status RdmaTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (!rdma_batch)
-        return Status::InvalidArgument("Invalid RDMA sub-batch" MSG_TAIL);
+        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
     if (request_list.size() + rdma_batch->task_list.size() >
         rdma_batch->max_size)
-        return Status::TooManyRequests("Exceed batch capacity" MSG_TAIL);
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     const size_t block_size = params_->workers.block_size;
     RdmaSliceList slice_list;
     RdmaSlice *slice_tail = nullptr;
@@ -174,7 +173,7 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                         TransferStatus &status) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
-        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
     auto &task = rdma_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
@@ -211,12 +210,10 @@ Status RdmaTransport::registerLocalMemory(
         auto status = results[i].get();
         if (!status.ok()) return status;
     }
-    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    local_buffer_manager_.fillBufferDesc(segment_desc);
-    int ret = metadata_manager_->updateSegmentDesc(segment_desc);
-    return ret == 0
-               ? Status::OK()
-               : Status::InternalError("update local segment descriptor error");
+    auto desc = metadata_->segmentManager().getLocal();
+    local_buffer_manager_.fillBufferDesc(desc);
+    metadata_->segmentManager().setLocal(desc);
+    return metadata_->segmentManager().applyLocal();
 }
 
 Status RdmaTransport::unregisterLocalMemory(
@@ -236,19 +233,19 @@ Status RdmaTransport::unregisterLocalMemory(
         auto status = results[i].get();
         if (!status.ok()) return status;
     }
-    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    local_buffer_manager_.fillBufferDesc(segment_desc);
-    int ret = metadata_manager_->updateSegmentDesc(segment_desc);
-    return ret == 0
-               ? Status::OK()
-               : Status::InternalError("update local segment descriptor error");
+    auto desc = metadata_->segmentManager().getLocal();
+    local_buffer_manager_.fillBufferDesc(desc);
+    metadata_->segmentManager().setLocal(desc);
+    return metadata_->segmentManager().applyLocal();
 }
 
 void RdmaTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    desc->name = local_segment_name_;
-    desc->type = SegmentType::Memory;
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    auto &manager = metadata_->segmentManager();
+    auto segment = manager.getLocal();
+    if (!segment) segment = std::make_shared<SegmentDesc>();
+    segment->name = local_segment_name_;
+    segment->type = SegmentType::Memory;
+    auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     for (auto &context : context_set_) {
         DeviceDesc device_desc;
         device_desc.name = context->name();
@@ -257,7 +254,8 @@ void RdmaTransport::allocateLocalSegmentID() {
         detail.devices.push_back(device_desc);
     }
     detail.topology = *(local_topology_.get());
-    metadata_manager_->updateSegmentDesc(desc);
+    manager.setLocal(segment);
+    manager.applyLocal();
 }
 
 Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
@@ -265,10 +263,11 @@ Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
     Status status = local_buffer_manager_.addBuffer(buffer);
     if (!status.ok()) return status;
     if (!update_meta) return Status::OK();
-    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    local_buffer_manager_.fillBufferDesc(segment_desc);
-    metadata_manager_->updateSegmentDesc(segment_desc);
-    return Status::OK();
+
+    auto desc = metadata_->segmentManager().getLocal();
+    local_buffer_manager_.fillBufferDesc(desc);
+    metadata_->segmentManager().setLocal(desc);
+    return metadata_->segmentManager().applyLocal();
 }
 
 Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
@@ -278,14 +277,15 @@ Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
     range.length = buffer.length;
     local_buffer_manager_.removeBuffer(range);
     if (!update_meta) return Status::OK();
-    auto segment_desc = metadata_manager_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    local_buffer_manager_.fillBufferDesc(segment_desc);
-    metadata_manager_->updateSegmentDesc(segment_desc);
-    return Status::OK();
+
+    auto desc = metadata_->segmentManager().getLocal();
+    local_buffer_manager_.fillBufferDesc(desc);
+    metadata_->segmentManager().setLocal(desc);
+    return metadata_->segmentManager().applyLocal();
 }
 
-int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                                          HandShakeDesc &local_desc) {
+int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
+                                          BootstrapDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name)) {
         local_desc.reply_msg =
@@ -313,15 +313,17 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
         MakeNicPath(local_segment_name_, context->name());
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = endpoint->qpNum();
-
-    auto segment_desc =
-        metadata_manager_->getSegmentDescByName(peer_server_name);
-    if (segment_desc) {
+    SegmentDescRef segment_desc;
+    auto status =
+        metadata_->segmentManager().getRemote(segment_desc, peer_server_name);
+    if (status.ok()) {
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
         for (auto &nic : detail.devices)
             if (nic.name == peer_nic_name)
                 return endpoint->configurePeer(
                     nic.gid, nic.lid, peer_desc.qp_num, &local_desc.reply_msg);
+    } else {
+        LOG(INFO) << status.ToString();
     }
     local_desc.reply_msg = "Unable to find RDMA device " + peer_nic_path_;
     return ERR_ENDPOINT;

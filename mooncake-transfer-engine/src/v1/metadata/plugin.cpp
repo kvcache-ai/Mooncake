@@ -70,14 +70,15 @@ std::shared_ptr<MetadataPlugin> MetadataPlugin::Create(
     }
 #endif  // USE_HTTP
     if (!plugin) {
-        LOG(FATAL) << "Unknown protocol " << proto;
+        LOG(FATAL) << "Protocol " << proto
+                   << " not installed. Please rebuild the package.";
         return nullptr;
     }
     auto status = plugin->connect(endpoint);
     if (status.ok())
         return plugin;
     else {
-        LOG(FATAL) << "Connect failure " << status.ToString();
+        LOG(FATAL) << status.ToString();
         return nullptr;
     }
 }

@@ -31,9 +31,9 @@
         return Status(Code::k##err, msg);                                \
     }
 
+#define LINE __LINE__
 #define STRINGIFY(x) #x
-#define MSG_TAIL \
-    ", called by " STRINGIFY(__func__) " at " __FILE__ ":" STRINGIFY(__LINE__)
+#define LOC_MARK     ", location " __FILE__ ":" STRINGIFY(LINE)
 
 namespace mooncake {
 namespace v1 {

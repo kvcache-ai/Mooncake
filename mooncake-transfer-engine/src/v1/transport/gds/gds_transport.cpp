@@ -46,7 +46,7 @@ Status GdsTransport::install(std::string &local_segment_name,
                              std::shared_ptr<Topology> local_topology) {
     if (installed_) {
         return Status::InvalidArgument(
-            "GDS transport has been installed" MSG_TAIL);
+            "GDS transport has been installed" LOC_MARK);
     }
 
     metadata_manager_ = metadata_manager;
@@ -102,7 +102,7 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
 Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (!gds_batch)
-        return Status::InvalidArgument("Invalid GDS sub-batch" MSG_TAIL);
+        return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
     desc_pool_->freeCUfileDesc(gds_batch->desc_idx);
     delete gds_batch;
     batch = nullptr;
@@ -113,7 +113,7 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)gds_batch->task_list.size()) {
-        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
     auto &task = gds_batch->task_list[task_id];
     status = {.s = PENDING, .transferred_bytes = 0};
@@ -170,7 +170,7 @@ Status GdsTransport::submitTransferTasks(
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (gds_batch->task_list.size() + request_list.size() >
         gds_batch->max_size) {
-        return Status::TooManyRequests("Exceed batch capacity" MSG_TAIL);
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     }
 
     size_t task_id = gds_batch->task_list.size();

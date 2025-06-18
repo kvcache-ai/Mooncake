@@ -152,8 +152,7 @@ Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
     getEthIpPort(hostname_, port_, conf_);
 
-    metadata_ =
-        std::make_shared<TransferMetadata>(getMetadataConnString(conf_));
+    metadata_ = std::make_shared<MetadataService>(getMetadataConnString(conf_));
     metadata_->start(port_);
 
     LOG(INFO) << "Segment name of this instance: " << hostname_ << ":" << port_;
@@ -196,21 +195,20 @@ uint16_t TransferEngine::getEthPort() const { return port_; }
 
 Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
     return Status::NotImplemented(
-        "exportLocalSegment not implemented" MSG_TAIL);
+        "exportLocalSegment not implemented" LOC_MARK);
 }
 
 Status TransferEngine::importRemoteSegment(SegmentID &handle,
                                            const std::string &shared_handle) {
     return Status::NotImplemented(
-        "importRemoteSegment not implemented" MSG_TAIL);
+        "importRemoteSegment not implemented" LOC_MARK);
 }
 
 Status TransferEngine::openRemoteSegment(SegmentID &handle,
                                          const std::string &segment_name) {
     if (segment_name.empty())
-        return Status::InvalidArgument("Invalid segment name" MSG_TAIL);
-    handle = metadata_->getSegmentID(segment_name);
-    return Status::OK();
+        return Status::InvalidArgument("Invalid segment name" LOC_MARK);
+    return metadata_->segmentManager().openRemote(handle, segment_name);
 }
 
 Status TransferEngine::closeRemoteSegment(SegmentID handle) {
@@ -256,7 +254,7 @@ BatchID TransferEngine::allocateBatch(size_t batch_size) {
 }
 
 Status TransferEngine::freeBatch(BatchID batch_id) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
     std::lock_guard<std::mutex> lock(mutex_);
     deferred_free_batch_set_.push_back(batch);
@@ -297,7 +295,7 @@ TransportType TransferEngine::getTransportType(const Request &request) {
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request> &request_list) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
@@ -327,17 +325,26 @@ Status TransferEngine::submitTransfer(
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
-    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" MSG_TAIL);
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
     if (task_id >= batch->task_id_lookup.size())
-        return Status::InvalidArgument("Invalid task ID" MSG_TAIL);
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto [type, sub_task_id] = batch->task_id_lookup[task_id];
     auto transport = transport_list_[type];
     auto sub_batch = batch->sub_batch[type];
     if (!transport || !sub_batch) {
-        return Status::InvalidArgument("Transport not available" MSG_TAIL);
+        return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
     return transport->getTransferStatus(sub_batch, sub_task_id, status);
+}
+
+std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
+    auto &manager = metadata_->segmentManager();
+    std::shared_ptr<SegmentDesc> desc;
+    if (handle == 0) return manager.getLocal();
+    auto status = manager.getRemote(desc, handle);
+    assert(status.ok());
+    return desc;
 }
 
 }  // namespace v1

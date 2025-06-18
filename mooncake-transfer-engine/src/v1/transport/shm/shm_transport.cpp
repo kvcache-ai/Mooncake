@@ -73,20 +73,23 @@ ShmTransport::ShmTransport() : installed_(false) {}
 ShmTransport::~ShmTransport() { uninstall(); }
 
 Status ShmTransport::install(std::string &local_segment_name,
-                             std::shared_ptr<TransferMetadata> metadata_manager,
+                             std::shared_ptr<MetadataService> metadata,
                              std::shared_ptr<Topology> local_topology) {
     if (installed_) {
         return Status::InvalidArgument(
-            "SHM transport has been installed" MSG_TAIL);
+            "SHM transport has been installed" LOC_MARK);
     }
 
-    metadata_manager_ = metadata_manager;
+    metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
-    allocateLocalSegmentID();
+    auto status = setupLocalSegment();
+    if (!status.ok()) return status;
+
     // TODO change to one environment variable
     const static size_t kDefaultThreadPoolSize = 4;
     workers_ = std::make_unique<ShmThreadPool>(kDefaultThreadPoolSize);
+
     installed_ = true;
     return Status::OK();
 }
@@ -95,8 +98,8 @@ Status ShmTransport::uninstall() {
     if (installed_) {
         workers_->stop();
         workers_.reset();
-        // metadata_manager_->removeSegmentDesc(local_segment_name_);
-        metadata_manager_.reset();
+        metadata_->segmentManager().deleteLocal();
+        metadata_.reset();
         installed_ = false;
     }
     return Status::OK();
@@ -113,7 +116,7 @@ Status ShmTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
 Status ShmTransport::freeSubBatch(SubBatchRef &batch) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
     if (!shm_batch)
-        return Status::InvalidArgument("Invalid SHM sub-batch" MSG_TAIL);
+        return Status::InvalidArgument("Invalid SHM sub-batch" LOC_MARK);
     delete shm_batch;
     batch = nullptr;
     return Status::OK();
@@ -123,9 +126,9 @@ Status ShmTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
     if (!shm_batch)
-        return Status::InvalidArgument("Invalid SHM sub-batch" MSG_TAIL);
+        return Status::InvalidArgument("Invalid SHM sub-batch" LOC_MARK);
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
-        return Status::TooManyRequests("Exceed batch capacity" MSG_TAIL);
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto &request : request_list) {
         shm_batch->task_list.push_back(ShmTask{});
         auto &task = shm_batch->task_list[shm_batch->task_list.size() - 1];
@@ -171,7 +174,7 @@ Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)shm_batch->task_list.size()) {
-        return Status::InvalidArgument("Invalid task id" MSG_TAIL);
+        return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = shm_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
@@ -193,33 +196,51 @@ void ShmTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status ShmTransport::registerLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {
+    auto &manager = metadata_->segmentManager();
+    auto segment = manager.getLocal();
+    auto &current_buffer_list =
+        std::get<MemorySegmentDesc>(segment->detail).buffers;
     for (auto &buffer : buffer_list) {
         BufferDesc desc;
+        desc.type = MemBufferType::SHM;
         desc.addr = (uint64_t)buffer.addr;
         desc.length = buffer.length;
         desc.location = buffer.location;
         desc.shared_handle = buffer.shm_path;
-        // TODO
-        // metadata_manager_->addLocalMemoryBuffer(desc, true);
+        current_buffer_list.push_back(desc);
     }
-    return Status::OK();
+    manager.setLocal(segment);
+    return manager.applyLocal();
 }
 
 Status ShmTransport::unregisterLocalMemory(
     const std::vector<BufferEntry> &buffer_list) {
+    auto &manager = metadata_->segmentManager();
+    auto segment = manager.getLocal();
+    auto &current_buffer_list =
+        std::get<MemorySegmentDesc>(segment->detail).buffers;
     for (auto &buffer : buffer_list) {
-        // TODO
-        (void)buffer;
-        // metadata_manager_->removeLocalMemoryBuffer(buffer.addr, true);
+        for (auto it = current_buffer_list.begin();
+             it != current_buffer_list.end(); ++it) {
+            if (it->addr == (uint64_t)buffer.addr &&
+                it->length == buffer.length && it->type == MemBufferType::SHM) {
+                it = current_buffer_list.erase(it);
+            }
+        }
     }
-    return Status::OK();
+    manager.setLocal(segment);
+    return manager.applyLocal();
 }
 
-void ShmTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    desc->name = local_segment_name_;
-    desc->type = SegmentType::Memory;
-    metadata_manager_->updateSegmentDesc(desc);
+Status ShmTransport::setupLocalSegment() {
+    auto &manager = metadata_->segmentManager();
+    auto segment = manager.getLocal();
+    if (segment) return Status::OK();
+    segment = std::make_shared<SegmentDesc>();
+    segment->name = local_segment_name_;
+    segment->type = SegmentType::Memory;
+    manager.setLocal(segment);
+    return manager.applyLocal();
 }
 
 void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
@@ -250,7 +271,9 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
 Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
-    auto desc = metadata_manager_->getSegmentDescByID(target_id);
+    SegmentDescRef desc;
+    auto status = metadata_->segmentManager().getRemote(desc, target_id);
+    if (!status.ok()) return status;
     int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : detail.buffers) {
@@ -263,14 +286,14 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 if (shm_fd < 0) {
                     return Status::InternalError(
                         std::string("Failed to open shared memory file ") +
-                        entry.shared_handle + MSG_TAIL);
+                        entry.shared_handle + LOC_MARK);
                 }
                 auto shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
                                      MAP_SHARED, shm_fd, 0);
                 if (shm_addr == MAP_FAILED) {
                     close(shm_fd);
                     return Status::InternalError(
-                        "Failed to map shared memory " MSG_TAIL);
+                        "Failed to map shared memory " LOC_MARK);
                 }
                 OpenedShmEntry shm_entry;
                 shm_entry.shm_fd = shm_fd;
@@ -285,7 +308,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         index++;
     }
     return Status::InvalidArgument(
-        "Requested address is not in registered buffer" MSG_TAIL);
+        "Requested address is not in registered buffer" LOC_MARK);
 }
 }  // namespace v1
 }  // namespace mooncake

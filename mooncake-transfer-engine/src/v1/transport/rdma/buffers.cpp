@@ -233,7 +233,7 @@ Status LocalBufferManager::addBuffer(const BufferEntry &buffer_entry) {
                 context->registerMemReg(to_reg.addr, to_reg.length, access);
             if (!mem_reg)
                 return Status::RdmaError(
-                    "Failed to register memory region" MSG_TAIL);
+                    "Failed to register memory region" LOC_MARK);
             item.mem_reg_map[context] = mem_reg;
         }
         auto location = buffer_entry.location;
@@ -278,7 +278,7 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
         if (device == context->name()) {
             if (context_list_[index])
                 return Status::InvalidArgument(
-                    "Context existed in local buffer manager" MSG_TAIL);
+                    "Context existed in local buffer manager" LOC_MARK);
             context_list_[index] = context;
             found = true;
             break;
@@ -286,7 +286,7 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
             index++;
         }
     }
-    if (!found) return Status::DeviceNotFound("Not matched device" MSG_TAIL);
+    if (!found) return Status::DeviceNotFound("Not matched device" LOC_MARK);
     for (auto &buffer : buffer_list_) {
         auto &to_reg = buffer.second.entry;
         auto access = getAccessFlags(to_reg.visibility);
@@ -295,7 +295,7 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
             context->registerMemReg(to_reg.addr, to_reg.length, access);
         if (!mem_reg)
             return Status::RdmaError(
-                "Failed to register memory region" MSG_TAIL);
+                "Failed to register memory region" LOC_MARK);
         buffer.second.mem_reg_map[context] = mem_reg;
     }
     return Status::OK();
@@ -386,7 +386,7 @@ Status LocalBufferManager::query(const AddressRange &range,
     }
     if (result.empty()) {
         return Status::AddressNotRegistered(
-            "No matched buffer in given address range" MSG_TAIL);
+            "No matched buffer in given address range" LOC_MARK);
     }
     return Status::OK();
 }
@@ -414,7 +414,7 @@ Status RemoteBufferManager::query(SegmentID id, const AddressRange &range,
                                   std::vector<BufferQueryResult> &result,
                                   int retry_count) {
     if (!segment_desc_.count(id))
-        return Status::InvalidArgument("Invalid segment ID" MSG_TAIL);
+        return Status::InvalidArgument("Invalid segment ID" LOC_MARK);
     auto &detail = std::get<MemorySegmentDesc>(segment_desc_[id]->detail);
     auto &topo = detail.topology;
     result.clear();
@@ -433,7 +433,7 @@ Status RemoteBufferManager::query(SegmentID id, const AddressRange &range,
     }
     if (result.empty()) {
         return Status::AddressNotRegistered(
-            "No matched buffer in given address range" MSG_TAIL);
+            "No matched buffer in given address range" LOC_MARK);
     }
     return Status::OK();
 }

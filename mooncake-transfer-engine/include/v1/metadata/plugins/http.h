@@ -34,13 +34,13 @@ class HttpMetadataPlugin : public MetadataPlugin {
     virtual Status connect(const std::string &endpoint) {
         if (connected_) {
             return Status::MetadataError(
-                "HTTP connection already established" MSG_TAIL);
+                "HTTP connection already established" LOC_MARK);
         }
         curl_global_init(CURL_GLOBAL_ALL);
         client_ = curl_easy_init();
         if (!client_) {
             return Status::InternalError(
-                "HTTP cannot allocate curl objects" MSG_TAIL);
+                "HTTP cannot allocate curl objects" LOC_MARK);
         }
         endpoint_ = endpoint;
         connected_ = true;
@@ -59,7 +59,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
     virtual Status get(const std::string &key, std::string &value) {
         if (!connected_) {
             return Status::MetadataError(
-                "HTTP connection not available" MSG_TAIL);
+                "HTTP connection not available" LOC_MARK);
         }
 
         curl_easy_reset(client_);
@@ -76,7 +76,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
         if (res != CURLE_OK) {
             return Status::MetadataError(
                 std::string("HTTP failed to post request: ") +
-                curl_easy_strerror(res) + MSG_TAIL);
+                curl_easy_strerror(res) + LOC_MARK);
         }
 
         // Get the HTTP response code
@@ -89,7 +89,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
                 std::string("HTTP received unexcepted response: ") + message +
-                MSG_TAIL);
+                LOC_MARK);
         }
         value = std::string(readBuffer);
         return Status::OK();
@@ -98,7 +98,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
     virtual Status set(const std::string &key, const std::string &value) {
         if (!connected_) {
             return Status::MetadataError(
-                "HTTP connection not available" MSG_TAIL);
+                "HTTP connection not available" LOC_MARK);
         }
 
         curl_easy_reset(client_);
@@ -124,7 +124,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
         if (res != CURLE_OK) {
             return Status::MetadataError(
                 std::string("HTTP failed to post request: ") +
-                curl_easy_strerror(res) + MSG_TAIL);
+                curl_easy_strerror(res) + LOC_MARK);
         }
 
         long responseCode;
@@ -134,7 +134,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
                 std::string("HTTP received unexcepted response: ") + message +
-                MSG_TAIL);
+                LOC_MARK);
         }
 
         return Status::OK();
@@ -143,7 +143,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
     virtual Status remove(const std::string &key) {
         if (!connected_) {
             return Status::MetadataError(
-                "HTTP connection not available" MSG_TAIL);
+                "HTTP connection not available" LOC_MARK);
         }
 
         curl_easy_reset(client_);
@@ -161,7 +161,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
         if (res != CURLE_OK) {
             return Status::MetadataError(
                 std::string("HTTP failed to post request: ") +
-                curl_easy_strerror(res) + MSG_TAIL);
+                curl_easy_strerror(res) + LOC_MARK);
         }
 
         long responseCode;
@@ -171,7 +171,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
                 std::string("HTTP received unexcepted response: ") + message +
-                MSG_TAIL);
+                LOC_MARK);
         }
 
         return Status::OK();

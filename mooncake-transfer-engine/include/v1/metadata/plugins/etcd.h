@@ -34,14 +34,14 @@ class EtcdMetadataPlugin : public MetadataPlugin {
         char *err_str;
         if (connected_) {
             return Status::MetadataError(
-                "Etcd connection already established" MSG_TAIL);
+                "Etcd connection already established" LOC_MARK);
         }
         auto ret = NewEtcdClient((char *)endpoint.c_str(), &err_str);
         if (ret) {
             std::string message =
                 "Etcd cannot connect \'" + endpoint + "\': " + err_str;
             free(err_str);
-            return Status::MetadataError(message + MSG_TAIL);
+            return Status::MetadataError(message + LOC_MARK);
         }
         connected_ = true;
         return Status::OK();
@@ -60,7 +60,7 @@ class EtcdMetadataPlugin : public MetadataPlugin {
         char *err_str;
         if (!connected_) {
             return Status::MetadataError(
-                "Etcd connection not available" MSG_TAIL);
+                "Etcd connection not available" LOC_MARK);
         }
         auto ret = EtcdGetWrapper((char *)key.c_str(), &raw_value, &err_str);
         if (ret) {
@@ -68,7 +68,7 @@ class EtcdMetadataPlugin : public MetadataPlugin {
                 "Etcd failed to get \'" + key + "\': " + err_str;
             free(err_str);  // free the memory for storing error message
             err_str = nullptr;
-            return Status::MetadataError(message + MSG_TAIL);
+            return Status::MetadataError(message + LOC_MARK);
         }
         if (!raw_value) return Status::InvalidEntry(key);
         value = std::string(raw_value);
@@ -80,7 +80,7 @@ class EtcdMetadataPlugin : public MetadataPlugin {
         char *err_str;
         if (!connected_) {
             return Status::MetadataError(
-                "Etcd connection not available" MSG_TAIL);
+                "Etcd connection not available" LOC_MARK);
         }
         auto ret = EtcdPutWrapper((char *)key.c_str(), (char *)value.c_str(),
                                   &err_str);
@@ -97,7 +97,7 @@ class EtcdMetadataPlugin : public MetadataPlugin {
         char *err_str;
         if (!connected_) {
             return Status::MetadataError(
-                "Etcd connection not available" MSG_TAIL);
+                "Etcd connection not available" LOC_MARK);
         }
         auto ret = EtcdDeleteWrapper((char *)key.c_str(), &err_str);
         if (ret) {
