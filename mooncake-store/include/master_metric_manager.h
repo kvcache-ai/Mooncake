@@ -162,7 +162,7 @@ class MasterMetricManager {
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
 
-    // Some metrices are used only in HA mode. Use a flag to control the output
+    // Some metrics are used only in HA mode. Use a flag to control the output
     // content.
     bool enable_ha_{false};
 };
