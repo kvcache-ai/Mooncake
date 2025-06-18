@@ -167,6 +167,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id, TransferStatus &
         }
         
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
+            status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
             status.s = Transport::TransferStatusEnum::FAILED;

@@ -298,7 +298,8 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             const int64_t timeout =
                 transfer_timeout_nsec_ + length;  // 1GiB per second
             if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync data transfer timeout, local buffer "
+                LOG(INFO) << "Sync data transfer timeout after "
+                          << current_ts - start_ts << "ns, local buffer "
                           << (void *)buffer << " remote buffer "
                           << (void *)peer_buffer_address << " length "
                           << length;
@@ -362,6 +363,7 @@ int TransferEnginePy::batchTransferSync(const char *target_hostname,
 
         TransferStatus status;
         bool completed = false;
+        bool already_freed = false;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
@@ -370,17 +372,22 @@ int TransferEnginePy::batchTransferSync(const char *target_hostname,
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
+                already_freed = true;
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
+                already_freed = true;
                 completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout = transfer_timeout_nsec_ + total_length; // 1GiB per second
             if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync batch data transfer timeout";
-                engine_->freeBatchID(batch_id);
+                LOG(INFO) << "Sync batch data transfer timeout after " 
+                          << current_ts - start_ts << "ns";
+                if (!already_freed) {
+                    engine_->freeBatchID(batch_id);
+                }
                 return -1;
             }
         }
