@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include <atomic>
 #include <cstdint>
@@ -117,6 +118,12 @@ uint16_t getDefaultHandshakePort();
 static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     const std::string &server_name) {
     uint16_t port = getDefaultHandshakePort();
+
+    // IPv6 check
+    in6_addr addr;
+    if (inet_pton(AF_INET6, server_name.c_str(), &addr) == 1)
+        return {server_name, port};
+
     auto pos = server_name.find(':');
     if (pos == server_name.npos) return std::make_pair(server_name, port);
     auto trimmed_server_name = server_name.substr(0, pos);
