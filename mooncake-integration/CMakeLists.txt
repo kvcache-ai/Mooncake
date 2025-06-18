@@ -31,7 +31,6 @@ set_target_properties(mooncake_vllm_adaptor PROPERTIES
     BUILD_RPATH "$ORIGIN/lib_so"
     SKIP_BUILD_RPATH FALSE
 )
- 
 
 target_link_libraries(mooncake_vllm_adaptor PUBLIC 
     transfer_engine 
@@ -44,9 +43,20 @@ message("${PYTHON_SYS_PATH}")
 install(TARGETS mooncake_vllm_adaptor DESTINATION ${PYTHON_SYS_PATH}/)
 
 set(PYTHON_PACKAGE_NAME "mooncake")
+
+set(HOOK_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-hook/hook.so")
+if(EXISTS "${HOOK_SO_PATH}")
+    message(STATUS "Found hook.so, will install to Python package")
+    install(FILES
+        "${HOOK_SO_PATH}"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp 
 )
+
 target_link_libraries(engine PUBLIC 
     transfer_engine 
     glog::glog
