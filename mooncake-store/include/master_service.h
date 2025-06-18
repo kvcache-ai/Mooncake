@@ -63,6 +63,7 @@ class MasterService {
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
                   double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                   ViewVersionId view_version = 0,
+                  int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
                   bool enable_ha = false);
     ~MasterService();
 
@@ -393,9 +394,10 @@ class MasterService {
     static constexpr size_t kClientPingQueueSize =
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
+    const int64_t client_live_ttl_sec_;
 
     // if high availability features enabled
-    bool enable_ha_;
+    const bool enable_ha_;
 };
 
 }  // namespace mooncake

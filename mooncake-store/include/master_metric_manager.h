@@ -34,6 +34,11 @@ class MasterMetricManager {
     void observe_value_size(int64_t size);
     int64_t get_key_count();
 
+    // Cluster Metrics
+    void inc_active_clients(int64_t val = 1);
+    void dec_active_clients(int64_t val = 1);
+    int64_t get_active_clients();
+
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
@@ -106,6 +111,9 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
 
+    // --- Setters ---
+    void set_enable_ha(bool enable_ha);
+
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();
@@ -120,6 +128,9 @@ class MasterMetricManager {
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::histogram_t value_size_distribution_;
+
+    // Cluster Metrics
+    ylt::metric::gauge_t active_clients_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
@@ -150,6 +161,10 @@ class MasterMetricManager {
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+
+    // Some metrices are used only in HA mode. Use a flag to control the output
+    // content.
+    bool enable_ha_{false};
 };
 
 }  // namespace mooncake

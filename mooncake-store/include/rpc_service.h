@@ -101,21 +101,25 @@ constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                         bool enable_metric_reporting = true,
-                         uint16_t http_port = 9003,
-                         double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                         double eviction_high_watermark_ratio =
-                             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                         ViewVersionId view_version = 0,
-                         bool enable_ha = false)
+    WrappedMasterService(
+        bool enable_gc, uint64_t default_kv_lease_ttl,
+        bool enable_metric_reporting = true, uint16_t http_port = 9003,
+        double eviction_ratio = DEFAULT_EVICTION_RATIO,
+        double eviction_high_watermark_ratio =
+            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+        ViewVersionId view_version = 0, bool enable_ha = false,
+        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
-                          eviction_high_watermark_ratio, view_version, enable_ha),
+                          eviction_high_watermark_ratio, view_version,
+                          client_live_ttl_sec, enable_ha),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
           view_version_(view_version) {
         // Initialize HTTP server for metrics
         init_http_server();
+
+        // Set the config for metric reporting
+        MasterMetricManager::instance().set_enable_ha(enable_ha);
 
         // Start metric reporting thread if enabled
         if (enable_metric_reporting) {

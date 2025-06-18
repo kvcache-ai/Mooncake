@@ -14,12 +14,13 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
                              ViewVersionId view_version,
-                             bool enable_ha)
+                             int64_t client_live_ttl_sec, bool enable_ha)
     : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
+      client_live_ttl_sec_(client_live_ttl_sec),
       enable_ha_(enable_ha) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
@@ -143,6 +144,8 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
     // Change the client status to OK
     ok_client_.insert(client_id);
+    MasterMetricManager::instance().inc_active_clients();
+
     return ErrorCode::OK;
 }
 
@@ -761,7 +764,7 @@ void MasterService::ClientMonitorFunc() {
         PodUUID pod_client_id;
         while (client_ping_queue_.pop(pod_client_id)) {
             UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] = now + std::chrono::seconds(CLIENT_LIVE_TTL_SEC);
+            client_ttl[client_id] = now + std::chrono::seconds(client_live_ttl_sec_);
         }
 
         // Find out expired clients
@@ -789,6 +792,7 @@ void MasterService::ClientMonitorFunc() {
                     auto it = ok_client_.find(client_id);
                     if (it != ok_client_.end()) {
                         ok_client_.erase(it);
+                        MasterMetricManager::instance().dec_active_clients();
                     }
                 }
 

@@ -28,6 +28,7 @@ Client::Client(const std::string& local_hostname,
     : local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring) {
     client_id_ = generate_uuid();
+    LOG(INFO) << "client_id=" << client_id_;
 }
 
 Client::~Client() {
@@ -570,11 +571,7 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    Segment segment;
-    segment.name = segment_name;
-    segment.base = reinterpret_cast<uintptr_t>(buffer);
-    segment.size = size;
-    segment.id = generate_uuid();
+    Segment segment(generate_uuid(), segment_name, reinterpret_cast<uintptr_t>(buffer), size);
 
     ErrorCode err =
         master_client_.MountSegment(segment, client_id_).error_code;
