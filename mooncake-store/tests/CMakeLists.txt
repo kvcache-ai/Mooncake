@@ -64,3 +64,5 @@ target_link_libraries(segment_test PUBLIC
     pthread
 )
 add_test(NAME segment_test COMMAND segment_test)
+
+add_subdirectory(e2e)

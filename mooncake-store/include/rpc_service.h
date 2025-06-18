@@ -107,8 +107,9 @@ class WrappedMasterService {
         double eviction_ratio = DEFAULT_EVICTION_RATIO,
         double eviction_high_watermark_ratio =
             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        ViewVersionId view_version = 0, bool enable_ha = false,
-        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC)
+        ViewVersionId view_version = 0,
+        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+        bool enable_ha = false)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
                           eviction_high_watermark_ratio, view_version,
                           client_live_ttl_sec, enable_ha),
