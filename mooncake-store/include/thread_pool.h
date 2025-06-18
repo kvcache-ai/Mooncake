@@ -52,14 +52,17 @@ private:
  */
 template<class F, class... Args>
 void ThreadPool::enqueue(F&& f, Args&&... args) {
+    auto task = std::make_shared<std::function<void()>>(
+        [f = std::forward<F>(f), ...args = std::forward<Args>(args)]() mutable {
+            std::invoke(f, args...);  
+        }
+    );
     {
         std::unique_lock<std::mutex> lock(queue_mutex);
         if(stop_flag) {
             throw std::runtime_error("enqueue on stopped ThreadPool");
         }
-        tasks.emplace([=] { 
-            std::invoke(f, args...); 
-        });
+        tasks.emplace([task]{(*task)();});
     }
     condition.notify_one();  ///< Wake one waiting worker
 }
