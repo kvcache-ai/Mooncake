@@ -40,6 +40,11 @@ echo "Copying master binary and shared libraries..."
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
 cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
+# Copy NVLink hook if it existed
+HOOK_SO_LIB=mooncake-transfer-engine/nvlink-hook/hook.so
+if test -f $HOOK_SO_LIB; then
+    cp $HOOK_SO_LIB mooncake-wheel/mooncake/
+fi
 
 echo "Building wheel package..."
 # Build the wheel package
