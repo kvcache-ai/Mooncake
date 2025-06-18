@@ -23,7 +23,7 @@ def test_entry_point_installed():
             print("❌ mooncake_master entry point not found in PATH")
             return False
             
-        print(f"✅ transfer_engine_bench entry point found at: {result.stdout.strip()}")
+        print(f"✅ mooncake_master entry point found at: {result.stdout.strip()}")
         result = subprocess.run(
             ["which", "transfer_engine_bench"], 
             capture_output=True, 
