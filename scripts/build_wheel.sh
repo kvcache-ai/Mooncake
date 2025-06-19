@@ -27,12 +27,12 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 
-# Copy nvlink-hook.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-hook/hook.so ]; then
-    echo "Copying CUDA nvlink-hook.so..."
-    cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+# Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    echo "Copying CUDA nvlink_allocator.so ..."
+    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
 else
-    echo "Skipping nvlink-hook.so (not built - likely ARM64 or non-CUDA build)"
+    echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
 fi
 
 echo "Copying master binary and shared libraries..."
