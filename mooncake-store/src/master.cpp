@@ -39,7 +39,7 @@ DEFINE_string(
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_string(local_hostname, "",
               "Local host address (IP:Port), required in HA mode");
-DEFINE_int64(client_live_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
 
@@ -59,7 +59,8 @@ int main(int argc, char* argv[]) {
               << FLAGS_eviction_high_watermark_ratio
               << ", enable_ha=" << FLAGS_enable_ha
               << ", etcd_endpoints=" << FLAGS_etcd_endpoints
-              << ", local_hostname=" << FLAGS_local_hostname;
+              << ", local_hostname=" << FLAGS_local_hostname
+              << ", client_ttl=" << FLAGS_client_ttl;
 
     int server_thread_num =
         std::min(FLAGS_max_threads,
@@ -88,7 +89,7 @@ int main(int argc, char* argv[]) {
             FLAGS_port, server_thread_num, FLAGS_enable_gc,
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_default_kv_lease_ttl, FLAGS_eviction_ratio,
-            FLAGS_eviction_high_watermark_ratio, FLAGS_client_live_ttl_sec,
+            FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
             FLAGS_etcd_endpoints, FLAGS_local_hostname);
 
         return supervisor.Start();
@@ -100,7 +101,7 @@ int main(int argc, char* argv[]) {
             FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio, version,
-            FLAGS_client_live_ttl_sec, FLAGS_enable_ha);
+            FLAGS_client_ttl, FLAGS_enable_ha);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

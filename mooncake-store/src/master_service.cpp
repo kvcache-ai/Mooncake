@@ -771,6 +771,7 @@ void MasterService::ClientMonitorFunc() {
         std::vector<UUID> expired_clients;
         for (auto it = client_ttl.begin(); it != client_ttl.end();) {
             if (it->second < now) {
+                LOG(INFO) << "client_id=" << it->first << ", action=client_expired";
                 expired_clients.push_back(it->first);
                 it = client_ttl.erase(it);
             } else {
@@ -785,6 +786,7 @@ void MasterService::ClientMonitorFunc() {
             std::vector<UUID> unmount_segments;
             std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
+            std::vector<std::string> segment_names;
             {
                 // Lock client_mutex and segment_mutex
                 std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -799,16 +801,21 @@ void MasterService::ClientMonitorFunc() {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (auto& client_id : expired_clients) {
-                    std::vector<UUID> segments;
+                    std::vector<Segment> segments;
                     segment_access.GetClientSegments(client_id, segments);
-                    for (auto& segment_id : segments) {
+                    for (auto& seg : segments) {
                         size_t metrics_dec_capacity = 0;
                         if (segment_access.PrepareUnmountSegment(
-                                segment_id, metrics_dec_capacity) ==
+                                seg.id, metrics_dec_capacity) ==
                             ErrorCode::OK) {
-                            unmount_segments.push_back(segment_id);
+                            unmount_segments.push_back(seg.id);
                             dec_capacities.push_back(metrics_dec_capacity);
                             client_ids.push_back(client_id);
+                            segment_names.push_back(seg.name);
+                        } else {
+                            LOG(ERROR) << "client_id=" << client_id
+                                       << ", segment_name=" << seg.name
+                                       << ", error=prepare_unmount_expired_segment_failed";
                         }
                     }
                 }
@@ -823,6 +830,9 @@ void MasterService::ClientMonitorFunc() {
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
                     segment_access.CommitUnmountSegment(
                         unmount_segments[i], client_ids[i], dec_capacities[i]);
+                    LOG(INFO) << "client_id=" << client_ids[i]
+                              << ", segment_name=" << segment_names[i]
+                              << ", action=unmount_expired_segment";
                 }
             }
         }

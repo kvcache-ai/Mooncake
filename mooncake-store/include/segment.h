@@ -91,7 +91,7 @@ class ScopedSegmentAccess {
      * @brief Get all the segments of a client
      */
     ErrorCode GetClientSegments(const UUID& client_id,
-                                std::vector<UUID>& segments) const;
+                                std::vector<Segment>& segments) const;
 
     /**
      * @brief Get the names of all the segments

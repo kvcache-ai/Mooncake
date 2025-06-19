@@ -184,12 +184,18 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
 }
 
 ErrorCode ScopedSegmentAccess::GetClientSegments(
-    const UUID& client_id, std::vector<UUID>& segments) const {
+    const UUID& client_id, std::vector<Segment>& segments) const {
     auto it = segment_manager_->client_segments_.find(client_id);
     if (it == segment_manager_->client_segments_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    segments = it->second;
+    segments.clear();
+    for (auto& segment_id : it->second) {
+        auto segment_it = segment_manager_->mounted_segments_.find(segment_id);
+        if (segment_it != segment_manager_->mounted_segments_.end()) {
+            segments.push_back(segment_it->second.segment);
+        }
+    }
     return ErrorCode::OK;
 }
 

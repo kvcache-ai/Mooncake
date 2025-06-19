@@ -476,7 +476,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all << ", ";
     if (enable_ha_) {
-        ss << "Ping=" << ping << "/" << ping_fails << ", ";
+        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
     }
 
     // Eviction summary

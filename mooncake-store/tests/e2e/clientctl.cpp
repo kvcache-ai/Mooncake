@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -17,25 +18,29 @@ DEFINE_string(metadata_connstring, "http://127.0.0.1:8080/metadata",
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
-DEFINE_string(master_server_entry, "localhost:50051",
-              "Master server address");
+DEFINE_string(master_server_entry, "localhost:50051", "Master server address");
 
 namespace mooncake {
 namespace testing {
 
+struct SegmentInfo {
+    void* base;
+    size_t size;
+};
+
 struct ClientInfo {
     std::shared_ptr<Client> client;
-    void* segment_buffers{nullptr};
+    std::unordered_map<std::string, SegmentInfo> segments;
     std::string hostname;
     ~ClientInfo() {
-        if (segment_buffers) {
-            free(segment_buffers);
+        for (auto& [name, segment] : segments) {
+            free(segment.base);
         }
     }
 };
 
 class ClientCtl {
-public:
+   public:
     void Run() {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -51,41 +56,50 @@ public:
                 HandleGet(iss);
             } else if (cmd == "mount") {
                 HandleMount(iss);
+            } else if (cmd == "remove") {
+                HandleRemove(iss);
+            } else if (cmd == "sleep") {
+                HandleSleep(iss);
+            } else if (cmd[0] == '#') {
+                // Ignore comment lines
+                continue;
+            } else if (cmd == "terminate") {
+                std::exit(0);
             } else {
                 std::cout << "Unknown command: " << cmd << std::endl;
             }
         }
     }
 
-private:
+   private:
     void HandleCreate(std::istringstream& iss) {
         std::string name;
         std::string port;
         iss >> name >> port;
 
         if (name.empty() || port.empty()) {
-            std::cout << "Invalid create command format. Expected: create [name] [port]" << std::endl;
+            std::cout << "Invalid create command format. Expected: create "
+                         "[name] [port]"
+                      << std::endl;
             return;
         }
 
-        void** args = (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
+        void** args =
+            (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
 
         std::string hostname = "localhost:" + port;
-        
-        auto client_opt = Client::Create(
-            hostname,  // Local hostname
-            FLAGS_metadata_connstring,
-            FLAGS_protocol,
-            args,
-            FLAGS_master_server_entry
-        );
+
+        auto client_opt =
+            Client::Create(hostname,  // Local hostname
+                           FLAGS_metadata_connstring, FLAGS_protocol, args,
+                           FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
             std::cout << "Failed to create client: " << name << std::endl;
             return;
         }
 
-        clients_[name] = ClientInfo{client_opt.value(), nullptr, hostname};
+        clients_[name] = ClientInfo{client_opt.value(), {}, hostname};
         std::cout << "Successfully created client: " << name << std::endl;
     }
 
@@ -119,12 +133,13 @@ private:
 
         // Perform put operation
         ErrorCode error_code = it->second.client->Put(key, slices, config);
-        
+
         // Free the buffer
         free(buffer);
 
         if (error_code != ErrorCode::OK) {
-            std::cout << "Failed to put value: " << toString(error_code) << std::endl;
+            std::cout << "Failed to put value: " << toString(error_code)
+                      << std::endl;
             return;
         }
 
@@ -148,10 +163,11 @@ private:
         }
 
         // Create slices
-        std::vector<AllocatedBuffer::Descriptor>& descriptors = object_info.replica_list[0].buffer_descriptors;
+        std::vector<AllocatedBuffer::Descriptor>& descriptors =
+            object_info.replica_list[0].buffer_descriptors;
         std::vector<Slice> slices(descriptors.size());
         for (size_t i = 0; i < descriptors.size(); i++) {
-            void *buffer = malloc(descriptors[i].size_);
+            void* buffer = malloc(descriptors[i].size_);
             slices[i] = Slice{buffer, descriptors[i].size_};
         }
         auto free_slices = [&]() {
@@ -165,7 +181,8 @@ private:
 
         if (error_code != ErrorCode::OK) {
             free_slices();
-            std::cout << "Failed to get value: " << toString(error_code) << std::endl;
+            std::cout << "Failed to get value: " << toString(error_code)
+                      << std::endl;
             return;
         }
 
@@ -174,7 +191,7 @@ private:
         for (const auto& slice : slices) {
             value.append(static_cast<const char*>(slice.ptr), slice.size);
         }
-        std::cout << "Value: " << value << std::endl;
+        std::cout << "Get value: " << value << std::endl;
 
         // Free the buffer
         free_slices();
@@ -182,8 +199,16 @@ private:
 
     void HandleMount(std::istringstream& iss) {
         std::string client_name;
+        std::string segment_name;
         size_t size;
-        iss >> client_name >> size;
+        iss >> client_name >> segment_name >> size;
+
+        if (segment_name.empty() || client_name.empty() || size == 0) {
+            std::cout << "Invalid mount command format. Expected: mount "
+                         "[client_name] [segment_name] [size]"
+                      << std::endl;
+            return;
+        }
 
         auto it = clients_.find(client_name);
         if (it == clients_.end()) {
@@ -191,8 +216,10 @@ private:
             return;
         }
 
-        if (it->second.segment_buffers) {
-            std::cout << "Client " << client_name << " has mounted segments, cannot mount" << std::endl;
+        if (it->second.segments.find(segment_name) !=
+            it->second.segments.end()) {
+            std::cout << "Segment " << segment_name << " already mounted"
+                      << std::endl;
             return;
         }
 
@@ -205,20 +232,53 @@ private:
 
         ErrorCode error_code = it->second.client->MountSegment(buffer, size);
         if (error_code != ErrorCode::OK) {
-            std::cout << "Failed to mount segment: " << toString(error_code) << std::endl;
+            std::cout << "Failed to mount segment: " << toString(error_code)
+                      << std::endl;
             free(buffer);
             return;
         }
-        it->second.segment_buffers = buffer;
 
-        std::cout << "Successfully mounted segment on client " << client_name << std::endl;
+        SegmentInfo segment_info{buffer, size};
+        it->second.segments[segment_name] = segment_info;
+
+        std::cout << "Successfully mounted segment on client " << client_name
+                  << std::endl;
+    }
+
+    void HandleRemove(std::istringstream& iss) {
+        std::string name;
+        iss >> name;
+
+        auto it = clients_.find(name);
+        if (it == clients_.end()) {
+            std::cout << "Client not found: " << name << std::endl;
+            return;
+        }
+
+        clients_.erase(it);
+        std::cout << "Successfully removed client: " << name << std::endl;
+    }
+
+    void HandleSleep(std::istringstream& iss) {
+        int seconds;
+        iss >> seconds;
+
+        if (seconds <= 0) {
+            std::cout << "Invalid sleep command format. Expected: sleep [seconds]"
+                      << std::endl;
+            return;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::cout << "Slept for " << seconds << " seconds"
+                  << std::endl;
     }
 
     std::unordered_map<std::string, ClientInfo> clients_;
 };
 
-} // namespace testing
-} // namespace mooncake
+}  // namespace testing
+}  // namespace mooncake
 
 int main(int argc, char** argv) {
     // Initialize Google's flags library

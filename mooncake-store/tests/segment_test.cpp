@@ -361,7 +361,7 @@ TEST_F(SegmentTest, QuerySegments) {
     // Create 10 different segments with different names and client IDs
     std::vector<Segment> segments;
     std::vector<UUID> client_ids;
-    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
+    std::unordered_map<UUID, UUID, boost::hash<UUID>>
         expected_client_segments;
 
     for (int i = 0; i < 10; i++) {
@@ -383,7 +383,7 @@ TEST_F(SegmentTest, QuerySegments) {
         // Store for verification
         segments.push_back(segment);
         client_ids.push_back(client_id);
-        expected_client_segments[client_id].push_back(segment.id);
+        expected_client_segments[client_id] = segment.id;
     }
 
     // Verify all segments are mounted correctly
@@ -391,22 +391,17 @@ TEST_F(SegmentTest, QuerySegments) {
 
     // Test GetClientSegments for each client
     for (size_t i = 0; i < client_ids.size(); i++) {
-        std::vector<UUID> client_segments;
+        std::vector<Segment> client_segments;
         ASSERT_EQ(
             segment_access.GetClientSegments(client_ids[i], client_segments),
             ErrorCode::OK);
 
         // Verify correct number of segments
-        ASSERT_EQ(client_segments.size(),
-                  expected_client_segments[client_ids[i]].size());
+        ASSERT_EQ(client_segments.size(), 1);
 
         // Verify all expected segments are present
-        for (const auto& expected_segment_id :
-             expected_client_segments[client_ids[i]]) {
-            ASSERT_NE(std::find(client_segments.begin(), client_segments.end(),
-                                expected_segment_id),
-                      client_segments.end());
-        }
+        ASSERT_EQ(client_segments[0].id,
+                  expected_client_segments[client_ids[i]]);
     }
 
     // Test GetAllSegments
