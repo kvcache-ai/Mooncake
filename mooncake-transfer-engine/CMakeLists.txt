@@ -24,6 +24,6 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-if (USE_NVLINK)
+if (USE_MNNVL)
   add_subdirectory(nvlink-allocator)
 endif()
