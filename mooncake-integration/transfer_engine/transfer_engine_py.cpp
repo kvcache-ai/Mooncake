@@ -17,7 +17,7 @@
 #include <cassert>
 #include <fstream>
 
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
     return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);

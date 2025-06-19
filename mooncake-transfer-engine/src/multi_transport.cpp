@@ -23,7 +23,7 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
 
@@ -163,7 +163,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new NVMeoFTransport();
     }
 #endif
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
