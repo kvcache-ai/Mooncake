@@ -43,7 +43,8 @@ Client::~Client() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto err_code = UnmountSegment(segment.name);
+        auto err_code = UnmountSegment(reinterpret_cast<void*>(segment.base),
+                                       segment.size);
         if (err_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
@@ -543,8 +544,7 @@ ErrorCode Client::Remove(const ObjectKey& key) {
 
 long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
 
-ErrorCode Client::MountSegment(const std::string& segment_name,
-                               const void* buffer, size_t size) {
+ErrorCode Client::MountSegment(const void* buffer, size_t size) {
     if (buffer == nullptr || size == 0 ||
         reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
@@ -555,10 +555,17 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
 
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
+    // Check if the segment overlaps with any existing segment
     for (auto& it : mounted_segments_) {
-        auto& segment = it.second;
-        if (segment.name == segment_name) {
-            LOG(ERROR) << "segment_already_exists segment_name=" << segment_name;
+        auto& mtseg = it.second;
+        uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+        uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
+        uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
+        uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
+        if (std::max(l1, l2) < std::min(r1, r2)) {
+            LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+                       << " size1=" << mtseg.size << " base2=" << buffer
+                       << " size2=" << size;
             return ErrorCode::INVALID_PARAMS;
         }
     }
@@ -566,18 +573,19 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     int rc = transfer_engine_.registerLocalMemory((void*)buffer, size, "cpu:0",
                                                   true, true);
     if (rc != 0) {
-        LOG(ERROR) << "register_local_memory_failed segment_name="
-                   << segment_name << ", error=" << rc;
+        LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                   << " size=" << size << ", error=" << rc;
         return ErrorCode::INVALID_PARAMS;
     }
 
-    Segment segment(generate_uuid(), segment_name, reinterpret_cast<uintptr_t>(buffer), size);
+    Segment segment(generate_uuid(), local_hostname_,
+                    reinterpret_cast<uintptr_t>(buffer), size);
 
     ErrorCode err =
         master_client_.MountSegment(segment, client_id_).error_code;
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "mount_segment_to_master_failed segment_name="
-                   << segment_name << ", error=" << err;
+        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                   << " size=" << size << ", error=" << err;
         return err;
     }
 
@@ -585,23 +593,26 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
     return ErrorCode::OK;
 }
 
-ErrorCode Client::UnmountSegment(const std::string& segment_name) {
+ErrorCode Client::UnmountSegment(const void* buffer, size_t size) {
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (it->second.name == segment_name) {
+        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+            it->second.size == size) {
             segment = it;
             break;
         }
     }
     if (segment == mounted_segments_.end()) {
-        LOG(ERROR) << "segment_not_found segment_name=" << segment_name;
+        LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
         return ErrorCode::INVALID_PARAMS;
     }
 
-    ErrorCode err = master_client_.UnmountSegment(segment->second.id, client_id_).error_code;
+    ErrorCode err =
+        master_client_.UnmountSegment(segment->second.id, client_id_)
+            .error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);

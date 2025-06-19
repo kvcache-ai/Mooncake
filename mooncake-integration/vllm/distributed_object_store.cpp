@@ -126,13 +126,14 @@ DistributedObjectStore::~DistributedObjectStore() {
     if (client_ && segment_ptr_) {
         // Try to unmount the segment using saved local_hostname
         ErrorCode error_code =
-            client_->UnmountSegment(local_hostname);
+            client_->UnmountSegment(segment_ptr_.get(), global_segment_size_);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment in destructor: "
                        << toString(error_code);
         }
         // The unique_ptr will automatically free the memory when reset
         segment_ptr_.reset();
+        global_segment_size_ = 0;
         client_.reset();
     }
 }
@@ -192,7 +193,8 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    error_code = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
+    global_segment_size_ = global_segment_size;
+    error_code = client_->MountSegment(segment_ptr_.get(),
                                        global_segment_size);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
@@ -280,7 +282,7 @@ int DistributedObjectStore::tearDownAll() {
     // Unmount all segments before destroying the client
     if (segment_ptr_) {
         ErrorCode error_code =
-            client_->UnmountSegment(local_hostname);
+            client_->UnmountSegment(segment_ptr_.get(), global_segment_size_);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(error_code);
             return 1;

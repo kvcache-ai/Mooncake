@@ -146,20 +146,19 @@ class Client {
 
     /**
      * @brief Registers a memory segment to master for allocation
-     * @param segment_name Unique identifier for the segment
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
-                           size_t size);
+    ErrorCode MountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
-     * @param segment_name Name of the segment to unregister
+     * @param buffer Memory buffer to unregister
+     * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode UnmountSegment(const std::string& segment_name);
+    ErrorCode UnmountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer

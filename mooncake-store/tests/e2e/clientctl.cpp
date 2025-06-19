@@ -203,7 +203,7 @@ private:
             return;
         }
 
-        ErrorCode error_code = it->second.client->MountSegment(it->second.hostname, buffer, size);
+        ErrorCode error_code = it->second.client->MountSegment(buffer, size);
         if (error_code != ErrorCode::OK) {
             std::cout << "Failed to mount segment: " << toString(error_code) << std::endl;
             free(buffer);

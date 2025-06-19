@@ -335,7 +335,7 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
                                                 const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                     ", segment_name=", segment.name, ", id=", segment.id,
+                     ", name=", segment.name, ", id=", segment.id,
                      ", client_id=", client_id);
 
     std::optional<MountSegmentResponse> result =
@@ -363,7 +363,7 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
 ReMountSegmentResponse MasterClient::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
-    timer.LogRequest("segments_count=", segments.size(), ", client_id=", client_id);
+    timer.LogRequest("segments_num=", segments.size(), ", client_id=", client_id);
 
     std::optional<ReMountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<ReMountSegmentResponse>> {
