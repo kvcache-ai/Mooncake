@@ -54,6 +54,15 @@ enum class HandShakeRequestType {
     OldProtocol = 0xff,
 };
 
+static inline std::string getHostname() {
+    char hostname[256];
+    if (gethostname(hostname, 256)) {
+        PLOG(ERROR) << "Failed to get hostname";
+        return "";
+    }
+    return hostname;
+}
+
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";

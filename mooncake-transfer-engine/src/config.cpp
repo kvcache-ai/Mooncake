@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "config.h"
+
 #include <dirent.h>
 #include <unistd.h>
-
-#include "config.h"
 
 namespace mooncake {
 void loadGlobalConfig(GlobalConfig &config) {
@@ -182,14 +182,15 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.metacache = false;
     }
 
-    const char *handshake_listen_backlog = std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
+    const char *handshake_listen_backlog =
+        std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
         int val = std::stoi(handshake_listen_backlog);
         if (val > 0) {
             config.handshake_listen_backlog = val;
         } else {
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_HANDSHAKE_LISTEN_BACKLOG";
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_HANDSHAKE_LISTEN_BACKLOG";
         }
     }
 
@@ -223,17 +224,23 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
         if (opendir(log_dir_path) == NULL) {
-            LOG(WARNING) << "Path [" << log_dir_path <<
-                "] is not a valid directory path. Still logging to stderr.";
+            LOG(WARNING)
+                << "Path [" << log_dir_path
+                << "] is not a valid directory path. Still logging to stderr.";
         } else if (access(log_dir_path, W_OK) != 0) {
-            LOG(WARNING) << "Path [" << log_dir_path <<
-                "] is not a permitted directory path for the current user. \
+            LOG(WARNING)
+                << "Path [" << log_dir_path
+                << "] is not a permitted directory path for the current user. \
                 Still logging to stderr.";
         } else {
             FLAGS_log_dir = log_dir_path;
             FLAGS_logtostderr = 0;
             FLAGS_stop_logging_if_full_disk = true;
         }
+    }
+
+    if (std::getenv("MC_USE_IPV6")) {
+        config.use_ipv6 = true;
     }
 }
 

@@ -27,9 +27,22 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
 
+# Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    echo "Copying CUDA nvlink_allocator.so ..."
+    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+else
+    echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
+fi
+
+echo "Copying allocator libraries..."
+# Copy allocator.py
+cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
 
 echo "Building wheel package..."
@@ -48,7 +61,18 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_$(uname -m)"}
+# Detect architecture and set appropriate platform tag
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_aarch64"}
+    echo "Building for ARM64 architecture"
+elif [ "$ARCH" = "x86_64" ]; then
+    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
+    echo "Building for x86_64 architecture"
+else
+    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+    exit 1
+fi
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
 python -m build --wheel --outdir ${OUTPUT_DIR}

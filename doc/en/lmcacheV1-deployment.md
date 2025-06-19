@@ -13,7 +13,7 @@ The vLLM v1 version has been released with support for PD separation. The detail
 `etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://localhost:2379`
 
 4. Launch D endpoint on machine A
-- Modify the vllm/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
+- Modify the vllm/examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
 ```diff
 diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
 index 831ef0bb5..a2ff0744c 100644
@@ -68,7 +68,7 @@ max_local_cpu_size: 100
 - Launch D endpoint using command `bash disagg_vllm_launcher.sh decoder Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4`
 
 5. Launch P endpoint on machine B
-- Modify the vllm/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
+- Modify the vllm/examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
 ```diff
 diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
 index 831ef0bb5..9e5a3f044 100644
@@ -128,7 +128,7 @@ max_local_cpu_size: 100
 
 6. Launch the LoadBalance endpoint using command
 ```bash
-python3 disagg_proxy_server.py --host localhost --port 9000 --prefiller-host IP_of_Machine_B --prefiller-port 8100 --decoder-host IP_of_Machine_B --decoder-port 8200 
+python3 disagg_proxy_server.py --host localhost --port 9000 --prefiller-host IP_of_Machine_B --prefiller-port 8100 --decoder-host IP_of_Machine_A --decoder-port 8200 
 ```
 
 7. Now we can send the requests to LoadBalance to test PD separation.

@@ -58,7 +58,7 @@ The process involves identifying the appropriate local and target NICs based on 
 
 For instance, as illustrated in figure above, to transfer data from buffer 0 (assigned to cpu:0) in the local node to buffer 1 (assigned to cpu:1) in the target node, the engine first identifies the preferred NICs for cpu:0 using the local server's topology matrix and selects one, such as mlx5_1, as the local NIC. Similarly, the target NIC, such as mlx5_3, is selected based on the target memory address. This setup enables establishing an RDMA connection from mlx5_1@local to mlx5_3@target to carry out RDMA read and write operations.
 
-To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exceeds 16KB. 
+To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exceeds 64KB. 
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
 ### Endpoint Management

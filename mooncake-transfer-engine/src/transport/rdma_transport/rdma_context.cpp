@@ -350,8 +350,13 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
     int num_devices = 0;
     struct ibv_context *context = nullptr;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
-    if (!devices || num_devices <= 0) {
+    if (!devices) {
         LOG(ERROR) << "ibv_get_device_list failed";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+    if (devices && num_devices <= 0) {
+        LOG(ERROR) << "ibv_get_device_list failed";
+        ibv_free_device_list(devices);
         return ERR_DEVICE_NOT_FOUND;
     }
 
