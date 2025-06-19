@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.3.post1"
+version = "0.3.3.post2"
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }
@@ -27,6 +27,7 @@ Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
+transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:main"
 
@@ -39,4 +40,4 @@ where = ["."]
 include = ["mooncake*"]
 
 [tool.setuptools.package-data]
-mooncake = ["*.so", "mooncake_master"]
+mooncake = ["*.so", "mooncake_master", "transfer_engine_bench"]
