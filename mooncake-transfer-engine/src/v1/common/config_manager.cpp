@@ -42,6 +42,17 @@ Status ConfigManager::loadConfig(const std::filesystem::path& config_path) {
     }
 }
 
+Status ConfigManager::loadConfigContent(const std::string& content) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Json::Reader reader;
+    if (content.empty() || !reader.parse(content, config_data_)) {
+        fprintf(stderr, "OK %s\n", content.c_str());
+        return Status::MalformedJson(
+            "Unrecognized format of json content" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 const Json::Value* ConfigManager::findValue(const std::string& key_path) const {
     size_t start = 0;
     size_t end = key_path.find('/');

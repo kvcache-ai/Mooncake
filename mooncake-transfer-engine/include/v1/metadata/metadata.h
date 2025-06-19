@@ -68,8 +68,7 @@ struct MemorySegmentDesc {
     Topology topology;
     std::vector<DeviceDesc> devices;  // TODO: change to map ...
     std::vector<BufferDesc> buffers;
-    std::string handshake_tcp_addr;
-    uint16_t handshake_tcp_port;
+    std::string rpc_server_addr;
 };
 
 struct FileSegmentDesc {

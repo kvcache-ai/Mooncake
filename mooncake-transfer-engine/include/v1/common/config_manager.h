@@ -29,6 +29,8 @@ class ConfigManager {
    public:
     Status loadConfig(const std::filesystem::path& config_path);
 
+    Status loadConfigContent(const std::string& content);
+
     std::string get(const std::string& key_path,
                     const char* default_value) const {
         return get(key_path, std::string(default_value));

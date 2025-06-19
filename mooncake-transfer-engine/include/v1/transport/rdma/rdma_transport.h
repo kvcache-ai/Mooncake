@@ -91,7 +91,7 @@ class RdmaTransport : public Transport {
                                BootstrapDesc &local_desc);
 
    public:
-    void allocateLocalSegmentID();
+    Status setupLocalSegment();
 
     Status registerSingleLocalMemory(const BufferEntry &buffer,
                                      bool update_meta);

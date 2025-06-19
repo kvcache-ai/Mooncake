@@ -94,6 +94,8 @@ class TransferEngine {
 
     Status deconstruct();
 
+    Status setupLocalSegment();
+
     void lazyFreeBatch();
 
     TransportType getTransportType(const Request &request);
@@ -111,6 +113,7 @@ class TransferEngine {
 
     std::string hostname_;
     uint16_t port_;
+    bool ipv6_;
     std::string local_segment_name_;
 };
 }  // namespace v1

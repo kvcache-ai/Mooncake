@@ -233,14 +233,7 @@ Status ShmTransport::unregisterLocalMemory(
 }
 
 Status ShmTransport::setupLocalSegment() {
-    auto &manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    if (segment) return Status::OK();
-    segment = std::make_shared<SegmentDesc>();
-    segment->name = local_segment_name_;
-    segment->type = SegmentType::Memory;
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return Status::OK();
 }
 
 void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {

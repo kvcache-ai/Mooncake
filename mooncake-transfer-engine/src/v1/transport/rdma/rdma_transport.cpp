@@ -75,7 +75,7 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "No RDMA device detected in active" LOC_MARK);
     }
 
-    allocateLocalSegmentID();
+    setupLocalSegment();
 
     metadata_->setBootstrapRdmaCallback(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
@@ -239,12 +239,10 @@ Status RdmaTransport::unregisterLocalMemory(
     return metadata_->segmentManager().applyLocal();
 }
 
-void RdmaTransport::allocateLocalSegmentID() {
+Status RdmaTransport::setupLocalSegment() {
     auto &manager = metadata_->segmentManager();
     auto segment = manager.getLocal();
-    if (!segment) segment = std::make_shared<SegmentDesc>();
-    segment->name = local_segment_name_;
-    segment->type = SegmentType::Memory;
+    assert(segment);
     auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     for (auto &context : context_set_) {
         DeviceDesc device_desc;
@@ -253,9 +251,8 @@ void RdmaTransport::allocateLocalSegmentID() {
         device_desc.gid = context->gid();
         detail.devices.push_back(device_desc);
     }
-    detail.topology = *(local_topology_.get());
     manager.setLocal(segment);
-    manager.applyLocal();
+    return manager.applyLocal();
 }
 
 Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,

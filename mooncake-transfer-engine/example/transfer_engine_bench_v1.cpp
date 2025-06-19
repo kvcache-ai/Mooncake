@@ -56,11 +56,10 @@ static void checkCudaError(cudaError_t result, const char *message) {
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
 
-static std::string getHostname();
+DEFINE_string(segment_name, "", "Segment name of this instance");
+DEFINE_string(metadata_type, "p2p", "Metadata type: p2p, etcd, redis or http");
+DEFINE_string(metadata_servers, "127.0.0.1:2379", "Metadata server addresses");
 
-DEFINE_string(local_server_name, getHostname(),
-              "Local server name for segment discovery");
-DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
@@ -90,15 +89,6 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 
 using namespace mooncake;
 using namespace mooncake::v1;
-
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
 
 static void *allocateMemoryPool(size_t size, const std::string &shm_path) {
     int shm_fd = shm_open(shm_path.c_str(), O_CREAT | O_RDWR, 0644);
@@ -211,7 +201,8 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
         exit(EXIT_FAILURE);
     }
-    auto &detail = std::get<mooncake::v1::MemorySegmentDesc>(segment_desc->detail);
+    auto &detail =
+        std::get<mooncake::v1::MemorySegmentDesc>(segment_desc->detail);
     uint64_t remote_base =
         (uint64_t)detail.buffers[thread_id % NR_SOCKETS].addr;
 
@@ -260,47 +251,14 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     return Status::OK();
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
-    std::stringstream ss(device_names);
-    std::string item;
-    std::vector<std::string> tokens;
-    while (getline(ss, item, ',')) {
-        tokens.push_back(item);
-    }
-
-    std::string formatted;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        formatted += "\"" + tokens[i] + "\"";
-        if (i < tokens.size() - 1) {
-            formatted += ",";
-        }
-    }
-    return formatted;
-}
-
-std::string loadNicPriorityMatrix() {
-    if (!FLAGS_nic_priority_matrix.empty()) {
-        std::ifstream file(FLAGS_nic_priority_matrix);
-        if (file.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                std::istreambuf_iterator<char>());
-            file.close();
-            return content;
-        }
-    }
-    // Build JSON Data
-    auto device_names = formatDeviceNames(FLAGS_device_name);
-    return "{\"cpu:0\": [[" + device_names +
-           "], []], "
-           " \"cpu:1\": [[" +
-           device_names +
-           "], []], "
-           " \"cuda:0\": [[" +
-           device_names + "], []]}";
-}
-
 int initiator() {
-    auto engine = std::make_unique<TransferEngine>();
+    auto config = std::make_shared<ConfigManager>();
+    std::string context;
+    context = "{ \"local_segment_name\": \"" + FLAGS_segment_name +
+              "\",\n\"metadata_type\": \"" + FLAGS_metadata_type +
+              "\",\"metadata_servers\": \"" + FLAGS_metadata_servers + "\"}";
+    config->loadConfigContent(context);
+    auto engine = std::make_unique<TransferEngine>(config);
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
     int buffer_num = NR_SOCKETS;
@@ -379,7 +337,13 @@ int target() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    auto engine = std::make_unique<TransferEngine>();
+    auto config = std::make_shared<ConfigManager>();
+    std::string context;
+    context = "{ \"local_segment_name\": \"" + FLAGS_segment_name +
+              "\",\n\"metadata_type\": \"" + FLAGS_metadata_type +
+              "\",\"metadata_servers\": \"" + FLAGS_metadata_servers + "\"}";
+    config->loadConfigContent(context);
+    auto engine = std::make_unique<TransferEngine>(config);
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
     for (int i = 0; i < NR_SOCKETS; ++i) {

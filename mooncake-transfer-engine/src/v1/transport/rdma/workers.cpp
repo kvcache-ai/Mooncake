@@ -19,6 +19,8 @@
 #include <cassert>
 
 #include "v1/transport/rdma/endpoint_store.h"
+#include "v1/utility/ip.h"
+
 namespace mooncake {
 namespace v1 {
 
@@ -216,34 +218,37 @@ void Workers::asyncPostSend(int thread_id) {
 int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
                          const std::string &peer_server_name,
                          const std::string &peer_nic_name) {
+    auto qp_num = endpoint->qpNum();
+
     BootstrapDesc local_desc, peer_desc;
     local_desc.local_nic_path = MakeNicPath(transport_->local_segment_name_,
                                             endpoint->context().name());
     local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
-    local_desc.qp_num = endpoint->qpNum();
+    local_desc.qp_num = qp_num;
 
     std::shared_ptr<SegmentDesc> segment_desc;
     if (local_desc.local_nic_path == local_desc.peer_nic_path) {
         segment_desc = transport_->metadata_->segmentManager().getLocal();
-        peer_desc = local_desc;
     } else {
-        BootstrapRdmaClient bootstrap_client;
-        auto status =
-            bootstrap_client.bootstrap(peer_server_name, local_desc, peer_desc);
-        if (!status.ok()) return ERR_ENDPOINT;
-        assert(peer_desc.qp_num.size());
-        
         auto &manager = transport_->metadata_->segmentManager();
-        status = manager.getRemote(segment_desc, peer_server_name);
+        auto status = manager.getRemote(segment_desc, peer_server_name);
         if (!status.ok()) return ERR_ENDPOINT;
+
+        BootstrapRdmaClient client;
+        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+        LOG(INFO) << "==> " << detail.rpc_server_addr;
+        status = client.bootstrap(detail.rpc_server_addr, local_desc, peer_desc);
+        if (!status.ok()) return ERR_ENDPOINT;
+
+        qp_num = peer_desc.qp_num;
     }
 
+    assert(qp_num.size());
     if (segment_desc) {
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
         for (auto &nic : detail.devices) {
             if (nic.name == peer_nic_name) {
-                return endpoint->configurePeer(nic.gid, nic.lid,
-                                               peer_desc.qp_num);
+                return endpoint->configurePeer(nic.gid, nic.lid, qp_num);
             }
         }
     }

@@ -76,18 +76,28 @@ std::string randomSegmentName() {
     return name;
 }
 
+Status TransferEngine::setupLocalSegment() {
+    auto &manager = metadata_->segmentManager();
+    auto segment = std::make_shared<SegmentDesc>();
+    segment->name = local_segment_name_;
+    segment->type = SegmentType::Memory;
+    auto &detail = std::get<MemorySegmentDesc>(segment->detail);
+    detail.topology = *(topology_.get());
+    detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
+    manager.setLocal(segment);
+    return manager.applyLocal();
+}
+
 Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
     hostname_ = conf_->get("rpc_server_hostname", "");
-    local_segment_name_ = conf_->get("local_segment_name", randomSegmentName());
-    bool ipv6;
-
+    local_segment_name_ = conf_->get("local_segment_name", "");
     if (!hostname_.empty())
-        CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6));
+        CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
-        CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6));
+        CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
     port_ = conf_->get("rpc_server_port", 0);
     metadata_ =
@@ -96,18 +106,21 @@ Status TransferEngine::construct() {
     CHECK_STATUS(metadata_->start(port_));
 
     if (metadata_type == "p2p")
-        local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6);
+        local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6_);
+    else if (local_segment_name_.empty())
+        local_segment_name_ = randomSegmentName();
+
+    topology_ = std::make_shared<Topology>();
+    CHECK_STATUS(topology_->discover());
+    CHECK_STATUS(setupLocalSegment());
 
     LOG(INFO) << "========== Transfer Engine Parameters ==========";
     LOG(INFO) << " - Segment Name:       " << local_segment_name_;
     LOG(INFO) << " - RPC Server Address: "
-              << buildIpAddrWithPort(hostname_, port_, ipv6);
+              << buildIpAddrWithPort(hostname_, port_, ipv6_);
     LOG(INFO) << " - Metadata Type:      " << metadata_type;
     LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
     LOG(INFO) << "================================================";
-
-    topology_ = std::make_shared<Topology>();
-    CHECK_STATUS(topology_->discover());
 
     if (!topology_->getHcaList().empty()) {
         auto transport = std::make_shared<RdmaTransport>();

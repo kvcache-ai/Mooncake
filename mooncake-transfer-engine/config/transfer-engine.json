@@ -3,7 +3,7 @@
     "metadata_type": "p2p",
     "metadata_servers": "127.0.0.1:2379",
     "rpc_server_hostname": "127.0.0.1",
-    "rpc_server_port": "auto",
+    "rpc_server_port": 0,
     "devices": {
         "whitelist": ["mlx5_0", "mlx5_2"],
         "blacklist": []

@@ -85,9 +85,7 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
             }
             if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
             segmentJSON["topology"] = detail.topology.toJson();
-            segmentJSON["handshake_tcp_addr"] = detail.handshake_tcp_addr;
-            segmentJSON["handshake_tcp_port"] =
-                static_cast<Json::UInt>(detail.handshake_tcp_port);
+            segmentJSON["rpc_server_addr"] = detail.rpc_server_addr;
         } else if (desc.type == SegmentType::File) {
             segmentJSON["type"] = "file";
             Json::Value buffersJSON(Json::arrayValue);
@@ -149,10 +147,7 @@ static std::shared_ptr<SegmentDesc> importSegmentDesc(
 
             auto topo_string = getStyledJsonString(segmentJSON, "topology");
             if (!topo_string.empty()) detail.topology.parse(topo_string);
-            detail.handshake_tcp_addr =
-                getItem(segmentJSON, "handshake_tcp_addr");
-            detail.handshake_tcp_port =
-                (uint16_t)getItemUInt64(segmentJSON, "handshake_tcp_port");
+            detail.rpc_server_addr = getItem(segmentJSON, "rpc_server_addr");
         } else if (type_str == "file") {
             desc->type = SegmentType::File;
             desc->detail = FileSegmentDesc{};
