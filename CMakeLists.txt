@@ -22,7 +22,6 @@ execute_process(
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
-
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
   if (USE_ETCD_LEGACY)
@@ -31,6 +30,10 @@ if (USE_ETCD)
   else()
     message(STATUS "etcd as metadata server support is enabled (go package)")
   endif()
+endif()
+option(STORE_USE_ETCD "build mooncake store with etcd" OFF)
+if (STORE_USE_ETCD)
+  add_compile_definitions(STORE_USE_ETCD)
 endif()
 
 add_subdirectory(mooncake-common)
