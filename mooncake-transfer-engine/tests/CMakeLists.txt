@@ -26,7 +26,7 @@ target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest gtest_main
 add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
 endif()
 
-if (USE_NVLINK)
+if (USE_MNNVL)
     add_executable(nvlink_transport_test nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
     add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)  
