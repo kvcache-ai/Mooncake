@@ -51,7 +51,8 @@ class ShmTransport : public Transport {
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<MetadataService> metadata,
-                           std::shared_ptr<Topology> local_topology);
+                           std::shared_ptr<Topology> local_topology,
+                           std::shared_ptr<ConfigManager> conf = nullptr);
 
     virtual Status uninstall();
 

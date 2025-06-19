@@ -101,6 +101,32 @@ int ConfigManager::get(const std::string& key_path, int default_value) const {
     return default_value;
 }
 
+uint32_t ConfigManager::get(const std::string& key_path, uint32_t default_value) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isConvertibleTo(Json::ValueType::intValue))
+                return val->asUInt();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+uint64_t ConfigManager::get(const std::string& key_path, uint64_t default_value) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isConvertibleTo(Json::ValueType::intValue))
+                return val->asUInt64();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
 double ConfigManager::get(const std::string& key_path,
                           double default_value) const {
     if (const Json::Value* val = findValue(key_path)) {

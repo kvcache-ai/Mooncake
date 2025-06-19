@@ -76,6 +76,15 @@ std::string randomSegmentName() {
     return name;
 }
 
+void setLogLevel(const std::string level) {
+    if (level == "info")
+        FLAGS_minloglevel = google::INFO;
+    else if (level == "warning")
+        FLAGS_minloglevel = google::WARNING;
+    else if (level == "error")
+        FLAGS_minloglevel = google::ERROR;
+}
+
 Status TransferEngine::setupLocalSegment() {
     auto &manager = metadata_->segmentManager();
     auto segment = std::make_shared<SegmentDesc>();
@@ -89,9 +98,9 @@ Status TransferEngine::setupLocalSegment() {
 }
 
 Status TransferEngine::construct() {
-    transport_list_.resize(kSupportedTransportTypes, nullptr);
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
+    setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     if (!hostname_.empty())
@@ -111,7 +120,7 @@ Status TransferEngine::construct() {
         local_segment_name_ = randomSegmentName();
 
     topology_ = std::make_shared<Topology>();
-    CHECK_STATUS(topology_->discover());
+    CHECK_STATUS(topology_->discover(conf_));
     CHECK_STATUS(setupLocalSegment());
 
     LOG(INFO) << "========== Transfer Engine Parameters ==========";
@@ -122,10 +131,10 @@ Status TransferEngine::construct() {
     LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
     LOG(INFO) << "================================================";
 
+    transport_list_.resize(kSupportedTransportTypes, nullptr);
     if (!topology_->getHcaList().empty()) {
         auto transport = std::make_shared<RdmaTransport>();
-        CHECK_STATUS(
-            transport->install(local_segment_name_, metadata_, topology_));
+        CHECK_STATUS(transport->install(local_segment_name_, metadata_, topology_, conf_));
         transport_list_[RDMA] = transport;
     }
 
@@ -301,7 +310,10 @@ std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
     std::shared_ptr<SegmentDesc> desc;
     if (handle == 0) return manager.getLocal();
     auto status = manager.getRemote(desc, handle);
-    assert(status.ok());
+    if (!status.ok()) {
+        LOG(ERROR) << status.ToString();
+        return nullptr;
+    }
     return desc;
 }
 

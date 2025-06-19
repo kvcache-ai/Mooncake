@@ -4,19 +4,18 @@
     "metadata_servers": "127.0.0.1:2379",
     "rpc_server_hostname": "127.0.0.1",
     "rpc_server_port": 0,
-    "devices": {
-        "whitelist": ["mlx5_0", "mlx5_2"],
-        "blacklist": []
+    "topology": {
+        "rdma_whitelist": ["mlx5_0", "mlx5_2"],
+        "rdma_blacklist": []
     },
-    "topology": {},
     "log_level": "warning",
     "transports": {
         "rdma": {
             "device": {
                 "num_cq_list": 1,
                 "num_comp_channels": 1,
-                "port": "auto",
-                "gid_index": "auto",
+                "port": 1,
+                "gid_index": 0,
                 "max_cqe": 4096
             },
             "endpoint": {
@@ -42,7 +41,7 @@
                 "send_rnr_count": 7,
                 "max_rd_atomic": 16
             },
-            "worker" : {
+            "workers" : {
                 "num_workers": 1,
                 "max_retry_count": 8,
                 "block_size": 65536,

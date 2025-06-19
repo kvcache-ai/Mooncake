@@ -65,12 +65,7 @@ class Topology {
 
     void clear();
 
-    Status discover() {
-        std::vector<std::string> filter;
-        return discover(filter);
-    }
-
-    Status discover(const std::vector<std::string> &filter);
+    Status discover(std::shared_ptr<ConfigManager> conf = nullptr);
 
     Status parse(const std::string &topology_json);
 

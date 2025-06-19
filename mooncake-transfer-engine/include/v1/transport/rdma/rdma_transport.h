@@ -61,7 +61,8 @@ class RdmaTransport : public Transport {
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<MetadataService> metadata,
-                           std::shared_ptr<Topology> local_topology);
+                           std::shared_ptr<Topology> local_topology,
+                           std::shared_ptr<ConfigManager> conf = nullptr);
 
     virtual Status uninstall();
 
@@ -101,6 +102,7 @@ class RdmaTransport : public Transport {
 
    private:
     bool installed_;
+    std::shared_ptr<ConfigManager> conf_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;

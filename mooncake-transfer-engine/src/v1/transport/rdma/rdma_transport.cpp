@@ -30,15 +30,70 @@
 #include "v1/utility/memory_location.h"
 #include "v1/utility/topology.h"
 
+#define SET_DEVICE(key, param)    \
+    param = conf->get("transports/rdma/device/" #key, param)
+
+#define SET_ENDPOINT(key, param)    \
+    param = conf->get("transports/rdma/endpoint/" #key, param)
+
+#define SET_WORKERS(key, param)    \
+    param = conf->get("transports/rdma/workers/" #key, param)
+
 namespace mooncake {
 namespace v1 {
+static void convertConfToRdmaParams(std::shared_ptr<ConfigManager> conf,
+                                    std::shared_ptr<RdmaParams> params) {
+    SET_DEVICE(num_cq_list, params->device.num_cq_list);
+    SET_DEVICE(num_comp_channels, params->device.num_comp_channels);
+    SET_DEVICE(port, params->device.port);
+    SET_DEVICE(gid_index, params->device.gid_index);
+    SET_DEVICE(max_cqe, params->device.max_cqe);
+
+    SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
+    SET_ENDPOINT(qp_mul_factor, params->endpoint.qp_mul_factor);
+    SET_ENDPOINT(max_sge, params->endpoint.max_sge);
+    SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
+    SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
+    SET_ENDPOINT(pkey_index, params->endpoint.pkey_index);
+    SET_ENDPOINT(hop_limit, params->endpoint.hop_limit);
+    SET_ENDPOINT(flow_label, params->endpoint.flow_label);
+    SET_ENDPOINT(traffic_class, params->endpoint.traffic_class);
+    SET_ENDPOINT(service_level, params->endpoint.service_level);
+    SET_ENDPOINT(src_path_bits, params->endpoint.src_path_bits);
+    SET_ENDPOINT(static_rate, params->endpoint.static_rate);
+    SET_ENDPOINT(rq_psn, params->endpoint.rq_psn);
+    SET_ENDPOINT(max_dest_rd_atomic, params->endpoint.max_dest_rd_atomic);
+    SET_ENDPOINT(min_rnr_timer, params->endpoint.min_rnr_timer);
+    SET_ENDPOINT(sq_psn, params->endpoint.sq_psn);
+    SET_ENDPOINT(send_timeout, params->endpoint.send_timeout);
+    SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
+    SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
+    SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+
+    size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
+    if (mtu_val == 4096)
+        params->endpoint.path_mtu = IBV_MTU_4096;
+    else if (mtu_val == 2048)
+        params->endpoint.path_mtu = IBV_MTU_2048;
+    else if (mtu_val == 1024)
+        params->endpoint.path_mtu = IBV_MTU_1024;
+    else
+        params->endpoint.path_mtu = IBV_MTU_512;
+
+    SET_WORKERS(num_workers, params->workers.num_workers);
+    SET_WORKERS(max_retry_count, params->workers.max_retry_count);
+    SET_WORKERS(block_size, params->workers.block_size);
+    SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
+}
+
 RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
 Status RdmaTransport::install(std::string &local_segment_name,
                               std::shared_ptr<MetadataService> metadata,
-                              std::shared_ptr<Topology> local_topology) {
+                              std::shared_ptr<Topology> local_topology,
+                              std::shared_ptr<ConfigManager> conf) {
     if (installed_) {
         return Status::InvalidArgument(
             "RDMA transport has been installed" LOC_MARK);
@@ -49,7 +104,9 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "No RDMA device found in topology" LOC_MARK);
     }
 
+    conf_ = conf;
     params_ = std::make_shared<RdmaParams>();
+    convertConfToRdmaParams(conf_, params_);
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;

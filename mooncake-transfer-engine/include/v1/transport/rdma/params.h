@@ -23,7 +23,7 @@ namespace v1 {
 
 struct DeviceParams {
     int num_cq_list = 1;
-    size_t num_comp_channels = 1;
+    int num_comp_channels = 1;
     uint8_t port = 1;
     int gid_index = 0;
     int max_cqe = 4096;

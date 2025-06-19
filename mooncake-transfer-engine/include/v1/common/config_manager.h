@@ -41,6 +41,10 @@ class ConfigManager {
 
     int get(const std::string& key_path, int default_value) const;
 
+    uint32_t get(const std::string& key_path, uint32_t default_value) const;
+
+    uint64_t get(const std::string& key_path, uint64_t default_value) const;
+
     double get(const std::string& key_path, double default_value) const;
 
     bool get(const std::string& key_path, bool default_value) const;

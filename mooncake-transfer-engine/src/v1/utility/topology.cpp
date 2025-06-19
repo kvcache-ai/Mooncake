@@ -48,8 +48,7 @@ struct InfinibandDevice {
     int numa_node;
 };
 
-static std::vector<InfinibandDevice> listInfiniBandDevices(
-    const std::vector<std::string> &filter) {
+static std::vector<InfinibandDevice> listInfiniBandDevices() {
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
 
@@ -61,9 +60,6 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
 
     for (int i = 0; i < num_devices; ++i) {
         std::string device_name = ibv_get_device_name(device_list[i]);
-        if (!filter.empty() && std::find(filter.begin(), filter.end(),
-                                         device_name) == filter.end())
-            continue;
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that
@@ -87,6 +83,31 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
                                            .numa_node = numa_node});
     }
     return devices;
+}
+
+static void filterInfiniBandDevices(std::vector<InfinibandDevice> &devices,
+                                    std::shared_ptr<ConfigManager> conf) {
+    auto whitelist = conf->getArray("topology/rdma_whitelist");
+    auto blacklist = conf->getArray("topology/rdma_blacklist");
+    std::vector<InfinibandDevice> new_devices;
+    if (!whitelist.empty()) {
+        for (auto &entry : devices) {
+            if (std::find(whitelist.begin(), whitelist.end(), entry.name) !=
+                whitelist.end())
+                new_devices.push_back(entry);
+        }
+        devices.swap(new_devices);
+        return;
+    }
+    if (!blacklist.empty()) {
+        for (auto &entry : devices) {
+            if (std::find(blacklist.begin(), blacklist.end(), entry.name) ==
+                blacklist.end())
+                new_devices.push_back(entry);
+        }
+        devices.swap(new_devices);
+        return;
+    }
 }
 
 static std::vector<TopologyEntry> discoverCpuTopology(
@@ -206,9 +227,10 @@ void Topology::clear() {
     resolved_matrix_.clear();
 }
 
-Status Topology::discover(const std::vector<std::string> &filter) {
+Status Topology::discover(std::shared_ptr<ConfigManager> conf) {
     matrix_.clear();
-    auto all_hca = listInfiniBandDevices(filter);
+    auto all_hca = listInfiniBandDevices();
+    if (conf) filterInfiniBandDevices(all_hca, conf);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
