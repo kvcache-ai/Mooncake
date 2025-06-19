@@ -2,7 +2,6 @@
 
 #include <glog/logging.h>
 
-#include "libetcd_wrapper.h"
 #include "types.h"
 
 namespace mooncake {

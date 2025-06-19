@@ -1,5 +1,9 @@
 #include "etcd_helper.h"
 
+#ifdef STORE_USE_ETCD
+#include "libetcd_wrapper.h"
+#endif
+
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -8,6 +12,7 @@ std::string EtcdHelper::connected_endpoints_ = "";
 std::mutex EtcdHelper::etcd_mutex_;
 bool EtcdHelper::etcd_connected_ = false;
 
+#ifdef STORE_USE_ETCD
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
     std::lock_guard<std::mutex> lock(etcd_mutex_);
@@ -147,5 +152,53 @@ ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     }
     return ErrorCode::OK;
 }
+#else
+ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
+    const std::string& etcd_endpoints) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
+                          std::string& value, EtcdRevisionId& revision_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
+                                      const char* value, const size_t value_size,
+                                      EtcdLeaseId lease_id,
+                                      EtcdRevisionId& revision_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::WatchUntilDeleted(const char* key,
+                                        const size_t key_size) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CancelWatch(const char* key, const size_t key_size) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+#endif
 
 }  // namespace mooncake

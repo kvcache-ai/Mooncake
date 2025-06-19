@@ -12,7 +12,10 @@
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+
+#ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
+#endif
 
 namespace mooncake {
 
@@ -42,9 +45,15 @@ using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
 // Mapping between c++ and go types
+#ifdef STORE_USE_ETCD
 using EtcdRevisionId = GoInt64;
 using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = GoInt64;
+#else
+using EtcdRevisionId = int64_t;
+using ViewVersionId = int64_t;
+using EtcdLeaseId = int64_t;
+#endif
 
 /**
  * @brief Error codes for various operations in the system
