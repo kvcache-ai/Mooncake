@@ -257,9 +257,9 @@ Status SegmentManager::deleteLocal() {
     return store_->deleteSegmentDesc(local_desc_->name);
 }
 
-CentralMetadataStore::CentralMetadataStore(
-    const std::string &connection_string) {
-    plugin_ = MetadataPlugin::Create(connection_string);
+CentralMetadataStore::CentralMetadataStore(const std::string &type,
+                                           const std::string &servers) {
+    plugin_ = MetadataPlugin::Create(type, servers);
 }
 
 Status CentralMetadataStore::getSegmentDesc(SegmentDescRef &desc,
@@ -297,7 +297,8 @@ Status CentralMetadataStore::putSegmentDesc(SegmentDescRef &desc) {
     return plugin_->set(getFullMetadataKey(desc->name), jstr);
 }
 
-Status CentralMetadataStore::deleteSegmentDesc(const std::string &segment_name) {
+Status CentralMetadataStore::deleteSegmentDesc(
+    const std::string &segment_name) {
     if (!plugin_)
         return Status::MetadataError(
             "Central metadata store not started" LOC_MARK);
@@ -402,13 +403,14 @@ Status BootstrapRdmaClient::bootstrap(const std::string &segment_name,
     return deserializeBootstrapDesc(response, response_raw);
 }
 
-MetadataService::MetadataService(const std::string &conn_string)
+MetadataService::MetadataService(const std::string &type,
+                                 const std::string &servers)
     : bootstrap_callback_(nullptr) {
-    if (conn_string == P2PHANDSHAKE) {
+    if (type == "p2p") {
         auto agent = std::make_unique<P2PMetadataStore>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralMetadataStore>(conn_string);
+        auto agent = std::make_unique<CentralMetadataStore>(type, servers);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<AsioRpcServer>();
@@ -425,7 +427,9 @@ MetadataService::MetadataService(const std::string &conn_string)
 
 MetadataService::~MetadataService() {}
 
-void MetadataService::start(uint16_t &port) { rpc_server_->start(port); }
+Status MetadataService::start(uint16_t &port) {
+    return rpc_server_->start(port);
+}
 
 void MetadataService::onGetSegmentDesc(const RpcRawData &request,
                                        RpcRawData &response) {

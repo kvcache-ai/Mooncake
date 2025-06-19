@@ -300,10 +300,7 @@ std::string loadNicPriorityMatrix() {
 }
 
 int initiator() {
-    TEConfig conf;
-    conf[TEConfigKeyLocalSegmentName] = FLAGS_local_server_name;
-    conf[TEConfigKeyMetadataConnString] = FLAGS_metadata_server;
-    auto engine = std::make_unique<TransferEngine>(conf);
+    auto engine = std::make_unique<TransferEngine>();
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
     int buffer_num = NR_SOCKETS;
@@ -382,11 +379,7 @@ int target() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    TEConfig conf;
-    conf[TEConfigKeyLocalSegmentName] = FLAGS_local_server_name;
-    conf[TEConfigKeyMetadataConnString] = FLAGS_metadata_server;
-    auto engine = std::make_unique<TransferEngine>(conf);
-
+    auto engine = std::make_unique<TransferEngine>();
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     BufferEntry entries[NR_SOCKETS];
     for (int i = 0; i < NR_SOCKETS; ++i) {

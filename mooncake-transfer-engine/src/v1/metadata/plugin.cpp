@@ -29,52 +29,31 @@
 
 namespace mooncake {
 namespace v1 {
-static std::pair<std::string, std::string> parseConnectionString(
-    const std::string &conn_string) {
-    std::pair<std::string, std::string> result;
-    std::string proto = "etcd";
-    std::string domain;
-    std::size_t pos = conn_string.find("://");
-
-    if (pos != std::string::npos) {
-        proto = conn_string.substr(0, pos);
-        domain = conn_string.substr(pos + 3);
-    } else {
-        domain = conn_string;
-    }
-
-    result.first = proto;
-    result.second = domain;
-    return result;
-}
-
 std::shared_ptr<MetadataPlugin> MetadataPlugin::Create(
-    const std::string &connection_string) {
-    auto [proto, endpoint] = parseConnectionString(connection_string);
+    const std::string &type, const std::string &servers) {
     std::shared_ptr<MetadataPlugin> plugin;
 #ifdef USE_ETCD
-    if (proto == "etcd") {
+    if (type == "etcd") {
         plugin = std::make_shared<EtcdMetadataPlugin>();
     }
 #endif  // USE_ETCD
 #ifdef USE_REDIS
-    if (proto == "redis") {
+    if (type == "redis") {
         plugin = std::make_shared<RedisMetadataPlugin>();
     }
 #endif  // USE_REDIS
 
 #ifdef USE_HTTP
-    if (proto == "http" || proto == "https") {
+    if (type == "http") {
         plugin = std::make_shared<HttpMetadataPlugin>();
-        endpoint = connection_string;
     }
 #endif  // USE_HTTP
     if (!plugin) {
-        LOG(FATAL) << "Protocol " << proto
+        LOG(FATAL) << "Protocol " << type
                    << " not installed. Please rebuild the package.";
         return nullptr;
     }
-    auto status = plugin->connect(endpoint);
+    auto status = plugin->connect(servers);
     if (status.ok())
         return plugin;
     else {

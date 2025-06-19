@@ -37,7 +37,7 @@ class TransferEngine {
    public:
     TransferEngine();
 
-    TransferEngine(TEConfig &conf);
+    TransferEngine(std::shared_ptr<ConfigManager> config);
 
     ~TransferEngine();
 
@@ -48,9 +48,11 @@ class TransferEngine {
    public:
     bool available() const { return available_; }
 
-    const std::string getEthIP() const;
+    const std::string getSegmentName() const;
 
-    uint16_t getEthPort() const;
+    const std::string getRpcServerAddress() const;
+
+    uint16_t getRpcServerPort() const;
 
    public:
     Status exportLocalSegment(std::string &shared_handle);
@@ -92,14 +94,12 @@ class TransferEngine {
 
     Status deconstruct();
 
-    Status registerRdmaTransport();
-
     void lazyFreeBatch();
 
     TransportType getTransportType(const Request &request);
 
    private:
-    TEConfig conf_;
+    std::shared_ptr<ConfigManager> conf_;
     std::shared_ptr<MetadataService> metadata_;
     std::shared_ptr<Topology> topology_;
     bool available_;
@@ -111,6 +111,7 @@ class TransferEngine {
 
     std::string hostname_;
     uint16_t port_;
+    std::string local_segment_name_;
 };
 }  // namespace v1
 }  // namespace mooncake

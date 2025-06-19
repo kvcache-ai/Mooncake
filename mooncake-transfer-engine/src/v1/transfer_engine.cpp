@@ -14,19 +14,12 @@
 
 #include "v1/transfer_engine.h"
 
-#include <arpa/inet.h>
-#include <bits/stdint-uintn.h>
-#include <ifaddrs.h>
-#include <jsoncpp/json/value.h>
-#include <net/if.h>
-#include <netdb.h>
-#include <sys/socket.h>
-
 #include <fstream>
 #include <random>
 
 #include "v1/transport/rdma/rdma_transport.h"
 #include "v1/transport/shm/shm_transport.h"
+#include "v1/utility/ip.h"
 
 #define CHECK_STATUS(cmd)                \
     do {                                 \
@@ -53,7 +46,8 @@ struct Batch {
     size_t max_size;
 };
 
-TransferEngine::TransferEngine() : available_(false) {
+TransferEngine::TransferEngine()
+    : conf_(std::make_shared<ConfigManager>()), available_(false) {
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -63,7 +57,7 @@ TransferEngine::TransferEngine() : available_(false) {
     }
 }
 
-TransferEngine::TransferEngine(TEConfig &conf)
+TransferEngine::TransferEngine(std::shared_ptr<ConfigManager> conf)
     : conf_(conf), available_(false) {
     auto status = construct();
     if (!status.ok()) {
@@ -76,107 +70,52 @@ TransferEngine::TransferEngine(TEConfig &conf)
 
 TransferEngine::~TransferEngine() { deconstruct(); }
 
-static std::string getMetadataConnString(const TEConfig &conf) {
-    if (conf.count(TEConfigKeyMetadataConnString)) {
-        return conf.at(TEConfigKeyMetadataConnString);
-    }
-    return "P2PHANDSHAKE";
-}
-
-static std::vector<std::string> findLocalIpAddresses() {
-    std::vector<std::string> ips;
-    struct ifaddrs *ifaddr, *ifa;
-
-    if (getifaddrs(&ifaddr) == -1) {
-        PLOG(ERROR) << "getifaddrs failed";
-        return ips;
-    }
-
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == nullptr) {
-            continue;
-        }
-
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            if (strcmp(ifa->ifa_name, "lo") == 0) {
-                continue;
-            }
-
-            char host[NI_MAXHOST];
-            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
-                            NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
-                ips.push_back(host);
-            }
-        }
-    }
-
-    freeifaddrs(ifaddr);
-    return ips;
-}
-
-static void getEthIpPort(std::string &hostname, uint16_t &port,
-                         const TEConfig &conf) {
-    if (conf.count(TEConfigKeyBindEthIP))
-        hostname = conf.at(TEConfigKeyBindEthIP);
-    if (hostname.empty()) {
-        auto ip_list = findLocalIpAddresses();
-        hostname = ip_list.empty() ? "127.0.0.1" : ip_list[0];
-    }
-    port = 0;
-    if (conf.count(TEConfigKeyBindEthPort))
-        port = std::atoi(conf.at(TEConfigKeyBindEthPort).c_str());
-}
-
-std::vector<std::string> splitString(const std::string &str, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(str);
-    while (std::getline(tokenStream, token, delimiter)) {
-        std::string cleanedToken;
-        for (char c : token) {
-            if (!std::isspace(static_cast<unsigned char>(c))) cleanedToken += c;
-        }
-        tokens.push_back(cleanedToken);
-    }
-    return tokens;
-}
-
-std::vector<std::string> getRdmaDeviceList(const TEConfig &conf) {
-    if (!conf.count(TEConfigKeyRdmaDeviceList)) {
-        return {};
-    }
-    return splitString(conf.at(TEConfigKeyRdmaDeviceList), ',');
+std::string randomSegmentName() {
+    std::string name = "segment_noname_";
+    for (int i = 0; i < 8; ++i) name += 'a' + SimpleRandom::Get().next(26);
+    return name;
 }
 
 Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
-    getEthIpPort(hostname_, port_, conf_);
+    auto metadata_type = conf_->get("metadata_type", "p2p");
+    auto metadata_servers = conf_->get("metadata_servers", "");
+    hostname_ = conf_->get("rpc_server_hostname", "");
+    local_segment_name_ = conf_->get("local_segment_name", randomSegmentName());
+    bool ipv6;
 
-    metadata_ = std::make_shared<MetadataService>(getMetadataConnString(conf_));
-    metadata_->start(port_);
+    if (!hostname_.empty())
+        CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6));
+    else
+        CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6));
 
-    LOG(INFO) << "Segment name of this instance: " << hostname_ << ":" << port_;
+    port_ = conf_->get("rpc_server_port", 0);
+    metadata_ =
+        std::make_shared<MetadataService>(metadata_type, metadata_servers);
+
+    CHECK_STATUS(metadata_->start(port_));
+
+    if (metadata_type == "p2p")
+        local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6);
+
+    LOG(INFO) << "========== Transfer Engine Parameters ==========";
+    LOG(INFO) << " - Segment Name:       " << local_segment_name_;
+    LOG(INFO) << " - RPC Server Address: "
+              << buildIpAddrWithPort(hostname_, port_, ipv6);
+    LOG(INFO) << " - Metadata Type:      " << metadata_type;
+    LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
+    LOG(INFO) << "================================================";
 
     topology_ = std::make_shared<Topology>();
-    if (conf_.count(TEConfigKeyTopology)) {
-        auto topology_data = conf_.at(TEConfigKeyTopology);
-        if (!topology_data.empty()) topology_->parse(topology_data);
+    CHECK_STATUS(topology_->discover());
+
+    if (!topology_->getHcaList().empty()) {
+        auto transport = std::make_shared<RdmaTransport>();
+        CHECK_STATUS(
+            transport->install(local_segment_name_, metadata_, topology_));
+        transport_list_[RDMA] = transport;
     }
 
-    auto rdma_device_list = getRdmaDeviceList(conf_);
-    topology_->discover(rdma_device_list);
-    if (topology_->getHcaList().size() > 0) {
-        CHECK_STATUS(registerRdmaTransport());
-    }
-
-    return Status::OK();
-}
-
-Status TransferEngine::registerRdmaTransport() {
-    auto transport = std::make_shared<RdmaTransport>();
-    auto segment_name = hostname_ + ":" + std::to_string(port_);
-    CHECK_STATUS(transport->install(segment_name, metadata_, topology_));
-    transport_list_[RDMA] = transport;
     return Status::OK();
 }
 
@@ -189,9 +128,15 @@ Status TransferEngine::deconstruct() {
     return Status::OK();
 }
 
-const std::string TransferEngine::getEthIP() const { return hostname_; }
+const std::string TransferEngine::getSegmentName() const {
+    return local_segment_name_;
+}
 
-uint16_t TransferEngine::getEthPort() const { return port_; }
+const std::string TransferEngine::getRpcServerAddress() const {
+    return hostname_;
+}
+
+uint16_t TransferEngine::getRpcServerPort() const { return port_; }
 
 Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
     return Status::NotImplemented(

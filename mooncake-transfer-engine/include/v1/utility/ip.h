@@ -12,33 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef METADATA_PLUGIN_H
-#define METADATA_PLUGIN_H
+#ifndef IP_UTIL_H
+#define IP_UTIL_H
 
-#include <memory>
+#include <arpa/inet.h>
+#include <bits/stdint-uintn.h>
+#include <ifaddrs.h>
+#include <jsoncpp/json/value.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <string>
 
 #include "v1/common.h"
 
 namespace mooncake {
 namespace v1 {
-struct MetadataPlugin {
-    static std::shared_ptr<MetadataPlugin> Create(
-        const std::string &type, const std::string &servers);
 
-    MetadataPlugin() {}
+Status discoverLocalIpAddress(std::string &hostname, bool &ipv6);
 
-    virtual ~MetadataPlugin() {}
+Status checkLocalIpAddress(std::string &hostname, bool &ipv6);
 
-    virtual Status connect(const std::string &endpoint) = 0;
-
-    virtual Status get(const std::string &key, std::string &value) = 0;
-
-    virtual Status set(const std::string &key, const std::string &value) = 0;
-
-    virtual Status remove(const std::string &key) = 0;
-};
+std::string buildIpAddrWithPort(const std::string &hostname, uint16_t port,
+                                bool ipv6);
 }  // namespace v1
 }  // namespace mooncake
-
-#endif  // METADATA_PLUGIN_H
+#endif  // IP_UTIL_H

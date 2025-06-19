@@ -27,11 +27,6 @@ namespace mooncake {
 namespace v1 {
 class ConfigManager {
    public:
-    static ConfigManager& Instance() {
-        static ConfigManager instance;
-        return instance;
-    }
-
     Status loadConfig(const std::filesystem::path& config_path);
 
     std::string get(const std::string& key_path,
@@ -55,8 +50,6 @@ class ConfigManager {
     void reload() { loadConfig(config_path_); }
 
    private:
-    ConfigManager() = default;
-
     Json::Value config_data_;
     std::filesystem::path config_path_;
     mutable std::mutex mutex_;

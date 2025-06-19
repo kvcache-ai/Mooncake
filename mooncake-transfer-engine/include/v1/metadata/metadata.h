@@ -147,7 +147,7 @@ class MetadataStore {
 
 class CentralMetadataStore : public MetadataStore {
    public:
-    CentralMetadataStore(const std::string &connection_string);
+    CentralMetadataStore(const std::string &type, const std::string &servers);
 
     virtual ~CentralMetadataStore() {}
 
@@ -211,7 +211,7 @@ class BootstrapRdmaClient {
 
 class MetadataService {
    public:
-    MetadataService(const std::string &conn_string);
+    MetadataService(const std::string &type, const std::string &servers);
 
     ~MetadataService();
 
@@ -224,7 +224,7 @@ class MetadataService {
         bootstrap_callback_ = callback;
     }
 
-    void start(uint16_t &port);
+    Status start(uint16_t &port);
 
    private:
     void onGetSegmentDesc(const RpcRawData &request, RpcRawData &response);

@@ -80,14 +80,6 @@ struct BufferEntry {
 enum TransportType { RDMA = 0, SHM, GDS };
 const static int kSupportedTransportTypes = 3;
 
-using TEConfig = std::unordered_map<std::string, std::string>;
-const std::string TEConfigKeyLocalSegmentName = "local_segment_name";
-const std::string TEConfigKeyMetadataConnString = "metadata_conn_string";
-const std::string TEConfigKeyBindEthIP = "bind_eth_ip";
-const std::string TEConfigKeyBindEthPort = "bind_eth_port";
-const std::string TEConfigKeyTopology = "topology";
-const std::string TEConfigKeyRdmaDeviceList = "rdma_device_list";
-
 }  // namespace v1
 }  // namespace mooncake
 
