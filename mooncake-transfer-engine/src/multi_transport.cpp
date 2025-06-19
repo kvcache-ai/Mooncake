@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "multi_transport.h"
-#include "config.h"
 
+#include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
@@ -65,6 +65,21 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
+    return Status::OK();
+}
+
+Status MultiTransport::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest> &entries,
+    TransferMetadata::NotifyDesc notify_msg) {
+    Status s = submitTransfer(batch_id, entries);
+    if (!s.ok()) {
+        return s;
+    }
+    // notify
+    auto desc = metadata_->getSegmentDescByID(entries[0].target_id);
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+
     return Status::OK();
 }
 
@@ -130,7 +145,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         if (globalConfig().slice_timeout > 0) {
             auto current_ts = getCurrentTimeInNano();
-            const int64_t kPacketDeliveryTimeout = 
+            const int64_t kPacketDeliveryTimeout =
                 globalConfig().slice_timeout * 1000000000;
             for (auto &slice : task.slice_list) {
                 auto ts = slice->ts;

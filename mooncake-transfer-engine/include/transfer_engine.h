@@ -124,6 +124,15 @@ class TransferEngine {
         return multi_transports_->submitTransfer(batch_id, entries);
     }
 
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest> &entries,
+                                    TransferMetadata::NotifyDesc notify_msg) {
+        return multi_transports_->submitTransferWithNotify(batch_id, entries,
+                                                           notify_msg);
+    }
+
+    int getNotifies(std::vector<std::pair<std::string, std::string>> &notifies);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
         Status result =
@@ -146,9 +155,7 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) {
-        auto_discover_ = auto_discover;
-    }
+    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
     void setWhitelistFilters(std::vector<std::string> &&filters) {
         filter_ = std::move(filters);
