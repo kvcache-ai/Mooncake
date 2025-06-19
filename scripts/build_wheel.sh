@@ -35,6 +35,10 @@ else
     echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
 fi
 
+echo "Copying allocator libraries..."
+# Copy allocator.py
+cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+
 echo "Copying master binary and shared libraries..."
 # Copy master binary and shared libraries
 cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
