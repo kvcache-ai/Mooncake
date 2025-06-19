@@ -15,8 +15,8 @@
 #ifndef CONFIG_MANAGER_H
 #define CONFIG_MANAGER_H
 
-#include <v1/common/status.h>
 #include <jsoncpp/json/json.h>
+#include <v1/common/status.h>
 
 #include <filesystem>
 #include <fstream>
@@ -34,11 +34,23 @@ class ConfigManager {
 
     Status loadConfig(const std::filesystem::path& config_path);
 
-    template <typename T>
-    T get(const std::string& key_path, const T& default_value) const;
+    std::string get(const std::string& key_path,
+                    const char* default_value) const {
+        return get(key_path, std::string(default_value));
+    }
 
-    template <typename T>
-    std::vector<T> getArray(const std::string& key_path) const;
+    std::string get(const std::string& key_path,
+                    const std::string& default_value) const;
+
+    int get(const std::string& key_path, int default_value) const;
+
+    double get(const std::string& key_path, double default_value) const;
+
+    bool get(const std::string& key_path, bool default_value) const;
+
+    std::vector<std::string> getArray(const std::string& key_path) const;
+
+    std::vector<int> getArrayInt(const std::string& key_path) const;
 
     void reload() { loadConfig(config_path_); }
 
@@ -51,25 +63,6 @@ class ConfigManager {
 
     const Json::Value* findValue(const std::string& key_path) const;
 };
-
-template <typename T>
-std::vector<T> ConfigManager::getArray(const std::string& key_path) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (const Json::Value* val = findValue(key_path)) {
-        if (val->isArray()) {
-            std::vector<int> result;
-            for (const auto& item : *val) {
-                if (item.isInt()) {
-                    result.push_back(item.asInt());
-                } else {
-                    return {};
-                }
-            }
-            return result;
-        }
-    }
-    return {};
-}
 }  // namespace v1
 }  // namespace mooncake
 

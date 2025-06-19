@@ -2,6 +2,7 @@
     "local_segment_name": "",
     "metadata_type": "p2p",
     "metadata_servers": "127.0.0.1:2379",
+    "rpc_server_hostname": "127.0.0.1",
     "rpc_server_port": "auto",
     "devices": {
         "whitelist": ["mlx5_0", "mlx5_2"],

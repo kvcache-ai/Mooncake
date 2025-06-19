@@ -63,5 +63,94 @@ const Json::Value* ConfigManager::findValue(const std::string& key_path) const {
 
     return nullptr;
 }
+
+std::string ConfigManager::get(const std::string& key_path,
+                               const std::string& default_value) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isString()) return val->asString();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+int ConfigManager::get(const std::string& key_path, int default_value) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isConvertibleTo(Json::ValueType::intValue))
+                return val->asInt();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+double ConfigManager::get(const std::string& key_path,
+                          double default_value) const {
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isConvertibleTo(Json::ValueType::realValue))
+                return val->asDouble();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+bool ConfigManager::get(const std::string& key_path, bool default_value) const {
+    if (const Json::Value* val = findValue(key_path)) {
+        try {
+            if (val && val->isConvertibleTo(Json::ValueType::booleanValue))
+                return val->asBool();
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+std::vector<std::string> ConfigManager::getArray(
+    const std::string& key_path) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        if (val->isArray()) {
+            std::vector<std::string> result;
+            for (const auto& item : *val) {
+                try {
+                    if (val->isString()) result.push_back(item.asString());
+                } catch (...) {
+                    return {};
+                }
+            }
+            return result;
+        }
+    }
+    return {};
+}
+
+std::vector<int> ConfigManager::getArrayInt(const std::string& key_path) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const Json::Value* val = findValue(key_path)) {
+        if (val->isArray()) {
+            std::vector<int> result;
+            for (const auto& item : *val) {
+                try {
+                    if (val->isConvertibleTo(Json::ValueType::intValue))
+                        result.push_back(item.asInt());
+                } catch (...) {
+                    return {};
+                }
+            }
+            return result;
+        }
+    }
+    return {};
+}
 }  // namespace v1
 }  // namespace mooncake
