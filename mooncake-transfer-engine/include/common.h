@@ -22,13 +22,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
-#include <thread>
-#include <iostream>
-#include <chrono>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
+#include <thread>
 
 #include "error.h"
 
@@ -50,6 +50,7 @@ const static int LOCAL_SEGMENT_ID = 0;
 enum class HandShakeRequestType {
     Connection = 0,
     Metadata = 1,
+    Notify = 2,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -106,9 +107,12 @@ static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto local_time = *std::localtime(&time_t_now);
-    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      now.time_since_epoch()) %
+                  1000000;
     std::ostringstream oss;
-    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros.count();
     return oss.str();
 }
 
@@ -216,7 +220,7 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Metadata)) {
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Notify)) {
         type = static_cast<HandShakeRequestType>(buffer[0]);
         str.assign(buffer.data() + sizeof(char), length - sizeof(char));
     } else {

@@ -49,6 +49,7 @@ class Transport {
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+    using NotifyDesc = TransferMetadata::NotifyDesc;
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
