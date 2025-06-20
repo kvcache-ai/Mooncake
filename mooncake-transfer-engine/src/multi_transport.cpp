@@ -68,21 +68,6 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
-Status MultiTransport::submitTransferWithNotify(
-    BatchID batch_id, const std::vector<TransferRequest> &entries,
-    TransferMetadata::NotifyDesc notify_msg) {
-    Status s = submitTransfer(batch_id, entries);
-    if (!s.ok()) {
-        return s;
-    }
-    // notify
-    auto desc = metadata_->getSegmentDescByID(entries[0].target_id);
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-
-    return Status::OK();
-}
-
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));

@@ -41,10 +41,6 @@ class MultiTransport {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest> &entries,
-                                    TransferMetadata::NotifyDesc notify_msg);
-
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 

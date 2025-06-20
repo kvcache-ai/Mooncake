@@ -127,11 +127,20 @@ class TransferEngine {
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest> &entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
-        return multi_transports_->submitTransferWithNotify(batch_id, entries,
-                                                           notify_msg);
+        auto target_id = entries[0].target_id;
+        Status s = multi_transports_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            return s;
+        }
+        // notify
+        int ret = sendNotify(target_id, notify_msg);
+        return s;
     }
 
     int getNotifies(std::vector<std::pair<std::string, std::string>> &notifies);
+
+    int sendNotify(SegmentID target_id,
+                   TransferMetadata::NotifyDesc notify_msg);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
