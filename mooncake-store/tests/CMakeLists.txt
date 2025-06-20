@@ -55,3 +55,16 @@ target_link_libraries(transfer_task_test PUBLIC
     pthread
 )
 add_test(NAME transfer_task_test COMMAND transfer_task_test)
+
+add_executable(segment_test segment_test.cpp)
+target_link_libraries(segment_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME segment_test COMMAND segment_test)
+
+add_subdirectory(e2e)
