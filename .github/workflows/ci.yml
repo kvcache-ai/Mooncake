@@ -102,7 +102,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_STORE_MEMCPY=false make test -j ARGS="-V"
       shell: bash
 
     - name: Stop Mooncake Master Service
@@ -172,7 +172,7 @@ jobs:
     - name: Run tests
       run: |
         source test_env/bin/activate
-        ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
         deactivate
       shell: bash
 
