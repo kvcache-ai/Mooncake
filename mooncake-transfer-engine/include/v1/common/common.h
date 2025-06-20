@@ -22,13 +22,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
-#include <thread>
-#include <iostream>
-#include <chrono>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
+#include <thread>
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -80,7 +80,7 @@ static inline int64_t getCurrentTimeInNano() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts)) {
         PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
-        return ERR_CLOCK;
+        return -1;
     }
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
 }
@@ -89,28 +89,13 @@ static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto local_time = *std::localtime(&time_t_now);
-    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      now.time_since_epoch()) %
+                  1000000;
     std::ostringstream oss;
-    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros.count();
     return oss.str();
-}
-
-uint16_t getDefaultHandshakePort();
-
-static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
-    const std::string &server_name) {
-    uint16_t port = getDefaultHandshakePort();
-    auto pos = server_name.find(':');
-    if (pos == server_name.npos) return std::make_pair(server_name, port);
-    auto trimmed_server_name = server_name.substr(0, pos);
-    auto port_str = server_name.substr(pos + 1);
-    int val = std::atoi(port_str.c_str());
-    if (val <= 0 || val > 65535)
-        LOG(WARNING) << "Illegal port number in " << server_name
-                     << ". Use default port " << port << " instead";
-    else
-        port = (uint16_t)val;
-    return std::make_pair(trimmed_server_name, port);
 }
 
 const static std::string NIC_PATH_DELIM = "@";
@@ -139,175 +124,7 @@ static inline bool overlap(const void *a, size_t a_len, const void *b,
            (b >= a && b < (char *)a + a_len);
 }
 
-class RWSpinlock {
-    union RWTicket {
-        constexpr RWTicket() : whole(0) {}
-        uint64_t whole;
-        uint32_t readWrite;
-        struct {
-            uint16_t write;
-            uint16_t read;
-            uint16_t users;
-        };
-    } ticket;
-
-   private:
-    static void asm_volatile_memory() { asm volatile("" ::: "memory"); }
-
-    template <class T>
-    static T load_acquire(T *addr) {
-        T t = *addr;
-        asm_volatile_memory();
-        return t;
-    }
-
-    template <class T>
-    static void store_release(T *addr, T v) {
-        asm_volatile_memory();
-        *addr = v;
-    }
-
-   public:
-    RWSpinlock() {}
-
-    RWSpinlock(RWSpinlock const &) = delete;
-    RWSpinlock &operator=(RWSpinlock const &) = delete;
-
-    void lock() { writeLockNice(); }
-
-    bool tryLock() {
-        RWTicket t;
-        uint64_t old = t.whole = load_acquire(&ticket.whole);
-        if (t.users != t.write) return false;
-        ++t.users;
-        return __sync_bool_compare_and_swap(&ticket.whole, old, t.whole);
-    }
-
-    void writeLockAggressive() {
-        uint32_t count = 0;
-        uint16_t val = __sync_fetch_and_add(&ticket.users, 1);
-        while (val != load_acquire(&ticket.write)) {
-            PAUSE();
-            if (++count > 1000) std::this_thread::yield();
-        }
-    }
-
-    void writeLockNice() {
-        uint32_t count = 0;
-        while (!tryLock()) {
-            PAUSE();
-            if (++count > 1000) std::this_thread::yield();
-        }
-    }
-
-    void unlockAndLockShared() {
-        uint16_t val = __sync_fetch_and_add(&ticket.read, 1);
-        (void)val;
-    }
-
-    void unlock() {
-        RWTicket t;
-        t.whole = load_acquire(&ticket.whole);
-        ++t.read;
-        ++t.write;
-        store_release(&ticket.readWrite, t.readWrite);
-    }
-
-    void lockShared() {
-        uint_fast32_t count = 0;
-        while (!tryLockShared()) {
-            PAUSE();
-            if (++count > 1000) std::this_thread::yield();
-        }
-    }
-
-    bool tryLockShared() {
-        RWTicket t, old;
-        old.whole = t.whole = load_acquire(&ticket.whole);
-        old.users = old.read;
-        ++t.read;
-        ++t.users;
-        return __sync_bool_compare_and_swap(&ticket.whole, old.whole, t.whole);
-    }
-
-    void unlockShared() { __sync_fetch_and_add(&ticket.write, 1); }
-
-   public:
-    struct WriteGuard {
-        WriteGuard(RWSpinlock &lock) : lock(lock) { lock.lock(); }
-
-        WriteGuard(const WriteGuard &) = delete;
-
-        WriteGuard &operator=(const WriteGuard &) = delete;
-
-        ~WriteGuard() { lock.unlock(); }
-
-        RWSpinlock &lock;
-    };
-
-    struct ReadGuard {
-        ReadGuard(RWSpinlock &lock) : lock(lock) { lock.lockShared(); }
-
-        ReadGuard(const ReadGuard &) = delete;
-
-        ReadGuard &operator=(const ReadGuard &) = delete;
-
-        ~ReadGuard() { lock.unlockShared(); }
-
-        RWSpinlock &lock;
-    };
-
-   private:
-    const static int64_t kExclusiveLock = INT64_MIN / 2;
-
-    std::atomic<int64_t> lock_;
-    uint64_t padding_[15];
-};
-
-class TicketLock {
-   public:
-    TicketLock() : next_ticket_(0), now_serving_(0) {}
-
-    void lock() {
-        int my_ticket = next_ticket_.fetch_add(1, std::memory_order_relaxed);
-        while (now_serving_.load(std::memory_order_acquire) != my_ticket) {
-            std::this_thread::yield();
-        }
-    }
-
-    void unlock() { now_serving_.fetch_add(1, std::memory_order_release); }
-
-   private:
-    std::atomic<int> next_ticket_;
-    std::atomic<int> now_serving_;
-    uint64_t padding_[14];
-};
-
-class SimpleRandom {
-   public:
-    SimpleRandom(uint32_t seed) : current(seed) {}
-
-    static SimpleRandom &Get() {
-        static std::atomic<uint64_t> g_incr_val(0);
-        thread_local SimpleRandom g_random(getCurrentTimeInNano() +
-                                           g_incr_val.fetch_add(1));
-        return g_random;
-    }
-
-    uint32_t next() {
-        current = (a * current + c) % m;
-        return current;
-    }
-
-    uint32_t next(uint32_t max) { return next() % max; }
-
-   private:
-    uint32_t current;
-    static const uint32_t a = 1664525;
-    static const uint32_t c = 1013904223;
-    static const uint32_t m = 0xFFFFFFFF;
-};
-}
+}  // namespace v1
 }  // namespace mooncake
 
 #endif  // COMMON_H

@@ -88,6 +88,48 @@ Status checkLocalIpAddress(std::string &hostname, bool &ipv6) {
     return Status::InvalidArgument("No available IP address");
 }
 
+std::pair<std::string, uint16_t> parseHostNameWithPort(
+    const std::string &url, uint16_t default_port) {
+    uint16_t port = default_port;
+
+    // Check if url is valid IPv6 address
+    in6_addr addr;
+    if (inet_pton(AF_INET6, url.c_str(), &addr) == 1)
+        return {url, port};
+
+    // Check if url is valid IPv6 address with port
+    size_t start_pos = 0;
+    size_t end_pos = url.find_last_of(']');
+    size_t port_pos = url.find_last_of(':');
+    if (url.front() == '[' && end_pos != std::string::npos &&
+        port_pos > end_pos) {
+        auto ip = url.substr(start_pos + 1, end_pos - start_pos - 1);
+        std::string port_str = url.substr(port_pos + 1);
+        int val = std::atoi(port_str.c_str());
+        if (val <= 0 || val > 65535) {
+            LOG(WARNING) << "Illegal port number in " << url
+                         << ". Use default port " << port << " instead";
+        } else {
+            port = static_cast<uint16_t>(val);
+        }
+        return std::make_pair(port_str, port);
+    }
+
+    // Check if url has port field
+    auto pos = url.find(':');
+    if (pos == url.npos) return std::make_pair(url, port);
+    auto trimmed_server_name = url.substr(0, pos);
+    auto port_str = url.substr(pos + 1);
+    int val = std::atoi(port_str.c_str());
+    if (val <= 0 || val > 65535)
+        LOG(WARNING) << "Illegal port number in " << url
+                     << ". Use default port " << port << " instead";
+    else
+        port = (uint16_t)val;
+
+    return std::make_pair(trimmed_server_name, port);
+}
+
 std::string buildIpAddrWithPort(const std::string &hostname, uint16_t port,
                                 bool ipv6) {
     if (ipv6)

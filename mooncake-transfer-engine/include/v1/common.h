@@ -18,6 +18,8 @@
 #include "v1/common/types.h"
 #include "v1/common/slab.h"
 #include "v1/common/common.h"
+#include "v1/common/concurrency.h"
+#include "v1/common/random.h"
 #include "v1/common/status.h"
 #include "v1/common/config_manager.h"
 
