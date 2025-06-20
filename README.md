@@ -139,13 +139,13 @@ pip install mooncake-transfer-engine
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
 
 ### Build and use binaries
-The following are additional dependencies of building Mooncake:
+The following are additional dependencies for building Mooncake:
 - Build essentials, including gcc, g++ (9.4+) and cmake (3.16+).
-- Go 1.20+, if you want to build with `-DWITH_P2P_STORE` or `-DUSE_ETCD` (enabled by default). 
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is build with `-DUSE_CUDA` . *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- [Optional] Rust Toolclain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS`, so that you use Redis instead of etcd as metadata servers.
-- [Optional] `curl`, if you want to build with `-DUSE_HTTP`, so that you use HTTP instead of etcd as metadata servers.
+- Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
+- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+- [Optional] Rust Toolchain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
+- [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
 The building and installation steps are the following:
 1. Retrieve source code from GitHub repo
