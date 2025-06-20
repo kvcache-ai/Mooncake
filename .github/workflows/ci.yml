@@ -335,7 +335,7 @@ jobs:
     runs-on: ${{ matrix.os }} 
     strategy:
       matrix:
-        os: [ubuntu-22.04, ubuntu-22.04-arm] # Added ubuntu-22.04-arm to the OS matrix
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
     steps:
     - uses: actions/checkout@v4
     
