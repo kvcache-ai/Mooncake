@@ -552,8 +552,8 @@ ErrorCode Client::MountSegment(const std::string& segment_name,
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory((void*)buffer, size, "cpu:0",
-                                                  true, true);
+    int rc = transfer_engine_.registerLocalMemory(
+        (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed segment_name="
                    << segment_name;

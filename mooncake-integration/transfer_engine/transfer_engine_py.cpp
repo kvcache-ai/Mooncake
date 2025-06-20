@@ -136,7 +136,7 @@ int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
         freeMemory(buffer);
         return nullptr;
