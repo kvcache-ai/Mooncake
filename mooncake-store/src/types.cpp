@@ -20,8 +20,13 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_IS_NOT_READY, "REPLICA_IS_NOT_READY"},
         {ErrorCode::OBJECT_NOT_FOUND, "OBJECT_NOT_FOUND"},
         {ErrorCode::OBJECT_ALREADY_EXISTS, "OBJECT_ALREADY_EXISTS"},
+        {ErrorCode::OBJECT_HAS_LEASE, "OBJECT_HAS_LEASE"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
+        {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
+        {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
+        {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
+        {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
     };
 
     auto it = errorCodeMap.find(errorCode);

@@ -9,7 +9,9 @@
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
+#include "ha_helper.h"
 
 namespace mooncake {
 
@@ -26,7 +28,9 @@ class Client {
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
      * @param protocol_args Protocol-specific arguments
-     * @param master_addr Master server address
+     * @param master_server_entry The entry of master server (IP:Port of master
+     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
+     *        HA mode)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -34,7 +38,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key
@@ -45,11 +49,27 @@ class Client {
     ErrorCode Get(const std::string& object_key, std::vector<Slice>& slices);
 
     /**
+     * @brief Gets object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param slices Output parameter for the retrieved data
+     */
+    ErrorCode BatchGet(
+        const std::vector<std::string>& object_keys,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
      * @brief Two-step data retrieval process
      * 1. Query object information
      * 2. Transfer data based on the information
      */
     using ObjectInfo = GetReplicaListResponse;
+
+    /**
+     * @brief Two-step data retrieval process
+     * 1. BatchQuery object information
+     * 2. Transfer data based on the information
+     */
+    using BatchObjectInfo = BatchGetReplicaListResponse;
 
     /**
      * @brief Gets object metadata without transferring data
@@ -58,6 +78,14 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     ErrorCode Query(const std::string& object_key, ObjectInfo& object_info);
+
+    /**
+     * @brief Batch query object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param object_infos Output parameter for object metadata
+     */
+    ErrorCode BatchQuery(const std::vector<std::string>& object_keys,
+                         BatchObjectInfo& object_infos);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -70,6 +98,18 @@ class Client {
                   std::vector<Slice>& slices);
 
     /**
+     * @brief Transfers data using pre-queried object information
+     * @param object_keys Keys of the objects
+     * @param object_infos Previously queried object metadata
+     * @param slices Vector of slices to store the data
+     * @return ErrorCode indicating success/failure
+     */
+    ErrorCode BatchGet(
+        const std::vector<std::string>& object_keys,
+        BatchObjectInfo& object_infos,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -78,6 +118,17 @@ class Client {
      */
     ErrorCode Put(const ObjectKey& key, std::vector<Slice>& slices,
                   const ReplicateConfig& config);
+
+    /**
+     * @brief Batch put data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of data slices to store
+     * @param config Replication configuration
+     */
+    ErrorCode BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        ReplicateConfig& config);
 
     /**
      * @brief Removes an object and all its replicas
@@ -150,7 +201,7 @@ class Client {
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
-    ErrorCode ConnectToMaster(const std::string& master_addr);
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
     ErrorCode InitTransferEngine(const std::string& local_hostname,
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,
@@ -165,17 +216,41 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param handles Output vector to store the buffer handles of the found
+     * replica
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        std::vector<AllocatedBuffer::Descriptor>& handles);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
+    // Client local segments
+    struct Segment{
+        void* buffer;
+        size_t size;
+    };
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, void*> mounted_segments_;
+    std::unordered_map<std::string, Segment> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // For high availability
+    MasterViewHelper master_view_helper_;
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void PingThreadFunc(int current_version);
 };
 
 }  // namespace mooncake

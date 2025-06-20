@@ -46,7 +46,7 @@ get_related_pids()
 destroy_vllm_engine()
 {
   local port=$1
-  local main_pid=$(ps -ef | grep 'vllm.entrypoints.openai.api_server' | grep "port=${port}" | awk -F ' ' '{print $2}')
+  local main_pid=$(ps -ef | grep 'vllm.entrypoints.openai.api_server' | grep "port ${port}" | awk -F ' ' '{print $2}')
   if [ -n "${main_pid}" ]; then
     local related_pids=$(get_related_pids "${main_pid}" | sed 's/^[ \t]*//;s/[ \t]*$//')
     for pid in ${related_pids}

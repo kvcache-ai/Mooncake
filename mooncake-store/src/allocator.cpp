@@ -16,6 +16,7 @@ AllocatedBuffer::~AllocatedBuffer() {
         VLOG(1) << "buf_handle_deallocated segment_name=" << segment_name_
                 << " size=" << size_;
     } else {
+        MasterMetricManager::instance().dec_allocated_size(size_);
         LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }

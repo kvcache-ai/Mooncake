@@ -5,7 +5,9 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "ha_helper.h"
 #include "rpc_service.h"
+#include "types.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
@@ -16,46 +18,87 @@ DEFINE_int32(max_threads, 4, "Maximum number of threads to use");
 DEFINE_bool(enable_gc, false, "Enable garbage collection");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
+DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
+              "Default lease time for kv objects");
+DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
+              "Ratio of objects to evict when storage space is full");
+DEFINE_double(eviction_high_watermark_ratio,
+              mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+              "Ratio of high watermark trigger eviction");
+DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_bool(enable_ha, false,
+            "Enable high availability, which depends on ETCD");
+DEFINE_string(
+    etcd_endpoints, "",
+    "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_string(local_hostname, "",
+              "Local host address (IP:Port), required in HA mode");
 
 int main(int argc, char* argv[]) {
+    easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
-    easylog::set_min_severity(easylog::Severity::WARN);
 
-    // init rpc server
-    coro_rpc_server server(
-        /*thread=*/std::min(
-            FLAGS_max_threads,
-            static_cast<int>(std::thread::hardware_concurrency())),
-        /*port=*/FLAGS_port);
     LOG(INFO) << "Master service started on port " << FLAGS_port
               << ", enable_gc=" << FLAGS_enable_gc
               << ", max_threads=" << FLAGS_max_threads
               << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting
-              << ", metrics_port=" << FLAGS_metrics_port;
+              << ", metrics_port=" << FLAGS_metrics_port
+              << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
+              << ", eviction_ratio=" << FLAGS_eviction_ratio
+              << ", eviction_high_watermark_ratio="
+              << FLAGS_eviction_high_watermark_ratio
+              << ", enable_ha=" << FLAGS_enable_ha
+              << ", etcd_endpoints=" << FLAGS_etcd_endpoints
+              << ", local_hostname=" << FLAGS_local_hostname;
 
-    mooncake::WrappedMasterService wrapped_master_service(
-        FLAGS_enable_gc, FLAGS_enable_metric_reporting, FLAGS_metrics_port);
-    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Remove>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
-        &wrapped_master_service);
+    int server_thread_num =
+        std::min(FLAGS_max_threads,
+                 static_cast<int>(std::thread::hardware_concurrency()));
 
-    // Metric reporting is now handled by WrappedMasterService
+    if (FLAGS_enable_ha && FLAGS_etcd_endpoints.empty()) {
+        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
+        return 1;
+    }
+    if (!FLAGS_enable_ha && !FLAGS_etcd_endpoints.empty()) {
+        LOG(WARNING)
+            << "Etcd endpoints are set but will not be used in non-HA mode";
+    }
 
-    return !server.start();
+    if (FLAGS_enable_ha && FLAGS_local_hostname.empty()) {
+        LOG(FATAL) << "Local hostname must be set when enable_ha is true";
+        return 1;
+    }
+    if (!FLAGS_enable_ha && !FLAGS_local_hostname.empty()) {
+        LOG(WARNING)
+            << "Local hostname is set but will not be used in non-HA mode";
+    }
+
+    if (FLAGS_enable_ha) {
+        mooncake::MasterServiceSupervisor supervisor(
+            FLAGS_port, server_thread_num, FLAGS_enable_gc,
+            FLAGS_enable_metric_reporting, FLAGS_metrics_port,
+            FLAGS_default_kv_lease_ttl, FLAGS_eviction_ratio,
+            FLAGS_eviction_high_watermark_ratio, FLAGS_etcd_endpoints,
+            FLAGS_local_hostname);
+
+        return supervisor.Start();
+    } else {
+        // version is not used in non-HA mode, just pass a dummy value
+        mooncake::ViewVersionId version = 0;
+        coro_rpc::coro_rpc_server server(server_thread_num, FLAGS_port);
+        mooncake::WrappedMasterService wrapped_master_service(
+            FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
+            FLAGS_enable_metric_reporting, FLAGS_metrics_port,
+            FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio, version);
+
+        mooncake::RegisterRpcService(server, wrapped_master_service);
+        return server.start();
+    }
 }

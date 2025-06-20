@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.0"
+version = "0.3.3.post1"
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }
 ]
 requires-python = ">=3.8"
+dependencies = ["aiohttp", "requests"]
 keywords = ["mooncake", "data transfer", "kv cache", "llm inference"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -26,6 +27,8 @@ Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
+mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:main"
 
 [tool.setuptools]
 zip-safe = false

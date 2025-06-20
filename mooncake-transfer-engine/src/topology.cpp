@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include <glog/logging.h>
-#include <json/json.h>
 
 #include <fstream>
 #include <iostream>
@@ -51,8 +50,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     std::vector<InfinibandDevice> devices;
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
-    if (!device_list || num_devices <= 0) {
+    if (!device_list) {
         LOG(WARNING) << "No RDMA devices found, check your device installation";
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        ibv_free_device_list(device_list);
         return {};
     }
 
@@ -69,7 +73,8 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
                  device_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
-            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path << " failed";
+            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path
+                        << " failed";
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
@@ -82,6 +87,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
                                            .pci_bus_id = std::move(pci_bus_id),
                                            .numa_node = numa_node});
     }
+    ibv_free_device_list(device_list);
     return devices;
 }
 
@@ -92,7 +98,8 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     std::vector<TopologyEntry> topology;
 
     if (dir == NULL) {
-        PLOG(WARNING) << "discoverCpuTopology: open /sys/devices/system/node failed";
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
         return {};
     }
     while ((entry = readdir(dir))) {

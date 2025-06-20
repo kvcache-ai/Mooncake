@@ -66,18 +66,30 @@ ErrorCode BufferAllocatorManager::RemoveSegment(
     return ErrorCode::OK;
 }
 
-MasterService::MasterService(bool enable_gc)
+MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
+                             double eviction_ratio,
+                             double eviction_high_watermark_ratio)
     : buffer_allocator_manager_(std::make_shared<BufferAllocatorManager>()),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
-      enable_gc_(enable_gc) {
-    // Start the GC thread if enabled
-    if (enable_gc_) {
-        gc_running_ = true;
-        gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-        VLOG(1) << "action=start_gc_thread";
-    } else {
-        VLOG(1) << "action=gc_disabled";
+      enable_gc_(enable_gc),
+      default_kv_lease_ttl_(default_kv_lease_ttl),
+      eviction_ratio_(eviction_ratio),
+      eviction_high_watermark_ratio_(eviction_high_watermark_ratio) {
+    if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
+        LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
+                   << "current value: " << eviction_ratio_;
+        throw std::invalid_argument("Invalid eviction ratio");
     }
+    if (eviction_high_watermark_ratio_ < 0.0 ||
+        eviction_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR)
+            << "Eviction high watermark ratio must be between 0.0 and 1.0, "
+            << "current value: " << eviction_high_watermark_ratio_;
+        throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+    gc_running_ = true;
+    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
+    VLOG(1) << "action=start_gc_thread";
 }
 
 MasterService::~MasterService() {
@@ -108,7 +120,34 @@ ErrorCode MasterService::MountSegment(uint64_t buffer, uint64_t size,
 }
 
 ErrorCode MasterService::UnmountSegment(const std::string& segment_name) {
-    return buffer_allocator_manager_->RemoveSegment(segment_name);
+    // 1. Remove the segment from the allocator
+    auto ret = buffer_allocator_manager_->RemoveSegment(segment_name);
+    if (ret != ErrorCode::OK) return ret;
+
+    // 2. Remove the metadata of the related objects
+    for (auto& shard : metadata_shards_) {
+        std::unique_lock lock(shard.mutex);
+        auto it = shard.metadata.begin();
+        while (it != shard.metadata.end()) {
+            // Check if the object has any invalid replicas
+            bool has_invalid = false;
+            for (auto& replica : it->second.replicas) {
+                if (replica.has_invalid_handle()) {
+                    has_invalid = true;
+                    break;
+                }
+            }
+            // Remove the object if it has no valid replicas
+            if (has_invalid || CleanupStaleHandles(it->second)) {
+                it = shard.metadata.erase(it);
+                MasterMetricManager::instance().dec_key_count(1);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    return ErrorCode::OK;
 }
 
 ErrorCode MasterService::ExistKey(const std::string& key) {
@@ -119,15 +158,56 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
-    for (const auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "key=" << key << ", status=" << status
-                         << ", error=replica_not_ready";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(WARNING) << "key=" << key << ", status=" << *status
+                     << ", error=replica_not_ready";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
+    // Grant a lease to the object as it may be further used by the client.
+    metadata.GrantLease(default_kv_lease_ttl_);
+
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::GetAllKeys(std::vector<std::string> & all_keys) {
+    all_keys.clear();
+    for(int i = 0; i < kNumShards; i++) {
+        for(const auto& item : metadata_shards_[i].metadata) {
+            all_keys.push_back(item.first);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::GetAllSegments(std::vector<std::string> & all_segments) {
+    all_segments.clear();
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    for(auto & allocator : allocators) {
+        all_segments.push_back(allocator.first);
+    }
+    alloc_lock.unlock();
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::QuerySegments(const std::string & segment,
+                                       size_t & used,
+                                       size_t & capacity) {
+    std::shared_lock<std::shared_mutex> alloc_lock(
+        buffer_allocator_manager_->GetMutex());
+    const auto& allocators = buffer_allocator_manager_->GetAllocators();
+    auto it = allocators.find(segment);
+    if (it != allocators.end()) {
+        auto& allocator = it -> second;
+        capacity = allocator -> capacity();
+        used = allocator -> size();
+    } else {
+        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment << ") not found!";
+        return ErrorCode::AVAILABLE_SEGMENT_EMPTY;
+    }
+    alloc_lock.unlock();
     return ErrorCode::OK;
 }
 
@@ -138,15 +218,11 @@ ErrorCode MasterService::GetReplicaList(
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return ErrorCode::OBJECT_NOT_FOUND;
     }
-
     auto& metadata = accessor.Get();
-    for (const auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "key=" << key << ", status=" << status
-                         << ", error=replica_not_ready";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(WARNING) << "key=" << key << ", status=" << *status
+                     << ", error=replica_not_ready";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     replica_list.clear();
@@ -158,8 +234,25 @@ ErrorCode MasterService::GetReplicaList(
     // Only mark for GC if enabled
     if (enable_gc_) {
         MarkForGC(key, 1000);  // After 1 second, the object will be removed
+    } else {
+        // Grant a lease to the object so it will not be removed
+        // when the client is reading it.
+        metadata.GrantLease(default_kv_lease_ttl_);
     }
 
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        batch_replica_list) {
+    for (const auto& key : keys) {
+        if (GetReplicaList(key, batch_replica_list[key]) != ErrorCode::OK) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            return ErrorCode::OBJECT_NOT_FOUND;
+        };
+    }
     return ErrorCode::OK;
 }
 
@@ -228,8 +321,10 @@ ErrorCode MasterService::PutStart(
             std::shared_lock<std::shared_mutex> alloc_lock(
                 buffer_allocator_manager_->GetMutex());
             const auto& allocators = buffer_allocator_manager_->GetAllocators();
+
+            // Use the unified allocation strategy with replica config
             auto handle =
-                allocation_strategy_->Allocate(allocators, chunk_size);
+                allocation_strategy_->Allocate(allocators, chunk_size, config);
             alloc_lock.unlock();
 
             if (!handle) {
@@ -237,6 +332,9 @@ ErrorCode MasterService::PutStart(
                            << ", slice_index=" << j
                            << ", error=allocation_failed";
                 replica_list.clear();
+                // If the allocation failed, we need to evict some objects
+                // to free up space for future allocations.
+                need_eviction_ = true;
                 return ErrorCode::NO_AVAILABLE_HANDLE;
             }
 
@@ -257,6 +355,8 @@ ErrorCode MasterService::PutStart(
         replica_list.emplace_back(replica.get_descriptor());
     }
 
+    // No need to set lease here. The object will not be evicted until
+    // PutEnd is called.
     metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
     return ErrorCode::OK;
 }
@@ -272,6 +372,9 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     for (auto& replica : metadata.replicas) {
         replica.mark_complete();
     }
+    // Set lease timeout to now, indicating that the object has no lease
+    // at beginning
+    metadata.GrantLease(0);
     return ErrorCode::OK;
 }
 
@@ -283,16 +386,66 @@ ErrorCode MasterService::PutRevoke(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
-    for (auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::PROCESSING) {
-            LOG(ERROR) << "key=" << key << ", status=" << status
-                       << ", error=invalid_replica_status";
-            return ErrorCode::INVALID_WRITE;
-        }
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
+        LOG(ERROR) << "key=" << key << ", status=" << *status
+                   << ", error=invalid_replica_status";
+        return ErrorCode::INVALID_WRITE;
     }
 
     accessor.Erase();
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutStart(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, uint64_t>& value_lengths,
+    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config,
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>& batch_replica_list) {
+    if (config.replica_num == 0 || keys.empty()) {
+        LOG(ERROR) << "replica_num=" << config.replica_num
+                   << ", keys_size=" << keys.size() << ", error=invalid_params";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    for (const auto& key : keys) {
+        auto value_length_it = value_lengths.find(key);
+        auto slice_length_it = slice_lengths.find(key);
+        if (value_length_it == value_lengths.end() ||
+            slice_length_it == slice_lengths.end()) {
+            LOG(ERROR) << "Key not found in value_lengths or slice_lengths: "
+                       << key;
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+
+        auto result =
+            PutStart(key, value_length_it->second, slice_length_it->second,
+                     config, batch_replica_list[key]);
+        if (result != ErrorCode::OK &&
+            result != ErrorCode::OBJECT_ALREADY_EXISTS) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutEnd(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutEnd(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::BatchPutRevoke(const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = PutRevoke(key);
+        if (result != ErrorCode::OK) {
+            return result;
+        }
+    }
     return ErrorCode::OK;
 }
 
@@ -304,13 +457,16 @@ ErrorCode MasterService::Remove(const std::string& key) {
     }
 
     auto& metadata = accessor.Get();
-    for (auto& replica : metadata.replicas) {
-        auto status = replica.status();
-        if (status != ReplicaStatus::COMPLETE) {
-            LOG(ERROR) << "key=" << key << ", status=" << status
-                       << ", error=invalid_replica_status";
-            return ErrorCode::REPLICA_IS_NOT_READY;
-        }
+
+    if (!metadata.IsLeaseExpired()) {
+        VLOG(1) << "key=" << key << ", error=object_has_lease";
+        return ErrorCode::OBJECT_HAS_LEASE;
+    }
+
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+        LOG(ERROR) << "key=" << key << ", status=" << *status
+                   << ", error=invalid_replica_status";
+        return ErrorCode::REPLICA_IS_NOT_READY;
     }
 
     // Remove object metadata
@@ -321,22 +477,36 @@ ErrorCode MasterService::Remove(const std::string& key) {
 long MasterService::RemoveAll() {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
+    // Store the current time to avoid repeatedly
+    // calling std::chrono::steady_clock::now()
+    auto now = std::chrono::steady_clock::now();
+
     for (auto& shard : metadata_shards_) {
         std::unique_lock lock(shard.mutex);
-        std::size_t object_count = shard.metadata.size();
-        if (object_count == 0)
+        if (shard.metadata.empty()) {
             continue;
-        for (const auto& [key, metadata] : shard.metadata) {
-            // Calculate the total freed size of the object
-            total_freed_size += metadata.size * metadata.replicas.size();
         }
-        removed_count += object_count;
-        // Reset related metrics on successful removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-        MasterMetricManager::instance().dec_allocated_size(total_freed_size);
-        shard.metadata.clear();
+
+        // Only remove objects with expired leases
+        auto it = shard.metadata.begin();
+        while (it != shard.metadata.end()) {
+            if (it->second.IsLeaseExpired(now)) {
+                total_freed_size +=
+                    it->second.size * it->second.replicas.size();
+                it = shard.metadata.erase(it);
+                removed_count++;
+            } else {
+                ++it;
+            }
+        }
     }
-    VLOG(1) << "action=remove_all_objects" << ", removed_count=" << removed_count
+
+    if (removed_count > 0) {
+        // Update metrics only if objects were actually removed
+        MasterMetricManager::instance().dec_key_count(removed_count);
+    }
+    VLOG(1) << "action=remove_all_objects"
+            << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
@@ -373,6 +543,15 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     return metadata.replicas.empty();
 }
 
+size_t MasterService::GetKeyCount() const {
+    size_t total = 0;
+    for (const auto& shard : metadata_shards_) {
+        std::unique_lock lock(shard.mutex);
+        total += shard.metadata.size();
+    }
+    return total;
+}
+
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";
 
@@ -381,6 +560,7 @@ void MasterService::GCThreadFunc() {
 
     while (gc_running_) {
         GCTask* task = nullptr;
+        long gc_count = 0;
         while (gc_queue_.pop(task)) {
             if (task) {
                 local_pq.push(task);
@@ -397,12 +577,28 @@ void MasterService::GCThreadFunc() {
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
             ErrorCode result = Remove(task->key);
             if (result != ErrorCode::OK &&
-                result != ErrorCode::OBJECT_NOT_FOUND) {
+                result != ErrorCode::OBJECT_NOT_FOUND &&
+                result != ErrorCode::OBJECT_HAS_LEASE) {
                 LOG(WARNING)
                     << "key=" << task->key
                     << ", error=gc_remove_failed, error_code=" << result;
             }
+            if (result == ErrorCode::OK) {
+                gc_count++;
+            }
             delete task;
+        }
+        if (gc_count > 0) {
+            MasterMetricManager::instance().dec_key_count(gc_count);
+        }
+
+        double used_ratio =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratio > eviction_high_watermark_ratio_ ||
+            (need_eviction_ && eviction_ratio_ > 0.0)) {
+            BatchEvict(std::max(
+                eviction_ratio_,
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
         }
 
         std::this_thread::sleep_for(
@@ -415,6 +611,88 @@ void MasterService::GCThreadFunc() {
     }
 
     VLOG(1) << "action=gc_thread_stopped";
+}
+
+void MasterService::BatchEvict(double eviction_ratio) {
+    auto now = std::chrono::steady_clock::now();
+    long evicted_count = 0;
+    long object_count = 0;
+    uint64_t total_freed_size = 0;
+
+    // Randomly select a starting shard to avoid imbalance eviction between
+    // shards. No need to use expensive random_device here.
+    size_t start_idx = rand() % metadata_shards_.size();
+    for (size_t i = 0; i < metadata_shards_.size(); i++) {
+        auto& shard =
+            metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+        std::unique_lock lock(shard.mutex);
+
+        // object_count must be updated at beginning as it will be used later
+        // to compute ideal_evict_num
+        object_count += shard.metadata.size();
+
+        // To achieve evicted_count / object_count = eviction_ration,
+        // ideally how many object should be evicted in this shard
+        const long ideal_evict_num =
+            std::ceil(object_count * eviction_ratio_) - evicted_count;
+
+        if (ideal_evict_num <= 0) {
+            // No need to evict any object in this shard
+            continue;
+        }
+
+        std::vector<std::chrono::steady_clock::time_point>
+            candidates;  // can be removed
+        for (auto it = shard.metadata.begin(); it != shard.metadata.end();
+             it++) {
+            // Only evict objects that have not expired and are complete
+            if (it->second.IsLeaseExpired(now) &&
+                !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                candidates.push_back(it->second.lease_timeout);
+            }
+        }
+
+        if (!candidates.empty()) {
+            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
+            long shard_evicted_count =
+                0;  // number of objects evicted from this shard
+            std::nth_element(candidates.begin(),
+                             candidates.begin() + (evict_num - 1),
+                             candidates.end());
+            auto target_timeout = candidates[evict_num - 1];
+            // Evict objects with lease timeout less than or equal to target.
+            auto it = shard.metadata.begin();
+            while (it != shard.metadata.end() &&
+                   shard_evicted_count < evict_num) {
+                if (it->second.lease_timeout <= target_timeout &&
+                    !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    total_freed_size +=
+                        it->second.size * it->second.replicas.size();
+                    it = shard.metadata.erase(it);
+                    shard_evicted_count++;
+                } else {
+                    ++it;
+                }
+            }
+            evicted_count += shard_evicted_count;
+        }
+    }
+
+    if (evicted_count > 0) {
+        need_eviction_ = false;
+        MasterMetricManager::instance().dec_key_count(evicted_count);
+        MasterMetricManager::instance().inc_eviction_success(evicted_count,
+                                                             total_freed_size);
+    } else {
+        if (object_count == 0) {
+            // No objects to evict, no need to check again
+            need_eviction_ = false;
+        }
+        MasterMetricManager::instance().inc_eviction_fail();
+    }
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
+            << ", total_freed_size=" << total_freed_size;
 }
 
 }  // namespace mooncake

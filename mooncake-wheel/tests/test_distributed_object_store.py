@@ -5,6 +5,9 @@ import threading
 import random
 from mooncake.store import MooncakeDistributedStore
 
+# The lease time of the kv object, should be set equal to
+# the master's value.
+DEFAULT_KV_LEASE_TTL = 200 # 200 milliseconds
 
 def get_client(store):
     """Initialize and setup the distributed store client."""
@@ -76,6 +79,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(key, test_data), 0)
 
         # Remove the key
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
         # Get after remove should return empty bytes
@@ -97,6 +101,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.get_size(key_2), len(test_data_2))
         
         # Should not exist after remove
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key_2), 0)
         self.assertLess(self.store.get_size(key_2), 0)
         self.assertEqual(self.store.is_exist(key_2), 0)
@@ -150,6 +155,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 get_barrier.wait()
                 
                 # Remove all keys
+                time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
                 for key in thread_keys:
                     self.assertEqual(self.store.remove(key), 0)
                 
@@ -249,14 +255,17 @@ class TestDistributedObjectStore(unittest.TestCase):
                  elif op == "get":
                      fuzz_record.append(f"{i}: get {key}")
                      retrieved = self.store.get(key)
-                     expected = reference.get(key, b"")
-                     self.assertEqual(retrieved, expected)
+                     if retrieved != b"": # Otherwise the key may have been evicted
+                        expected = reference.get(key, b"")
+                        self.assertEqual(retrieved, expected)
                  elif op == "remove":
                      fuzz_record.append(f"{i}: remove {key}")
-                     self.store.remove(key)
-                     reference.pop(key, None)
-                     # Also remove from key_values to allow new value if key is reused
-                     key_values.pop(key, None)
+                     error_code = self.store.remove(key)
+                     # if remove did not fail due to the key has a lease
+                     if error_code != -706:
+                        reference.pop(key, None)
+                        # Also remove from key_values to allow new value if key is reused
+                        key_values.pop(key, None)
          except Exception as e:
              print(f"Error: {e}")
              print('\nFuzz record (operations so far):')
@@ -264,6 +273,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                  print(record)
              raise e
          # Cleanup: ensure all remaining keys are removed
+         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
          for key in list(reference.keys()):
              self.store.remove(key)
              

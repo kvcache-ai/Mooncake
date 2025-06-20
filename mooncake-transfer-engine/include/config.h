@@ -17,7 +17,6 @@
 
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
-#include <json/json.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +28,7 @@ struct GlobalConfig {
     size_t num_comp_channels_per_ctx = 1;
     uint8_t port = 1;
     int gid_index = 0;
+    uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
     int max_ep_per_ctx = 256;
     size_t num_qp_per_ep = 2;
@@ -39,10 +39,13 @@ struct GlobalConfig {
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
-    int retry_cnt = 8;
+    int retry_cnt = 9;
+    int handshake_listen_backlog = 128;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;
+    int64_t slice_timeout = -1;
+    bool use_ipv6 = false;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

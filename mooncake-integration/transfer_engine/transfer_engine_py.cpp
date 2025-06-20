@@ -17,15 +17,36 @@
 #include <cassert>
 #include <fstream>
 
-TransferEnginePy::TransferEnginePy() {}
+#ifdef USE_NVLINK
+#include "transport/nvlink_transport/nvlink_transport.h"
+static void *allocateMemory(size_t size) {
+    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+}
+static void freeMemory(void *ptr) {
+    mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
+}
+#else
+static void *allocateMemory(size_t size) { return malloc(size); }
+static void freeMemory(void *ptr) { free(ptr); }
+#endif
+
+TransferEnginePy::TransferEnginePy() {
+    const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+    if (getenv("MC_TRANSFER_TIMEOUT")) {
+        int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
+        transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
+    } else {
+        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+    }
+}
 
 TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
-    for (auto &buffer : buffer_list_) free(buffer);
+    for (auto &buffer : buffer_list_) freeMemory(buffer);
     buffer_list_.clear();
-    for (auto &buffer : large_buffer_list_) free(buffer);
+    for (auto &buffer : large_buffer_list_) freeMemory(buffer);
     large_buffer_list_.clear();
 }
 
@@ -113,11 +134,11 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
-    auto buffer = malloc(capacity);
+    auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
     if (ret) {
-        free(buffer);
+        freeMemory(buffer);
         return nullptr;
     }
     return (char *)buffer;
@@ -174,7 +195,7 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
         engine_->unregisterLocalMemory(buffer);
-        free(buffer);
+        freeMemory(buffer);
         return 0;
     }
     free_list_[class_id].push(buffer);
@@ -185,78 +206,16 @@ int TransferEnginePy::transferSyncWrite(const char *target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
                                         size_t length) {
-    pybind11::gil_scoped_release release;
-    Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
-    }
-
-    auto batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
-    entry.opcode = TransferRequest::WRITE;
-    entry.length = length;
-    entry.source = (void *)buffer;
-    entry.target_id = handle;
-    entry.target_offset = peer_buffer_address;
-
-    Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
-
-    TransferStatus status;
-    while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(s.ok());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(batch_id);
-            return -1;
-        }
-    }
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::WRITE);
 }
 
 int TransferEnginePy::transferSyncRead(const char *target_hostname,
                                        uintptr_t buffer,
                                        uintptr_t peer_buffer_address,
                                        size_t length) {
-    pybind11::gil_scoped_release release;
-    Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
-    }
-
-    auto batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
-    entry.opcode = TransferRequest::READ;
-    entry.length = length;
-    entry.source = (void *)buffer;
-    entry.target_id = handle;
-    entry.target_offset = peer_buffer_address;
-
-    Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
-
-    TransferStatus status;
-    while (true) {
-        Status s = engine_->getTransferStatus(batch_id, 0, status);
-        LOG_ASSERT(s.ok());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(batch_id);
-            return -1;
-        }
-    }
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::READ);
 }
 
 int TransferEnginePy::transferSync(const char *target_hostname,
@@ -265,20 +224,25 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                                    TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     // TODO this is just a workaround
-    // When transfer engine submits one task, it will be dispatch to a worker 
+    // When transfer engine submits one task, it will be dispatch to a worker
     // associated with one local RNIC. If the local RNIC fails to connect to any
-    // remote RNIC, it will eventually fail. This allows selecting multiple local 
-    // RNIC in one transferSync call. Will be fixed in the next revision.
-    const int max_retry = 3;
+    // remote RNIC, it will eventually fail. This allows selecting multiple
+    // local RNIC in one transferSync call. Will be fixed in the next revision.
+    const int max_retry =
+        engine_->numContexts() + 1;  // Iter all possible local contexts
+    auto start_ts = getCurrentTimeInNano();
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
         TransferRequest entry;
@@ -291,6 +255,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.source = (void *)buffer;
         entry.target_id = handle;
         entry.target_offset = peer_buffer_address;
+        entry.advise_retry_cnt = retry;
 
         Status s = engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) return -1;
@@ -306,24 +271,40 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                completed = true;
+            }
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t timeout =
+                transfer_timeout_nsec_ + length;  // 1GiB per second
+            if (current_ts - start_ts > timeout) {
+                LOG(INFO) << "Sync data transfer timeout, local buffer "
+                          << (void *)buffer << " remote buffer "
+                          << (void *)peer_buffer_address << " length "
+                          << length;
+                return -1;
             }
         }
     }
     return -1;
 }
 
-int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
-                                          uintptr_t buffer,
-                                          uintptr_t peer_buffer_address,
-                                          size_t length) {
+batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
+                                                 uintptr_t buffer,
+                                                 uintptr_t peer_buffer_address,
+                                                 size_t length) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
-    if (handle_map_.count(target_hostname)) {
-        handle = handle_map_[target_hostname];
-    } else {
-        handle = engine_->openSegment(target_hostname);
-        if (handle == (Transport::SegmentHandle)-1) return -1;
-        handle_map_[target_hostname] = handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
     }
 
     auto batch_id = engine_->allocateBatchID(1);
@@ -340,7 +321,7 @@ int TransferEnginePy::transferSubmitWrite(const char *target_hostname,
     return batch_id;
 }
 
-int TransferEnginePy::transferCheckStatus(int batch_id) {
+int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
@@ -351,6 +332,8 @@ int TransferEnginePy::transferCheckStatus(int batch_id) {
     } else if (status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(batch_id);
         return -1;
+    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        return -2;
     } else {
         return 0;
     }
@@ -395,8 +378,10 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite)
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
-            .def("transfer_submit_write", &TransferEnginePy::transferSubmitWrite)
-            .def("transfer_check_status", &TransferEnginePy::transferCheckStatus)
+            .def("transfer_submit_write",
+                 &TransferEnginePy::transferSubmitWrite)
+            .def("transfer_check_status",
+                 &TransferEnginePy::transferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
