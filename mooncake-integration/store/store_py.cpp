@@ -179,9 +179,9 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    ErrorCode error_code =
-        client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
-                                     local_buffer_size, "cpu:0", false, false);
+    ErrorCode error_code = client_->RegisterLocalMemory(
+        client_buffer_allocator_->getBase(), local_buffer_size,
+        kWildcardLocation, false, false);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Failed to register local memory: "
                    << toString(error_code);
