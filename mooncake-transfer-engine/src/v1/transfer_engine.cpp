@@ -134,7 +134,8 @@ Status TransferEngine::construct() {
     transport_list_.resize(kSupportedTransportTypes, nullptr);
     if (!topology_->getHcaList().empty()) {
         auto transport = std::make_shared<RdmaTransport>();
-        CHECK_STATUS(transport->install(local_segment_name_, metadata_, topology_, conf_));
+        CHECK_STATUS(transport->install(local_segment_name_, metadata_,
+                                        topology_, conf_));
         transport_list_[RDMA] = transport;
     }
 
@@ -315,6 +316,19 @@ std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
         return nullptr;
     }
     return desc;
+}
+
+Status TransferEngine::allocateLocalMemory(void **pptr, TransportType type,
+                                           size_t size, size_t align,
+                                           const Location &location) {
+    if (!pptr) return Status::InvalidArgument("pptr is nullptr");
+    auto transport = transport_list_[type];
+    return transport->allocateLocalMemory(pptr, size, align, location);
+}
+
+Status TransferEngine::freeLocalMemory(void *ptr, TransportType type, size_t size) { 
+    auto transport = transport_list_[type];
+    return transport->freeLocalMemory(ptr, size);
 }
 
 }  // namespace v1

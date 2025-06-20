@@ -29,6 +29,7 @@
 
 #include "v1/common.h"
 #include "v1/metadata/metadata.h"
+#include "v1/utility/allocator.h"
 #include "v1/utility/memory_location.h"
 
 namespace mooncake {
@@ -71,7 +72,8 @@ class Transport {
             "submitTransferTasks not implemented" LOC_MARK);
     }
 
-    virtual Status getTransferStatus(SubBatchRef batch, int task_id, TransferStatus &status) {
+    virtual Status getTransferStatus(SubBatchRef batch, int task_id,
+                                     TransferStatus &status) {
         return Status::NotImplemented(
             "getTransferStatus not implemented" LOC_MARK);
     }
@@ -89,6 +91,15 @@ class Transport {
         const std::vector<BufferEntry> &buffer_list) {
         return Status::NotImplemented(
             "unregisterLocalMemory not implemented" LOC_MARK);
+    }
+
+    virtual Status allocateLocalMemory(void **pptr, size_t size, size_t align,
+                                       const Location &location) {
+        return genericAllocateLocalMemory(pptr, size, align, location);
+    }
+
+    virtual Status freeLocalMemory(void *ptr, size_t size) {
+        return genericFreeLocalMemory(ptr, size);
     }
 
     virtual const char *getName() const { return "<generic>"; }

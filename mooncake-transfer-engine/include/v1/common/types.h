@@ -77,8 +77,8 @@ struct BufferEntry {
     size_t shm_offset = 0;
 };
 
-enum TransportType { RDMA = 0, SHM, GDS };
-const static int kSupportedTransportTypes = 3;
+enum TransportType { RDMA = 0, SHM, GDS, NVLINK, TCP };
+const static int kSupportedTransportTypes = 5;
 
 }  // namespace v1
 }  // namespace mooncake

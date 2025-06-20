@@ -37,8 +37,6 @@ namespace mooncake {
 namespace v1 {
 using SegmentID = uint64_t;
 
-#define P2PHANDSHAKE "P2PHANDSHAKE"
-
 struct DeviceDesc {
     std::string name;
     uint16_t lid;
