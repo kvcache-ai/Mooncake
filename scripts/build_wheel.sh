@@ -15,7 +15,7 @@ echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
-echo "Cleaning wheel-build direcotry"
+echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm mooncake-wheel/mooncake/*.so
