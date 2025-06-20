@@ -314,15 +314,15 @@ if ret != 0:
     raise RuntimeError(f"Initialization failed with code {ret}")
 
 # Allocate and initialize client buffer (1MB)
-data_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
-data = client_buffer.ctypes.data
-data_len = client_buffer.nbytes
+client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
+buffer_data = client_buffer.ctypes.data
+buffer_data_len = client_buffer.nbytes
 
 # Prepare data
 data = b"Hello, Transfer Engine!"
 data_len = len(data)
 
-engine.register(data, data_len)
+engine.register(buffer_data, buffer_data_len)
 
 # Get Remote Addr from ZMQ or upper-layer inference framework
 remote_addr = ??
