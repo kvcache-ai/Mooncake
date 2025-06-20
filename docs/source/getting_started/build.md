@@ -27,8 +27,6 @@ This document describes how to build Mooncake.
    sudo make install
    ```
 
-Note: If you plan to use Mooncake Store with vLLM, you need to have the package `mooncake_vllm_adaptor` installed in your active python library. You can verify if the package exists by running `python -c "import mooncake_vllm_adaptor"`. If the package is missing, you can manually copy the built shared library into your python library directory (e.g. `cp ./build/mooncake-integration/mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so .venv/lib/python3.10/site-packages/`)
-
 ## Manual
 
 ### Recommended Version
