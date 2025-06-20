@@ -93,8 +93,8 @@ MasterServiceSupervisor::MasterServiceSupervisor(
     int port, int server_thread_num, bool enable_gc,
     bool enable_metric_reporting, int metrics_port,
     int64_t default_kv_lease_ttl, double eviction_ratio,
-    double eviction_high_watermark_ratio, const std::string& etcd_endpoints,
-    const std::string& local_hostname)
+    double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
+    const std::string& etcd_endpoints, const std::string& local_hostname)
     : port_(port),
       server_thread_num_(server_thread_num),
       enable_gc_(enable_gc),
@@ -103,6 +103,7 @@ MasterServiceSupervisor::MasterServiceSupervisor(
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
+      client_live_ttl_sec_(client_live_ttl_sec),
       etcd_endpoints_(etcd_endpoints),
       local_hostname_(local_hostname) {}
 
@@ -136,10 +137,11 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
+        bool enable_ha = true;
         mooncake::WrappedMasterService wrapped_master_service(
             enable_gc_, default_kv_lease_ttl_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version);
+            version, client_live_ttl_sec_, enable_ha);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

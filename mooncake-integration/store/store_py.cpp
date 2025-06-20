@@ -197,8 +197,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    error_code = client_->MountSegment(this->local_hostname, segment_ptr_.get(),
-                                       global_segment_size);
+    error_code = client_->MountSegment(segment_ptr_.get(), global_segment_size);
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
         return 1;

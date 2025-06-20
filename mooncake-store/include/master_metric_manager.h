@@ -34,6 +34,11 @@ class MasterMetricManager {
     void observe_value_size(int64_t size);
     int64_t get_key_count();
 
+    // Cluster Metrics
+    void inc_active_clients(int64_t val = 1);
+    void dec_active_clients(int64_t val = 1);
+    int64_t get_active_clients();
+
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
@@ -53,7 +58,11 @@ class MasterMetricManager {
     void inc_mount_segment_failures(int64_t val = 1);
     void inc_unmount_segment_requests(int64_t val = 1);
     void inc_unmount_segment_failures(int64_t val = 1);
+    void inc_remount_segment_requests(int64_t val = 1);
+    void inc_remount_segment_failures(int64_t val = 1);
     void inc_ping_requests(int64_t val = 1);
+    void inc_ping_failures(int64_t val = 1);
+
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -74,7 +83,10 @@ class MasterMetricManager {
     int64_t get_mount_segment_failures();
     int64_t get_unmount_segment_requests();
     int64_t get_unmount_segment_failures();
+    int64_t get_remount_segment_requests();
+    int64_t get_remount_segment_failures();
     int64_t get_ping_requests();
+    int64_t get_ping_failures();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
@@ -99,6 +111,9 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
 
+    // --- Setters ---
+    void set_enable_ha(bool enable_ha);
+
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();
@@ -113,6 +128,9 @@ class MasterMetricManager {
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::histogram_t value_size_distribution_;
+
+    // Cluster Metrics
+    ylt::metric::gauge_t active_clients_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
@@ -133,13 +151,20 @@ class MasterMetricManager {
     ylt::metric::counter_t mount_segment_failures_;
     ylt::metric::counter_t unmount_segment_requests_;
     ylt::metric::counter_t unmount_segment_failures_;
+    ylt::metric::counter_t remount_segment_requests_;
+    ylt::metric::counter_t remount_segment_failures_;
     ylt::metric::counter_t ping_requests_;
+    ylt::metric::counter_t ping_failures_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+
+    // Some metrics are used only in HA mode. Use a flag to control the output
+    // content.
+    bool enable_ha_{false};
 };
 
 }  // namespace mooncake
