@@ -383,6 +383,8 @@ int TransferEnginePy::batchTransferSync(const char *target_hostname,
             if (current_ts - start_ts > timeout) {
                 LOG(INFO) << "Sync batch data transfer timeout after " 
                           << current_ts - start_ts << "ns";
+                // TODO: as @doujiang24 mentioned, early free(while there are still waiting tasks)
+                // the batch_id may fail and cause memory leak(a known issue).
                 if (!already_freed) {
                     engine_->freeBatchID(batch_id);
                 }
