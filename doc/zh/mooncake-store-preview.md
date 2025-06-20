@@ -514,8 +514,8 @@ def close(self) -> int
 ### 代码使用样例
 ```python
 
-import mooncake_vllm_adaptor as mva
-store = mva.MooncakeDistributedStore()
+from mooncake.store import MooncakeDistributedStore
+store = MooncakeDistributedStore()
 store.setup(
     local_hostname="IP:port",
     metadata_server="etcd://metadata server IP:port",
