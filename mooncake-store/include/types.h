@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <variant>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -104,6 +105,15 @@ enum class ErrorCode : int32_t {
     ETCD_KEY_NOT_EXIST = -1001,  ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,  ///< etcd context cancelled.
+
+    // FILE errors (Range: -1100 to -1199)
+    FILE_NOT_FOUND = -1100,  ///< File not found.
+    FILE_OPEN_FAIL = -1101,  ///< Error open file or write to a exist file.
+    FILE_READ_FAIL = -1102,  ///< Error reading file.
+    FILE_WRITE_FAIL = -1103,  ///< Error writing file.
+    FILE_INVALID_BUFFER = -1104,  ///< File buffer is wrong.
+    FILE_LOCK_FAIL = -1105,  ///< File lock operation failed.
+    FILE_INVALID_HANDLE = -1106,  ///< Invalid file handle.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -262,6 +272,17 @@ inline std::ostream& operator<<(std::ostream& os,
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
+struct MemoryDescriptor {
+    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors; 
+    YLT_REFL(MemoryDescriptor, buffer_descriptors);
+};
+
+struct DiskDescriptor {
+    std::string file_path{};
+    uint64_t file_size = 0;
+    YLT_REFL(DiskDescriptor, file_path, file_size);
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -299,9 +320,46 @@ class Replica {
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct Descriptor {
-        std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
+        std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, buffer_descriptors, status);
+        YLT_REFL(Descriptor, descriptor_variant, status);
+
+        // Helper functions
+        bool is_memory_replica() noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        bool is_memory_replica() const noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        MemoryDescriptor& get_memory_descriptor() {
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        DiskDescriptor& get_disk_descriptor() {
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
+
+        const MemoryDescriptor& get_memory_descriptor() const{
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        const DiskDescriptor& get_disk_descriptor() const{
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
     };
 
    private:
@@ -312,12 +370,14 @@ class Replica {
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.status = status_;
-    desc.buffer_descriptors.reserve(buffers_.size());
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptors.reserve(buffers_.size());
     for (const auto& buf_ptr : buffers_) {
         if (buf_ptr) {
-            desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
+            mem_desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
         }
     }
+    desc.descriptor_variant = std::move(mem_desc);
     return desc;
 }
 

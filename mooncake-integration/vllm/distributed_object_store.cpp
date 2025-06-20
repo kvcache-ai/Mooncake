@@ -148,6 +148,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
+
     size_t colon_pos = hostname.find(":");
     if (colon_pos == std::string::npos) {
         // Get a random available port
@@ -240,7 +241,7 @@ int DistributedObjectStore::allocateSlices(
     length = 0;
     if (object_info.replica_list.empty()) return -1;
     auto &replica = object_info.replica_list[0];
-    for (auto &handle : replica.buffer_descriptors) {
+    for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
         auto ptr = client_buffer_allocator_->allocate(chunk_size);
@@ -398,7 +399,7 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     int64_t total_size = 0;
     if (!object_info.replica_list.empty()) {
         auto &replica = object_info.replica_list[0];
-        for (auto &handle : replica.buffer_descriptors) {
+        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
             total_size += handle.size_;
         }
     } else {

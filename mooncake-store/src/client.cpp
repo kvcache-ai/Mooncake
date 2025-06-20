@@ -24,9 +24,12 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::string& storage_root_dir)
     : local_hostname_(local_hostname),
-      metadata_connstring_(metadata_connstring) {}
+      metadata_connstring_(metadata_connstring),
+      storage_root_dir_(storage_root_dir),
+      write_thread_pool_(2){}
 
 Client::~Client() {
     // No need for mutex here since the client is being destroyed(protected by
@@ -44,6 +47,8 @@ Client::~Client() {
 
     // Clear any remaining segments
     mounted_segments_.clear();
+
+    write_thread_pool_.stop();
 
     // Stop ping thread only after no need to contact master anymore
     if (ping_running_) {
@@ -191,12 +196,29 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
     const std::string& master_server_entry) {
+
+    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
+    std::string storage_root_dir = std::getenv("MOONCAKE_STORAGE_ROOT_DIR")?
+    std::getenv("MOONCAKE_STORAGE_ROOT_DIR") : "";
+
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, storage_root_dir));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
+    }
+
+    LOG(INFO) << "Connect to Master success";
+
+    // Initialize storage backend if storage_root_dir is provided
+    auto response = client->master_client_.GetSessionId();
+    if(storage_root_dir.empty()) {
+        LOG(INFO) << "Storage root directory is not set. persisting data is disabled.";
+    }else{
+        LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+        // Initialize storage backend
+        client->PrepareStorageBackend(storage_root_dir, response.session_id);
     }
 
     // Initialize transfer engine
@@ -245,6 +267,21 @@ ErrorCode Client::Query(const std::string& object_key,
     for (size_t i = 0; i < response.replica_list.size(); ++i) {
         object_info.replica_list[i] = response.replica_list[i];
     }
+
+    // Currently, it is a client-side query. Manually construct a disk descriptor 
+    // that meets the requirements. In the future, the matching disk replica descriptor 
+    // can be directly obtained from the master.
+    if(response.error_code!= ErrorCode::OK && storage_backend_){
+        Replica::Descriptor desc;
+        auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();  
+        
+        if (storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size)) {
+            desc.status = ReplicaStatus::COMPLETE;
+            object_info.replica_list.emplace_back(std::move(desc));  
+            return ErrorCode::OK;
+        }
+    }
+
     return response.error_code;
 }
 
@@ -273,23 +310,66 @@ ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
 }
 
 ErrorCode Client::Get(const std::string& object_key,
-                      const ObjectInfo& object_info,
+                      ObjectInfo& object_info,
                       std::vector<Slice>& slices) {
     // Find the first complete replica
-    std::vector<AllocatedBuffer::Descriptor> handles;
-    ErrorCode err = FindFirstCompleteReplica(object_info.replica_list, handles);
+ 
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(object_info.replica_list, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
         return err;
     }
-
-    if (TransferRead(handles, slices) != ErrorCode::OK) {
-        LOG(ERROR) << "transfer_read_failed key=" << object_key;
-        return ErrorCode::INVALID_PARAMS;
+    if(replica.is_memory_replica()){ 
+        std::vector<AllocatedBuffer::Descriptor> handles;
+        auto& mem_desc =  replica.get_memory_descriptor();
+        handles = mem_desc.buffer_descriptors;
+        if (TransferRead(handles, slices) != ErrorCode::OK) {
+            LOG(ERROR) << "transfer_read_failed key=" << object_key;
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }else{
+        // If the replica is a disk replica, read from local file
+        return GetFromLocalFile(object_key, slices, object_info);
     }
     return ErrorCode::OK;
+}
+
+ErrorCode Client::GetFromLocalFile(
+    const std::string& object_key, std::vector<Slice>& slices, ObjectInfo& object_info) {
+    if (!storage_backend_) {
+        return ErrorCode::FILE_READ_FAIL;
+    }
+
+    ErrorCode err=storage_backend_->LoadObject(object_key, slices);
+    //TODO： add path in parameter
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    return ErrorCode::OK;
+}
+
+void Client::PutToLocalFile(
+    const std::string& key, std::vector<Slice>& slices){
+    if (!storage_backend_) return;
+
+    size_t total_size = 0;
+    for (const auto& slice : slices) {
+        total_size += slice.size;
+    }
+
+    std::string value;
+    value.reserve(total_size); 
+    for (const auto& slice : slices) {
+        value.append(static_cast<char*>(slice.ptr), slice.size);
+    }
+
+    write_thread_pool_.enqueue([backend = storage_backend_, key, value = std::move(value)] {
+        backend->StoreObject(key, value);
+    });
 }
 
 ErrorCode Client::BatchGet(
@@ -315,8 +395,9 @@ ErrorCode Client::BatchGet(
 
         // Find the first complete replica for this key
         const auto& replica_list = object_info_it->second;
-        std::vector<AllocatedBuffer::Descriptor> handles;
-        ErrorCode err = FindFirstCompleteReplica(replica_list, handles);
+
+        Replica::Descriptor replica;
+        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -325,20 +406,33 @@ ErrorCode Client::BatchGet(
             return err;
         }
 
-        // Submit transfer operation asynchronously
-        auto future = transfer_submitter_->submit(handles, slices_it->second,
-                                                  TransferRequest::READ);
-        if (!future) {
-            LOG(ERROR) << "Failed to submit transfer operation for key: "
-                       << key;
-            slices.clear();
-            return ErrorCode::TRANSFER_FAIL;
+        if(replica.is_memory_replica()){
+            std::vector<AllocatedBuffer::Descriptor> handles;
+            auto& mem_desc = replica.get_memory_descriptor();
+            handles = mem_desc.buffer_descriptors;
+
+            // Submit transfer operation asynchronously
+            auto future = transfer_submitter_->submit(handles, slices_it->second,
+                                                    TransferRequest::READ);
+            if (!future) {
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                        << key;
+                slices.clear();
+                return ErrorCode::TRANSFER_FAIL;
+            }
+
+            VLOG(1) << "Submitted transfer for key " << key
+                    << " using strategy: " << static_cast<int>(future->strategy());
+
+            pending_transfers.emplace_back(key, std::move(*future));
+        }else{
+            // In the current implementation, batchget does not read data from files, 
+            // so it does not follow the existing path. In future versions, 
+            // we need to improve this synchronization path by optimizing it to support asynchronous file reading.
+            ObjectInfo object_info{object_info_it->second};
+            GetFromLocalFile(key, slices_it->second, object_info);
         }
 
-        VLOG(1) << "Submitted transfer for key " << key
-                << " using strategy: " << static_cast<int>(future->strategy());
-
-        pending_transfers.emplace_back(key, std::move(*future));
     }
 
     // Wait for all transfers to complete
@@ -384,7 +478,8 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     // Transfer data using allocated handles from all replicas
     for (const auto& replica : start_response.replica_list) {
         std::vector<AllocatedBuffer::Descriptor> handles;
-        for (const auto& handle : replica.buffer_descriptors) {
+        auto& mem_desc=replica.get_memory_descriptor();
+        for (const auto& handle : mem_desc.buffer_descriptors) {
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);
         }
@@ -407,6 +502,9 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return err;
     }
+
+    PutToLocalFile(key, slices);
+
     return ErrorCode::OK;
 }
 
@@ -466,7 +564,8 @@ ErrorCode Client::BatchPut(
              ++replica_idx) {
             const auto& replica = replica_list->second[replica_idx];
             std::vector<AllocatedBuffer::Descriptor> handles;
-            for (const auto& handle : replica.buffer_descriptors) {
+            auto& mem_desc = replica.get_memory_descriptor();
+            for (const auto& handle : mem_desc.buffer_descriptors) {
                 CHECK(handle.buffer_address_ != 0)
                     << "buffer_address_ is nullptr";
                 handles.push_back(handle);
@@ -528,10 +627,22 @@ ErrorCode Client::BatchPut(
 }
 
 ErrorCode Client::Remove(const ObjectKey& key) {
-    return master_client_.Remove(key).error_code;
+
+    auto error_code = master_client_.Remove(key).error_code;
+    if (storage_backend_) {
+        // Remove from storage backend
+        storage_backend_->RemoveFile(key);
+    }
+    return error_code;
 }
 
-long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
+long Client::RemoveAll() { 
+    if (storage_backend_) {
+        // Remove from storage backend
+        storage_backend_->RemoveAll();
+    }
+    return master_client_.RemoveAll().removed_count; 
+}
 
 ErrorCode Client::MountSegment(const std::string& segment_name,
                                const void* buffer, size_t size) {
@@ -625,8 +736,24 @@ ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
 
 ErrorCode Client::IsExist(const std::string& key) {
     auto response = master_client_.ExistKey(key);
+    if ( response.error_code!=ErrorCode::OK && storage_backend_) {
+        // Check if the key exists in the storage backend
+        if (storage_backend_->Existkey(key) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+    }
     return response.error_code;
 }
+
+void Client::PrepareStorageBackend(const std::string& storage_root_dir, 
+                                   const std::string& session_id) {
+    // Initialize storage backend
+    storage_backend_ = FileStorageBackend::Create(storage_root_dir, session_id);
+    if (!storage_backend_) {
+        LOG(INFO) << "Failed to initialize storage backend";
+    }
+}
+
 
 ErrorCode Client::TransferData(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
@@ -767,13 +894,12 @@ void Client::PingThreadFunc(int current_version) {
 
 ErrorCode Client::FindFirstCompleteReplica(
     const std::vector<Replica::Descriptor>& replica_list,
-    std::vector<AllocatedBuffer::Descriptor>& handles) {
-    handles.clear();
+    Replica::Descriptor& replica) {
 
     // Find the first complete replica
     for (size_t i = 0; i < replica_list.size(); ++i) {
         if (replica_list[i].status == ReplicaStatus::COMPLETE) {
-            handles = replica_list[i].buffer_descriptors;
+            replica = replica_list[i];
             return ErrorCode::OK;
         }
     }
