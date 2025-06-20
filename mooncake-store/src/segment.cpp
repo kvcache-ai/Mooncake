@@ -193,7 +193,7 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     for (auto& segment_id : it->second) {
         auto segment_it = segment_manager_->mounted_segments_.find(segment_id);
         if (segment_it != segment_manager_->mounted_segments_.end()) {
-            segments.push_back(segment_it->second.segment);
+            segments.emplace_back(segment_it->second.segment);
         }
     }
     return ErrorCode::OK;

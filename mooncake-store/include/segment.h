@@ -6,7 +6,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <variant>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -125,21 +124,21 @@ class ScopedAllocatorAccess {
           allocators_(allocators),
           lock_(mutex) {}
 
-    std::unordered_map<std::string,
+    const std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocator>>>&
     getAllocatorsByName() {
         return allocators_by_name_;
     }
 
-    std::vector<std::shared_ptr<BufferAllocator>>& getAllocators() {
+    const std::vector<std::shared_ptr<BufferAllocator>>& getAllocators() {
         return allocators_;
     }
 
    private:
-    std::unordered_map<std::string,
+    const std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocator>>>&
         allocators_by_name_;  // segment name -> allocators
-    std::vector<std::shared_ptr<BufferAllocator>>& allocators_;
+    const std::vector<std::shared_ptr<BufferAllocator>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;
 };
 
