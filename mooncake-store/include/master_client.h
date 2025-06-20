@@ -42,6 +42,14 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Checks if a batch of objects exist
+     * @param object_keys Keys to query
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] BatchExistKeyResponse BatchExistKey(
+        const std::vector<std::string>& object_keys);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
      * @param object_info Output parameter for object metadata

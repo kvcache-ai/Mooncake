@@ -60,6 +60,31 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
     return result.value();
 }
 
+BatchExistKeyResponse MasterClient::BatchExistKey(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
+    timer.LogRequest("object_key count=", object_keys.size());
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchExistKey>(object_keys);
+    std::optional<BatchExistKeyResponse> result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::optional<BatchExistKeyResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to check existence for a batch of key: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        auto response = BatchExistKeyResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");

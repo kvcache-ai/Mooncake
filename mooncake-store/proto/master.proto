@@ -47,6 +47,11 @@ message BatchSliceLength {
   repeated uint64 slice_lengths = 2;
 }
 
+message ExistencePair {
+  required string key = 1;
+  required int32 status_code = 2
+}
+
 // Request to check key existence.
 message ExistKeyRequest {
   required string key = 1; // Object key.
@@ -56,6 +61,17 @@ message ExistKeyRequest {
 message ExistKeyResponse {
   required int32 status_code = 1; // Status.
 }
+
+// Request to check key existence.
+message BatchExistKeyRequest {
+  repeated string key = 1; // Object key.
+}
+// Response to check key existence.
+message BatchExistKeyResponse {
+  repeated ExistencePair existence_pair = 1;
+  required int32 status_code = 2; // Status.
+}
+
 
 // Request to get replica list.
 message GetReplicaListRequest {
@@ -222,4 +238,7 @@ service MasterService {
 
   // Check existence of a key.
   rpc ExistKey(ExistKeyRequest) returns (ExistKeyResponse);
+
+  // Check existence of a batch of keys.
+  rpc BatchExistKey(BatchExistKeyRequest) returns (BatchExistKeyResponse);
 }
