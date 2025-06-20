@@ -3,12 +3,12 @@ import threading
 from importlib import resources
 from typing import Dict, Final, Optional
 
-import torch
+from torch import device as torch_device
 from torch.cuda.memory import CUDAPluggableAllocator
 
 
 class NVLinkAllocator:
-    _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+    _instances: Dict[torch_device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()
 
     @classmethod
@@ -36,7 +36,7 @@ class NVLinkAllocator:
             )
 
     @classmethod
-    def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
+    def get_allocator(cls, device: torch_device) -> CUDAPluggableAllocator:
         with cls._lock:
             if device not in cls._instances:
                 so_path = cls._get_so_path()
