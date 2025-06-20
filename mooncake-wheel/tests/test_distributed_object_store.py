@@ -272,7 +272,8 @@ class TestDistributedObjectStore(unittest.TestCase):
         print(f"System Put bandwidth: {total_data_size_gb/put_duration:.2f} GB/sec")
         print(f"System Get bandwidth: {total_data_size_gb/get_duration:.2f} GB/sec")
 
-    def test_dict_fuzz_e2e(self):
+    # Mark this test as zzz_ so that it is the last test to run
+    def zzz_test_dict_fuzz_e2e(self):
          """End-to-end fuzz test comparing distributed store behavior with dict.
          Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
          After testing, all keys are removed.
