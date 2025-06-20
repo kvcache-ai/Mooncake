@@ -150,6 +150,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    status.transferred_bytes = 0;
     
     if (task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
