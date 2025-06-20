@@ -123,8 +123,9 @@ void TransferEngineOperationState::check_task_status() {
         TransferStatus status;
         Status s = engine_.getTransferStatus(batch_id_, i, status);
         if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for task " << i
-                       << " with error " << s.message();
+            LOG(ERROR) << "Failed to get transfer status for batch "
+                       << batch_id_ << " task " << i << " with error "
+                       << s.message();
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -136,8 +137,9 @@ void TransferEngineOperationState::check_task_status() {
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
-                LOG(ERROR) << "Transfer failed for task " << i
-                           << " with status " << static_cast<int>(status.s);
+                LOG(ERROR) << "Transfer failed for batch " << batch_id_
+                           << " task " << i << " with status "
+                           << static_cast<int>(status.s);
                 has_failure = true;
                 break;
             default:
@@ -148,6 +150,8 @@ void TransferEngineOperationState::check_task_status() {
     }
 
     if (has_failure) {
+        LOG(INFO) << "Setting batch " << batch_id_
+                  << " result to TRANSFER_FAIL due to task failures";
         set_result_internal(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -161,7 +165,17 @@ void TransferEngineOperationState::check_task_status() {
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
-    assert(!result_.has_value() && "Result should only be set once.");
+    if (result_.has_value()) {
+        LOG(ERROR) << "Attempting to set result multiple times for batch "
+                   << batch_id_
+                   << ". Previous result: " << static_cast<int>(result_.value())
+                   << ", attempted new result: " << static_cast<int>(error_code)
+                   << ". This indicates a race condition or logic error.";
+        return;  // Don't crash, just return early
+    }
+
+    LOG(INFO) << "Setting transfer result for batch " << batch_id_ << " to "
+              << static_cast<int>(error_code);
     result_.emplace(error_code);
 
     cv_.notify_all();
@@ -182,7 +196,7 @@ void TransferEngineOperationState::wait_for_completion() {
         if (getCurrentTimeInNano() - start_ts >
             timeout_seconds * kOneSecondInNano) {
             LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_seconds << " seconds";
+                       << timeout_seconds << " seconds for batch " << batch_id_;
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -190,15 +204,15 @@ void TransferEngineOperationState::wait_for_completion() {
         std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed successfully";
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(result_.value());
             break;
         }
         // Continue polling
-        VLOG(1) << "Transfer engine operation still pending";
+        VLOG(1) << "Transfer engine operation still pending for batch "
+                << batch_id_;
     }
-
-    VLOG(1) << "Transfer engine operation completed successfully";
-    set_result_internal(ErrorCode::OK);
 }
 
 // ============================================================================

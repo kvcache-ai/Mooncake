@@ -20,7 +20,7 @@
 
 #include <pybind11/stl.h>
 
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
     return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
@@ -149,7 +149,7 @@ char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
 
 int TransferEnginePy::findClassId(size_t size) {
     if (size > 1024ull * kSlabSizeKB[kMaxClassId]) return -1;
-    for (int i = kMaxClassId - 2; i >= 0; --i)
+    for (int i = kMaxClassId - 1; i >= 0; --i)
         if (size > 1024ull * kSlabSizeKB[i]) return i + 1;
     return 0;
 }
