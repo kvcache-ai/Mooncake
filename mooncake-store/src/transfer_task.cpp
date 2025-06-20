@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "utils.h"
 
@@ -150,8 +151,8 @@ void TransferEngineOperationState::check_task_status() {
     }
 
     if (has_failure) {
-        LOG(INFO) << "Setting batch " << batch_id_
-                  << " result to TRANSFER_FAIL due to task failures";
+        VLOG(1) << "Setting batch " << batch_id_
+                << " result to TRANSFER_FAIL due to task failures";
         set_result_internal(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -174,8 +175,8 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
         return;  // Don't crash, just return early
     }
 
-    LOG(INFO) << "Setting transfer result for batch " << batch_id_ << " to "
-              << static_cast<int>(error_code);
+    VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
+            << static_cast<int>(error_code);
     result_.emplace(error_code);
 
     cv_.notify_all();
@@ -249,6 +250,31 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()) {
     CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
+
+    // Read MC_STORE_MEMCPY environment variable, default to true (enabled)
+    const char* env_value = std::getenv("MC_STORE_MEMCPY");
+    if (env_value == nullptr) {
+        memcpy_enabled_ = true;  // Default: enabled
+    } else {
+        std::string env_str(env_value);
+        // Convert to lowercase for case-insensitive comparison
+        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
+                       ::tolower);
+        if (env_str == "false" || env_str == "0" || env_str == "no" ||
+            env_str == "off") {
+            memcpy_enabled_ = false;
+        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
+                   env_str == "on") {
+            memcpy_enabled_ = true;
+        } else {
+            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
+                         << ", defaulting to enabled";
+            memcpy_enabled_ = true;
+        }
+    }
+
+    VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
+            << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -371,9 +397,14 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     const std::vector<Slice>& slices) const {
-    // Check conditions for local memcpy optimization (currently disabled as
-    // RDMA is faster)
-    // TODO: add a config to disable this optimization
+    // Check if memcpy operations are enabled via environment variable
+    if (!memcpy_enabled_) {
+        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
+                   "variable";
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+    // Check conditions for local memcpy optimization
     if (isLocalTransfer(handles)) {
         return TransferStrategy::LOCAL_MEMCPY;
     }

@@ -112,6 +112,32 @@ class DistributedObjectStore {
 
     int put(const std::string &key, std::span<const char> value);
 
+    int register_buffer(void *buffer, size_t size);
+
+    /**
+     * @brief Get object data directly into a pre-allocated buffer
+     * @param key Key of the object to get
+     * @param buffer Pointer to the pre-allocated buffer (must be registered
+     * with register_buffer)
+     * @param size Size of the buffer
+     * @return Number of bytes read on success, negative value on error
+     * @note The buffer address must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    int get_into(const std::string &key, void *buffer, size_t size);
+
+    /**
+     * @brief Put object data directly from a pre-allocated buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the buffer containing data (must be registered
+     * with register_buffer)
+     * @param size Size of the data to put
+     * @return 0 on success, negative value on error
+     * @note The buffer address must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    int put_from(const std::string &key, void *buffer, size_t size);
+
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
