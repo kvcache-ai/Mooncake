@@ -8,10 +8,11 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
     env:
       SCCACHE_GHA_ENABLED: "true"
 
@@ -25,9 +26,21 @@ jobs:
 
     - name: Install and start etcd
       run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+        ARCH=$(uname -m)
+        ETCD_ARCH=""
+        if [ "$ARCH" = "x86_64" ]; then
+          ETCD_ARCH="amd64"
+        elif [ "$ARCH" = "aarch64" ]; then
+          ETCD_ARCH="arm64"
+        else
+          echo "Unsupported architecture: $ARCH for etcd"
+          exit 1
+        fi
+        
+        ETCD_TAR="etcd-v3.6.1-linux-${ETCD_ARCH}.tar.gz"
+        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/${ETCD_TAR}
+        tar xzf ${ETCD_TAR}
+        sudo mv etcd-v3.6.1-linux-${ETCD_ARCH}/etcd* /usr/local/bin/
         etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
         sleep 3 # Give etcd time to start
         etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
@@ -40,7 +53,7 @@ jobs:
         sudo rm -rf /opt/hostedtoolcache/CodeQL
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.25
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
@@ -122,13 +135,23 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
+    - name: Upload Python wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-py${{ steps.generate_tag_build.outputs.python_version_tag }}-${{ matrix.os }} # Differentiate by OS
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+
   test-wheel-ubuntu:
-    needs: build-flags
+    # This job now depends on a new job name below or on `build` if `build-flags` is removed/renamed
+    # Assuming `build` is the primary build job, and its artifacts will be used.
+    # If `build-flags` is intended to be the source for these artifacts, its name should be fixed.
+    # For this update, I'm assuming it should depend on 'build'.
+    needs: build # Changed from 'build-flags' to 'build' as it's the primary build job.
     strategy:
       matrix:
-        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm] 
         python-version: ['3.10', '3.12']
-    runs-on: ${{ matrix.ubuntu-version }}
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
 
@@ -146,7 +169,8 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        # Changed artifact name to match the upload name from the 'build' job
+        name: mooncake-wheel-py${{ steps.generate_tag_test.outputs.python_version_tag }}-${{ matrix.os }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -177,10 +201,11 @@ jobs:
       shell: bash
 
   build-flags:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
     env:
       SCCACHE_GHA_ENABLED: "true"
 
@@ -199,7 +224,7 @@ jobs:
         sudo rm -rf /opt/hostedtoolcache/CodeQL
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.25
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
@@ -302,24 +327,33 @@ jobs:
     - name: Upload Python wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}-${{ matrix.os }} # Differentiate by OS
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
-    name: Builcd Docker Image
-    runs-on: ubuntu-22.04
+    name: Build Docker Image
+    runs-on: ${{ matrix.os }} 
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm] # Added ubuntu-22.04-arm to the OS matrix
     steps:
     - uses: actions/checkout@v4
-  
+    
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
     
     - name: Build Docker image
+      # For multi-arch docker builds, buildx is recommended to target multiple platforms
+      # For simplicity, keeping the direct build command which will build for the runner's architecture.
+      # If cross-architecture images are needed, "docker buildx build --platform linux/amd64,linux/arm64 ..." would be used.
       run: docker build -t mooncake-app .
 
   spell-check:
     name: Spell Check with Typos
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm] # Added ubuntu-22.04-arm to the OS matrix
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
