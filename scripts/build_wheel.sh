@@ -18,7 +18,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
-rm mooncake-wheel/mooncake/*.so
+rm -f mooncake-wheel/mooncake/*.so
 
 echo "Creating directory structure..."
 
