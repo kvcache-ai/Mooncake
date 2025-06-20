@@ -10,11 +10,13 @@ if("${PYTHON_SYS_PATH}" STREQUAL "")
     message(FATAL_ERROR "Python path is empty! Please check the python env.")
 endif()
 
-include_directories("../mooncake-store/include")
-include_directories("../mooncake-store/include/cachelib_memory_allocator")
+if (WITH_STORE)
+    include_directories("../mooncake-store/include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator")
 
-include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
-include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
+    include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
+endif()
 
 include_directories("/usr/include/jsoncpp")
 
@@ -45,16 +47,19 @@ if(USE_MNNVL)
     )
 endif()
 
-pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp 
-)
-target_link_libraries(store PUBLIC 
-    transfer_engine 
-    glog::glog
-    gflags::gflags
-    mooncake_store 
-    cachelib_memory_allocator
-)
+if (WITH_STORE)
+    pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        store/store_py.cpp
+    )
+    target_link_libraries(store PUBLIC
+        transfer_engine
+        glog::glog
+        gflags::gflags
+        mooncake_store
+        cachelib_memory_allocator
+    )
+endif()
+
 message("${PYTHON_SYS_PATH}")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
@@ -82,5 +87,9 @@ install(
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
     "
 )
-install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+
+if (WITH_STORE)
+    install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
