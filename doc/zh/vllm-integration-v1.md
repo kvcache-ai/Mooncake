@@ -21,7 +21,7 @@ pip3 install mooncake-transfer-engine
 
 注意事项：
   - 如遇缺失 `lib*.so` 等库问题，请先执行 `pip3 uninstall mooncake-transfer-engine` 卸载，然后按照[编译指南](build.md)手动编译。
-  - 对于 vLLM <= v0.8.4，必须从源码编译安装，因为早期版本的 pip wheel 未包含 mooncake_vllm_adaptor 接口。
+  - 对于 vLLM <= v0.8.4，请使用mooncake-transfer-engine <= v0.3.3.post2，`mooncake_vllm_adaptor`接口已被废弃。
 
 ### 安装最新版 vLLM
 #### 1. 克隆官方仓库

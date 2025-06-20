@@ -39,7 +39,7 @@
 #include <cufile.h>
 #endif
 
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include <transport/nvlink_transport/nvlink_transport.h>
 #endif
 
@@ -100,7 +100,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -114,7 +114,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #ifdef USE_CUDA
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
     if (result == CUDA_SUCCESS) {
@@ -424,7 +424,7 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);

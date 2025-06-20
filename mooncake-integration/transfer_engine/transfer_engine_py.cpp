@@ -17,7 +17,7 @@
 #include <cassert>
 #include <fstream>
 
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
     return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
@@ -136,7 +136,7 @@ int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
         freeMemory(buffer);
         return nullptr;

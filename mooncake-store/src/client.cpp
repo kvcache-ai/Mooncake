@@ -570,8 +570,8 @@ ErrorCode Client::MountSegment(const void* buffer, size_t size) {
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory((void*)buffer, size, "cpu:0",
-                                                  true, true);
+    int rc = transfer_engine_.registerLocalMemory(
+        (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
                    << " size=" << size << ", error=" << rc;
