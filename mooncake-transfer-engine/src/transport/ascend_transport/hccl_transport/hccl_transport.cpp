@@ -30,6 +30,11 @@ HcclTransport::HcclTransport() : running_(-1) {
 
 HcclTransport::~HcclTransport() {
     //TODO
+    running = false;
+    for (int i = 0; i < THREAD_NUM; i++){
+        allInitiatorThreads_[i].join();
+    }
+    allAcceptThreads_.join();
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
@@ -46,9 +51,9 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx){
     }
     
     while(1) {
-        std::unique_lock<std::mutex> lock(initiator_mutex_);
+        std::unique_lock<std::mutex> lock(mutex_pool_[selfIdx]);
         if (allReqQueues_[selfIdx].empty()){
-            initiator_cond_.wait(lock);
+            cond_pool_[selfIdx].wait(lock);
         }
 
         auto slice = std::move(allReqQueues_[selfIdx].front());
@@ -109,8 +114,8 @@ int HcclTransport::initPdThread(){
 
     for (int i = 0; i < THREAD_NUM; ++i) {
         allInitiatorThreads_[i] = std::thread(&HcclTransport::initiatorLoop, this, deviceLogicId, i);
-        allAcceptThreads_[i] = std::thread(&HcclTransport::acceptLoop, this, deviceLogicId);
     }
+    allAcceptThreads_ = std::thread(&HcclTransport::acceptLoop, this, deviceLogicId);
 
     LOG(INFO) << "HcclTransport: initPdThread, pid: " << pid << ";" << "init " << THREAD_NUM << " initiator threads and accept threads, deviceLogicId: " << deviceLogicId;
     return 0;
@@ -293,10 +298,12 @@ Status HcclTransport::submitTransfer(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        std::unique_lock<std::mutex> lock(initiator_mutex_);
-        allReqQueues_[0].push(slice);
+        // slice->target_id for 1 
+        int target_id = slice->target_id -1;
+        std::unique_lock<std::mutex> lock(mutex_pool_[target_id]);
+        allReqQueues_[target_id].push(slice);
         lock.unlock();
-        initiator_cond_.notify_one();
+        cond_pool_[target_id].notify_one();
     }
 
     return Status::OK();
@@ -319,10 +326,12 @@ Status HcclTransport::submitTransferTask(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        std::unique_lock<std::mutex> lock(initiator_mutex_);
-        allReqQueues_[0].push(slice);
+        // slice->target_id for 1 
+        int target_id = slice->target_id -1;
+        std::unique_lock<std::mutex> lock(mutex_pool_[target_id]);
+        allReqQueues_[target_id].push(slice);
         lock.unlock();
-        initiator_cond_.notify_one();
+        cond_pool_[target_id].notify_one();
     }
 
     return Status::OK();

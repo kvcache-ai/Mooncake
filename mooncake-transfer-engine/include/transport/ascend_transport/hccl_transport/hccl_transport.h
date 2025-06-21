@@ -31,7 +31,7 @@
 #include "transport/transport.h"
 #include "hccl_transport_mem_c.h"
 
-#define THREAD_NUM 1
+#define THREAD_NUM 64
 #define ASCEND_DEFAULT_HOST_PORT  10000
 #define ASCEND_DEFAULT_DEVICE_PORT 16666
 
@@ -91,10 +91,10 @@ class HcclTransport : public Transport {
    private:
     std::atomic_bool running_;
     std::thread allInitiatorThreads_[THREAD_NUM];
-    std::thread allAcceptThreads_[THREAD_NUM];
+    std::thread allAcceptThreads_;
     std::queue<Slice*> allReqQueues_[THREAD_NUM];
-    std::mutex initiator_mutex_;
-    std::condition_variable initiator_cond_;
+    std::vector<std::mutex> mutex_pool_(THREAD_NUM);
+    std::vector<std::condition_variable> cond_pool_(THREAD_NUM);
     // local rank info
     RankInfo local_rank_info_;
     RankInfo remote_rank_info_;
