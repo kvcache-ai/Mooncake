@@ -1,0 +1,22 @@
+name: "⚙️ Preformance discussions"
+description: "Questions about Mooncake's performance"
+title: "[Performance]: "
+labels: ["performance"]
+body:
+- type: textarea
+  attributes:
+    label: Describe your performance question
+    description: >
+      A clear and concise description of your question about performance.
+  validations:
+    required: true
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)
