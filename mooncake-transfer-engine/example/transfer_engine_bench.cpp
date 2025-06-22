@@ -407,8 +407,12 @@ int target() {
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
 #ifdef USE_NVLINK
-        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
-            FLAGS_buffer_size);
+        if (FLAGS_use_vram) {
+            addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
+                FLAGS_buffer_size);
+        } else {
+            addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
+        }
 #else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
 #endif
