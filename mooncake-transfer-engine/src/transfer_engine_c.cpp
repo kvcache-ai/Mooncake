@@ -168,7 +168,7 @@ int getTransferStatus(transfer_engine_t engine,
     return (int)s.code();
 }
 
-int getNotifs(transfer_engine_t engine,
+int getNotifsFromEngine(transfer_engine_t engine,
               std::vector<std::pair<std::string, std::string>> &notifies) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->getNotifies(notifies);

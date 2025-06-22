@@ -147,7 +147,7 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg);
 
-int getNotifs(transfer_engine_t engine,
+int getNotifsFromEngine(transfer_engine_t engine,
               std::vector<std::pair<std::string, std::string>> &notifies);
 
 int getTransferStatus(transfer_engine_t engine,
