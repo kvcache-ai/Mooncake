@@ -268,11 +268,17 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
-    int qp_index = SimpleRandom::Get().next(qp_list_.size());
-    int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
-                            (int)slice_list.size());
-    wr_count =
-        std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
+    int qp_index = 0, wr_count = 0;
+    for (size_t i = 0; i < qp_list_.size(); i++) {
+        int curr_wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
+                            std::min(std::static_cast<int>(slice_list.size()),
+                                     std::static_cast<int>(globalConfig().max_cqe) - *cq_outstanding_));
+
+        if (curr_wr_count > wr_count) {
+            wr_count = curr_wr_count;
+            qp_index = i;
+        }
+    }
     if (wr_count <= 0) return 0;
 
     ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
