@@ -156,6 +156,18 @@ class TransferEngine {
         return result;
     }
 
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+        Status result = multi_transports_->getBatchTransferStatus(batch_id, status);
+#ifdef WITH_METRICS
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes > 0) {
+                transferred_bytes_counter_.inc(status.transferred_bytes);
+            }
+        }
+#endif
+        return result;
+    }
+
     int syncSegmentCache(const std::string &segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);
     }

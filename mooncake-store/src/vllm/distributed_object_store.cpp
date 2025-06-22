@@ -33,9 +33,9 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    ErrorCode rc =
-        client_->RegisterLocalMemory(client_buffer_allocator_->getBase(),
-                                     local_buffer_size, "cpu:0", false, false);
+    ErrorCode rc = client_->RegisterLocalMemory(
+        client_buffer_allocator_->getBase(), local_buffer_size,
+        kWildcardLocation, false, false);
     segment_ptr_ =
         (uint64_t)allocate_buffer_allocator_memory(global_segment_size);
     if (segment_ptr_ == 0) {

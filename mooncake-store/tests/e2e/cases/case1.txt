@@ -1,0 +1,12 @@
+# Test case for None HA mode
+create c1 9888
+mount c1 s1 1073741824
+put c1 key1 val1
+put c1 key2 val2
+create c2 9889
+mount c2 s2 1073741824
+get c2 key2
+remove c1
+put c2 key1 val1b
+get c2 key1
+remove c2

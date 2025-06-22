@@ -27,6 +27,10 @@ MasterMetricManager::MasterMetricManager()
                                "Distribution of object value sizes",
                                {4096, 65536, 262144, 1048576, 4194304,
                                 16777216, 67108864}),
+      // Initialize cluster metrics
+      active_clients_("master_active_clients",
+                      "Total number of active clients"),
+
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
@@ -71,8 +75,16 @@ MasterMetricManager::MasterMetricManager()
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
           "Total number of failed UnmountSegment requests"),
+      remount_segment_requests_(
+          "master_remount_segment_requests_total",
+          "Total number of RemountSegment requests received"),
+      remount_segment_failures_(
+          "master_remount_segment_failures_total",
+          "Total number of failed RemountSegment requests"),
       ping_requests_("master_ping_requests_total",
                      "Total number of ping requests received"),
+      ping_failures_("master_ping_failures_total",
+                     "Total number of failed ping requests"),
 
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
@@ -130,6 +142,19 @@ int64_t MasterMetricManager::get_key_count() {
     return key_count_.value();
 }
 
+// Cluster Metrics
+void MasterMetricManager::inc_active_clients(int64_t val) {
+    active_clients_.inc(val);
+}
+
+void MasterMetricManager::dec_active_clients(int64_t val) {
+    active_clients_.dec(val);
+}
+
+int64_t MasterMetricManager::get_active_clients() {
+    return active_clients_.value();
+}
+
 // Operation Statistics (Counters)
 void MasterMetricManager::inc_exist_key_requests(int64_t val) {
     exist_key_requests_.inc(val);
@@ -185,8 +210,17 @@ void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
+    remount_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
+    remount_segment_failures_.inc(val);
+}
 void MasterMetricManager::inc_ping_requests(int64_t val) {
     ping_requests_.inc(val);
+}
+void MasterMetricManager::inc_ping_failures(int64_t val) {
+    ping_failures_.inc(val);
 }
 
 int64_t MasterMetricManager::get_put_start_requests() {
@@ -261,8 +295,20 @@ int64_t MasterMetricManager::get_unmount_segment_failures() {
     return unmount_segment_failures_.value();
 }
 
+int64_t MasterMetricManager::get_remount_segment_requests() {
+    return remount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remount_segment_failures() {
+    return remount_segment_failures_.value();
+}
+
 int64_t MasterMetricManager::get_ping_requests() {
     return ping_requests_.value();
+}
+
+int64_t MasterMetricManager::get_ping_failures() {
+    return ping_failures_.value();
 }
 
 // Eviction Metrics
@@ -293,6 +339,11 @@ int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
 }
 
+// --- Setters ---
+void MasterMetricManager::set_enable_ha(bool enable_ha) {
+    enable_ha_ = enable_ha;
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -311,6 +362,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(allocated_size_);
     serialize_metric(total_capacity_);
     serialize_metric(key_count_);
+    if (enable_ha_) {
+        serialize_metric(active_clients_);
+    }
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
@@ -334,7 +388,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
     serialize_metric(unmount_segment_failures_);
-    serialize_metric(ping_requests_);
+    serialize_metric(remount_segment_requests_);
+    serialize_metric(remount_segment_failures_);
+    if (enable_ha_) {
+        serialize_metric(ping_requests_);
+        serialize_metric(ping_failures_);
+    }
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);
@@ -369,6 +428,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t allocated = allocated_size_.value();
     int64_t capacity = total_capacity_.value();
     int64_t keys = key_count_.value();
+    int64_t active_clients = active_clients_.value();
 
     // Request counters
     int64_t exist_keys = exist_key_requests_.value();
@@ -383,13 +443,16 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
-    int64_t pings = ping_requests_.value();
 
     // Eviction counters
     int64_t eviction_success = eviction_success_.value();
     int64_t eviction_attempts = eviction_attempts_.value();
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
+
+    // Ping counters
+    int64_t ping = ping_requests_.value();
+    int64_t ping_fails = ping_failures_.value();
 
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
@@ -399,6 +462,9 @@ std::string MasterMetricManager::get_summary_string() {
            << ((double) allocated / (double)capacity * 100.0) << "%)";
     }
     ss << " | Keys: " << keys;
+    if (enable_ha_) {
+        ss << " | Clients: " << active_clients;
+    }
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
@@ -409,7 +475,9 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all << ", ";
-    ss << "Ping=" << pings;
+    if (enable_ha_) {
+        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
+    }
 
     // Eviction summary
     ss << " | Eviction: "

@@ -31,7 +31,9 @@ add_test(NAME master_metrics_test COMMAND master_metrics_test)
 
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC mooncake_store cachelib_memory_allocator glog gtest gtest_main pthread ${ETCD_WRAPPER_LIB})
-add_test(NAME high_availability_test COMMAND high_availability_test)
+if (STORE_USE_ETCD)
+    add_test(NAME high_availability_test COMMAND high_availability_test)
+endif()
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(stress_workload_test PUBLIC
@@ -53,3 +55,16 @@ target_link_libraries(transfer_task_test PUBLIC
     pthread
 )
 add_test(NAME transfer_task_test COMMAND transfer_task_test)
+
+add_executable(segment_test segment_test.cpp)
+target_link_libraries(segment_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME segment_test COMMAND segment_test)
+
+add_subdirectory(e2e)

@@ -15,29 +15,41 @@ echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
-echo "Creating directory structure..."
+echo "Cleaning wheel-build directory"
+rm -rf mooncake-wheel/mooncake_transfer_engine*
+rm -rf mooncake-wheel/build/
+rm -f mooncake-wheel/mooncake/*.so
 
-echo "Copying Python modules..."
-# Copy mooncake_vllm_adaptor to root level for backward compatibility
-cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake/mooncake_vllm_adaptor.so
+echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy engine.so to mooncake directory (will be imported by transfer module)
-cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
-
-# Copy nvlink-hook.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-hook/hook.so ]; then
-    echo "Copying CUDA nvlink-hook.so..."
-    cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+# Copy store.so to mooncake directory
+if [ -f build/mooncake-integration/store.*.so ]; then
+    echo "Copying store.so..."
+    cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    echo "Copying master binary..."
+    # Copy master binary
+    cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
 else
-    echo "Skipping nvlink-hook.so (not built - likely ARM64 or non-CUDA build)"
+    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
-echo "Copying master binary and shared libraries..."
-# Copy master binary and shared libraries
-cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+# Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    echo "Copying CUDA nvlink_allocator.so..."
+    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+    echo "Copying allocator libraries..."
+    # Copy allocator.py
+    cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+else
+    echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
+fi
+
+echo "Copying transfer_engine_bench..."
+# Copy transfer_engine_bench
+cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
 
 echo "Building wheel package..."

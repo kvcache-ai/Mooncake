@@ -21,7 +21,8 @@ class AllocationStrategy {
     /**
      * @brief Given all mounted BufferAllocators and required object size,
      *        the strategy can freely choose a suitable BufferAllocator.
-     * @param allocators Container of mounted allocators, key is segment_name,
+     * @param allocators Container of mounted allocators
+     * @param allocators_by_name Container of mounted allocators, key is segment_name,
      *                  value is the corresponding allocator
      * @param objectSize Size of object to be allocated
      * @param config Replica configuration
@@ -29,8 +30,9 @@ class AllocationStrategy {
      *         or no suitable allocator is found
      */
     virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators_by_name,
         size_t objectSize, const ReplicateConfig& config) = 0;
 };
 
@@ -46,22 +48,23 @@ class RandomAllocationStrategy : public AllocationStrategy {
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators_by_name,
         size_t objectSize, const ReplicateConfig& config) override {
         // Fast path: single allocator case
         if (allocators.size() == 1) {
-            return allocators.begin()->second->allocate(objectSize);
+            return allocators[0]->allocate(objectSize);
         }
 
         // Try preferred segment first if specified
         if (auto preferred_buffer =
-                TryPreferredAllocation(allocators, objectSize, config)) {
+                TryPreferredAllocate(allocators_by_name, objectSize, config)) {
             return preferred_buffer;
         }
 
         // Fall back to random allocation among all eligible allocators
-        return RandomAllocateFromEligible(allocators, objectSize);
+        return TryRandomAllocate(allocators, objectSize);
     }
 
    private:
@@ -73,8 +76,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
      * @brief Attempts allocation from preferred segment if available and
      * eligible
      */
-    std::unique_ptr<AllocatedBuffer> TryPreferredAllocation(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
+    std::unique_ptr<AllocatedBuffer> TryPreferredAllocate(
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
             allocators,
         size_t objectSize, const ReplicateConfig& config) {
         if (config.preferred_segment.empty()) {
@@ -86,96 +89,47 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return nullptr;
         }
 
-        auto& preferred_allocator = preferred_it->second;
-        if (MayHasSufficientSpace(preferred_allocator, objectSize)) {
-            return preferred_allocator->allocate(objectSize);
-        }
-
-        return nullptr;
-    }
-
-    /**
-     * @brief Performs random allocation from eligible allocators with retry
-     * logic
-     */
-    std::unique_ptr<AllocatedBuffer> RandomAllocateFromEligible(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
-        size_t objectSize) {
-        auto eligible = CollectEligibleAllocators(allocators, objectSize);
-        if (eligible.empty()) {
-            return nullptr;
-        }
-
-        return TryAllocateWithRetry(eligible, objectSize);
-    }
-
-    /**
-     * @brief Collects all allocators with sufficient available space
-     */
-    std::vector<std::shared_ptr<BufferAllocator>> CollectEligibleAllocators(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
-        size_t objectSize) {
-        std::vector<std::shared_ptr<BufferAllocator>> eligible;
-        eligible.reserve(allocators.size());
-
-        for (const auto& [segment_name, allocator] : allocators) {
-            if (MayHasSufficientSpace(allocator, objectSize)) {
-                eligible.push_back(allocator);
+        auto& preferred_allocators = preferred_it->second;
+        for (auto& allocator : preferred_allocators) {
+            auto buffer = allocator->allocate(objectSize);
+            if (buffer != nullptr) {
+                return buffer;
             }
         }
 
-        return eligible;
+        return nullptr;
     }
 
     /**
      * @brief Attempts allocation with random selection and retry logic
      */
-    std::unique_ptr<AllocatedBuffer> TryAllocateWithRetry(
-        std::vector<std::shared_ptr<BufferAllocator>>& eligible,
+    std::unique_ptr<AllocatedBuffer> TryRandomAllocate(
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
         size_t objectSize) {
-        const size_t max_tries = std::min(kMaxRetryLimit, eligible.size());
+        const size_t max_tries = std::min(kMaxRetryLimit, allocators.size());
+
+        std::vector<size_t> allocator_indices(allocators.size());
+        std::iota(allocator_indices.begin(), allocator_indices.end(), 0);
 
         for (size_t try_count = 0; try_count < max_tries; ++try_count) {
             // Randomly select an allocator
-            std::uniform_int_distribution<size_t> dist(0, eligible.size() - 1);
-            const size_t random_index = dist(rng_);
+            std::uniform_int_distribution<size_t> dist(
+                0, allocator_indices.size() - 1);
+            const size_t random_index = allocator_indices[dist(rng_)];
 
-            auto& allocator = eligible[random_index];
+            auto& allocator = allocators[random_index];
             if (auto buffer = allocator->allocate(objectSize)) {
                 return buffer;
             }
 
             // Remove failed allocator and continue with remaining ones
-            RemoveAllocatorAtIndex(eligible, random_index);
+            if (random_index + 1 != allocator_indices.size()) {
+                std::swap(allocator_indices[random_index],
+                          allocator_indices[allocator_indices.size() - 1]);
+            }
+            allocator_indices.pop_back();
         }
-
         return nullptr;
-    }
-
-    /**
-     * @brief Checks if allocator has sufficient available space
-     */
-    static bool MayHasSufficientSpace(
-        const std::shared_ptr<BufferAllocator>& allocator,
-        size_t required_size) {
-        const size_t capacity = allocator->capacity();
-        const size_t used = allocator->size();
-        const size_t available = capacity > used ? (capacity - used) : 0;
-        return available >= required_size;
-    }
-
-    /**
-     * @brief Efficiently removes allocator at given index using swap-and-pop
-     */
-    static void RemoveAllocatorAtIndex(
-        std::vector<std::shared_ptr<BufferAllocator>>& allocators,
-        size_t index) {
-        if (index + 1 != allocators.size()) {
-            std::swap(allocators[index], allocators.back());
-        }
-        allocators.pop_back();
     }
 };
 

@@ -131,7 +131,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
             multi_transports_->installTransport("nvlink", nullptr);
 #else
             multi_transports_->installTransport("tcp", nullptr);

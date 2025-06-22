@@ -12,7 +12,10 @@
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+
+#ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
+#endif
 
 namespace mooncake {
 
@@ -25,6 +28,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5; // in seconds
+static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 
 // Forward declarations
 class BufferAllocator;
@@ -42,9 +46,24 @@ using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
 // Mapping between c++ and go types
+#ifdef STORE_USE_ETCD
 using EtcdRevisionId = GoInt64;
 using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = GoInt64;
+#else
+using EtcdRevisionId = int64_t;
+using ViewVersionId = int64_t;
+using EtcdLeaseId = int64_t;
+#endif
+
+using UUID = std::pair<uint64_t, uint64_t>;
+
+inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
+    os << uuid.first << "-" << uuid.second;
+    return os;
+}
+
+UUID generate_uuid();
 
 /**
  * @brief Error codes for various operations in the system
@@ -58,7 +77,8 @@ enum class ErrorCode : int32_t {
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
-    AVAILABLE_SEGMENT_EMPTY = -101,   ///< No available segments found.
+    SEGMENT_NOT_FOUND = -101,   ///< No available segments found.
+    SEGMENT_ALREADY_EXISTS = -102,   ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE = -200,  ///< No available handles.
@@ -90,11 +110,15 @@ enum class ErrorCode : int32_t {
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
 
-    // ETCD errors (Range: -1000 to -1099)
-    ETCD_OPERATION_ERROR = -1000,  ///< etcd operation failed.
-    ETCD_KEY_NOT_EXIST = -1001,  ///< key not found in etcd.
+    // High availability errors (Range: -1000 to -1099)
+    ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
+    ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
-    ETCD_CTX_CANCELLED = -1003,  ///< etcd context cancelled.
+    ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    UNAVAILABLE_IN_CURRENT_STATUS =
+        -1010,  ///< Request cannot be done in current status.
+    UNAVAILABLE_IN_CURRENT_MODE =
+        -1011,  ///< Request cannot be done in current mode.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -335,5 +359,46 @@ struct Slice {
 const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
+
+/**
+ * @brief Represents a contiguous memory region
+ */
+struct Segment {
+    UUID id{0, 0};
+    std::string name{};  // The name of the segment, also might be the hostname
+                         // of the server that owns the segment
+    uintptr_t base{0};
+    size_t size{0};
+    Segment() = default;
+    Segment(const UUID& id, const std::string& name, uintptr_t base,
+            size_t size)
+        : id(id), name(name), base(base), size(size) {}
+};
+YLT_REFL(Segment, id, name, base, size);
+
+/**
+ * @brief Client status from the master's perspective
+ */
+enum class ClientStatus {
+    UNDEFINED = 0,  // Uninitialized
+    OK,             // Client is alive, no need to remount for now
+    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
+                    // need to remount
+};
+
+/**
+ * @brief Stream operator for ClientStatus
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const ClientStatus& status) noexcept {
+    static const std::unordered_map<ClientStatus, std::string_view>
+        status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
+                       {ClientStatus::OK, "OK"},
+                       {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
+
+    os << (status_strings.count(status) ? status_strings.at(status)
+                                        : "UNKNOWN");
+    return os;
+}
 
 }  // namespace mooncake

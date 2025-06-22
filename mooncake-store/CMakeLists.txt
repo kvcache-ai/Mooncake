@@ -1,7 +1,11 @@
 project(MooncakeStore)
 
-set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)
-set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/libetcd_wrapper.so)
+if (STORE_USE_ETCD)
+    set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)
+    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/libetcd_wrapper.so)
+else()
+    message(STATUS "STORE_USE_ETCD=OFF, high availability of Store is disabled")
+endif()
 
 # Add include directories
 include_directories(
