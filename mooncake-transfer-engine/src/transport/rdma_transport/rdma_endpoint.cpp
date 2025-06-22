@@ -271,8 +271,8 @@ int RdmaEndPoint::submitPostSend(
     int qp_index = 0, wr_count = 0;
     for (size_t i = 0; i < qp_list_.size(); i++) {
         int curr_wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
-                            std::min(std::static_cast<int>(slice_list.size()),
-                                     std::static_cast<int>(globalConfig().max_cqe) - *cq_outstanding_));
+                            std::min(static_cast<int>(slice_list.size()),
+                                     static_cast<int>(globalConfig().max_cqe) - *cq_outstanding_));
 
         if (curr_wr_count > wr_count) {
             wr_count = curr_wr_count;
