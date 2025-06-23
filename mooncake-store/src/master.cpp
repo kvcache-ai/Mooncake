@@ -124,6 +124,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Convert timeout from seconds to chrono duration
+    // Note: 0 seconds means no timeout (infinite timeout)
     auto rpc_conn_timeout =
         std::chrono::seconds(FLAGS_rpc_conn_timeout_seconds);
 
