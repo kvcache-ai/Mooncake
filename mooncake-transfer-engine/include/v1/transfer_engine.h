@@ -87,6 +87,9 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 
+    Status getTransferStatus(BatchID batch_id,
+                             std::vector<TransferStatus> &status_list);
+
     std::shared_ptr<SegmentDesc> getSegmentDesc(SegmentID handle);
 
     Status allocateLocalMemory(void **pptr, TransportType type, size_t size,

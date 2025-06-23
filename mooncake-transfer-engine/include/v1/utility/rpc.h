@@ -37,7 +37,7 @@ namespace v1 {
 
 using RpcRawData = std::vector<char>;
 enum RpcErrorCode { OK = 0, ErrIncompleted, ErrInvalidFunc };
-enum RpcFuncID { GetSegmentDesc = 1, BootstrapRdma };
+enum RpcFuncID { GetSegmentDesc = 1, BootstrapRdma, SendData, RecvData };
 
 class AsioRpcServer {
    public:

@@ -42,6 +42,11 @@
 #define unlikely(x) __glibc_unlikely(x)
 #endif
 
+#ifdef USE_CUDA
+#include <bits/stdint-uintn.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 namespace v1 {
 const static int LOCAL_SEGMENT_ID = 0;
@@ -123,6 +128,18 @@ static inline bool overlap(const void *a, size_t a_len, const void *b,
     return (a >= b && a < (char *)b + b_len) ||
            (b >= a && b < (char *)a + a_len);
 }
+
+#ifdef USE_CUDA
+static inline bool genericMemcpy(void *dst, void *src, size_t length) {
+    auto ret = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
+    return ret == cudaSuccess;
+}
+#else
+static inline bool genericMemcpy(void *dst, void *src, size_t length) {
+    memcpy(dst, src, length);
+    return true;
+}
+#endif
 
 }  // namespace v1
 }  // namespace mooncake

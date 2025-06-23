@@ -306,6 +306,24 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return transport->getTransferStatus(sub_batch, sub_task_id, status);
 }
 
+Status TransferEngine::getTransferStatus(
+    BatchID batch_id, std::vector<TransferStatus> &status_list) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    Batch *batch = (Batch *)(batch_id);
+    for (size_t task_id = 0; task_id < batch->task_id_lookup.size(); ++task_id) {
+        auto [type, sub_task_id] = batch->task_id_lookup[task_id];
+        auto transport = transport_list_[type];
+        auto sub_batch = batch->sub_batch[type];
+        if (!transport || !sub_batch) {
+            return Status::InvalidArgument("Transport not available" LOC_MARK);
+        }
+        TransferStatus xfer_status;
+        CHECK_STATUS(transport->getTransferStatus(sub_batch, sub_task_id, xfer_status));
+        status_list.push_back(xfer_status);
+    }
+    return Status::OK();
+}
+
 std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
     auto &manager = metadata_->segmentManager();
     std::shared_ptr<SegmentDesc> desc;
@@ -326,7 +344,8 @@ Status TransferEngine::allocateLocalMemory(void **pptr, TransportType type,
     return transport->allocateLocalMemory(pptr, size, align, location);
 }
 
-Status TransferEngine::freeLocalMemory(void *ptr, TransportType type, size_t size) { 
+Status TransferEngine::freeLocalMemory(void *ptr, TransportType type,
+                                       size_t size) {
     auto transport = transport_list_[type];
     return transport->freeLocalMemory(ptr, size);
 }

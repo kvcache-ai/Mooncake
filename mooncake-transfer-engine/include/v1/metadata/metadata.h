@@ -43,7 +43,7 @@ struct DeviceDesc {
     std::string gid;
 };
 
-enum class MemBufferType { RDMA, SHM, NVLINK };
+enum class MemBufferType { RDMA, SHM, NVLINK, TCP };
 
 struct BufferDesc {
     std::string location;
@@ -173,7 +173,7 @@ class P2PMetadataStore : public MetadataStore {
     virtual Status putSegmentDesc(SegmentDescRef &desc) {
         return Status::OK();  // no operation in purpose
     }
-    
+
     virtual Status deleteSegmentDesc(const std::string &segment_name) {
         return Status::OK();  // no operation in purpose
     }
@@ -189,18 +189,29 @@ struct BootstrapDesc {
     std::string reply_msg;  // on error
 };
 
+struct XferDataDesc {
+    uint64_t peer_mem_addr;
+    size_t length;
+};
+
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc &request, BootstrapDesc &response)>;
 
-class BootstrapRdmaClient {
+class RpcClient {
    public:
-    BootstrapRdmaClient() {}
+    RpcClient() {}
 
-    ~BootstrapRdmaClient() {}
+    ~RpcClient() {}
 
    public:
-    Status bootstrap(const std::string &segment_name,
+    Status bootstrap(const std::string &server_addr,
                      const BootstrapDesc &request, BootstrapDesc &response);
+
+    Status sendData(const std::string &server_addr, uint64_t peer_mem_addr,
+                    void *local_mem_addr, size_t length);
+
+    Status recvData(const std::string &server_addr, uint64_t peer_mem_addr,
+                    void *local_mem_addr, size_t length);
 
    private:
     std::unique_ptr<AsioRpcClient> client_;
@@ -227,6 +238,10 @@ class MetadataService {
     void onGetSegmentDesc(const RpcRawData &request, RpcRawData &response);
 
     void onBootstrapRdma(const RpcRawData &request, RpcRawData &response);
+
+    void onSendData(const RpcRawData &request, RpcRawData &response);
+
+    void onRecvData(const RpcRawData &request, RpcRawData &response);
 
    private:
     std::unique_ptr<SegmentManager> manager_;

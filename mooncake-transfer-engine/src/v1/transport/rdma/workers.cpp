@@ -234,7 +234,7 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
         auto status = manager.getRemote(segment_desc, peer_server_name);
         if (!status.ok()) return ERR_ENDPOINT;
 
-        BootstrapRdmaClient client;
+        RpcClient client;
         auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
         LOG(INFO) << "==> " << detail.rpc_server_addr;
         status = client.bootstrap(detail.rpc_server_addr, local_desc, peer_desc);

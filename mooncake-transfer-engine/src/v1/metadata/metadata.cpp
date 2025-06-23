@@ -380,10 +380,10 @@ Status deserializeBootstrapDesc(BootstrapDesc &desc, const RpcRawData &stream) {
         "Failed to import handshake message from json" LOC_MARK);
 }
 
-Status BootstrapRdmaClient::bootstrap(const std::string &segment_name,
-                                      const BootstrapDesc &request,
-                                      BootstrapDesc &response) {
-    client_ = std::make_unique<AsioRpcClient>(segment_name);
+Status RpcClient::bootstrap(const std::string &server_addr,
+                            const BootstrapDesc &request,
+                            BootstrapDesc &response) {
+    client_ = std::make_unique<AsioRpcClient>(server_addr);
     RpcRawData request_raw, response_raw;
 
     auto status = serializeBootstrapDesc(request, request_raw);
@@ -396,6 +396,40 @@ Status BootstrapRdmaClient::bootstrap(const std::string &segment_name,
             "RPC error found: " + std::to_string(err_code) + LOC_MARK);
 
     return deserializeBootstrapDesc(response, response_raw);
+}
+
+Status RpcClient::sendData(const std::string &server_addr,
+                           uint64_t peer_mem_addr, void *local_mem_addr,
+                           size_t length) {
+    client_ = std::make_unique<AsioRpcClient>(server_addr);
+    RpcRawData request, response;
+    XferDataDesc desc{peer_mem_addr, length};
+    request.resize(sizeof(XferDataDesc) + length);
+    memcpy(&request[0], &desc, sizeof(desc));
+    genericMemcpy(&request[sizeof(desc)], local_mem_addr, length);
+    RpcErrorCode err_code = client_->call(SendData, request, response);
+    if (err_code)
+        return Status::MetadataError(
+            "RPC error found: " + std::to_string(err_code) + LOC_MARK);
+    assert(response.empty());
+    return Status::OK();
+}
+
+Status RpcClient::recvData(const std::string &server_addr,
+                           uint64_t peer_mem_addr, void *local_mem_addr,
+                           size_t length) {
+    client_ = std::make_unique<AsioRpcClient>(server_addr);
+    RpcRawData request, response;
+    XferDataDesc desc{peer_mem_addr, length};
+    request.resize(sizeof(XferDataDesc) + length);
+    memcpy(&request[0], &desc, sizeof(desc));
+    RpcErrorCode err_code = client_->call(RecvData, request, response);
+    if (err_code)
+        return Status::MetadataError(
+            "RPC error found: " + std::to_string(err_code) + LOC_MARK);
+    assert(response.size() == length);
+    genericMemcpy(local_mem_addr, response.data(), length);
+    return Status::OK();
 }
 
 MetadataService::MetadataService(const std::string &type,
@@ -417,6 +451,14 @@ MetadataService::MetadataService(const std::string &type,
     rpc_server_->registerFunction(
         BootstrapRdma, [this](const RpcRawData &request, RpcRawData &response) {
             onBootstrapRdma(request, response);
+        });
+    rpc_server_->registerFunction(
+        SendData, [this](const RpcRawData &request, RpcRawData &response) {
+            onSendData(request, response);
+        });
+    rpc_server_->registerFunction(
+        RecvData, [this](const RpcRawData &request, RpcRawData &response) {
+            onRecvData(request, response);
         });
 }
 
@@ -442,6 +484,21 @@ void MetadataService::onBootstrapRdma(const RpcRawData &request,
     if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
     serializeBootstrapDesc(response_desc, response);
     LOG(INFO) << std::string(response.data(), response.size());
+}
+
+void MetadataService::onSendData(const RpcRawData &request,
+                                 RpcRawData &response) {
+    XferDataDesc *desc = (XferDataDesc *)request.data();
+    // TODO check validity before copying
+    genericMemcpy((void *)desc->peer_mem_addr, &desc[1], desc->length);
+}
+
+void MetadataService::onRecvData(const RpcRawData &request,
+                                 RpcRawData &response) {
+    XferDataDesc *desc = (XferDataDesc *)request.data();
+    // TODO check validity before copying
+    response.resize(desc->length);
+    genericMemcpy(response.data(), (void *)desc->peer_mem_addr, desc->length);
 }
 
 }  // namespace v1
