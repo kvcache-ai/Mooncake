@@ -57,10 +57,53 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         auto hostname_port = parseHostNameWithPort(metadata_uri);
         client_ =
             redisConnect(hostname_port.first.c_str(), hostname_port.second);
-        if (!client_ || client_->err) {
+        if (!client_) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
+                       << metadata_uri_;
+            return;
+        }
+        if (client_->err) {
             LOG(ERROR) << "RedisStoragePlugin: unable to connect "
                        << metadata_uri_ << ": " << client_->errstr;
+            redisFree(client_);
             client_ = nullptr;
+            return;
+        }
+    }
+
+    RedisStoragePlugin(const std::string &metadata_uri,
+                       const std::string &password, const uint8_t &db_index)
+        : RedisStoragePlugin(metadata_uri) {
+        if (!client_) {
+            return;
+        }
+
+        if (!password.empty()) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "AUTH %s", password.c_str()));
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
+                           << metadata_uri_;
+                freeReplyObject(reply);
+                redisFree(client_);
+                client_ = nullptr;
+                return;
+            }
+            freeReplyObject(reply);
+        }
+
+        if (db_index != 0) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "SELECT %d", db_index));
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: failed to select database "
+                           << (int)db_index << " for " << metadata_uri_;
+                freeReplyObject(reply);
+                redisFree(client_);
+                client_ = nullptr;
+                return;
+            }
+            freeReplyObject(reply);
         }
     }
 
@@ -427,7 +470,29 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second);
+        const char *password = std::getenv("MC_REDIS_PASSWORD");
+        std::string password_str = password ? password : "";
+
+        uint8_t db_index = 0;
+        const char *db_index_str = std::getenv("MC_REDIS_DB_INDEX");
+        if (db_index_str) {
+            try {
+                int index = std::stoi(db_index_str);
+                if (index >= 0 && index <= 255) {
+                    db_index = static_cast<uint8_t>(index);
+                } else {
+                    LOG(WARNING) << "Invalid Redis DB index: " << index
+                                 << ", using default 0";
+                }
+            } catch (const std::exception &e) {
+                LOG(WARNING)
+                    << "Failed to parse MC_REDIS_DB_INDEX: " << e.what()
+                    << ", using default 0";
+            }
+        }
+
+        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second,
+                                                    password_str, db_index);
     }
 #endif  // USE_REDIS
 
