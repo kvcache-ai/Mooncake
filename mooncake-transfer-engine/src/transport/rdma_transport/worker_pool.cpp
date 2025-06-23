@@ -415,6 +415,7 @@ int WorkerPool::doProcessContextEvents() {
                event.event_type == IBV_EVENT_PORT_ERR ||
                event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
+        context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now inactive";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
