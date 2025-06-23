@@ -25,6 +25,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'mooncake-common/etcd/go.mod'
+          check-latest: true
+
+      - run: go version    # sanity-check
+
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet

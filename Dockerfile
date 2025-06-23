@@ -18,6 +18,7 @@ RUN apt-get update -y && \
     cmake \
     net-tools \
     tcpdump \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update -y && \
