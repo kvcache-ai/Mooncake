@@ -68,3 +68,4 @@ target_link_libraries(segment_test PUBLIC
 add_test(NAME segment_test COMMAND segment_test)
 
 add_subdirectory(e2e)
+add_subdirectory(chaos)
