@@ -158,7 +158,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm] 
-        python-version: ['3.10', '3.12']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4

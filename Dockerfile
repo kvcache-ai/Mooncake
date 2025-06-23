@@ -73,13 +73,11 @@ RUN python --version && pip --version
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN pip install --no-cache-dir \
-    "pybind11[global]" \
-    torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
     
 RUN apt update \
      && apt install -y unzip wget cmake git sudo \
-     && pip install pybind11
+     && pip install "pybind11[global]"
 
 # Execute installation in the container
 RUN bash dependencies.sh \

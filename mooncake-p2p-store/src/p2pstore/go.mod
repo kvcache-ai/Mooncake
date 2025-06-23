@@ -1,8 +1,8 @@
 module github.com/kvcache-ai/Mooncake/mooncake-p2p-store/src/p2pstore
 
-go 1.23.0
+go 1.23.10
 
-toolchain go1.24.1
+toolchain go1.23.10
 
 require go.etcd.io/etcd/client/v3 v3.5.15
 
