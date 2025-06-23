@@ -15,6 +15,10 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_C_FLAGS_DEBUG "-O0")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0")
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=thread-safety")
+endif()
+
 option(ENABLE_ASAN "enable address sanitizer" OFF)
 
 if (ENABLE_ASAN)
