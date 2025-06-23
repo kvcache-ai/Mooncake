@@ -209,8 +209,8 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    // for (auto &endpoint : waiting_list_)
-    //     if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
+    for (auto &endpoint : waiting_list_)
+        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
 }
