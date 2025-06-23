@@ -37,8 +37,8 @@ DEFINE_bool(enable_ha, false,
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_string(local_hostname, "",
-              "Local host address (IP:Port), required in HA mode");
+DEFINE_string(host_ip, "",
+              "Local host IP, required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
@@ -59,7 +59,7 @@ int main(int argc, char* argv[]) {
               << FLAGS_eviction_high_watermark_ratio
               << ", enable_ha=" << FLAGS_enable_ha
               << ", etcd_endpoints=" << FLAGS_etcd_endpoints
-              << ", local_hostname=" << FLAGS_local_hostname
+              << ", host_ip=" << FLAGS_host_ip
               << ", client_ttl=" << FLAGS_client_ttl;
 
     int server_thread_num =
@@ -75,22 +75,23 @@ int main(int argc, char* argv[]) {
             << "Etcd endpoints are set but will not be used in non-HA mode";
     }
 
-    if (FLAGS_enable_ha && FLAGS_local_hostname.empty()) {
-        LOG(FATAL) << "Local hostname must be set when enable_ha is true";
+    if (FLAGS_enable_ha && FLAGS_host_ip.empty()) {
+        LOG(FATAL) << "Host IP must be set when enable_ha is true";
         return 1;
     }
-    if (!FLAGS_enable_ha && !FLAGS_local_hostname.empty()) {
+    if (!FLAGS_enable_ha && !FLAGS_host_ip.empty()) {
         LOG(WARNING)
-            << "Local hostname is set but will not be used in non-HA mode";
+            << "Host IP is set but will not be used in non-HA mode";
     }
 
     if (FLAGS_enable_ha) {
+        std::string hostname = FLAGS_host_ip + ":" + std::to_string(FLAGS_port);
         mooncake::MasterServiceSupervisor supervisor(
             FLAGS_port, server_thread_num, FLAGS_enable_gc,
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_default_kv_lease_ttl, FLAGS_eviction_ratio,
             FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
-            FLAGS_etcd_endpoints, FLAGS_local_hostname);
+            FLAGS_etcd_endpoints, hostname);
 
         return supervisor.Start();
     } else {

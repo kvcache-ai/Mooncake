@@ -147,13 +147,13 @@ class MasterHandler {
             close(stderr_fd);
 
             // Execute the master
-            std::string hostname_arg =
-                "--local-hostname=0.0.0.0:" + std::to_string(port_);
+            std::string host_ip_arg = "--host-ip=0.0.0.0";
+            std::string port_arg = "--port=" + std::to_string(port_);
             LOG(INFO) << "[m" << index_ << "] Execl master" << " "
-                      << hostname_arg;
+                      << host_ip_arg << " " << port_arg;
             execl(master_path_.c_str(), master_path_.c_str(),
                   "--enable-ha=true", "--etcd-endpoints=0.0.0.0:2379",
-                  hostname_arg.c_str(), nullptr);
+                  host_ip_arg.c_str(), port_arg.c_str(), nullptr);
 
             // If execl returns, it means there was an error
             LOG(ERROR) << "[m" << index_
@@ -164,8 +164,7 @@ class MasterHandler {
             // Parent process - store the PID
             master_pid_ = pid;
             LOG(INFO) << "[m" << index_
-                      << "] Started master process with PID: " << pid
-                      << " at path: " << master_path_;
+                      << "] Started master process with PID: " << pid;
 
             // Mark that this is no longer the first start
             first_start_ = false;
@@ -309,9 +308,7 @@ class ClientHandler {
             // Parent process - store the PID
             client_pid_ = pid;
             LOG(INFO) << "[c" << index_
-                      << "] Started client process with PID: " << pid
-                      << " at path: " << client_path_;
-
+                      << "] Started client process with PID: " << pid;
             // Mark that this is no longer the first start
             first_start_ = false;
 
