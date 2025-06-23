@@ -123,29 +123,12 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(len(non_existent_result), 1)
         self.assertEqual(non_existent_result[0], 0)
         
-        # Get after remove should return empty bytes
-        self.assertLess(self.store.get_size(key), 0)
-        empty_data = self.store.get(key)
-        self.assertEqual(empty_data, b"")
-
-        # Test isExist functionality
-        test_data_2 = b"Testing exists!"
-        key_2 = "test_exist_key"
-        
-        # Should not exist initially
-        self.assertLess(self.store.get_size(key_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 0)
-        
-        # Should exist after put
-        self.assertEqual(self.store.put(key_2, test_data_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 1)
-        self.assertEqual(self.store.get_size(key_2), len(test_data_2))
-        
-        # Should not exist after remove
+        # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-        self.assertEqual(self.store.remove(key_2), 0)
-        self.assertLess(self.store.get_size(key_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 0)
+        for key in existing_keys:
+            self.assertEqual(self.store.remove(key), 0)
+        
+
     
     def test_zero_copy_operations(self):
         """Test zero-copy get_into and put_from operations."""

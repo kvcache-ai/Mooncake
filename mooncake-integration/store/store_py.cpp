@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 #include <pybind11/gil.h>  // For GIL management
+#include <pybind11/stl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 

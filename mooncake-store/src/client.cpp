@@ -660,20 +660,8 @@ ErrorCode Client::IsExist(const std::string& key) {
 
 ErrorCode Client::BatchIsExist(const std::vector<std::string>& keys,
                                std::vector<ErrorCode>& exist_results) {
-    // Check for duplicate keys
-    std::unordered_set<std::string> seen;
-    for (const auto& key : keys) {
-        if (!seen.insert(key).second) {
-            LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
-                       << key;
-            return ErrorCode::INVALID_PARAMS;
-        }
-    }
-
-    auto response = master_client_.BatchExistKey(keys);
-
-    // Resize the output vector to match the number of keys
     exist_results.resize(keys.size());
+    auto response = master_client_.BatchExistKey(keys);
 
     // Check if we got the expected number of responses
     if (response.exist_responses.size() != keys.size()) {
@@ -686,10 +674,7 @@ ErrorCode Client::BatchIsExist(const std::vector<std::string>& keys,
         return ErrorCode::RPC_FAIL;
     }
 
-    // Copy the error codes from the response
-    for (size_t i = 0; i < keys.size(); ++i) {
-        exist_results[i] = response.exist_responses[i];
-    }
+    exist_results = response.exist_responses;
 
     return ErrorCode::OK;
 }
