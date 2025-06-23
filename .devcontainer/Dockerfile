@@ -1,7 +1,7 @@
 FROM ubuntu:22.04
 
 ARG ARCH
-ARG GO_VERSION=1.22.2
+ARG GO_VERSION=1.23
 
 WORKDIR /workspaces
 
