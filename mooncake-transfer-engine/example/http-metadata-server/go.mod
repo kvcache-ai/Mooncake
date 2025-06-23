@@ -1,7 +1,9 @@
 module github.com/kvcache-ai/Mooncake/mooncake-transfer-engine/example/http-metadata-server
 
-go 1.23.10
+// The `go` directive specifies the language version and must be in 1.XX format.
+go 1.23
 
+// The `toolchain` directive specifies the exact Go toolset to use for building.
 toolchain go1.23.10
 
 require github.com/gin-gonic/gin v1.10.0

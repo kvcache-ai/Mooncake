@@ -1,7 +1,9 @@
 module github.com/kvcache-ai/Mooncake/mooncake-common/etcd
 
-go 1.23.10
+// The `go` directive specifies the language version and must be in 1.XX format.
+go 1.23
 
+// The `toolchain` directive specifies the exact Go toolset to use for building.
 toolchain go1.23.10
 
 require go.etcd.io/etcd/client/v3 v3.5.21
