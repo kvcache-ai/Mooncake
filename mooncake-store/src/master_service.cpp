@@ -583,7 +583,7 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
     for (const auto& shard : metadata_shards_) {
-        MutexLocker lock(const_cast<Mutex*>(&shard.mutex));
+        MutexLocker lock(&shard.mutex);
         total += shard.metadata.size();
     }
     return total;
