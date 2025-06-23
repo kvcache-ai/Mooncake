@@ -73,8 +73,8 @@ RUN python --version && pip --version
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN pip3 install --no-cache-dir \
-    pybind11 \
+RUN pip install --no-cache-dir \
+    "pybind11[global]" \
     torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
     
 RUN apt update \
