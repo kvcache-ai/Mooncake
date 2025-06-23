@@ -6,14 +6,9 @@ labels: ["RFC"]
 body:
 - type: textarea
   attributes:
-    label: Motivation
-    description: >
-      A clear and concise description of the motivation behind this RFC.
-- type: textarea
-  attributes:
     label: Changes proposed
     description: >
-      A clear and concise description of the changes proposed in this RFC.
+      A clear and concise description of the motivation and changes proposed in this RFC.
 - type: markdown
   attributes:
     value: >

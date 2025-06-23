@@ -1,44 +1,21 @@
 name: "🐞 Bug Report"
-description: "Create a bug report to help us improve"
+description: "Report a bug to help us improve"
 title: "[Bug]: "
 labels: ["bug"]
 
 body:
 - type: textarea
   attributes:
-    label: Describe your environment
-    description: >
-      Include details about your environment such as:
-  validations:
-    required: true
-- type: textarea
-  attributes:
-    label: Describe the bug
-    description: >
-      A clear and concise description of what the bug is.
-  validations:
-    required: true
-- type: textarea
-  attributes:
-    label: Steps to reproduce
-    description: >
-      Provide a list of steps to reproduce the bug.
-  validations:
-    required: true
-- type: textarea
-  attributes:
-    label: Expected behavior
-    description: >
-      Describe what you expected to happen.
+    label: Bug Report
+    description: "Include your environment, a clear description of the bug, and steps to reproduce."
   validations:
     required: true
 - type: markdown
   attributes:
-    value: >
-      Thanks for contributing 🎉!
+    value: "Thanks for your contribution! 🎉"
 - type: checkboxes
   id: before_submit
   attributes:
-    label: Before submitting a new issue...
+    label: Before submitting...
     options:
-      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)
+      - label: "Ensure you searched for relevant issues and read the [documentation]"

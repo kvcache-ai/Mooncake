@@ -10,13 +10,6 @@ body:
       A clear and concise description of your question about using the repo.
   validations:
     required: true
-- type: textarea
-  attributes:
-    label: Provide context
-    description: >
-      Include any relevant context or examples that might help us understand your question.
-  validations:
-    required: true
 - type: markdown
   attributes:
     value: >

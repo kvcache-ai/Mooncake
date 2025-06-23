@@ -5,15 +5,9 @@ labels: ["documentation"]
 body:
 - type: textarea
   attributes:
-    label: errors or unclear descriptions you have encountered in the documentation
+    label: Documentation Feedback
     description: >
-      Please provide any specific errors or unclear descriptions you have encountered in the documentation.
-
-- type: textarea
-  attributes:
-    label: Changes proposed
-    description: >
-     How to improve the documentation based on your experience.
+      Please provide any specific errors or unclear descriptions you have encountered in the documentation, along with any proposed changes to improve it based on your experience.
 - type: markdown
   attributes:
     value: >
