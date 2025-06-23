@@ -495,6 +495,10 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_metadata_callback_ = callback;
     }
 
+    virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) {
+        on_notify_callback_ = callback;
+    }
+
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
         if (listener_running_) {
             // LOG(INFO) << "SocketHandShakePlugin: listener already running";
@@ -622,6 +626,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
                     on_metadata_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Notify) {
+                    on_notify_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -665,6 +671,41 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         });
 
         return 0;
+    }
+
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const Json::Value &local, Json::Value &peer) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = doSendNotify(rp, local, peer);
+            if (ret == 0) {
+                freeaddrinfo(result);
+                return 0;
+            }
+            if (ret == ERR_MALFORMED_JSON) {
+                return ret;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
     }
 
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
@@ -810,6 +851,48 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
+    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
+                     Json::Value &peer_notify) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
+        if (ret) {
+            return ret;
+        }
+
+        ret = writeString(conn_fd, HandShakeRequestType::Notify,
+                          Json::FastWriter{}.write(local_notify));
+        if (ret) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to send metadata message: "
+                   "malformed json format, check tcp connection";
+            close(conn_fd);
+            return ret;
+        }
+
+        Json::Reader reader;
+        auto [type, json_str] = readString(conn_fd);
+        if (type != HandShakeRequestType::Notify) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
+        //           << json_str;
+
+        if (!reader.parse(json_str, peer_notify)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
+                          "message, malformed json format: "
+                       << reader.getFormattedErrorMessages();
+            close(conn_fd);
+            return ERR_MALFORMED_JSON;
+        }
+
+        close(conn_fd);
+        return 0;
+    }
+
     int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
                        Json::Value &peer_metadata) {
         int conn_fd = -1;
@@ -859,6 +942,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
+    OnReceiveCallBack on_notify_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(

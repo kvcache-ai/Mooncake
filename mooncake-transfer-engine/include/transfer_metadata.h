@@ -89,6 +89,11 @@ class TransferMetadata {
         std::string reply_msg;  // on error
     };
 
+    struct NotifyDesc {
+        std::string name;
+        std::string notify_msg;
+    };
+
    public:
     TransferMetadata(const std::string &conn_string);
 
@@ -129,6 +134,7 @@ class TransferMetadata {
     int removeRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
@@ -141,6 +147,9 @@ class TransferMetadata {
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 
+    int sendNotify(const std::string &peer_server_name,
+                   const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
 
@@ -152,6 +161,8 @@ class TransferMetadata {
         Json::Value &segmentJSON, const std::string &segment_name);
     int receivePeerMetadata(const Json::Value &peer_json,
                             Json::Value &local_json);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
 
     bool p2p_handshake_mode_{false};
     // local cache
@@ -160,6 +171,8 @@ class TransferMetadata {
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
 
+    RWSpinlock notify_lock_;
+    std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;
