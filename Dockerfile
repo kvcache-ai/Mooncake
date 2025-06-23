@@ -1,6 +1,7 @@
 # Base Image from NVIDIA
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 ARG GO_VERSION=1.22.2
+ENV PYTHON_VERSION=3.12
 WORKDIR /app
 
 COPY . .
@@ -52,7 +53,26 @@ RUN ARCH=$(uname -m) && \
 ENV GOPROXY='https://goproxy.cn'
 ENV PATH=/usr/local/go/bin:$PATH
 
-RUN pip install --no-cache-dir \
+
+# pyenv
+# The pyenv python paths are used during docker run, in this way docker run
+# does not need to activate the environment again.
+# The soft link from the python patch level version to the python mino version
+# ensures python wheel commands (i.e. open3d) are in PATH, since we don't know
+# which patch level pyenv will install (latest).
+ENV PYENV_ROOT=/root/.pyenv
+ENV PATH="$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PYENV_ROOT/versions/$PYTHON_VERSION/bin:$PATH"
+RUN curl https://pyenv.run | bash \
+        && pyenv update \
+        && pyenv install $PYTHON_VERSION \
+        && pyenv global $PYTHON_VERSION \
+        && pyenv rehash \
+        && ln -s $PYENV_ROOT/versions/${PYTHON_VERSION}* $PYENV_ROOT/versions/${PYTHON_VERSION};
+RUN python --version && pip --version
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN pip3 install --no-cache-dir \
     pybind11 \
     torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
     
