@@ -1,6 +1,6 @@
 # Base Image from NVIDIA
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
-ARG GO_VERSION=1.23
+ARG GO_VERSION=1.23.10
 ENV PYTHON_VERSION=3.12
 WORKDIR /app
 
