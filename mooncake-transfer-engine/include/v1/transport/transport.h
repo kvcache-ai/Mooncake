@@ -93,13 +93,15 @@ class Transport {
             "unregisterLocalMemory not implemented" LOC_MARK);
     }
 
-    virtual Status allocateLocalMemory(void **pptr, size_t size, size_t align,
+    virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
                                        const Location &location) {
-        return genericAllocateLocalMemory(pptr, size, align, location);
+        buffer.length = size;
+        buffer.location = location;
+        return genericAllocateLocalMemory(&buffer.addr, size, location);
     }
 
-    virtual Status freeLocalMemory(void *ptr, size_t size) {
-        return genericFreeLocalMemory(ptr, size);
+    virtual Status freeLocalMemory(const BufferEntry &buffer) {
+        return genericFreeLocalMemory(buffer.addr, buffer.length);
     }
 
     virtual const char *getName() const { return "<generic>"; }

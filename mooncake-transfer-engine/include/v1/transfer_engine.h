@@ -92,10 +92,10 @@ class TransferEngine {
 
     std::shared_ptr<SegmentDesc> getSegmentDesc(SegmentID handle);
 
-    Status allocateLocalMemory(void **pptr, TransportType type, size_t size,
-                               size_t align, const Location &location);
+    Status allocateLocalMemory(BufferEntry &buffer, TransportType type,
+                               size_t size, const Location &location);
 
-    Status freeLocalMemory(void *ptr, TransportType type, size_t size);
+    Status freeLocalMemory(const BufferEntry &buffer, TransportType type);
 
    private:
     Status construct();

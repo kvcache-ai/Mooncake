@@ -35,7 +35,7 @@ std::pair<std::string, int> parseKeyValue(const std::string &input) {
     }
 }
 
-Status genericAllocateLocalMemory(void **pptr, size_t size, size_t align,
+Status genericAllocateLocalMemory(void **pptr, size_t size,
                                   const Location &location) {
     auto result = parseKeyValue(location);
     if (result.first == "cuda") {

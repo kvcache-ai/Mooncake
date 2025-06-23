@@ -77,6 +77,11 @@ class ShmTransport : public Transport {
 
     virtual const char *getName() const { return "shm"; }
 
+    virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
+                                       const Location &location);
+
+    virtual Status freeLocalMemory(const BufferEntry &buffer);
+
    private:
     Status setupLocalSegment();
 
@@ -102,6 +107,7 @@ class ShmTransport : public Transport {
 
     std::mutex relocate_mutex_;
     std::unordered_map<uint64_t, OpenedShmEntry> relocate_map_;
+    std::shared_ptr<ConfigManager> conf_;
 };
 }  // namespace v1
 }  // namespace mooncake

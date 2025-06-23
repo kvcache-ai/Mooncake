@@ -84,11 +84,11 @@ Status ShmTransport::install(std::string &local_segment_name,
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
+    conf_ = conf;
     auto status = setupLocalSegment();
     if (!status.ok()) return status;
 
-    // TODO change to one environment variable
-    const static size_t kDefaultThreadPoolSize = 4;
+    const static size_t kDefaultThreadPoolSize = 1;
     workers_ = std::make_unique<ShmThreadPool>(kDefaultThreadPoolSize);
 
     installed_ = true;
@@ -233,7 +233,32 @@ Status ShmTransport::unregisterLocalMemory(
     return manager.applyLocal();
 }
 
-Status ShmTransport::setupLocalSegment() {
+Status ShmTransport::setupLocalSegment() { return Status::OK(); }
+
+static inline std::string makeRandomMmapFileName(const std::string &parent) {
+    std::string result = parent;
+    if (result.empty()) result = "/dev/shm/";
+    if (result[result.size() - 1] != '/') result += '/';
+    result += "mooncake_";
+    for (int i = 0; i < 8; ++i) result += 'a' + SimpleRandom::Get().next(26);
+    return result;
+}
+
+Status ShmTransport::allocateLocalMemory(BufferEntry &buffer, size_t size,
+                                         const Location &location) {
+    buffer.length = size;
+    buffer.location = location;
+    auto base_path = conf_->get("transports/shm/shm_base_path", "/dev/shm/");
+    buffer.shm_path = makeRandomMmapFileName(base_path);
+    buffer.addr = createSharedMemory(buffer.shm_path, size);
+    if (!buffer.addr) {
+        return Status::InternalError("Failed to allocate shared memory");
+    }
+    return Status::OK();
+}
+
+Status ShmTransport::freeLocalMemory(const BufferEntry &buffer) {
+    munmap(buffer.addr, buffer.length);
     return Status::OK();
 }
 

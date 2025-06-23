@@ -20,7 +20,7 @@
 namespace mooncake {
 namespace v1 {
 
-Status genericAllocateLocalMemory(void **pptr, size_t size, size_t align,
+Status genericAllocateLocalMemory(void **pptr, size_t size,
                                   const Location &location);
 
 Status genericFreeLocalMemory(void *ptr, size_t size);

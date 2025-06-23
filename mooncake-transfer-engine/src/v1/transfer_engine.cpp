@@ -310,7 +310,8 @@ Status TransferEngine::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus> &status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
-    for (size_t task_id = 0; task_id < batch->task_id_lookup.size(); ++task_id) {
+    for (size_t task_id = 0; task_id < batch->task_id_lookup.size();
+         ++task_id) {
         auto [type, sub_task_id] = batch->task_id_lookup[task_id];
         auto transport = transport_list_[type];
         auto sub_batch = batch->sub_batch[type];
@@ -318,7 +319,8 @@ Status TransferEngine::getTransferStatus(
             return Status::InvalidArgument("Transport not available" LOC_MARK);
         }
         TransferStatus xfer_status;
-        CHECK_STATUS(transport->getTransferStatus(sub_batch, sub_task_id, xfer_status));
+        CHECK_STATUS(
+            transport->getTransferStatus(sub_batch, sub_task_id, xfer_status));
         status_list.push_back(xfer_status);
     }
     return Status::OK();
@@ -336,18 +338,17 @@ std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
     return desc;
 }
 
-Status TransferEngine::allocateLocalMemory(void **pptr, TransportType type,
-                                           size_t size, size_t align,
+Status TransferEngine::allocateLocalMemory(BufferEntry &buffer,
+                                           TransportType type, size_t size,
                                            const Location &location) {
-    if (!pptr) return Status::InvalidArgument("pptr is nullptr");
     auto transport = transport_list_[type];
-    return transport->allocateLocalMemory(pptr, size, align, location);
+    return transport->allocateLocalMemory(buffer, size, location);
 }
 
-Status TransferEngine::freeLocalMemory(void *ptr, TransportType type,
-                                       size_t size) {
+Status TransferEngine::freeLocalMemory(const BufferEntry &buffer,
+                                       TransportType type) {
     auto transport = transport_list_[type];
-    return transport->freeLocalMemory(ptr, size);
+    return transport->freeLocalMemory(buffer);
 }
 
 }  // namespace v1
