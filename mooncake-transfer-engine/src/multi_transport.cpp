@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "multi_transport.h"
-#include "config.h"
 
+#include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
@@ -130,7 +130,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         if (globalConfig().slice_timeout > 0) {
             auto current_ts = getCurrentTimeInNano();
-            const int64_t kPacketDeliveryTimeout = 
+            const int64_t kPacketDeliveryTimeout =
                 globalConfig().slice_timeout * 1000000000;
             for (auto &slice : task.slice_list) {
                 auto ts = slice->ts;

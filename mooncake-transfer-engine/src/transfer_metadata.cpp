@@ -38,6 +38,22 @@ static inline std::string getFullMetadataKey(const std::string &segment_name) {
         return kCommonKeyPrefix + segment_name;
 }
 
+struct TransferNotifyUtil {
+    static Json::Value encode(const TransferMetadata::NotifyDesc &desc) {
+        Json::Value root;
+        root["name"] = desc.name;
+        root["notify_msg"] = desc.notify_msg;
+        return root;
+    }
+
+    static int decode(Json::Value root, TransferMetadata::NotifyDesc &desc) {
+        Json::Reader reader;
+        desc.name = root["name"].asString();
+        desc.notify_msg = root["notify_msg"].asString();
+        return 0;
+    }
+};
+
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
@@ -82,6 +98,29 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
 }
 
 TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
+
+int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
+                                        Json::Value &local_json) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    TransferMetadata::NotifyDesc peer_notify, local_reply;
+    TransferNotifyUtil::decode(peer_json, peer_notify);
+    notifys.push_back(peer_notify);
+    // reply
+    local_reply.name = "";
+    local_reply.notify_msg = "success";
+    local_json = TransferNotifyUtil::encode(local_reply);
+    return 0;
+}
+
+int TransferMetadata::getNotifies(
+    std::vector<NotifyDesc> &notifies) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    if (notifys.size() > 0) {
+        std::move(notifys.begin(), notifys.end(), std::back_inserter(notifies));
+        notifys.clear();
+    }
+    return 0;
+}
 
 int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
@@ -540,7 +579,10 @@ int TransferMetadata::startHandshakeDaemon(
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });
-
+    handshake_plugin_->registerOnNotifyCallBack(
+        [this](const Json::Value &peer, Json::Value &local) -> int {
+            return receivePeerNotify(peer, local);
+        });
     return 0;
 }
 
@@ -560,6 +602,27 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;
+        return ERR_METADATA;
+    }
+    return 0;
+}
+
+int TransferMetadata::sendNotify(const std::string &peer_server_name,
+                                 const NotifyDesc &local_desc,
+                                 NotifyDesc &peer_desc) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
+    }
+    auto local = TransferNotifyUtil::encode(local_desc);
+    Json::Value peer;
+    int ret = handshake_plugin_->sendNotify(
+        peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
+    if (ret) return ret;
+    TransferNotifyUtil::decode(peer, peer_desc);
+    if (peer_desc.notify_msg.empty()) {
+        LOG(ERROR) << "Notify rejected by " << peer_server_name << ": "
+                   << peer_desc.notify_msg;
         return ERR_METADATA;
     }
     return 0;

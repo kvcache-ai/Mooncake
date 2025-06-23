@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -40,6 +41,13 @@ struct transfer_request {
 };
 
 typedef struct transfer_request transfer_request_t;
+
+struct notify_msg {
+    char *name;
+    char *msg;
+};
+
+typedef struct notify_msg notify_msg_t;
 
 #define STATUS_WAITING (0)
 #define STATUS_PENDING (1)
@@ -132,6 +140,13 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count);
+
+int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
+                             struct transfer_request *entries, size_t count,
+                             notify_msg_t notify_msg);
+
+notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
+              int* size);
 
 int getTransferStatus(transfer_engine_t engine,
                       batch_id_t batch_id, size_t task_id,
