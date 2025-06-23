@@ -168,10 +168,18 @@ int getTransferStatus(transfer_engine_t engine,
     return (int)s.code();
 }
 
-int getNotifsFromEngine(transfer_engine_t engine,
-              std::vector<std::pair<std::string, std::string>> &notifies) {
+notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
+              int *size) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->getNotifies(notifies);
+    std::vector<TransferMetadata::NotifyDesc> notifies_desc;
+    native->getNotifies(notifies_desc);
+    *size = notifies_desc.size();
+    notify_msg_t* notifies = (notify_msg_t*)malloc(*size * sizeof(notify_msg_t));
+    for (int i = 0 ;i < *size;i++) {
+        notifies[i].name = const_cast<char*>(notifies_desc[i].name.c_str());
+        notifies[i].msg = const_cast<char*>(notifies_desc[i].notify_msg.c_str());
+    }
+    return notifies;
 }
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {

@@ -104,7 +104,7 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     RWSpinlock::WriteGuard guard(notify_lock_);
     TransferMetadata::NotifyDesc peer_notify, local_reply;
     TransferNotifyUtil::decode(peer_json, peer_notify);
-    notifys.push_back(std::make_pair(peer_notify.name, peer_notify.notify_msg));
+    notifys.push_back(peer_notify);
     // reply
     local_reply.name = "";
     local_reply.notify_msg = "success";
@@ -113,7 +113,7 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
 }
 
 int TransferMetadata::getNotifies(
-    std::vector<std::pair<std::string, std::string>> &notifies) {
+    std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
         std::move(notifys.begin(), notifys.end(), std::back_inserter(notifies));

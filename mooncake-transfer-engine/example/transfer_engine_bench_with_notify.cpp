@@ -427,12 +427,12 @@ int target() {
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
-    std::vector<std::pair<std::string, std::string>> notifies;
+    std::vector<TransferMetadata::NotifyDesc> notifies;
     while (target_running) {
         sleep(1);
         engine->getNotifies(notifies);
         for (auto notify : notifies) {
-            LOG(INFO) << notify.first << notify.second;
+            LOG(INFO) << notify.name << notify.notify_msg;
         }
         notifies.clear();
     }

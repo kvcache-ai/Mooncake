@@ -18,8 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <string>
-#include <vector>
 
 #ifdef __cplusplus
 extern "C" {
@@ -147,8 +145,8 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg);
 
-int getNotifsFromEngine(transfer_engine_t engine,
-              std::vector<std::pair<std::string, std::string>> &notifies);
+notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
+              int* size);
 
 int getTransferStatus(transfer_engine_t engine,
                       batch_id_t batch_id, size_t task_id,

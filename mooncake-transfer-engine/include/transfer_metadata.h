@@ -134,7 +134,7 @@ class TransferMetadata {
     int removeRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
-    int getNotifies(std::vector<std::pair<std::string, std::string>> &notifies);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
@@ -172,7 +172,7 @@ class TransferMetadata {
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
 
     RWSpinlock notify_lock_;
-    std::vector<std::pair<std::string, std::string>> notifys;
+    std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;

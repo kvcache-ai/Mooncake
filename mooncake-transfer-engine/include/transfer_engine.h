@@ -133,11 +133,11 @@ class TransferEngine {
             return s;
         }
         // notify
-        int ret = sendNotify(target_id, notify_msg);
+        sendNotify(target_id, notify_msg);
         return s;
     }
 
-    int getNotifies(std::vector<std::pair<std::string, std::string>> &notifies);
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
 
     int sendNotify(SegmentID target_id,
                    TransferMetadata::NotifyDesc notify_msg);
