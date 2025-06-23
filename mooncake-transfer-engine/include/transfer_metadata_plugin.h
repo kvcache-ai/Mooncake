@@ -49,6 +49,8 @@ struct HandShakePlugin {
     // peer endpoint's attributes
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const Json::Value &local, Json::Value &peer) = 0;
 
     // Exchange metadata with remote peer.
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
@@ -60,6 +62,9 @@ struct HandShakePlugin {
 
     // Register callback function for receiving metadata exchange request.
     virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) = 0;
+
+    // Register callback function for receiving metadata exchange request.
+    virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();
