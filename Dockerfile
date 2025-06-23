@@ -1,5 +1,5 @@
 # Base Image from NVIDIA
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
 ARG GO_VERSION=1.23.10
 ENV PYTHON_VERSION=3.12
 WORKDIR /app
@@ -53,31 +53,6 @@ RUN ARCH=$(uname -m) && \
     
 ENV GOPROXY='https://goproxy.cn'
 ENV PATH=/usr/local/go/bin:$PATH
-
-
-# pyenv
-# The pyenv python paths are used during docker run, in this way docker run
-# does not need to activate the environment again.
-# The soft link from the python patch level version to the python mino version
-# ensures python wheel commands (i.e. open3d) are in PATH, since we don't know
-# which patch level pyenv will install (latest).
-ENV PYENV_ROOT=/root/.pyenv
-ENV PATH="$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PYENV_ROOT/versions/$PYTHON_VERSION/bin:$PATH"
-RUN curl https://pyenv.run | bash \
-        && pyenv update \
-        && pyenv install $PYTHON_VERSION \
-        && pyenv global $PYTHON_VERSION \
-        && pyenv rehash \
-        && ln -s $PYENV_ROOT/versions/${PYTHON_VERSION}* $PYENV_ROOT/versions/${PYTHON_VERSION};
-RUN python --version && pip --version
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
-    
-RUN apt update \
-     && apt install -y unzip wget cmake git sudo \
-     && pip install "pybind11[global]"
 
 # Execute installation in the container
 RUN bash dependencies.sh \

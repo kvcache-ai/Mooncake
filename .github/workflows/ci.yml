@@ -25,7 +25,8 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
       with:
         go-version-file: 'mooncake-common/etcd/go.mod'
         check-latest: true
@@ -226,9 +227,10 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
       with:
-        go-version-file: 'mooncake-common/etcd/go.mod'
+        go-version-file: 'mooncake-p2p-store/src/p2pstore/go.mod'
         check-latest: true
 
     - run: go version    # sanity-check
