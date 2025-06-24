@@ -19,15 +19,14 @@ DEFINE_string(device_name, "ibp6s0",
 DEFINE_string(master_server_entry, "etcd://0.0.0.0:2379",
               "Master server entry");
 DEFINE_int32(port, 9001, "Port to use for the client");
+DEFINE_int32(put_prob, 1000, "Probability weight for PUT operations");
+DEFINE_int32(get_prob, 1000, "Probability weight for GET operations");
+DEFINE_int32(mount_prob, 2, "Probability weight for MOUNT operations");
+DEFINE_int32(unmount_prob, 1, "Probability weight for UNMOUNT operations");
 
 // Segment memory size: maximum 1280MB per client
 const int kMaxSegmentNum = 10;
 const int kSegmentSize = 1024 * 1024 * 128;
-// Probability of each operation
-const int kPutProb = 1000;
-const int kGetProb = 1000;
-const int kMountProb = 2;
-const int kUnmountProb = 1;
 
 namespace mooncake {
 namespace testing {
@@ -50,14 +49,14 @@ class ClientRunner {
         Mount();
 
         const int kOpProbTotal =
-            kPutProb + kGetProb + kMountProb + kUnmountProb;
+            FLAGS_put_prob + FLAGS_get_prob + FLAGS_mount_prob + FLAGS_unmount_prob;
         while (true) {
             int operation = rand() % kOpProbTotal;
-            if (operation < kPutProb) {
+            if (operation < FLAGS_put_prob) {
                 Put();
-            } else if (operation < kPutProb + kGetProb) {
+            } else if (operation < FLAGS_put_prob + FLAGS_get_prob) {
                 Get();
-            } else if (operation < kPutProb + kGetProb + kMountProb) {
+            } else if (operation < FLAGS_put_prob + FLAGS_get_prob + FLAGS_mount_prob) {
                 Mount();
             } else {
                 Unmount();

@@ -178,7 +178,7 @@ int main(int argc, char* argv[]) {
             clients.emplace_back(
                 std::make_unique<mooncake::testing::ClientHandler>(
                     FLAGS_client_path, FLAGS_out_dir, i));
-            clients.back()->start();
+            clients.back()->start(mooncake::testing::ChaosClientConfig());
         }
 
         const int kOpProbTotal = FLAGS_master_op_prob + FLAGS_client_op_prob;
@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
                 if (clients[index]->is_running()) {
                     clients[index]->kill();
                 } else {
-                    clients[index]->start();
+                    clients[index]->start(mooncake::testing::ChaosClientConfig());
                 }
             }
             sleep(5);

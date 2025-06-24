@@ -12,6 +12,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace mooncake {
 namespace testing {
@@ -190,6 +191,13 @@ class MasterHandler {
     bool is_running() const { return master_pid_ != 0; }
 };
 
+struct ChaosClientConfig {
+    std::optional<int> put_prob;
+    std::optional<int> get_prob;
+    std::optional<int> mount_prob;
+    std::optional<int> unmount_prob;
+};
+
 class ClientHandler {
    private:
     pid_t client_pid_{0};
@@ -217,7 +225,7 @@ class ClientHandler {
     ClientHandler(ClientHandler&&) = delete;
     ClientHandler& operator=(ClientHandler&&) = delete;
 
-    bool start() {
+    bool start(const ChaosClientConfig& config) {
         if (client_pid_ != 0) {
             LOG(ERROR) << "[c" << index_
                        << "] Client process already running with PID: "
@@ -297,13 +305,43 @@ class ClientHandler {
             close(stdout_fd);
             close(stderr_fd);
 
-            // Execute the client
-            std::string port_arg = "--port=" + std::to_string(14888 + index_);
-            LOG(INFO) << "[c" << index_ << "] Execl client" << " " << port_arg;
-            execl(client_path_.c_str(), client_path_.c_str(), port_arg.c_str(),
-                  nullptr);
+            // Build command line arguments
+            std::vector<std::string> args;
+            args.push_back(client_path_);  // argv[0] - program name
+            args.push_back("--port=" + std::to_string(14888 + index_));
+            
+            // Add configurable probability parameters if they have values
+            if (config.put_prob.has_value()) {
+                args.push_back("--put-prob=" + std::to_string(config.put_prob.value()));
+            }
+            if (config.get_prob.has_value()) {
+                args.push_back("--get-prob=" + std::to_string(config.get_prob.value()));
+            }
+            if (config.mount_prob.has_value()) {
+                args.push_back("--mount-prob=" + std::to_string(config.mount_prob.value()));
+            }
+            if (config.unmount_prob.has_value()) {
+                args.push_back("--unmount-prob=" + std::to_string(config.unmount_prob.value()));
+            }
 
-            // If execl returns, it means there was an error
+            // Convert vector of strings to char* array for execv
+            std::vector<char*> argv;
+            for (const auto& arg : args) {
+                argv.push_back(const_cast<char*>(arg.c_str()));
+            }
+            argv.push_back(nullptr);  // null-terminate the array
+
+            // Log the command being executed
+            std::string cmd_str;
+            for (const auto& arg : args) {
+                cmd_str += arg + " ";
+            }
+            LOG(INFO) << "[c" << index_ << "] Executing: " << cmd_str;
+
+            // Execute the client using execv
+            execv(client_path_.c_str(), argv.data());
+
+            // If execv returns, it means there was an error
             LOG(ERROR) << "[c" << index_
                        << "] Client process terminated with error: "
                        << strerror(errno);
