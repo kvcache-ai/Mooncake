@@ -2,14 +2,13 @@
 #include <glog/logging.h>
 
 #include <iostream>
-#include <memory>
 #include <string>
 #include <vector>
 
-#include "chaos.h"
-#include "client.h"
+#include "client_test_helper.h"
 #include "types.h"
 #include "utils.h"
+#include "chaos.h"
 
 // Command line flags
 DEFINE_string(metadata_connstring, "http://127.0.0.1:8080/metadata",
@@ -33,22 +32,12 @@ const int kUnmountProb = 1;
 namespace mooncake {
 namespace testing {
 
-struct SegmentInfo {
-    void* base;
-    size_t size;
-};
-
 class ClientRunner {
    private:
-    std::shared_ptr<Client> client_;
-    std::vector<SegmentInfo> segments_;
+    std::shared_ptr<ClientTestWrapper> client_;
+    std::vector<void*> segments_;
 
    public:
-    ~ClientRunner() {
-        for (auto& segment : segments_) {
-            free(segment.base);
-        }
-    }
 
     void Run() {
         bool create_success = false;
@@ -79,32 +68,12 @@ class ClientRunner {
     }
 
    private:
-    struct SliceGuard {
-        std::vector<Slice> slices;
-        SliceGuard(std::vector<AllocatedBuffer::Descriptor>& descriptors) {
-            slices.resize(descriptors.size());
-            for (size_t i = 0; i < descriptors.size(); i++) {
-                void* buffer = malloc(descriptors[i].size_);
-                slices[i] = Slice{buffer, descriptors[i].size_};
-            }
-        }
-        ~SliceGuard() {
-            for (auto& slice : slices) {
-                free(slice.ptr);
-            }
-        }
-    };
-
     bool CreateClient() {
-        void** args =
-            (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-
         std::string hostname = "localhost:" + std::to_string(FLAGS_port);
 
-        auto client_opt =
-            Client::Create(hostname,  // Local hostname
-                           FLAGS_metadata_connstring, FLAGS_protocol, args,
-                           FLAGS_master_server_entry);
+        auto client_opt = ClientTestWrapper::CreateClient(
+            hostname, FLAGS_metadata_connstring, FLAGS_protocol,
+            FLAGS_device_name, FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
             return false;
@@ -165,30 +134,7 @@ class ClientRunner {
         std::string key, value;
         gen_kv(key, value);
 
-        // Allocate buffer for the value
-        void* buffer = malloc(value.size());
-        if (!buffer) {
-            LOG(ERROR) << CHAOS_ERROR_STR
-                       << " Failed to allocate memory for put value";
-            exit(1);
-        }
-
-        // Copy value to buffer
-        memcpy(buffer, value.data(), value.size());
-
-        // Create slices
-        std::vector<Slice> slices;
-        slices.emplace_back(Slice{buffer, value.size()});
-
-        // Configure replication
-        ReplicateConfig config;
-        config.replica_num = 1;
-
-        // Perform put operation
-        ErrorCode error_code = client_->Put(key, slices, config);
-
-        // Free the buffer
-        free(buffer);
+        ErrorCode error_code = client_->Put(key, value);
 
         if (error_code != ErrorCode::OK) {
             LOG(INFO) << CHAOS_PUT_FAILURE_STR << " key=" << key
@@ -204,33 +150,15 @@ class ClientRunner {
         std::string key;
         gen_key(key);
 
-        Client::ObjectInfo object_info;
-        ErrorCode error_code = client_->Query(key, object_info);
-        if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_GET_FAILURE_STR << " key=" << key
-                      << " error=" << toString(error_code);
-            return;
-        }
-
-        // Create slices
-        std::vector<AllocatedBuffer::Descriptor>& descriptors =
-            object_info.replica_list[0].buffer_descriptors;
-        SliceGuard slice_guard(descriptors);
-
-        // Perform get operation
-        error_code = client_->Get(key, object_info, slice_guard.slices);
-
-        if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_GET_FAILURE_STR << " key=" << key
-                      << " error=" << toString(error_code);
-            return;
-        }
-
-        // Print the value
         std::string value;
-        for (const auto& slice : slice_guard.slices) {
-            value.append(static_cast<const char*>(slice.ptr), slice.size);
+        ErrorCode error_code = client_->Get(key, value);
+
+        if (error_code != ErrorCode::OK) {
+            LOG(INFO) << CHAOS_GET_FAILURE_STR << " key=" << key
+                      << " error=" << toString(error_code);
+            return;
         }
+
         if (!verify_kv(key, value)) {
             LOG(ERROR) << CHAOS_ERROR_STR << " key=" << key
                        << " value=" << value;
@@ -245,21 +173,15 @@ class ClientRunner {
         if (segments_.size() >= kMaxSegmentNum) {
             return;
         }
-        void* buffer = allocate_buffer_allocator_memory(kSegmentSize);
-        if (!buffer) {
-            LOG(ERROR) << CHAOS_ERROR_STR
-                       << " Failed to allocate memory for segment";
-            return;
-        }
 
-        ErrorCode error_code = client_->MountSegment(buffer, kSegmentSize);
+        void *buffer;
+        ErrorCode error_code = client_->Mount(kSegmentSize, buffer);
         if (error_code != ErrorCode::OK) {
             LOG(INFO) << CHAOS_MOUNT_FAILURE_STR
                       << " error=" << toString(error_code);
-            free(buffer);
             return;
         } else {
-            segments_.emplace_back(SegmentInfo{buffer, kSegmentSize});
+            segments_.emplace_back(buffer);
             LOG(INFO) << CHAOS_MOUNT_SUCCESS_STR << " buffer=" << buffer
                       << " size=" << kSegmentSize;
         }
@@ -270,19 +192,15 @@ class ClientRunner {
             return;
         }
         int index = rand() % segments_.size();
-        SegmentInfo& segment = segments_[index];
-        segments_.erase(segments_.begin() + index);
-        ErrorCode error_code =
-            client_->UnmountSegment(segment.base, segment.size);
+        void* base = segments_[index];
+        ErrorCode error_code = client_->Unmount(base);
         if (error_code != ErrorCode::OK) {
             LOG(INFO) << CHAOS_UNMOUNT_FAILURE_STR
                       << " error=" << toString(error_code);
         } else {
-            LOG(INFO) << CHAOS_UNMOUNT_SUCCESS_STR << " buffer=" << segment.base
-                      << " size=" << segment.size;
+            segments_.erase(segments_.begin() + index);
+            LOG(INFO) << CHAOS_UNMOUNT_SUCCESS_STR << " buffer=" << base;
         }
-        // Free the buffer no matter unmount succeeds or not
-        free(segment.base);
     }
 };
 
