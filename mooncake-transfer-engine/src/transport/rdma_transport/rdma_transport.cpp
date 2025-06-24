@@ -273,14 +273,21 @@ Status RdmaTransport::submitTransferTask(
     assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
+    const size_t kSubmitWatermark = globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    uint64_t nr_slices;
     for (size_t index = 0; index < request_list.size(); ++index) {
         assert(request_list[index] && task_list[index]);
         auto &request = *request_list[index];
         auto &task = *task_list[index];
+        nr_slices = 0;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
             assert(slice);
+            if (!slice->from_cache) {
+                nr_slices++;
+            }
+
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
             slice->opcode = request.opcode;
@@ -320,6 +327,7 @@ Status RdmaTransport::submitTransferTask(
                 auto source_addr = slice->source_addr;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) getSliceCache().deallocate(s);
+                nr_slices = 0;
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -327,10 +335,19 @@ Status RdmaTransport::submitTransferTask(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
+
+            if (nr_slices >= kSubmitWatermark) {
+                for (auto &entry : slices_to_post)
+                    entry.first->submitPostSend(entry.second);
+                slices_to_post.clear();
+                nr_slices = 0;
+            }
         }
     }
+
     for (auto &entry : slices_to_post)
-        entry.first->submitPostSend(entry.second);
+        if (!entry.second.empty())
+            entry.first->submitPostSend(entry.second);
     return Status::OK();
 }
 
