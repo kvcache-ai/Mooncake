@@ -331,20 +331,19 @@ RemoveAllResponse MasterClient::RemoveAll() {
     return result.value();
 }
 
-MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
-                                                const void* buffer,
-                                                size_t size) {
+MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
+                                                const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
-    timer.LogRequest("segment_name=", segment_name, ", buffer=", buffer,
-                     ", size=", size);
+    timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                     ", name=", segment.name, ", id=", segment.id,
+                     ", client_id=", client_id);
 
     std::optional<MountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
             Lazy<async_rpc_result<MountSegmentResponse>> handler =
                 co_await client_
                     .send_request<&WrappedMasterService::MountSegment>(
-                        reinterpret_cast<uint64_t>(buffer),
-                        static_cast<uint64_t>(size), segment_name);
+                        segment, client_id);
             async_rpc_result<MountSegmentResponse> result = co_await handler;
             if (!result) {
                 co_return std::nullopt;
@@ -361,14 +360,41 @@ MountSegmentResponse MasterClient::MountSegment(const std::string& segment_name,
     return result.value();
 }
 
-UnmountSegmentResponse MasterClient::UnmountSegment(
-    const std::string& segment_name) {
+ReMountSegmentResponse MasterClient::ReMountSegment(
+    const std::vector<Segment>& segments, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
+    timer.LogRequest("segments_num=", segments.size(), ", client_id=", client_id);
+
+    std::optional<ReMountSegmentResponse> result =
+        syncAwait([&]() -> coro::Lazy<std::optional<ReMountSegmentResponse>> {
+            Lazy<async_rpc_result<ReMountSegmentResponse>> handler =
+                co_await client_
+                    .send_request<&WrappedMasterService::ReMountSegment>(
+                        segments, client_id);
+            async_rpc_result<ReMountSegmentResponse> result = co_await handler;
+            if (!result) {
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+    if (!result) {
+        LOG(ERROR) << "Failed to remount segment due to rpc error";
+        auto response = ReMountSegmentResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+UnmountSegmentResponse MasterClient::UnmountSegment(const UUID& segment_id,
+                                                    const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
-    timer.LogRequest("segment_name=", segment_name);
+    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id);
 
     auto request_result =
-        client_.send_request<&WrappedMasterService::UnmountSegment>(
-            segment_name);
+        client_.send_request<&WrappedMasterService::UnmountSegment>(segment_id,
+                                                                    client_id);
     std::optional<UnmountSegmentResponse> result = coro::syncAwait(
         [&]() -> coro::Lazy<std::optional<UnmountSegmentResponse>> {
             auto result = co_await co_await request_result;
@@ -388,12 +414,12 @@ UnmountSegmentResponse MasterClient::UnmountSegment(
     return result.value();
 }
 
-PingResponse MasterClient::Ping() {
+PingResponse MasterClient::Ping(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
-    timer.LogRequest("action=ping");
+    timer.LogRequest("client_id=", client_id);
 
     auto request_result =
-        client_.send_request<&WrappedMasterService::Ping>();
+        client_.send_request<&WrappedMasterService::Ping>(client_id);
     std::optional<PingResponse> result =
         coro::syncAwait([&]() -> coro::Lazy<std::optional<PingResponse>> {
             auto result = co_await co_await request_result;
@@ -405,7 +431,7 @@ PingResponse MasterClient::Ping() {
         }());
 
     if (!result) {
-        auto response = PingResponse{0, ErrorCode::RPC_FAIL};
+        auto response = PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

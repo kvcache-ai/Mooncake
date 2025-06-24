@@ -131,7 +131,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
             multi_transports_->installTransport("nvlink", nullptr);
 #else
             multi_transports_->installTransport("tcp", nullptr);
@@ -192,6 +192,18 @@ int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
 std::string TransferEngine::getLocalIpAndPort() {
     return metadata_->localRpcMeta().ip_or_host_name + ":" +
            std::to_string(metadata_->localRpcMeta().rpc_port);
+}
+
+int TransferEngine::getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies) {
+    return metadata_->getNotifies(notifies);
+}
+
+int TransferEngine::sendNotify(SegmentID target_id,
+                               TransferMetadata::NotifyDesc notify_msg) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+    return 0;
 }
 
 Transport::SegmentHandle TransferEngine::openSegment(

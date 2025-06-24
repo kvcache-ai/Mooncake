@@ -73,6 +73,14 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
+    UUID segment_id = generate_uuid();
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = segment_name;
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+
     std::string key = "test_key";
     uint64_t value_length = 1024;
     std::vector<uint64_t> slice_lengths = {value_length};
@@ -81,7 +89,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test MountSegment request
     ASSERT_EQ(ErrorCode::OK,
-            service_.MountSegment(kBufferAddress, kSegmentSize, segment_name).error_code);
+            service_.MountSegment(segment, client_id).error_code);
     ASSERT_EQ(metrics.get_allocated_size(), 0);
     ASSERT_EQ(metrics.get_total_capacity(), kSegmentSize);
     ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
@@ -147,7 +155,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(ErrorCode::OK,
               service_.PutStart(key, value_length, slice_lengths, config).error_code);
     ASSERT_EQ(ErrorCode::OK, service_.PutEnd(key).error_code);
-    ASSERT_EQ(ErrorCode::OK, service_.UnmountSegment(segment_name).error_code);
+    ASSERT_EQ(ErrorCode::OK, service_.UnmountSegment(segment_id, client_id).error_code);
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);

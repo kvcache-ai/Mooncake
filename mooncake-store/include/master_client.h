@@ -132,21 +132,33 @@ class MasterClient {
 
     /**
      * @brief Registers a segment to master for allocation
-     * @param segment_name hostname:port of the segment
-     * @param buffer Buffer address of the segment
-     * @param size Size of the segment in bytes
+     * @param segment Segment to register
+     * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] MountSegmentResponse MountSegment(
-        const std::string& segment_name, const void* buffer, size_t size);
+        const Segment& segment, const UUID& client_id);
+
+    /**
+     * @brief Re-mount segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @param client_id The uuid of the client
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] ReMountSegmentResponse ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
     /**
      * @brief Unregisters a memory segment from master
-     * @param segment_name Name which is used to register the segment
+     * @param segment_id ID of the segment to unmount
+     * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] UnmountSegmentResponse UnmountSegment(
-        const std::string& segment_name);
+        const UUID& segment_id, const UUID& client_id);
 
     /**
      * @brief Gets the session ID for the current client
@@ -156,11 +168,12 @@ class MasterClient {
 
     /**
      * @brief Pings master to check its availability
-     * @param No parameters
+     * @param client_id The uuid of the client
      * @return current master view version
+     * @return client status from the master
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] PingResponse Ping();
+    [[nodiscard]] PingResponse Ping(const UUID& client_id);
 
    private:
     coro_rpc_client client_;

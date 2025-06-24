@@ -76,25 +76,36 @@ class MasterViewHelper {
 class MasterServiceSupervisor {
    public:
     MasterServiceSupervisor(
-        int port, int server_thread_num, bool enable_gc,
+        int rpc_port, size_t rpc_thread_num, bool enable_gc,
         bool enable_metric_reporting, int metrics_port,
         int64_t default_kv_lease_ttl, double eviction_ratio,
-        double eviction_high_watermark_ratio,
+        double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
         const std::string& etcd_endpoints = "0.0.0.0:2379",
-        const std::string& local_hostname = "0.0.0.0:50051");
+        const std::string& local_hostname = "0.0.0.0:50051",
+        const std::string& rpc_address = "0.0.0.0",
+        std::chrono::steady_clock::duration rpc_conn_timeout =
+            std::chrono::seconds(
+                0),  // Client connection timeout. 0 = no timeout (infinite)
+        bool rpc_enable_tcp_no_delay = true);
     int Start();
     ~MasterServiceSupervisor();
 
    private:
     // Master service parameters
-    int port_;
-    int server_thread_num_;
     bool enable_gc_;
     bool enable_metric_reporting_;
     int metrics_port_;
     int64_t default_kv_lease_ttl_;
     double eviction_ratio_;
     double eviction_high_watermark_ratio_;
+    int64_t client_live_ttl_sec_;
+
+    // RPC server configuration parameters
+    const int rpc_port_;
+    const size_t rpc_thread_num_;
+    const std::string rpc_address_;
+    const std::chrono::steady_clock::duration rpc_conn_timeout_;
+    const bool rpc_enable_tcp_no_delay_;
 
     // coro_rpc server thread
     std::thread server_thread_;

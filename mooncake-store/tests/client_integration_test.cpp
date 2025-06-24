@@ -72,11 +72,11 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeSegment() {
-        const size_t ram_buffer_size = 512 * 1024 * 1024;  // 512 MB
-        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size);
+        ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
+        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
         LOG_ASSERT(segment_ptr_);
-        ErrorCode rc = segment_provider_client_->MountSegment(
-            "localhost:17812", segment_ptr_, ram_buffer_size);
+        ErrorCode rc = segment_provider_client_->MountSegment(segment_ptr_,
+                                                              ram_buffer_size_);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment: " << toString(rc);
         }
@@ -103,13 +103,12 @@ class ClientIntegrationTest : public ::testing::Test {
         }
 
         // Mount segment for test_client_ as well
-        const size_t test_client_ram_buffer_size = 512 * 1024 * 1024;  // 512 MB
+        test_client_ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
         test_client_segment_ptr_ =
-            allocate_buffer_allocator_memory(test_client_ram_buffer_size);
+            allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
         LOG_ASSERT(test_client_segment_ptr_);
-        ErrorCode rc = test_client_->MountSegment("localhost:17813",
-                                                  test_client_segment_ptr_,
-                                                  test_client_ram_buffer_size);
+        ErrorCode rc = test_client_->MountSegment(test_client_segment_ptr_,
+                                                  test_client_ram_buffer_size_);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment for test_client_: "
                        << toString(rc);
@@ -120,8 +119,8 @@ class ClientIntegrationTest : public ::testing::Test {
     static void CleanupClients() {
         // Unmount test client segment first
         if (test_client_ && test_client_segment_ptr_) {
-            if (test_client_->UnmountSegment("localhost:17813",
-                                             test_client_segment_ptr_) !=
+            if (test_client_->UnmountSegment(test_client_segment_ptr_,
+                                            test_client_ram_buffer_size_) !=
                 ErrorCode::OK) {
                 LOG(ERROR) << "Failed to unmount test client segment";
             }
@@ -136,8 +135,9 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void CleanupSegment() {
-        if (segment_provider_client_->UnmountSegment(
-                "localhost:17812", segment_ptr_) != ErrorCode::OK) {
+        if (segment_provider_client_->UnmountSegment(segment_ptr_,
+                                                    ram_buffer_size_) !=
+            ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment";
         }
     }
@@ -149,7 +149,9 @@ class ClientIntegrationTest : public ::testing::Test {
     // themselves.
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
     static void* segment_ptr_;
+    static size_t ram_buffer_size_;
     static void* test_client_segment_ptr_;
+    static size_t test_client_ram_buffer_size_;
 };
 
 // Static members initialization
@@ -160,6 +162,8 @@ void* ClientIntegrationTest::segment_ptr_ = nullptr;
 void* ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;
+size_t ClientIntegrationTest::ram_buffer_size_ = 0;
+size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {

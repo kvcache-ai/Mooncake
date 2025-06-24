@@ -15,9 +15,12 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <numeric>
 #include <fstream>
 
-#ifdef USE_NVLINK
+#include <pybind11/stl.h>
+
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
     return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
@@ -136,7 +139,7 @@ int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, "cpu:0");
+    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
         freeMemory(buffer);
         return nullptr;
@@ -146,7 +149,7 @@ char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
 
 int TransferEnginePy::findClassId(size_t size) {
     if (size > 1024ull * kSlabSizeKB[kMaxClassId]) return -1;
-    for (int i = kMaxClassId - 2; i >= 0; --i)
+    for (int i = kMaxClassId - 1; i >= 0; --i)
         if (size > 1024ull * kSlabSizeKB[i]) return i + 1;
     return 0;
 }
@@ -218,6 +221,22 @@ int TransferEnginePy::transferSyncRead(const char *target_hostname,
                         TransferOpcode::READ);
 }
 
+int TransferEnginePy::batchTransferSyncWrite(const char *target_hostname,
+                                             std::vector<uintptr_t> buffers,
+                                             std::vector<uintptr_t> peer_buffer_addresses,
+                                             std::vector<size_t> lengths) {
+    return batchTransferSync(target_hostname, buffers, peer_buffer_addresses, lengths,
+                             TransferOpcode::WRITE);
+}
+
+int TransferEnginePy::batchTransferSyncRead(const char *target_hostname,
+                                            std::vector<uintptr_t> buffers,
+                                            std::vector<uintptr_t> peer_buffer_addresses,
+                                            std::vector<size_t> lengths) {
+    return batchTransferSync(target_hostname, buffers, peer_buffer_addresses, lengths,
+                             TransferOpcode::READ);
+}
+
 int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
@@ -279,10 +298,96 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             const int64_t timeout =
                 transfer_timeout_nsec_ + length;  // 1GiB per second
             if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync data transfer timeout, local buffer "
+                LOG(INFO) << "Sync data transfer timeout after "
+                          << current_ts - start_ts << "ns, local buffer "
                           << (void *)buffer << " remote buffer "
                           << (void *)peer_buffer_address << " length "
                           << length;
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
+int TransferEnginePy::batchTransferSync(const char *target_hostname,
+                                   std::vector<uintptr_t> buffers,
+                                   std::vector<uintptr_t> peer_buffer_addresses,
+                                   std::vector<size_t> lengths,
+                                   TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (buffers.size() != peer_buffer_addresses.size() || buffers.size() != lengths.size()) {
+        LOG(ERROR) << "buffers, peer_buffer_addresses and lengths have different size";
+        return -1;
+    }
+
+    const int max_retry = engine_->numContexts() + 1;
+    auto start_ts = getCurrentTimeInNano();
+    auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
+    auto batch_size = buffers.size();
+    std::vector<TransferRequest> entries;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = lengths[i];
+        entry.source = (void *)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entry.advise_retry_cnt = 0;
+        entries.push_back(entry);
+    }
+
+    for (int retry = 0; retry < max_retry; ++retry) {
+        auto batch_id = engine_->allocateBatchID(batch_size);
+        Status s = engine_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
+            return -1;
+        }
+
+        TransferStatus status;
+        bool completed = false;
+        bool already_freed = false;
+        while (!completed) {
+            Status s = engine_->getBatchTransferStatus(batch_id, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(batch_id);
+                return 0;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                engine_->freeBatchID(batch_id);
+                already_freed = true;
+                completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                completed = true;
+            }
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t timeout = transfer_timeout_nsec_ + total_length; // 1GiB per second
+            if (current_ts - start_ts > timeout) {
+                LOG(INFO) << "Sync batch data transfer timeout after " 
+                          << current_ts - start_ts << "ns";
+                // TODO: as @doujiang24 mentioned, early free(while there are still waiting tasks)
+                // the batch_id may fail and cause memory leak(a known issue).
+                if (!already_freed) {
+                    engine_->freeBatchID(batch_id);
+                }
                 return -1;
             }
         }
@@ -377,7 +482,10 @@ PYBIND11_MODULE(engine, m) {
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite)
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
+            .def("batch_transfer_sync_write", &TransferEnginePy::batchTransferSyncWrite)
+            .def("batch_transfer_sync_read", &TransferEnginePy::batchTransferSyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
+            .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("transfer_submit_write",
                  &TransferEnginePy::transferSubmitWrite)
             .def("transfer_check_status",
