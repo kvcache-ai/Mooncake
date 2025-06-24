@@ -38,8 +38,15 @@ class MasterClient {
      * @param object_key Key to query
      * @return ErrorCode indicating exist or not
      */
-    [[nodiscard]] ExistKeyResponse ExistKey(
-        const std::string& object_key);
+    [[nodiscard]] ExistKeyResponse ExistKey(const std::string& object_key);
+
+    /**
+     * @brief Checks if multiple objects exist
+     * @param object_keys Vector of keys to query
+     * @return BatchExistResponse containing existence status for each key
+     */
+    [[nodiscard]] BatchExistResponse BatchExistKey(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -136,8 +143,8 @@ class MasterClient {
      * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] MountSegmentResponse MountSegment(
-        const Segment& segment, const UUID& client_id);
+    [[nodiscard]] MountSegmentResponse MountSegment(const Segment& segment,
+                                                    const UUID& client_id);
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -157,8 +164,8 @@ class MasterClient {
      * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] UnmountSegmentResponse UnmountSegment(
-        const UUID& segment_id, const UUID& client_id);
+    [[nodiscard]] UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
+                                                        const UUID& client_id);
 
     /**
      * @brief Pings master to check its availability
