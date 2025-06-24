@@ -105,6 +105,8 @@ class MasterService {
      */
     ErrorCode ExistKey(const std::string& key);
 
+    std::vector<ErrorCode> BatchExistKey(const std::vector<std::string>& keys);
+
     /**
      * @brief Fetch all keys
      * @return ErrorCode::OK if exists

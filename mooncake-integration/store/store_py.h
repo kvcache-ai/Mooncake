@@ -165,6 +165,14 @@ class DistributedObjectStore {
     int isExist(const std::string &key);
 
     /**
+     * @brief Check if multiple objects exist
+     * @param keys Vector of keys to check
+     * @return Vector of existence results: 1 if exists, 0 if not exists, -1 if
+     * error
+     */
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't

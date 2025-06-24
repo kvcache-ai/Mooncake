@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 #include <pybind11/gil.h>  // For GIL management
+#include <pybind11/stl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -494,6 +495,48 @@ int DistributedObjectStore::isExist(const std::string &key) {
     return toInt(err);                                 // Error
 }
 
+std::vector<int> DistributedObjectStore::batchIsExist(
+    const std::vector<std::string> &keys) {
+    std::vector<int> results;
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        results.resize(keys.size(), -1);  // Fill with error codes
+        return results;
+    }
+
+    if (keys.empty()) {
+        LOG(WARNING) << "Empty keys vector provided to batchIsExist";
+        return results;  // Return empty vector
+    }
+
+    std::vector<ErrorCode> exist_results;
+    ErrorCode batch_err = client_->BatchIsExist(keys, exist_results);
+
+    results.resize(keys.size());
+
+    if (batch_err != ErrorCode::OK) {
+        LOG(ERROR) << "BatchIsExist operation failed with error: "
+                   << toString(batch_err);
+        // Fill all results with error code
+        std::fill(results.begin(), results.end(), toInt(batch_err));
+        return results;
+    }
+
+    // Convert ErrorCode results to int results
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exist_results[i] == ErrorCode::OK) {
+            results[i] = 1;  // Exists
+        } else if (exist_results[i] == ErrorCode::OBJECT_NOT_FOUND) {
+            results[i] = 0;  // Does not exist
+        } else {
+            results[i] = toInt(exist_results[i]);  // Error
+        }
+    }
+
+    return results;
+}
+
 int64_t DistributedObjectStore::getSize(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -775,6 +818,10 @@ PYBIND11_MODULE(store, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
              py::call_guard<py::gil_scoped_release>())
+        .def("batch_is_exist", &DistributedObjectStore::batchIsExist,
+             py::call_guard<py::gil_scoped_release>(), py::arg("keys"),
+             "Check if multiple objects exist. Returns list of results: 1 if "
+             "exists, 0 if not exists, -1 if error")
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
