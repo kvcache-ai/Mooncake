@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <atomic>
+#include <memory>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
@@ -170,7 +172,20 @@ class MasterClient {
     [[nodiscard]] PingResponse Ping(const UUID& client_id);
 
    private:
-    coro_rpc_client client_;
+    class RpcClientAccessor {
+       public:
+        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+            client_.store(client, std::memory_order_release);
+        }
+        
+        std::shared_ptr<coro_rpc_client> GetClient() {
+            return client_.load(std::memory_order_acquire);
+        }
+        
+       private:
+        std::atomic<std::shared_ptr<coro_rpc_client>> client_{nullptr};
+    };
+    RpcClientAccessor client_accessor_;
 };
 
 }  // namespace mooncake

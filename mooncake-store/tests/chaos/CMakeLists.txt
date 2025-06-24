@@ -13,3 +13,13 @@ target_link_libraries(chaosclient PUBLIC
     glog
     pthread
 )
+
+add_executable(chaostest chaostest.cpp)
+target_link_libraries(chaostest PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
