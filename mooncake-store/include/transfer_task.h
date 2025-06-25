@@ -288,17 +288,19 @@ class TransferSubmitter {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
 
-   private:
-    TransferEngine& engine_;
-    const std::string local_hostname_;
-    std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
-
     /**
      * @brief Select the optimal transfer strategy
      */
     TransferStrategy selectStrategy(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         const std::vector<Slice>& slices) const;
+        
+   private:
+    TransferEngine& engine_;
+    const std::string local_hostname_;
+    std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
+
+
 
     /**
      * @brief Check if all handles refer to local segments

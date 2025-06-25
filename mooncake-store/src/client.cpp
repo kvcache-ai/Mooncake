@@ -369,6 +369,8 @@ ErrorCode Client::BatchGet(
     return ErrorCode::OK;
 }
 
+std::map<std::string, std::string> kv_map_;
+
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                       const ReplicateConfig& config) {
     // Prepare slice lengths
@@ -393,8 +395,9 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // Transfer data using allocated handles from all replicas
+    std::vector<AllocatedBuffer::Descriptor> handles;
     for (const auto& replica : start_response.replica_list) {
-        std::vector<AllocatedBuffer::Descriptor> handles;
+        handles.clear();
         for (const auto& handle : replica.buffer_descriptors) {
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);
@@ -410,6 +413,28 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             }
             return transfer_err;
         }
+    }
+
+    const size_t value_size = 1024 * 1024;
+    auto &value = kv_map_[key];
+
+    auto ds = start_response.replica_list[0].buffer_descriptors[0];
+    LOG(INFO) << "key=" << key << ", replica_list=" << ds.buffer_address_ << " " << ds.size_
+              << " " << ds.segment_name_
+              << ", action=put_start";
+    char* buffer = reinterpret_cast<char*>(ds.buffer_address_);
+    bool check_fail = false;
+    for (size_t i = 0; i < value_size; i++) {
+        if (value[i] != buffer[i]) {
+            LOG(ERROR) << "value[i..3]=" << value[i] << value[i+1] << value[i+2] << ", buffer[i..3]=" << buffer[i] << buffer[i+1] << buffer[i+2];
+            LOG(ERROR) << "key=" << key << ", i=" << i;
+            check_fail = true;
+            break;
+        }
+    }
+    if (check_fail) {
+        TransferStrategy strategy = transfer_submitter_->selectStrategy(handles, slices);
+        LOG(ERROR) << "strategy=" << static_cast<int>(strategy);
     }
 
     // End put operation

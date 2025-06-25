@@ -138,6 +138,10 @@ class ClientTestWrapper {
         return error_code;
     }
 
+    ErrorCode Delete(const std::string& key) {
+        return client_->Remove(key);
+    }
+
    private:
     struct SliceGuard {
         std::vector<Slice> slices;

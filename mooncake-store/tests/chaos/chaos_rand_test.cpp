@@ -120,7 +120,8 @@ std::shared_ptr<MasterViewHelper> ChaosRandTest::master_view_helper_ = nullptr;
 // errors.
 // 3. After the system becomes stable, verify the system can properly serve
 // requests.
-TEST_F(ChaosRandTest, SystemFailoverAfterRandomMasterCrash) {
+// Small value means the kv size is far less than the segment size.
+TEST_F(ChaosRandTest, RandomMasterCrashSmallValue) {
     const int master_num = 3;
     const int client_num = 5;
     const int run_sec = 3600;         // 1 hour
@@ -222,6 +223,150 @@ TEST_F(ChaosRandTest, SystemFailoverAfterRandomMasterCrash) {
                 ASSERT_EQ(clients[rand() % client_num]->Get(key, get_value),
                           ErrorCode::OK);
                 ASSERT_EQ(get_value, value);
+            }
+        }
+
+        // Randomly start some masters
+        for (int i = 0; i < master_num; ++i) {
+            if (!masters[i]->is_running() && rand() % 100 < master_start_prob) {
+                ASSERT_TRUE(masters[i]->start());
+            }
+        }
+    }
+}
+
+// Large value means the kv size is close to the segment size, so the eviction
+// is more likely to happen and it is more likely to read wrong data if there
+// are bugs.
+TEST_F(ChaosRandTest, RandomMasterCrashLargeValue) {
+    const int master_num = 3;
+    const int client_num = 5;
+    const int run_sec = 3600;         // 1 hour
+    const int master_kill_prob = 50;  // percentage
+    const int master_start_prob = 50;  // percentage
+    const int segment_size = 1024 * 1024 * 16;
+    const int kv_range = 100;
+    const size_t value_size = 1024 * 1024;
+    static_assert(value_size * kv_range >= segment_size * client_num,
+                  "The total value size is too small");
+
+    unsigned int seed;
+    if (FLAGS_rand_seed == 0) {
+        seed = time(NULL);
+    } else {
+        seed = FLAGS_rand_seed;
+    }
+    LOG(INFO) << "Random seed: " << seed;
+    srand(seed);
+
+    auto gen_key = [](int key_i) {
+        return "key_" + std::to_string(key_i);
+    };
+
+    auto gen_value = [&](int key_i) {
+        std::string value = "value_";
+
+        // Create a deterministic pattern based on key_i
+        std::string pattern = std::to_string(key_i) + "_";
+
+        // Fill the value string with the pattern repeated to reach value_size
+        while (value.size() < value_size) {
+            value += pattern;
+        }
+
+        // Trim to exactly value_size
+        value.resize(value_size);
+
+        return value;
+    };
+    for (int i = 0; i < kv_range; ++i) {
+        kv_map_[gen_key(i)] = gen_value(i);
+    }
+
+    // Start masters
+    std::vector<std::unique_ptr<mooncake::testing::MasterHandler>> masters;
+    for (int i = 0; i < master_num; ++i) {
+        masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
+            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        ASSERT_TRUE(masters.back()->start());
+    }
+
+    // Wait for the leader to be elected
+    WaitMasterViewChange();
+
+    // Create clients
+    std::vector<std::shared_ptr<ClientTestWrapper>> clients;
+    std::vector<std::vector<void*>> client_segments;
+    for (int i = 0; i < client_num; ++i) {
+        clients.emplace_back(
+            CreateClient("0.0.0.0:" + std::to_string(client_port_base + i)));
+        ASSERT_TRUE(clients.back() != nullptr);
+        client_segments.emplace_back();
+        // Mount a segment
+        void* buffer;
+        ASSERT_EQ(clients.back()->Mount(segment_size, buffer), ErrorCode::OK);
+        client_segments.back().emplace_back(buffer);
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    while (true) {
+        // Check if we've exceeded the run time
+        auto current_time = std::chrono::steady_clock::now();
+        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                   current_time - start_time)
+                                   .count();
+        if (elapsed_seconds >= run_sec) {
+            break;
+        }
+
+        // Randomly kill some masters
+        for (int i = 0; i < master_num; ++i) {
+            if (rand() % 100 < master_kill_prob) {
+                masters[i]->kill();
+            }
+        }
+
+        // Verify the data integrity when system is unstable.
+        for (int key_i = 0; key_i < kv_range; ++key_i) {
+            std::string key = gen_key(key_i);
+            std::string value = gen_value(key_i);
+
+            if (rand() % 2 == 0) {
+                clients[rand() % client_num]->Put(key, value);
+            }
+            std::string get_value;
+            if (clients[rand() % client_num]->Get(key, get_value) == ErrorCode::OK) {
+                ASSERT_EQ(get_value, value);
+            }
+        }
+
+        // Wait for the system to become stable
+        WaitMasterViewChange();
+
+        // After the system becomes stable, verify the system can properly serve
+        // requests if there are still some master alive.
+        bool has_master_alive = false;
+        for (int i = 0; i < master_num; ++i) {
+            if (masters[i]->is_running()) {
+                has_master_alive = true;
+                break;
+            }
+        }
+
+        if (has_master_alive) {
+            for (int key_i = 0; key_i < kv_range; ++key_i) {
+                std::string key = gen_key(key_i);
+                std::string value = gen_value(key_i);
+
+                if (rand() % 2 == 0) {
+                    clients[rand() % client_num]->Put(key, value);
+                }
+                std::string get_value;
+                if (clients[rand() % client_num]->Get(key, get_value) == ErrorCode::OK) {
+                    // First compare the first few bytes to avoid very large output message
+                    ASSERT_EQ(get_value.size(), value.size());
+                    ASSERT_EQ(get_value.substr(0, 20), value.substr(0, 20));
+                }
             }
         }
 
