@@ -424,7 +424,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
               << ", action=put_start";
     char* buffer = reinterpret_cast<char*>(ds.buffer_address_);
     bool check_fail = false;
-    for (size_t i = 0; i < value_size; i++) {
+    for (int i = value_size - 3; i >= 0; i--) {
         if (value[i] != buffer[i]) {
             LOG(ERROR) << "value[i..3]=" << value[i] << value[i+1] << value[i+2] << ", buffer[i..3]=" << buffer[i] << buffer[i+1] << buffer[i+2];
             LOG(ERROR) << "key=" << key << ", i=" << i;
