@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.23.10
+GOVER=1.24.4
 
 # Function to print section headers
 print_section() {
