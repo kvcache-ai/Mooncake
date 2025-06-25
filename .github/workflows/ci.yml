@@ -257,6 +257,8 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> $GITHUB_PATH
+        export PATH="/usr/local/go/bin:$PATH"
       shell: bash
 
     - name: Build transfer engine only
