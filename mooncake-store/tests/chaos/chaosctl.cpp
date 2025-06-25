@@ -1,6 +1,4 @@
-
-
-#include "chaos.h"
+#include "chaos_test_helper.h"
 
 #include <map>
 #include <fstream>
@@ -10,7 +8,7 @@ DEFINE_int32(master_num, 1, "Number of master instances (must be > 0)");
 DEFINE_int32(client_num, 1, "Number of client instances (must be > 0)");
 DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
               "Path to the master executable");
-DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaosclient",
+DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaos_client",
               "Path to the client executable");
 DEFINE_string(out_dir, "./output", "Directory for log files");
 DEFINE_bool(skip_run, false, "Only generate report, do not run the test");

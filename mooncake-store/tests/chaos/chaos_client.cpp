@@ -1,14 +1,13 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include <iostream>
 #include <string>
 #include <vector>
 
 #include "client_test_helper.h"
+#include "chaos_test_helper.h"
 #include "types.h"
 #include "utils.h"
-#include "chaos.h"
 
 // Command line flags
 DEFINE_string(metadata_connstring, "http://127.0.0.1:8080/metadata",

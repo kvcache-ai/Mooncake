@@ -164,12 +164,13 @@ class MasterHandler {
         }
     }
 
-    void kill() {
+    bool kill() {
         if (master_pid_ == 0) {
             LOG(ERROR) << "[m" << index_ << "] Master process not running";
-            return;
+            return false;
         }
 
+        bool success = false;
         // For chaos testing, kill the process forcefully to simulate a crash
         if (::kill(master_pid_, SIGKILL) == 0) {
             LOG(INFO) << "[m" << index_
@@ -179,13 +180,16 @@ class MasterHandler {
             // Wait for the process to be reaped
             int status;
             waitpid(master_pid_, &status, 0);
+            success = true;
         } else {
             LOG(ERROR) << CHAOS_ERROR_STR << " [m" << index_
                        << "] Failed to kill master process with PID: "
                        << master_pid_ << ": " << strerror(errno);
+            success = false;
         }
 
         master_pid_ = 0;
+        return success;
     }
 
     bool is_running() const { return master_pid_ != 0; }
@@ -358,12 +362,13 @@ class ClientHandler {
         }
     }
 
-    void kill() {
+    bool kill() {
         if (client_pid_ == 0) {
             LOG(ERROR) << "[c" << index_ << "] Client process not running";
-            return;
+            return false;
         }
 
+        bool success = false;
         // For chaos testing, kill the process forcefully to simulate a crash
         if (::kill(client_pid_, SIGKILL) == 0) {
             LOG(INFO) << "[c" << index_
@@ -373,13 +378,16 @@ class ClientHandler {
             // Wait for the process to be reaped
             int status;
             waitpid(client_pid_, &status, 0);
+            success = true;
         } else {
             LOG(ERROR) << CHAOS_ERROR_STR << " [c" << index_
                        << "] Failed to kill client process with PID: "
                        << client_pid_ << ": " << strerror(errno);
+            success = false;
         }
 
         client_pid_ = 0;
+        return success;
     }
 
     bool is_running() const { return client_pid_ != 0; }

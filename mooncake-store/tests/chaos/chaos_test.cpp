@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-#include "chaos.h"
+#include "chaos_test_helper.h"
 #include "client_test_helper.h"
 #include "types.h"
 #include "utils.h"
@@ -19,7 +19,7 @@ DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8080/metadata",
 DEFINE_string(etcd_endpoints, "localhost:2379", "Etcd endpoints");
 DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
               "Path to the master executable");
-DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaosclient",
+DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaos_client",
               "Path to the client executable");
 DEFINE_string(out_dir, "./output", "Directory for log files");
 
@@ -120,7 +120,7 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -145,7 +145,7 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
     ASSERT_EQ(client->Put(key, value), ErrorCode::OK);
 
     // Kill the leader and wait for the new leader to be elected
-    masters[leader_index]->kill();
+    ASSERT_TRUE(masters[leader_index]->kill());
     WaitMasterViewChange();
 
     // Verify the segment is remounted by trying to put a new key-value pair
@@ -167,7 +167,7 @@ TEST_F(ChaosTest, BackupMasterKilled) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -194,7 +194,7 @@ TEST_F(ChaosTest, BackupMasterKilled) {
     // Kill the non-leader masters
     for (int i = 0; i < master_num; ++i) {
         if (i != leader_index) {
-            masters[i]->kill();
+            ASSERT_TRUE(masters[i]->kill());
         }
     }
 
@@ -213,7 +213,7 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -238,7 +238,7 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
         if (i != leader_index && !find_one_backup) {
             find_one_backup = true;
         } else {
-            masters[i]->kill();
+            ASSERT_TRUE(masters[i]->kill());
         }
     }
 
@@ -264,7 +264,7 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -281,12 +281,12 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
 
     // Kill all masters
     for (int i = 0; i < master_num; ++i) {
-        masters[i]->kill();
+        ASSERT_TRUE(masters[i]->kill());
     }
 
     // Restart the masters
     for (int i = 0; i < master_num; ++i) {
-        masters[i]->start();
+        ASSERT_TRUE(masters[i]->start());
     }
 
     // Wait for the leader to be elected
@@ -311,7 +311,7 @@ TEST_F(ChaosTest, ClientGracefulClose) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -353,7 +353,7 @@ TEST_F(ChaosTest, ClientKilledFailover) {
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
-        masters.back()->start();
+        ASSERT_TRUE(masters.back()->start());
     }
 
     // Wait for the leader to be elected
@@ -362,7 +362,8 @@ TEST_F(ChaosTest, ClientKilledFailover) {
     // Create two clients
     ClientHandler to_close_client(FLAGS_client_path, FLAGS_out_dir, 0);
     // Set the client config to only run mount operation
-    to_close_client.start(ChaosClientConfig{.put_prob = 0, .get_prob = 0, .mount_prob = 1000, .unmount_prob = 0});
+    ASSERT_TRUE(to_close_client.start(ChaosClientConfig{
+        .put_prob = 0, .get_prob = 0, .mount_prob = 1000, .unmount_prob = 0}));
     std::shared_ptr<ClientTestWrapper> other_client =
         CreateClient("0.0.0.0:" + std::to_string(client_port_base + 1));
     ASSERT_TRUE(other_client != nullptr);
@@ -381,7 +382,7 @@ TEST_F(ChaosTest, ClientKilledFailover) {
     ASSERT_EQ(get_value, value);
 
     // Kill the to_close_client
-    to_close_client.kill();
+    ASSERT_TRUE(to_close_client.kill());
 
     // Wait for the leader to notice the client is killed
     WaitClientCrashDetection();
