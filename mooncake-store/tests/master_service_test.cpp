@@ -26,7 +26,7 @@ class MasterServiceTest : public ::testing::Test {
 };
 
 std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
-                                 const std::string& segment_name) {
+                                  const std::string& segment_name) {
     static std::atomic<uint64_t> counter(0);
 
     while (true) {
@@ -35,12 +35,12 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
 
         // Check if the key already exists.
         if (service->ExistKey(key) == ErrorCode::OK) {
-            continue; // Retry if the key already exists
+            continue;  // Retry if the key already exists
         }
 
         // Attempt to put the key.
         ErrorCode code = service->PutStart(key, 1024, {1024},
-                                         {.replica_num=1}, replica_list);
+                                           {.replica_num = 1}, replica_list);
 
         if (code == ErrorCode::OBJECT_ALREADY_EXISTS) {
             continue;  // Retry if the key already exists
@@ -50,7 +50,8 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
                                      std::to_string(static_cast<int>(code)));
         }
         service->PutEnd(key);
-        if (replica_list[0].buffer_descriptors[0].segment_name_ == segment_name) {
+        if (replica_list[0].buffer_descriptors[0].segment_name_ ==
+            segment_name) {
             return key;
         }
         // Clean up failed attempt
@@ -67,7 +68,8 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
     // Define the name of the test segment.
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress,
+                    kSegmentSize);
     UUID client_id = generate_uuid();
 
     // Test invalid parameters.
@@ -101,16 +103,17 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     // Test mounting the same segment again (idempotent request should succeed).
-    EXPECT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     // Test unmounting the segment.
     EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
 
-    // Test unmounting the same segment again (idempotent request should succeed).
+    // Test unmounting the same segment again (idempotent request should
+    // succeed).
     EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
 
-    // Test unmounting a non-existent segment (idempotent request should succeed).
+    // Test unmounting a non-existent segment (idempotent request should
+    // succeed).
     UUID non_existent_id = generate_uuid();
     EXPECT_EQ(ErrorCode::OK,
               service_->UnmountSegment(non_existent_id, client_id));
@@ -137,12 +140,13 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         int random_number = dis(gen);
         // Define the size of the segment (16MB).
         size_t kSegmentSize = 1024 * 1024 * 16 * random_number;
-        
+
         Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize);
 
         // Test remounting after unmount.
         EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
-        EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+        EXPECT_EQ(ErrorCode::OK,
+                  service_->UnmountSegment(segment.id, client_id));
     }
 }
 
@@ -188,10 +192,10 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
-    
+
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    
+
     ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
@@ -394,7 +398,8 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
 
 TEST_F(MasterServiceTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     // Mount segment and put 10 objects
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -682,28 +687,33 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
     for (int i = 0; i < num_threads; ++i) {
         writers.emplace_back([&, i]() {
             for (int j = 0; j < objects_per_thread; ++j) {
-                std::string key = "key_" + std::to_string(i) + "_" + std::to_string(j);
+                std::string key =
+                    "key_" + std::to_string(i) + "_" + std::to_string(j);
                 std::vector<uint64_t> slice_lengths = {1024};
                 ReplicateConfig config;
                 config.replica_num = 1;
                 std::vector<Replica::Descriptor> replica_list;
 
-                if (service_->PutStart(key, 1024, slice_lengths, config, replica_list) == ErrorCode::OK &&
+                if (service_->PutStart(key, 1024, slice_lengths, config,
+                                       replica_list) == ErrorCode::OK &&
                     service_->PutEnd(key) == ErrorCode::OK) {
                     success_writes++;
                 }
 
                 // Random sleep to increase concurrency complexity
-                std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 10));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(rand() % 10));
             }
         });
     }
 
     // RemoveAll thread
     std::thread remove_thread([&]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Let some writes start
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(50));  // Let some writes start
         long removed = service_->RemoveAll();
-        LOG(INFO) << "Removed " << removed << " objects during concurrent writes";
+        LOG(INFO) << "Removed " << removed
+                  << " objects during concurrent writes";
         ASSERT_GT(removed, 0);
         remove_all_done = true;
         total_removed.fetch_add(removed);
@@ -728,9 +738,10 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
-    // set a large kv_lease_ttl so the granted lease will not quickly expire 
+    // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 200;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
@@ -747,7 +758,8 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
 
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                    config, replica_list));
         ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
     }
 
@@ -761,21 +773,25 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
             std::vector<Replica::Descriptor> replica_list;
             for (int j = 0; j < num_objects; ++j) {
                 std::string key = "pre_key_" + std::to_string(j);
-                if (service_->GetReplicaList(key, replica_list) == ErrorCode::OK) {
+                if (service_->GetReplicaList(key, replica_list) ==
+                    ErrorCode::OK) {
                     success_reads++;
                 }
 
                 // Random sleep to increase concurrency complexity
-                std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 5));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(rand() % 5));
             }
         });
     }
 
     // RemoveAll thread
     std::thread remove_thread([&]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Let some reads start
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10));  // Let some reads start
         long removed = service_->RemoveAll();
-        LOG(INFO) << "Removed " << removed << " objects during concurrent reads";
+        LOG(INFO) << "Removed " << removed
+                  << " objects during concurrent reads";
         remove_all_done = true;
     });
 
@@ -799,14 +815,16 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     std::vector<Replica::Descriptor> replica_list;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+                  service_->GetReplicaList(key, replica_list));
     }
 }
 
 TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
+    constexpr size_t size =
+        1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
@@ -821,7 +839,8 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
 
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths, config, replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                    config, replica_list));
         ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
     }
 
@@ -849,7 +868,8 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     std::vector<Replica::Descriptor> replica_list;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->GetReplicaList(key, replica_list));
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+                  service_->GetReplicaList(key, replica_list));
     }
 }
 
@@ -884,29 +904,28 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
               service_->GetReplicaList(key1, retrieved));
 
     // Verify objects in segment2 is still there
-    ASSERT_EQ(ErrorCode::OK,
-              service_->GetReplicaList(key2, retrieved));
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key2, retrieved));
 
     // Verify put key1 will put into segment2 rather than segment1
     ASSERT_EQ(ErrorCode::OK, service_->PutStart(key1, 1024, slice_lengths,
                                                 config, replica_list));
     ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key1));
-    ASSERT_EQ(ErrorCode::OK,
-              service_->GetReplicaList(key1, retrieved));
-    ASSERT_EQ(replica_list[0].buffer_descriptors[0].segment_name_, segment2.name);
+    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key1, retrieved));
+    ASSERT_EQ(replica_list[0].buffer_descriptors[0].segment_name_,
+              segment2.name);
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;
-    constexpr size_t kSegmentSize = 1024 * 1024 * 256; // 256MB
+    constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress,
+                    kSegmentSize);
     UUID client_id = generate_uuid();
 
     // Mount a segment for testing
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     // Create 10000 keys for testing
     constexpr int kNumKeys = 1000;
@@ -928,8 +947,9 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
     auto unmount_end = std::chrono::steady_clock::now();
 
-    auto unmount_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        unmount_end - unmount_start);
+    auto unmount_duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(unmount_end -
+                                                              unmount_start);
 
     // Unmount operation should be very fast, so we set 1s limit
     EXPECT_LE(unmount_duration.count(), 1000)
@@ -944,8 +964,9 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     }
 
     // Output performance report
-    auto total_create_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        create_end - start);
+    auto total_create_duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(create_end -
+                                                              start);
     std::cout << "\nPerformance Metrics:\n"
               << "Keys created: " << kNumKeys << "\n"
               << "Creation time: " << total_create_duration.count() << "ms\n"
@@ -954,15 +975,15 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
 
 TEST_F(MasterServiceTest, RemoveLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
@@ -1017,15 +1038,15 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
 TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     // Mount segment and put 10 objects, with 5 of them having lease
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
     for (int i = 0; i < 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
         std::vector<uint64_t> slice_lengths = {1024};
@@ -1056,7 +1077,8 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
 TEST_F(MasterServiceTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
     // we need to fill each shard with enough objects to thoroughly
@@ -1067,8 +1089,7 @@ TEST_F(MasterServiceTest, EvictObject) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     // Verify if we can put objects more than the segment can hold
     int success_puts = 0;
@@ -1078,8 +1099,8 @@ TEST_F(MasterServiceTest, EvictObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
-        if (ErrorCode::OK == service_->PutStart(key, object_size,
-            slice_lengths, config, replica_list)) {
+        if (ErrorCode::OK == service_->PutStart(key, object_size, slice_lengths,
+                                                config, replica_list)) {
             ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
             success_puts++;
         } else {
@@ -1095,15 +1116,15 @@ TEST_F(MasterServiceTest, EvictObject) {
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 500;
-    std::unique_ptr<MasterService> service_(new MasterService(false, kv_lease_ttl));
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     constexpr size_t object_size = 1024 * 1024;
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK,
-              service_->MountSegment(segment, client_id));
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
 
     // Verify leased object will not be evicted.
     int success_puts = 0;
@@ -1115,11 +1136,12 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
-        if (ErrorCode::OK == service_->PutStart(key, object_size,
-            slice_lengths, config, replica_list)) {
+        if (ErrorCode::OK == service_->PutStart(key, object_size, slice_lengths,
+                                                config, replica_list)) {
             ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
             // the object is leased
-            ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+            ASSERT_EQ(ErrorCode::OK,
+                      service_->GetReplicaList(key, replica_list));
             leased_keys.push_back(key);
             success_puts++;
         } else {
@@ -1137,6 +1159,45 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, BatchExistKeyTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount a segment
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 128;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    int test_object_num = 10;
+    std::vector<std::string> test_keys;
+    for (int i = 0; i < test_object_num; ++i) {
+        test_keys.push_back("test_key" + std::to_string(i));
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<uint64_t> slice_lengths = {1024};
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK,
+                  service_->PutStart(test_keys[i], 1024, slice_lengths, config,
+                                     replica_list));
+        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(test_keys[i]));
+    }
+
+    // Test individual ExistKey calls to verify the underlying functionality
+    for (int i = 0; i < test_object_num; ++i) {
+        EXPECT_EQ(ErrorCode::OK, service_->ExistKey(test_keys[i]));
+    }
+
+    // Tets batch
+    test_keys.push_back("non_existent_key");
+    auto exist_resp = service_->BatchExistKey(test_keys);
+    for (int i = 0; i < test_object_num; ++i) {
+        ASSERT_EQ(ErrorCode::OK, exist_resp[i]);
+    }
+    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, exist_resp[test_object_num]);
 }
 
 }  // namespace mooncake::test
