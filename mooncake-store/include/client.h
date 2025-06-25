@@ -14,7 +14,7 @@
 #include "types.h"
 #include "ha_helper.h"
 #include "thread_pool.h"
-#include "file_storage_backend.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -209,13 +209,13 @@ class Client {
                                  const std::string& protocol,
                                  void** protocol_args);
     ErrorCode TransferData(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code);
     ErrorCode TransferWrite(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices);
     ErrorCode TransferRead(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices);
 
     /**

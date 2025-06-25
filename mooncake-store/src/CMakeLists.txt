@@ -9,7 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     master_client.cpp
     utils.cpp
     master_metric_manager.cpp
-    file_storage_backend.cpp
+    storage_backend.cpp
     local_file.cpp
     thread_pool.cpp
     etcd_helper.cpp

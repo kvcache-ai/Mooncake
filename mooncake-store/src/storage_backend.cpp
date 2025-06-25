@@ -1,6 +1,6 @@
 
 // #include "storage_backend.h"
-#include "file_storage_backend.h"
+#include "storage_backend.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -10,7 +10,7 @@
 
 namespace mooncake {
   
-ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
+ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
                                      const std::vector<Slice>& slices) {
     std::string path = ResolvePath(key);
 
@@ -58,7 +58,7 @@ ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
+ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
                                     const std::string& str) {
     std::string path = ResolvePath(key);
 
@@ -94,11 +94,20 @@ ErrorCode FileStorageBackend::StoreObject(const ObjectKey& key,
 
     return ErrorCode::OK;
 }
-
-ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
+      
+ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
                                     std::vector<Slice>& slices) {
     std::string path = ResolvePath(key);
+    return LoadObjectInPath(path,slices);
+}
 
+ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
+                                    std::vector<Slice>& slices, std::string& path) {
+    return LoadObjectInPath(path, slices);
+}
+
+ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
+                                    std::vector<Slice>& slices) {
     FILE* file = fopen(path.c_str(), "rb");
     size_t slices_total_size=0;
     std::vector<iovec> iovs;
@@ -136,7 +145,7 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
+ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
                                     std::string& str) {
     std::string path = ResolvePath(key);
     FILE* file = fopen(path.c_str(), "rb");
@@ -171,7 +180,7 @@ ErrorCode FileStorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-bool FileStorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
+bool StorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
 
@@ -186,7 +195,7 @@ bool FileStorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, 
     return true;
 }
 
-ErrorCode FileStorageBackend::Existkey(const ObjectKey& key) {
+ErrorCode StorageBackend::Existkey(const ObjectKey& key) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
 
@@ -198,7 +207,7 @@ ErrorCode FileStorageBackend::Existkey(const ObjectKey& key) {
     }
 }
 
-void FileStorageBackend::RemoveFile(const ObjectKey& key) {
+void StorageBackend::RemoveFile(const ObjectKey& key) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
     // TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
@@ -215,7 +224,7 @@ void FileStorageBackend::RemoveFile(const ObjectKey& key) {
     } 
 }
 
-void FileStorageBackend::RemoveAll() {
+void StorageBackend::RemoveAll() {
     namespace fs = std::filesystem;
     // Iterate through the root directory and remove all files
     for (const auto& entry : fs::directory_iterator(root_dir_)) {
@@ -230,7 +239,7 @@ void FileStorageBackend::RemoveAll() {
 
 }
 
-std::string FileStorageBackend::SanitizeKey(const ObjectKey& key) const {
+std::string StorageBackend::SanitizeKey(const ObjectKey& key) const {
     // Set of invalid filesystem characters to be replaced
     constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
     std::string sanitized_key;
@@ -245,7 +254,7 @@ std::string FileStorageBackend::SanitizeKey(const ObjectKey& key) const {
     return sanitized_key;
 }
 
-std::string FileStorageBackend::ResolvePath(const ObjectKey& key) const {
+std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
     // Compute hash of the key 
     size_t hash = std::hash<std::string>{}(key);
     
