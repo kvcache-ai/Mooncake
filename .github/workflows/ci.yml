@@ -225,14 +225,6 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version-file: 'mooncake-p2p-store/src/p2pstore/go.mod'
-        check-latest: true
-
-    - run: go version    # sanity-check
-
     - name: Free up disk space
       run: |
         sudo rm -rf /usr/share/dotnet
@@ -286,6 +278,14 @@ jobs:
         cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_CUDA,USE_MNNVL
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'mooncake-p2p-store/src/p2pstore/go.mod'
+        check-latest: true
+
+    - run: go version    # sanity-check
 
     - name: Build project with all settings are ON
       run: |
