@@ -287,9 +287,11 @@ Status RdmaTransport::submitTransferTask(
             if (!slice->from_cache) {
                 nr_slices++;
             }
+            
+            bool large_last_slice = request.length - offset <= kBlockSize + (kBlockSize >> 2);
 
             slice->source_addr = (char *)request.source + offset;
-            slice->length = std::min(request.length - offset, kBlockSize);
+            slice->length = large_last_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -341,6 +343,10 @@ Status RdmaTransport::submitTransferTask(
                     entry.first->submitPostSend(entry.second);
                 slices_to_post.clear();
                 nr_slices = 0;
+            }
+
+            if (large_last_slice) {
+                break;
             }
         }
     }
