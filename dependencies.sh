@@ -252,6 +252,7 @@ fi
 if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
     echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
     echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+    echo 'export GOTOOLCHAIN=local' >> ~/.bashrc
     echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
 fi
 
