@@ -444,6 +444,25 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     }
 }
 
+int TransferEnginePy::registerMemoryBatch(std::vector<uintptr_t> buffer_addresses,
+                                          std::vector<size_t> capacities) {
+    auto batch_size = buffer_addresses.size();
+    std::vector<BufferEntry> buffers;
+    for (int i = 0; i < batch_size; i ++ ) {
+        buffers.push_back(BufferEntry{(void *)buffer_addresses[i], capacities[i]});
+    }
+    return engine_->registerLocalMemoryBatch(buffers, kWildcardLocation);
+}
+
+int TransferEnginePy::unregisterMemoryBatch(std::vector<uintptr_t> buffer_addresses) {
+    auto batch_size = buffer_addresses.size();
+    std::vector<void *> buffers;
+    for (int i = 0; i < batch_size; i ++ ) {
+        buffers.push_back(reinterpret_cast<char *>(buffer_addresses[i]));
+    }
+    return engine_->unregisterLocalMemoryBatch(buffers);
+}
+
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity);
