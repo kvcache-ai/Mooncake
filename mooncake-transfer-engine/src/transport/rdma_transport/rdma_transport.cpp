@@ -271,6 +271,7 @@ Status RdmaTransport::submitTransferTask(
     assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
+    const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark = globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
     for (size_t index = 0; index < request_list.size(); ++index) {
@@ -286,10 +287,10 @@ Status RdmaTransport::submitTransferTask(
                 nr_slices++;
             }
             
-            bool large_last_slice = request.length - offset <= kBlockSize + (kBlockSize >> 2);
+            bool merge_final_slice = request.length - offset <= kBlockSize + kFragmentSize;
 
             slice->source_addr = (char *)request.source + offset;
-            slice->length = large_last_slice ? request.length - offset : kBlockSize;
+            slice->length = merge_final_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -345,7 +346,7 @@ Status RdmaTransport::submitTransferTask(
                 nr_slices = 0;
             }
 
-            if (large_last_slice) {
+            if (merge_final_slice) {
                 break;
             }
         }
