@@ -227,6 +227,16 @@ ErrorCode MasterService::ExistKey(const std::string& key) {
     return ErrorCode::OK;
 }
 
+std::vector<ErrorCode> MasterService::BatchExistKey(
+    const std::vector<std::string>& keys) {
+    std::vector<ErrorCode> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(ExistKey(key));
+    }
+    return results;
+}
+
 ErrorCode MasterService::GetAllKeys(std::vector<std::string>& all_keys) {
     all_keys.clear();
     for (size_t i = 0; i < kNumShards; i++) {
@@ -299,10 +309,10 @@ ErrorCode MasterService::PutStart(
     const std::string& key, uint64_t value_length,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
     std::vector<Replica::Descriptor>& replica_list) {
-    if (config.replica_num == 0 || value_length == 0) {
+    if (config.replica_num == 0 || value_length == 0 || key.empty()) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", value_length=" << value_length
-                   << ", error=invalid_params";
+                   << ", key_size=" << key.size() << ", error=invalid_params";
         return ErrorCode::INVALID_PARAMS;
     }
 

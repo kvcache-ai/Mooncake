@@ -46,8 +46,8 @@ Client::~Client() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto err_code = UnmountSegment(reinterpret_cast<void*>(segment.base),
-                                       segment.size);
+        auto err_code =
+            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
         if (err_code != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
         }
@@ -153,8 +153,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         // Start Ping thread to monitor master view changes and remount segments
         // if needed
         ping_running_ = true;
-        ping_thread_ =
-            std::thread(&Client::PingThreadFunc, this);
+        ping_thread_ = std::thread(&Client::PingThreadFunc, this);
 
         return ErrorCode::OK;
     } else {
@@ -234,7 +233,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                    protocol, protocol_args);
+                                     protocol, protocol_args);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;
@@ -684,8 +683,7 @@ ErrorCode Client::MountSegment(const void* buffer, size_t size) {
     Segment segment(generate_uuid(), local_hostname_,
                     reinterpret_cast<uintptr_t>(buffer), size);
 
-    ErrorCode err =
-        master_client_.MountSegment(segment, client_id_).error_code;
+    ErrorCode err = master_client_.MountSegment(segment, client_id_).error_code;
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                    << " size=" << size << ", error=" << err;
@@ -767,6 +765,27 @@ ErrorCode Client::IsExist(const std::string& key) {
         }
     }
     return response.error_code;
+}
+
+ErrorCode Client::BatchIsExist(const std::vector<std::string>& keys,
+                               std::vector<ErrorCode>& exist_results) {
+    exist_results.resize(keys.size());
+    auto response = master_client_.BatchExistKey(keys);
+
+    // Check if we got the expected number of responses
+    if (response.exist_responses.size() != keys.size()) {
+        LOG(ERROR) << "BatchExistKey response size mismatch. Expected: "
+                   << keys.size()
+                   << ", Got: " << response.exist_responses.size();
+        // Fill with RPC_FAIL error codes
+        std::fill(exist_results.begin(), exist_results.end(),
+                  ErrorCode::RPC_FAIL);
+        return ErrorCode::RPC_FAIL;
+    }
+
+    exist_results = response.exist_responses;
+
+    return ErrorCode::OK;
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir, 

@@ -39,8 +39,8 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
 
     auto request_result =
         client_.send_request<&WrappedMasterService::ExistKey>(object_key);
-    std::optional<ExistKeyResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
+    std::optional<ExistKeyResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to check key existence: "
@@ -52,6 +52,38 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
 
     if (!result) {
         auto response = ExistKeyResponse{ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+BatchExistResponse MasterClient::BatchExistKey(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::BatchExistKey>(object_keys);
+    std::optional<BatchExistResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<BatchExistResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to check batch key existence: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        BatchExistResponse response;
+        response.exist_responses.resize(object_keys.size());
+        for (auto& exist_response : response.exist_responses) {
+            exist_response = ErrorCode::RPC_FAIL;
+        }
         timer.LogResponseJson(response);
         return response;
     }
@@ -315,7 +347,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to remove all objects: "
-                          << result.error().msg;
+                           << result.error().msg;
                 co_return std::nullopt;
             }
             co_return result->result();
@@ -363,7 +395,8 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
 ReMountSegmentResponse MasterClient::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
-    timer.LogRequest("segments_num=", segments.size(), ", client_id=", client_id);
+    timer.LogRequest("segments_num=", segments.size(),
+                     ", client_id=", client_id);
 
     std::optional<ReMountSegmentResponse> result =
         syncAwait([&]() -> coro::Lazy<std::optional<ReMountSegmentResponse>> {
@@ -431,7 +464,8 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
         }());
 
     if (!result) {
-        auto response = PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
+        auto response =
+            PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

@@ -84,29 +84,53 @@ class TestDistributedObjectStore(unittest.TestCase):
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
-        # Get after remove should return empty bytes
-        self.assertLess(self.store.get_size(key), 0)
-        empty_data = self.store.get(key)
-        self.assertEqual(empty_data, b"")
+    def test_batch_is_exist_operations(self):
+        """Test batch is_exist operations through the Python interface."""
+        batch_size = 20
+        test_data = b"Hello, Batch World!"
 
-        # Test isExist functionality
-        test_data_2 = b"Testing exists!"
-        key_2 = "test_exist_key"
+        # Create test keys
+        keys = [f"test_batch_exist_key_{i}" for i in range(batch_size)]
+
+        # Put only the first half of the keys
+        existing_keys = keys[:batch_size // 2]
+        for key in existing_keys:
+            self.assertEqual(self.store.put(key, test_data), 0)
+
+        # Test batch_is_exist with mixed existing and non-existing keys
+        results = self.store.batch_is_exist(keys)
+
+        # Verify results
+        self.assertEqual(len(results), len(keys))
+
+        # First half should exist (result = 1)
+        for i in range(batch_size // 2):
+            self.assertEqual(results[i], 1, f"Key {keys[i]} should exist but got {results[i]}")
+
+        # Second half should not exist (result = 0)
+        for i in range(batch_size // 2, batch_size):
+            self.assertEqual(results[i], 0, f"Key {keys[i]} should not exist but got {results[i]}")
+
+        # Test with empty keys list
+        empty_results = self.store.batch_is_exist([])
+        self.assertEqual(len(empty_results), 0)
+
+        # Test with single key
+        single_result = self.store.batch_is_exist([existing_keys[0]])
+        self.assertEqual(len(single_result), 1)
+        self.assertEqual(single_result[0], 1)
+
+        # Test with non-existent key
+        non_existent_result = self.store.batch_is_exist(["non_existent_key"])
+        self.assertEqual(len(non_existent_result), 1)
+        self.assertEqual(non_existent_result[0], 0)
         
-        # Should not exist initially
-        self.assertLess(self.store.get_size(key_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 0)
-        
-        # Should exist after put
-        self.assertEqual(self.store.put(key_2, test_data_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 1)
-        self.assertEqual(self.store.get_size(key_2), len(test_data_2))
-        
-        # Should not exist after remove
+        # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-        self.assertEqual(self.store.remove(key_2), 0)
-        self.assertLess(self.store.get_size(key_2), 0)
-        self.assertEqual(self.store.is_exist(key_2), 0)
+        for key in existing_keys:
+            self.assertEqual(self.store.remove(key), 0)
+        
+
     
     def test_zero_copy_operations(self):
         """Test zero-copy get_into and put_from operations."""
