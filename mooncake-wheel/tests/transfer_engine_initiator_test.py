@@ -132,7 +132,7 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         print(f"[✓] {circles} rounds of batch_write_read passed, batch size {batch_size}.")
 
     def test_async_batch_write_read(self):
-        """Test batch_transfer_sync_write and batch_transfer_sync_read for batch write/read consistency."""
+        """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
         import random, string
 
         def generate_random_string(length):

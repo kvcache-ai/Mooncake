@@ -86,12 +86,12 @@ class TransferEnginePy {
                               std::vector<uintptr_t> peer_buffer_addresses,
                               std::vector<size_t> lengths);
 
-    int batchTransferAsyncWrite(const char *target_hostname,
+    batch_id_t batchTransferAsyncWrite(const char *target_hostname,
                                 const std::vector<uintptr_t> &buffers,
                                 const std::vector<uintptr_t> &peer_buffer_addresses,
                                 const std::vector<size_t> &lengths);
 
-    int batchTransferAsyncRead(const char *target_hostname,
+    batch_id_t batchTransferAsyncRead(const char *target_hostname,
                                const std::vector<uintptr_t> &buffers,
                                const std::vector<uintptr_t> &peer_buffer_addresses,
                                const std::vector<size_t> &lengths);

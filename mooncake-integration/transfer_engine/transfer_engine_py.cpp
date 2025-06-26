@@ -237,7 +237,7 @@ int TransferEnginePy::batchTransferSyncRead(const char *target_hostname,
                              TransferOpcode::READ);
 }
 
-int TransferEnginePy::batchTransferAsyncWrite(const char *target_hostname,
+batch_id_t TransferEnginePy::batchTransferAsyncWrite(const char *target_hostname,
                                               const std::vector<uintptr_t> &buffers,
                                               const std::vector<uintptr_t> &peer_buffer_addresses,
                                               const std::vector<size_t> &lengths) {
@@ -245,7 +245,7 @@ int TransferEnginePy::batchTransferAsyncWrite(const char *target_hostname,
                              TransferOpcode::WRITE);
 }
 
-int TransferEnginePy::batchTransferAsyncRead(const char *target_hostname,
+batch_id_t TransferEnginePy::batchTransferAsyncRead(const char *target_hostname,
                                              const std::vector<uintptr_t> &buffers,
                                              const std::vector<uintptr_t> &peer_buffer_addresses,
                                              const std::vector<size_t> &lengths) {
@@ -473,6 +473,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(const char *target_hostname,
 }
 
 int TransferEnginePy::getBatchTransferStatus(const std::vector<batch_id_t>& batch_ids) {
+    pybind11::gil_scoped_release release;
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto &batch_id : batch_ids) {
