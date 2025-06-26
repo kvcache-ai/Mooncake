@@ -6,16 +6,13 @@
 #include <string>
 #include <unordered_map>
 
-#include "client_test_helper.h"
+#include "client_wrapper.h"
 #include "types.h"
 #include "utils.h"
+#include "e2e_utils.h"
 
 // Command line flags
-DEFINE_string(metadata_connstring, "http://127.0.0.1:8080/metadata",
-              "Metadata connection string for transfer engine");
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
+USE_engine_flags
 DEFINE_string(master_server_entry, "localhost:50051", "Master server address");
 
 namespace mooncake {
@@ -74,8 +71,8 @@ class ClientCtl {
 
         std::string hostname = "localhost:" + port;
 
-        auto client_opt = ClientTestWrapper::CreateClient(
-            hostname, FLAGS_metadata_connstring, FLAGS_protocol,
+        auto client_opt = ClientTestWrapper::CreateClientWrapper(
+            hostname, FLAGS_engine_meta_url, FLAGS_protocol,
             FLAGS_device_name, FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {

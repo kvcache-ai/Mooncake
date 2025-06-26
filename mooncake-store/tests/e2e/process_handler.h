@@ -17,17 +17,17 @@
 namespace mooncake {
 namespace testing {
 
-inline const char* const CHAOS_ERROR_STR = "[CHAOS_ERROR]";
-inline const char* const CHAOS_PUT_SUCCESS_STR = "[CHAOS_PUT_SUCCESS]";
-inline const char* const CHAOS_PUT_FAILURE_STR = "[CHAOS_PUT_FAILURE]";
-inline const char* const CHAOS_GET_SUCCESS_STR = "[CHAOS_GET_SUCCESS]";
-inline const char* const CHAOS_GET_FAILURE_STR = "[CHAOS_GET_FAILURE]";
-inline const char* const CHAOS_MOUNT_SUCCESS_STR = "[CHAOS_MOUNT_SUCCESS]";
-inline const char* const CHAOS_MOUNT_FAILURE_STR = "[CHAOS_MOUNT_FAILURE]";
-inline const char* const CHAOS_UNMOUNT_SUCCESS_STR = "[CHAOS_UNMOUNT_SUCCESS]";
-inline const char* const CHAOS_UNMOUNT_FAILURE_STR = "[CHAOS_UNMOUNT_FAILURE]";
+inline const char* const TEST_ERROR_STR = "[TEST_ERROR]";
+inline const char* const TEST_PUT_SUCCESS_STR = "[TEST_PUT_SUCCESS]";
+inline const char* const TEST_PUT_FAILURE_STR = "[TEST_PUT_FAILURE]";
+inline const char* const TEST_GET_SUCCESS_STR = "[TEST_GET_SUCCESS]";
+inline const char* const TEST_GET_FAILURE_STR = "[TEST_GET_FAILURE]";
+inline const char* const TEST_MOUNT_SUCCESS_STR = "[TEST_MOUNT_SUCCESS]";
+inline const char* const TEST_MOUNT_FAILURE_STR = "[TEST_MOUNT_FAILURE]";
+inline const char* const TEST_UNMOUNT_SUCCESS_STR = "[TEST_UNMOUNT_SUCCESS]";
+inline const char* const TEST_UNMOUNT_FAILURE_STR = "[TEST_UNMOUNT_FAILURE]";
 
-class MasterHandler {
+class MasterProcessHandler {
    private:
     pid_t master_pid_{0};
     std::string master_path_;
@@ -37,23 +37,23 @@ class MasterHandler {
     std::string out_dir_;
 
    public:
-    MasterHandler(const std::string& path, const int port, const int index,
+    MasterProcessHandler(const std::string& path, const int port, const int index,
                   const std::string& out_dir)
         : master_path_(path), port_(port), index_(index), out_dir_(out_dir) {}
 
-    ~MasterHandler() {
+    ~MasterProcessHandler() {
         if (master_pid_ != 0) {
             kill();
         }
     }
 
     // Delete copy constructor and assignment operator
-    MasterHandler(const MasterHandler&) = delete;
-    MasterHandler& operator=(const MasterHandler&) = delete;
+    MasterProcessHandler(const MasterProcessHandler&) = delete;
+    MasterProcessHandler& operator=(const MasterProcessHandler&) = delete;
 
     // Delete move constructor and assignment operator
-    MasterHandler(MasterHandler&&) = delete;
-    MasterHandler& operator=(MasterHandler&&) = delete;
+    MasterProcessHandler(MasterProcessHandler&&) = delete;
+    MasterProcessHandler& operator=(MasterProcessHandler&&) = delete;
 
     bool start() {
         if (master_pid_ != 0) {
@@ -171,7 +171,7 @@ class MasterHandler {
         }
 
         bool success = false;
-        // For chaos testing, kill the process forcefully to simulate a crash
+        // Kill the process forcefully to simulate a crash
         if (::kill(master_pid_, SIGKILL) == 0) {
             LOG(INFO) << "[m" << index_
                       << "] Force killed master process with PID: "
@@ -182,7 +182,7 @@ class MasterHandler {
             waitpid(master_pid_, &status, 0);
             success = true;
         } else {
-            LOG(ERROR) << CHAOS_ERROR_STR << " [m" << index_
+            LOG(ERROR) << TEST_ERROR_STR << " [m" << index_
                        << "] Failed to kill master process with PID: "
                        << master_pid_ << ": " << strerror(errno);
             success = false;
@@ -195,14 +195,14 @@ class MasterHandler {
     bool is_running() const { return master_pid_ != 0; }
 };
 
-struct ChaosClientConfig {
+struct ClientRunnerConfig {
     std::optional<int> put_prob;
     std::optional<int> get_prob;
     std::optional<int> mount_prob;
     std::optional<int> unmount_prob;
 };
 
-class ClientHandler {
+class ClientProcessHandler {
    private:
     pid_t client_pid_{0};
     std::string client_path_;
@@ -211,25 +211,25 @@ class ClientHandler {
     bool first_start_{true};
 
    public:
-    ClientHandler(const std::string& path, const std::string& out_dir,
+    ClientProcessHandler(const std::string& path, const std::string& out_dir,
                   const int index)
         : client_path_(path), out_dir_(out_dir), index_(index) {}
 
-    ~ClientHandler() {
+    ~ClientProcessHandler() {
         if (client_pid_ != 0) {
             kill();
         }
     }
 
     // Delete copy constructor and assignment operator
-    ClientHandler(const ClientHandler&) = delete;
-    ClientHandler& operator=(const ClientHandler&) = delete;
+    ClientProcessHandler(const ClientProcessHandler&) = delete;
+    ClientProcessHandler& operator=(const ClientProcessHandler&) = delete;
 
     // Delete move constructor and assignment operator
-    ClientHandler(ClientHandler&&) = delete;
-    ClientHandler& operator=(ClientHandler&&) = delete;
+    ClientProcessHandler(ClientProcessHandler&&) = delete;
+    ClientProcessHandler& operator=(ClientProcessHandler&&) = delete;
 
-    bool start(const ChaosClientConfig& config) {
+    bool start(const ClientRunnerConfig& config) {
         if (client_pid_ != 0) {
             LOG(ERROR) << "[c" << index_
                        << "] Client process already running with PID: "
@@ -369,7 +369,7 @@ class ClientHandler {
         }
 
         bool success = false;
-        // For chaos testing, kill the process forcefully to simulate a crash
+        // Kill the process forcefully to simulate a crash
         if (::kill(client_pid_, SIGKILL) == 0) {
             LOG(INFO) << "[c" << index_
                       << "] Force killed client process with PID: "
@@ -380,7 +380,7 @@ class ClientHandler {
             waitpid(client_pid_, &status, 0);
             success = true;
         } else {
-            LOG(ERROR) << CHAOS_ERROR_STR << " [c" << index_
+            LOG(ERROR) << TEST_ERROR_STR << " [c" << index_
                        << "] Failed to kill client process with PID: "
                        << client_pid_ << ": " << strerror(errno);
             success = false;

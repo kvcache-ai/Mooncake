@@ -35,7 +35,7 @@ class ClientTestWrapper {
         }
     }
 
-    static std::optional<std::shared_ptr<ClientTestWrapper>> CreateClient(
+    static std::optional<std::shared_ptr<ClientTestWrapper>> CreateClientWrapper(
         const std::string& hostname, const std::string& metadata_connstring,
         const std::string& protocol, const std::string& device_name,
         const std::string& master_server_entry, size_t local_buffer_size = 1024 * 1024 * 128) {

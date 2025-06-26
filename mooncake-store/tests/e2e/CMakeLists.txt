@@ -4,6 +4,7 @@ target_link_libraries(clientctl PUBLIC
     cachelib_memory_allocator
     glog
     pthread
+    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(e2e_rand_test e2e_rand_test.cpp)
@@ -13,4 +14,43 @@ target_link_libraries(e2e_rand_test PUBLIC
     glog
     gtest
     pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_executable(chaosctl chaosctl.cpp)
+target_link_libraries(chaosctl PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_executable(client_runner client_runner.cpp)
+target_link_libraries(client_runner PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_executable(chaos_test chaos_test.cpp)
+target_link_libraries(chaos_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_executable(chaos_rand_test chaos_rand_test.cpp)
+target_link_libraries(chaos_rand_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
 )

@@ -1,21 +1,20 @@
-#include "chaos_test_helper.h"
+#include "e2e_utils.h"
+#include "process_handler.h"
 
 #include <map>
 #include <fstream>
 
 // Define command line flags
+FLAG_master_path
+FLAG_client_path
+FLAG_out_dir
+FLAG_rand_seed
 DEFINE_int32(master_num, 1, "Number of master instances (must be > 0)");
 DEFINE_int32(client_num, 1, "Number of client instances (must be > 0)");
-DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
-              "Path to the master executable");
-DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaos_client",
-              "Path to the client executable");
-DEFINE_string(out_dir, "./output", "Directory for log files");
 DEFINE_bool(skip_run, false, "Only generate report, do not run the test");
 DEFINE_int32(run_sec, 100, "Test duration in seconds");
 DEFINE_int32(master_op_prob, 1000, "Probability weight for master operations");
 DEFINE_int32(client_op_prob, 1000, "Probability weight for client operations");
-DEFINE_int32(rand_seed, 0, "Seed for random number generator");
 
 // Custom validators for the flags
 DEFINE_validator(master_num, [](const char* flagname, int32_t value) {
@@ -34,21 +33,21 @@ DEFINE_validator(client_num, [](const char* flagname, int32_t value) {
     return true;
 });
 
-// Function to count occurrences of CHAOS_xxx_STR in a file
-std::map<std::string, int> count_chaos_occurrences(
+// Function to count occurrences of TEST_xxx_STR in a file
+std::map<std::string, int> count_test_string(
     const std::string& filename) {
     std::map<std::string, int> counts;
 
-    // Initialize all CHAOS_xxx_STR to 0
-    counts[mooncake::testing::CHAOS_ERROR_STR] = 0;
-    counts[mooncake::testing::CHAOS_PUT_SUCCESS_STR] = 0;
-    counts[mooncake::testing::CHAOS_PUT_FAILURE_STR] = 0;
-    counts[mooncake::testing::CHAOS_GET_SUCCESS_STR] = 0;
-    counts[mooncake::testing::CHAOS_GET_FAILURE_STR] = 0;
-    counts[mooncake::testing::CHAOS_MOUNT_SUCCESS_STR] = 0;
-    counts[mooncake::testing::CHAOS_MOUNT_FAILURE_STR] = 0;
-    counts[mooncake::testing::CHAOS_UNMOUNT_SUCCESS_STR] = 0;
-    counts[mooncake::testing::CHAOS_UNMOUNT_FAILURE_STR] = 0;
+    // Initialize all TEST_xxx_STR to 0
+    counts[mooncake::testing::TEST_ERROR_STR] = 0;
+    counts[mooncake::testing::TEST_PUT_SUCCESS_STR] = 0;
+    counts[mooncake::testing::TEST_PUT_FAILURE_STR] = 0;
+    counts[mooncake::testing::TEST_GET_SUCCESS_STR] = 0;
+    counts[mooncake::testing::TEST_GET_FAILURE_STR] = 0;
+    counts[mooncake::testing::TEST_MOUNT_SUCCESS_STR] = 0;
+    counts[mooncake::testing::TEST_MOUNT_FAILURE_STR] = 0;
+    counts[mooncake::testing::TEST_UNMOUNT_SUCCESS_STR] = 0;
+    counts[mooncake::testing::TEST_UNMOUNT_FAILURE_STR] = 0;
 
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -76,24 +75,24 @@ void generate_testing_report(int master_num, int client_num,
     std::stringstream report;
     std::map<std::string, int> total_counts;
 
-    // Define the order of CHAOS_xxx_STR as they appear in chaos.h
-    std::vector<std::string> chaos_strings = {
-        mooncake::testing::CHAOS_ERROR_STR,
-        mooncake::testing::CHAOS_PUT_SUCCESS_STR,
-        mooncake::testing::CHAOS_PUT_FAILURE_STR,
-        mooncake::testing::CHAOS_GET_SUCCESS_STR,
-        mooncake::testing::CHAOS_GET_FAILURE_STR,
-        mooncake::testing::CHAOS_MOUNT_SUCCESS_STR,
-        mooncake::testing::CHAOS_MOUNT_FAILURE_STR,
-        mooncake::testing::CHAOS_UNMOUNT_SUCCESS_STR,
-        mooncake::testing::CHAOS_UNMOUNT_FAILURE_STR};
+    // Define the output order of TEST_xxx_STR
+    std::vector<std::string> test_strings = {
+        mooncake::testing::TEST_ERROR_STR,
+        mooncake::testing::TEST_PUT_SUCCESS_STR,
+        mooncake::testing::TEST_PUT_FAILURE_STR,
+        mooncake::testing::TEST_GET_SUCCESS_STR,
+        mooncake::testing::TEST_GET_FAILURE_STR,
+        mooncake::testing::TEST_MOUNT_SUCCESS_STR,
+        mooncake::testing::TEST_MOUNT_FAILURE_STR,
+        mooncake::testing::TEST_UNMOUNT_SUCCESS_STR,
+        mooncake::testing::TEST_UNMOUNT_FAILURE_STR};
 
-    // master's log only has the following chaos strings
-    std::vector<std::string> master_chaos_strings = {
-        mooncake::testing::CHAOS_ERROR_STR};
+    // master's log only has the following test strings
+    std::vector<std::string> master_test_strings = {
+        mooncake::testing::TEST_ERROR_STR};
 
     // Initialize total counts
-    for (const auto& str : chaos_strings) {
+    for (const auto& str : test_strings) {
         total_counts[str] = 0;
     }
 
@@ -101,11 +100,11 @@ void generate_testing_report(int master_num, int client_num,
     for (int i = 0; i < master_num; ++i) {
         std::string filename =
             out_dir + "/master_" + std::to_string(i) + ".err";
-        auto counts = count_chaos_occurrences(filename);
+        auto counts = count_test_string(filename);
 
         report << "=======================\n";
         report << "report: master_" << i << "\n";
-        for (const auto& str : master_chaos_strings) {
+        for (const auto& str : master_test_strings) {
             report << str << " " << counts[str] << "\n";
             total_counts[str] += counts[str];
         }
@@ -116,11 +115,11 @@ void generate_testing_report(int master_num, int client_num,
     for (int i = 0; i < client_num; ++i) {
         std::string filename =
             out_dir + "/client_" + std::to_string(i) + ".err";
-        auto counts = count_chaos_occurrences(filename);
+        auto counts = count_test_string(filename);
 
         report << "=======================\n";
         report << "report: client_" << i << "\n";
-        for (const auto& str : chaos_strings) {
+        for (const auto& str : test_strings) {
             report << str << " " << counts[str] << "\n";
             total_counts[str] += counts[str];
         }
@@ -130,7 +129,7 @@ void generate_testing_report(int master_num, int client_num,
     // Generate summary report
     report << "=======================\n";
     report << "report: summary\n";
-    for (const auto& str : chaos_strings) {
+    for (const auto& str : test_strings) {
         report << str << " " << total_counts[str] << "\n";
     }
 
@@ -163,20 +162,20 @@ int main(int argc, char* argv[]) {
     srand(FLAGS_rand_seed);
 
     if (!FLAGS_skip_run) {
-        std::vector<std::unique_ptr<mooncake::testing::MasterHandler>> masters;
+        std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
         for (int i = 0; i < master_num; ++i) {
             masters.emplace_back(
-                std::make_unique<mooncake::testing::MasterHandler>(
+                std::make_unique<mooncake::testing::MasterProcessHandler>(
                     FLAGS_master_path, 50051 + i, i, FLAGS_out_dir));
             masters.back()->start();
         }
 
-        std::vector<std::unique_ptr<mooncake::testing::ClientHandler>> clients;
+        std::vector<std::unique_ptr<mooncake::testing::ClientProcessHandler>> clients;
         for (int i = 0; i < client_num; ++i) {
             clients.emplace_back(
-                std::make_unique<mooncake::testing::ClientHandler>(
+                std::make_unique<mooncake::testing::ClientProcessHandler>(
                     FLAGS_client_path, FLAGS_out_dir, i));
-            clients.back()->start(mooncake::testing::ChaosClientConfig());
+            clients.back()->start(mooncake::testing::ClientRunnerConfig());
         }
 
         const int kOpProbTotal = FLAGS_master_op_prob + FLAGS_client_op_prob;
@@ -213,7 +212,7 @@ int main(int argc, char* argv[]) {
                 if (clients[index]->is_running()) {
                     clients[index]->kill();
                 } else {
-                    clients[index]->start(mooncake::testing::ChaosClientConfig());
+                    clients[index]->start(mooncake::testing::ClientRunnerConfig());
                 }
             }
             sleep(5);

@@ -67,10 +67,4 @@ target_link_libraries(segment_test PUBLIC
 )
 add_test(NAME segment_test COMMAND segment_test)
 
-# Add include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/
-)
-
 add_subdirectory(e2e)
-add_subdirectory(chaos)

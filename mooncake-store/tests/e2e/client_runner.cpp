@@ -4,17 +4,14 @@
 #include <string>
 #include <vector>
 
-#include "client_test_helper.h"
-#include "chaos_test_helper.h"
+#include "client_wrapper.h"
+#include "process_handler.h"
 #include "types.h"
 #include "utils.h"
+#include "e2e_utils.h"
 
 // Command line flags
-DEFINE_string(metadata_connstring, "http://127.0.0.1:8080/metadata",
-              "Metadata connection string for transfer engine");
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
+USE_engine_flags
 DEFINE_string(master_server_entry, "etcd://0.0.0.0:2379",
               "Master server entry");
 DEFINE_int32(port, 9001, "Port to use for the client");
@@ -69,8 +66,8 @@ class ClientRunner {
     bool CreateClient() {
         std::string hostname = "localhost:" + std::to_string(FLAGS_port);
 
-        auto client_opt = ClientTestWrapper::CreateClient(
-            hostname, FLAGS_metadata_connstring, FLAGS_protocol,
+        auto client_opt = ClientTestWrapper::CreateClientWrapper(
+            hostname, FLAGS_engine_meta_url, FLAGS_protocol,
             FLAGS_device_name, FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
@@ -135,11 +132,11 @@ class ClientRunner {
         ErrorCode error_code = client_->Put(key, value);
 
         if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_PUT_FAILURE_STR << " key=" << key
+            LOG(INFO) << TEST_PUT_FAILURE_STR << " key=" << key
                       << " value=" << value
                       << " error=" << toString(error_code);
         } else {
-            LOG(INFO) << CHAOS_PUT_SUCCESS_STR << " key=" << key
+            LOG(INFO) << TEST_PUT_SUCCESS_STR << " key=" << key
                       << " value=" << value;
         }
     }
@@ -152,17 +149,17 @@ class ClientRunner {
         ErrorCode error_code = client_->Get(key, value);
 
         if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_GET_FAILURE_STR << " key=" << key
+            LOG(INFO) << TEST_GET_FAILURE_STR << " key=" << key
                       << " error=" << toString(error_code);
             return;
         }
 
         if (!verify_kv(key, value)) {
-            LOG(ERROR) << CHAOS_ERROR_STR << " key=" << key
+            LOG(ERROR) << TEST_ERROR_STR << " key=" << key
                        << " value=" << value;
             return;
         } else {
-            LOG(INFO) << CHAOS_GET_SUCCESS_STR << " key=" << key
+            LOG(INFO) << TEST_GET_SUCCESS_STR << " key=" << key
                       << " value=" << value;
         }
     }
@@ -175,12 +172,12 @@ class ClientRunner {
         void *buffer;
         ErrorCode error_code = client_->Mount(kSegmentSize, buffer);
         if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_MOUNT_FAILURE_STR
+            LOG(INFO) << TEST_MOUNT_FAILURE_STR
                       << " error=" << toString(error_code);
             return;
         } else {
             segments_.emplace_back(buffer);
-            LOG(INFO) << CHAOS_MOUNT_SUCCESS_STR << " buffer=" << buffer
+            LOG(INFO) << TEST_MOUNT_SUCCESS_STR << " buffer=" << buffer
                       << " size=" << kSegmentSize;
         }
     }
@@ -193,11 +190,11 @@ class ClientRunner {
         void* base = segments_[index];
         ErrorCode error_code = client_->Unmount(base);
         if (error_code != ErrorCode::OK) {
-            LOG(INFO) << CHAOS_UNMOUNT_FAILURE_STR
+            LOG(INFO) << TEST_UNMOUNT_FAILURE_STR
                       << " error=" << toString(error_code);
         } else {
             segments_.erase(segments_.begin() + index);
-            LOG(INFO) << CHAOS_UNMOUNT_SUCCESS_STR << " buffer=" << base;
+            LOG(INFO) << TEST_UNMOUNT_SUCCESS_STR << " buffer=" << base;
         }
     }
 };

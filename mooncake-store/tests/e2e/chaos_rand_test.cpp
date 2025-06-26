@@ -6,23 +6,19 @@
 #include <memory>
 #include <string>
 
-#include "chaos_test_helper.h"
-#include "client_test_helper.h"
+#include "process_handler.h"
+#include "client_wrapper.h"
 #include "types.h"
 #include "utils.h"
+#include "e2e_utils.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "http://127.0.0.1:8080/metadata",
-              "Metadata connection string for transfer engine");
-DEFINE_string(etcd_endpoints, "localhost:2379", "Etcd endpoints");
-DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
-              "Path to the master executable");
-DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaos_client",
-              "Path to the client executable");
-DEFINE_string(out_dir, "./output", "Directory for log files");
-DEFINE_int32(rand_seed, 0, "Random seed, 0 means use current time as seed");
+// Define flags
+USE_engine_flags;
+FLAG_etcd_endpoints
+FLAG_master_path
+FLAG_client_path
+FLAG_out_dir
+FLAG_rand_seed
 
 constexpr int master_port_base = 50051;
 constexpr int client_port_base = 12888;
@@ -38,15 +34,12 @@ class ChaosRandTest : public ::testing::Test {
 
         FLAGS_logtostderr = 1;
 
-        // Override flags from environment variables if present
-        if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
-        if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
-        if (getenv("MC_METADATA_SERVER"))
-            FLAGS_transfer_engine_metadata_url = getenv("MC_METADATA_SERVER");
-
         LOG(INFO) << "Protocol: " << FLAGS_protocol
                   << ", Device name: " << FLAGS_device_name
-                  << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
+                  << ", Metadata URL: " << FLAGS_engine_meta_url;
+
+        LOG(INFO) << "Random seed: " << FLAGS_rand_seed;
+        srand(FLAGS_rand_seed);
 
         master_view_helper_ = std::make_shared<MasterViewHelper>();
         EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
@@ -56,11 +49,11 @@ class ChaosRandTest : public ::testing::Test {
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
-    static std::shared_ptr<ClientTestWrapper> CreateClient(
+    static std::shared_ptr<ClientTestWrapper> CreateClientWrapper(
         const std::string& host_name) {
-        auto client_opt = ClientTestWrapper::CreateClient(
+        auto client_opt = ClientTestWrapper::CreateClientWrapper(
             host_name,                           // Local hostname
-            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
+            FLAGS_engine_meta_url,  // Metadata connection string
             FLAGS_protocol, FLAGS_device_name,
             "etcd://" + FLAGS_etcd_endpoints);
         EXPECT_TRUE(client_opt.has_value()) << "Failed to create client";
@@ -130,19 +123,10 @@ TEST_F(ChaosRandTest, RandomMasterCrashSmallValue) {
     const int segment_size = 1024 * 1024 * 16;
     const int kv_range = 100;
 
-    unsigned int seed;
-    if (FLAGS_rand_seed == 0) {
-        seed = time(NULL);
-    } else {
-        seed = FLAGS_rand_seed;
-    }
-    LOG(INFO) << "Random seed: " << seed;
-    srand(seed);
-
     // Start masters
-    std::vector<std::unique_ptr<mooncake::testing::MasterHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
+        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
@@ -155,7 +139,7 @@ TEST_F(ChaosRandTest, RandomMasterCrashSmallValue) {
     std::vector<std::vector<void*>> client_segments;
     for (int i = 0; i < client_num; ++i) {
         clients.emplace_back(
-            CreateClient("0.0.0.0:" + std::to_string(client_port_base + i)));
+            CreateClientWrapper("0.0.0.0:" + std::to_string(client_port_base + i)));
         ASSERT_TRUE(clients.back() != nullptr);
         client_segments.emplace_back();
         // Mount a segment
@@ -281,9 +265,9 @@ TEST_F(ChaosRandTest, RandomMasterCrashLargeValue) {
     };
 
     // Start masters
-    std::vector<std::unique_ptr<mooncake::testing::MasterHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterHandler>(
+        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
             FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
@@ -296,7 +280,7 @@ TEST_F(ChaosRandTest, RandomMasterCrashLargeValue) {
     std::vector<std::vector<void*>> client_segments;
     for (int i = 0; i < client_num; ++i) {
         clients.emplace_back(
-            CreateClient("0.0.0.0:" + std::to_string(client_port_base + i)));
+            CreateClientWrapper("0.0.0.0:" + std::to_string(client_port_base + i)));
         ASSERT_TRUE(clients.back() != nullptr);
         client_segments.emplace_back();
         // Mount a segment
@@ -378,3 +362,13 @@ TEST_F(ChaosRandTest, RandomMasterCrashLargeValue) {
 
 }  // namespace testing
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    // Initialize gflags first to parse command line arguments
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    
+    // Initialize Google Test
+    ::testing::InitGoogleTest(&argc, argv);
+    
+    return RUN_ALL_TESTS();
+}
