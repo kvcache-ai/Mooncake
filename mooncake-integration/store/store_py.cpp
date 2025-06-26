@@ -316,15 +316,13 @@ int DistributedObjectStore::allocateSlices(
 }
 
 int DistributedObjectStore::allocateBatchedSlices(
-    std::vector<std::string> &keys,
-    const std::unordered_map<std::string, std::span<const char>> &batches,
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         &batched_slices) {
-    if (batches.empty()) return -1;
-    for (const auto &item : batches) {
+    for (size_t i = 0; i < keys.size(); ++i) {
         uint64_t offset = 0;
-        auto key = item.first;
-        auto value = item.second;
+        const auto &value = values[i];
         std::vector<Slice> slices;
         while (offset < value.size()) {
             auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
@@ -336,8 +334,7 @@ int DistributedObjectStore::allocateBatchedSlices(
             slices.emplace_back(Slice{ptr, chunk_size});
             offset += chunk_size;
         }
-        keys.emplace_back(key);
-        batched_slices.emplace(key, std::move(slices));
+        batched_slices.emplace(keys[i], std::move(slices));
     }
     return 0;
 }
@@ -436,15 +433,18 @@ int DistributedObjectStore::put(const std::string &key,
 }
 
 int DistributedObjectStore::put_batch(
-    const std::unordered_map<std::string, std::span<const char>> &batches) {
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    std::vector<std::string> keys;
+    if (keys.size() != values.size()) {
+        LOG(ERROR) << "Key and value size mismatch";
+    }
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         batched_slices;
-    int ret = allocateBatchedSlices(keys, batches, batched_slices);
+    int ret = allocateBatchedSlices(keys, values, batched_slices);
     if (ret) {
         LOG(ERROR) << "Failed to allocate slices for put_batch operation";
         return ret;
@@ -1051,22 +1051,24 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release unlock;
                  return self.put_parts(key, spans);
              })
-        .def("put_batch", [](DistributedObjectStore &self,
-                             const std::unordered_map<std::string, py::bytes>
-                                 &batches) {
-            std::unordered_map<std::string, std::span<const char>> batches_c;
-            std::vector<std::vector<char>> temp_buffers;
-            for (auto item : batches) {
-                const std::string &key = item.first;
-                const std::string &value = item.second;
-                temp_buffers.emplace_back(value.begin(), value.end());
+        .def(
+            "put_batch",
+            [](DistributedObjectStore &self,
+               const std::vector<std::string> &keys,
+               const std::vector<py::bytes> &py_values) {
+                std::vector<std::string> temp_values;
+                temp_values.reserve(py_values.size());
+                for (const auto &value : py_values) {
+                    temp_values.emplace_back(value.cast<std::string>());
+                }
 
-                batches_c.emplace(
-                    key, std::span<const char>(temp_buffers.back().data(),
-                                               temp_buffers.back().size()));
-            }
+                std::vector<std::span<const char>> spans;
+                spans.reserve(temp_values.size());
+                for (const auto &s : temp_values) {
+                    spans.emplace_back(s.data(), s.size());
+                }
 
-            py::gil_scoped_release release;
-            return self.put_batch(batches_c);
-        });
+                return self.put_batch(keys, spans);
+            },
+            py::arg("keys"), py::arg("values"));
 }

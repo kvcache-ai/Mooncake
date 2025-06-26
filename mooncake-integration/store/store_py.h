@@ -141,8 +141,8 @@ class DistributedObjectStore {
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
-    int put_batch(
-        const std::unordered_map<std::string, std::span<const char>> &batches);
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values);
 
     pybind11::bytes get(const std::string &key);
 
@@ -208,8 +208,8 @@ class DistributedObjectStore {
         std::unordered_map<std::string, uint64_t> &str_length_map);
 
     int allocateBatchedSlices(
-        std::vector<std::string> &keys,
-        const std::unordered_map<std::string, std::span<const char>> &batches,
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
         std::unordered_map<std::string, std::vector<mooncake::Slice>>
             &batched_slices);
 
