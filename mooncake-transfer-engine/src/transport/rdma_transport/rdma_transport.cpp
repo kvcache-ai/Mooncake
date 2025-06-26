@@ -263,7 +263,6 @@ Status RdmaTransport::submitTransfer(
 }
 
 Status RdmaTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
@@ -274,11 +273,12 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark = globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        assert(request_list[index] && task_list[index]);
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
         nr_slices = 0;
+        assert(task.request);
+        auto &request = *task.request;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();

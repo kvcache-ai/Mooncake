@@ -41,7 +41,6 @@ class NvlinkTransport : public Transport {
                           const std::vector<TransferRequest>& entries) override;
 
     Status submitTransferTask(
-        const std::vector<TransferRequest*>& request_list,
         const std::vector<TransferTask*>& task_list) override;
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
