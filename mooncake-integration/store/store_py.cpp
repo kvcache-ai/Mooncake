@@ -314,7 +314,6 @@ int DistributedObjectStore::allocateSlicesPacked(
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
-
     length = 0;
     if (object_info.replica_list.empty()) return -1;
     auto &replica = object_info.replica_list[0];
@@ -719,10 +718,15 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
         LOG(ERROR) << "Internal error: object_info.replica_list is empty";
         return -1;
     }
-    // TODO: for now, we assume replica is memory replica.
+
     auto &replica = object_info.replica_list[0];
-    for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
-        total_size += handle.size_;
+    if(replica.is_memory_replica() == false) {
+        auto &disk_descriptor = replica.get_disk_descriptor();
+        total_size = disk_descriptor.file_size;
+    }else{
+        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+            total_size += handle.size_;
+        }
     }
 
     // Check if user buffer is large enough
@@ -736,12 +740,19 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
 
-    // TODO: for now, we assume replica is memory replica.
-    for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
-        auto chunk_size = handle.size_;
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
+    if(replica.is_memory_replica() == false) {
+        while(offset < total_size){
+            auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+    }else{
+        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            slices.emplace_back(Slice{chunk_ptr, handle.size_});
+            offset += handle.size_;
+        }
     }
 
     // Step 3: Read data directly into user buffer
