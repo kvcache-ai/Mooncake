@@ -79,8 +79,8 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
                 Json::Value rkeyJSON(Json::arrayValue);
                 for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
                 if (!buffer.rkey.empty()) bufferJSON["rkey"] = rkeyJSON;
-                if (!buffer.shared_handle.empty())
-                    bufferJSON["shared_handle"] = buffer.shared_handle;
+                if (!buffer.shm_path.empty())
+                    bufferJSON["shm_path"] = buffer.shm_path;
                 buffersJSON.append(bufferJSON);
             }
             if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
@@ -136,7 +136,7 @@ static std::shared_ptr<SegmentDesc> importSegmentDesc(
                     buffer.length = getItemUInt64(bufferJSON, "length");
                     for (const auto &rkeyJSON : bufferJSON["rkey"])
                         buffer.rkey.push_back(rkeyJSON.asUInt());
-                    buffer.shared_handle = getItem(bufferJSON, "shared_handle");
+                    buffer.shm_path = getItem(bufferJSON, "shm_path");
                     if (buffer.location.empty() || !buffer.addr ||
                         !buffer.length ||
                         detail.devices.size() != buffer.rkey.size()) {

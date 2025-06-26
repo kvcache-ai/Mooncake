@@ -206,7 +206,7 @@ Status ShmTransport::registerLocalMemory(
         desc.addr = (uint64_t)buffer.addr;
         desc.length = buffer.length;
         desc.location = buffer.location;
-        desc.shared_handle = buffer.shm_path;
+        desc.shm_path = buffer.shm_path;
         current_buffer_list.push_back(desc);
     }
     return manager.synchronizeLocal();
@@ -293,16 +293,16 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : detail.buffers) {
-        if (!entry.shared_handle.empty() && entry.addr <= dest_addr &&
+        if (!entry.shm_path.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             std::lock_guard<std::mutex> lock(relocate_mutex_);
             if (!relocate_map_.count(entry.addr)) {
                 int shm_fd =
-                    shm_open(entry.shared_handle.c_str(), O_RDWR, 0644);
+                    shm_open(entry.shm_path.c_str(), O_RDWR, 0644);
                 if (shm_fd < 0) {
                     return Status::InternalError(
                         std::string("Failed to open shared memory file ") +
-                        entry.shared_handle + LOC_MARK);
+                        entry.shm_path + LOC_MARK);
                 }
                 auto shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
                                      MAP_SHARED, shm_fd, 0);

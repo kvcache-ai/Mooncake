@@ -192,7 +192,7 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
     int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : detail.buffers) {
-        if (!entry.shared_handle.empty() && entry.addr <= dest_addr &&
+        if (entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             rpc_server_addr = detail.rpc_server_addr;
             return Status::OK();

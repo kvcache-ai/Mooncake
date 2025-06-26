@@ -46,14 +46,15 @@ struct DeviceDesc {
 enum class MemBufferType { RDMA, SHM, NVLINK, TCP, UNKNOWN };
 
 struct BufferDesc {
-    std::string location;
     uint64_t addr;
     uint64_t length;
+    std::string location;
+    std::vector<uint32_t> rkey;
+    std::string shm_path;
+    std::string mnnvl_handle;
+    int ref_count;
+
     MemBufferType type;
-    int device_id;               // numa id for DRAM, GPU device id for VRAM
-    std::vector<uint32_t> rkey;  // rkey for each RDMA device change to map ...
-    std::string shared_handle;   // shm path for IPC/CXL, or serialized shared
-                                 // handle for NVLINK
 };
 
 struct FileBufferDesc {
@@ -79,15 +80,6 @@ struct SegmentDesc {
     std::string name;
     SegmentType type;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
-    RWSpinlock lock_;
-
-   public:
-    bool isMemoryType() const { return type == SegmentType::Memory; }
-
-    Status query(uint64_t base, size_t length, std::vector<BufferDesc> &result);
-
-    Status update(uint64_t base, size_t length,
-                  std::function<void(BufferDesc &)> on_update);
 };
 
 using SegmentDescRef = std::shared_ptr<SegmentDesc>;
@@ -131,6 +123,30 @@ class SegmentManager {
     SegmentDescRef local_desc_;
 
     std::unique_ptr<MetadataStore> store_;
+};
+
+class LocalSegmentHelper {
+   public:
+    LocalSegmentHelper(SegmentDescRef &local_desc) : local_desc_(local_desc) {}
+
+    ~LocalSegmentHelper() {}
+
+    LocalSegmentHelper(const LocalSegmentHelper &) = delete;
+    LocalSegmentHelper &operator==(const LocalSegmentHelper &) = delete;
+
+   public:
+    Status query(uint64_t base, size_t length, std::vector<BufferDesc *> &result);
+
+    Status add(uint64_t base, size_t length,
+               std::function<Status(BufferDesc &)> callback);
+
+    Status remove(uint64_t base, size_t length,
+                  std::function<Status(BufferDesc &)> callback);
+
+    Status update(std::function<Status(BufferDesc &)> callback);
+
+   private:
+    SegmentDescRef local_desc_;
 };
 
 }  // namespace v1

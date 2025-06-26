@@ -106,75 +106,75 @@ Status SegmentManager::deleteLocal() {
     return store_->deleteSegmentDesc(local_desc_->name);
 }
 
-Status SegmentDesc::query(uint64_t base, size_t length,
-                          std::vector<BufferDesc> &result) {
-    RWSpinlock::ReadGuard guard(lock_);
-    auto &detail_cast = std::get<MemorySegmentDesc>(detail);
-    result.clear();
-    uint64_t current = base;
-    for (auto &entry : detail_cast.buffers) {
-        uint64_t entry_end = entry.addr + entry.length;
-        // check if it is non-overlapped
-        if (entry_end <= base) continue;
-        if (entry.addr >= base + length) break;
-        // first buffer
-        if (current < entry.addr)
-            return Status::InvalidArgument("Query segment hole existed");
-        auto new_current = std::min(base + length, entry_end);
-        if (new_current - current > 0) {
-            result.push_back(entry);
-            current = new_current;
+Status LocalSegmentHelper::query(uint64_t base, size_t length,
+                                 std::vector<BufferDesc *> &result) {
+    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    assert(length);
+    for (auto &buf : detail.buffers) {
+        if (buf.addr > base) continue;
+        if (buf.addr + buf.length <= base) break;
+        result.push_back(&buf);
+        if (buf.addr + buf.length >= base + length) {
+            return Status::OK();
+        } else {
+            auto new_base = buf.addr + buf.length;
+            auto new_length = base + length - new_base;
+            return query(new_base, new_length, result);
         }
     }
-    if (current < base + length)
-        return Status::InvalidArgument("Query segment hole existed");
+    return Status::InvalidArgument("Some buffers are not registered");
+}
+
+Status LocalSegmentHelper::add(uint64_t base, size_t length,
+                               std::function<Status(BufferDesc &)> callback) {
+    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    for (auto &buf : detail.buffers) {
+        if (buf.addr == base && buf.length == length) {
+            buf.ref_count++;
+            return Status::OK();
+        }
+    }
+    BufferDesc new_desc;
+    new_desc.addr = base;
+    new_desc.length = length;
+    new_desc.type = MemBufferType::UNKNOWN;
+    new_desc.ref_count = 1;
+    auto status = callback(new_desc);
+    if (!status.ok()) return status;
+    detail.buffers.push_back(new_desc);
+    std::sort(detail.buffers.begin(), detail.buffers.end(),
+              [](const BufferDesc &lhs, BufferDesc &rhs) -> bool {
+                  if (lhs.addr < rhs.addr) return true;
+                  if (lhs.addr > rhs.addr) return false;
+                  return lhs.length > rhs.length;  // prefer large interval
+              });
     return Status::OK();
 }
 
-Status SegmentDesc::update(
+Status LocalSegmentHelper::remove(
     uint64_t base, size_t length,
-    std::function<void(BufferDesc &)> on_update_callback) {
-    RWSpinlock::WriteGuard guard(lock_);
-    auto &detail_cast = std::get<MemorySegmentDesc>(detail);
-    uint64_t current = base;
-    std::vector<BufferDesc> to_insert;
-    for (auto &entry : detail_cast.buffers) {
-        uint64_t entry_end = entry.addr + entry.length;
-        // check if it is non-overlapped
-        if (entry_end <= base) continue;
-        if (entry.addr >= base + length) break;
-        // first buffer
-        if (current < entry.addr) {
-            BufferDesc desc;
-            desc.addr = current;
-            desc.length = entry.addr - current;
-            desc.type = MemBufferType::UNKNOWN;
-            on_update_callback(desc);
-            to_insert.push_back(desc);
-        }
-        auto new_current = std::min(base + length, entry_end);
-        if (new_current - current > 0) {
-            on_update_callback(entry);
-            current = new_current;
+    std::function<Status(BufferDesc &)> callback) {
+    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    for (auto it = detail.buffers.begin(); it != detail.buffers.end(); ++it) {
+        if (it->addr == base && it->length == length) {
+            it->ref_count--;
+            Status status = Status::OK();
+            if (it->ref_count == 0) {
+                status = callback(*it);
+                detail.buffers.erase(it);
+            }
+            return status;
         }
     }
+    return Status::OK();
+}
 
-    if (current < base + length) {
-        BufferDesc desc;
-        desc.addr = current;
-        desc.length = base + length - current;
-        desc.type = MemBufferType::UNKNOWN;
-        on_update_callback(desc);
-        to_insert.push_back(desc);
-    }
-
-    if (!to_insert.empty()) {
-        detail_cast.buffers.insert(detail_cast.buffers.end(), to_insert.begin(),
-                                   to_insert.end());
-        std::sort(detail_cast.buffers.begin(), detail_cast.buffers.end(),
-                  [](const BufferDesc &lhs, const BufferDesc &rhs) {
-                      return lhs.addr < rhs.addr;
-                  });
+Status LocalSegmentHelper::update(
+    std::function<Status(BufferDesc &)> callback) {
+    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    for (auto &buf : detail.buffers) {
+        auto status = callback(buf);
+        if (!status.ok()) return status;
     }
     return Status::OK();
 }
