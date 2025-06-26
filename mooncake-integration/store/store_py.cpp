@@ -743,13 +743,13 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     if(replica.is_memory_replica() == false) {
         while(offset < total_size){
             auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
     }else{
         for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, handle.size_});
             offset += handle.size_;
         }
