@@ -99,7 +99,6 @@ Status ShmTransport::uninstall() {
     if (installed_) {
         workers_->stop();
         workers_.reset();
-        metadata_->segmentManager().deleteLocal();
         metadata_.reset();
         installed_ = false;
     }
@@ -210,8 +209,7 @@ Status ShmTransport::registerLocalMemory(
         desc.shared_handle = buffer.shm_path;
         current_buffer_list.push_back(desc);
     }
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status ShmTransport::unregisterLocalMemory(
@@ -229,8 +227,7 @@ Status ShmTransport::unregisterLocalMemory(
             }
         }
     }
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status ShmTransport::setupLocalSegment() { return Status::OK(); }

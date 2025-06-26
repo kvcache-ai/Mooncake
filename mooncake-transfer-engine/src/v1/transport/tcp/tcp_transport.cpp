@@ -54,7 +54,6 @@ Status TcpTransport::install(std::string &local_segment_name,
 
 Status TcpTransport::uninstall() {
     if (installed_) {
-        metadata_->segmentManager().deleteLocal();
         metadata_.reset();
         installed_ = false;
     }
@@ -136,8 +135,7 @@ Status TcpTransport::registerLocalMemory(
         desc.location = buffer.location;
         current_buffer_list.push_back(desc);
     }
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status TcpTransport::unregisterLocalMemory(
@@ -155,8 +153,7 @@ Status TcpTransport::unregisterLocalMemory(
             }
         }
     }
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status TcpTransport::setupLocalSegment() { return Status::OK(); }

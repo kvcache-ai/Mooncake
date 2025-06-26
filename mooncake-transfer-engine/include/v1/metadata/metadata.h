@@ -32,98 +32,10 @@
 #include "v1/metadata/plugin.h"
 #include "v1/utility/rpc.h"
 #include "v1/utility/topology.h"
+#include "v1/metadata/segment.h"
 
 namespace mooncake {
 namespace v1 {
-using SegmentID = uint64_t;
-
-struct DeviceDesc {
-    std::string name;
-    uint16_t lid;
-    std::string gid;
-};
-
-enum class MemBufferType { RDMA, SHM, NVLINK, TCP };
-
-struct BufferDesc {
-    std::string location;
-    uint64_t addr;
-    uint64_t length;
-    MemBufferType type;
-    int device_id;               // numa id for DRAM, GPU device id for VRAM
-    std::vector<uint32_t> rkey;  // rkey for each RDMA device change to map ...
-    std::string shared_handle;   // shm path for IPC/CXL, or serialized shared
-                                 // handle for NVLINK
-};
-
-struct FileBufferDesc {
-    std::string path;
-    uint64_t length;
-    uint64_t offset;
-};
-
-struct MemorySegmentDesc {
-    Topology topology;
-    std::vector<DeviceDesc> devices;  // TODO: change to map ...
-    std::vector<BufferDesc> buffers;
-    std::string rpc_server_addr;
-};
-
-struct FileSegmentDesc {
-    std::vector<FileBufferDesc> buffers;
-};
-
-enum class SegmentType { Memory, File };
-
-struct SegmentDesc {
-    std::string name;
-    SegmentType type;
-    std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
-};
-
-using SegmentDescRef = std::shared_ptr<SegmentDesc>;
-
-class MetadataStore;
-
-class SegmentManager {
-   public:
-    SegmentManager(std::unique_ptr<MetadataStore> agent);
-
-    ~SegmentManager();
-
-    SegmentManager(const SegmentManager &) = delete;
-    SegmentManager &operator=(const SegmentManager &) = delete;
-
-   public:
-    Status openRemote(SegmentID &handle, const std::string &segment_name);
-
-    Status closeRemote(SegmentID handle);
-
-    Status getRemote(SegmentDescRef &desc, SegmentID handle);
-
-    Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
-
-    Status invalidateRemote(SegmentID handle);
-
-    SegmentDescRef getLocal() { return local_desc_; }
-
-    void setLocal(const SegmentDescRef &desc) { local_desc_ = desc; }
-
-    Status applyLocal();
-
-    Status deleteLocal();
-
-   private:
-    RWSpinlock lock_;
-    std::unordered_map<SegmentID, SegmentDescRef> id_to_desc_map_;
-    std::unordered_map<SegmentID, std::string> id_to_name_map_;
-    std::unordered_map<std::string, SegmentID> name_to_id_map_;
-    std::atomic<SegmentID> next_id_;
-    SegmentDescRef local_desc_;
-    std::unique_ptr<MetadataStore> store_;
-    std::atomic<int> xport_ref_cnt_;
-};
-
 class MetadataStore {
    public:
     MetadataStore() {}

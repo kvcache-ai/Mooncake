@@ -30,13 +30,13 @@
 #include "v1/utility/memory_location.h"
 #include "v1/utility/topology.h"
 
-#define SET_DEVICE(key, param)    \
+#define SET_DEVICE(key, param) \
     param = conf->get("transports/rdma/device/" #key, param)
 
-#define SET_ENDPOINT(key, param)    \
+#define SET_ENDPOINT(key, param) \
     param = conf->get("transports/rdma/endpoint/" #key, param)
 
-#define SET_WORKERS(key, param)    \
+#define SET_WORKERS(key, param) \
     param = conf->get("transports/rdma/workers/" #key, param)
 
 namespace mooncake {
@@ -148,7 +148,6 @@ Status RdmaTransport::install(std::string &local_segment_name,
 Status RdmaTransport::uninstall() {
     if (installed_) {
         workers_.reset();
-        metadata_->segmentManager().deleteLocal();
         metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
@@ -269,8 +268,7 @@ Status RdmaTransport::registerLocalMemory(
     }
     auto desc = metadata_->segmentManager().getLocal();
     local_buffer_manager_.fillBufferDesc(desc);
-    metadata_->segmentManager().setLocal(desc);
-    return metadata_->segmentManager().applyLocal();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 Status RdmaTransport::unregisterLocalMemory(
@@ -292,8 +290,7 @@ Status RdmaTransport::unregisterLocalMemory(
     }
     auto desc = metadata_->segmentManager().getLocal();
     local_buffer_manager_.fillBufferDesc(desc);
-    metadata_->segmentManager().setLocal(desc);
-    return metadata_->segmentManager().applyLocal();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 Status RdmaTransport::setupLocalSegment() {
@@ -308,20 +305,16 @@ Status RdmaTransport::setupLocalSegment() {
         device_desc.gid = context->gid();
         detail.devices.push_back(device_desc);
     }
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
                                                 bool update_meta) {
     Status status = local_buffer_manager_.addBuffer(buffer);
-    if (!status.ok()) return status;
-    if (!update_meta) return Status::OK();
-
+    if (!update_meta || !status.ok()) return status;
     auto desc = metadata_->segmentManager().getLocal();
     local_buffer_manager_.fillBufferDesc(desc);
-    metadata_->segmentManager().setLocal(desc);
-    return metadata_->segmentManager().applyLocal();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
@@ -329,13 +322,11 @@ Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
     AddressRange range;
     range.addr = buffer.addr;
     range.length = buffer.length;
-    local_buffer_manager_.removeBuffer(range);
-    if (!update_meta) return Status::OK();
-
+    Status status = local_buffer_manager_.removeBuffer(range);
+    if (!update_meta || !status.ok()) return status;
     auto desc = metadata_->segmentManager().getLocal();
     local_buffer_manager_.fillBufferDesc(desc);
-    metadata_->segmentManager().setLocal(desc);
-    return metadata_->segmentManager().applyLocal();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,

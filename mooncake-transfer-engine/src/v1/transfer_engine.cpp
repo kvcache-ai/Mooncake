@@ -87,14 +87,13 @@ void setLogLevel(const std::string level) {
 
 Status TransferEngine::setupLocalSegment() {
     auto &manager = metadata_->segmentManager();
-    auto segment = std::make_shared<SegmentDesc>();
+    auto segment = manager.getLocal();
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
     auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
     detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
-    manager.setLocal(segment);
-    return manager.applyLocal();
+    return manager.synchronizeLocal();
 }
 
 Status TransferEngine::construct() {
@@ -103,12 +102,16 @@ Status TransferEngine::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
+    port_ = conf_->get("rpc_server_port", 0);
+    transport_list_.resize(kSupportedTransportTypes, nullptr);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
         CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
-    port_ = conf_->get("rpc_server_port", 0);
+    topology_ = std::make_shared<Topology>();
+    CHECK_STATUS(topology_->discover(conf_));
+
     metadata_ =
         std::make_shared<MetadataService>(metadata_type, metadata_servers);
 
@@ -119,8 +122,6 @@ Status TransferEngine::construct() {
     else if (local_segment_name_.empty())
         local_segment_name_ = randomSegmentName();
 
-    topology_ = std::make_shared<Topology>();
-    CHECK_STATUS(topology_->discover(conf_));
     CHECK_STATUS(setupLocalSegment());
 
     LOG(INFO) << "========== Transfer Engine Parameters ==========";
@@ -131,7 +132,6 @@ Status TransferEngine::construct() {
     LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
     LOG(INFO) << "================================================";
 
-    transport_list_.resize(kSupportedTransportTypes, nullptr);
     if (!topology_->getHcaList().empty()) {
         auto transport = std::make_shared<RdmaTransport>();
         CHECK_STATUS(transport->install(local_segment_name_, metadata_,
@@ -143,8 +143,9 @@ Status TransferEngine::construct() {
 }
 
 Status TransferEngine::deconstruct() {
-    metadata_.reset();
     transport_list_.clear();
+    metadata_->segmentManager().deleteLocal();
+    metadata_.reset();
     for (auto &batch : batch_set_) delete batch;
     batch_set_.clear();
     deferred_free_batch_set_.clear();
