@@ -623,6 +623,16 @@ ErrorCode Client::BatchPut(
         return err;
     }
 
+    // Put to local file
+    for(const auto& key : keys) {
+        auto slices_it = batched_slices.find(key);
+        if (slices_it == batched_slices.end()) {
+            LOG(ERROR) << "Cannot find slices for key: " << key;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        PutToLocalFile(key, slices_it->second);
+    }
+
     VLOG(1) << "BatchPut completed successfully for " << keys.size()
             << " keys with " << pending_transfers.size() << " total transfers";
     return ErrorCode::OK;
