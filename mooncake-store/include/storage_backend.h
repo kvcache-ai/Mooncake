@@ -22,22 +22,22 @@ class StorageBackend  {
     /**
      * @brief Constructs a new StorageBackend instance
      * @param root_dir Root directory path for object storage
-     * @param session_id Unique session identifier for subdirectory
+     * @param fsdir  subdirectory name
      * @note Directory existence is not checked in constructor
      */
-    explicit StorageBackend(const std::string& root_dir, const std::string& session_id): root_dir_(root_dir), session_id_(session_id) {}
+    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir): root_dir_(root_dir), fsdir_(fsdir) {}
 
     /**
      * @brief Factory method to create a StorageBackend instance
      * @param root_dir Root directory path for object storage
-     * @param session_id Unique session identifier for subdirectory
+     * @param fsdir  subdirectory name
      * @return shared_ptr to new instance or nullptr if directory is invalid
      * 
      * Performs validation of the root directory before creating the instance:
      * - Verifies directory exists
      * - Verifies path is actually a directory
      */
-    static std::shared_ptr<StorageBackend> Create(const std::string& root_dir, const std::string& session_id) {
+    static std::shared_ptr<StorageBackend> Create(const std::string& root_dir, const std::string& fsdir) {
         namespace fs = std::filesystem;
         if (!fs::exists(root_dir)) {
             LOG(INFO) << "Root directory does not exist: " << root_dir;
@@ -45,12 +45,12 @@ class StorageBackend  {
         } else if (!fs::is_directory(root_dir)) {
             LOG(INFO) << "Root path is not a directory: " << root_dir;
             return nullptr;
-        } else if (session_id.empty()) {
-            LOG(INFO) << "Session ID cannot be empty";
+        } else if (fsdir.empty()) {
+            LOG(INFO) << "FSDIR cannot be empty";
             return nullptr;
         }
-        std::string real_session_id = "moon_" + session_id;
-        return std::make_shared<StorageBackend>(root_dir, real_session_id);
+        std::string real_fsdir = "moon_" + fsdir;
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir);
     }  
     
     /**
@@ -118,13 +118,13 @@ class StorageBackend  {
     /**
      * @brief Deletes all objects from the storage backend
      * 
-     * Removes all files in the session subdirectory.
+     * Removes all files in the cluster subdirectory.
      */
     void RemoveAll() ;
 
-    // Root directory path for storage and session ID for subdirectory
+    // Root directory path for storage and  subdirectory name
     std::string root_dir_;
-    std::string session_id_;
+    std::string fsdir_;
     
    private:
     /**

@@ -63,7 +63,7 @@ class MasterService {
                       DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                   ViewVersionId view_version = 0,
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-                  bool enable_ha = false);
+                  bool enable_ha = false, const std::string &cluster_id = DEFAULT_CLUSTER_ID);
     ~MasterService();
 
     /**
@@ -243,10 +243,10 @@ class MasterService {
                    ClientStatus& client_status);
 
     /**
-     * @brief Get the master service session ID
-     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if session ID is not set
+     * @brief Get the master service cluster ID to use as subdirectory name
+     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID is not set
      */
-    ErrorCode GetSessionId(std::string& session_id) const; 
+    ErrorCode GetFsdir(std::string& fsdir) const; 
 
    private:
     // GC thread function
@@ -338,9 +338,6 @@ class MasterService {
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
-    // session id for persistent sub directory
-    std::string session_id_;
-
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
        public:
@@ -415,6 +412,9 @@ class MasterService {
 
     // if high availability features enabled
     const bool enable_ha_;
+
+    // cluster id for persistent sub directory
+    const std::string cluster_id_;
 };
 
 }  // namespace mooncake

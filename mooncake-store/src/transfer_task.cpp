@@ -13,7 +13,7 @@ namespace mooncake {
 // FilereadWorkerPool Implementation
 // ============================================================================
 //to fully utilize the available ssd bandwidth, we use a default of 8 worker threads.
-constexpr int kDefaultFilereadWorkers = 4;
+constexpr int kDefaultFilereadWorkers = 8;
 
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend) : shutdown_(false) {
     VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers

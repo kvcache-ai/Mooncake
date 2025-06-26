@@ -222,13 +222,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     LOG(INFO) << "Connect to Master success";
 
     // Initialize storage backend if storage_root_dir is provided
-    auto response = client->master_client_.GetSessionId();
+    auto response = client->master_client_.GetFsdir();
     if(storage_root_dir.empty()) {
         LOG(INFO) << "Storage root directory is not set. persisting data is disabled.";
     }else{
         LOG(INFO) << "Storage root directory is: " << storage_root_dir;
         // Initialize storage backend
-        client->PrepareStorageBackend(storage_root_dir, response.session_id);
+        client->PrepareStorageBackend(storage_root_dir, response.fsdir);
     }
 
     // Initialize transfer engine
@@ -789,9 +789,9 @@ ErrorCode Client::BatchIsExist(const std::vector<std::string>& keys,
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir, 
-                                   const std::string& session_id) {
+                                   const std::string& fsdir) {
     // Initialize storage backend
-    storage_backend_ = StorageBackend::Create(storage_root_dir, session_id);
+    storage_backend_ = StorageBackend::Create(storage_root_dir, fsdir);
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
     }

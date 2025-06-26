@@ -264,7 +264,7 @@ std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
     
     // Safely construct path using std::filesystem
     namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(root_dir_) / session_id_ / std::string(1, dir1) / std::string(1, dir2);
+    fs::path dir_path = fs::path(root_dir_) / fsdir_ / std::string(1, dir1) / std::string(1, dir2);
 
     // Create directory if not exists
     std::error_code ec;

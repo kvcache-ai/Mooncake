@@ -230,7 +230,7 @@ class Client {
     /**
      * @brief Prepare and use the storage backend for persisting data
      */
-    void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& session_id);
+    void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& fsdir);
 
     ErrorCode GetFromLocalFile(const std::string& object_key,
                              std::vector<Slice>& slices, ObjectInfo& object_info);

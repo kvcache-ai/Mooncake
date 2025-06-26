@@ -474,17 +474,17 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
     return result.value();
 }
 
-GetSessionIdResponse MasterClient::GetSessionId() {
-    ScopedVLogTimer timer(1, "MasterClient::GetSessionId");
-    timer.LogRequest("action=get_session_id");
+GetFsdirResponse MasterClient::GetFsdir() {
+    ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
+    timer.LogRequest("action=get_fsdir");
 
     auto request_result =
-        client_.send_request<&WrappedMasterService::GetSessionId>();
-    std::optional<GetSessionIdResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetSessionIdResponse>> {
+        client_.send_request<&WrappedMasterService::GetFsdir>();
+    std::optional<GetFsdirResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetFsdirResponse>> {
             auto result = co_await co_await request_result;
             if (!result) {
-                LOG(ERROR) << "Failed to get session id: "
+                LOG(ERROR) << "Failed to get fsdir: "
                           << result.error().msg;
                 co_return std::nullopt;
             }
@@ -492,7 +492,7 @@ GetSessionIdResponse MasterClient::GetSessionId() {
         }());
 
     if (!result) {
-        auto response = GetSessionIdResponse{{}, ErrorCode::RPC_FAIL};
+        auto response = GetFsdirResponse{{}, ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

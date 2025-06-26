@@ -168,10 +168,10 @@ class MasterClient {
                                                         const UUID& client_id);
 
     /**
-     * @brief Gets the session ID for the current client
-     * @return GetSessionIdResponse containing the session ID
+     * @brief Gets the cluster ID for the current client to use as subdirectory name
+     * @return GetClusterIdResponse containing the cluster ID
      */    
-    [[nodiscard]] GetSessionIdResponse GetSessionId();
+    [[nodiscard]] GetFsdirResponse GetFsdir();
 
     /**
      * @brief Pings master to check its availability

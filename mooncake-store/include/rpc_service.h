@@ -90,11 +90,11 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
-struct GetSessionIdResponse {
-    std::string session_id;
+struct GetFsdirResponse {
+    std::string fsdir;
     ErrorCode error_code = ErrorCode::OK;
 };
-YLT_REFL(GetSessionIdResponse, error_code, session_id)
+YLT_REFL(GetFsdirResponse, error_code, fsdir)
 
 struct PingResponse {
     ViewVersionId view_version = 0;
@@ -120,10 +120,11 @@ class WrappedMasterService {
             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
         ViewVersionId view_version = 0,
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false)
+        bool enable_ha = false,
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
                           eviction_high_watermark_ratio, view_version,
-                          client_live_ttl_sec, enable_ha),
+                          client_live_ttl_sec, enable_ha, cluster_id),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
           view_version_(view_version) {
@@ -548,14 +549,14 @@ class WrappedMasterService {
         return response;
     }
 
-    GetSessionIdResponse GetSessionId() {
-        ScopedVLogTimer timer(1, "GetSessionId");
-        timer.LogRequest("action=get_session_id");
+    GetFsdirResponse GetFsdir() {
+        ScopedVLogTimer timer(1, "GetFsdir");
+        timer.LogRequest("action=get_fsdir");
 
-        GetSessionIdResponse response;
-        std::string session_id;
-        response.error_code = master_service_.GetSessionId(session_id);
-        response.session_id = std::move(session_id);
+        GetFsdirResponse response;
+        std::string fsdir;
+        response.error_code = master_service_.GetFsdir(fsdir);
+        response.fsdir = std::move(fsdir);
 
         timer.LogResponseJson(response);
         return response;
@@ -619,7 +620,7 @@ inline void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetSessionId>(
+    server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
