@@ -27,19 +27,19 @@ MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
 }
 
 MemcpyWorkerPool::~MemcpyWorkerPool() {
-    // Signal shutdown
+    // Request stop for all worker threads
+    for (auto& worker : workers_) {
+        worker.request_stop();
+    }
+    
+    // Signal shutdown and notify all waiting threads
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         shutdown_.store(true);
     }
     queue_cv_.notify_all();
 
-    // Wait for all workers to finish
-    for (auto& worker : workers_) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
+    // std::jthread automatically joins in destructor, no need for explicit join
 
     VLOG(1) << "MemcpyWorkerPool destroyed";
 }
@@ -58,20 +58,20 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
     queue_cv_.notify_one();
 }
 
-void MemcpyWorkerPool::workerThread() {
+void MemcpyWorkerPool::workerThread(std::stop_token stop_token) {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
 
     while (true) {
         MemcpyTask task({}, nullptr);
 
-        // Wait for task or shutdown signal
+        // Wait for task, shutdown signal, or stop request
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return shutdown_.load() || !task_queue_.empty();
+            queue_cv_.wait(lock, [this, &stop_token] {
+                return stop_token.stop_requested() || shutdown_.load() || !task_queue_.empty();
             });
 
-            if (shutdown_.load() && task_queue_.empty()) {
+            if ((stop_token.stop_requested() || shutdown_.load()) && task_queue_.empty()) {
                 break;
             }
 

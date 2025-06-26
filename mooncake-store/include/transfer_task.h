@@ -250,9 +250,9 @@ class MemcpyWorkerPool {
     void submitTask(MemcpyTask task);
 
    private:
-    void workerThread();
+    void workerThread(std::stop_token stop_token);
 
-    std::vector<std::thread> workers_;
+    std::vector<std::jthread> workers_;
     std::queue<MemcpyTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;

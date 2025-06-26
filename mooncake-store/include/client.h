@@ -251,9 +251,8 @@ class Client {
 
     // For high availability
     MasterViewHelper master_view_helper_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
+    std::jthread ping_thread_;
+    void PingThreadFunc(std::stop_token stop_token);
 
     // Client identification
     UUID client_id_;

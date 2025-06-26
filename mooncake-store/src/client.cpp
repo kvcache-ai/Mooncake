@@ -57,12 +57,8 @@ Client::~Client() {
     }
 
     // Stop ping thread only after no need to contact master anymore
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
-    }
+    // std::jthread automatically joins in destructor, but we request stop explicitly
+    ping_thread_.request_stop();
 }
 
 static bool get_auto_discover() {
@@ -147,8 +143,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         // Start Ping thread to monitor master view changes and remount segments
         // if needed
-        ping_running_ = true;
-        ping_thread_ = std::thread(&Client::PingThreadFunc, this);
+        ping_thread_ = std::jthread(&Client::PingThreadFunc, this);
 
         return ErrorCode::OK;
     } else {
@@ -719,7 +714,7 @@ ErrorCode Client::TransferRead(
     return TransferData(handles, slices, TransferRequest::READ);
 }
 
-void Client::PingThreadFunc() {
+void Client::PingThreadFunc(std::stop_token stop_token) {
     // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -748,7 +743,7 @@ void Client::PingThreadFunc() {
     // Use another thread to remount segments to avoid blocking the ping thread
     std::future<void> remount_segment_future;
 
-    while (ping_running_) {
+    while (!stop_token.stop_requested()) {
         // Join the remount segment thread if it is ready
         if (remount_segment_future.valid() &&
             remount_segment_future.wait_for(std::chrono::seconds(0)) ==
