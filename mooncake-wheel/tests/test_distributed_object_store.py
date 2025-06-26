@@ -187,6 +187,136 @@ class TestDistributedObjectStore(unittest.TestCase):
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_batch_get_into_operations(self):
+        """Test batch_get_into operations for multiple keys."""
+        import ctypes
+
+        # Test data
+        batch_size = 3
+        test_data = [
+            b"Hello, Batch World 1! " * 100,  # ~2.3KB
+            b"Hello, Batch World 2! " * 200,  # ~4.6KB
+            b"Hello, Batch World 3! " * 150,  # ~3.5KB
+        ]
+        keys = [f"test_batch_get_into_key_{i}" for i in range(batch_size)]
+
+        # First, put the test data using regular put operations
+        for i, (key, data) in enumerate(zip(keys, test_data)):
+            result = self.store.put(key, data)
+            self.assertEqual(result, 0, f"Failed to put data for key {key}")
+
+        # Allocate and register buffers for batch_get_into
+        buffers = []
+        buffer_ptrs = []
+        buffer_sizes = []
+
+        for data in test_data:
+            buffer_size = len(data) + 1024  # Extra space for safety
+            buffer = (ctypes.c_ubyte * buffer_size)()
+            buffer_ptr = ctypes.addressof(buffer)
+
+            # Register buffer
+            result = self.store.register_buffer(buffer_ptr, buffer_size)
+            self.assertEqual(result, 0, "Buffer registration should succeed")
+
+            buffers.append(buffer)
+            buffer_ptrs.append(buffer_ptr)
+            buffer_sizes.append(buffer_size)
+
+        # Test batch_get_into
+        results = self.store.batch_get_into(keys, buffer_ptrs, buffer_sizes)
+
+        # Verify results
+        self.assertEqual(len(results), batch_size, "Should return result for each key")
+
+        for i, (expected_data, buffer, result) in enumerate(zip(test_data, buffers, results)):
+            self.assertGreater(result, 0, f"batch_get_into should succeed for key {keys[i]}")
+            self.assertEqual(result, len(expected_data), f"Should read correct number of bytes for key {keys[i]}")
+
+            # Verify data integrity
+            read_data = bytes(buffer[:result])
+            self.assertEqual(read_data, expected_data, f"Data should match for key {keys[i]}")
+
+        # Test error cases
+        # Test with mismatched array sizes
+        mismatched_results = self.store.batch_get_into(keys[:2], buffer_ptrs, buffer_sizes)
+        self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
+        for result in mismatched_results:
+            self.assertLess(result, 0, "Should fail with mismatched array sizes")
+
+        # Test with empty arrays
+        empty_results = self.store.batch_get_into([], [], [])
+        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+
+        # Cleanup
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        for key in keys:
+            self.assertEqual(self.store.remove(key), 0)
+
+    def test_batch_put_from_operations(self):
+        """Test batch_put_from operations for multiple keys."""
+        import ctypes
+
+        # Test data
+        batch_size = 3
+        test_data = [
+            b"Batch Put Data 1! " * 100,  # ~1.8KB
+            b"Batch Put Data 2! " * 200,  # ~3.6KB
+            b"Batch Put Data 3! " * 150,  # ~2.7KB
+        ]
+        keys = [f"test_batch_put_from_key_{i}" for i in range(batch_size)]
+
+        # Allocate and register buffers for batch_put_from
+        buffers = []
+        buffer_ptrs = []
+        buffer_sizes = []
+
+        for data in test_data:
+            buffer_size = len(data)
+            buffer = (ctypes.c_ubyte * buffer_size)()
+            buffer_ptr = ctypes.addressof(buffer)
+
+            # Copy test data to buffer
+            ctypes.memmove(buffer, data, len(data))
+
+            # Register buffer
+            result = self.store.register_buffer(buffer_ptr, buffer_size)
+            self.assertEqual(result, 0, "Buffer registration should succeed")
+
+            buffers.append(buffer)
+            buffer_ptrs.append(buffer_ptr)
+            buffer_sizes.append(buffer_size)
+
+        # Test batch_put_from
+        results = self.store.batch_put_from(keys, buffer_ptrs, buffer_sizes)
+
+        # Verify results
+        self.assertEqual(len(results), batch_size, "Should return result for each key")
+
+        for i, result in enumerate(results):
+            self.assertEqual(result, 0, f"batch_put_from should succeed for key {keys[i]}")
+
+        # Verify data was stored correctly using regular get
+        for i, (key, expected_data) in enumerate(zip(keys, test_data)):
+            retrieved_data = self.store.get(key)
+            self.assertEqual(retrieved_data, expected_data, f"Data should match after batch_put_from for key {key}")
+
+        # Test error cases
+        # Test with mismatched array sizes
+        mismatched_results = self.store.batch_put_from(keys[:2], buffer_ptrs, buffer_sizes)
+        self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
+        for result in mismatched_results:
+            self.assertLess(result, 0, "Should fail with mismatched array sizes")
+
+        # Test with empty arrays
+        empty_results = self.store.batch_put_from([], [], [])
+        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+
+        # Cleanup
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        for key in keys:
+            self.assertEqual(self.store.remove(key), 0)
+
 
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
