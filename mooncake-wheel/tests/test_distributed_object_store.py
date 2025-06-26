@@ -205,23 +205,31 @@ class TestDistributedObjectStore(unittest.TestCase):
             result = self.store.put(key, data)
             self.assertEqual(result, 0, f"Failed to put data for key {key}")
 
-        # Allocate and register buffers for batch_get_into
+        # Use a large spacing between buffers to avoid any overlap detection
+        buffer_spacing = 1024 * 1024  # 1MB spacing between buffers
+        
+        # Allocate one large buffer with significant spacing
+        total_buffer_size = buffer_spacing * batch_size
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+        
+        # Register the entire large buffer once
+        result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(result, 0, "Buffer registration should succeed")
+
+        # Create individual buffer views within the large buffer with spacing
         buffers = []
         buffer_ptrs = []
         buffer_sizes = []
 
-        for data in test_data:
-            buffer_size = len(data) + 1024  # Extra space for safety
-            buffer = (ctypes.c_ubyte * buffer_size)()
-            buffer_ptr = ctypes.addressof(buffer)
+        for i, data in enumerate(test_data):
+            # Calculate offset with large spacing to avoid any overlap issues
+            offset = i * buffer_spacing
+            buffer_ptr = large_buffer_ptr + offset
 
-            # Register buffer
-            result = self.store.register_buffer(buffer_ptr, buffer_size)
-            self.assertEqual(result, 0, "Buffer registration should succeed")
-
-            buffers.append(buffer)
+            buffers.append(large_buffer)  # Keep reference to prevent GC
             buffer_ptrs.append(buffer_ptr)
-            buffer_sizes.append(buffer_size)
+            buffer_sizes.append(buffer_spacing)  # Use full spacing as buffer size
 
         # Test batch_get_into
         results = self.store.batch_get_into(keys, buffer_ptrs, buffer_sizes)
@@ -229,17 +237,18 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Verify results
         self.assertEqual(len(results), batch_size, "Should return result for each key")
 
-        for i, (expected_data, buffer, result) in enumerate(zip(test_data, buffers, results)):
+        for i, (expected_data, result) in enumerate(zip(test_data, results)):
             self.assertGreater(result, 0, f"batch_get_into should succeed for key {keys[i]}")
             self.assertEqual(result, len(expected_data), f"Should read correct number of bytes for key {keys[i]}")
 
-            # Verify data integrity
-            read_data = bytes(buffer[:result])
+            # Verify data integrity - read from the correct offset in the large buffer
+            offset = i * buffer_spacing
+            read_data = bytes(large_buffer[offset:offset + result])
             self.assertEqual(read_data, expected_data, f"Data should match for key {keys[i]}")
 
         # Test error cases
         # Test with mismatched array sizes
-        mismatched_results = self.store.batch_get_into(keys[:2], buffer_ptrs, buffer_sizes)
+        mismatched_results = self.store.batch_get_into(keys[:2], buffer_ptrs[:3], buffer_sizes[:3])
         self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
         for result in mismatched_results:
             self.assertLess(result, 0, "Should fail with mismatched array sizes")
@@ -266,26 +275,34 @@ class TestDistributedObjectStore(unittest.TestCase):
         ]
         keys = [f"test_batch_put_from_key_{i}" for i in range(batch_size)]
 
-        # Allocate and register buffers for batch_put_from
+        # Use a large spacing between buffers to avoid any overlap detection
+        buffer_spacing = 1024 * 1024  # 1MB spacing between buffers
+        
+        # Allocate one large buffer with significant spacing
+        total_buffer_size = buffer_spacing * batch_size
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+        
+        # Register the entire large buffer once
+        result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(result, 0, "Buffer registration should succeed")
+
+        # Create individual buffer views within the large buffer with spacing
         buffers = []
         buffer_ptrs = []
         buffer_sizes = []
 
-        for data in test_data:
-            buffer_size = len(data)
-            buffer = (ctypes.c_ubyte * buffer_size)()
-            buffer_ptr = ctypes.addressof(buffer)
-
+        for i, data in enumerate(test_data):
+            # Calculate offset with large spacing to avoid any overlap issues
+            offset = i * buffer_spacing
+            buffer_ptr = large_buffer_ptr + offset
+            
             # Copy test data to buffer
-            ctypes.memmove(buffer, data, len(data))
+            ctypes.memmove(ctypes.c_void_p(buffer_ptr), data, len(data))
 
-            # Register buffer
-            result = self.store.register_buffer(buffer_ptr, buffer_size)
-            self.assertEqual(result, 0, "Buffer registration should succeed")
-
-            buffers.append(buffer)
+            buffers.append(large_buffer)  # Keep reference to prevent GC
             buffer_ptrs.append(buffer_ptr)
-            buffer_sizes.append(buffer_size)
+            buffer_sizes.append(len(data))  # Use actual data size for put_from
 
         # Test batch_put_from
         results = self.store.batch_put_from(keys, buffer_ptrs, buffer_sizes)
@@ -303,7 +320,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Test error cases
         # Test with mismatched array sizes
-        mismatched_results = self.store.batch_put_from(keys[:2], buffer_ptrs, buffer_sizes)
+        mismatched_results = self.store.batch_put_from(keys[:2], buffer_ptrs[:3], buffer_sizes[:3])
         self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
         for result in mismatched_results:
             self.assertLess(result, 0, "Should fail with mismatched array sizes")
