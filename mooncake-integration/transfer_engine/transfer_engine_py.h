@@ -45,6 +45,9 @@ class TransferEnginePy {
     enum class TransferOpcode { READ = 0, WRITE = 1 };
 
    public:
+    using BatchDesc = Transport::BatchDesc;
+
+   public:
     TransferEnginePy();
 
     ~TransferEnginePy();
@@ -83,6 +86,16 @@ class TransferEnginePy {
                               std::vector<uintptr_t> peer_buffer_addresses,
                               std::vector<size_t> lengths);
 
+    int batchTransferAsyncWrite(const char *target_hostname,
+                                const std::vector<uintptr_t> &buffers,
+                                const std::vector<uintptr_t> &peer_buffer_addresses,
+                                const std::vector<size_t> &lengths);
+
+    int batchTransferAsyncRead(const char *target_hostname,
+                               const std::vector<uintptr_t> &buffers,
+                               const std::vector<uintptr_t> &peer_buffer_addresses,
+                               const std::vector<size_t> &lengths);
+
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode);
@@ -92,6 +105,14 @@ class TransferEnginePy {
                           std::vector<uintptr_t> peer_buffer_addresses,
                           std::vector<size_t> lengths,
                           TransferOpcode opcode);
+
+    batch_id_t batchTransferAsync(const char *target_hostname,
+                          const std::vector<uintptr_t> &buffers,
+                          const std::vector<uintptr_t> &peer_buffer_addresses,
+                          const std::vector<size_t> &lengths,
+                          TransferOpcode opcode);
+    
+    int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
