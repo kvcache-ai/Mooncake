@@ -419,9 +419,6 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     auto &value = kv_map_[key];
 
     auto ds = start_response.replica_list[0].buffer_descriptors[0];
-    LOG(INFO) << "key=" << key << ", replica_list=" << ds.buffer_address_ << " " << ds.size_
-              << " " << ds.segment_name_
-              << ", action=put_start";
     char* buffer = reinterpret_cast<char*>(ds.buffer_address_);
     bool check_fail = false;
     for (int i = value_size - 3; i >= 0; i--) {

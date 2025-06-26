@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -8,6 +9,7 @@
 #include "client.h"
 #include "types.h"
 #include "utils.h"
+#include "allocator.h"
 
 namespace mooncake {
 namespace testing {
@@ -21,9 +23,11 @@ class ClientTestWrapper {
    private:
     std::shared_ptr<Client> client_;
     std::unordered_map<uintptr_t, SegmentInfo> segments_;
+    std::shared_ptr<SimpleAllocator> allocator_;
 
    public:
-    ClientTestWrapper(std::shared_ptr<Client> client) : client_(client) {}
+    ClientTestWrapper(std::shared_ptr<Client> client, std::shared_ptr<SimpleAllocator> allocator)
+        : client_(client), allocator_(allocator) {}
 
     ~ClientTestWrapper() {
         for (auto& [base, segment] : segments_) {
@@ -34,7 +38,7 @@ class ClientTestWrapper {
     static std::optional<std::shared_ptr<ClientTestWrapper>> CreateClient(
         const std::string& hostname, const std::string& metadata_connstring,
         const std::string& protocol, const std::string& device_name,
-        const std::string& master_server_entry) {
+        const std::string& master_server_entry, size_t local_buffer_size = 1024 * 1024 * 128) {
         void** args = (protocol == "rdma") ? rdma_args(device_name) : nullptr;
 
         auto client_opt = Client::Create(hostname,  // Local hostname
@@ -45,7 +49,23 @@ class ClientTestWrapper {
             return std::nullopt;
         }
 
-        return std::make_shared<ClientTestWrapper>(ClientTestWrapper(client_opt.value()));
+        std::shared_ptr<SimpleAllocator> allocator =
+            std::make_shared<SimpleAllocator>(local_buffer_size);
+        if (!allocator) {
+            LOG(ERROR) << "Failed to create allocator";
+            return std::nullopt;
+        }
+
+        ErrorCode error_code = client_opt.value()->RegisterLocalMemory(
+            allocator->getBase(), local_buffer_size, "cpu:0",
+            false, false);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "register_local_memory_failed base=" << allocator->getBase()
+                    << " size=" << local_buffer_size << ", error=" << error_code;
+            return std::nullopt;
+        }
+        return std::make_shared<ClientTestWrapper>(
+            ClientTestWrapper(client_opt.value(), allocator));
     }
 
     ErrorCode Mount(const size_t size, void*& buffer) {
@@ -95,45 +115,37 @@ class ClientTestWrapper {
         // Create slices
         std::vector<AllocatedBuffer::Descriptor>& descriptors =
             object_info.replica_list[0].buffer_descriptors;
-        SliceGuard slice_guard(descriptors);
+        SliceGuard slice_guard(descriptors, allocator_);
 
         // Perform get operation
-        error_code = client_->Get(key, object_info, slice_guard.slices);
+        error_code = client_->Get(key, object_info, slice_guard.slices_);
         if (error_code != ErrorCode::OK) {
             return error_code;
         }
 
         // Fill value
         value.clear();
-        for (const auto& slice : slice_guard.slices) {
+        for (const auto& slice : slice_guard.slices_) {
             value.append(static_cast<const char*>(slice.ptr), slice.size);
         }
         return ErrorCode::OK;
     }
 
     ErrorCode Put(const std::string& key, const std::string& value) {
-        // Allocate buffer for the value
-        void* buffer = malloc(value.size());
-        if (!buffer) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-
-        // Copy value to buffer
-        memcpy(buffer, value.data(), value.size());
-
         // Create slices
-        std::vector<Slice> slices;
-        slices.emplace_back(Slice{buffer, value.size()});
+        SliceGuard slice_guard(value.size(), allocator_);
+        size_t offset = 0;
+        for (const auto& slice : slice_guard.slices_) {
+            memcpy(slice.ptr, value.data() + offset, slice.size);
+            offset += slice.size;
+        }
 
         // Configure replication
         ReplicateConfig config;
         config.replica_num = 1;
 
         // Perform put operation
-        ErrorCode error_code = client_->Put(key, slices, config);
-
-        // Free the buffer
-        free(buffer);
+        ErrorCode error_code = client_->Put(key, slice_guard.slices_, config);
 
         return error_code;
     }
@@ -144,17 +156,37 @@ class ClientTestWrapper {
 
    private:
     struct SliceGuard {
-        std::vector<Slice> slices;
-        SliceGuard(std::vector<AllocatedBuffer::Descriptor>& descriptors) {
-            slices.resize(descriptors.size());
+        std::vector<Slice> slices_;
+        std::shared_ptr<SimpleAllocator> allocator_;
+        SliceGuard(std::vector<AllocatedBuffer::Descriptor>& descriptors, std::shared_ptr<SimpleAllocator> allocator)
+            : allocator_(allocator) {
+            slices_.resize(descriptors.size());
             for (size_t i = 0; i < descriptors.size(); i++) {
-                void* buffer = malloc(descriptors[i].size_);
-                slices[i] = Slice{buffer, descriptors[i].size_};
+                void* buffer = allocator_->allocate(descriptors[i].size_);
+                if (!buffer) {
+                    LOG(ERROR) << "Failed to allocate memory for slice";
+                    throw std::runtime_error("Failed to allocate memory for slice");
+                }
+                slices_[i] = Slice{buffer, descriptors[i].size_};
             }
         }
+        SliceGuard(size_t size, std::shared_ptr<SimpleAllocator> allocator)
+            : allocator_(allocator) {
+            slices_.resize(1);
+            void* buffer = allocator_->allocate(size);
+            if (!buffer) {
+                LOG(ERROR) << "Failed to allocate memory for slice";
+                throw std::runtime_error("Failed to allocate memory for slice");
+            }
+            slices_[0] = Slice{buffer, size};
+        }
+
+        // Prevent copying
+        SliceGuard(const SliceGuard &) = delete;
+        SliceGuard &operator=(const SliceGuard &) = delete;
         ~SliceGuard() {
-            for (auto& slice : slices) {
-                free(slice.ptr);
+            for (auto& slice : slices_) {
+                allocator_->deallocate(slice.ptr, slice.size);
             }
         }
     };

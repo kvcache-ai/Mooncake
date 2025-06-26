@@ -74,8 +74,8 @@ TEST_F(E2ERandTest, RandomSequentialDeletePutGet) {
     const int master_num = 1;
     const int client_num = 2;
     const int run_sec = 3600;         // 1 hour
-    const int segment_size = 1024 * 1024 * 16;
-    const size_t value_size = 1024 * 1024;
+    const int segment_size = 1024 * 1024 * 16 * 16;
+    const size_t value_size = 1024 * 1024 * 15;
     const int kv_range = segment_size * client_num / value_size * 2;
 
     unsigned int seed;
@@ -155,12 +155,31 @@ TEST_F(E2ERandTest, RandomSequentialDeletePutGet) {
                 continue;
             }
             auto key = gen_key(i);
-            auto &value = kv_map[key];
+            auto& value = kv_map[key];
             clients[rand() % client_num]->Delete(key);
             clients[rand() % client_num]->Put(key, value);
             std::string get_value;
-            if (clients[rand() % client_num]->Get(key, get_value) == ErrorCode::OK) {
-                ASSERT_EQ(get_value, value);
+            if (clients[rand() % client_num]->Get(key, get_value) ==
+                ErrorCode::OK) {
+                if (get_value != value) {
+                    ASSERT_EQ(get_value.size(), value.size());
+                    // Only display the first 10 characters from the different
+                    // position to avoid huge output
+                    for (size_t i = 0; i < get_value.size(); i++) {
+                        if (get_value[i] != value[i]) {
+                            std::string val_substr = value.substr(
+                                i, std::min(10, static_cast<int>(
+                                                    get_value.size() - i)));
+                            std::string get_substr = get_value.substr(
+                                i, std::min(10, static_cast<int>(
+                                                    get_value.size() - i)));
+                            LOG(ERROR)
+                                << "Get value mismatch at position " << i
+                                << ": " << get_substr << " != " << val_substr;
+                            ASSERT_EQ(get_value, value);
+                        }
+                    }
+                }
             }
         }
     }
