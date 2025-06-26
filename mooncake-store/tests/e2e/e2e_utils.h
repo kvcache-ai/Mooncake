@@ -6,6 +6,7 @@ namespace mooncake {
 namespace testing {
 
 // Common flags used in the tests
+
 // Flags for transfer engine
 #define FLAG_protocol \
     DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");

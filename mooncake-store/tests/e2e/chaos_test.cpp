@@ -349,7 +349,7 @@ TEST_F(ChaosTest, ClientKilledFailover) {
     WaitMasterViewChange();
 
     // Create two clients
-    ClientProcessHandler to_close_client(FLAGS_client_path, FLAGS_out_dir, 0);
+    ClientProcessHandler to_close_client(FLAGS_client_path, 0, FLAGS_out_dir);
     // Set the client config to only run mount operation
     ASSERT_TRUE(to_close_client.start(ClientRunnerConfig{
         .put_prob = 0, .get_prob = 0, .mount_prob = 1000, .unmount_prob = 0}));

@@ -393,9 +393,8 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // Transfer data using allocated handles from all replicas
-    std::vector<AllocatedBuffer::Descriptor> handles;
     for (const auto& replica : start_response.replica_list) {
-        handles.clear();
+        std::vector<AllocatedBuffer::Descriptor> handles;
         for (const auto& handle : replica.buffer_descriptors) {
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
             handles.push_back(handle);

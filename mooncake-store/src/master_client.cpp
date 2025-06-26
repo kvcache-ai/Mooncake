@@ -24,18 +24,34 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
-    // Once connected to address A, the coro_rpc_client does not support connect
-    // to a new address B. So we need to create a new coro_rpc_client for each
-    // connection.
-    auto client = std::make_shared<coro_rpc_client>();
-    auto result = coro::syncAwait(client->connect(master_addr));
-    if (result.val() != 0) {
-        LOG(ERROR) << "Failed to connect to master: " << result.message();
-        return ErrorCode::RPC_FAIL;
+    std::lock_guard<std::mutex> lock(connect_mutex_);
+    if (client_addr_param_ == master_addr) {
+        auto client = client_accessor_.GetClient();
+        auto result = coro::syncAwait(client->connect(master_addr));
+        if (result.val() != 0) {
+            LOG(ERROR) << "Failed to connect to master: " << result.message();
+            timer.LogResponse("error_code=", ErrorCode::RPC_FAIL);
+            return ErrorCode::RPC_FAIL;
+        }
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        return ErrorCode::OK;
+    } else {
+        // Once connected to address A, the coro_rpc_client does not support connect
+        // to a new address B. So we need to create a new coro_rpc_client if the
+        // address is different from the current one.
+        auto client = std::make_shared<coro_rpc_client>();
+        auto result = coro::syncAwait(client->connect(master_addr));
+        if (result.val() != 0) {
+            LOG(ERROR) << "Failed to connect to master: " << result.message();
+            timer.LogResponse("error_code=", ErrorCode::RPC_FAIL);
+            return ErrorCode::RPC_FAIL;
+        }
+        // Set the client to the accessor and update the address parameter
+        client_accessor_.SetClient(client);
+        client_addr_param_ = master_addr;
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        return ErrorCode::OK;
     }
-    client_accessor_.SetClient(client);
-    timer.LogResponse("error_code=", ErrorCode::OK);
-    return ErrorCode::OK;
 }
 
 ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {

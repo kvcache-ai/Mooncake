@@ -172,6 +172,11 @@ class MasterClient {
     [[nodiscard]] PingResponse Ping(const UUID& client_id);
 
    private:
+    /**
+     * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
+     * reconnect to a different address, a new coro_rpc_client is created if
+     * the address is different from the current one.
+     */
     class RpcClientAccessor {
        public:
         void SetClient(std::shared_ptr<coro_rpc_client> client) {
@@ -186,6 +191,11 @@ class MasterClient {
         std::atomic<std::shared_ptr<coro_rpc_client>> client_{nullptr};
     };
     RpcClientAccessor client_accessor_;
+
+    // Mutex to insure the Connect function is atomic.
+    mutable std::mutex connect_mutex_;
+    // The address which is passed to the coro_rpc_client
+    std::string client_addr_param_;
 };
 
 }  // namespace mooncake

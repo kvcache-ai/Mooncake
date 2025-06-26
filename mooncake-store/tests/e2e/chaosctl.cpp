@@ -3,6 +3,7 @@
 
 #include <map>
 #include <fstream>
+#include <glog/logging.h>
 
 // Define command line flags
 FLAG_master_path
@@ -174,7 +175,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < client_num; ++i) {
             clients.emplace_back(
                 std::make_unique<mooncake::testing::ClientProcessHandler>(
-                    FLAGS_client_path, FLAGS_out_dir, i));
+                    FLAGS_client_path, i, FLAGS_out_dir));
             clients.back()->start(mooncake::testing::ClientRunnerConfig());
         }
 
