@@ -279,9 +279,6 @@ TEST_F(ChaosRandTest, RandomMasterCrashLargeValue) {
 
         return value;
     };
-    for (int i = 0; i < kv_range; ++i) {
-        kv_map_[gen_key(i)] = gen_value(i);
-    }
 
     // Start masters
     std::vector<std::unique_ptr<mooncake::testing::MasterHandler>> masters;

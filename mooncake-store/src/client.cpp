@@ -369,8 +369,6 @@ ErrorCode Client::BatchGet(
     return ErrorCode::OK;
 }
 
-std::map<std::string, std::string> kv_map_;
-
 ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
                       const ReplicateConfig& config) {
     // Prepare slice lengths
@@ -413,25 +411,6 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
             }
             return transfer_err;
         }
-    }
-
-    const size_t value_size = 1024 * 1024;
-    auto &value = kv_map_[key];
-
-    auto ds = start_response.replica_list[0].buffer_descriptors[0];
-    char* buffer = reinterpret_cast<char*>(ds.buffer_address_);
-    bool check_fail = false;
-    for (int i = value_size - 3; i >= 0; i--) {
-        if (value[i] != buffer[i]) {
-            LOG(ERROR) << "value[i..3]=" << value[i] << value[i+1] << value[i+2] << ", buffer[i..3]=" << buffer[i] << buffer[i+1] << buffer[i+2];
-            LOG(ERROR) << "key=" << key << ", i=" << i;
-            check_fail = true;
-            break;
-        }
-    }
-    if (check_fail) {
-        TransferStrategy strategy = transfer_submitter_->selectStrategy(handles, slices);
-        LOG(ERROR) << "strategy=" << static_cast<int>(strategy);
     }
 
     // End put operation

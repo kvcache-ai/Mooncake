@@ -250,6 +250,4 @@ class Client {
     UUID client_id_;
 };
 
-extern std::map<std::string, std::string> kv_map_;
-
 }  // namespace mooncake

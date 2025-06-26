@@ -111,7 +111,6 @@ TEST_F(E2ERandTest, RandomSequentialDeletePutGet) {
     std::unordered_map<std::string, std::string> kv_map;
     for (int i = 0; i < kv_range; ++i) {
         kv_map[gen_key(i)] = gen_value(i);
-        kv_map_[gen_key(i)] = gen_value(i);
     }
 
     // Start masters

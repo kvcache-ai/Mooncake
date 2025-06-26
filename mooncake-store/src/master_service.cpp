@@ -273,11 +273,6 @@ ErrorCode MasterService::GetReplicaList(
         metadata.GrantLease(default_kv_lease_ttl_);
     }
 
-    // ykykykyk
-    auto ds =  replica_list[0].buffer_descriptors[0];
-    LOG(INFO) << "key=" << key << ", replica_list=" << ds.buffer_address_ << " " << ds.size_
-              << " " << ds.segment_name_
-              << ", action=get_replica_list";
     return ErrorCode::OK;
 }
 
@@ -391,11 +386,6 @@ ErrorCode MasterService::PutStart(
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
-    // ykykykyk
-    auto ds =  replica_list[0].buffer_descriptors[0];
-    LOG(INFO) << "key=" << key << ", replica_list=" << ds.buffer_address_ << " " << ds.size_
-              << " " << ds.segment_name_
-              << ", action=put_start";
 
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
