@@ -264,14 +264,14 @@ class ClientCtl {
         iss >> seconds;
 
         if (seconds <= 0) {
-            std::cout << "Invalid sleep command format. Expected: sleep [seconds]"
-                      << std::endl;
+            std::cout
+                << "Invalid sleep command format. Expected: sleep [seconds]"
+                << std::endl;
             return;
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
-        std::cout << "Slept for " << seconds << " seconds"
-                  << std::endl;
+        std::cout << "Slept for " << seconds << " seconds" << std::endl;
     }
 
     std::unordered_map<std::string, ClientInfo> clients_;

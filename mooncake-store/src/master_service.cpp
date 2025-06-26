@@ -66,8 +66,8 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(const Segment& segment,
-                                      const UUID& client_id) {
+auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
+    -> ylt::expected<void, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     if (enable_ha_) {
@@ -88,24 +88,26 @@ ErrorCode MasterService::MountSegment(const Segment& segment,
         if (!client_ping_queue_.push(pod_client_id)) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=client_ping_queue_full";
-            return ErrorCode::INTERNAL_ERROR;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 
     auto err = segment_access.MountSegment(segment, client_id);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
-    } else {
-        return err;
+        return {};
+    } else if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
     }
+    return {};
 }
 
-ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
-                                        const UUID& client_id) {
+auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
+                                   const UUID& client_id)
+    -> ylt::expected<void, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "ReMountSegment is only available in HA mode";
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -113,7 +115,7 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
         LOG(WARNING) << "client_id=" << client_id
                      << ", warn=client_already_remounted";
         // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
+        return {};
     }
 
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -135,19 +137,19 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
     if (!client_ping_queue_.push(pod_client_id)) {
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=client_ping_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     ErrorCode err = segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
-        return err;
+        return tl::make_unexpected(err);
     }
 
     // Change the client status to OK
     ok_client_.insert(client_id);
     MasterMetricManager::instance().inc_active_clients();
 
-    return ErrorCode::OK;
+    return {};
 }
 
 void MasterService::ClearInvalidHandles() {
@@ -166,7 +168,6 @@ void MasterService::ClearInvalidHandles() {
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
                 it = shard.metadata.erase(it);
-                MasterMetricManager::instance().dec_key_count(1);
             } else {
                 ++it;
             }
@@ -174,8 +175,9 @@ void MasterService::ClearInvalidHandles() {
     }
 }
 
-ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
-                                        const UUID& client_id) {
+auto MasterService::UnmountSegment(const UUID& segment_id,
+                                   const UUID& client_id)
+    -> ylt::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     // 1. Prepare to unmount the segment by deleting its allocator
@@ -186,10 +188,10 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
-            return ErrorCode::OK;
+            return {};
         }
         if (err != ErrorCode::OK) {
-            return err;
+            return tl::make_unexpected(err);
         }
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
@@ -199,78 +201,94 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
 
     // 3. Commit the unmount operation
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.CommitUnmountSegment(segment_id, client_id,
-                                               metrics_dec_capacity);
+    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                   metrics_dec_capacity);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
-ErrorCode MasterService::ExistKey(const std::string& key) {
+auto MasterService::ExistKey(const std::string& key)
+    -> ylt::expected<bool, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return false;
     }
 
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(WARNING) << "key=" << key << ", status=" << *status
                      << ", error=replica_not_ready";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Grant a lease to the object as it may be further used by the client.
     metadata.GrantLease(default_kv_lease_ttl_);
 
-    return ErrorCode::OK;
+    return true;
 }
 
-std::vector<ErrorCode> MasterService::BatchExistKey(
+std::vector<ylt::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
-    std::vector<ErrorCode> results;
+    std::vector<ylt::expected<bool, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.push_back(ExistKey(key));
+        results.emplace_back(ExistKey(key));
     }
     return results;
 }
 
-ErrorCode MasterService::GetAllKeys(std::vector<std::string>& all_keys) {
-    all_keys.clear();
+auto MasterService::GetAllKeys()
+    -> ylt::expected<std::vector<std::string>, ErrorCode> {
+    std::vector<std::string> all_keys;
     for (size_t i = 0; i < kNumShards; i++) {
         MutexLocker lock(&metadata_shards_[i].mutex);
         for (const auto& item : metadata_shards_[i].metadata) {
             all_keys.push_back(item.first);
         }
     }
-    return ErrorCode::OK;
+    return all_keys;
 }
 
-ErrorCode MasterService::GetAllSegments(
-    std::vector<std::string>& all_segments) {
+auto MasterService::GetAllSegments()
+    -> ylt::expected<std::vector<std::string>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.GetAllSegments(all_segments);
+    std::vector<std::string> all_segments;
+    auto err = segment_access.GetAllSegments(all_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return all_segments;
 }
 
-ErrorCode MasterService::QuerySegments(const std::string& segment, size_t& used,
-                                       size_t& capacity) {
+auto MasterService::QuerySegments(const std::string& segment)
+    -> ylt::expected<std::pair<size_t, size_t>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.QuerySegments(segment, used, capacity);
+    size_t used, capacity;
+    auto err = segment_access.QuerySegments(segment, used, capacity);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return std::make_pair(used, capacity);
 }
 
-ErrorCode MasterService::GetReplicaList(
-    const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
-    MetadataAccessor accessor(this, key);
+auto MasterService::GetReplicaList(std::string_view key)
+    -> ylt::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(WARNING) << "key=" << key << ", status=" << *status
                      << ", error=replica_not_ready";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    replica_list.clear();
+    std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(metadata.replicas.size());
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
@@ -278,38 +296,44 @@ ErrorCode MasterService::GetReplicaList(
 
     // Only mark for GC if enabled
     if (enable_gc_) {
-        MarkForGC(key, 1000);  // After 1 second, the object will be removed
+        MarkForGC(std::string(key),
+                  1000);  // After 1 second, the object will be removed
     } else {
         // Grant a lease to the object so it will not be removed
         // when the client is reading it.
         metadata.GrantLease(default_kv_lease_ttl_);
     }
 
-    return ErrorCode::OK;
+    return replica_list;
 }
 
-ErrorCode MasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys,
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
-        batch_replica_list) {
+auto MasterService::BatchGetReplicaList(const std::vector<std::string>& keys)
+    -> ylt::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode> {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
     for (const auto& key : keys) {
-        if (GetReplicaList(key, batch_replica_list[key]) != ErrorCode::OK) {
-            LOG(ERROR) << "key=" << key << ", error=object_not_found";
-            return ErrorCode::OBJECT_NOT_FOUND;
-        };
+        auto result = GetReplicaList(key);
+        if (result) {
+            batch_replica_list[key] = std::move(*result);
+        } else {
+            LOG(ERROR) << "key=" << key << ", error=" << result.error();
+            return tl::make_unexpected(result.error());
+        }
     }
-    return ErrorCode::OK;
+    return batch_replica_list;
 }
 
-ErrorCode MasterService::PutStart(
-    const std::string& key, uint64_t value_length,
-    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
-    std::vector<Replica::Descriptor>& replica_list) {
+auto MasterService::PutStart(const std::string& key, uint64_t value_length,
+                             const std::vector<uint64_t>& slice_lengths,
+                             const ReplicateConfig& config)
+    -> ylt::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     if (config.replica_num == 0 || value_length == 0 || key.empty()) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", value_length=" << value_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Validate slice lengths
@@ -320,7 +344,7 @@ ErrorCode MasterService::PutStart(
                        << ", slice_size=" << slice_lengths[i]
                        << ", max_size=" << kMaxSliceSize
                        << ", error=invalid_slice_size";
-            return ErrorCode::INVALID_PARAMS;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         total_length += slice_lengths[i];
     }
@@ -329,7 +353,7 @@ ErrorCode MasterService::PutStart(
         LOG(ERROR) << "key=" << key << ", total_length=" << total_length
                    << ", expected_length=" << value_length
                    << ", error=slice_length_mismatch";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     VLOG(1) << "key=" << key << ", value_length=" << value_length
@@ -344,12 +368,8 @@ ErrorCode MasterService::PutStart(
     if (it != metadata_shards_[shard_idx].metadata.end() &&
         !CleanupStaleHandles(it->second)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
-
-    // Initialize object metadata
-    ObjectMetadata metadata;
-    metadata.size = value_length;
 
     // Allocate replicas
     std::vector<Replica> replicas;
@@ -375,11 +395,10 @@ ErrorCode MasterService::PutStart(
                     LOG(ERROR)
                         << "key=" << key << ", replica_id=" << i
                         << ", slice_index=" << j << ", error=allocation_failed";
-                    replica_list.clear();
                     // If the allocation failed, we need to evict some objects
                     // to free up space for future allocations.
                     need_eviction_ = true;
-                    return ErrorCode::NO_AVAILABLE_HANDLE;
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                 }
 
                 VLOG(1) << "key=" << key << ", replica_id=" << i
@@ -393,25 +412,26 @@ ErrorCode MasterService::PutStart(
         }
     }
 
-    metadata.replicas = std::move(replicas);
-
-    replica_list.clear();
-    replica_list.reserve(metadata.replicas.size());
-    for (const auto& replica : metadata.replicas) {
+    std::vector<Replica::Descriptor> replica_list;
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
 
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
-    return ErrorCode::OK;
+    metadata_shards_[shard_idx].metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(value_length, std::move(replicas)));
+    return replica_list;
 }
 
-ErrorCode MasterService::PutEnd(const std::string& key) {
+auto MasterService::PutEnd(const std::string& key)
+    -> ylt::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
@@ -421,40 +441,44 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
     // Set lease timeout to now, indicating that the object has no lease
     // at beginning
     metadata.GrantLease(0);
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode MasterService::PutRevoke(const std::string& key) {
+auto MasterService::PutRevoke(const std::string& key)
+    -> ylt::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::INVALID_WRITE;
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
     accessor.Erase();
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode MasterService::BatchPutStart(
+auto MasterService::BatchPutStart(
     const std::vector<std::string>& keys,
     const std::unordered_map<std::string, uint64_t>& value_lengths,
     const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config,
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
-        batch_replica_list) {
+    const ReplicateConfig& config)
+    -> ylt::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode> {
     if (config.replica_num == 0 || keys.empty()) {
         LOG(ERROR) << "replica_num=" << config.replica_num
                    << ", keys_size=" << keys.size() << ", error=invalid_params";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        batch_replica_list;
     for (const auto& key : keys) {
         auto value_length_it = value_lengths.find(key);
         auto slice_length_it = slice_lengths.find(key);
@@ -462,63 +486,66 @@ ErrorCode MasterService::BatchPutStart(
             slice_length_it == slice_lengths.end()) {
             LOG(ERROR) << "Key not found in value_lengths or slice_lengths: "
                        << key;
-            return ErrorCode::OBJECT_NOT_FOUND;
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
 
-        auto result =
-            PutStart(key, value_length_it->second, slice_length_it->second,
-                     config, batch_replica_list[key]);
-        if (result != ErrorCode::OK &&
-            result != ErrorCode::OBJECT_ALREADY_EXISTS) {
-            return result;
+        auto result = PutStart(key, value_length_it->second,
+                               slice_length_it->second, config);
+        if (result) {
+            batch_replica_list[key] = std::move(*result);
+        } else if (result.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
+            return tl::make_unexpected(result.error());
         }
     }
-    return ErrorCode::OK;
+    return batch_replica_list;
 }
 
-ErrorCode MasterService::BatchPutEnd(const std::vector<std::string>& keys) {
+auto MasterService::BatchPutEnd(const std::vector<std::string>& keys)
+    -> ylt::expected<void, ErrorCode> {
     for (const auto& key : keys) {
         auto result = PutEnd(key);
-        if (result != ErrorCode::OK) {
+        if (!result) {
             return result;
         }
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode MasterService::BatchPutRevoke(const std::vector<std::string>& keys) {
+auto MasterService::BatchPutRevoke(const std::vector<std::string>& keys)
+    -> ylt::expected<void, ErrorCode> {
     for (const auto& key : keys) {
         auto result = PutRevoke(key);
-        if (result != ErrorCode::OK) {
+        if (!result) {
             return result;
         }
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode MasterService::Remove(const std::string& key) {
+auto MasterService::Remove(const std::string& key)
+    -> ylt::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
 
     if (!metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
-        return ErrorCode::OBJECT_HAS_LEASE;
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Remove object metadata
     accessor.Erase();
-    return ErrorCode::OK;
+    return {};
 }
 
 long MasterService::RemoveAll() {
@@ -548,27 +575,24 @@ long MasterService::RemoveAll() {
         }
     }
 
-    if (removed_count > 0) {
-        // Update metrics only if objects were actually removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-    }
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 
-ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
+auto MasterService::MarkForGC(const std::string& key, uint64_t delay_ms)
+    -> ylt::expected<void, ErrorCode> {
     // Create a new GC task and add it to the queue
     GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
     if (!gc_queue_.push(task)) {
         // Queue is full, delete the task to avoid memory leak
         delete task;
         LOG(ERROR) << "key=" << key << ", error=gc_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    return ErrorCode::OK;
+    return {};
 }
 
 bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
@@ -599,30 +623,29 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-ErrorCode MasterService::Ping(const UUID& client_id,
-                              ViewVersionId& view_version,
-                              ClientStatus& client_status) {
+auto MasterService::Ping(const UUID& client_id)
+    -> ylt::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "Ping is only available in HA mode";
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    ClientStatus client_status;
     auto it = ok_client_.find(client_id);
     if (it != ok_client_.end()) {
         client_status = ClientStatus::OK;
     } else {
         client_status = ClientStatus::NEED_REMOUNT;
     }
-    view_version = view_version_;
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {
         // Queue is full
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=client_ping_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return ErrorCode::OK;
+    return std::make_pair(view_version_, client_status);
 }
 
 void MasterService::GCThreadFunc() {
@@ -648,23 +671,18 @@ void MasterService::GCThreadFunc() {
 
             local_pq.pop();
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
-            ErrorCode result = Remove(task->key);
-            if (result != ErrorCode::OK &&
-                result != ErrorCode::OBJECT_NOT_FOUND &&
-                result != ErrorCode::OBJECT_HAS_LEASE) {
-                LOG(WARNING)
-                    << "key=" << task->key
-                    << ", error=gc_remove_failed, error_code=" << result;
+            auto result = Remove(task->key);
+            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                result.error() != ErrorCode::OBJECT_HAS_LEASE) {
+                LOG(WARNING) << "key=" << task->key
+                             << ", error=gc_remove_failed, error_code="
+                             << result.error();
             }
-            if (result == ErrorCode::OK) {
+            if (result) {
                 gc_count++;
             }
             delete task;
         }
-        if (gc_count > 0) {
-            MasterMetricManager::instance().dec_key_count(gc_count);
-        }
-
         double used_ratio =
             MasterMetricManager::instance().get_global_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -753,7 +771,6 @@ void MasterService::BatchEvict(double eviction_ratio) {
 
     if (evicted_count > 0) {
         need_eviction_ = false;
-        MasterMetricManager::instance().dec_key_count(evicted_count);
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {
