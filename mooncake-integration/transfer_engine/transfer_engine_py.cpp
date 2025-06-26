@@ -444,7 +444,7 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     }
 }
 
-int TransferEnginePy::registerMemoryBatch(std::vector<uintptr_t> buffer_addresses,
+int TransferEnginePy::batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
                                           std::vector<size_t> capacities) {
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
@@ -454,7 +454,7 @@ int TransferEnginePy::registerMemoryBatch(std::vector<uintptr_t> buffer_addresse
     return engine_->registerLocalMemoryBatch(buffers, kWildcardLocation);
 }
 
-int TransferEnginePy::unregisterMemoryBatch(std::vector<uintptr_t> buffer_addresses) {
+int TransferEnginePy::batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses) {
     auto batch_size = buffer_addresses.size();
     std::vector<void *> buffers;
     for (int i = 0; i < batch_size; i ++ ) {
@@ -514,6 +514,8 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::readBytesFromBuffer)
             .def("register_memory", &TransferEnginePy::registerMemory)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
+            .def("batch_register_memory", &TransferEnginePy::batchRegisterMemory)
+            .def("batch_unregister_memory", &TransferEnginePy::batchUnregisterMemory)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress);
 
