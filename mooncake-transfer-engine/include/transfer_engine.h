@@ -124,10 +124,40 @@ class TransferEngine {
         return multi_transports_->submitTransfer(batch_id, entries);
     }
 
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest> &entries,
+                                    TransferMetadata::NotifyDesc notify_msg) {
+        auto target_id = entries[0].target_id;
+        Status s = multi_transports_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            return s;
+        }
+        // notify
+        sendNotify(target_id, notify_msg);
+        return s;
+    }
+
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
+
+    int sendNotify(SegmentID target_id,
+                   TransferMetadata::NotifyDesc notify_msg);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
+#ifdef WITH_METRICS
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes > 0) {
+                transferred_bytes_counter_.inc(status.transferred_bytes);
+            }
+        }
+#endif
+        return result;
+    }
+
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+        Status result = multi_transports_->getBatchTransferStatus(batch_id, status);
 #ifdef WITH_METRICS
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
@@ -146,9 +176,7 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) {
-        auto_discover_ = auto_discover;
-    }
+    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
     void setWhitelistFilters(std::vector<std::string> &&filters) {
         filter_ = std::move(filters);

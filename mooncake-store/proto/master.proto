@@ -32,6 +32,21 @@ message ReplicaInfo {
   required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status.
 }
 
+message BatchReplicaInfo {
+  required string key = 1;
+  repeated ReplicaInfo replica_list= 2;
+}
+
+message BatchValueLength {
+  required string key = 1;
+  required uint64 value_lengths = 2;
+}
+
+message BatchSliceLength {
+  required string key = 1;
+  repeated uint64 slice_lengths = 2;
+}
+
 // Request to check key existence.
 message ExistKeyRequest {
   required string key = 1; // Object key.
@@ -53,9 +68,21 @@ message GetReplicaListResponse {
   repeated ReplicaInfo replica_list = 2; // Replicas.
 }
 
+// Request to get replica list.
+message BatchGetReplicaListRequest {
+  repeated string keys = 1; // Object keys.
+}
+
+// Response to batch get replica lists.
+message BatchGetReplicaListResponse {
+  required int32 status_code = 1; // Status.
+  repeated BatchReplicaInfo batch_replica_list = 2; // Replicas.
+}
+
 // Replication configuration.
 message ReplicateConfig {
   required int32 replica_num = 1;
+  optional string preferred_segment = 2; // Preferred segment for allocation
   // Future replication settings.
 }
 
@@ -90,6 +117,39 @@ message PutRevokeRequest {
 
 // Response to revoke a Put operation.
 message PutRevokeResponse {
+  required int32 status_code = 1; // Status.
+}
+
+// Request to start a BatchPut operation.
+message BatchPutStartRequest {
+  repeated string keys = 1;         // Object keys.
+  repeated BatchValueLength value_lengths = 2; // Total data length.
+  repeated BatchSliceLength slice_lengths = 3; // Length of each slice.
+  required ReplicateConfig config = 4; // Replication config.
+}
+
+message BatchPutStartResponse {
+  required int32 status_code = 1; // Status.
+  repeated BatchReplicaInfo batch_replica_list = 2; // Replicas.
+}
+
+// Request to end a BatchPut operation.
+message BatchPutEndRequest {
+  repeated string key = 1; // Object keys.
+}
+
+// Response to end a BatchPut operation.
+message BatchPutEndResponse {
+  required int32 status_code = 1; // Status.
+}
+
+// Request to revoke a BatchPut operation.
+message BatchPutRevokeRequest {
+  repeated string key = 1; // Object key.
+}
+
+// Response to revoke a BatchPut operation.
+message BatchPutRevokeResponse {
   required int32 status_code = 1; // Status.
 }
 
@@ -130,6 +190,9 @@ service MasterService {
   // Get replica list.
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // BatchGet replica list.
+  rpc BatchGetReplicaList(BatchGetReplicaListRequest) returns (BatchGetReplicaListResponse);
+
   // Start Put operation.
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -138,6 +201,15 @@ service MasterService {
 
   // Revoke Put operation.
   rpc PutRevoke(PutRevokeRequest) returns (PutRevokeResponse);
+
+  // Start Batch Put operation.
+  rpc BatchPutStart(BatchPutStartRequest) returns (BatchPutStartResponse);
+
+  // End Batch Put operation.
+  rpc BatchPutEnd(BatchPutEndRequest) returns (BatchPutEndResponse);
+
+  // Revoke Batch Put operation.
+  rpc BatchPutRevoke(BatchPutRevokeRequest) returns (BatchPutRevokeResponse);
 
   // Remove object.
   rpc Remove(RemoveRequest) returns (RemoveResponse);

@@ -21,74 +21,116 @@ class AllocationStrategy {
     /**
      * @brief Given all mounted BufferAllocators and required object size,
      *        the strategy can freely choose a suitable BufferAllocator.
-     * @param allocators Container of mounted allocators, key is segment_name,
+     * @param allocators Container of mounted allocators
+     * @param allocators_by_name Container of mounted allocators, key is segment_name,
      *                  value is the corresponding allocator
      * @param objectSize Size of object to be allocated
+     * @param config Replica configuration
      * @return Selected allocator; returns nullptr if allocation is not possible
      *         or no suitable allocator is found
      */
     virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
-        size_t objectSize) = 0;
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators_by_name,
+        size_t objectSize, const ReplicateConfig& config) = 0;
 };
 
+/**
+ * @brief Random allocation strategy with local preference support.
+ *
+ * This strategy first attempts to allocate from a preferred segment if
+ * specified, then falls back to random allocation among all available
+ * allocators.
+ */
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>&
-            allocators,
-        size_t objectSize) override {
-        // Because there is only one allocator, we can directly allocate from it
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators_by_name,
+        size_t objectSize, const ReplicateConfig& config) override {
+        // Fast path: single allocator case
         if (allocators.size() == 1) {
-            auto& allocator = allocators.begin()->second;
-            return allocator->allocate(objectSize);
-        }
-        // First, collect all eligible allocators
-        std::vector<std::shared_ptr<BufferAllocator>> eligible;
-
-        for (const auto& kv : allocators) {
-            auto& allocator = kv.second;
-            size_t capacity = allocator->capacity();
-            size_t used = allocator->size();
-            size_t available = capacity > used ? (capacity - used) : 0;
-
-            if (available >= objectSize) {
-                eligible.push_back(allocator);
-            }
+            return allocators[0]->allocate(objectSize);
         }
 
-        // If no eligible allocators found, return nullptr
-        if (eligible.empty()) {
-            return nullptr;
+        // Try preferred segment first if specified
+        if (auto preferred_buffer =
+                TryPreferredAllocate(allocators_by_name, objectSize, config)) {
+            return preferred_buffer;
         }
 
-        const size_t max_try_limit = 10;
-        size_t max_try = std::min(max_try_limit, eligible.size());
-        // Due to allocator fragmentation, we may fail to allocate memory even
-        // if there is enough free memory.
-        for (size_t try_count = 0; try_count < max_try; try_count++) {
-            // Randomly select one from eligible allocators
-            std::uniform_int_distribution<size_t> dist(0, eligible.size() - 1);
-            size_t randomIndex = dist(rng_);
-            auto& allocator = eligible[randomIndex];
-            auto bufHandle = allocator->allocate(objectSize);
-            if (bufHandle) {
-                return bufHandle;
-            }
-            // If allocation failed, try other allocators
-            if (randomIndex + 1 != eligible.size()) {
-                eligible[randomIndex].swap(eligible.back());
-            }
-            eligible.pop_back();
-        }
-        return nullptr;
+        // Fall back to random allocation among all eligible allocators
+        return TryRandomAllocate(allocators, objectSize);
     }
 
    private:
+    static constexpr size_t kMaxRetryLimit = 10;
+
     std::mt19937 rng_;  // Mersenne Twister random number generator
+
+    /**
+     * @brief Attempts allocation from preferred segment if available and
+     * eligible
+     */
+    std::unique_ptr<AllocatedBuffer> TryPreferredAllocate(
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+            allocators,
+        size_t objectSize, const ReplicateConfig& config) {
+        if (config.preferred_segment.empty()) {
+            return nullptr;
+        }
+
+        auto preferred_it = allocators.find(config.preferred_segment);
+        if (preferred_it == allocators.end()) {
+            return nullptr;
+        }
+
+        auto& preferred_allocators = preferred_it->second;
+        for (auto& allocator : preferred_allocators) {
+            auto buffer = allocator->allocate(objectSize);
+            if (buffer != nullptr) {
+                return buffer;
+            }
+        }
+
+        return nullptr;
+    }
+
+    /**
+     * @brief Attempts allocation with random selection and retry logic
+     */
+    std::unique_ptr<AllocatedBuffer> TryRandomAllocate(
+        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        size_t objectSize) {
+        const size_t max_tries = std::min(kMaxRetryLimit, allocators.size());
+
+        std::vector<size_t> allocator_indices(allocators.size());
+        std::iota(allocator_indices.begin(), allocator_indices.end(), 0);
+
+        for (size_t try_count = 0; try_count < max_tries; ++try_count) {
+            // Randomly select an allocator
+            std::uniform_int_distribution<size_t> dist(
+                0, allocator_indices.size() - 1);
+            const size_t random_index = allocator_indices[dist(rng_)];
+
+            auto& allocator = allocators[random_index];
+            if (auto buffer = allocator->allocate(objectSize)) {
+                return buffer;
+            }
+
+            // Remove failed allocator and continue with remaining ones
+            if (random_index + 1 != allocator_indices.size()) {
+                std::swap(allocator_indices[random_index],
+                          allocator_indices[allocator_indices.size() - 1]);
+            }
+            allocator_indices.pop_back();
+        }
+        return nullptr;
+    }
 };
 
 }  // namespace mooncake

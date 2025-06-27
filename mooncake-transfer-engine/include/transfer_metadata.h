@@ -16,7 +16,7 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <json/json.h>
+#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>
@@ -48,8 +48,9 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        std::vector<uint32_t> lkey;
-        std::vector<uint32_t> rkey;
+        std::vector<uint32_t> lkey;  // for rdma
+        std::vector<uint32_t> rkey;  // for rdma
+        std::string shm_name;        // for nvlink
     };
 
     struct NVMeoFBufferDesc {
@@ -75,7 +76,7 @@ class TransferMetadata {
     struct SegmentDesc {
         std::string name;
         std::string protocol;
-        // this is for rdma
+        // this is for rdma/shm
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
@@ -100,6 +101,11 @@ class TransferMetadata {
         std::string peer_nic_path;
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
+    };
+
+    struct NotifyDesc {
+        std::string name;
+        std::string notify_msg;
     };
 
    public:
@@ -134,7 +140,7 @@ class TransferMetadata {
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
-    
+
     int removeLocalSegment(const std::string &segment_name);
 
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
@@ -142,6 +148,7 @@ class TransferMetadata {
     int removeRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
@@ -154,6 +161,9 @@ class TransferMetadata {
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 
+    int sendNotify(const std::string &peer_server_name,
+                   const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
 
@@ -165,6 +175,8 @@ class TransferMetadata {
         Json::Value &segmentJSON, const std::string &segment_name);
     int receivePeerMetadata(const Json::Value &peer_json,
                             Json::Value &local_json);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
 
     bool p2p_handshake_mode_{false};
     // local cache
@@ -173,6 +185,8 @@ class TransferMetadata {
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
 
+    RWSpinlock notify_lock_;
+    std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;

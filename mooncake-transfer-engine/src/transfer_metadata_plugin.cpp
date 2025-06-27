@@ -57,10 +57,53 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         auto hostname_port = parseHostNameWithPort(metadata_uri);
         client_ =
             redisConnect(hostname_port.first.c_str(), hostname_port.second);
-        if (!client_ || client_->err) {
+        if (!client_) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
+                       << metadata_uri_;
+            return;
+        }
+        if (client_->err) {
             LOG(ERROR) << "RedisStoragePlugin: unable to connect "
                        << metadata_uri_ << ": " << client_->errstr;
+            redisFree(client_);
             client_ = nullptr;
+            return;
+        }
+    }
+
+    RedisStoragePlugin(const std::string &metadata_uri,
+                       const std::string &password, const uint8_t &db_index)
+        : RedisStoragePlugin(metadata_uri) {
+        if (!client_) {
+            return;
+        }
+
+        if (!password.empty()) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "AUTH %s", password.c_str()));
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
+                           << metadata_uri_;
+                freeReplyObject(reply);
+                redisFree(client_);
+                client_ = nullptr;
+                return;
+            }
+            freeReplyObject(reply);
+        }
+
+        if (db_index != 0) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "SELECT %d", db_index));
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: failed to select database "
+                           << (int)db_index << " for " << metadata_uri_;
+                freeReplyObject(reply);
+                redisFree(client_);
+                client_ = nullptr;
+                return;
+            }
+            freeReplyObject(reply);
         }
     }
 
@@ -427,7 +470,29 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second);
+        const char *password = std::getenv("MC_REDIS_PASSWORD");
+        std::string password_str = password ? password : "";
+
+        uint8_t db_index = 0;
+        const char *db_index_str = std::getenv("MC_REDIS_DB_INDEX");
+        if (db_index_str) {
+            try {
+                int index = std::stoi(db_index_str);
+                if (index >= 0 && index <= 255) {
+                    db_index = static_cast<uint8_t>(index);
+                } else {
+                    LOG(WARNING) << "Invalid Redis DB index: " << index
+                                 << ", using default 0";
+                }
+            } catch (const std::exception &e) {
+                LOG(WARNING)
+                    << "Failed to parse MC_REDIS_DB_INDEX: " << e.what()
+                    << ", using default 0";
+            }
+        }
+
+        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second,
+                                                    password_str, db_index);
     }
 #endif  // USE_REDIS
 
@@ -495,23 +560,23 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_metadata_callback_ = callback;
     }
 
+    virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) {
+        on_notify_callback_ = callback;
+    }
+
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
         if (listener_running_) {
             // LOG(INFO) << "SocketHandShakePlugin: listener already running";
             return 0;
         }
 
-        sockaddr_in bind_address;
         int on = 1;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(listen_port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
 
         if (sockfd >= 0) {
             listen_fd_ = sockfd;
         } else {
-            listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+            listen_fd_ = socket(globalConfig().use_ipv6 ? AF_INET6 : AF_INET,
+                                SOCK_STREAM, 0);
             if (listen_fd_ < 0) {
                 PLOG(ERROR) << "SocketHandShakePlugin: socket()";
                 return ERR_SOCKET;
@@ -535,12 +600,34 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return ERR_SOCKET;
             }
 
-            if (bind(listen_fd_, (sockaddr *)&bind_address,
-                     sizeof(sockaddr_in)) < 0) {
-                PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
-                            << listen_port << ")";
-                closeListen();
-                return ERR_SOCKET;
+            if (globalConfig().use_ipv6) {
+                sockaddr_in6 bind_address;
+                memset(&bind_address, 0, sizeof(sockaddr_in6));
+                bind_address.sin6_family = AF_INET6;
+                bind_address.sin6_port = htons(listen_port);
+                bind_address.sin6_addr = IN6ADDR_ANY_INIT;
+
+                if (bind(listen_fd_, (sockaddr *)&bind_address,
+                         sizeof(sockaddr_in6)) < 0) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
+                                << listen_port << ")";
+                    closeListen();
+                    return ERR_SOCKET;
+                }
+            } else {
+                sockaddr_in bind_address;
+                memset(&bind_address, 0, sizeof(sockaddr_in));
+                bind_address.sin_family = AF_INET;
+                bind_address.sin_port = htons(listen_port);
+                bind_address.sin_addr.s_addr = INADDR_ANY;
+
+                if (bind(listen_fd_, (sockaddr *)&bind_address,
+                         sizeof(sockaddr_in)) < 0) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
+                                << listen_port << ")";
+                    closeListen();
+                    return ERR_SOCKET;
+                }
             }
         }
 
@@ -604,6 +691,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
                     on_metadata_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Notify) {
+                    on_notify_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -647,6 +736,41 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         });
 
         return 0;
+    }
+
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const Json::Value &local, Json::Value &peer) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = doSendNotify(rp, local, peer);
+            if (ret == 0) {
+                freeaddrinfo(result);
+                return 0;
+            }
+            if (ret == ERR_MALFORMED_JSON) {
+                return ret;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
     }
 
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
@@ -792,6 +916,48 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
+    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
+                     Json::Value &peer_notify) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
+        if (ret) {
+            return ret;
+        }
+
+        ret = writeString(conn_fd, HandShakeRequestType::Notify,
+                          Json::FastWriter{}.write(local_notify));
+        if (ret) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to send metadata message: "
+                   "malformed json format, check tcp connection";
+            close(conn_fd);
+            return ret;
+        }
+
+        Json::Reader reader;
+        auto [type, json_str] = readString(conn_fd);
+        if (type != HandShakeRequestType::Notify) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
+        //           << json_str;
+
+        if (!reader.parse(json_str, peer_notify)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
+                          "message, malformed json format: "
+                       << reader.getFormattedErrorMessages();
+            close(conn_fd);
+            return ERR_MALFORMED_JSON;
+        }
+
+        close(conn_fd);
+        return 0;
+    }
+
     int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
                        Json::Value &peer_metadata) {
         int conn_fd = -1;
@@ -841,6 +1007,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
+    OnReceiveCallBack on_notify_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
@@ -857,12 +1024,15 @@ std::vector<std::string> findLocalIpAddresses() {
         return ips;
     }
 
+    auto use_ipv6 = globalConfig().use_ipv6;
+    sa_family_t family = use_ipv6 ? AF_INET6 : AF_INET;
+
     for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr) {
             continue;
         }
 
-        if (ifa->ifa_addr->sa_family == AF_INET) {
+        if (ifa->ifa_addr->sa_family == family) {
             if (strcmp(ifa->ifa_name, "lo") == 0) {
                 continue;
             }
@@ -875,8 +1045,11 @@ std::vector<std::string> findLocalIpAddresses() {
             }
 
             char host[NI_MAXHOST];
-            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
-                            NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+            if (getnameinfo(ifa->ifa_addr,
+                            use_ipv6 ? sizeof(struct sockaddr_in6)
+                                     : sizeof(struct sockaddr_in),
+                            host, NI_MAXHOST, nullptr, 0,
+                            NI_NUMERICHOST) == 0) {
                 LOG(INFO) << "Found active interface " << ifa->ifa_name
                           << " with IP " << host;
                 ips.push_back(host);
@@ -894,9 +1067,11 @@ uint16_t findAvailableTcpPort(int &sockfd) {
     const int min_port = 15000;
     const int max_port = 17000;
     const int max_attempts = 500;
+    bool use_ipv6 = globalConfig().use_ipv6;
+
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
         }
@@ -918,15 +1093,30 @@ uint16_t findAvailableTcpPort(int &sockfd) {
             continue;
         }
 
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
+        if (use_ipv6) {
+            sockaddr_in6 bind_address;
+            memset(&bind_address, 0, sizeof(sockaddr_in6));
+            bind_address.sin6_family = AF_INET6;
+            bind_address.sin6_port = htons(port);
+            bind_address.sin6_addr = IN6ADDR_ANY_INIT;
+            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in6)) <
+                0) {
+                close(sockfd);
+                sockfd = -1;
+                continue;
+            }
+        } else {
+            sockaddr_in bind_address;
+            memset(&bind_address, 0, sizeof(sockaddr_in));
+            bind_address.sin_family = AF_INET;
+            bind_address.sin_port = htons(port);
+            bind_address.sin_addr.s_addr = INADDR_ANY;
+            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
+                0) {
+                close(sockfd);
+                sockfd = -1;
+                continue;
+            }
         }
 
         return port;

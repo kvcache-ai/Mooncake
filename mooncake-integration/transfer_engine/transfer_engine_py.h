@@ -72,10 +72,26 @@ class TransferEnginePy {
 
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length);
+    
+    int batchTransferSyncWrite(const char *target_hostname,
+                               std::vector<uintptr_t> buffers,
+                               std::vector<uintptr_t> peer_buffer_addresses,
+                               std::vector<size_t> lengths);
+
+    int batchTransferSyncRead(const char *target_hostname,
+                              std::vector<uintptr_t> buffers,
+                              std::vector<uintptr_t> peer_buffer_addresses,
+                              std::vector<size_t> lengths);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode);
+
+    int batchTransferSync(const char *target_hostname,
+                          std::vector<uintptr_t> buffers,
+                          std::vector<uintptr_t> peer_buffer_addresses,
+                          std::vector<size_t> lengths,
+                          TransferOpcode opcode);
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
@@ -97,6 +113,10 @@ class TransferEnginePy {
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
+
+    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+
+    int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
    private:
     char *allocateRawBuffer(size_t capacity);

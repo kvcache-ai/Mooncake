@@ -5,9 +5,23 @@ import argparse
 import asyncio
 import json
 import logging
+import time
+
 from aiohttp import web
 from mooncake.store import MooncakeDistributedStore
 from mooncake.mooncake_config import MooncakeConfig
+
+
+def _timed_handler(operation_name, handler):
+    async def wrapper(request):
+        start_time = time.perf_counter()
+        try:
+            return await handler(request)
+        finally:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logging.info(f"{operation_name} operation completed in {elapsed_ms:.2f} ms")
+    return wrapper
+
 
 class MooncakeStoreService:
     """
@@ -85,11 +99,11 @@ class MooncakeStoreService:
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
         app.add_routes([
-            web.put('/api/put', self.handle_put),
-            web.get('/api/get/{key}', self.handle_get),
-            web.get('/api/exist/{key}', self.handle_exist),
-            web.delete('/api/remove/{key}', self.handle_remove),
-            web.delete('/api/remove_all', self.handle_remove_all)
+            web.put('/api/put', _timed_handler("PUT", self.handle_put)),
+            web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
+            web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
+            web.delete('/api/remove/{key}', _timed_handler("REMOVE", self.handle_remove)),
+            web.delete('/api/remove_all', _timed_handler("REMOVE_ALL", self.handle_remove_all))
         ])
         runner = web.AppRunner(app)
         await runner.setup()

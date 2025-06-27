@@ -6,14 +6,14 @@ on:
   pull_request:
     branches: [ "main" ]
 
-env:
-  SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
     - uses: actions/checkout@v4
@@ -23,17 +23,65 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Install and start etcd
+      run: |
+        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+        sleep 3 # Give etcd time to start
+        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+      shell: bash
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
-    - name: Configure and build project
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
+    - name: Configure project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
+        make -j
+        sudo make install
+      shell: bash
+
+    - name: Build nvlink_allocator.so
+      run: |
+        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+        cd mooncake-transfer-engine/nvlink-allocator
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Start Metadata Server
@@ -54,17 +102,13 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_STORE_MEMCPY=false make test -j ARGS="-V"
       shell: bash
 
     - name: Stop Mooncake Master Service
       run: |
         pkill mooncake_master || true
       shell: bash
-
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
 
     - name: Generate Python version tag
       id: generate_tag_build
@@ -78,18 +122,12 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
-
   test-wheel-ubuntu:
-    needs: build
+    needs: build-flags
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -134,7 +172,7 @@ jobs:
     - name: Run tests
       run: |
         source test_env/bin/activate
-        ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
         deactivate
       shell: bash
 
@@ -142,7 +180,9 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.12']
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
     - uses: actions/checkout@v4
@@ -152,8 +192,33 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Install dependencies
       run: |
@@ -166,26 +231,61 @@ jobs:
         cd mooncake-transfer-engine
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        make -j
+        sudo make install
       shell: bash
 
-    - name: Configure and build project with all settings are ON
+    - name: Configure project with all settings are ON
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
-      # TODO: lack USE_CUDA and USE_NVMEOF
+      # TODO: lack USE_NVMEOF,USE_CUDA,USE_MNNVL
 
-    - name: Configure and build project with unit tests and examples
+    - name: Build project with all settings are ON
       run: |
         cd build
-        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_C_COMPILER_LAUNCHER=${SCCACHE_PATH} -DCMAKE_CXX_COMPILER_LAUNCHER=${SCCACHE_PATH}
-        sudo make install -j
+        make -j
+        sudo make install
+      shell: bash
+
+    - name: Configure project with unit tests and examples
+      run: |
+        cd build
+        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
+
+    - name: Build project with unit tests and examples
+      run: |
+        cd build
+        make -j
+        sudo make install
+      shell: bash
+
+    - name: Configure project
+      run: |
+        cd build
+        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
+        make -j
+        sudo make install
+      shell: bash
+
+    - name: Build nvlink_allocator.so
+      run: |
+        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+        cd mooncake-transfer-engine/nvlink-allocator
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+      shell: bash
 
     - name: Generate Python version tag
       id: generate_tag_flags
@@ -199,9 +299,11 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
+    - name: Upload Python wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
     name: Builcd Docker Image

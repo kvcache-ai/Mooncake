@@ -58,7 +58,7 @@ The process involves identifying the appropriate local and target NICs based on 
 
 For instance, as illustrated in figure above, to transfer data from buffer 0 (assigned to cpu:0) in the local node to buffer 1 (assigned to cpu:1) in the target node, the engine first identifies the preferred NICs for cpu:0 using the local server's topology matrix and selects one, such as mlx5_1, as the local NIC. Similarly, the target NIC, such as mlx5_3, is selected based on the target memory address. This setup enables establishing an RDMA connection from mlx5_1@local to mlx5_3@target to carry out RDMA read and write operations.
 
-To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exceeds 16KB. 
+To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exceeds 64KB. 
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
 ### Endpoint Management
@@ -100,6 +100,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
    1.1. **`etcd`**
 
+   By default, the use of etcd service is off. To use etcd service in transfer engine, in `mooncake-common/common.cmake`, change the switch of `USE_ETCD` from `OFF` to `ON`.
    For example, the following command line can be used to start the etcd service:
       ```bash
       etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
@@ -436,4 +437,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
 - `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.
-
+- `MC_REDIS_PASSWORD` The password for Redis storage plugin, only takes effect when Redis is specified as the metadata server. If not set, no authentication will be attempted to log in to the Redis.
+- `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.

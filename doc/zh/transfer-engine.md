@@ -50,7 +50,7 @@ BatchTransfer API 使用请求（Request）对象数组传入用户请求，需�
 
 例如，如图所示，要将数据从本地节点分配给 `cpu:0` 的缓冲区0传输到目标节点分配给`cpu:1`的缓冲区1，引擎首先使用本地服务器的拓扑矩阵识别`cpu:0`的首选NIC，并选择一个，如`mlx5_1`，作为本地NIC。同样，根据目标内存地址选择目标NIC，如`mlx5_3`。这种设置允许建立从`mlx5_1@本地`到`mlx5_3@目标`的RDMA连接，以执行RDMA读写操作。
 
-为了进一步最大化带宽利用率，如果单个请求的传输长度超过16KB，则其内部被划分为多个切片。每个切片可能使用不同的路径，使所有RDMA NIC能够协同工作。
+为了进一步最大化带宽利用率，如果单个请求的传输长度超过64KB，则其内部被划分为多个切片。每个切片可能使用不同的路径，使所有RDMA NIC能够协同工作。
 
 ### 端点管理
 Transfer Engine 使用一对端点来表示本地RDMA NIC和远程RDMA NIC之间的连接。实际上，每个端点包括一个或多个RDMA QP对象。
@@ -73,6 +73,8 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
    Transfer Engine 支持多种 metadata 服务，包括 `etcd`, `redis` 和 `http`。下面以 `etcd` 和 `http` 为例说明如何启动 metadata 服务。
 
    1.1. **`etcd`**
+
+   默认状态下不会使用etcd服务，要在transfer engine中使用etcd服务，需要在`mooncake-common/common.cmake`文件中，把`USE_ETCD`变量的值设为`ON`，就可以使用了。
 
    例如，可使用如下命令行启动 `etcd` 服务：
       ```bash
@@ -405,3 +407,5 @@ int init(const std::string &metadata_conn_string,
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 - `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
 - `MC_LOG_DIR` 该选项指定存放日志重定向文件的目录路径。如果路径无效，glog将回退到向标准错误[stderr]输出日志。
+- `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
+- `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
