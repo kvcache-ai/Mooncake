@@ -446,6 +446,7 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
 
 int TransferEnginePy::batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
                                           std::vector<size_t> capacities) {
+    pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
     for (int i = 0; i < batch_size; i ++ ) {
@@ -455,6 +456,7 @@ int TransferEnginePy::batchRegisterMemory(std::vector<uintptr_t> buffer_addresse
 }
 
 int TransferEnginePy::batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses) {
+    pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<void *> buffers;
     for (int i = 0; i < batch_size; i ++ ) {
