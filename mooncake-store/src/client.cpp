@@ -349,14 +349,10 @@ ErrorCode Client::Get(const std::string& object_key,
         }
         return err;
     }
-    if(replica.is_memory_replica()){ 
-        if (TransferRead(replica, slices) != ErrorCode::OK) {
-            LOG(ERROR) << "transfer_read_failed key=" << object_key;
-            return ErrorCode::INVALID_PARAMS;
-        }
-    }else{
-        // If the replica is a disk replica, read from local file
-        return GetFromLocalFile(object_key, slices, object_info);
+
+    if (TransferRead(replica, slices) != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
 }
@@ -833,10 +829,15 @@ ErrorCode Client::TransferWrite(
 ErrorCode Client::TransferRead(
     const Replica::Descriptor &replica_descriptor,
     std::vector<Slice>& slices) {
-    auto &mem_desc=replica_descriptor.get_memory_descriptor();
     size_t total_size = 0;
-    for (const auto& handle : mem_desc.buffer_descriptors) {
-        total_size += handle.size_;
+    if(replica_descriptor.is_memory_replica()){
+        auto &mem_desc=replica_descriptor.get_memory_descriptor();
+        for (const auto& handle : mem_desc.buffer_descriptors) {
+            total_size += handle.size_;
+        }
+    }else{
+        auto &disk_desc=replica_descriptor.get_disk_descriptor();
+        total_size = disk_desc.file_size;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
