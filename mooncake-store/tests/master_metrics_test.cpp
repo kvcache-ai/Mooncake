@@ -87,8 +87,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     config.replica_num = 1;
 
     // Test MountSegment request
-    ASSERT_EQ(ErrorCode::OK,
-              service_.MountSegment(segment, client_id).error_code);
+    auto mount_result = service_.MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_size(), 0);
     ASSERT_EQ(metrics.get_total_capacity(), kSegmentSize);
     ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
@@ -96,71 +96,74 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
     // Test PutStart and PutRevoke request
-    ASSERT_EQ(
-        ErrorCode::OK,
-        service_.PutStart(key, value_length, slice_lengths, config).error_code);
+    auto put_start_result1 = service_.PutStart(key, value_length, slice_lengths, config);
+    ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    ASSERT_EQ(ErrorCode::OK, service_.PutRevoke(key).error_code);
+    auto put_revoke_result = service_.PutRevoke(key);
+    ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_size(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 1);
     ASSERT_EQ(metrics.get_put_revoke_failures(), 0);
 
     // Test PutStart and PutEnd request
-    ASSERT_EQ(
-        ErrorCode::OK,
-        service_.PutStart(key, value_length, slice_lengths, config).error_code);
+    auto put_start_result2 = service_.PutStart(key, value_length, slice_lengths, config);
+    ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    ASSERT_EQ(ErrorCode::OK, service_.PutEnd(key).error_code);
+    auto put_end_result = service_.PutEnd(key);
+    ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
     ASSERT_EQ(metrics.get_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
     // Test ExistKey request
-    ASSERT_EQ(ErrorCode::OK, service_.ExistKey(key).error_code);
+    auto exist_result = service_.ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value() && exist_result.value());
     ASSERT_EQ(metrics.get_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
 
     // Test GetReplicaList request
-    ASSERT_EQ(ErrorCode::OK, service_.GetReplicaList(key).error_code);
+    auto get_replica_result = service_.GetReplicaList(key);
+    ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(metrics.get_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_get_replica_list_failures(), 0);
 
     // Test Remove request
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    ASSERT_EQ(ErrorCode::OK, service_.Remove(key).error_code);
+    auto remove_result = service_.Remove(key);
+    ASSERT_TRUE(remove_result.has_value());
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_size(), 0);
 
     // Test RemoveAll request
-    ASSERT_EQ(
-        ErrorCode::OK,
-        service_.PutStart(key, value_length, slice_lengths, config).error_code);
-    ASSERT_EQ(ErrorCode::OK, service_.PutEnd(key).error_code);
+    auto put_start_result3 = service_.PutStart(key, value_length, slice_lengths, config);
+    ASSERT_TRUE(put_start_result3.has_value());
+    auto put_end_result2 = service_.PutEnd(key);
+    ASSERT_TRUE(put_end_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
-    ASSERT_EQ(1, service_.RemoveAll().removed_count);
+    ASSERT_EQ(1, service_.RemoveAll());
     ASSERT_EQ(metrics.get_remove_all_requests(), 1);
     ASSERT_EQ(metrics.get_remove_all_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_size(), 0);
 
     // Test UnmountSegment request
-    ASSERT_EQ(
-        ErrorCode::OK,
-        service_.PutStart(key, value_length, slice_lengths, config).error_code);
-    ASSERT_EQ(ErrorCode::OK, service_.PutEnd(key).error_code);
-    ASSERT_EQ(ErrorCode::OK,
-              service_.UnmountSegment(segment_id, client_id).error_code);
+    auto put_start_result4 = service_.PutStart(key, value_length, slice_lengths, config);
+    ASSERT_TRUE(put_start_result4.has_value());
+    auto put_end_result3 = service_.PutEnd(key);
+    ASSERT_TRUE(put_end_result3.has_value());
+    auto unmount_result = service_.UnmountSegment(segment_id, client_id);
+    ASSERT_TRUE(unmount_result.has_value());
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);

@@ -10,97 +10,15 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "rpc_helper.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
-
-struct ExistKeyResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(ExistKeyResponse, error_code)
-
-struct GetReplicaListResponse {
-    std::vector<Replica::Descriptor> replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(GetReplicaListResponse, replica_list, error_code)
-
-struct BatchGetReplicaListResponse {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
-        batch_replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchGetReplicaListResponse, batch_replica_list, error_code)
-
-struct PutStartResponse {
-    std::vector<Replica::Descriptor> replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutStartResponse, replica_list, error_code)
-
-struct PutEndResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutEndResponse, error_code)
-struct PutRevokeResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutRevokeResponse, error_code)
-struct BatchPutStartResponse {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
-        batch_replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutStartResponse, batch_replica_list, error_code)
-
-struct BatchPutEndResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutEndResponse, error_code)
-
-struct BatchPutRevokeResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutRevokeResponse, error_code)
-
-struct RemoveResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(RemoveResponse, error_code)
-struct RemoveAllResponse {
-    long removed_count = 0;
-};
-YLT_REFL(RemoveAllResponse, removed_count)
-struct MountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(MountSegmentResponse, error_code)
-
-struct ReMountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(ReMountSegmentResponse, error_code)
-
-struct UnmountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(UnmountSegmentResponse, error_code)
-
-struct PingResponse {
-    ViewVersionId view_version = 0;
-    ClientStatus client_status = ClientStatus::UNDEFINED;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PingResponse, view_version, error_code)
-
-struct BatchExistResponse {
-    std::vector<ErrorCode> exist_responses;
-};
-YLT_REFL(BatchExistResponse, exist_responses)
 
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
@@ -119,8 +37,7 @@ class WrappedMasterService {
                           eviction_high_watermark_ratio, view_version,
                           client_live_ttl_sec, enable_ha),
           http_server_(4, http_port),
-          metric_report_running_(enable_metric_reporting),
-          view_version_(view_version) {
+          metric_report_running_(enable_metric_reporting) {
         // Initialize HTTP server for metrics
         init_http_server();
 
@@ -178,14 +95,13 @@ class WrappedMasterService {
             "/query_key",
             [&](coro_http_request& req, coro_http_response& resp) {
                 auto key = req.get_query_value("key");
-                GetReplicaListResponse response =
-                    GetReplicaList(std::string(key));
+                auto get_result = GetReplicaList(std::string(key));
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                if (response.error_code == ErrorCode::OK) {
+                if (get_result) {
                     std::string ss = "";
-                    for (size_t i = 0; i < response.replica_list.size(); i++) {
+                    for (size_t i = 0; i < get_result.value().size(); i++) {
                         for (const auto& handle :
-                             response.replica_list[i].buffer_descriptors) {
+                             get_result.value()[i].buffer_descriptors) {
                             std::string tmp = "";
                             struct_json::to_json(handle, tmp);
                             ss += tmp;
@@ -195,7 +111,7 @@ class WrappedMasterService {
                     resp.set_status_and_content(status_type::ok, ss);
                 } else {
                     resp.set_status_and_content(status_type::not_found,
-                                                "Key not found");
+                                                toString(get_result.error()));
                 }
             });
 
@@ -282,351 +198,224 @@ class WrappedMasterService {
                   << http_server_.port();
     }
 
-    ExistKeyResponse ExistKey(const std::string& key) {
-        ScopedVLogTimer timer(1, "ExistKey");
-        timer.LogRequest("key=", key);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_exist_key_requests();
-
-        ExistKeyResponse response;
-
-        auto result = master_service_.ExistKey(key);
-        if (result) {
-            // TODO: Refactor rpc exist interface, use boolean instead
-            response.error_code =
-                (result.value()) ? ErrorCode::OK : ErrorCode::OBJECT_NOT_FOUND;
-        } else {
-            MasterMetricManager::instance().inc_exist_key_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<bool, ErrorCode> ExistKey(const std::string& key) {
+        return execute_rpc(
+            "ExistKey", [&] { return master_service_.ExistKey(key); },
+            [&](auto& timer) { timer.LogRequest("key=", key); },
+            [] { MasterMetricManager::instance().inc_exist_key_requests(); },
+            [] { MasterMetricManager::instance().inc_exist_key_failures(); });
     }
 
-    BatchExistResponse BatchExistKey(const std::vector<std::string>& keys) {
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys) {
         ScopedVLogTimer timer(1, "BatchExistKey");
         timer.LogRequest("keys_count=", keys.size());
 
-        BatchExistResponse response;
-        response.exist_responses.reserve(keys.size());
         auto result = master_service_.BatchExistKey(keys);
-        if (result.size() != keys.size()) {
-            LOG(ERROR) << "Internal error, batch exist key result size "
-                          "mismatch,expected"
-                       << keys.size() << ", actual=" << result.size();
-            response.exist_responses.resize(keys.size(),
-                                            ErrorCode::INTERNAL_ERROR);
-            timer.LogResponseJson(response);
-            return response;
-        }
-
-        for (const auto& each_key_result : result) {
-            if (each_key_result) {
-                // TODO: Refactor rpc exist interface, use boolean instead
-                if (each_key_result.value()) {
-                    response.exist_responses.emplace_back(ErrorCode::OK);
-                } else {
-                    response.exist_responses.emplace_back(
-                        ErrorCode::OBJECT_NOT_FOUND);
-                }
-            } else {
-                response.exist_responses.emplace_back(each_key_result.error());
-            }
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponse("results_count=", result.size());
+        return result;
     }
 
-    GetReplicaListResponse GetReplicaList(const std::string& key) {
-        ScopedVLogTimer timer(1, "GetReplicaList");
-        timer.LogRequest("key=", key);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_get_replica_list_requests();
-
-        GetReplicaListResponse response;
-        auto result = master_service_.GetReplicaList(key);
-        if (result) {
-            response.replica_list = std::move(result.value());
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_get_replica_list_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
+        const std::string& key) {
+        return execute_rpc(
+            "GetReplicaList",
+            [&] { return master_service_.GetReplicaList(key); },
+            [&](auto& timer) { timer.LogRequest("key=", key); },
+            [] {
+                MasterMetricManager::instance().inc_get_replica_list_requests();
+            },
+            [] {
+                MasterMetricManager::instance().inc_get_replica_list_failures();
+            });
     }
 
-    BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::vector<std::string>& keys) {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys) {
         ScopedVLogTimer timer(1, "BatchGetReplicaList");
-        timer.LogRequest("action=get_batch_replica_list");
+        timer.LogRequest("keys_count=", keys.size());
 
-        BatchGetReplicaListResponse response;
-        auto result = master_service_.BatchGetReplicaList(keys);
-        if (result) {
-            response.batch_replica_list = std::move(result.value());
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_get_replica_list_failures();
-            response.error_code = result.error();
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            results;
+        results.reserve(keys.size());
+
+        for (const auto& key : keys) {
+            results.emplace_back(master_service_.GetReplicaList(key));
         }
 
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponse("results_count=", results.size());
+        return results;
     }
 
-    PutStartResponse PutStart(const std::string& key, uint64_t value_length,
-                              const std::vector<uint64_t>& slice_lengths,
-                              const ReplicateConfig& config) {
-        ScopedVLogTimer timer(1, "PutStart");
-        timer.LogRequest("key=", key, ", value_length=", value_length,
-                         ", slice_lengths=", slice_lengths.size());
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_put_start_requests();
-
-        // Track value size in histogram
-        MasterMetricManager::instance().observe_value_size(value_length);
-
-        PutStartResponse response;
-        auto result =
-            master_service_.PutStart(key, value_length, slice_lengths, config);
-        if (result) {
-            response.replica_list = std::move(result.value());
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_start_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    PutEndResponse PutEnd(const std::string& key) {
-        ScopedVLogTimer timer(1, "PutEnd");
-        timer.LogRequest("key=", key);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_put_end_requests();
-
-        PutEndResponse response;
-        auto result = master_service_.PutEnd(key);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_end_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    PutRevokeResponse PutRevoke(const std::string& key) {
-        ScopedVLogTimer timer(1, "PutRevoke");
-        timer.LogRequest("key=", key);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_put_revoke_requests();
-
-        PutRevokeResponse response;
-        auto result = master_service_.PutRevoke(key);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_revoke_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    BatchPutStartResponse BatchPutStart(
-        const std::vector<std::string>& keys,
-        const std::unordered_map<std::string, uint64_t>& value_lengths,
-        const std::unordered_map<std::string, std::vector<uint64_t>>&
-            slice_lengths,
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+        const std::string& key, uint64_t value_length,
+        const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config) {
-        ScopedVLogTimer timer(1, "BatchPutStart");
-        timer.LogRequest("xrrkeys_count=", keys.size());
-
-        BatchPutStartResponse response;
-        auto result = master_service_.BatchPutStart(keys, value_lengths,
-                                                    slice_lengths, config);
-        if (result) {
-            response.batch_replica_list = std::move(result.value());
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_start_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+        return execute_rpc(
+            "PutStart",
+            [&] {
+                return master_service_.PutStart(key, value_length,
+                                                slice_lengths, config);
+            },
+            [&](auto& timer) {
+                timer.LogRequest("key=", key, ", value_length=", value_length,
+                                 ", slice_lengths=", slice_lengths.size());
+            },
+            [&] {
+                MasterMetricManager::instance().inc_put_start_requests();
+                MasterMetricManager::instance().observe_value_size(
+                    value_length);
+            },
+            [] { MasterMetricManager::instance().inc_put_start_failures(); });
     }
 
-    BatchPutEndResponse BatchPutEnd(const std::vector<std::string>& keys) {
+    tl::expected<void, ErrorCode> PutEnd(const std::string& key) {
+        return execute_rpc(
+            "PutEnd", [&] { return master_service_.PutEnd(key); },
+            [&](auto& timer) { timer.LogRequest("key=", key); },
+            [] { MasterMetricManager::instance().inc_put_end_requests(); },
+            [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    }
+
+    tl::expected<void, ErrorCode> PutRevoke(const std::string& key) {
+        return execute_rpc(
+            "PutRevoke", [&] { return master_service_.PutRevoke(key); },
+            [&](auto& timer) { timer.LogRequest("key=", key); },
+            [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
+            [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+    }
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& value_lengths,
+                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+                  const ReplicateConfig& config) {
+        ScopedVLogTimer timer(1, "BatchPutStart");
+        timer.LogRequest("keys_count=", keys.size());
+
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            results;
+        results.reserve(keys.size());
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(master_service_.PutStart(
+                keys[i], value_lengths[i], slice_lengths[i], config));
+        }
+
+        timer.LogResponse("results_count=", results.size());
+        return results;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<std::string>& keys) {
         ScopedVLogTimer timer(1, "BatchPutEnd");
         timer.LogRequest("keys_count=", keys.size());
 
-        BatchPutEndResponse response;
-        auto result = master_service_.BatchPutEnd(keys);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_end_failures();
-            response.error_code = result.error();
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
+
+        for (const auto& key : keys) {
+            results.emplace_back(master_service_.PutEnd(key));
         }
 
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponse("results_count=", results.size());
+        return results;
     }
 
-    BatchPutRevokeResponse BatchPutRevoke(
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys) {
         ScopedVLogTimer timer(1, "BatchPutRevoke");
         timer.LogRequest("keys_count=", keys.size());
 
-        BatchPutRevokeResponse response;
-        auto result = master_service_.BatchPutRevoke(keys);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_put_revoke_failures();
-            response.error_code = result.error();
-        }
-        timer.LogResponseJson(response);
-        return response;
-    }
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
 
-    RemoveResponse Remove(const std::string& key) {
-        ScopedVLogTimer timer(1, "Remove");
-        timer.LogRequest("key=", key);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_remove_requests();
-
-        RemoveResponse response;
-        auto result = master_service_.Remove(key);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_remove_failures();
-            response.error_code = result.error();
+        for (const auto& key : keys) {
+            results.emplace_back(master_service_.PutRevoke(key));
         }
 
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponse("results_count=", results.size());
+        return results;
     }
 
-    RemoveAllResponse RemoveAll() {
+    tl::expected<void, ErrorCode> Remove(const std::string& key) {
+        return execute_rpc(
+            "Remove", [&] { return master_service_.Remove(key); },
+            [&](auto& timer) { timer.LogRequest("key=", key); },
+            [] { MasterMetricManager::instance().inc_remove_requests(); },
+            [] { MasterMetricManager::instance().inc_remove_failures(); });
+    }
+
+    long RemoveAll() {
         ScopedVLogTimer timer(1, "RemoveAll");
         timer.LogRequest("action=remove_all_objects");
-
-        // Increment request metric
         MasterMetricManager::instance().inc_remove_all_requests();
-
-        RemoveAllResponse response;
-        const long removed_count = master_service_.RemoveAll();
-
-        assert(removed_count >= 0);
-        response.removed_count = removed_count;
-        timer.LogResponseJson(response);
-        return response;
+        long result = master_service_.RemoveAll();
+        timer.LogResponse("items_removed=", result);
+        return result;
     }
 
-    MountSegmentResponse MountSegment(const Segment& segment,
-                                      const UUID& client_id) {
-        ScopedVLogTimer timer(1, "MountSegment");
-        timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                         ", segment_name=", segment.name, ", id=", segment.id);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_mount_segment_requests();
-
-        MountSegmentResponse response;
-        auto result = master_service_.MountSegment(segment, client_id);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_mount_segment_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
+                                               const UUID& client_id) {
+        return execute_rpc(
+            "MountSegment",
+            [&] { return master_service_.MountSegment(segment, client_id); },
+            [&](auto& timer) {
+                timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                                 ", segment_name=", segment.name,
+                                 ", id=", segment.id);
+            },
+            [] {
+                MasterMetricManager::instance().inc_mount_segment_requests();
+            },
+            [] {
+                MasterMetricManager::instance().inc_mount_segment_failures();
+            });
     }
 
-    ReMountSegmentResponse ReMountSegment(const std::vector<Segment>& segments,
-                                          const UUID& client_id) {
-        ScopedVLogTimer timer(1, "ReMountSegment");
-        timer.LogRequest("segments_count=", segments.size(),
-                         ", client_id=", client_id);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_remount_segment_requests();
-
-        ReMountSegmentResponse response;
-        auto result = master_service_.ReMountSegment(segments, client_id);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_remount_segment_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<void, ErrorCode> ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id) {
+        return execute_rpc(
+            "ReMountSegment",
+            [&] { return master_service_.ReMountSegment(segments, client_id); },
+            [&](auto& timer) {
+                timer.LogRequest("segments_count=", segments.size(),
+                                 ", client_id=", client_id);
+            },
+            [] {
+                MasterMetricManager::instance().inc_remount_segment_requests();
+            },
+            [] {
+                MasterMetricManager::instance().inc_remount_segment_failures();
+            });
     }
 
-    UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
-                                          const UUID& client_id) {
-        ScopedVLogTimer timer(1, "UnmountSegment");
-        timer.LogRequest("segment_id=", segment_id);
-
-        // Increment request metric
-        MasterMetricManager::instance().inc_unmount_segment_requests();
-
-        UnmountSegmentResponse response;
-        auto result = master_service_.UnmountSegment(segment_id, client_id);
-        if (result) {
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_unmount_segment_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
+                                                 const UUID& client_id) {
+        return execute_rpc(
+            "UnmountSegment",
+            [&] {
+                return master_service_.UnmountSegment(segment_id, client_id);
+            },
+            [&](auto& timer) {
+                timer.LogRequest("segment_id=", segment_id,
+                                 ", client_id=", client_id);
+            },
+            [] {
+                MasterMetricManager::instance().inc_unmount_segment_requests();
+            },
+            [] {
+                MasterMetricManager::instance().inc_unmount_segment_failures();
+            });
     }
 
-    PingResponse Ping(const UUID& client_id) {
-        ScopedVLogTimer timer(1, "Ping");
-        timer.LogRequest("client_id=", client_id);
-
-        MasterMetricManager::instance().inc_ping_requests();
-
-        PingResponse response;
-        auto result = master_service_.Ping(client_id);
-        if (result) {
-            auto [view_version, client_status] = result.value();
-            response.view_version = view_version;
-            response.client_status = client_status;
-            response.error_code = ErrorCode::OK;
-        } else {
-            MasterMetricManager::instance().inc_ping_failures();
-            response.error_code = result.error();
-        }
-
-        timer.LogResponseJson(response);
-        return response;
+    tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(
+        const UUID& client_id) {
+        return execute_rpc(
+            "Ping", [&] { return master_service_.Ping(client_id); },
+            [&](auto& timer) { timer.LogRequest("client_id=", client_id); },
+            [] { MasterMetricManager::instance().inc_ping_requests(); },
+            [] { MasterMetricManager::instance().inc_ping_failures(); });
     }
 
    private:
@@ -634,7 +423,6 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
-    ViewVersionId view_version_;
 };
 
 inline void RegisterRpcService(
