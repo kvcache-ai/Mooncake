@@ -61,6 +61,7 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return ExistKeyResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -87,6 +88,50 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
     return result.value();
 }
 
+BatchExistResponse MasterClient::BatchExistKey(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto client = client_accessor_.GetClient();
+    if (!client) {
+        LOG(ERROR) << "Client not available";
+        BatchExistResponse response;
+        response.exist_responses.resize(object_keys.size());
+        for (auto& exist_response : response.exist_responses) {
+            exist_response = ErrorCode::RPC_FAIL;
+        }
+        timer.LogResponse("error=Client not available");
+        return response;
+    }
+
+    auto request_result =
+        client->send_request<&WrappedMasterService::BatchExistKey>(object_keys);
+    std::optional<BatchExistResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<BatchExistResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to check batch key existence: "
+                           << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        BatchExistResponse response;
+        response.exist_responses.resize(object_keys.size());
+        for (auto& exist_response : response.exist_responses) {
+            exist_response = ErrorCode::RPC_FAIL;
+        }
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 GetReplicaListResponse MasterClient::GetReplicaList(
     const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
@@ -95,6 +140,7 @@ GetReplicaListResponse MasterClient::GetReplicaList(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
     }
 
@@ -127,6 +173,7 @@ BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return BatchGetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
     }
 
@@ -162,6 +209,7 @@ PutStartResponse MasterClient::PutStart(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return PutStartResponse{{}, ErrorCode::RPC_FAIL};
     }
 
@@ -204,6 +252,7 @@ BatchPutStartResponse MasterClient::BatchPutStart(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return BatchPutStartResponse{{}, ErrorCode::RPC_FAIL};
     }
 
@@ -236,6 +285,7 @@ PutEndResponse MasterClient::PutEnd(const std::string& key) {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return PutEndResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -268,6 +318,7 @@ BatchPutEndResponse MasterClient::BatchPutEnd(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return BatchPutEndResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -299,6 +350,7 @@ PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return PutRevokeResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -331,6 +383,7 @@ BatchPutRevokeResponse MasterClient::BatchPutRevoke(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return BatchPutRevokeResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -362,6 +415,7 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return RemoveResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -392,6 +446,7 @@ RemoveAllResponse MasterClient::RemoveAll() {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return RemoveAllResponse{toInt(ErrorCode::RPC_FAIL)};
     }
 
@@ -428,6 +483,7 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return MountSegmentResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -462,6 +518,7 @@ ReMountSegmentResponse MasterClient::ReMountSegment(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return ReMountSegmentResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -495,6 +552,7 @@ UnmountSegmentResponse MasterClient::UnmountSegment(const UUID& segment_id,
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return UnmountSegmentResponse{ErrorCode::RPC_FAIL};
     }
 
@@ -527,6 +585,7 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
         return PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
     }
 

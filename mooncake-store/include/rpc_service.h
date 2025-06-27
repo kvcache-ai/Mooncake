@@ -97,6 +97,11 @@ struct PingResponse {
 };
 YLT_REFL(PingResponse, view_version, client_status, error_code)
 
+struct BatchExistResponse {
+    std::vector<ErrorCode> exist_responses;
+};
+YLT_REFL(BatchExistResponse, exist_responses)
+
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
@@ -270,6 +275,15 @@ class WrappedMasterService {
             MasterMetricManager::instance().inc_exist_key_failures();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchExistResponse BatchExistKey(const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchExistKey");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchExistResponse response{master_service_.BatchExistKey(keys)};
         timer.LogResponseJson(response);
         return response;
     }
@@ -462,7 +476,8 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(const Segment& segment, const UUID& client_id) {
+    MountSegmentResponse MountSegment(const Segment& segment,
+                                      const UUID& client_id) {
         ScopedVLogTimer timer(1, "MountSegment");
         timer.LogRequest("base=", segment.base, ", size=", segment.size,
                          ", segment_name=", segment.name, ", id=", segment.id);
@@ -504,7 +519,8 @@ class WrappedMasterService {
         return response;
     }
 
-    UnmountSegmentResponse UnmountSegment(const UUID& segment_id, const UUID& client_id) {
+    UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
+                                          const UUID& client_id) {
         ScopedVLogTimer timer(1, "UnmountSegment");
         timer.LogRequest("segment_id=", segment_id);
 
@@ -512,7 +528,8 @@ class WrappedMasterService {
         MasterMetricManager::instance().inc_unmount_segment_requests();
 
         UnmountSegmentResponse response;
-        response.error_code = master_service_.UnmountSegment(segment_id, client_id);
+        response.error_code =
+            master_service_.UnmountSegment(segment_id, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
@@ -582,6 +599,8 @@ inline void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
 }
 

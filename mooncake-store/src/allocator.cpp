@@ -17,7 +17,7 @@ AllocatedBuffer::~AllocatedBuffer() {
                 << " size=" << size_;
     } else {
         MasterMetricManager::instance().dec_allocated_size(size_);
-        LOG(WARNING) << "allocator=expired_or_null in buf_handle_destructor";
+        VLOG(1) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
 

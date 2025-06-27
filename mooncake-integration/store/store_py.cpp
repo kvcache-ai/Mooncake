@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 #include <pybind11/gil.h>  // For GIL management
+#include <pybind11/stl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -494,6 +495,48 @@ int DistributedObjectStore::isExist(const std::string &key) {
     return toInt(err);                                 // Error
 }
 
+std::vector<int> DistributedObjectStore::batchIsExist(
+    const std::vector<std::string> &keys) {
+    std::vector<int> results;
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        results.resize(keys.size(), -1);  // Fill with error codes
+        return results;
+    }
+
+    if (keys.empty()) {
+        LOG(WARNING) << "Empty keys vector provided to batchIsExist";
+        return results;  // Return empty vector
+    }
+
+    std::vector<ErrorCode> exist_results;
+    ErrorCode batch_err = client_->BatchIsExist(keys, exist_results);
+
+    results.resize(keys.size());
+
+    if (batch_err != ErrorCode::OK) {
+        LOG(ERROR) << "BatchIsExist operation failed with error: "
+                   << toString(batch_err);
+        // Fill all results with error code
+        std::fill(results.begin(), results.end(), toInt(batch_err));
+        return results;
+    }
+
+    // Convert ErrorCode results to int results
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exist_results[i] == ErrorCode::OK) {
+            results[i] = 1;  // Exists
+        } else if (exist_results[i] == ErrorCode::OBJECT_NOT_FOUND) {
+            results[i] = 0;  // Does not exist
+        } else {
+            results[i] = toInt(exist_results[i]);  // Error
+        }
+    }
+
+    return results;
+}
+
 int64_t DistributedObjectStore::getSize(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -602,6 +645,125 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
     return result;
 }
 
+int DistributedObjectStore::register_buffer(void *buffer, size_t size) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+    ErrorCode error_code =
+        client_->RegisterLocalMemory(buffer, size, kWildcardLocation);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Register buffer failed with error: "
+                   << toString(error_code);
+        return toInt(error_code);
+    }
+    return 0;
+}
+
+int DistributedObjectStore::get_into(const std::string &key, void *buffer,
+                                     size_t size) {
+    // NOTE: The buffer address must be previously registered with
+    // register_buffer() for zero-copy RDMA operations to work correctly
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    mooncake::Client::ObjectInfo object_info;
+    ErrorCode error_code;
+
+    // Step 1: Get object info
+    error_code = client_->Query(key, object_info);
+    if (error_code == ErrorCode::OBJECT_NOT_FOUND) {
+        VLOG(1) << "Object not found for key: " << key;
+        return -toInt(error_code);
+    }
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Query failed for key: " << key
+                   << " with error: " << toString(error_code);
+        return -toInt(error_code);
+    }
+
+    // Calculate total size from object info
+    uint64_t total_size = 0;
+    if (object_info.replica_list.empty()) {
+        LOG(ERROR) << "Internal error: object_info.replica_list is empty";
+        return -1;
+    }
+
+    auto &replica = object_info.replica_list[0];
+    for (auto &handle : replica.buffer_descriptors) {
+        total_size += handle.size_;
+    }
+
+    // Check if user buffer is large enough
+    if (size < total_size) {
+        LOG(ERROR) << "User buffer too small. Required: " << total_size
+                   << ", provided: " << size;
+        return -1;
+    }
+
+    // Step 2: Split user buffer according to object info and create slices
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+
+    for (auto &handle : replica.buffer_descriptors) {
+        auto chunk_size = handle.size_;
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    // Step 3: Read data directly into user buffer
+    error_code = client_->Get(key, object_info, slices);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Get failed for key: " << key
+                   << " with error: " << toString(error_code);
+        return -toInt(error_code);
+    }
+
+    return static_cast<int>(total_size);
+}
+
+int DistributedObjectStore::put_from(const std::string &key, void *buffer,
+                                     size_t size) {
+    // NOTE: The buffer address must be previously registered with
+    // register_buffer() for zero-copy RDMA operations to work correctly
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to put empty data for key: " << key;
+        return 0;
+    }
+
+    // Create slices directly from the user buffer
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;  // Make configurable
+    config.preferred_segment = this->local_hostname;
+
+    ErrorCode error_code = client_->Put(key, slices, config);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(error_code);
+        return -toInt(error_code);
+    }
+
+    return 0;
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the SliceBuffer class
     py::class_<SliceBuffer, std::shared_ptr<SliceBuffer>>(m, "SliceBuffer",
@@ -656,9 +818,46 @@ PYBIND11_MODULE(store, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("is_exist", &DistributedObjectStore::isExist,
              py::call_guard<py::gil_scoped_release>())
+        .def("batch_is_exist", &DistributedObjectStore::batchIsExist,
+             py::call_guard<py::gil_scoped_release>(), py::arg("keys"),
+             "Check if multiple objects exist. Returns list of results: 1 if "
+             "exists, 0 if not exists, -1 if error")
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
+        .def(
+            "register_buffer",
+            [](DistributedObjectStore &self, uintptr_t buffer_ptr,
+               size_t size) {
+                // Register memory buffer for RDMA operations
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.register_buffer(buffer, size);
+            },
+            py::arg("buffer_ptr"), py::arg("size"),
+            "Register a memory buffer for direct access operations")
+        .def(
+            "get_into",
+            [](DistributedObjectStore &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size) {
+                // Get data directly into user-provided buffer
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.get_into(key, buffer, size);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            "Get object data directly into a pre-allocated buffer")
+        .def(
+            "put_from",
+            [](DistributedObjectStore &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size) {
+                // Put data directly from user-provided buffer
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.put_from(key, buffer, size);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            "Put object data directly from a pre-allocated buffer")
         .def("put",
              [](DistributedObjectStore &self, const std::string &key,
                 py::buffer buf) {

@@ -378,7 +378,8 @@ TEST_F(ChaosTest, ClientKilledFailover) {
         .protocol = FLAGS_protocol,
         .device_name = FLAGS_device_name,
     };
-    ClientProcessHandler to_close_client(FLAGS_client_path, 0, FLAGS_out_dir, clt_runner_cfg);
+    ClientProcessHandler to_close_client(FLAGS_client_path, 0, FLAGS_out_dir,
+                                         clt_runner_cfg);
     // Set the client config to only run mount operation
     ASSERT_TRUE(to_close_client.start());
     std::shared_ptr<ClientTestWrapper> other_client =

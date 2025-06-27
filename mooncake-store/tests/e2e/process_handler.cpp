@@ -112,13 +112,13 @@ bool MasterProcessHandler::start() {
         close(stderr_fd);
 
         // Execute the master
-        std::string host_ip_arg = "--host-ip=0.0.0.0";
-        std::string port_arg = "--port=" + std::to_string(port_);
-        LOG(INFO) << "[m" << index_ << "] Execl master" << " " << host_ip_arg
-                  << " " << port_arg;
+        std::string rpc_address_arg = "--rpc-address=0.0.0.0";
+        std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
+        LOG(INFO) << "[m" << index_ << "] Execl master" << " "
+                  << rpc_address_arg << " " << rpc_port_arg;
         execl(master_path_.c_str(), master_path_.c_str(), "--enable-ha=true",
               ("--etcd-endpoints=" + etcd_endpoints_).c_str(),
-              host_ip_arg.c_str(), port_arg.c_str(), nullptr);
+              rpc_address_arg.c_str(), rpc_port_arg.c_str(), nullptr);
 
         // If execl returns, it means there was an error
         LOG(ERROR) << "[m" << index_

@@ -1,18 +1,18 @@
 #pragma once
 
+#include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
-#include <boost/functional/hash.hpp>
 
+#include "ha_helper.h"
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
-#include "ha_helper.h"
 
 namespace mooncake {
 
@@ -189,6 +189,15 @@ class Client {
      * exists, other ErrorCode for errors
      */
     ErrorCode IsExist(const std::string& key);
+
+    /**
+     * @brief Checks if multiple objects exist
+     * @param keys Vector of keys to check
+     * @param exist_results Output vector of existence results for each key
+     * @return ErrorCode indicating success/failure of the batch operation
+     */
+    ErrorCode BatchIsExist(const std::vector<std::string>& keys,
+                           std::vector<ErrorCode>& exist_results);
 
    private:
     /**

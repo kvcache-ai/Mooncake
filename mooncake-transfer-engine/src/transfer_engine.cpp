@@ -194,6 +194,18 @@ std::string TransferEngine::getLocalIpAndPort() {
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
+int TransferEngine::getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies) {
+    return metadata_->getNotifies(notifies);
+}
+
+int TransferEngine::sendNotify(SegmentID target_id,
+                               TransferMetadata::NotifyDesc notify_msg) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+    return ret;
+}
+
 Transport::SegmentHandle TransferEngine::openSegment(
     const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;

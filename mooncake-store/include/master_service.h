@@ -1,25 +1,23 @@
 #pragma once
 
 #include <atomic>
-#include <boost/lockfree/queue.hpp>
 #include <boost/functional/hash.hpp>
+#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <optional>
 
 #include "allocation_strategy.h"
-#include "eviction_strategy.h"
-#include "allocator.h"
-#include "types.h"
+#include "mutex.h"
 #include "segment.h"
-
+#include "types.h"
 
 namespace mooncake {
 // Forward declarations
@@ -47,7 +45,7 @@ struct GCTask {
  * 1. client_mutex_
  * 2. metadata_shards_[shard_idx_].mutex
  * 3. segment_mutex_
-*/
+ */
 class MasterService {
    private:
     // Comparator for GC tasks priority queue
@@ -61,7 +59,8 @@ class MasterService {
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+                  double eviction_high_watermark_ratio =
+                      DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                   ViewVersionId view_version = 0,
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
                   bool enable_ha = false);
@@ -83,8 +82,8 @@ class MasterService {
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the
      * return code is not ErrorCode::OK.
-     * @return ErrorCode::OK means either all segments are remounted successfully
-     *         or the fail is not solvable by a new remount request.
+     * @return ErrorCode::OK means either all segments are remounted
+     * successfully or the fail is not solvable by a new remount request.
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
      *         be mounted temporarily.
      *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
@@ -106,25 +105,29 @@ class MasterService {
      */
     ErrorCode ExistKey(const std::string& key);
 
+    std::vector<ErrorCode> BatchExistKey(const std::vector<std::string>& keys);
+
     /**
      * @brief Fetch all keys
      * @return ErrorCode::OK if exists
      */
-    ErrorCode GetAllKeys(std::vector<std::string> & all_keys);
+    ErrorCode GetAllKeys(std::vector<std::string>& all_keys);
 
     /**
-     * @brief Fetch all segments, each node has a unique real client with fixed segment
-     * name : segment name, preferred format : {ip}:{port}, bad format : localhost:{port}
+     * @brief Fetch all segments, each node has a unique real client with fixed
+     * segment name : segment name, preferred format : {ip}:{port}, bad format :
+     * localhost:{port}
      * @return ErrorCode::OK if exists
      */
-    ErrorCode GetAllSegments(std::vector<std::string> & all_segments);
+    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
-     * Conductor should use these information to schedule new requests. 
+     * Conductor should use these information to schedule new requests.
      * @return ErrorCode::OK if exists
      */
-    ErrorCode QuerySegments(const std::string & segment, size_t & used, size_t & capacity);
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
 
     /**
      * @brief Get list of replicas for an object
@@ -222,7 +225,6 @@ class MasterService {
      */
     long RemoveAll();
 
-
     /**
      * @brief Get the count of keys
      * @return The count of keys
@@ -238,7 +240,7 @@ class MasterService {
      *         ping queue is full
      */
     ErrorCode Ping(const UUID& client_id, ViewVersionId& view_version,
-              ClientStatus& client_status);
+                   ClientStatus& client_status);
 
    private:
     // GC thread function
@@ -258,10 +260,11 @@ class MasterService {
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         std::chrono::steady_clock::time_point lease_timeout;
 
-        // Check if there is some replica with a different status than the given value.
-        // If there is, return the status of the first replica that is not equal to
-        // the given value. Otherwise, return false.
-        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
+        // Check if there is some replica with a different status than the given
+        // value. If there is, return the status of the first replica that is
+        // not equal to the given value. Otherwise, return false.
+        std::optional<ReplicaStatus> HasDiffRepStatus(
+            ReplicaStatus status) const {
             for (const auto& replica : replicas) {
                 if (replica.status() != status) {
                     return replica.status();
@@ -270,10 +273,12 @@ class MasterService {
             return {};
         }
 
-        // Grant a lease with timeout as now() + ttl, only update if the new timeout is larger
+        // Grant a lease with timeout as now() + ttl, only update if the new
+        // timeout is larger
         void GrantLease(const uint64_t ttl) {
-            lease_timeout = std::max(lease_timeout,
-                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl));
+            lease_timeout =
+                std::max(lease_timeout, std::chrono::steady_clock::now() +
+                                            std::chrono::milliseconds(ttl));
         }
 
         // Check if the lease has expired
@@ -282,7 +287,7 @@ class MasterService {
         }
 
         // Check if the lease has expired
-        bool IsLeaseExpired(std::chrono::steady_clock::time_point &now) const {
+        bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
             return now >= lease_timeout;
         }
     };
@@ -295,8 +300,9 @@ class MasterService {
 
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
-        mutable std::mutex mutex;
-        std::unordered_map<std::string, ObjectMetadata> metadata;
+        mutable Mutex mutex;
+        std::unordered_map<std::string, ObjectMetadata> metadata
+            GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -318,12 +324,13 @@ class MasterService {
         10;  // 10 ms sleep between GC and eviction checks
 
     // Lease related members
-    const uint64_t default_kv_lease_ttl_; // in milliseconds
+    const uint64_t default_kv_lease_ttl_;  // in milliseconds
 
     // Eviction related members
-    std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
-    const double eviction_ratio_; // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_; // in range [0.0, 1.0]
+    std::atomic<bool> need_eviction_{
+        false};  // Set to trigger eviction when not enough space left
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
@@ -332,7 +339,7 @@ class MasterService {
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
-              lock_(service_->metadata_shards_[shard_idx_].mutex),
+              lock_(&service_->metadata_shards_[shard_idx_].mutex),
               it_(service_->metadata_shards_[shard_idx_].metadata.find(key)) {
             // Automatically clean up invalid handles
             if (it_ != service_->metadata_shards_[shard_idx_].metadata.end()) {
@@ -344,21 +351,21 @@ class MasterService {
         }
 
         // Check if metadata exists
-        bool Exists() const {
+        bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return it_ != service_->metadata_shards_[shard_idx_].metadata.end();
         }
 
         // Get metadata (only call when Exists() is true)
-        ObjectMetadata& Get() { return it_->second; }
+        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
 
         // Delete current metadata (for PutRevoke or Remove operations)
-        void Erase() {
+        void Erase() NO_THREAD_SAFETY_ANALYSIS {
             service_->metadata_shards_[shard_idx_].metadata.erase(it_);
             it_ = service_->metadata_shards_[shard_idx_].metadata.end();
         }
 
         // Create new metadata (only call when !Exists())
-        ObjectMetadata& Create() {
+        ObjectMetadata& Create() NO_THREAD_SAFETY_ANALYSIS {
             auto result =
                 service_->metadata_shards_[shard_idx_].metadata.emplace(
                     key_, ObjectMetadata());
@@ -370,7 +377,7 @@ class MasterService {
         MasterService* service_;
         std::string key_;
         size_t shard_idx_;
-        std::unique_lock<std::mutex> lock_;
+        MutexLocker lock_;
         std::unordered_map<std::string, ObjectMetadata>::iterator it_;
     };
 
@@ -380,7 +387,8 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
-    std::unordered_set<UUID, boost::hash<UUID>> ok_client_;  // client with ok status
+    std::unordered_set<UUID, boost::hash<UUID>>
+        ok_client_;  // client with ok status
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};

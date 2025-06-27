@@ -292,6 +292,7 @@ class TransferSubmitter {
     TransferEngine& engine_;
     const std::string local_hostname_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
+    bool memcpy_enabled_;
 
     /**
      * @brief Select the optimal transfer strategy
