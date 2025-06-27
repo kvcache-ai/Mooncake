@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <map>
+#include <memory>
 
 #include "e2e_utils.h"
 #include "process_handler.h"
