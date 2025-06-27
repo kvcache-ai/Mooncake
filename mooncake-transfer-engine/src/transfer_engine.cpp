@@ -203,7 +203,7 @@ int TransferEngine::sendNotify(SegmentID target_id,
     auto desc = metadata_->getSegmentDescByID(target_id);
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return 0;
+    return ret;
 }
 
 Transport::SegmentHandle TransferEngine::openSegment(

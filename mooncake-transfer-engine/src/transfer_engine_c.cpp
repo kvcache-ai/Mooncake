@@ -146,6 +146,9 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              notify_msg_t notify_msg) {
     uint64_t target_id = entries[0].target_id;
     int rc = submitTransfer(engine, batch_id, entries, count);
+    if (rc) {
+        return rc;
+    }
     // notify
     TransferEngine *native = (TransferEngine *)engine;
     TransferMetadata::NotifyDesc notify;
