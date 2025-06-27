@@ -1,8 +1,9 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <optional>
 #include <string>
-#include <sys/types.h>
 
 namespace mooncake {
 namespace testing {
@@ -31,12 +32,14 @@ class MasterProcessHandler {
      * @brief Constructor.
      *
      * @param path The path to the master executable.
+     * @param etcd_endpoints The etcd endpoints.
      * @param port The port of the master service.
      * @param index The index of the master, used for log.
      * @param out_dir The directory to store the log files.
      */
-    MasterProcessHandler(const std::string& path, const int port, const int index,
-                         const std::string& out_dir);
+    MasterProcessHandler(const std::string& path,
+                         const std::string& etcd_endpoints, const int port,
+                         const int index, const std::string& out_dir);
     ~MasterProcessHandler();
 
     // Delete copy constructor and assignment operator
@@ -61,6 +64,8 @@ class MasterProcessHandler {
     pid_t master_pid_{0};
     // The path to the master executable.
     std::string master_path_;
+    // The etcd endpoints.
+    std::string etcd_endpoints_;
     // The port of the master process.
     int port_;
     // The index of the master, used to name the log file.
@@ -81,6 +86,11 @@ struct ClientRunnerConfig {
     std::optional<int> get_prob;
     std::optional<int> mount_prob;
     std::optional<int> unmount_prob;
+    std::optional<int> port;
+    std::optional<std::string> master_server_entry;
+    std::optional<std::string> engine_meta_url;
+    std::optional<std::string> protocol;
+    std::optional<std::string> device_name;
 };
 
 /**
@@ -98,7 +108,8 @@ class ClientProcessHandler {
      * @param out_dir The directory to store the log files.
      */
     ClientProcessHandler(const std::string& path, const int index,
-                         const std::string& out_dir);
+                         const std::string& out_dir,
+                         const ClientRunnerConfig& config);
     ~ClientProcessHandler();
 
     // Delete copy constructor and assignment operator
@@ -110,7 +121,7 @@ class ClientProcessHandler {
     ClientProcessHandler& operator=(ClientProcessHandler&&) = delete;
 
     // Start the client process with the given parameters.
-    bool start(const ClientRunnerConfig& config);
+    bool start();
 
     // Kill the client process.
     bool kill();
@@ -127,6 +138,8 @@ class ClientProcessHandler {
     int index_;
     // The directory to store the log files.
     std::string out_dir_;
+    // The start parameters for the client runner.
+    ClientRunnerConfig config_;
     // Whether the client is started for the first time.
     bool first_start_{true};
 };

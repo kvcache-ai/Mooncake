@@ -5,16 +5,17 @@
 #include <vector>
 
 #include "client_wrapper.h"
+#include "e2e_utils.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"
-#include "e2e_utils.h"
 
 // Command line flags
-USE_engine_flags
+USE_engine_flags;
 DEFINE_string(master_server_entry, "etcd://0.0.0.0:2379",
               "Master server entry");
 DEFINE_int32(port, 9001, "Port to use for the client");
+// Relative probability for each operation.
 DEFINE_int32(put_prob, 1000, "Probability weight for PUT operations");
 DEFINE_int32(get_prob, 1000, "Probability weight for GET operations");
 DEFINE_int32(mount_prob, 2, "Probability weight for MOUNT operations");
@@ -28,13 +29,9 @@ namespace mooncake {
 namespace testing {
 
 class ClientRunner {
-   private:
-    std::shared_ptr<ClientTestWrapper> client_;
-    std::vector<void*> segments_;
-
    public:
-
     void Run() {
+        // Try until the client is created successfully.
         bool create_success = false;
         while (!create_success) {
             create_success = CreateClient();
@@ -42,22 +39,24 @@ class ClientRunner {
                 sleep(1);
             }
         }
+        // At lease mount one segment.
         Mount();
 
-        const int kOpProbTotal =
-            FLAGS_put_prob + FLAGS_get_prob + FLAGS_mount_prob + FLAGS_unmount_prob;
+        const int kOpProbTotal = FLAGS_put_prob + FLAGS_get_prob +
+                                 FLAGS_mount_prob + FLAGS_unmount_prob;
+        // Randomly generate operations and execute them.
         while (true) {
             int operation = rand() % kOpProbTotal;
             if (operation < FLAGS_put_prob) {
                 Put();
             } else if (operation < FLAGS_put_prob + FLAGS_get_prob) {
                 Get();
-            } else if (operation < FLAGS_put_prob + FLAGS_get_prob + FLAGS_mount_prob) {
+            } else if (operation <
+                       FLAGS_put_prob + FLAGS_get_prob + FLAGS_mount_prob) {
                 Mount();
             } else {
                 Unmount();
             }
-            // 10 operations per second
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
@@ -67,8 +66,8 @@ class ClientRunner {
         std::string hostname = "localhost:" + std::to_string(FLAGS_port);
 
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
-            hostname, FLAGS_engine_meta_url, FLAGS_protocol,
-            FLAGS_device_name, FLAGS_master_server_entry);
+            hostname, FLAGS_engine_meta_url, FLAGS_protocol, FLAGS_device_name,
+            FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
             return false;
@@ -79,6 +78,9 @@ class ClientRunner {
         return true;
     }
 
+    // Randomly generate a key and value. The value can be computed from the
+    // key. This feature is used by verify_kv to verify the correctness of
+    // the value.
     void gen_kv(std::string& key, std::string& value) {
         int key_seed = rand() % 100;
         key = "key_" + std::to_string(key_seed);
@@ -169,7 +171,7 @@ class ClientRunner {
             return;
         }
 
-        void *buffer;
+        void* buffer;
         ErrorCode error_code = client_->Mount(kSegmentSize, buffer);
         if (error_code != ErrorCode::OK) {
             LOG(INFO) << TEST_MOUNT_FAILURE_STR
@@ -197,6 +199,10 @@ class ClientRunner {
             LOG(INFO) << TEST_UNMOUNT_SUCCESS_STR << " buffer=" << base;
         }
     }
+
+   private:
+    std::shared_ptr<ClientTestWrapper> client_;
+    std::vector<void*> segments_;
 };
 
 }  // namespace testing

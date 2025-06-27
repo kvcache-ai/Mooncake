@@ -6,17 +6,17 @@
 #include <memory>
 #include <string>
 
-#include "process_handler.h"
 #include "client_wrapper.h"
+#include "e2e_utils.h"
+#include "process_handler.h"
 #include "types.h"
 #include "utils.h"
-#include "e2e_utils.h"
 
-USE_engine_flags
-FLAG_etcd_endpoints
-FLAG_master_path
-FLAG_client_path
-FLAG_out_dir
+USE_engine_flags;
+FLAG_etcd_endpoints;
+FLAG_master_path;
+FLAG_client_path;
+FLAG_out_dir;
 
 constexpr int master_port_base = 50051;
 constexpr int client_port_base = 12888;
@@ -47,7 +47,7 @@ class ChaosTest : public ::testing::Test {
     static std::shared_ptr<ClientTestWrapper> CreateClientWrapper(
         const std::string& host_name) {
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
-            host_name,                           // Local hostname
+            host_name,              // Local hostname
             FLAGS_engine_meta_url,  // Metadata connection string
             FLAGS_protocol, FLAGS_device_name,
             "etcd://" + FLAGS_etcd_endpoints);
@@ -105,10 +105,13 @@ std::shared_ptr<MasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
 TEST_F(ChaosTest, LeaderKilledFailover) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -152,10 +155,13 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
 TEST_F(ChaosTest, BackupMasterKilled) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -198,10 +204,13 @@ TEST_F(ChaosTest, BackupMasterKilled) {
 TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -245,14 +254,17 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
     ASSERT_EQ(get_value, value);
 }
 
-// Verify the client can automatically remount after all master are killed.
+// Verify the client can automatically remount after all masters are killed.
 TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -296,10 +308,13 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
 TEST_F(ChaosTest, ClientGracefulClose) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -338,10 +353,13 @@ TEST_F(ChaosTest, ClientGracefulClose) {
 TEST_F(ChaosTest, ClientKilledFailover) {
     // Start masters
     const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
     for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(std::make_unique<mooncake::testing::MasterProcessHandler>(
-            FLAGS_master_path, master_port_base + i, i, FLAGS_out_dir));
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -349,10 +367,20 @@ TEST_F(ChaosTest, ClientKilledFailover) {
     WaitMasterViewChange();
 
     // Create two clients
-    ClientProcessHandler to_close_client(FLAGS_client_path, 0, FLAGS_out_dir);
+    ClientRunnerConfig clt_runner_cfg = {
+        .put_prob = 0,
+        .get_prob = 0,
+        .mount_prob = 1000,
+        .unmount_prob = 0,
+        .port = client_port_base + 0,  // index 0
+        .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
+        .engine_meta_url = FLAGS_engine_meta_url,
+        .protocol = FLAGS_protocol,
+        .device_name = FLAGS_device_name,
+    };
+    ClientProcessHandler to_close_client(FLAGS_client_path, 0, FLAGS_out_dir, clt_runner_cfg);
     // Set the client config to only run mount operation
-    ASSERT_TRUE(to_close_client.start(ClientRunnerConfig{
-        .put_prob = 0, .get_prob = 0, .mount_prob = 1000, .unmount_prob = 0}));
+    ASSERT_TRUE(to_close_client.start());
     std::shared_ptr<ClientTestWrapper> other_client =
         CreateClientWrapper("0.0.0.0:" + std::to_string(client_port_base + 1));
     ASSERT_TRUE(other_client != nullptr);
@@ -387,11 +415,11 @@ TEST_F(ChaosTest, ClientKilledFailover) {
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
-    // Initialize gflags first to parse command line arguments
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
-    
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);
-    
+
+    // Initialize gflags first to parse command line arguments
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
+
     return RUN_ALL_TESTS();
 }

@@ -16,9 +16,15 @@
 namespace mooncake {
 namespace testing {
 
-MasterProcessHandler::MasterProcessHandler(const std::string& path, const int port, const int index,
-                                          const std::string& out_dir)
-    : master_path_(path), port_(port), index_(index), out_dir_(out_dir) {}
+MasterProcessHandler::MasterProcessHandler(const std::string& path,
+                                           const std::string& etcd_endpoints,
+                                           const int port, const int index,
+                                           const std::string& out_dir)
+    : master_path_(path),
+      etcd_endpoints_(etcd_endpoints),
+      port_(port),
+      index_(index),
+      out_dir_(out_dir) {}
 
 MasterProcessHandler::~MasterProcessHandler() {
     if (master_pid_ != 0) {
@@ -37,22 +43,19 @@ bool MasterProcessHandler::start() {
     // Create output directory if it doesn't exist
     if (mkdir(out_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
         LOG(ERROR) << "[m" << index_
-                   << "] Failed to create output directory: "
-                   << out_dir_ << ", error: " << strerror(errno);
+                   << "] Failed to create output directory: " << out_dir_
+                   << ", error: " << strerror(errno);
         return false;
     }
 
     std::stringstream stdout_file, stderr_file;
-    stdout_file << out_dir_
-                << "/master_" + std::to_string(index_) + ".out";
-    stderr_file << out_dir_
-                << "/master_" + std::to_string(index_) + ".err";
+    stdout_file << out_dir_ << "/master_" + std::to_string(index_) + ".out";
+    stderr_file << out_dir_ << "/master_" + std::to_string(index_) + ".err";
 
     pid_t pid = fork();
 
     if (pid == -1) {
-        LOG(ERROR) << "[m" << index_
-                   << "] Failed to fork process for master: "
+        LOG(ERROR) << "[m" << index_ << "] Failed to fork process for master: "
                    << strerror(errno);
         return false;
     }
@@ -71,8 +74,8 @@ bool MasterProcessHandler::start() {
         // Open stdout file
         int stdout_fd = open(stdout_file.str().c_str(), open_flags, 0644);
         if (stdout_fd == -1) {
-            LOG(ERROR) << "[m" << index_ << "] Failed to open stdout file: "
-                       << stdout_file.str()
+            LOG(ERROR) << "[m" << index_
+                       << "] Failed to open stdout file: " << stdout_file.str()
                        << ", error: " << strerror(errno);
             exit(1);
         }
@@ -80,8 +83,8 @@ bool MasterProcessHandler::start() {
         // Open stderr file
         int stderr_fd = open(stderr_file.str().c_str(), open_flags, 0644);
         if (stderr_fd == -1) {
-            LOG(ERROR) << "[m" << index_ << "] Failed to open stderr file: "
-                       << stderr_file.str()
+            LOG(ERROR) << "[m" << index_
+                       << "] Failed to open stderr file: " << stderr_file.str()
                        << ", error: " << strerror(errno);
             close(stdout_fd);
             exit(1);
@@ -89,16 +92,16 @@ bool MasterProcessHandler::start() {
 
         // Redirect stdout and stderr
         if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
-            LOG(ERROR) << "[m" << index_ << "] Failed to redirect stdout: "
-                       << strerror(errno);
+            LOG(ERROR) << "[m" << index_
+                       << "] Failed to redirect stdout: " << strerror(errno);
             close(stdout_fd);
             close(stderr_fd);
             exit(1);
         }
 
         if (dup2(stderr_fd, STDERR_FILENO) == -1) {
-            LOG(ERROR) << "[m" << index_ << "] Failed to redirect stderr: "
-                       << strerror(errno);
+            LOG(ERROR) << "[m" << index_
+                       << "] Failed to redirect stderr: " << strerror(errno);
             close(stdout_fd);
             close(stderr_fd);
             exit(1);
@@ -111,10 +114,10 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string host_ip_arg = "--host-ip=0.0.0.0";
         std::string port_arg = "--port=" + std::to_string(port_);
-        LOG(INFO) << "[m" << index_ << "] Execl master" << " "
-                  << host_ip_arg << " " << port_arg;
-        execl(master_path_.c_str(), master_path_.c_str(),
-              "--enable-ha=true", "--etcd-endpoints=0.0.0.0:2379",
+        LOG(INFO) << "[m" << index_ << "] Execl master" << " " << host_ip_arg
+                  << " " << port_arg;
+        execl(master_path_.c_str(), master_path_.c_str(), "--enable-ha=true",
+              ("--etcd-endpoints=" + etcd_endpoints_).c_str(),
               host_ip_arg.c_str(), port_arg.c_str(), nullptr);
 
         // If execl returns, it means there was an error
@@ -145,8 +148,8 @@ bool MasterProcessHandler::kill() {
     // Kill the process forcefully to simulate a crash
     if (::kill(master_pid_, SIGKILL) == 0) {
         LOG(INFO) << "[m" << index_
-                  << "] Force killed master process with PID: "
-                  << master_pid_ << " (simulating crash)";
+                  << "] Force killed master process with PID: " << master_pid_
+                  << " (simulating crash)";
 
         // Wait for the process to be reaped
         int status;
@@ -163,13 +166,13 @@ bool MasterProcessHandler::kill() {
     return success;
 }
 
-bool MasterProcessHandler::is_running() const {
-    return master_pid_ != 0;
-}
+bool MasterProcessHandler::is_running() const { return master_pid_ != 0; }
 
-ClientProcessHandler::ClientProcessHandler(const std::string& path, const int index,
-                                          const std::string& out_dir)
-    : client_path_(path), index_(index), out_dir_(out_dir) {}
+ClientProcessHandler::ClientProcessHandler(const std::string& path,
+                                           const int index,
+                                           const std::string& out_dir,
+                                           const ClientRunnerConfig& config)
+    : client_path_(path), index_(index), out_dir_(out_dir), config_(config) {}
 
 ClientProcessHandler::~ClientProcessHandler() {
     if (client_pid_ != 0) {
@@ -177,7 +180,7 @@ ClientProcessHandler::~ClientProcessHandler() {
     }
 }
 
-bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
+bool ClientProcessHandler::start() {
     if (client_pid_ != 0) {
         LOG(ERROR) << "[c" << index_
                    << "] Client process already running with PID: "
@@ -200,8 +203,7 @@ bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
     pid_t pid = fork();
 
     if (pid == -1) {
-        LOG(ERROR) << "[c" << index_
-                   << "] Failed to fork process for client: "
+        LOG(ERROR) << "[c" << index_ << "] Failed to fork process for client: "
                    << strerror(errno);
         return false;
     }
@@ -220,8 +222,8 @@ bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
         // Open stdout file
         int stdout_fd = open(stdout_file.str().c_str(), open_flags, 0644);
         if (stdout_fd == -1) {
-            LOG(ERROR) << "[c" << index_ << "] Failed to open stdout file: "
-                       << stdout_file.str()
+            LOG(ERROR) << "[c" << index_
+                       << "] Failed to open stdout file: " << stdout_file.str()
                        << ", error: " << strerror(errno);
             exit(1);
         }
@@ -229,8 +231,8 @@ bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
         // Open stderr file
         int stderr_fd = open(stderr_file.str().c_str(), open_flags, 0644);
         if (stderr_fd == -1) {
-            LOG(ERROR) << "[c" << index_ << "] Failed to open stderr file: "
-                       << stderr_file.str()
+            LOG(ERROR) << "[c" << index_
+                       << "] Failed to open stderr file: " << stderr_file.str()
                        << ", error: " << strerror(errno);
             close(stdout_fd);
             exit(1);
@@ -238,16 +240,16 @@ bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
 
         // Redirect stdout and stderr
         if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
-            LOG(ERROR) << "[c" << index_ << "] Failed to redirect stdout: "
-                       << strerror(errno);
+            LOG(ERROR) << "[c" << index_
+                       << "] Failed to redirect stdout: " << strerror(errno);
             close(stdout_fd);
             close(stderr_fd);
             exit(1);
         }
 
         if (dup2(stderr_fd, STDERR_FILENO) == -1) {
-            LOG(ERROR) << "[c" << index_ << "] Failed to redirect stderr: "
-                       << strerror(errno);
+            LOG(ERROR) << "[c" << index_
+                       << "] Failed to redirect stderr: " << strerror(errno);
             close(stdout_fd);
             close(stderr_fd);
             exit(1);
@@ -260,20 +262,40 @@ bool ClientProcessHandler::start(const ClientRunnerConfig& config) {
         // Build command line arguments
         std::vector<std::string> args;
         args.push_back(client_path_);  // argv[0] - program name
-        args.push_back("--port=" + std::to_string(14888 + index_));
-        
+
         // Add configurable probability parameters if they have values
-        if (config.put_prob.has_value()) {
-            args.push_back("--put-prob=" + std::to_string(config.put_prob.value()));
+        if (config_.put_prob.has_value()) {
+            args.push_back("--put-prob=" +
+                           std::to_string(config_.put_prob.value()));
         }
-        if (config.get_prob.has_value()) {
-            args.push_back("--get-prob=" + std::to_string(config.get_prob.value()));
+        if (config_.get_prob.has_value()) {
+            args.push_back("--get-prob=" +
+                           std::to_string(config_.get_prob.value()));
         }
-        if (config.mount_prob.has_value()) {
-            args.push_back("--mount-prob=" + std::to_string(config.mount_prob.value()));
+        if (config_.mount_prob.has_value()) {
+            args.push_back("--mount-prob=" +
+                           std::to_string(config_.mount_prob.value()));
         }
-        if (config.unmount_prob.has_value()) {
-            args.push_back("--unmount-prob=" + std::to_string(config.unmount_prob.value()));
+        if (config_.unmount_prob.has_value()) {
+            args.push_back("--unmount-prob=" +
+                           std::to_string(config_.unmount_prob.value()));
+        }
+        if (config_.port.has_value()) {
+            args.push_back("--port=" + std::to_string(config_.port.value()));
+        }
+        if (config_.master_server_entry.has_value()) {
+            args.push_back("--master-server-entry=" +
+                           config_.master_server_entry.value());
+        }
+        if (config_.engine_meta_url.has_value()) {
+            args.push_back("--engine-meta-url=" +
+                           config_.engine_meta_url.value());
+        }
+        if (config_.protocol.has_value()) {
+            args.push_back("--protocol=" + config_.protocol.value());
+        }
+        if (config_.device_name.has_value()) {
+            args.push_back("--device-name=" + config_.device_name.value());
         }
 
         // Convert vector of strings to char* array for execv
@@ -320,8 +342,8 @@ bool ClientProcessHandler::kill() {
     // Kill the process forcefully to simulate a crash
     if (::kill(client_pid_, SIGKILL) == 0) {
         LOG(INFO) << "[c" << index_
-                  << "] Force killed client process with PID: "
-                  << client_pid_ << " (simulating crash)";
+                  << "] Force killed client process with PID: " << client_pid_
+                  << " (simulating crash)";
 
         // Wait for the process to be reaped
         int status;
@@ -338,9 +360,7 @@ bool ClientProcessHandler::kill() {
     return success;
 }
 
-bool ClientProcessHandler::is_running() const {
-    return client_pid_ != 0;
-}
+bool ClientProcessHandler::is_running() const { return client_pid_ != 0; }
 
 }  // namespace testing
-}  // namespace mooncake 
+}  // namespace mooncake

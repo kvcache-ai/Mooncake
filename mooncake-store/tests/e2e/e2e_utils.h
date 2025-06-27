@@ -25,7 +25,7 @@ namespace testing {
     DEFINE_string(master_path, "./mooncake-store/src/mooncake_master", \
                   "Path to the master executable");
 #define FLAG_client_path                                                    \
-    DEFINE_string(client_path, "./mooncake-store/tests/chaos/chaos_client", \
+    DEFINE_string(client_path, "./mooncake-store/tests/e2e/client_runner", \
                   "Path to the client executable");
 #define FLAG_out_dir \
     DEFINE_string(out_dir, "./output", "Directory for log files");

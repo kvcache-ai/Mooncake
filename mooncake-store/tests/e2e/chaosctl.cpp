@@ -1,15 +1,18 @@
+#include <glog/logging.h>
+
+#include <fstream>
+#include <map>
+
 #include "e2e_utils.h"
 #include "process_handler.h"
 
-#include <map>
-#include <fstream>
-#include <glog/logging.h>
-
 // Define command line flags
-FLAG_master_path
-FLAG_client_path
-FLAG_out_dir
-FLAG_rand_seed
+USE_engine_flags;
+FLAG_etcd_endpoints;
+FLAG_master_path;
+FLAG_client_path;
+FLAG_out_dir;
+FLAG_rand_seed;
 DEFINE_int32(master_num, 1, "Number of master instances (must be > 0)");
 DEFINE_int32(client_num, 1, "Number of client instances (must be > 0)");
 DEFINE_bool(skip_run, false, "Only generate report, do not run the test");
@@ -35,8 +38,7 @@ DEFINE_validator(client_num, [](const char* flagname, int32_t value) {
 });
 
 // Function to count occurrences of TEST_xxx_STR in a file
-std::map<std::string, int> count_test_string(
-    const std::string& filename) {
+std::map<std::string, int> count_test_string(const std::string& filename) {
     std::map<std::string, int> counts;
 
     // Initialize all TEST_xxx_STR to 0
@@ -162,21 +164,40 @@ int main(int argc, char* argv[]) {
     int client_num = FLAGS_client_num;
     srand(FLAGS_rand_seed);
 
+    // If Flags_skip_run is true, only generate the report based on the logs
+    // generated on previous runs. Otherwise, run the chaos testing and generate
+    // the report.
     if (!FLAGS_skip_run) {
-        std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>> masters;
+        // Create and start the master processes.
+        std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+            masters;
         for (int i = 0; i < master_num; ++i) {
             masters.emplace_back(
                 std::make_unique<mooncake::testing::MasterProcessHandler>(
-                    FLAGS_master_path, 50051 + i, i, FLAGS_out_dir));
+                    FLAGS_master_path, FLAGS_etcd_endpoints, 50051 + i, i,
+                    FLAGS_out_dir));
             masters.back()->start();
         }
 
-        std::vector<std::unique_ptr<mooncake::testing::ClientProcessHandler>> clients;
+        // Create and start the client processes.
+        std::vector<std::unique_ptr<mooncake::testing::ClientProcessHandler>>
+            clients;
         for (int i = 0; i < client_num; ++i) {
-            clients.emplace_back(
+                mooncake::testing::ClientRunnerConfig client_config{
+                    .put_prob = std::nullopt,
+                    .get_prob = std::nullopt,
+                    .mount_prob = std::nullopt,
+                    .unmount_prob = std::nullopt,
+                    .port = 17812 + i,
+                    .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
+                    .engine_meta_url = FLAGS_engine_meta_url,
+                    .protocol = FLAGS_protocol,
+                    .device_name = FLAGS_device_name,
+                };
+                clients.emplace_back(
                 std::make_unique<mooncake::testing::ClientProcessHandler>(
-                    FLAGS_client_path, i, FLAGS_out_dir));
-            clients.back()->start(mooncake::testing::ClientRunnerConfig());
+                    FLAGS_client_path, i, FLAGS_out_dir, client_config));
+            clients.back()->start();
         }
 
         const int kOpProbTotal = FLAGS_master_op_prob + FLAGS_client_op_prob;
@@ -201,6 +222,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
+            // Randomly kill or start a master or a client.
             if (rand() % kOpProbTotal < FLAGS_master_op_prob) {
                 int index = rand() % master_num;
                 if (masters[index]->is_running()) {
@@ -213,7 +235,7 @@ int main(int argc, char* argv[]) {
                 if (clients[index]->is_running()) {
                     clients[index]->kill();
                 } else {
-                    clients[index]->start(mooncake::testing::ClientRunnerConfig());
+                    clients[index]->start();
                 }
             }
             sleep(5);
