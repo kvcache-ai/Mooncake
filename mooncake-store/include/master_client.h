@@ -197,7 +197,7 @@ class MasterClient {
         }
 
        private:
-        std::atomic<std::shared_ptr<coro_rpc_client>> client_{nullptr};
+        std::shared_ptr<coro_rpc_client> client_{nullptr};
     };
     RpcClientAccessor client_accessor_;
 
