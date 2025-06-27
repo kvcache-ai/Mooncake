@@ -187,13 +187,15 @@ class MasterClient {
     class RpcClientAccessor {
        public:
         void SetClient(std::shared_ptr<coro_rpc_client> client) {
-            client_.store(client, std::memory_order_release);
+            std::atomic_store_explicit(&client_, client,
+                                       std::memory_order_release);
         }
-        
+
         std::shared_ptr<coro_rpc_client> GetClient() {
-            return client_.load(std::memory_order_acquire);
+            return std::atomic_load_explicit(&client_,
+                                             std::memory_order_acquire);
         }
-        
+
        private:
         std::atomic<std::shared_ptr<coro_rpc_client>> client_{nullptr};
     };
