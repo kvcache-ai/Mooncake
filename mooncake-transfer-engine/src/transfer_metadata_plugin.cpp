@@ -545,11 +545,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual ~SocketHandShakePlugin() {
-        closeListen();
         if (listener_running_) {
             listener_running_ = false;
             listener_.join();
         }
+        closeListen();
     }
 
     virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
