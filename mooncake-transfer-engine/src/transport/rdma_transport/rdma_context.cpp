@@ -156,6 +156,8 @@ int RdmaContext::deconstruct() {
     memory_region_list_.clear();
 
     for (size_t i = 0; i < cq_list_.size(); ++i) {
+        if (!cq_list_[i].native) continue;
+
         int ret = ibv_destroy_cq(cq_list_[i].native);
         if (ret) {
             PLOG(ERROR) << "Failed to destroy completion queue";
