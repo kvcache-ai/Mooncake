@@ -651,11 +651,11 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
 
     auto stop = std::chrono::high_resolution_clock::now();
     if (printEnabled()) {
-        auto duration_sync = std::chrono::duration_cast<std::chrono::microseconds>(mid - start);
-        auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(stop - mid);
+        auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(mid - start);
+        auto duration_sync = std::chrono::duration_cast<std::chrono::microseconds>(stop - mid);
         LOG(INFO) << "pid: " << pid << "; " << "thread submit one block size: "<< req_len;
-        LOG(INFO) << "pid: " << pid << "; " << "thread sync stream spent: "<< duration_sync.count() << "us";
         LOG(INFO) << "pid: " << pid << "; " << "thread call write/read spent: "<< duration_call.count() << "us";
+        LOG(INFO) << "pid: " << pid << "; " << "thread sync stream spent: "<< duration_sync.count() << "us";
     } else {
         (void)start;
         (void)mid;

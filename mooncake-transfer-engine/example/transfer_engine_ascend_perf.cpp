@@ -155,7 +155,7 @@ int initiator() {
             LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
             return -1;
         }
-        LOG(INFO) << "dev_addr_initor: " << devAddr << " len:" << FLAGS_batch_size * block_size;
+        LOG(INFO) << "dev_addr_initiator: " << devAddr << " len:" << FLAGS_batch_size * block_size;
         ret = engine->registerLocalMemory(devAddr, FLAGS_batch_size * block_size,
                                             "npu:" + std::to_string(g_deviceId));
         if (ret) {

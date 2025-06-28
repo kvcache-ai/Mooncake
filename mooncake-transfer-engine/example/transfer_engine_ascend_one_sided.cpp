@@ -143,7 +143,7 @@ int initiator() {
         return ret;
     }
 
-    LOG(INFO) << "devAddr_initator: " << devAddr;
+    LOG(INFO) << "devAddr_initiator: " << devAddr;
 
     ret = engine->registerLocalMemory(devAddr, g_TotalSize,
                                         "npu:" + std::to_string(g_deviceId));
@@ -159,7 +159,7 @@ int initiator() {
         return ret;
     }
 
-    LOG(INFO) << "devAddr_initator2: " << devAddr2;
+    LOG(INFO) << "devAddr_initiator2: " << devAddr2;
 
     ret = engine->registerLocalMemory(devAddr2, g_TotalSize,
                                         "npu:" + std::to_string(g_deviceId));

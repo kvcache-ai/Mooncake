@@ -47,7 +47,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 ```
 唯一的区别在于，在TransferEngine init时需要在local_server_name参数中包含TransferEngine所在的NPU物理卡号，local_server_name参数从ip:port改为ip:port:npu_x，例如"0.0.0.0:12345:npu_2"。
 
-```注意```：Ascend Transport只是在不修改Mooncake对外接口的形势下，传入所在的NPU物理卡号，只为Transport内部使用，metadata的segement_desc_name仍然还是原来的形式，即ip:port，因此，每张npu卡的port需要保证互不相同，且端口未被占用。
+```注意```：Ascend Transport只是在不修改Mooncake对外接口的形势下，传入所在的NPU物理卡号，只为Transport内部使用，metadata的segment_desc_name仍然还是原来的形式，即ip:port，因此，每张npu卡的port需要保证互不相同，且端口未被占用。
 
 ### metadata服务
 Ascend Transport兼容所有Mooncake当前支持的metadata服务，包括 etcd, redis 和 http，以及p2phandshake。Ascend Transport在初始化时会注册当前NPU卡的一系列信息，包括device_id\device_ip\rank_id\server_ip等。
