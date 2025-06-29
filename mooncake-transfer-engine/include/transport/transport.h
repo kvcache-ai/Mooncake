@@ -201,6 +201,7 @@ class Transport {
         size_t batch_size;
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
+        int64_t start_timestamp;
     };
 
    public:
