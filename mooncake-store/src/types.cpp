@@ -34,6 +34,13 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
+        {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
+        {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
+        {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},
+        {ErrorCode::FILE_WRITE_FAIL, "FILE_WRITE_FAIL"},
+        {ErrorCode::FILE_INVALID_BUFFER, "FILE_INVALID_BUFFER"},
+        {ErrorCode::FILE_LOCK_FAIL, "FILE_LOCK_FAIL"},
+        {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"}
     };
 
     auto it = errorCodeMap.find(errorCode);

@@ -14,14 +14,15 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
                              ViewVersionId view_version,
-                             int64_t client_live_ttl_sec, bool enable_ha)
+                             int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id)
     : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
-      enable_ha_(enable_ha) {
+      enable_ha_(enable_ha),
+      cluster_id_(cluster_id) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -624,6 +625,16 @@ ErrorCode MasterService::Ping(const UUID& client_id,
     }
     return ErrorCode::OK;
 }
+
+ErrorCode MasterService::GetFsdir(std::string& fsdir) const{
+    if (cluster_id_.empty()) {
+        LOG(ERROR) << "Cluster ID is not initialized";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    fsdir = cluster_id_;
+    return ErrorCode::OK;
+}
+
 
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";

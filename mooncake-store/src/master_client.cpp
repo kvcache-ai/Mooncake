@@ -29,7 +29,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         LOG(ERROR) << "Failed to connect to master: " << result.message();
         return ErrorCode::RPC_FAIL;
     }
-    timer.LogResponse("error_code=", ErrorCode::OK);
+    timer.LogResponse("error_code=", ErrorCode::OK);   
     return ErrorCode::OK;
 }
 
@@ -466,6 +466,33 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
     if (!result) {
         auto response =
             PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
+GetFsdirResponse MasterClient::GetFsdir() {
+    ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
+    timer.LogRequest("action=get_fsdir");
+
+    auto request_result =
+        client_.send_request<&WrappedMasterService::GetFsdir>();
+    std::optional<GetFsdirResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetFsdirResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to get fsdir: "
+                          << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        auto response = GetFsdirResponse{{}, ErrorCode::RPC_FAIL};
         timer.LogResponseJson(response);
         return response;
     }

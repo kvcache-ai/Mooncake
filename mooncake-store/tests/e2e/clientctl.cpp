@@ -164,7 +164,7 @@ class ClientCtl {
 
         // Create slices
         std::vector<AllocatedBuffer::Descriptor>& descriptors =
-            object_info.replica_list[0].buffer_descriptors;
+            object_info.replica_list[0].get_memory_descriptor().buffer_descriptors;
         std::vector<Slice> slices(descriptors.size());
         for (size_t i = 0; i < descriptors.size(); i++) {
             void* buffer = malloc(descriptors[i].size_);
