@@ -165,11 +165,12 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status NvlinkTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
