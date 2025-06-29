@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.23.8
+GOVER=1.24.4
 
 # Function to print section headers
 print_section() {
@@ -252,6 +252,7 @@ fi
 if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
     echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
     echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+    echo 'export GOTOOLCHAIN=local' >> ~/.bashrc
     echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
 fi
 

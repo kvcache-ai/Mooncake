@@ -9,12 +9,13 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }} # Changed to use a matrix for OS
     permissions:
       contents: write
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -24,6 +25,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'mooncake-common/etcd/go.mod'
+          check-latest: true
+
+      - run: go version    # sanity-check
+
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -31,7 +40,7 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.25
         with:
           cuda: '12.8.1'
           linux-local-args: '["--toolkit"]'
@@ -92,7 +101,7 @@ jobs:
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}-${{ matrix.os }}
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
