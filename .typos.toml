@@ -1,0 +1,5 @@
+[files]
+
+extend-exclude = [
+  "mooncake-store/include/cachelib_memory_allocator/include/fmt/",
+]
