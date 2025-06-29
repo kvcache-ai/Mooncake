@@ -1,0 +1,20 @@
+name: "🛠️ Installation"
+description: "Report issues or suggest improvements for Mooncake's installation process"
+title: "[Installation]: "
+labels: ["installation"]
+body:
+- type: textarea
+  attributes:
+    label: Installation errors
+    description: >
+      Describe any errors or issues you encountered during the installation of Mooncake.
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)
