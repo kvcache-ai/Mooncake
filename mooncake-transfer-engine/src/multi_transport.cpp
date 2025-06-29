@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+#include <string>
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -223,7 +224,7 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
-                                       entry.target_id);
+                                       std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
     if (!transport_map_.count(proto)) {

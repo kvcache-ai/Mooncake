@@ -114,6 +114,10 @@ class TransferEnginePy {
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
+    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+
+    int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
+
    private:
     char *allocateRawBuffer(size_t capacity);
 
