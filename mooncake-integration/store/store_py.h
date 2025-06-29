@@ -141,7 +141,13 @@ class DistributedObjectStore {
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values);
+
     pybind11::bytes get(const std::string &key);
+
+    std::vector<pybind11::bytes> get_batch(
+        const std::vector<std::string> &keys);
 
     /**
      * @brief Get a buffer containing the data for a key
@@ -193,6 +199,19 @@ class DistributedObjectStore {
 
     int allocateSlicesPacked(std::vector<mooncake::Slice> &slices,
                              const std::vector<std::span<const char>> &parts);
+
+    int allocateBatchedSlices(
+        const std::vector<std::string> &keys,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices,
+        const mooncake::Client::BatchObjectInfo &batched_object_info,
+        std::unordered_map<std::string, uint64_t> &str_length_map);
+
+    int allocateBatchedSlices(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices);
 
     char *exportSlices(const std::vector<mooncake::Slice> &slices,
                        uint64_t length);
