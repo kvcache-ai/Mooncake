@@ -22,5 +22,5 @@ RUN bash dependencies.sh \
 
 RUN rm -rf build || true \
      && mkdir build && cd build \
-     && cmake .. && make -j && make install
+     && cmake .. -DSTORE_USE_ETCD=ON && make -j && make install
 
