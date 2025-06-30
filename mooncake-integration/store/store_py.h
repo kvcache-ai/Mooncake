@@ -236,7 +236,8 @@ class DistributedObjectStore {
         const std::vector<std::string> &keys,
         std::unordered_map<std::string, std::vector<mooncake::Slice>>
             &batched_slices,
-        const mooncake::Client::BatchObjectInfo &batched_object_info,
+        const std::vector<std::vector<mooncake::Replica::Descriptor>>
+            &replica_lists,
         std::unordered_map<std::string, uint64_t> &str_length_map);
 
     int allocateBatchedSlices(

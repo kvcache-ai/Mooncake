@@ -403,10 +403,3 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 }  // namespace mooncake
-
-namespace iguana {
-template <typename Stream>
-inline void to_json_impl(Stream& s, mooncake::ErrorCode code) {
-    s.write(std::to_string(static_cast<int32_t>(code)));
-}
-}  // namespace iguana
