@@ -180,19 +180,48 @@ ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-bool StorageBackend::Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) {
+std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
     std::string path = ResolvePath(key);
     namespace fs = std::filesystem;
 
     // Check if the file exists
     if (!fs::exists(path)) {
-        return false;
+        return std::nullopt;  // File does not exist
     }
 
     // Populate object_info with file metadata
-    filePath_ = path;
-    fileLength_ = fs::file_size(path);
-    return true;
+    Replica::Descriptor desc;
+    auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+    disk_desc.file_path = path;
+    disk_desc.file_size = fs::file_size(path);
+    desc.status = ReplicaStatus::COMPLETE;
+    
+    return desc;
+}
+
+std::unordered_map<ObjectKey, Replica::Descriptor>
+StorageBackend::BatchQueryKey(const std::vector<ObjectKey>& keys) {
+    namespace fs = std::filesystem;
+    std::unordered_map<ObjectKey, Replica::Descriptor> result;
+
+    for (const auto& key : keys) {
+        std::string path = ResolvePath(key);
+
+        if (!fs::exists(path)) {
+            LOG(WARNING) << "Key not found: " << key << ", skipping...";
+            return std::nullopt; 
+        }
+
+        Replica::Descriptor desc;
+        auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+        disk_desc.file_path = path;
+        disk_desc.file_size = fs::file_size(path);
+        desc.status = ReplicaStatus::COMPLETE;
+
+        result.emplace(key, std::move(desc));
+    }
+
+    return result;
 }
 
 ErrorCode StorageBackend::Existkey(const ObjectKey& key) {

@@ -85,6 +85,12 @@ void FilereadWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             try {
+                if (!backend_) {
+                    LOG(ERROR) << "Backend is not initialized, cannot load object";
+                    task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    continue; 
+                }
+
                 auto error_code = backend_->LoadObject("", task.slices, task.file_path);
                 if(error_code == ErrorCode::OK){
                     VLOG(2) << "Fileread task completed successfully with "

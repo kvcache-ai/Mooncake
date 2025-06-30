@@ -94,13 +94,20 @@ class StorageBackend  {
     ErrorCode LoadObject(const ObjectKey& key, std::string& str) ;
 
     /**
-     * @brief Queries file metadata for an object key
+     * @brief Queries metadata for an object by key
      * @param key Object identifier
-     * @param filePath_ Output file path
-     * @param fileLength_ Output file length
-     * @return true if object exists, false otherwise
-     */    
-    bool Querykey(const ObjectKey& key, std::string& filePath_, size_t& fileLength_) ;
+     * @return Optional Replica::Descriptor containing object metadata, or empty if not found
+     * 
+     * This method retrieves the file path and size for the given object key.
+     */
+    std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key);
+
+    /**
+     * @brief Batch queries metadata for multiple object keys
+     * @param keys Vector of object identifiers
+     * @return unordered_map mapping ObjectKey to Replica::Descriptor
+     */
+    std::unordered_map<ObjectKey, Replica::Descriptor> BatchQueryKey(const std::vector<ObjectKey>& keys);
 
     /**
      * @brief Checks if an object with the given key exists

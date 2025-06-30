@@ -281,13 +281,9 @@ ErrorCode Client::Query(const std::string& object_key,
     // Currently, it is a client-side query. Manually construct a disk descriptor 
     // that meets the requirements. In the future, the matching disk replica descriptor 
     // can be directly obtained from the master.
-    if(response.error_code!= ErrorCode::OK && storage_backend_){
-        Replica::Descriptor desc;
-        auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();  
-        
-        if (storage_backend_->Querykey(object_key, disk_desc.file_path, disk_desc.file_size)) {
-            desc.status = ReplicaStatus::COMPLETE;
-            object_info.replica_list.emplace_back(std::move(desc));  
+    if(response.error_code!= ErrorCode::OK && storage_backend_){        
+        if (auto desc_opt = storage_backend_->Querykey(object_key)) {
+            object_info.replica_list.emplace_back(std::move(*desc_opt));
             return ErrorCode::OK;
         }
     }
@@ -300,18 +296,18 @@ ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
     auto response = master_client_.BatchGetReplicaList(object_keys);
     // for now , if the master returns an error, we still need to check if the object exists in the storage backend.
     if(response.error_code!= ErrorCode::OK && storage_backend_){
-        for (const auto& key : object_keys) {
-            Replica::Descriptor desc;
-            auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+        auto batch_result = storage_backend_->BatchQueryKey(object_keys);
 
-            if (storage_backend_->Querykey(key, disk_desc.file_path, disk_desc.file_size)) {
-                desc.status = ReplicaStatus::COMPLETE;
-                batched_object_info.batch_replica_list.emplace(key, std::vector<Replica::Descriptor>{std::move(desc)});
-            } else {
-                LOG(ERROR) << "BatchQuery failed, key: " << key
-                           << " not found in storage backend";
-                return ErrorCode::OBJECT_NOT_FOUND;
-            }
+        if (batch_result.size() != object_keys.size()) {
+            LOG(ERROR) << "BatchQuery failed, some keys not found in storage backend";
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+
+        for (const auto& [key, desc] : batch_result) {
+            batched_object_info.batch_replica_list.emplace(
+                key, 
+                std::vector<Replica::Descriptor>{std::move(desc)}
+            );
         }
         return ErrorCode::OK;
     }
