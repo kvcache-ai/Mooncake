@@ -182,7 +182,8 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
@@ -190,7 +191,8 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     slices.emplace_back(Slice{buffer, test_data.size()});
     // Verify data through Get operation
     auto get_result = test_client_->Get(key, slices);
-    ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);
     ASSERT_EQ(slices[0].size, test_data.size());
     ASSERT_EQ(slices[0].ptr, buffer);
@@ -203,11 +205,13 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     slices.clear();
     slices.emplace_back(Slice{buffer, test_data.size()});
     auto put_result2 = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result2.has_value()) << "Second Put operation failed: " << toString(put_result2.error());
+    ASSERT_TRUE(put_result2.has_value())
+        << "Second Put operation failed: " << toString(put_result2.error());
     std::this_thread::sleep_for(
         std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
     auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
 
@@ -224,12 +228,14 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Remove the data
     auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
 
     // Try to get the removed data - should fail
     buffer = client_buffer_allocator_->allocate(test_data.size());
@@ -259,7 +265,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     config.preferred_segment = "localhost:17812";  // Local segment
 
     auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Verify data through Get operation
@@ -268,7 +275,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     slices.emplace_back(Slice{buffer, test_data.size()});
 
     auto query_result = test_client_->Query(key);
-    ASSERT_TRUE(query_result.has_value()) << "Query operation failed: " << toString(query_result.error());
+    ASSERT_TRUE(query_result.has_value())
+        << "Query operation failed: " << toString(query_result.error());
     auto replica_list = query_result.value();
     ASSERT_EQ(replica_list.size(), 1);
     ASSERT_EQ(replica_list[0].buffer_descriptors.size(), 1);
@@ -276,7 +284,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
               "localhost:17812");
 
     auto get_result = test_client_->Get(key, replica_list, slices);
-    ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);
     ASSERT_EQ(slices[0].size, test_data.size());
     ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
@@ -286,7 +295,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
     auto remove_result2 = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result2.has_value()) << "Remove operation failed: " << toString(remove_result2.error());
+    ASSERT_TRUE(remove_result2.has_value())
+        << "Remove operation failed: " << toString(remove_result2.error());
 }
 
 // Test heavy workload operations
@@ -317,7 +327,8 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
         std::vector<Slice> get_slices;
         get_slices.emplace_back(Slice{buffer, data_size});
         auto get_result = test_client_->Get(key, get_slices);
-        ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+        ASSERT_TRUE(get_result.has_value())
+            << "Get operation failed: " << toString(get_result.error());
         ASSERT_EQ(get_slices[0].size, data_size);
 
         std::string retrieved_data(static_cast<const char*>(get_slices[0].ptr),
@@ -331,8 +342,10 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
     std::vector<Slice> failed_slices;
     failed_slices.emplace_back(Slice{failed_buffer, data_size});
     memcpy(failed_buffer, large_data.data(), data_size);
-    auto failed_put_result = test_client_->Put(allocate_failed_key, failed_slices, config);
-    ASSERT_FALSE(failed_put_result.has_value()) << "Put operation should have failed";
+    auto failed_put_result =
+        test_client_->Put(allocate_failed_key, failed_slices, config);
+    ASSERT_FALSE(failed_put_result.has_value())
+        << "Put operation should have failed";
     client_buffer_allocator_->deallocate(failed_buffer, data_size);
 
     // sleep for 2 seconds to ensure the object is marked for GC
@@ -343,11 +356,15 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
     std::vector<Slice> success_slices;
     success_slices.emplace_back(Slice{success_buffer, data_size});
     memcpy(success_buffer, large_data.data(), data_size);
-    auto success_put_result = test_client_->Put(allocate_failed_key, success_slices, config);
-    ASSERT_TRUE(success_put_result.has_value()) << "Put operation failed: " << toString(success_put_result.error());
+    auto success_put_result =
+        test_client_->Put(allocate_failed_key, success_slices, config);
+    ASSERT_TRUE(success_put_result.has_value())
+        << "Put operation failed: " << toString(success_put_result.error());
     client_buffer_allocator_->deallocate(success_buffer, data_size);
     auto success_remove_result = test_client_->Remove(allocate_failed_key);
-    ASSERT_TRUE(success_remove_result.has_value()) << "Remove operation failed: " << toString(success_remove_result.error());
+    ASSERT_TRUE(success_remove_result.has_value())
+        << "Remove operation failed: "
+        << toString(success_remove_result.error());
 }
 
 // Test large allocation operations
@@ -377,7 +394,8 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
 
     // Put operation
     auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
 
     // Clear buffers before Get
     for (size_t i = 0; i < kNumBuffers; ++i) {
@@ -386,7 +404,8 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
 
     // Get operation
     auto get_result = test_client_->Get(key, slices);
-    ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
 
     // Verify data and deallocate buffers
     for (size_t i = 0; i < kNumBuffers; ++i) {
@@ -403,7 +422,8 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
     auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
 }
 
 // Test batch Put/Get operations through the client
@@ -450,7 +470,8 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
             client_buffer_allocator_->allocate(test_data_list[i].size());
         slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
         auto get_result = test_client_->Get(keys[i], slices);
-        ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+        ASSERT_TRUE(get_result.has_value())
+            << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
                                              test_data_list[i].size());
     }
@@ -471,7 +492,8 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
             Slice{target_buffer, test_data_list[i].size()});
         target_batched_slices.emplace(keys[i], target_slices);
     }
-    auto batch_get_results = test_client_->BatchGet(keys, target_batched_slices);
+    auto batch_get_results =
+        test_client_->BatchGet(keys, target_batched_slices);
     for (const auto& result : batch_get_results) {
         ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
@@ -566,7 +588,8 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
         std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
     for (int i = 0; i < batch_size / 2; i++) {
         auto remove_result = test_client_->Remove(keys[i]);
-        ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+        ASSERT_TRUE(remove_result.has_value())
+            << "Remove operation failed: " << toString(remove_result.error());
     }
 }
 
