@@ -81,27 +81,24 @@ class Transport {
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list) {}
 
-    virtual Status registerLocalMemory(
-        const std::vector<BufferEntry> &buffer_list) {
+    virtual Status allocateLocalMemory(void **addr, size_t size,
+                                       MemoryOptions &options) {
+        return genericAllocateLocalMemory(addr, size, options);
+    }
+
+    virtual Status freeLocalMemory(void *addr, size_t size) {
+        return genericFreeLocalMemory(addr, size);
+    }
+
+    virtual Status addMemoryBuffer(BufferDesc &desc,
+                                   const MemoryOptions &options) {
         return Status::NotImplemented(
-            "registerLocalMemory not implemented" LOC_MARK);
+            "addMemoryBuffer not implemented" LOC_MARK);
     }
 
-    virtual Status unregisterLocalMemory(
-        const std::vector<BufferEntry> &buffer_list) {
+    virtual Status removeMemoryBuffer(BufferDesc &desc) {
         return Status::NotImplemented(
-            "unregisterLocalMemory not implemented" LOC_MARK);
-    }
-
-    virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
-                                       const Location &location) {
-        buffer.length = size;
-        buffer.location = location;
-        return genericAllocateLocalMemory(&buffer.addr, size, location);
-    }
-
-    virtual Status freeLocalMemory(const BufferEntry &buffer) {
-        return genericFreeLocalMemory(buffer.addr, buffer.length);
+            "removeMemoryBuffer not implemented" LOC_MARK);
     }
 
     virtual const char *getName() const { return "<generic>"; }

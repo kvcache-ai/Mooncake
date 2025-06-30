@@ -59,7 +59,7 @@ struct TransferStatus {
     size_t transferred_bytes;
 };
 
-enum BufferVisibility {
+enum Permission {
     kLocalReadWrite,
     kGlobalReadOnly,
     kGlobalReadWrite,
@@ -72,13 +72,21 @@ struct BufferEntry {
     void *addr;
     size_t length;
     Location location = kWildcardLocation;
-    BufferVisibility visibility = kGlobalReadWrite;
+    Permission visibility = kGlobalReadWrite;
     std::string shm_path = "";
     size_t shm_offset = 0;
 };
 
 enum TransportType { RDMA = 0, SHM, GDS, NVLINK, TCP };
 const static int kSupportedTransportTypes = 5;
+
+struct MemoryOptions {
+    Location location = kWildcardLocation;
+    Permission perm = kGlobalReadWrite;
+    TransportType type = RDMA;
+    std::string shm_path = "";
+    size_t shm_offset = 0;
+};
 
 }  // namespace v1
 }  // namespace mooncake

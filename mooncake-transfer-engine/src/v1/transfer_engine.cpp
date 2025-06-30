@@ -93,6 +93,7 @@ Status TransferEngine::setupLocalSegment() {
     auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
     detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
+    local_segment_ = std::make_shared<LocalSegmentHelper>(segment);
     return manager.synchronizeLocal();
 }
 
@@ -144,6 +145,7 @@ Status TransferEngine::construct() {
 
 Status TransferEngine::deconstruct() {
     transport_list_.clear();
+    local_segment_.reset();
     metadata_->segmentManager().deleteLocal();
     metadata_.reset();
     for (auto &batch : batch_set_) delete batch;
@@ -184,34 +186,38 @@ Status TransferEngine::closeRemoteSegment(SegmentID handle) {
     return Status::OK();
 }
 
-Status TransferEngine::registerLocalMemory(BufferEntry &buffer) {
-    std::vector<BufferEntry> buffer_list;
-    buffer_list.push_back(buffer);
-    return registerLocalMemoryBatch(buffer_list);
+Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
+                                           MemoryOptions &options) {
+    return Status::NotImplemented("allocate local memory not implemented");
 }
 
-Status TransferEngine::unregisterLocalMemory(BufferEntry &buffer) {
-    std::vector<BufferEntry> buffer_list;
-    buffer_list.push_back(buffer);
-    return unregisterLocalMemoryBatch(buffer_list);
+Status TransferEngine::freeLocalMemory(void *addr, size_t size) {
+    return Status::NotImplemented("free local memory not implemented");
 }
 
-Status TransferEngine::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list) {
-    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (!transport_list_[type]) continue;
-        CHECK_STATUS(transport_list_[type]->registerLocalMemory(buffer_list));
-    }
-    return Status::OK();
+Status TransferEngine::registerLocalMemory(void *addr, size_t size,
+                                           MemoryOptions &options) {
+    return local_segment_->add(
+        (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                if (!transport_list_[type]) continue;
+                CHECK_STATUS(
+                    transport_list_[type]->addMemoryBuffer(desc, options));
+            }
+            return Status::OK();
+        });
 }
 
-Status TransferEngine::unregisterLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list) {
-    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (!transport_list_[type]) continue;
-        CHECK_STATUS(transport_list_[type]->unregisterLocalMemory(buffer_list));
-    }
-    return Status::OK();
+Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
+    return local_segment_->add(
+        (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                if (!transport_list_[type]) continue;
+                CHECK_STATUS(
+                    transport_list_[type]->removeMemoryBuffer(desc));
+            }
+            return Status::OK();
+        });
 }
 
 BatchID TransferEngine::allocateBatch(size_t batch_size) {
@@ -337,19 +343,6 @@ std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
         return nullptr;
     }
     return desc;
-}
-
-Status TransferEngine::allocateLocalMemory(BufferEntry &buffer,
-                                           TransportType type, size_t size,
-                                           const Location &location) {
-    auto transport = transport_list_[type];
-    return transport->allocateLocalMemory(buffer, size, location);
-}
-
-Status TransferEngine::freeLocalMemory(const BufferEntry &buffer,
-                                       TransportType type) {
-    auto transport = transport_list_[type];
-    return transport->freeLocalMemory(buffer);
 }
 
 }  // namespace v1

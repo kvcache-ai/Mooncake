@@ -137,6 +137,7 @@ Status LocalSegmentHelper::add(uint64_t base, size_t length,
     BufferDesc new_desc;
     new_desc.addr = base;
     new_desc.length = length;
+    new_desc.location = kWildcardLocation;
     new_desc.type = MemBufferType::UNKNOWN;
     new_desc.ref_count = 1;
     auto status = callback(new_desc);

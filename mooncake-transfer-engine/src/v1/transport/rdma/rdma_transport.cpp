@@ -249,48 +249,13 @@ void RdmaTransport::queryOutstandingTasks(SubBatchRef batch,
     }
 }
 
-Status RdmaTransport::registerLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    if (buffer_list.empty()) return Status::OK();
-    if (buffer_list.size() == 1) {
-        return registerSingleLocalMemory(buffer_list[0], true);
-    }
-    std::vector<std::future<Status>> results;
-    for (auto &buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer]() -> Status {
-                return registerSingleLocalMemory(buffer, false);
-            }));
-    }
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        auto status = results[i].get();
-        if (!status.ok()) return status;
-    }
-    auto desc = metadata_->segmentManager().getLocal();
-    local_buffer_manager_.fillBufferDesc(desc);
-    return metadata_->segmentManager().synchronizeLocal();
+Status RdmaTransport::addMemoryBuffer(BufferDesc &desc,
+                                      const MemoryOptions &options) {
+    return local_buffer_manager_.addBuffer(desc, options);
 }
 
-Status RdmaTransport::unregisterLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    if (buffer_list.empty()) return Status::OK();
-    if (buffer_list.size() == 1) {
-        return unregisterSingleLocalMemory(buffer_list[0], true);
-    }
-    std::vector<std::future<Status>> results;
-    for (auto &buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer]() -> Status {
-                return unregisterSingleLocalMemory(buffer, false);
-            }));
-    }
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        auto status = results[i].get();
-        if (!status.ok()) return status;
-    }
-    auto desc = metadata_->segmentManager().getLocal();
-    local_buffer_manager_.fillBufferDesc(desc);
-    return metadata_->segmentManager().synchronizeLocal();
+Status RdmaTransport::removeMemoryBuffer(BufferDesc &desc) {
+    return local_buffer_manager_.removeBuffer(desc);
 }
 
 Status RdmaTransport::setupLocalSegment() {
@@ -306,27 +271,6 @@ Status RdmaTransport::setupLocalSegment() {
         detail.devices.push_back(device_desc);
     }
     return manager.synchronizeLocal();
-}
-
-Status RdmaTransport::registerSingleLocalMemory(const BufferEntry &buffer,
-                                                bool update_meta) {
-    Status status = local_buffer_manager_.addBuffer(buffer);
-    if (!update_meta || !status.ok()) return status;
-    auto desc = metadata_->segmentManager().getLocal();
-    local_buffer_manager_.fillBufferDesc(desc);
-    return metadata_->segmentManager().synchronizeLocal();
-}
-
-Status RdmaTransport::unregisterSingleLocalMemory(const BufferEntry &buffer,
-                                                  bool update_meta) {
-    AddressRange range;
-    range.addr = buffer.addr;
-    range.length = buffer.length;
-    Status status = local_buffer_manager_.removeBuffer(range);
-    if (!update_meta || !status.ok()) return status;
-    auto desc = metadata_->segmentManager().getLocal();
-    local_buffer_manager_.fillBufferDesc(desc);
-    return metadata_->segmentManager().synchronizeLocal();
 }
 
 int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,

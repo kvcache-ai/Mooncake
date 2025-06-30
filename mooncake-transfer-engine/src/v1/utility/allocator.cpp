@@ -36,8 +36,8 @@ std::pair<std::string, int> parseKeyValue(const std::string &input) {
 }
 
 Status genericAllocateLocalMemory(void **pptr, size_t size,
-                                  const Location &location) {
-    auto result = parseKeyValue(location);
+                                  MemoryOptions &options) {
+    auto result = parseKeyValue(options.location);
     if (result.first == "cuda") {
 #ifdef USE_CUDA
         auto ret = cudaSetDevice(result.second);

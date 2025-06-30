@@ -237,6 +237,9 @@ Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
     Json::Value j;
     if (Json::Reader{}.parse(jstr, j)) {
         desc = importSegmentDesc(j);
+        if (!desc)
+            return Status::MalformedJson(
+                "Failed to import segment from json" LOC_MARK);
         desc->name = segment_name;
     }
 

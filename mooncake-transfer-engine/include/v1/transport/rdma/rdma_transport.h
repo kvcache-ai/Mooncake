@@ -79,11 +79,10 @@ class RdmaTransport : public Transport {
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
 
-    virtual Status registerLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status addMemoryBuffer(BufferDesc &desc,
+                                   const MemoryOptions &options);
 
-    virtual Status unregisterLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "rdma"; }
 
@@ -93,12 +92,6 @@ class RdmaTransport : public Transport {
 
    public:
     Status setupLocalSegment();
-
-    Status registerSingleLocalMemory(const BufferEntry &buffer,
-                                     bool update_meta);
-
-    Status unregisterSingleLocalMemory(const BufferEntry &buffer,
-                                       bool update_meta);
 
    private:
     bool installed_;

@@ -26,6 +26,7 @@
 
 #include "v1/common.h"
 #include "v1/metadata/metadata.h"
+#include "v1/metadata/segment.h"
 #include "v1/transport/transport.h"
 #include "v1/utility/memory_location.h"
 
@@ -66,15 +67,19 @@ class TransferEngine {
     Status closeRemoteSegment(SegmentID handle);
 
    public:
-    Status registerLocalMemory(BufferEntry &buffer);
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options);
 
-    Status unregisterLocalMemory(BufferEntry &buffer);
+    Status freeLocalMemory(void *addr, size_t size);
 
-    Status registerLocalMemoryBatch(
-        const std::vector<BufferEntry> &buffer_list);
+    Status registerLocalMemory(void *addr, size_t size) {
+        MemoryOptions options;
+        return registerLocalMemory(addr, size, options);
+    }
 
-    Status unregisterLocalMemoryBatch(
-        const std::vector<BufferEntry> &buffer_list);
+    Status registerLocalMemory(void *addr, size_t size, MemoryOptions &options);
+
+    Status unregisterLocalMemory(void *addr, size_t size);
 
    public:
     BatchID allocateBatch(size_t batch_size);
@@ -91,11 +96,6 @@ class TransferEngine {
                              std::vector<TransferStatus> &status_list);
 
     std::shared_ptr<SegmentDesc> getSegmentDesc(SegmentID handle);
-
-    Status allocateLocalMemory(BufferEntry &buffer, TransportType type,
-                               size_t size, const Location &location);
-
-    Status freeLocalMemory(const BufferEntry &buffer, TransportType type);
 
    private:
     Status construct();
@@ -118,6 +118,8 @@ class TransferEngine {
     std::unordered_set<Batch *> batch_set_;
     std::vector<Batch *> deferred_free_batch_set_;
     std::mutex mutex_;
+
+    std::shared_ptr<LocalSegmentHelper> local_segment_;
 
     std::string hostname_;
     uint16_t port_;

@@ -127,7 +127,7 @@ class SegmentManager {
 
 class LocalSegmentHelper {
    public:
-    LocalSegmentHelper(SegmentDescRef &local_desc) : local_desc_(local_desc) {}
+    LocalSegmentHelper(const SegmentDescRef &local_desc) : local_desc_(local_desc) {}
 
     ~LocalSegmentHelper() {}
 

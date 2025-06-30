@@ -70,32 +70,6 @@ struct AddressRange {
     }
 };
 
-class AddressRangeManager {
-   private:
-    struct AddressRangeRC {
-        void *addr;
-        size_t length;
-        int ref_cnt;
-        AddressRangeRC(void *addr = nullptr, size_t length = 0, int ref_cnt = 0)
-            : addr(addr), length(length), ref_cnt(ref_cnt) {}
-    };
-
-    std::vector<AddressRangeRC> addr_list;
-
-    // Helper function to find the position where a range would be inserted
-    std::vector<AddressRangeRC>::iterator findInsertPosition(
-        const AddressRange &range);
-
-    // Helper function to check if two ranges overlap
-    bool rangesOverlap(const AddressRangeRC &a, const AddressRange &b);
-
-   public:
-    void add(const AddressRange &range, std::vector<AddressRange> &reg_parts);
-
-    void remove(const AddressRange &range,
-                std::vector<AddressRange> &dereg_parts);
-};
-
 struct BufferQueryResult {
     void *addr;
     size_t length;
@@ -114,17 +88,15 @@ class LocalBufferManager {
         context_list_.resize(topology->getHcaList().size(), nullptr);
     }
 
-    Status addBuffer(const BufferEntry &buffer_entry);
+    Status addBuffer(BufferDesc &desc, const MemoryOptions &options);
 
-    Status removeBuffer(const AddressRange &range);
+    Status removeBuffer(BufferDesc &desc);
 
     Status addDevice(RdmaContext *context);
 
     Status removeDevice(RdmaContext *context, bool do_unreg = true);
 
     Status clear();
-
-    Status fillBufferDesc(std::shared_ptr<SegmentDesc> &segment_desc);
 
     Status query(const AddressRange &range,
                  std::vector<BufferQueryResult> &result, int retry_count = 0);
@@ -133,13 +105,12 @@ class LocalBufferManager {
 
    private:
     struct BufferEntryForRdma {
-        BufferEntry entry;
+        MemoryOptions options;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
     };
 
    private:
     RWSpinlock lock_;
-    AddressRangeManager manager_;
     std::vector<RdmaContext *> context_list_;
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;
@@ -156,7 +127,7 @@ class RemoteBufferManager {
     bool valid(SegmentID id);
 
     Status query(SegmentID id, const AddressRange &range,
-              std::vector<BufferQueryResult> &result, int retry_count = 0);
+                 std::vector<BufferQueryResult> &result, int retry_count = 0);
 
     const std::string segmentName(SegmentID id);
 
