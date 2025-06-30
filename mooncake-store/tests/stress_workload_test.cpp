@@ -115,16 +115,17 @@ class ClientIntegrationTest : public ::testing::Test {
         ram_buffer_size_ = 3200ull * 1024 * 1024;
         segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
         ASSERT_TRUE(segment_ptr_);
-        ErrorCode rc = client_->MountSegment(segment_ptr_,
-                                             ram_buffer_size_);
-        if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to mount segment: " << toString(rc);
+        auto mount_result =
+            client_->MountSegment(segment_ptr_, ram_buffer_size_);
+        if (!mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount segment: "
+                       << toString(mount_result.error());
         }
     }
 
     static void CleanupSegment() {
-        if (client_->UnmountSegment(segment_ptr_, ram_buffer_size_) !=
-            ErrorCode::OK) {
+        if (!client_->UnmountSegment(segment_ptr_, ram_buffer_size_)
+                 .has_value()) {
             LOG(ERROR) << "Failed to unmount segment";
         }
     }
@@ -144,12 +145,12 @@ class ClientIntegrationTest : public ::testing::Test {
         auto client_buffer_allocator_size = 128 * 1024 * 1024;
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(client_buffer_allocator_size);
-        ErrorCode error_code = client_->RegisterLocalMemory(
+        auto register_result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), client_buffer_allocator_size,
             "cpu:0", false, false);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to allocate transfer buffer: "
-                       << toString(error_code);
+        if (!register_result.has_value()) {
+            LOG(ERROR) << "Failed to register local memory: "
+                       << toString(register_result.error());
         }
     }
 
