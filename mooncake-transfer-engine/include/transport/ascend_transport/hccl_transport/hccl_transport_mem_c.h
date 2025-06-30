@@ -43,11 +43,11 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif //__cplusplus
+#endif // __cplusplus
 struct RankInfo {
-    uint64_t rankId = 0xFFFFFFFF; // rank id, user rank
-    uint64_t serverIdx; // the Server order in ranktable (User spec)
-    struct in_addr hostIp; // host IP in local server
+    uint64_t rankId = 0xFFFFFFFF;
+    uint64_t serverIdx; 
+    struct in_addr hostIp;
     uint64_t hostPort;
     uint64_t deviceLogicId;
     uint64_t devicePhyId;

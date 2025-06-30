@@ -165,7 +165,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
-    } else if (segmentJSON["protocol"] == "ascend"){
+    } else if (segmentJSON["protocol"] == "ascend") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;

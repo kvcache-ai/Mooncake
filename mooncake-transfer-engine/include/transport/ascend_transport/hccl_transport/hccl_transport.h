@@ -95,7 +95,6 @@ class HcclTransport : public Transport {
     std::queue<Slice*> allReqQueues_[THREAD_NUM];
     std::mutex initiator_mutex_;
     std::condition_variable initiator_cond_;
-    // local rank info
     RankInfo local_rank_info_;
     RankInfo remote_rank_info_;
 };

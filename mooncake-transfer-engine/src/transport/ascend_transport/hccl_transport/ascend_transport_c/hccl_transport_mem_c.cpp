@@ -27,12 +27,12 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif //__cplusplus
+#endif // __cplusplus
 
 #define READ 0
 #define WRITE 1
-#define CONNECT_MAX 1000 // 允许的连接数
-#define RETRY_TIMES 3 //
+#define CONNECT_MAX 1000
+#define RETRY_TIMES 3
 #define MAX_EVENTS 32
 #define VECTOR_RESERVE_SIZE 100
 
@@ -61,7 +61,7 @@ int g_epoll_fd = 0;
 struct epoll_event g_ev;
 struct epoll_event g_events[MAX_EVENTS];
 
-// 初始化函数失败重试机制
+// Retry mechanism for initialization function failure
 #define RETRY_CALL(funcCall, errorMsg) \
     do { \
         int retryCount = 0; \
@@ -81,12 +81,11 @@ bool printEnabled() {
     return env != nullptr && std::string(env) == "1";
 }
 
-static int initServerNetSocket(RankInfo *local_rank_info){
-    // Init Netdev
+static int initServerNetSocket(RankInfo *local_rank_info) {
     RETRY_CALL(HcclNetInit(NICDeployment::NIC_DEPLOYMENT_DEVICE,
     local_rank_info->devicePhyId, local_rank_info->deviceLogicId, false), "HcclNetInit failed");
 
-    // 跨hccs使用device物理网卡IP
+    // Use the physical network card of the device across HCCS
     hccl::HcclIpAddress localIp(local_rank_info->deviceIp);
     RETRY_CALL(HcclNetOpenDev(&nicNetDevCtx_, NicType::DEVICE_NIC_TYPE, local_rank_info->devicePhyId, 
         local_rank_info->deviceLogicId, localIp), "HcclNetOpenDev DEVICE_NIC_TYPE failed");
@@ -100,7 +99,7 @@ static int initServerNetSocket(RankInfo *local_rank_info){
     RETRY_CALL(nicServerSocket_->Init(), "nicServerSocket_ Init failed");
     RETRY_CALL(nicServerSocket_->Listen(), "nicServerSocket_ Listen failed");
 
-    // hccs内使用虚拟网卡
+    // Use virtual network card within HCCS
     hccl::HcclIpAddress localVnicIp(local_rank_info->devicePhyId);
     RETRY_CALL(hrtRaGetSingleSocketVnicIpInfo(
             local_rank_info->devicePhyId, DeviceIdType::DEVICE_ID_TYPE_PHY_ID,
@@ -136,7 +135,7 @@ static int initServerNetSocket(RankInfo *local_rank_info){
     return 0;
 }
 
-// ascend_transport依赖的host侧带外socket，用于传递deviceId、deviceIp等控制信息
+// The out-of-band socket on the host side that ascend_transport depends on, used to convey control information such as deviceId and deviceIp
 static int initControlSocket(RankInfo *local_rank_info) {
     int ret = 0;
     g_server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -165,7 +164,6 @@ static int initControlSocket(RankInfo *local_rank_info) {
         return ret;
     }
 
-    // 设置接收超时
     struct timeval timeout;
     timeout.tv_sec = 120;
     timeout.tv_usec = 0;
@@ -202,7 +200,7 @@ static int initControlSocket(RankInfo *local_rank_info) {
 
 int initTransportMem(RankInfo *local_rank_info) {
     int ret = 0;
-    if (local_rank_info == NULL){
+    if (local_rank_info == NULL) {
         LOG(ERROR) << "initTransportMem local_rank_info is NULL";
         return -1;
     }
@@ -227,7 +225,7 @@ int initTransportMem(RankInfo *local_rank_info) {
               << ", hostPort: " << local_rank_info->hostPort
               << ", pid: " << local_rank_info->pid;
 
-    // 初始化数据通道虚拟网卡和socket，交换RmaMem，以及创建QP链接
+    // Initialize the virtual network card and socket for the data channel, exchange RmaMem, and create the QP connection
     ret = initServerNetSocket(local_rank_info);
     if (ret) {
         LOG(ERROR) << "initServerNetSocket failed";
@@ -287,7 +285,7 @@ static int connectToTarget(std::string target_ip, int target_port) {
 
         LOG(ERROR) << "Connect attempt " << i << " failed: " << strerror(errno);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));  // 等待 1 毫秒再重试
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     if (!connected) {
@@ -323,14 +321,14 @@ int controlInfoSend(RankInfo *local_rank_info, RankInfo *remote_rank_info) {
             << ", hostPort: " << remote_rank_info->hostPort
             << ", pid: " << remote_rank_info->pid;
 
-    // 2、封装控制信息
+    // Encapsulate control information
     RankControlInfo control_info;
     control_info.deviceLogicId = local_rank_info->deviceLogicId;
     control_info.devicePhyId = local_rank_info->devicePhyId;
     control_info.hostIp = local_rank_info->hostIp;
     control_info.deviceIp = local_rank_info->deviceIp;
     control_info.pid = local_rank_info->pid;
-    // hccl_transport自建带外,发送控制面的host socket
+    // Self-built out-of-band, host socket for sending control plane
     int client_socket = connectToTarget(inet_ntoa(remote_rank_info->hostIp), 
                                         remote_rank_info->hostPort);
     if (client_socket < 0) {
@@ -352,7 +350,6 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
     hccl::HcclIpAddress rempoteDevIp;
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
     std::string baseTag_ = inet_ntoa(local_rank_info->hostIp) + std::to_string(local_rank_info->devicePhyId) + key_str + tag;
-    // 不跨HCCS
     if (!is_cross_hccs) {
         std::vector<unsigned int> remoteDevPhyId;
         remoteDevPhyId.push_back(remote_rank_info->devicePhyId);
@@ -422,9 +419,9 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
 int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, std::shared_ptr<hccl::TransportMem>& transport_mem) {
     int ret = 0;
     bool same_host = local_rank_info->hostIp.s_addr == remote_rank_info->hostIp.s_addr;
-    // 8卡内部通信不跨HCCS，如0-7卡内部通信
+    // For A2 series, internal communication among 8 cards does not cross HCCS, such as communication among cards 0-7
     bool same_group = (local_rank_info->devicePhyId / 8) == (remote_rank_info->devicePhyId / 8);
-    bool is_cross_hccs = !(same_host && same_group); // 同一主机且同一组时才不跨
+    bool is_cross_hccs = !(same_host && same_group);
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
     if (printEnabled()) {
         LOG(INFO) << "transport is cross_hccs: " << (is_cross_hccs ? "true (cross-hccs)" : "false (same-hccs)");
@@ -497,7 +494,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
     target_key_to_transport_mem_map_[key_str] = transport_mem;
     size_t m_num = g_localMemAddr.size();
     std::vector<hccl::TransportMem::RmaMemDesc> rmaMemDescs(m_num);
-    // 第一块内存是host内存，交换内存时不做处理
+
     for (size_t i = 0; i < m_num; ++i) {
         HcclMem mem;
         HcclBuf buf;
@@ -529,7 +526,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
             return -1;
         }
 
-        // HCCS内场景下，需要调用HcclMemGrant授权对端内存
+        // In the scenario within HCCS, it is necessary to call HcclMemGrant to authorize peer memory
         if (!is_cross_hccs) {
             HcclMemGrantInfo grant_info;
             grant_info.remotePid = (int32_t)remote_rank_info->pid;
@@ -563,7 +560,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
             return ret;
         }
     }
-    // 交换和使能对端内存完成，可以进行读写
+
     LOG(INFO) << "ExchangeMem and EnableMemAccess Success!";
     return 0;
 }
@@ -573,11 +570,10 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
                     uint64_t req_len, void *local_mem, aclrtStream stream)
 {
     int ret = 0;
-    // 1、查找对端，检查是否具备对应的socket，并发送本端的信息给对端
+    // 1. Check if a connection has been established with the peer, and send local information to the peer
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
     auto iter = target_key_to_control_socket_map_.find(key_str);
     if (iter == target_key_to_control_socket_map_.end()) {
-        // 用host侧带外发送控制信息
         ret = controlInfoSend(local_rank_info, remote_rank_info);
         if (ret) {
             LOG(ERROR) << "controlInfoSend failed, ret: " << ret;
@@ -585,12 +581,10 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
         }
     }
 
-    // 2、查找对端，检查时候具备对应的transport_mem,并发送本端的信息给对端。
+    // 2. Check if transport_mem has been established with the peer, and send local information to the peer.
     std::shared_ptr<hccl::TransportMem> transport_mem{};
     auto iter_mem = target_key_to_transport_mem_map_.find(key_str);
-    // 根据hostIp和deviceId判断是否需要跨HCCS通信，跨HCCS使用真实网卡，内部使用虚拟网卡
     if (iter_mem == target_key_to_transport_mem_map_.end()) {
-        // 新建TransportMem
         ret = createTransportMem(local_rank_info, remote_rank_info, transport_mem);
         if (ret) {
             LOG(ERROR) << "createTransportMem failed, ret: " << ret;
@@ -609,7 +603,7 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     hccl::TransportMem::RmaOpMem remoteMem;
     remoteMem.addr = (void *)offset;
     remoteMem.size = req_len;
-    if (op_code == WRITE){
+    if (op_code == WRITE) {
         ret = transport_mem->Write(remoteMem, localMem, stream);
         if (ret) {
             LOG(ERROR) << "transport_mem Read failed, localMem.addr: " 
@@ -695,10 +689,9 @@ int acceptSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo *local
         LOG(ERROR) << "serverSocket AddWhiteList failed, ret: " << ret;
         return ret;
     }
-    // 使用device侧网卡通信之前需要添加client端地址到白名单
-    LOG(INFO) << "Add the client's IP address to the whitelist success.";
+    // Before using the device-side network card for communication, it is necessary to add the client device address to the whitelist.
+    LOG(INFO) << "Add the client's Device IP address to the whitelist success.";
 
-    // 接收socket
     ret = serverSocket->Accept(baseTag_, hccl_socket);
     if (ret) {
         LOG(ERROR) << "serverSocket transportMemAccept ctrl socket failed ret:" << ret;
@@ -708,7 +701,7 @@ int acceptSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo *local
 }
 
 int transportMemAccept(RankInfo *local_rank_info) {
-    // hccl_transport自建带外,接受控制面的host socket
+    // Self-built out-of-band, host socket for receiving control plane
     int ret = 0;
     int nfds = epoll_wait(g_epoll_fd, g_events, MAX_EVENTS, -1);
     if (nfds == -1) {
@@ -718,7 +711,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (client_socket < 0) {
         return client_socket;
     }
-    // 接受控制面发送端的对端信息
+
     RankControlInfo remote_control_info;
     ret = recv(client_socket, &remote_control_info, sizeof(RankControlInfo), 0);
     if (ret <= 0) {
@@ -728,7 +721,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
             LOG(ERROR) << "Peer close the connection, ret: " << ret;
         }
         close(client_socket);
-        return ret; // 接受对端通知消息失败
+        return ret;
     }
 
     LOG(INFO) << "Received remote_control_info, deviceLogicId: "
@@ -737,7 +730,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
               << ", hostIp: " << inet_ntoa(remote_control_info.hostIp)
               << ", deviceIp: " << inet_ntoa(remote_control_info.deviceIp);
 
-    // 根据host_ip+device_id，查找是否存在相同的点对点TransportMem
+    // Check if TransportMem has been established with the peer
     std::string key_str = inet_ntoa(remote_control_info.hostIp) + std::to_string(remote_control_info.devicePhyId);
     auto iter = target_key_to_transport_mem_map_.find(key_str);
     if (iter != target_key_to_transport_mem_map_.end()) {
@@ -748,11 +741,10 @@ int transportMemAccept(RankInfo *local_rank_info) {
     hccl::HcclIpAddress rempoteDevIp;
     std::shared_ptr<hccl::HcclSocket> hccl_ctrl_socket;
     std::shared_ptr<hccl::HcclSocket> hccl_data_socket;
-    // 根据hostIp和deviceId判断是否需要跨HCCS通信，跨HCCS使用真实网卡，内部使用虚拟网卡
     bool same_host = local_rank_info->hostIp.s_addr == remote_control_info.hostIp.s_addr;
-    // 8卡内部通信不跨HCCS，如0-7卡内部通信
+    // For A2 series, internal communication among 8 cards does not cross HCCS, such as communication among cards 0-7
     bool same_group = (local_rank_info->devicePhyId / 8) == (remote_control_info.devicePhyId / 8);
-    bool is_cross_hccs = !(same_host && same_group); // 同一主机且同一组时才不跨
+    bool is_cross_hccs = !(same_host && same_group);
     if (printEnabled()) {
         LOG(INFO) << "transport is cross_hccs: " << (is_cross_hccs ? "true (cross-hccs)" : "false (same-hccs)");
     }
@@ -892,7 +884,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
             return -1;
         }
 
-        // HCCS内场景下，需要调用HcclMemGrant授权对端内存
+        // In the scenario within HCCS, it is necessary to call HcclMemGrant to authorize peer memory
         if (!is_cross_hccs) {
             HcclMemGrantInfo grant_info;
             grant_info.remotePid = (int32_t)remote_control_info.pid;
@@ -927,14 +919,12 @@ int transportMemAccept(RankInfo *local_rank_info) {
         }
     }
 
-    // 交换和使能对端内存完成，可以进行读写
     LOG(INFO) << "ExchangeMem and EnableMemAccess Success, with remote";
     return 0;
 }
 
 int regLocalRmaMem(void *addr, uint64_t length)
 {
-    // 本地内存信息保存
     g_localMemAddr.push_back(addr);
     g_localMemLen.push_back(length);
     return 0;

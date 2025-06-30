@@ -80,7 +80,7 @@ static inline std::string calculateRate(uint64_t data_bytes, uint64_t duration) 
     return oss.str();
 }
 
-int allocateDevMem(void* &devAddr, size_t size){
+int allocateDevMem(void* &devAddr, size_t size) {
     // malloc device mem
     aclError ret = aclrtMalloc(&devAddr, size, ACL_MEM_MALLOC_NORMAL_ONLY);
     if (ret != ACL_ERROR_NONE) {
@@ -96,7 +96,6 @@ int allocateDevMem(void* &devAddr, size_t size){
         return ret;
     }
 
-    // memset
     for (size_t i = 0; i < size; i += sizeof(uint32_t)) {
         *(uint32_t*)((char *)host_addr + i) = 0x12345678;
     }
@@ -110,7 +109,7 @@ int allocateDevMem(void* &devAddr, size_t size){
         return ret;
     }
     
-    //release resource
+    // release resource
     ret = aclrtFreeHost(host_addr);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to aclrtFreeHost, ret: " << ret;
@@ -128,7 +127,6 @@ int initiator() {
         return ret;
     }
 
-    // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
@@ -269,7 +267,8 @@ int initiator() {
     s = engine->freeBatchID(batch_id);
     LOG_ASSERT(s.ok());
     
-    // 测试1对2发送时填入第二个接收端的segment_id，不填时默认NA不开启，只做1对1
+    // When testing 1-to-2 transmission (1 initiator to 2 targets), fill in the segment_id of the second receiver.  
+    // If not filled, it defaults to "NA" and 1-to-2 transmission is not enabled, only 1-to-1 transmission is performed.
     if (FLAGS_segment_id_1 != "NA") {
         sleep(10);
         auto segment_id_1 = engine->openSegment(FLAGS_segment_id_1.c_str());
@@ -344,7 +343,6 @@ int target() {
         return -1;
     }
 
-    // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
@@ -399,7 +397,6 @@ int main(int argc, char **argv) {
     g_TotalSize = (uint64_t)(FLAGS_batch_size * FLAGS_block_size);
 
     g_deviceId = FLAGS_device_id;
-    // init ACL 
     const char *aclConfigPath = nullptr;
     aclError ret = aclInit(aclConfigPath);
     if (ret != ACL_ERROR_NONE) {

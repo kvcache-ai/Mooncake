@@ -16,12 +16,16 @@ In addition to the dependencies already required by Mooncake, Ascend Transport n
 ```bash
 yum install -y mpich mpich-devel
 ```
+
+**Ascend Compute Architecture for Neural Networks**
+Ascend Compute Architecture for Neural Networks 8.1.RC1 version
+
 ### One-Step Build Script
 
-Ascend Transport provides a one-step build script located at `Mooncake/mooncake-transfer-engine/src/transport/ascend_transport/scripts/build_all_with_dependencies.sh`. Copy this script to the desired installation directory and run it. You can also pass an installation path as an argument; if not provided, it defaults to the current directory:
+Ascend Transport provides a one-step build script located at `scripts/ascend/dependencies_ascend.sh`. Copy this script to the desired installation directory and run it. You can also pass an installation path as an argument; if not provided, it defaults to the current directory:
 
 ```bash
-./build_all_with_dependencies.sh /path/to/install_directory
+./dependencies_ascend.sh /path/to/install_directory
 ```
 
 This script also supports environments where users cannot perform `git clone` directly. Users can place the source code for dependencies and Mooncake in the target directory, and the script will handle the compilation accordingly.
@@ -30,11 +34,11 @@ This script also supports environments where users cannot perform `git clone` di
 
 To avoid potential conflicts when running other processes during Mooncake compilation, Ascend Transport offers a solution that separates the build and runtime environments.
 
-After completing the Mooncake build via build_all_with_dependencies.sh, you can run setup_basic_dependencies.sh to install only the required dependencies. Place the generated Mooncake .whl package and libascend_transport_mem.so into the installation directory.
+After completing the Mooncake build via dependencies_ascend.sh, you can run dependencies_ascend_installation.sh to install only the required dependencies. Place the generated Mooncake .whl package and libascend_transport_mem.so into the installation directory.
 
 Copy the script to the installation directory and run:
 ```bash
-./setup_basic_dependencies.sh /path/to/install_directory
+./dependencies_ascend_installation.sh /path/to/install_directory
 ```
 
 Before use, ensure that `libascend_transport_mem.so` has been copied to `/usr/local/Ascend/ascend-toolkit/latest/python/site-packages`, then execute:
@@ -125,8 +129,17 @@ export ASCEND_TRANSPORT_PRINT=1
 ```
 
 ### Notes
-ascned_transport will establish a TCP connection on the host side.This connection uses port (10000 + deviceId). Please avoid using this port for other services to prevent conflicts.
+ascend_transport will establish a TCP connection on the host side. This connection uses port (10000 + deviceId). Please avoid using this port for other services to prevent conflicts.
 
-ascned_transport has an automatic reconnection mechanism in place that triggers after a transfer is completed, in case the remote end goes offline and restarts. There is no need to manually restart the local service.
+ascend_transport has an automatic reconnection mechanism in place that triggers after a transfer is completed, in case the remote end goes offline and restarts. There is no need to manually restart the local service.
 
 Note If the target end goes offline and restarts, the initiating end will attempt to re-establish the connection when it sends the next request. The target must complete its restart and become ready within 5 seconds after the initiator sends the request. If the target does not become available within this window, the connection will fail and an error will be returned.
+
+### Timeout Configuration
+Ascend Transport uses TCP-based out-of-band communication on the host side, with a receive timeout set to 120 seconds.
+
+Connection timeout is controlled by the environment variable HCCL_CONNECT_TIMEOUT.
+Execution timeout is configured via HCCL_EXEC_TIMEOUT.
+If no communication occurs within this timeout, the hccl_socket connection will be terminated.
+
+Point-to-point communication between endpoints involves a connection handshake with a timeout of 120 seconds.

@@ -78,7 +78,7 @@ static inline std::string calculateRate(uint64_t data_bytes, uint64_t duration) 
     return oss.str();
 }
 
-int allocateDevMem(void* &devAddr, size_t size){
+int allocateDevMem(void* &devAddr, size_t size) {
     // malloc device mem
     aclError ret = aclrtMalloc(&devAddr, size, ACL_MEM_MALLOC_NORMAL_ONLY);
     if (ret != ACL_ERROR_NONE) {
@@ -94,7 +94,6 @@ int allocateDevMem(void* &devAddr, size_t size){
         return ret;
     }
 
-    // memset
     for (size_t i = 0; i < size; i += sizeof(uint32_t)) {
         *(uint32_t*)((char *)host_addr + i) = 0x12345678;
     }
@@ -126,7 +125,6 @@ int initiator() {
         return ret;
     }
 
-    // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
@@ -134,7 +132,7 @@ int initiator() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_new.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
     
-    // 预热发送 
+    // Warm-up transmission
     void *tmp_devAddr = NULL;
     ret = allocateDevMem(tmp_devAddr, FLAGS_block_size);
     if (ret) {
@@ -277,7 +275,6 @@ int target() {
         return -1;
     }
 
-    // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
@@ -285,7 +282,7 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_new.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
-    // 预热发送 
+    // Warm-up transmission
     void *tmp_devAddr = NULL;
     ret = allocateDevMem(tmp_devAddr, FLAGS_block_size);
     if (ret) {
@@ -320,7 +317,7 @@ int target() {
 
     while (target_running) sleep(1);
 
-    //release resource
+    // release resource
     aclrtFree(tmp_devAddr);
     for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
         aclrtFree(g_addr[i]);
@@ -333,7 +330,6 @@ int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
 
     g_deviceId = FLAGS_device_id;
-    //init ACL 
     const char *aclConfigPath = NULL;
     aclError ret = aclInit(aclConfigPath);
     if (ret != ACL_ERROR_NONE) {

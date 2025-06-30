@@ -29,25 +29,32 @@ HcclTransport::HcclTransport() : running_(-1) {
 }
 
 HcclTransport::~HcclTransport() {
-    //TODO
+    if (running_) {
+        running_ = false;
+       
+        for (size_t i = 0; i < THREAD_NUM; ++i) {
+            allInitiatorThreads_[i].join();
+            allAcceptThreads_[i].join();
+        }
+    }
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
-void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx){
+void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
     aclrtStream stream;
     int ret = aclrtSetDevice(deviceLogicId);
-    if (ret){
+    if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtSetDevice error, ret:" << ret;
     }
 
     ret = aclrtCreateStream(&stream);
-    if (ret){
+    if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret:" << ret;
     }
     
-    while(1) {
+    while(running_) {
         std::unique_lock<std::mutex> lock(initiator_mutex_);
-        if (allReqQueues_[selfIdx].empty()){
+        if (allReqQueues_[selfIdx].empty()) {
             initiator_cond_.wait(lock);
         }
 
@@ -55,7 +62,6 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx){
         allReqQueues_[selfIdx].pop();
         lock.unlock();
         auto segment_desc = metadata_->getSegmentDescByID(slice->target_id);
-        // 请求的target_id错误，无法发送
         if (!segment_desc) {
             LOG(ERROR) << "Unable to get target segment ID, please recheck, segment ID:" << slice->target_id;
             slice->markFailed();
@@ -84,12 +90,12 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx){
     }
 }
 
-void HcclTransport::acceptLoop(int deviceLogicId){
+void HcclTransport::acceptLoop(int deviceLogicId) {
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtSetDevice failed ret:" << ret;
     }
-    while(1) {
+    while(running_) {
         ret = transportMemAccept(&local_rank_info_);
         if (ret) {
             LOG(ERROR) << "HcclTransport: transportMemAccept failed ret:" << ret;
@@ -97,7 +103,7 @@ void HcclTransport::acceptLoop(int deviceLogicId){
     }
 }
 
-int HcclTransport::initPdThread(){
+int HcclTransport::initPdThread() {
     pid_t pid = getpid();
 
     int ret = 0;
@@ -117,7 +123,7 @@ int HcclTransport::initPdThread(){
     return 0;
 }
 
-// get DevicePhyId
+// Get HostIp\Port\DevicePhyId
 int HcclTransport::getDevIdAndIpPortFromServerName(std::string& identifier, std::string& hostIp, int &port, int& npuId) {
     size_t firstColon = identifier.find(":");
     if (firstColon == std::string::npos) {
@@ -166,7 +172,7 @@ int HcclTransport::rankInfoParse(int devicePhyId, std::string hostIp) {
         return ret;
     }
     
-    // hccl默认配置文件路径
+    // Default configuration file path for HCCL
     std::ifstream fin("/etc/hccn.conf");
     if (!fin) {
         LOG(ERROR) << "can't open conf 文件：/etc/hccn.conf";
@@ -179,11 +185,9 @@ int HcclTransport::rankInfoParse(int devicePhyId, std::string hostIp) {
             size_t equal_pos = line.find('=');
             if (equal_pos != std::string::npos) {
                 std::string key = line.substr(8, equal_pos - 8);
-                // 去除 key 前后空格（如果格式规范可以省略）
                 key.erase(key.begin(), std::find_if(key.begin(), key.end(), [](unsigned char c){ return !std::isspace(c); }));
                 if (key == std::to_string(devicePhyId)) {
                     std::string deviceIp = line.substr(equal_pos + 1);
-                    // 去除值前后空白字符（如果格式规范可以省略）
                     deviceIp.erase(deviceIp.begin(), std::find_if(deviceIp.begin(), deviceIp.end(), [](unsigned char c){ return !std::isspace(c); }));
                     deviceIp.erase(std::find_if(deviceIp.rbegin(), deviceIp.rend(), [](unsigned char c){ return !std::isspace(c); }).base(), deviceIp.end());
 
@@ -206,13 +210,13 @@ int HcclTransport::rankInfoParse(int devicePhyId, std::string hostIp) {
                     << " serverIdx: " << local_rank_info_.serverIdx << " devicePhyId: " << local_rank_info_.devicePhyId
                     << " hostPort: " << local_rank_info_.hostPort << " deviceLogicId: " << local_rank_info_.deviceLogicId
                     << " devicePort: " << local_rank_info_.devicePort << " deviceIp: " << deviceIp << " pid:" << local_rank_info_.pid;
-
-                    return 0; // 找到后立即退出
+                    // Exit after finishing rankInfoParse
+                    return 0;
                 }
             }
         }
     }
-
+    // Not Found
     return -1;
 }
 
@@ -224,15 +228,15 @@ int HcclTransport::install(std::string &local_server_name,
     int devicePhyId;
     metadata_ = meta;
     ret = getDevIdAndIpPortFromServerName(local_server_name, hostIp, port, devicePhyId);
-    if (ret){
+    if (ret) {
         LOG(ERROR) << "HcclTransport: getDevIdAndIpPortFromServerName failed, ret: " << ret;
         return ret; 
     }
-    // 以ip:port作为desc_name
+
     local_server_name_ = hostIp + ":" + std::to_string(port);
     LOG(INFO) << "HcclTransport: begin to install transport, local devicePhyId: " << devicePhyId  << ", local_server_name: " << local_server_name;
 
-    // add to rankinfo_
+    // add to local_rank_info_
     ret = rankInfoParse(devicePhyId, hostIp);
     if (ret) {
         LOG(ERROR) << "HcclTransport: rankInfoParse failed, ret: " << ret;

@@ -10,17 +10,20 @@ Ascend Transport在Mooncake本身依赖的基础上，新增了一部分HCCL的�
 **MPI**
 yum install -y mpich mpich-devel
 
+**昇腾Compute Architecture for Neural Networks**
+昇腾Compute Architecture for Neural Networks 8.1.RC1版本
+
 ### 一键式编译脚本
-Ascend Transport提供一键式编译脚本，脚本位置为Mooncake/mooncake-transfer-engine/src/transport/ascend_transport/scripts/build_all_with_dependencies.sh，将脚本复制到想要安装依赖和Mooncake的目录下执行脚本即可，也支持传入参数指定安装路径，不传入时默认为脚本所在目录，命令如下：
-./build_all_with_dependencies.sh /path/to/install_directory
+Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh，将脚本复制到想要安装依赖和Mooncake的目录下执行脚本即可，也支持传入参数指定安装路径，不传入时默认为脚本所在目录，命令如下：
+./dependencies_ascend.sh /path/to/install_directory
 一键式编译脚本同样考虑到用户无法直接在环境上git clone的情况，用户可以把给依赖和Mooncake的源码放在安装目录下并指定，脚本会自动编译依赖和Mooncake。
 
 ### 一键式安装脚本(不编译Mooncake)
 为了避免用户出现在编译Mooncake的环境上，执行其它进程有冲突的可能问题，Ascend Transport给出编译和执行Mooncake分离的一种方案。
-在执行build_all_with_dependencies.sh完成Mooncake编译后，用户可执行Mooncake/mooncake-transfer-engine/src/transport/ascend_transport/scripts/setup_basic_dependencies.sh，仅安装依赖。将一键式编译脚本生成的mooncake whl包和libascend_transport_mem.so放在安装目录下
+在执行dependencies_ascend.sh完成Mooncake编译后，用户可执行scripts/ascend/dependencies_ascend_installation.sh，仅安装依赖。将一键式编译脚本生成的mooncake whl包和libascend_transport_mem.so放在安装目录下
 
 将脚本复制到安装目录下执行脚本即可，命令如下：
-./setup_basic_dependencies.sh /path/to/install_directory
+./dependencies_ascend_installation.sh /path/to/install_directory
 
 在使用前，确保编译生成的libascend_transport_mem.so文件已经复制到/usr/local/Ascend/ascend-toolkit/latest/python/site-packages下，然后执行命令：
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
@@ -79,6 +82,13 @@ Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_e
 export ASCEND_TRANSPORT_PRINT=1
 
 ### 注意事项
-1.ascned_transport会建立一个host侧的tcp连接，占用端口为10000+deviceId,请注意避开此端口，勿重复占用
-2.ascned_transport 在一次传输结束后，若对端（remote end）发生掉线并重启，系统已设计有自动重试建链机制，无需手动重启本端服务。
+1.ascend_transport会建立一个host侧的tcp连接，占用端口为10000+deviceId,请注意避开此端口，勿重复占用
+2.ascend_transport 在一次传输结束后，若对端（remote end）发生掉线并重启，系统已设计有自动重试建链机制，无需手动重启本端服务。
 注意：若目标端发生掉线并重启，发起端在下次发起请求时会尝试重新建立连接。目标端需确保在发起端发起请求后的 5 秒内完成重启并进入就绪状态。若超过该时间窗口仍未恢复，连接将失败并返回错误。
+
+### 超时时间配置
+Ascend Transport基于TCP的带外通信，在主机侧接收超时设置为 120 秒。
+
+在hccl_socket中，连接超时时间由环境变量HCCL_CONNECT_TIMEOUT配置，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+
+在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间为 120 秒。

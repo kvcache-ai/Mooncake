@@ -63,13 +63,12 @@ make -j$(nproc)
 make install
 cd ../..
 
-# 处理 Mooncake 和 pybind11
+# 处理 Mooncake
 clone_repo_if_not_exists "Mooncake" "https://github.com/AscendTransport/Mooncake.git"
-clone_repo_if_not_exists "pybind11" "https://github.com/pybind/pybind11.git"
 
 # 克隆 Mooncake 项目并进行构建和安装
-cp -r pybind11/* Mooncake/extern/pybind11/
 cd Mooncake
+git submodule update --init --recursive
 
 # 创建构建目录并编译安装 Mooncake
 mkdir -p build
