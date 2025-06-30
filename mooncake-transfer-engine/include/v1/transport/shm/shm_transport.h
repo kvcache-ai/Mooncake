@@ -69,11 +69,10 @@ class ShmTransport : public Transport {
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
 
-    virtual Status registerLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status addMemoryBuffer(BufferDesc &desc,
+                                   const MemoryOptions &options);
 
-    virtual Status unregisterLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "shm"; }
 
@@ -83,8 +82,6 @@ class ShmTransport : public Transport {
     virtual Status freeLocalMemory(const BufferEntry &buffer);
 
    private:
-    Status setupLocalSegment();
-
     void startTransfer(ShmTask *task);
 
     void *createSharedMemory(const std::string &path, size_t size);

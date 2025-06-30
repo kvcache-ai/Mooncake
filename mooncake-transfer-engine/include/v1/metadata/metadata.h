@@ -30,9 +30,9 @@
 
 #include "v1/common.h"
 #include "v1/metadata/plugin.h"
+#include "v1/metadata/segment.h"
 #include "v1/utility/rpc.h"
 #include "v1/utility/topology.h"
-#include "v1/metadata/segment.h"
 
 namespace mooncake {
 namespace v1 {
@@ -116,14 +116,17 @@ class RpcClient {
     ~RpcClient() {}
 
    public:
-    Status bootstrap(const std::string &server_addr,
-                     const BootstrapDesc &request, BootstrapDesc &response);
+    static Status bootstrap(const std::string &server_addr,
+                            const BootstrapDesc &request,
+                            BootstrapDesc &response);
 
-    Status sendData(const std::string &server_addr, uint64_t peer_mem_addr,
-                    void *local_mem_addr, size_t length);
+    static Status sendData(const std::string &server_addr,
+                           uint64_t peer_mem_addr, void *local_mem_addr,
+                           size_t length);
 
-    Status recvData(const std::string &server_addr, uint64_t peer_mem_addr,
-                    void *local_mem_addr, size_t length);
+    static Status recvData(const std::string &server_addr,
+                           uint64_t peer_mem_addr, void *local_mem_addr,
+                           size_t length);
 };
 
 class MetadataService {

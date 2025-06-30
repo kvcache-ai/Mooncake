@@ -45,9 +45,6 @@ Status TcpTransport::install(std::string &local_segment_name,
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
-    auto status = setupLocalSegment();
-    if (!status.ok()) return status;
-
     installed_ = true;
     return Status::OK();
 }
@@ -121,45 +118,16 @@ void TcpTransport::queryOutstandingTasks(SubBatchRef batch,
     }
 }
 
-Status TcpTransport::registerLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    auto &manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    auto &current_buffer_list =
-        std::get<MemorySegmentDesc>(segment->detail).buffers;
-    for (auto &buffer : buffer_list) {
-        BufferDesc desc;
-        desc.type = MemBufferType::TCP;
-        desc.addr = (uint64_t)buffer.addr;
-        desc.length = buffer.length;
-        desc.location = buffer.location;
-        current_buffer_list.push_back(desc);
-    }
-    return manager.synchronizeLocal();
+Status TcpTransport::addMemoryBuffer(BufferDesc &desc,
+                                     const MemoryOptions &options) {
+    return Status::OK();
 }
 
-Status TcpTransport::unregisterLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    auto &manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    auto &current_buffer_list =
-        std::get<MemorySegmentDesc>(segment->detail).buffers;
-    for (auto &buffer : buffer_list) {
-        for (auto it = current_buffer_list.begin();
-             it != current_buffer_list.end(); ++it) {
-            if (it->addr == (uint64_t)buffer.addr &&
-                it->length == buffer.length && it->type == MemBufferType::TCP) {
-                it = current_buffer_list.erase(it);
-            }
-        }
-    }
-    return manager.synchronizeLocal();
+Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
+    return Status::OK();
 }
-
-Status TcpTransport::setupLocalSegment() { return Status::OK(); }
 
 void TcpTransport::startTransfer(TcpTask *task) {
-    RpcClient client;
     std::string rpc_server_addr;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
@@ -169,11 +137,13 @@ void TcpTransport::startTransfer(TcpTask *task) {
         return;
     }
     if (task->request.opcode == Request::WRITE) {
-        status = client.sendData(rpc_server_addr, task->request.target_offset,
-                                 task->request.source, task->request.length);
+        status =
+            RpcClient::sendData(rpc_server_addr, task->request.target_offset,
+                                task->request.source, task->request.length);
     } else {
-        status = client.recvData(rpc_server_addr, task->request.target_offset,
-                                 task->request.source, task->request.length);
+        status =
+            RpcClient::recvData(rpc_server_addr, task->request.target_offset,
+                                task->request.source, task->request.length);
     }
     if (!status.ok()) {
         task->status_word = TransferStatusEnum::FAILED;

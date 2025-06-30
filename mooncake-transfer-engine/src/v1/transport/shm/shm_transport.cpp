@@ -85,8 +85,6 @@ Status ShmTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     conf_ = conf;
-    auto status = setupLocalSegment();
-    if (!status.ok()) return status;
 
     const static size_t kDefaultThreadPoolSize = 1;
     workers_ = std::make_unique<ShmThreadPool>(kDefaultThreadPoolSize);
@@ -194,43 +192,14 @@ void ShmTransport::queryOutstandingTasks(SubBatchRef batch,
     }
 }
 
-Status ShmTransport::registerLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    auto &manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    auto &current_buffer_list =
-        std::get<MemorySegmentDesc>(segment->detail).buffers;
-    for (auto &buffer : buffer_list) {
-        BufferDesc desc;
-        desc.type = MemBufferType::SHM;
-        desc.addr = (uint64_t)buffer.addr;
-        desc.length = buffer.length;
-        desc.location = buffer.location;
-        desc.shm_path = buffer.shm_path;
-        current_buffer_list.push_back(desc);
-    }
-    return manager.synchronizeLocal();
+Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
+                                     const MemoryOptions &options) {
+    return Status::OK();
 }
 
-Status ShmTransport::unregisterLocalMemory(
-    const std::vector<BufferEntry> &buffer_list) {
-    auto &manager = metadata_->segmentManager();
-    auto segment = manager.getLocal();
-    auto &current_buffer_list =
-        std::get<MemorySegmentDesc>(segment->detail).buffers;
-    for (auto &buffer : buffer_list) {
-        for (auto it = current_buffer_list.begin();
-             it != current_buffer_list.end(); ++it) {
-            if (it->addr == (uint64_t)buffer.addr &&
-                it->length == buffer.length && it->type == MemBufferType::SHM) {
-                it = current_buffer_list.erase(it);
-            }
-        }
-    }
-    return manager.synchronizeLocal();
+Status ShmTransport::removeMemoryBuffer(BufferDesc &desc) {
+    return Status::OK();
 }
-
-Status ShmTransport::setupLocalSegment() { return Status::OK(); }
 
 static inline std::string makeRandomMmapFileName(const std::string &parent) {
     std::string result = parent;

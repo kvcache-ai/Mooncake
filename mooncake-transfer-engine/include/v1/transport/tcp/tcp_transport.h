@@ -65,17 +65,14 @@ class TcpTransport : public Transport {
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
 
-    virtual Status registerLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status addMemoryBuffer(BufferDesc &desc,
+                                   const MemoryOptions &options);
 
-    virtual Status unregisterLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "tcp"; }
 
    private:
-    Status setupLocalSegment();
-
     void startTransfer(TcpTask *task);
 
     Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
