@@ -12,7 +12,8 @@
 #include "types.h"
 
 namespace py = pybind11;
-using namespace mooncake;
+
+namespace mooncake {
 
 // RAII container that automatically frees slices on destruction
 class SliceGuard {
@@ -180,12 +181,12 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
 
     client_buffer_allocator_ =
         std::make_unique<SimpleAllocator>(local_buffer_size);
-    ErrorCode error_code = client_->RegisterLocalMemory(
+    auto result = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), local_buffer_size,
         kWildcardLocation, false, false);
-    if (error_code != ErrorCode::OK) {
+    if (!result.has_value()) {
         LOG(ERROR) << "Failed to register local memory: "
-                   << toString(error_code);
+                   << toString(result.error());
         return 1;
     }
     // Skip mount segment if global_segment_size is 0
@@ -198,11 +199,14 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         return 1;
     }
     segment_ptr_.reset(ptr);
-    error_code = client_->MountSegment(segment_ptr_.get(), global_segment_size);
-    if (error_code != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to mount segment: " << toString(error_code);
+    auto mount_result =
+        client_->MountSegment(segment_ptr_.get(), global_segment_size);
+    if (!mount_result.has_value()) {
+        LOG(ERROR) << "Failed to mount segment: "
+                   << toString(mount_result.error());
         return 1;
     }
+
     return 0;
 }
 
@@ -298,10 +302,11 @@ int DistributedObjectStore::allocateSlicesPacked(
 
 int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
-    const mooncake::Client::ObjectInfo &object_info, uint64_t &length) {
+    const std::vector<Replica::Descriptor> &replica_list, uint64_t &length) {
     length = 0;
-    if (object_info.replica_list.empty()) return -1;
-    auto &replica = object_info.replica_list[0];
+    if (replica_list.empty()) return -1;
+
+    auto &replica = replica_list[0];
     for (auto &handle : replica.buffer_descriptors) {
         auto chunk_size = handle.size_;
         assert(chunk_size <= kMaxSliceSize);
@@ -343,19 +348,30 @@ int DistributedObjectStore::allocateBatchedSlices(
     const std::vector<std::string> &keys,
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         &batched_slices,
-    const mooncake::Client::BatchObjectInfo &batched_object_info,
+    const std::vector<std::vector<mooncake::Replica::Descriptor>>
+        &replica_lists,
     std::unordered_map<std::string, uint64_t> &str_length_map) {
-    if (batched_object_info.batch_replica_list.empty()) return -1;
-    for (const auto &key : keys) {
-        auto object_info_it = batched_object_info.batch_replica_list.find(key);
-        if (object_info_it == batched_object_info.batch_replica_list.end()) {
-            LOG(ERROR) << "Key not found: " << key;
+    if (replica_lists.empty()) return -1;
+    if (keys.size() != replica_lists.size()) {
+        LOG(ERROR) << "Keys size (" << keys.size()
+                   << ") doesn't match replica lists size ("
+                   << replica_lists.size() << ")";
+        return 1;
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &key = keys[i];
+        const auto &replica_list = replica_lists[i];
+
+        if (replica_list.empty()) {
+            LOG(ERROR) << "Empty replica list for key: " << key;
             return 1;
         }
+
         // Get first replica
-        auto &replica = object_info_it->second[0];
+        const auto &replica = replica_list[0];
         uint64_t length = 0;
-        for (auto &handle : replica.buffer_descriptors) {
+        for (const auto &handle : replica.buffer_descriptors) {
             auto chunk_size = handle.size_;
             assert(chunk_size <= kMaxSliceSize);
             auto ptr = client_buffer_allocator_->allocate(chunk_size);
@@ -422,11 +438,11 @@ int DistributedObjectStore::put(const std::string &key,
     ReplicateConfig config;
     config.replica_num = 1;  // Make configurable
     config.preferred_segment = this->local_hostname;
-    ErrorCode error_code = client_->Put(key, slices.slices(), config);
-    if (error_code != ErrorCode::OK) {
+    auto put_result = client_->Put(key, slices.slices(), config);
+    if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
-                   << toString(error_code);
-        return toInt(error_code);
+                   << toString(put_result.error());
+        return toInt(put_result.error());
     }
 
     return 0;
@@ -452,11 +468,29 @@ int DistributedObjectStore::put_batch(
 
     ReplicateConfig config;
     config.replica_num = 1;
-    ErrorCode error_code = client_->BatchPut(keys, batched_slices, config);
-    if (error_code != ErrorCode::OK) {
-        LOG(ERROR) << "BatchPut operation failed with error: "
-                   << toString(error_code);
-        return toInt(error_code);
+
+    // Convert unordered_map to vector format expected by BatchPut
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+    for (const auto &key : keys) {
+        auto it = batched_slices.find(key);
+        if (it != batched_slices.end()) {
+            ordered_batched_slices.emplace_back(it->second);
+        } else {
+            LOG(ERROR) << "Missing slices for key: " << key;
+            return 1;
+        }
+    }
+
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+
+    // Check if any operations failed
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            LOG(ERROR) << "BatchPut operation failed for key '" << keys[i]
+                       << "' with error: " << toString(results[i].error());
+            return toInt(results[i].error());
+        }
     }
 
     for (auto &slice : batched_slices) {
@@ -481,11 +515,11 @@ int DistributedObjectStore::put_parts(
     ReplicateConfig config;
     config.replica_num = 1;  // Make configurable
     config.preferred_segment = this->local_hostname;
-    ErrorCode error_code = client_->Put(key, slices.slices(), config);
-    if (error_code != ErrorCode::OK) {
+    auto put_result = client_->Put(key, slices.slices(), config);
+    if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
-                   << toString(error_code);
-        return toInt(error_code);
+                   << toString(put_result.error());
+        return toInt(put_result.error());
     }
     return 0;
 }
@@ -496,10 +530,8 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
         return pybind11::bytes("\0", 0);
     }
 
-    mooncake::Client::ObjectInfo object_info;
     SliceGuard guard(*this);  // Use SliceGuard for RAII
     uint64_t str_length = 0;
-    ErrorCode error_code;
     char *exported_str_ptr = nullptr;
     bool use_exported_str = false;
 
@@ -508,20 +540,25 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     {
         py::gil_scoped_release release_gil;
 
-        error_code = client_->Query(key, object_info);
-        if (error_code != ErrorCode::OK) {
+        auto query_result = client_->Query(key);
+        if (!query_result) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
-
-        int ret = allocateSlices(guard.slices(), object_info, str_length);
+        // Extract replica list from the query result
+        auto replica_list = query_result.value();
+        if (replica_list.empty()) {
+            py::gil_scoped_acquire acquire_gil;
+            return kNullString;
+        }
+        int ret = allocateSlices(guard.slices(), replica_list, str_length);
         if (ret) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
 
-        error_code = client_->Get(key, object_info, guard.slices());
-        if (error_code != ErrorCode::OK) {
+        auto get_result = client_->Get(key, replica_list, guard.slices());
+        if (!get_result) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
@@ -571,27 +608,40 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     }
 
     std::vector<pybind11::bytes> results;
-    mooncake::Client::BatchObjectInfo batched_object_info;
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         batched_slices;
     std::unordered_map<std::string, uint64_t> str_length_map;
     {
         py::gil_scoped_release release_gil;
-        ErrorCode error_code = client_->BatchQuery(keys, batched_object_info);
-        if (error_code != ErrorCode::OK) {
-            py::gil_scoped_acquire acquire_gil;
-            return {kNullString};
-        } else {
-            int ret = allocateBatchedSlices(
-                keys, batched_slices, batched_object_info, str_length_map);
-            if (ret) {
+        auto query_results = client_->BatchQuery(keys);
+
+        // Extract successful replica lists
+        std::vector<std::vector<mooncake::Replica::Descriptor>> replica_lists;
+        replica_lists.reserve(keys.size());
+        for (size_t i = 0; i < query_results.size(); ++i) {
+            if (!query_results[i]) {
                 py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "Query failed for key '" << keys[i]
+                           << "': " << toString(query_results[i].error());
                 return {kNullString};
             }
-            error_code =
-                client_->BatchGet(keys, batched_object_info, batched_slices);
-            if (error_code != ErrorCode::OK) {
+            replica_lists.emplace_back(query_results[i].value());
+        }
+
+        int ret = allocateBatchedSlices(keys, batched_slices, replica_lists,
+                                        str_length_map);
+        if (ret) {
+            py::gil_scoped_acquire acquire_gil;
+            return {kNullString};
+        }
+
+        auto get_results =
+            client_->BatchGet(keys, replica_lists, batched_slices);
+        for (size_t i = 0; i < get_results.size(); ++i) {
+            if (!get_results[i]) {
                 py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "BatchGet failed for key '" << keys[i]
+                           << "': " << toString(get_results[i].error());
                 return {kNullString};
             }
         }
@@ -629,8 +679,8 @@ int DistributedObjectStore::remove(const std::string &key) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ErrorCode error_code = client_->Remove(key);
-    if (error_code != ErrorCode::OK) return toInt(error_code);
+    auto remove_result = client_->Remove(key);
+    if (!remove_result) return toInt(remove_result.error());
     return 0;
 }
 
@@ -639,7 +689,12 @@ long DistributedObjectStore::removeAll() {
         LOG(ERROR) << "Client is not initialized";
         return -1;
     }
-    return client_->RemoveAll();
+    auto result = client_->RemoveAll();
+    if (!result) {
+        LOG(ERROR) << "RemoveAll failed: " << result.error();
+        return -1;
+    }
+    return result.value();
 }
 
 int DistributedObjectStore::isExist(const std::string &key) {
@@ -647,10 +702,13 @@ int DistributedObjectStore::isExist(const std::string &key) {
         LOG(ERROR) << "Client is not initialized";
         return -1;
     }
-    ErrorCode err = client_->IsExist(key);
-    if (err == ErrorCode::OK) return 1;                // Yes
-    if (err == ErrorCode::OBJECT_NOT_FOUND) return 0;  // No
-    return toInt(err);                                 // Error
+    auto exist_result = client_->IsExist(key);
+    if (!exist_result) {
+        if (exist_result.error() == ErrorCode::OBJECT_NOT_FOUND)
+            return 0;                        // No
+        return toInt(exist_result.error());  // Error
+    }
+    return exist_result.value() ? 1 : 0;  // Yes/No
 }
 
 std::vector<int> DistributedObjectStore::batchIsExist(
@@ -668,27 +726,21 @@ std::vector<int> DistributedObjectStore::batchIsExist(
         return results;  // Return empty vector
     }
 
-    std::vector<ErrorCode> exist_results;
-    ErrorCode batch_err = client_->BatchIsExist(keys, exist_results);
+    auto batch_exist_results = client_->BatchIsExist(keys);
 
     results.resize(keys.size());
 
-    if (batch_err != ErrorCode::OK) {
-        LOG(ERROR) << "BatchIsExist operation failed with error: "
-                   << toString(batch_err);
-        // Fill all results with error code
-        std::fill(results.begin(), results.end(), toInt(batch_err));
-        return results;
-    }
-
-    // Convert ErrorCode results to int results
+    // Convert tl::expected results to int results
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (exist_results[i] == ErrorCode::OK) {
-            results[i] = 1;  // Exists
-        } else if (exist_results[i] == ErrorCode::OBJECT_NOT_FOUND) {
-            results[i] = 0;  // Does not exist
+        if (!batch_exist_results[i]) {
+            if (batch_exist_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                results[i] = 0;  // Does not exist
+            } else {
+                results[i] = toInt(batch_exist_results[i].error());  // Error
+            }
         } else {
-            results[i] = toInt(exist_results[i]);  // Error
+            results[i] =
+                batch_exist_results[i].value() ? 1 : 0;  // Exists/Not exists
         }
     }
 
@@ -701,22 +753,23 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
         return -1;
     }
 
-    mooncake::Client::ObjectInfo object_info;
-    ErrorCode error_code = client_->Query(key, object_info);
+    auto query_result = client_->Query(key);
 
-    if (error_code != ErrorCode::OK) {
-        return toInt(error_code);
+    if (!query_result) {
+        return toInt(query_result.error());
     }
+
+    auto replica_list = query_result.value();
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
-    if (!object_info.replica_list.empty()) {
-        auto &replica = object_info.replica_list[0];
+    if (!replica_list.empty()) {
+        auto &replica = replica_list[0];
         for (auto &handle : replica.buffer_descriptors) {
             total_size += handle.size_;
         }
     } else {
-        LOG(ERROR) << "Internal error: object_info.replica_list_size() is 0";
+        LOG(ERROR) << "Internal error: replica_list is empty";
         return -1;  // Internal error
     }
 
@@ -756,35 +809,35 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
         return nullptr;
     }
 
-    mooncake::Client::ObjectInfo object_info;
     SliceGuard guard(*this);  // Use SliceGuard for RAII
     uint64_t total_length = 0;
-    ErrorCode error_code;
     std::shared_ptr<SliceBuffer> result = nullptr;
 
     // Query the object info
-    error_code = client_->Query(key, object_info);
-    if (error_code == ErrorCode::OBJECT_NOT_FOUND) {
-        return nullptr;
-    }
-    if (error_code != ErrorCode::OK) {
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            return nullptr;
+        }
         LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(error_code);
+                   << " with error: " << toString(query_result.error());
         return nullptr;
     }
 
+    auto replica_list = query_result.value();
+
     // Allocate slices for the object using the guard
-    int ret = allocateSlices(guard.slices(), object_info, total_length);
+    int ret = allocateSlices(guard.slices(), replica_list, total_length);
     if (ret) {
         LOG(ERROR) << "Failed to allocate slices for key: " << key;
         return nullptr;
     }
 
     // Get the object data
-    error_code = client_->Get(key, object_info, guard.slices());
-    if (error_code != ErrorCode::OK) {
+    auto get_result = client_->Get(key, replica_list, guard.slices());
+    if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(error_code);
+                   << " with error: " << toString(get_result.error());
         return nullptr;
     }
 
@@ -808,12 +861,12 @@ int DistributedObjectStore::register_buffer(void *buffer, size_t size) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    ErrorCode error_code =
+    auto register_result =
         client_->RegisterLocalMemory(buffer, size, kWildcardLocation);
-    if (error_code != ErrorCode::OK) {
+    if (!register_result) {
         LOG(ERROR) << "Register buffer failed with error: "
-                   << toString(error_code);
-        return toInt(error_code);
+                   << toString(register_result.error());
+        return toInt(register_result.error());
     }
     return 0;
 }
@@ -827,29 +880,28 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
         return -1;
     }
 
-    mooncake::Client::ObjectInfo object_info;
-    ErrorCode error_code;
-
     // Step 1: Get object info
-    error_code = client_->Query(key, object_info);
-    if (error_code == ErrorCode::OBJECT_NOT_FOUND) {
-        VLOG(1) << "Object not found for key: " << key;
-        return -toInt(error_code);
-    }
-    if (error_code != ErrorCode::OK) {
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            VLOG(1) << "Object not found for key: " << key;
+            return -toInt(query_result.error());
+        }
         LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(error_code);
-        return -toInt(error_code);
+                   << " with error: " << toString(query_result.error());
+        return -toInt(query_result.error());
     }
 
-    // Calculate total size from object info
+    auto replica_list = query_result.value();
+
+    // Calculate total size from replica list
     uint64_t total_size = 0;
-    if (object_info.replica_list.empty()) {
-        LOG(ERROR) << "Internal error: object_info.replica_list is empty";
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
         return -1;
     }
 
-    auto &replica = object_info.replica_list[0];
+    auto &replica = replica_list[0];
     for (auto &handle : replica.buffer_descriptors) {
         total_size += handle.size_;
     }
@@ -873,11 +925,11 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     }
 
     // Step 3: Read data directly into user buffer
-    error_code = client_->Get(key, object_info, slices);
-    if (error_code != ErrorCode::OK) {
+    auto get_result = client_->Get(key, replica_list, slices);
+    if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(error_code);
-        return -toInt(error_code);
+                   << " with error: " << toString(get_result.error());
+        return -toInt(get_result.error());
     }
 
     return static_cast<int>(total_size);
@@ -912,11 +964,11 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     config.replica_num = 1;  // Make configurable
     config.preferred_segment = this->local_hostname;
 
-    ErrorCode error_code = client_->Put(key, slices, config);
-    if (error_code != ErrorCode::OK) {
+    auto put_result = client_->Put(key, slices, config);
+    if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
-                   << toString(error_code);
-        return -toInt(error_code);
+                   << toString(put_result.error());
+        return -toInt(put_result.error());
     }
 
     return 0;
@@ -1072,3 +1124,5 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"));
 }
+
+}  // namespace mooncake

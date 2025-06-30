@@ -16,9 +16,6 @@ namespace mooncake {
 constexpr int kDefaultMemcpyWorkers = 1;
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
-
     // Start worker threads
     workers_.reserve(kDefaultMemcpyWorkers);
     for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
@@ -40,8 +37,6 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
             worker.join();
         }
     }
-
-    VLOG(1) << "MemcpyWorkerPool destroyed";
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
@@ -59,8 +54,6 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
 }
 
 void MemcpyWorkerPool::workerThread() {
-    VLOG(2) << "MemcpyWorkerPool worker thread started";
-
     while (true) {
         MemcpyTask task({}, nullptr);
 
@@ -88,8 +81,6 @@ void MemcpyWorkerPool::workerThread() {
                     std::memcpy(op.dest, op.src, op.size);
                 }
 
-                VLOG(2) << "Memcpy task completed successfully with "
-                        << task.operations.size() << " operations";
                 task.state->set_completed(ErrorCode::OK);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
@@ -97,8 +88,6 @@ void MemcpyWorkerPool::workerThread() {
             }
         }
     }
-
-    VLOG(2) << "MemcpyWorkerPool worker thread exiting";
 }
 
 // ============================================================================
@@ -151,8 +140,6 @@ void TransferEngineOperationState::check_task_status() {
     }
 
     if (has_failure) {
-        VLOG(1) << "Setting batch " << batch_id_
-                << " result to TRANSFER_FAIL due to task failures";
         set_result_internal(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -175,10 +162,7 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
         return;  // Don't crash, just return early
     }
 
-    VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
-            << static_cast<int>(error_code);
     result_.emplace(error_code);
-
     cv_.notify_all();
 }
 
@@ -187,7 +171,6 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
     constexpr int64_t timeout_seconds = 60;
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
@@ -205,14 +188,9 @@ void TransferEngineOperationState::wait_for_completion() {
         std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
             break;
         }
         // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
     }
 }
 
@@ -272,9 +250,6 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             memcpy_enabled_ = true;
         }
     }
-
-    VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -286,15 +261,20 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
     TransferStrategy strategy = selectStrategy(handles, slices);
 
+    std::optional<TransferFuture> result;
     switch (strategy) {
         case TransferStrategy::LOCAL_MEMCPY:
-            return submitMemcpyOperation(handles, slices, op_code);
+            result = submitMemcpyOperation(handles, slices, op_code);
+            break;
         case TransferStrategy::TRANSFER_ENGINE:
-            return submitTransferEngineOperation(handles, slices, op_code);
+            result = submitTransferEngineOperation(handles, slices, op_code);
+            break;
         default:
             LOG(ERROR) << "Unknown transfer strategy: " << strategy;
             return std::nullopt;
     }
+
+    return result;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -331,9 +311,6 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
-
-    VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << handles.size() << " operations";
 
     return TransferFuture(state);
 }
@@ -399,8 +376,6 @@ TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<Slice>& slices) const {
     // Check if memcpy operations are enabled via environment variable
     if (!memcpy_enabled_) {
-        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
-                   "variable";
         return TransferStrategy::TRANSFER_ENGINE;
     }
 
