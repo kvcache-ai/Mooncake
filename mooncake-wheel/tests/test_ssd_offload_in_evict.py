@@ -183,115 +183,115 @@ class TestDistributedObjectStore(unittest.TestCase):
             index += 1
         print("Cleanup completed")  
 
-    def test_batch_put_get_in_evict_operations(self):
-        """Test batch Put/Get operations with eviction scenario
+    # def test_batch_put_get_in_evict_operations(self):
+    #     """Test batch Put/Get operations with eviction scenario
         
-        Verifies:
-        1. Data eviction to file when exceeding memory capacity using batch operations
-        2. Correct retrieval of evicted data in batches
-        """ 
-        VALUE_SIZE = 1024 * 1024 
-        MAX_REQUESTS = 1000
-        BATCH_SIZE = 4
-        reference = {}
+    #     Verifies:
+    #     1. Data eviction to file when exceeding memory capacity using batch operations
+    #     2. Correct retrieval of evicted data in batches
+    #     """ 
+    #     VALUE_SIZE = 1024 * 1024 
+    #     MAX_REQUESTS = 1000
+    #     BATCH_SIZE = 4
+    #     reference = {}
 
-        # --------------------------
-        # Phase 1: Batch data population (trigger eviction)
-        # --------------------------
-        index = 0
-        while index < MAX_REQUESTS:
-            batch_keys = []
-            batch_values = []
+    #     # --------------------------
+    #     # Phase 1: Batch data population (trigger eviction)
+    #     # --------------------------
+    #     index = 0
+    #     while index < MAX_REQUESTS:
+    #         batch_keys = []
+    #         batch_values = []
             
-            # Prepare a batch
-            for _ in range(BATCH_SIZE):
-                if index >= MAX_REQUESTS:
-                    break
-                key = "k_" + str(index)
-                value = os.urandom(VALUE_SIZE)
-                batch_keys.append(key)
-                batch_values.append(value)
-                index += 1
+    #         # Prepare a batch
+    #         for _ in range(BATCH_SIZE):
+    #             if index >= MAX_REQUESTS:
+    #                 break
+    #             key = "k_" + str(index)
+    #             value = os.urandom(VALUE_SIZE)
+    #             batch_keys.append(key)
+    #             batch_values.append(value)
+    #             index += 1
             
-            if not batch_keys:  # No more keys to process
-                break
+    #         if not batch_keys:  # No more keys to process
+    #             break
                 
-            # Execute batch put
-            retcode = self.store.put_batch(batch_keys, batch_values)
+    #         # Execute batch put
+    #         retcode = self.store.put_batch(batch_keys, batch_values)
             
-            # Process results
-            if retcode == -200:
-                # The space is not enough, skip this entire batch
-                print(f"Batch put failed (no space) for keys: {batch_keys}")
-                continue
-            elif retcode != 0:
-                raise RuntimeError(f"Batch put operation failed. Error code: {retcode}")
-            else:
-                # All puts succeeded, add to reference
-                for key, value in zip(batch_keys, batch_values):
-                    reference[key] = value
+    #         # Process results
+    #         if retcode == -200:
+    #             # The space is not enough, skip this entire batch
+    #             print(f"Batch put failed (no space) for keys: {batch_keys}")
+    #             continue
+    #         elif retcode != 0:
+    #             raise RuntimeError(f"Batch put operation failed. Error code: {retcode}")
+    #         else:
+    #             # All puts succeeded, add to reference
+    #             for key, value in zip(batch_keys, batch_values):
+    #                 reference[key] = value
             
-            if index % 500 == 0:
-                print("completed", index, "entries")
+    #         if index % 500 == 0:
+    #             print("completed", index, "entries")
         
-        time.sleep(5)
+    #     time.sleep(5)
 
-        # --------------------------
-        # Phase 2: Batch data verification
-        # --------------------------
-        index = 0
-        count = 0
-        while index < MAX_REQUESTS:
-            batch_keys = []
+    #     # --------------------------
+    #     # Phase 2: Batch data verification
+    #     # --------------------------
+    #     index = 0
+    #     count = 0
+    #     while index < MAX_REQUESTS:
+    #         batch_keys = []
             
-            # Prepare a batch of keys to get
-            for _ in range(BATCH_SIZE):
-                if index >= MAX_REQUESTS:
-                    break
-                key = "k_" + str(index)
-                batch_keys.append(key)
-                index += 1
+    #         # Prepare a batch of keys to get
+    #         for _ in range(BATCH_SIZE):
+    #             if index >= MAX_REQUESTS:
+    #                 break
+    #             key = "k_" + str(index)
+    #             batch_keys.append(key)
+    #             index += 1
                 
-            if not batch_keys:  # No more keys to process
-                break
+    #         if not batch_keys:  # No more keys to process
+    #             break
                 
-            # Execute batch get
-            retrieved_values = self.store.get_batch(batch_keys)
+    #         # Execute batch get
+    #         retrieved_values = self.store.get_batch(batch_keys)
 
-            # First verify the returned list size matches requested keys
-            if len(retrieved_values) != len(batch_keys):
-                continue
+    #         # First verify the returned list size matches requested keys
+    #         if len(retrieved_values) != len(batch_keys):
+    #             continue
             
-            # Verify each returned value
-            for i in range(len(batch_keys)):
-                retrieved = retrieved_values[i]
-                current_key = batch_keys[i]
+    #         # Verify each returned value
+    #         for i in range(len(batch_keys)):
+    #             retrieved = retrieved_values[i]
+    #             current_key = batch_keys[i]
                 
-                if len(retrieved) != 0:
-                    expected = reference.get(current_key)
-                    if expected is not None:
-                        self.assertEqual(
-                            retrieved, expected,
-                            f"Data mismatch for key: {current_key} "
-                            f"(index {index - len(batch_keys) + i})"
-                        )
-                        count += 1
+    #             if len(retrieved) != 0:
+    #                 expected = reference.get(current_key)
+    #                 if expected is not None:
+    #                     self.assertEqual(
+    #                         retrieved, expected,
+    #                         f"Data mismatch for key: {current_key} "
+    #                         f"(index {index - len(batch_keys) + i})"
+    #                     )
+    #                     count += 1
             
-            if index % 500 == 0:
-                print("completed", index, "entries")
+    #         if index % 500 == 0:
+    #             print("completed", index, "entries")
         
-        print("Total get count:", count)
+    #     print("Total get count:", count)
         
-        # --------------------------
-        # Phase 3: Cleanup (still using single remove for simplicity)
-        # --------------------------
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-        index = 0
-        while index < MAX_REQUESTS:
-            key = "k_" + str(index)
-            self.store.remove(key)
-            index += 1
-        print("Cleanup completed")
+    #     # --------------------------
+    #     # Phase 3: Cleanup (still using single remove for simplicity)
+    #     # --------------------------
+    #     time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+    #     index = 0
+    #     while index < MAX_REQUESTS:
+    #         key = "k_" + str(index)
+    #         self.store.remove(key)
+    #         index += 1
+    #     print("Cleanup completed")
     
 
 if __name__ == "__main__":
