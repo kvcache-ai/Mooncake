@@ -148,10 +148,8 @@ class MasterService {
      * @param[out] batch_replica_list Vector to store replicas information for
      * slices
      */
-    auto BatchGetReplicaList(const std::vector<std::string>& keys)
-        -> tl::expected<
-            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>;
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys);
 
     /**
      * @brief Mark a key for garbage collection after specified delay
@@ -195,31 +193,28 @@ class MasterService {
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
-    auto BatchPutStart(
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(
         const std::vector<std::string>& keys,
-        const std::unordered_map<std::string, uint64_t>& value_lengths,
-        const std::unordered_map<std::string, std::vector<uint64_t>>&
-            slice_lengths,
-        const ReplicateConfig& config)
-        -> tl::expected<
-            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>;
+        const std::vector<uint64_t>& value_lengths,
+        const std::vector<std::vector<uint64_t>>& slice_lengths,
+        const ReplicateConfig& config);
 
     /**
      * @brief Complete a batch of put operations
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto BatchPutEnd(const std::vector<std::string>& keys)
-        -> tl::expected<void, ErrorCode>;
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Revoke a batch of put operations
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto BatchPutRevoke(const std::vector<std::string>& keys)
-        -> tl::expected<void, ErrorCode>;
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Remove an object and its replicas

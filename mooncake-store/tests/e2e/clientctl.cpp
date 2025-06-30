@@ -132,13 +132,13 @@ class ClientCtl {
         config.replica_num = 1;
 
         // Perform put operation
-        ErrorCode error_code = it->second.client->Put(key, slices, config);
+        auto put_result = it->second.client->Put(key, slices, config);
 
         // Free the buffer
         free(buffer);
 
-        if (error_code != ErrorCode::OK) {
-            std::cout << "Failed to put value: " << toString(error_code)
+        if (!put_result.has_value()) {
+            std::cout << "Failed to put value: " << toString(put_result.error())
                       << std::endl;
             return;
         }
@@ -156,15 +156,18 @@ class ClientCtl {
             return;
         }
 
-        Client::ObjectInfo object_info;
-        if (it->second.client->Query(key, object_info) != ErrorCode::OK) {
-            std::cout << "Key not found: " << key << std::endl;
+        auto query_result = it->second.client->Query(key);
+        if (!query_result.has_value()) {
+            std::cout << "Failed to query key: "
+                      << toString(query_result.error()) << std::endl;
             return;
         }
 
+        auto object_info = query_result.value();
+
         // Create slices
         std::vector<AllocatedBuffer::Descriptor>& descriptors =
-            object_info.replica_list[0].buffer_descriptors;
+            object_info[0].buffer_descriptors;
         std::vector<Slice> slices(descriptors.size());
         for (size_t i = 0; i < descriptors.size(); i++) {
             void* buffer = malloc(descriptors[i].size_);
@@ -177,11 +180,10 @@ class ClientCtl {
         };
 
         // Perform get operation
-        ErrorCode error_code = it->second.client->Get(key, object_info, slices);
-
-        if (error_code != ErrorCode::OK) {
+        auto get_result = it->second.client->Get(key, slices);
+        if (!get_result.has_value()) {
             free_slices();
-            std::cout << "Failed to get value: " << toString(error_code)
+            std::cout << "Failed to get value: " << toString(get_result.error())
                       << std::endl;
             return;
         }
@@ -230,10 +232,10 @@ class ClientCtl {
             return;
         }
 
-        ErrorCode error_code = it->second.client->MountSegment(buffer, size);
-        if (error_code != ErrorCode::OK) {
-            std::cout << "Failed to mount segment: " << toString(error_code)
-                      << std::endl;
+        auto mount_result = it->second.client->MountSegment(buffer, size);
+        if (!mount_result.has_value()) {
+            std::cout << "Failed to mount segment: "
+                      << toString(mount_result.error()) << std::endl;
             free(buffer);
             return;
         }

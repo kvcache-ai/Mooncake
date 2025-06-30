@@ -385,6 +385,7 @@ enum class ClientStatus {
     NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
                     // need to remount
 };
+YLT_REFL(ClientStatus);
 
 /**
  * @brief Stream operator for ClientStatus
@@ -402,3 +403,10 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 }  // namespace mooncake
+
+namespace iguana {
+template <typename Stream>
+inline void to_json_impl(Stream& s, mooncake::ErrorCode code) {
+    s.write(std::to_string(static_cast<int32_t>(code)));
+}
+}  // namespace iguana

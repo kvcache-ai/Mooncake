@@ -5,9 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <unordered_set>
 
-#include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
@@ -43,10 +41,11 @@ Client::~Client() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto err_code =
+        auto result =
             UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
-        if (err_code != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to unmount segment: " << toString(err_code);
+        if (!result) {
+            LOG(ERROR) << "Failed to unmount segment: "
+                       << toString(result.error());
         }
     }
 
@@ -220,119 +219,168 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
-ErrorCode Client::Get(const std::string& object_key,
-                      std::vector<Slice>& slices) {
-    ObjectInfo object_info;
-    auto err = Query(object_key, object_info);
-    if (err != ErrorCode::OK) return err;
-    return Get(object_key, object_info, slices);
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                          std::vector<Slice>& slices) {
+    auto query_result = Query(object_key);
+    if (!query_result) {
+        return tl::unexpected(query_result.error());
+    }
+    return Get(object_key, query_result.value(), slices);
 }
 
-ErrorCode Client::BatchGet(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    std::unordered_set<std::string> seen;
-    for (const auto& key : object_keys) {
-        if (!seen.insert(key).second) {
-            LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
-                       << key;
-            return ErrorCode::INVALID_PARAMS;
-        };
+    auto batched_query_results = BatchQuery(object_keys);
+
+    // If any queries failed, return error results immediately for failed
+    // queries
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(object_keys.size());
+
+    std::vector<std::vector<Replica::Descriptor>> valid_replica_lists;
+    std::vector<size_t> valid_indices;
+    std::vector<std::string> valid_keys;
+
+    for (size_t i = 0; i < batched_query_results.size(); ++i) {
+        if (batched_query_results[i]) {
+            valid_replica_lists.push_back(batched_query_results[i].value());
+            valid_indices.push_back(i);
+            valid_keys.push_back(object_keys[i]);
+            results.emplace_back();  // placeholder for successful results
+        } else {
+            results.emplace_back(
+                tl::unexpected(batched_query_results[i].error()));
+        }
     }
-    BatchObjectInfo batched_object_info;
-    auto err = BatchQuery(object_keys, batched_object_info);
-    if (err == ErrorCode::OK) {
-        return BatchGet(object_keys, batched_object_info, slices);
+
+    // If we have any valid queries, process them
+    if (!valid_keys.empty()) {
+        std::unordered_map<std::string, std::vector<Slice>> valid_slices;
+        for (const auto& key : valid_keys) {
+            auto it = slices.find(key);
+            if (it != slices.end()) {
+                valid_slices[key] = it->second;
+            }
+        }
+
+        auto valid_results =
+            BatchGet(valid_keys, valid_replica_lists, valid_slices);
+
+        // Merge results back
+        for (size_t i = 0; i < valid_indices.size(); ++i) {
+            results[valid_indices[i]] = valid_results[i];
+        }
     }
-    return ErrorCode::OBJECT_NOT_FOUND;
+
+    return results;
 }
 
-ErrorCode Client::Query(const std::string& object_key,
-                        ObjectInfo& object_info) {
-    auto response = master_client_.GetReplicaList(object_key);
-    // copy vec
-    object_info.replica_list.resize(response.replica_list.size());
-    for (size_t i = 0; i < response.replica_list.size(); ++i) {
-        object_info.replica_list[i] = response.replica_list[i];
-    }
-    return response.error_code;
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
+    const std::string& object_key) {
+    return master_client_.GetReplicaList(object_key);
 }
 
-ErrorCode Client::BatchQuery(const std::vector<std::string>& object_keys,
-                             BatchObjectInfo& batched_object_info) {
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+Client::BatchQuery(const std::vector<std::string>& object_keys) {
     auto response = master_client_.BatchGetReplicaList(object_keys);
-    // copy vec
-    if (response.batch_replica_list.size() != object_keys.size()) {
+
+    if (!response) {
+        LOG(ERROR) << "QueryBatch failed: RPC error";
+        // Return vector of errors
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            error_results;
+        error_results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            error_results.emplace_back(tl::unexpected(response.error()));
+        }
+        return error_results;
+    }
+
+    if (response.value().size() != object_keys.size()) {
         LOG(ERROR) << "QueryBatch failed, response size is not equal to "
                       "request size";
-        LOG(ERROR) << "clear batched_object_info.batch_replica_list";
-        batched_object_info.batch_replica_list.clear();
-        return ErrorCode::INVALID_PARAMS;
-    }
-    for (const auto& key : object_keys) {
-        auto it = response.batch_replica_list.find(key);
-        if (it == response.batch_replica_list.end()) {
-            LOG(ERROR) << "QueryBatch failed, key: " << key
-                       << " not found in response";
-            batched_object_info.batch_replica_list.clear();
-            return ErrorCode::OBJECT_NOT_FOUND;
+        // Return vector of INVALID_PARAMS errors
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            error_results;
+        error_results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            error_results.emplace_back(
+                tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        batched_object_info.batch_replica_list.emplace(key, it->second);
+        return error_results;
     }
-    return response.error_code;
+
+    return response.value();
 }
 
-ErrorCode Client::Get(const std::string& object_key,
-                      const ObjectInfo& object_info,
-                      std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> Client::Get(
+    const std::string& object_key,
+    const std::vector<Replica::Descriptor>& replica_list,
+    std::vector<Slice>& slices) {
     // Find the first complete replica
     std::vector<AllocatedBuffer::Descriptor> handles;
-    ErrorCode err = FindFirstCompleteReplica(object_info.replica_list, handles);
+    ErrorCode err = FindFirstCompleteReplica(replica_list, handles);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
-        return err;
+        return tl::unexpected(err);
     }
 
-    if (TransferRead(handles, slices) != ErrorCode::OK) {
+    err = TransferRead(handles, slices);
+    if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(err);
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::BatchGet(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
-    BatchObjectInfo& batched_object_info,
+    const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
     CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
 
+    // Validate input size consistency
+    if (replica_lists.size() != object_keys.size()) {
+        LOG(ERROR) << "Replica lists size (" << replica_lists.size()
+                   << ") doesn't match object keys size (" << object_keys.size()
+                   << ")";
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+
     // Collect all transfer operations for parallel execution
-    std::vector<std::pair<std::string, TransferFuture>> pending_transfers;
-    pending_transfers.reserve(object_keys.size());
+    std::vector<std::tuple<size_t, std::string, TransferFuture>>
+        pending_transfers;
+    std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
 
     // Submit all transfers in parallel
-    for (const auto& key : object_keys) {
-        auto object_info_it = batched_object_info.batch_replica_list.find(key);
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        const auto& key = object_keys[i];
+        const auto& replica_list = replica_lists[i];
+
         auto slices_it = slices.find(key);
-        if (object_info_it == batched_object_info.batch_replica_list.end() ||
-            slices_it == slices.end()) {
-            LOG(ERROR) << "Key not found: " << key;
-            slices.clear();
-            return ErrorCode::INVALID_PARAMS;
+        if (slices_it == slices.end()) {
+            LOG(ERROR) << "Slices not found for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
         }
 
         // Find the first complete replica for this key
-        const auto& replica_list = object_info_it->second;
         std::vector<AllocatedBuffer::Descriptor> handles;
         ErrorCode err = FindFirstCompleteReplica(replica_list, handles);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
             }
-            slices.clear();
-            return err;
+            results[i] = tl::unexpected(err);
+            continue;
         }
 
         // Submit transfer operation asynchronously
@@ -341,35 +389,36 @@ ErrorCode Client::BatchGet(
         if (!future) {
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
-            slices.clear();
-            return ErrorCode::TRANSFER_FAIL;
+            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
         }
 
         VLOG(1) << "Submitted transfer for key " << key
                 << " using strategy: " << static_cast<int>(future->strategy());
 
-        pending_transfers.emplace_back(key, std::move(*future));
+        pending_transfers.emplace_back(i, key, std::move(*future));
     }
 
     // Wait for all transfers to complete
-    for (auto& [key, future] : pending_transfers) {
+    for (auto& [index, key, future] : pending_transfers) {
         ErrorCode result = future.get();
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
-            slices.clear();
-            return result;
+            results[index] = tl::unexpected(result);
+        } else {
+            VLOG(1) << "Transfer completed successfully for key: " << key;
+            results[index] = {};
         }
-        VLOG(1) << "Transfer completed successfully for key: " << key;
     }
 
-    VLOG(1) << "BatchGet completed successfully for " << object_keys.size()
-            << " keys";
-    return ErrorCode::OK;
+    VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    return results;
 }
 
-ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
-                      const ReplicateConfig& config) {
+tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
+                                          std::vector<Slice>& slices,
+                                          const ReplicateConfig& config) {
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
     size_t slice_size = 0;
@@ -379,20 +428,20 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
     }
 
     // Start put operation
-    PutStartResponse start_response =
+    auto start_result =
         master_client_.PutStart(key, slice_lengths, slice_size, config);
-    ErrorCode err = start_response.error_code;
-    if (err != ErrorCode::OK) {
+    if (!start_result) {
+        ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return ErrorCode::OK;
+            return {};
         }
         LOG(ERROR) << "Failed to start put operation: " << err;
-        return err;
+        return tl::unexpected(err);
     }
 
     // Transfer data using allocated handles from all replicas
-    for (const auto& replica : start_response.replica_list) {
+    for (const auto& replica : start_result.value()) {
         std::vector<AllocatedBuffer::Descriptor> handles;
         for (const auto& handle : replica.buffer_descriptors) {
             CHECK(handle.buffer_address_ != 0) << "buffer_address_ is nullptr";
@@ -402,57 +451,98 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         ErrorCode transfer_err = TransferWrite(handles, slices);
         if (transfer_err != ErrorCode::OK) {
             // Revoke put operation
-            auto revoke_err = master_client_.PutRevoke(key);
-            if (revoke_err.error_code != ErrorCode::OK) {
+            auto revoke_result = master_client_.PutRevoke(key);
+            if (!revoke_result) {
                 LOG(ERROR) << "Failed to revoke put operation";
-                return revoke_err.error_code;
+                return tl::unexpected(revoke_result.error());
             }
-            return transfer_err;
+            return tl::unexpected(transfer_err);
         }
     }
 
     // End put operation
-    err = master_client_.PutEnd(key).error_code;
-    if (err != ErrorCode::OK) {
+    auto end_result = master_client_.PutEnd(key);
+    if (!end_result) {
+        ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end put operation: " << err;
-        return err;
+        return tl::unexpected(err);
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::BatchPut(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    ReplicateConfig& config) {
+    std::vector<std::vector<Slice>>& batched_slices, ReplicateConfig& config) {
     CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
 
-    std::unordered_map<std::string, std::vector<size_t>> batched_slice_lengths;
-    std::unordered_map<std::string, size_t> batched_value_lengths;
-    for (const auto& key : keys) {
-        auto slices = batched_slices.find(key);
-        if (slices == batched_slices.end()) {
-            LOG(ERROR) << "Cannot find slices for key: " << key;
-            return ErrorCode::INVALID_PARAMS;
-        }
-        size_t slice_size = 0;
-        std::vector<size_t> slice_lengths;
-        for (const auto& slice : slices->second) {
+    std::vector<tl::expected<void, ErrorCode>> results =
+        std::vector<tl::expected<void, ErrorCode>>(keys.size());
+
+    if (keys.size() != batched_slices.size()) {
+        LOG(ERROR) << "Keys size (" << keys.size()
+                   << ") doesn't match batched slices size ("
+                   << batched_slices.size() << ")";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<std::vector<uint64_t>> batched_slice_lengths;
+    std::vector<uint64_t> batched_value_lengths;
+    batched_slice_lengths.reserve(keys.size());
+    batched_value_lengths.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& slices = batched_slices[i];
+        uint64_t slice_size = 0;
+        std::vector<uint64_t> slice_lengths;
+        slice_lengths.reserve(slices.size());
+        for (const auto& slice : slices) {
             slice_lengths.push_back(slice.size);
             slice_size += slice.size;
         }
-        batched_slice_lengths.emplace(key, std::move(slice_lengths));
-        batched_value_lengths.emplace(key, slice_size);
+        batched_slice_lengths.push_back(std::move(slice_lengths));
+        batched_value_lengths.push_back(slice_size);
     }
-    BatchPutStartResponse start_response = master_client_.BatchPutStart(
+
+    auto start_responses = master_client_.BatchPutStart(
         keys, batched_value_lengths, batched_slice_lengths, config);
-    ErrorCode err = start_response.error_code;
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            LOG(INFO) << "object_already_exists key count " << keys.size();
-            return ErrorCode::OK;
+    if (start_responses.size() != keys.size()) {
+        LOG(ERROR) << "BatchPutStart response size mismatch. Expected: "
+                   << keys.size() << ", Got: " << start_responses.size();
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    // Check for errors in individual start responses and collect successful
+    // replica lists
+    std::vector<std::vector<Replica::Descriptor>> replica_lists;
+    replica_lists.reserve(keys.size());
+    bool has_object_exists = false;
+
+    for (size_t i = 0; i < start_responses.size(); ++i) {
+        if (!start_responses[i]) {
+            ErrorCode err = start_responses[i].error();
+            if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                has_object_exists = true;
+                results[i] =
+                    tl::expected<void,
+                                 ErrorCode>{};  // Success for existing object
+                replica_lists
+                    .emplace_back();  // Empty replica list for existing object
+            } else {
+                LOG(ERROR) << "Failed to start put operation for key "
+                           << keys[i] << ": " << err;
+                results[i] = tl::unexpected(err);
+                replica_lists
+                    .emplace_back();  // Empty replica list for failed operation
+            }
+        } else {
+            replica_lists.push_back(start_responses[i].value());
         }
-        LOG(ERROR) << "Failed to start batch put operation: " << err;
-        return err;
+    }
+
+    if (has_object_exists) {
+        LOG(INFO) << "Some objects already exist in batch put operation";
     }
 
     // Collect all transfer operations for parallel execution
@@ -460,21 +550,25 @@ ErrorCode Client::BatchPut(
         pending_transfers;
 
     // Submit all transfers in parallel
-    for (const auto& key : keys) {
-        const auto& slices_it = batched_slices.find(key);
-        if (slices_it == batched_slices.end()) {
-            LOG(ERROR) << "Cannot find slices for key: " << key;
-            return ErrorCode::INVALID_PARAMS;
-        }
-        const auto& replica_list = start_response.batch_replica_list.find(key);
-        if (replica_list == start_response.batch_replica_list.end()) {
-            LOG(ERROR) << "Cannot find replica_list for key: " << key;
-            return ErrorCode::INVALID_PARAMS;
+    for (size_t key_idx = 0; key_idx < keys.size(); ++key_idx) {
+        const auto& key = keys[key_idx];
+
+        // Skip if this key had an error during start operation
+        if (!results[key_idx]) {
+            continue;
         }
 
-        for (size_t replica_idx = 0; replica_idx < replica_list->second.size();
+        // Skip if this key already exists (empty replica list)
+        const auto& replica_list = replica_lists[key_idx];
+        if (replica_list.empty()) {
+            continue;
+        }
+
+        auto& slices = batched_slices[key_idx];
+
+        for (size_t replica_idx = 0; replica_idx < replica_list.size();
              ++replica_idx) {
-            const auto& replica = replica_list->second[replica_idx];
+            const auto& replica = replica_list[replica_idx];
             std::vector<AllocatedBuffer::Descriptor> handles;
             for (const auto& handle : replica.buffer_descriptors) {
                 CHECK(handle.buffer_address_ != 0)
@@ -483,18 +577,27 @@ ErrorCode Client::BatchPut(
             }
 
             // Submit transfer operation asynchronously
-            auto future = transfer_submitter_->submit(
-                handles, slices_it->second, TransferRequest::WRITE);
+            auto future = transfer_submitter_->submit(handles, slices,
+                                                      TransferRequest::WRITE);
             if (!future) {
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << key << " replica: " << replica_idx;
                 // Revoke put operation
-                auto revoke_err = master_client_.BatchPutRevoke(keys);
-                if (revoke_err.error_code != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    return revoke_err.error_code;
+                auto revoke_results = master_client_.BatchPutRevoke(keys);
+                for (size_t i = 0; i < revoke_results.size(); ++i) {
+                    if (!revoke_results[i]) {
+                        LOG(ERROR)
+                            << "Failed to revoke put operation for key "
+                            << keys[i] << ": " << revoke_results[i].error();
+                    }
                 }
-                return ErrorCode::TRANSFER_FAIL;
+                // Mark all remaining operations as failed
+                for (size_t i = 0; i < results.size(); ++i) {
+                    if (results[i]) {  // Only update successful ones
+                        results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    }
+                }
+                return results;
             }
 
             VLOG(1) << "Submitted transfer for key " << key << " replica "
@@ -514,42 +617,65 @@ ErrorCode Client::BatchPut(
                        << " replica: " << replica_idx
                        << " with error: " << result;
             // Revoke put operation
-            auto revoke_err = master_client_.BatchPutRevoke(keys);
-            if (revoke_err.error_code != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to revoke put operation";
-                return revoke_err.error_code;
+            auto revoke_results = master_client_.BatchPutRevoke(keys);
+            for (size_t i = 0; i < revoke_results.size(); ++i) {
+                if (!revoke_results[i]) {
+                    LOG(ERROR) << "Failed to revoke put operation for key "
+                               << keys[i] << ": " << revoke_results[i].error();
+                }
             }
-            return result;
+            // Mark all remaining operations as failed
+            for (size_t i = 0; i < results.size(); ++i) {
+                if (results[i]) {  // Only update successful ones
+                    results[i] = tl::unexpected(result);
+                }
+            }
+            return results;
         }
         VLOG(1) << "Transfer completed successfully for key: " << key
                 << " replica: " << replica_idx;
     }
 
     // End put operation
-    err = master_client_.BatchPutEnd(keys).error_code;
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to end put operation: " << err;
-        return err;
+    auto end_results = master_client_.BatchPutEnd(keys);
+
+    // Check individual end operation results
+    for (size_t i = 0; i < end_results.size(); ++i) {
+        if (!end_results[i]) {
+            LOG(ERROR) << "Failed to end put operation for key " << keys[i]
+                       << ": " << end_results[i].error();
+            results[i] = tl::unexpected(end_results[i].error());
+        } else if (results[i]) {
+            // Mark as successful only if not already failed
+            results[i] = tl::expected<void, ErrorCode>{};
+        }
     }
 
     VLOG(1) << "BatchPut completed successfully for " << keys.size()
             << " keys with " << pending_transfers.size() << " total transfers";
-    return ErrorCode::OK;
+    return results;
 }
 
-ErrorCode Client::Remove(const ObjectKey& key) {
-    return master_client_.Remove(key).error_code;
+tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
+    auto result = master_client_.Remove(key);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
 }
 
-long Client::RemoveAll() { return master_client_.RemoveAll().removed_count; }
+tl::expected<long, ErrorCode> Client::RemoveAll() {
+    return master_client_.RemoveAll();
+}
 
-ErrorCode Client::MountSegment(const void* buffer, size_t size) {
+tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
+                                                   size_t size) {
     if (buffer == nullptr || size == 0 ||
         reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
         size % facebook::cachelib::Slab::kSize) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
                    << " is not aligned to " << facebook::cachelib::Slab::kSize;
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -565,7 +691,7 @@ ErrorCode Client::MountSegment(const void* buffer, size_t size) {
             LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
                        << " size1=" << mtseg.size << " base2=" << buffer
                        << " size2=" << size;
-            return ErrorCode::INVALID_PARAMS;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 
@@ -574,24 +700,26 @@ ErrorCode Client::MountSegment(const void* buffer, size_t size) {
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
                    << " size=" << size << ", error=" << rc;
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     Segment segment(generate_uuid(), local_hostname_,
                     reinterpret_cast<uintptr_t>(buffer), size);
 
-    ErrorCode err = master_client_.MountSegment(segment, client_id_).error_code;
-    if (err != ErrorCode::OK) {
+    auto mount_result = master_client_.MountSegment(segment, client_id_);
+    if (!mount_result) {
+        ErrorCode err = mount_result.error();
         LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                    << " size=" << size << ", error=" << err;
-        return err;
+        return tl::unexpected(err);
     }
 
     mounted_segments_[segment.id] = segment;
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::UnmountSegment(const void* buffer, size_t size) {
+tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
+                                                     size_t size) {
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
@@ -605,16 +733,16 @@ ErrorCode Client::UnmountSegment(const void* buffer, size_t size) {
     }
     if (segment == mounted_segments_.end()) {
         LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    ErrorCode err =
-        master_client_.UnmountSegment(segment->second.id, client_id_)
-            .error_code;
-    if (err != ErrorCode::OK) {
+    auto unmount_result =
+        master_client_.UnmountSegment(segment->second.id, client_id_);
+    if (!unmount_result) {
+        ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
                    << toString(err);
-        return err;
+        return tl::unexpected(err);
     }
 
     int rc = transfer_engine_.unregisterLocalMemory(
@@ -624,59 +752,62 @@ ErrorCode Client::UnmountSegment(const void* buffer, size_t size) {
                       "engine ret is "
                    << rc;
         if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return ErrorCode::INTERNAL_ERROR;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         // Otherwise, the segment is already unregistered from transfer engine,
         // we can continue
     }
 
     mounted_segments_.erase(segment);
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::RegisterLocalMemory(void* addr, size_t length,
-                                      const std::string& location,
-                                      bool remote_accessible,
-                                      bool update_metadata) {
+tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
+    void* addr, size_t length, const std::string& location,
+    bool remote_accessible, bool update_metadata) {
     if (this->transfer_engine_.registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::unregisterLocalMemory(void* addr, bool update_metadata) {
+tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
+    void* addr, bool update_metadata) {
     if (this->transfer_engine_.unregisterLocalMemory(addr, update_metadata) !=
         0) {
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode Client::IsExist(const std::string& key) {
-    auto response = master_client_.ExistKey(key);
-    return response.error_code;
+tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
+    auto result = master_client_.ExistKey(key);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return result.value();
 }
 
-ErrorCode Client::BatchIsExist(const std::vector<std::string>& keys,
-                               std::vector<ErrorCode>& exist_results) {
-    exist_results.resize(keys.size());
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
+    const std::vector<std::string>& keys) {
     auto response = master_client_.BatchExistKey(keys);
 
     // Check if we got the expected number of responses
-    if (response.exist_responses.size() != keys.size()) {
+    if (response.size() != keys.size()) {
         LOG(ERROR) << "BatchExistKey response size mismatch. Expected: "
-                   << keys.size()
-                   << ", Got: " << response.exist_responses.size();
-        // Fill with RPC_FAIL error codes
-        std::fill(exist_results.begin(), exist_results.end(),
-                  ErrorCode::RPC_FAIL);
-        return ErrorCode::RPC_FAIL;
+                   << keys.size() << ", Got: " << response.size();
+        // Return vector of RPC_FAIL errors
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
     }
 
-    exist_results = response.exist_responses;
-
-    return ErrorCode::OK;
+    // Return the response directly as it's already in the correct format
+    return response;
 }
 
 ErrorCode Client::TransferData(
@@ -739,9 +870,10 @@ void Client::PingThreadFunc() {
             auto& segment = it.second;
             segments.push_back(segment);
         }
-        ErrorCode err =
-            master_client_.ReMountSegment(segments, client_id_).error_code;
-        if (err != ErrorCode::OK) {
+        auto remount_result =
+            master_client_.ReMountSegment(segments, client_id_);
+        if (!remount_result) {
+            ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
         }
     };
@@ -758,10 +890,11 @@ void Client::PingThreadFunc() {
 
         // Ping master
         auto ping_result = master_client_.Ping(client_id_);
-        if (ping_result.error_code == ErrorCode::OK) {
+        if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
-            if (ping_result.client_status == ClientStatus::NEED_REMOUNT &&
+            auto [view_version, client_status] = ping_result.value();
+            if (client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
