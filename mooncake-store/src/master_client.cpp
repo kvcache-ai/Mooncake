@@ -107,9 +107,7 @@ MasterClient::GetReplicaList(const std::string& object_key) {
     return result;
 }
 
-tl::expected<
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>,
-    ErrorCode>
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size());
@@ -118,20 +116,26 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
         client_.send_request<&WrappedMasterService::BatchGetReplicaList>(
             object_keys);
     auto result = coro::syncAwait(
-        [&]() -> coro::Lazy<tl::expected<
-                  std::vector<tl::expected<std::vector<Replica::Descriptor>,
-                                           ErrorCode>>,
-                  ErrorCode>> {
+        [&]() -> coro::Lazy<std::vector<
+                  tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to get batch replica list: "
                            << result.error().msg;
-                co_return tl::unexpected(ErrorCode::RPC_FAIL);
+                std::vector<
+                    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+                    error_results;
+                error_results.reserve(object_keys.size());
+                for (size_t i = 0; i < object_keys.size(); ++i) {
+                    error_results.emplace_back(
+                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                co_return error_results;
             }
             co_return result->result();
         }());
 
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 

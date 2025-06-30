@@ -194,11 +194,10 @@ class MasterService {
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(
-        const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& value_lengths,
-        const std::vector<std::vector<uint64_t>>& slice_lengths,
-        const ReplicateConfig& config);
+    BatchPutStart(const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& value_lengths,
+                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Complete a batch of put operations

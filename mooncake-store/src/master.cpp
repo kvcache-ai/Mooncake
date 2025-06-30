@@ -61,7 +61,7 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "used in HA mode");
 
 int main(int argc, char* argv[]) {
-    // easylog::set_min_severity(easylog::Severity::WARN);
+    easylog::set_min_severity(easylog::Severity::INFO);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 

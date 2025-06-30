@@ -64,9 +64,8 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] tl::expected<
-        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>,
-        ErrorCode>
+    [[nodiscard]]
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**

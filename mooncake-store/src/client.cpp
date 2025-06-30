@@ -294,35 +294,7 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::BatchQuery(const std::vector<std::string>& object_keys) {
-    auto response = master_client_.BatchGetReplicaList(object_keys);
-
-    if (!response) {
-        LOG(ERROR) << "QueryBatch failed: RPC error";
-        // Return vector of errors
-        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-            error_results;
-        error_results.reserve(object_keys.size());
-        for (size_t i = 0; i < object_keys.size(); ++i) {
-            error_results.emplace_back(tl::unexpected(response.error()));
-        }
-        return error_results;
-    }
-
-    if (response.value().size() != object_keys.size()) {
-        LOG(ERROR) << "QueryBatch failed, response size is not equal to "
-                      "request size";
-        // Return vector of INVALID_PARAMS errors
-        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-            error_results;
-        error_results.reserve(object_keys.size());
-        for (size_t i = 0; i < object_keys.size(); ++i) {
-            error_results.emplace_back(
-                tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return error_results;
-    }
-
-    return response.value();
+    return master_client_.BatchGetReplicaList(object_keys);
 }
 
 tl::expected<void, ErrorCode> Client::Get(

@@ -95,12 +95,12 @@ class ClientIntegrationTest : public ::testing::Test {
 
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
-        auto resigeter_result = test_client_->RegisterLocalMemory(
+        auto register_result = test_client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), 128 * 1024 * 1024, "cpu:0",
             false, false);
-        if (!resigeter_result.has_value()) {
+        if (!register_result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
-                       << toString(resigeter_result.error());
+                       << toString(register_result.error());
         }
 
         // Mount segment for test_client_ as well
