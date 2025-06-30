@@ -127,6 +127,21 @@ class DistributedObjectStore {
     int get_into(const std::string &key, void *buffer, size_t size);
 
     /**
+     * @brief Get object data directly into pre-allocated buffers for multiple
+     * keys (batch version)
+     * @param keys Vector of keys of the objects to get
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @return Vector of integers, where each element is the number of bytes
+     * read on success, or a negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_get_into(const std::vector<std::string> &keys,
+                                    const std::vector<void *> &buffers,
+                                    const std::vector<size_t> &sizes);
+
+    /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
      * @param buffer Pointer to the buffer containing data (must be registered
@@ -137,6 +152,21 @@ class DistributedObjectStore {
      * register_buffer() for zero-copy operations
      */
     int put_from(const std::string &key, void *buffer, size_t size);
+
+    /**
+     * @brief Put object data directly from pre-allocated buffers for multiple
+     * keys (batch version)
+     * @param keys Vector of keys of the objects to put
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_put_from(const std::vector<std::string> &keys,
+                                    const std::vector<void *> &buffers,
+                                    const std::vector<size_t> &sizes);
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
