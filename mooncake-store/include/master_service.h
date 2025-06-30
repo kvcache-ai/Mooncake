@@ -10,14 +10,18 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <optional>
 
 #include "allocation_strategy.h"
+#include "eviction_strategy.h"
 #include "allocator.h"
 #include "types.h"
+
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
+class EvictionStrategy;
 
 // Structure to store garbage collection tasks
 struct GCTask {
@@ -86,7 +90,10 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true);
+    MasterService(bool enable_gc = true,
+                  uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
+                  double eviction_ratio = DEFAULT_EVICTION_RATIO,
+                  double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
     ~MasterService();
 
     /**
@@ -111,6 +118,26 @@ class MasterService {
     ErrorCode ExistKey(const std::string& key);
 
     /**
+     * @brief Fetch all keys
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllKeys(std::vector<std::string> & all_keys);
+
+    /**
+     * @brief Fetch all segments, each node has a unique real client with fixed segment
+     * name : segment name, preferred format : {ip}:{port}, bad format : localhost:{port}
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode GetAllSegments(std::vector<std::string> & all_segments);
+
+    /**
+     * @brief Query a segment's capacity and used size in bytes.
+     * Conductor should use these information to schedule new requests. 
+     * @return ErrorCode::OK if exists
+     */
+    ErrorCode QuerySegments(const std::string & segment, size_t & used, size_t & capacity);
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
@@ -118,6 +145,16 @@ class MasterService {
      */
     ErrorCode GetReplicaList(const std::string& key,
                              std::vector<Replica::Descriptor>& replica_list);
+
+    /**
+     * @brief Get list of replicas for a batch of objects
+     * @param[out] batch_replica_list Vector to store replicas information for
+     * slices
+     */
+    ErrorCode BatchGetReplicaList(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
 
     /**
      * @brief Mark a key for garbage collection after specified delay
@@ -154,11 +191,42 @@ class MasterService {
     ErrorCode PutRevoke(const std::string& key);
 
     /**
+     * @brief Start a batch of put operations for N objects
+     * @param[out] replica_list Vector to store replica information for slices
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
+     *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
+     *         ErrorCode::INVALID_PARAMS if slice size is invalid
+     */
+    ErrorCode BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+            batch_replica_list);
+
+    /**
+     * @brief Complete a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutEnd(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Revoke a batch of put operations
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if replica status is invalid
+     */
+    ErrorCode BatchPutRevoke(const std::vector<std::string>& keys);
+
+    /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
     ErrorCode Remove(const std::string& key);
+
     /**
      * @brief Remove all objects and their replicas
      * @return return the number of objects removed
@@ -166,19 +234,60 @@ class MasterService {
     long RemoveAll();
 
 
+    /**
+     * @brief Get the count of keys
+     * @return The count of keys
+     */
+    size_t GetKeyCount() const;
+
    private:
     // GC thread function
     void GCThreadFunc();
+
+    // Check all shards and try to evict some keys
+    void BatchEvict(double eviction_ratio);
 
     // Internal data structures
     struct ObjectMetadata {
         std::vector<Replica> replicas;
         size_t size;
+        // Default constructor, creates a time_point representing
+        // the Clock's epoch (i.e., time_since_epoch() is zero).
+        std::chrono::steady_clock::time_point lease_timeout;
+
+        // Check if there is some replica with a different status than the given value.
+        // If there is, return the status of the first replica that is not equal to
+        // the given value. Otherwise, return false.
+        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
+            for (const auto& replica : replicas) {
+                if (replica.status() != status) {
+                    return replica.status();
+                }
+            }
+            return {};
+        }
+
+        // Grant a lease with timeout as now() + ttl, only update if the new timeout is larger
+        void GrantLease(const uint64_t ttl) {
+            lease_timeout = std::max(lease_timeout,
+                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl));
+        }
+
+        // Check if the lease has expired
+        bool IsLeaseExpired() const {
+            return std::chrono::steady_clock::now() >= lease_timeout;
+        }
+
+        // Check if the lease has expired
+        bool IsLeaseExpired(std::chrono::steady_clock::time_point &now) const {
+            return now >= lease_timeout;
+        }
     };
 
     // Buffer allocator management
     std::shared_ptr<BufferAllocatorManager> buffer_allocator_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
@@ -204,7 +313,15 @@ class MasterService {
     std::atomic<bool> gc_running_{false};
     bool enable_gc_{true};  // Flag to enable/disable garbage collection
     static constexpr uint64_t kGCThreadSleepMs =
-        10;  // 10 ms sleep between GC checks
+        10;  // 10 ms sleep between GC and eviction checks
+
+    // Lease related members
+    const uint64_t default_kv_lease_ttl_; // in milliseconds
+
+    // Eviction related members
+    std::atomic<bool> need_eviction_{false}; // Set to trigger eviction when not enough space left
+    const double eviction_ratio_; // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_; // in range [0.0, 1.0]
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

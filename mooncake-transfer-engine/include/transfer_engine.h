@@ -154,6 +154,10 @@ class TransferEngine {
         filter_ = std::move(filters);
     }
 
+    int numContexts() const {
+        return (int)local_topology_->getHcaList().size();
+    }
+
    private:
     struct MemoryRegion {
         void *addr;

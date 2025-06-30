@@ -6,7 +6,7 @@ This document describes how to build Mooncake.
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.16.x
+- cmake: 3.20.x
 - gcc: 9.4+
 
 ### Steps

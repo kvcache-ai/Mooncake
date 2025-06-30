@@ -193,6 +193,11 @@ int RdmaContext::deconstruct() {
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    if (length > (size_t)globalConfig().max_mr_size) {
+        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
+                      << "shrink it to " << globalConfig().max_mr_size;
+        length = (size_t)globalConfig().max_mr_size;
+    }
     ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
     if (!mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;
@@ -253,12 +258,12 @@ uint32_t RdmaContext::lkey(void *addr) {
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
     if (!active_) {
-        LOG(ERROR) << "Endpoint is not active";
+        LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
     }
 
     if (peer_nic_path.empty()) {
-        LOG(ERROR) << "Invalid peer NIC path";
+        LOG(ERROR) << "Invalid peer NIC path: " << deviceName();
         return nullptr;
     }
 
@@ -345,8 +350,13 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
     int num_devices = 0;
     struct ibv_context *context = nullptr;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
-    if (!devices || num_devices <= 0) {
+    if (!devices) {
         LOG(ERROR) << "ibv_get_device_list failed";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+    if (devices && num_devices <= 0) {
+        LOG(ERROR) << "ibv_get_device_list failed";
+        ibv_free_device_list(devices);
         return ERR_DEVICE_NOT_FOUND;
     }
 

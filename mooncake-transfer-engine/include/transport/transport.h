@@ -58,6 +58,7 @@ class Transport {
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
+        int advise_retry_cnt = 0;
     };
 
     enum TransferStatusEnum {
@@ -110,7 +111,7 @@ class Transport {
                 uint64_t offset;
                 int cufile_desc;
                 uint64_t start;
-                const char * file_path;
+                const char *file_path;
             } nvmeof;
             struct {
                 void *remote_filename;
@@ -130,6 +131,8 @@ class Transport {
             status = Slice::FAILED;
             __sync_fetch_and_add(&task->failed_slice_count, 1);
         }
+
+        volatile uint64_t ts;
     };
 
     struct ThreadLocalSliceCache {
@@ -144,8 +147,8 @@ class Transport {
                 freed_++;
             }
             if (allocated_ != freed_) {
-                LOG(WARNING) << "detected slice leak: allocated "
-                             << allocated_ << " freed " << freed_;
+                LOG(WARNING) << "detected slice leak: allocated " << allocated_
+                             << " freed " << freed_;
             }
         }
 

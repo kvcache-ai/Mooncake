@@ -204,18 +204,27 @@ fi
 print_section "Installing Go $GOVER"
 
 install_go() {
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+        ARCH="arm64"
+    elif [ "$ARCH" = "x86_64" ]; then
+        ARCH="amd64"
+    else
+        echo "Unsupported architecture: $ARCH"
+        exit 1
+    fi
     # Download Go
     echo "Downloading Go $GOVER..."
-    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-amd64.tar.gz
+    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-$ARCH.tar.gz
     check_success "Failed to download Go $GOVER"
 
     # Install Go
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf go$GOVER.linux-amd64.tar.gz
+    tar -C /usr/local -xzf go$GOVER.linux-$ARCH.tar.gz
     check_success "Failed to install Go $GOVER"
 
     # Clean up downloaded file
-    rm -f go$GOVER.linux-amd64.tar.gz
+    rm -f go$GOVER.linux-$ARCH.tar.gz
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"
