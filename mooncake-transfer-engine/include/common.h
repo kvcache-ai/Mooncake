@@ -134,6 +134,46 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     return std::make_pair(trimmed_server_name, port);
 }
 
+static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
+    const std::string &server_name, int *device_id) {
+    uint16_t port = getDefaultHandshakePort();
+    auto pos = server_name.find(':');
+    if (pos == server_name.npos) {
+        return std::make_pair(server_name, port);
+    }
+    auto trimmed_server_name = server_name.substr(0, pos);
+    auto remaining = server_name.substr(pos + 1);
+    auto second_pods = remaining.find(':');
+    if (second_pods == remaining.npos) {
+        int val = std::atoi(remaining.c_str());
+        if (val <= 0 || val > 65535) {
+            LOG(WARNING) << "Illegal port number in " << server_name
+                         << ". Use default port " << port << " instead";
+        } else {
+            port = (uint16_t)val;
+        }
+        return std::make_pair(trimmed_server_name, port);
+    }
+    auto port_str = remaining.substr(0, second_pods);
+    auto npu_str = remaining.substr(second_pods + 1);
+
+    int val = std::atoi(port_str.c_str());
+    if (val <= 0 || val > 65535) {
+        LOG(WARNING) << "Illegal port number in " << server_name
+                     << ". Use default port " << port << " instead";
+    } else {
+        port = (uint16_t)val;
+    }
+
+    auto npu_ops = npu_str.find('_');
+    if (npu_ops != npu_str.npos && npu_ops != 0 && npu_ops != npu_str.size() - 1) {
+        auto npu_value_str = npu_str.substr(npu_ops + 1);
+        *device_id = std::atoi(npu_value_str.c_str());
+    }
+
+    return std::make_pair(trimmed_server_name, port);
+}
+
 static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     char *pos = (char *)buf;
     size_t nbytes = len;
