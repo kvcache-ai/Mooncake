@@ -511,7 +511,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     size_t file_length = disk_replica.file_size;
 
     // Submit memcpy operations to worker pool for async execution
-    FilereadTask task(file_path, file_length, std::move(slices), state);
+    FilereadTask task(file_path, file_length, slices, state);
     fileread_pool_->submitTask(std::move(task));
 
     VLOG(1) << "Fileread transfer submitted to worker pool with "

@@ -299,14 +299,14 @@ struct FilereadTask {
     std::vector<Slice> slices;
     std::shared_ptr<FilereadOperationState> state;
 
-    FilereadTask(std::string path,
-                size_t size,
-                std::vector<Slice>&& slices_ref,
-                std::shared_ptr<FilereadOperationState> s)
-        : file_path(std::move(path)),
-          file_size(size),
-          slices(std::move(slices_ref)),
-          state(std::move(s)) {}
+    FilereadTask(const std::string &path,
+            size_t size,
+            const std::vector<Slice>& slices_ref,
+            std::shared_ptr<FilereadOperationState> s)
+    : file_path(path),
+        file_size(size),
+        slices(slices_ref),
+        state(std::move(s)) {}
 };
 
 /**
