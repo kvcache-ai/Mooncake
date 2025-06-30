@@ -217,7 +217,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 break
                 
             # Execute batch put
-            retcodes = self.store.batchput(batch_keys, batch_values)
+            retcode = self.store.put_batch(batch_keys, batch_values)
             
             # Process results
             if retcode == -200:
@@ -256,7 +256,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 break
                 
             # Execute batch get
-            retrieved_values = self.store.batchget(batch_keys)
+            retrieved_values = self.store.get_batch(batch_keys)
 
             # First verify the returned list size matches requested keys
             if len(retrieved_values) != len(batch_keys):
