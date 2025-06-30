@@ -883,6 +883,158 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     return static_cast<int>(total_size);
 }
 
+std::vector<int> DistributedObjectStore::batch_put_from(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<int>(keys.size(), -1);
+    }
+
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<int>(keys.size(), -1);
+    }
+
+    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    ReplicateConfig config;
+    config.replica_num = 1;  // Make configurable
+    config.preferred_segment = this->local_hostname;
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &key = keys[i];
+        void *buffer = buffers[i];
+        size_t size = sizes[i];
+
+        if (size == 0) {
+            LOG(WARNING) << "Attempting to put empty data for key: " << key;
+            continue;
+        }
+
+        std::vector<mooncake::Slice> key_slices;
+        uint64_t offset = 0;
+        while (offset < size) {
+            auto chunk_size = std::min(size - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+        all_slices[key] = key_slices;
+    }
+
+    ErrorCode batch_put_err = client_->BatchPut(keys, all_slices, config);
+
+    std::vector<int> results(keys.size());
+    if (batch_put_err != ErrorCode::OK) {
+        LOG(ERROR) << "BatchPut failed with error: " << toString(batch_put_err);
+        std::fill(results.begin(), results.end(), toInt(batch_put_err));
+    } else {
+        std::fill(results.begin(), results.end(), 0);
+    }
+
+    return results;
+}
+
+std::vector<int> DistributedObjectStore::batch_get_into(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
+    auto start_time = std::chrono::steady_clock::now();
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<int>(keys.size(), -1);
+    }
+
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<int>(keys.size(), -1);
+    }
+
+    std::vector<int> results(keys.size());
+    mooncake::Client::BatchObjectInfo
+        object_infos;  // This is BatchGetReplicaListResponse
+
+    // Step 1: Batch query object info
+    ErrorCode batch_query_err = client_->BatchQuery(keys, object_infos);
+    if (batch_query_err != ErrorCode::OK) {
+        LOG(ERROR) << "BatchQuery failed with error: "
+                   << toString(batch_query_err);
+        std::fill(results.begin(), results.end(), toInt(batch_query_err));
+        return results;
+    }
+
+    // Step 2: Prepare slices for each key
+    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    std::vector<std::string> valid_keys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &key = keys[i];
+        auto it = object_infos.batch_replica_list.find(key);
+
+        if (it == object_infos.batch_replica_list.end()) {
+            results[i] = -toInt(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+
+        auto &replica_list = it->second;
+        if (replica_list.empty()) {
+            LOG(ERROR) << "Internal error: replica_list is empty for key: "
+                       << key;
+            results[i] = -1;
+            continue;
+        }
+
+        auto &replica = replica_list[0];
+        uint64_t total_size = 0;
+        for (auto &handle : replica.buffer_descriptors) {
+            total_size += handle.size_;
+        }
+
+        if (sizes[i] < total_size) {
+            LOG(ERROR) << "User buffer too small for key: " << key
+                       << ". Required: " << total_size
+                       << ", provided: " << sizes[i];
+            results[i] = -1;
+            continue;
+        }
+
+        uint64_t offset = 0;
+        std::vector<mooncake::Slice> key_slices;
+        for (auto &handle : replica.buffer_descriptors) {
+            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
+            offset += handle.size_;
+        }
+        all_slices[key] = key_slices;
+        results[i] = static_cast<int>(total_size);
+        valid_keys.push_back(key);
+    }
+
+    if (valid_keys.empty()) {
+        return results;
+    }
+
+    // Step 3: Batch get data
+    ErrorCode batch_get_err =
+        client_->BatchGet(valid_keys, object_infos, all_slices);
+    if (batch_get_err != ErrorCode::OK) {
+        LOG(ERROR) << "BatchGet failed with error: " << toString(batch_get_err);
+        for (const auto &key : valid_keys) {
+            auto it = std::find(keys.begin(), keys.end(), key);
+            if (it != keys.end()) {
+                size_t i = std::distance(keys.begin(), it);
+                results[i] = toInt(batch_get_err);
+            }
+        }
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time)
+                            .count();
+    LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time << "us";
+
+    return results;
+}
+
 int DistributedObjectStore::put_from(const std::string &key, void *buffer,
                                      size_t size) {
     // NOTE: The buffer address must be previously registered with
@@ -1007,6 +1159,23 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
         .def(
+            "batch_get_into",
+            [](DistributedObjectStore &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.batch_get_into(keys, buffers, sizes);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            "Get object data directly into pre-allocated buffers for multiple "
+            "keys")
+        .def(
             "put_from",
             [](DistributedObjectStore &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size) {
@@ -1017,6 +1186,23 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Put object data directly from a pre-allocated buffer")
+        .def(
+            "batch_put_from",
+            [](DistributedObjectStore &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.batch_put_from(keys, buffers, sizes);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            "Put object data directly from pre-allocated buffers for multiple "
+            "keys")
         .def("put",
              [](DistributedObjectStore &self, const std::string &key,
                 py::buffer buf) {
