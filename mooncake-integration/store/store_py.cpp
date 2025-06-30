@@ -377,15 +377,26 @@ int DistributedObjectStore::allocateBatchedSlices(
         // Get first replica
         auto &replica = object_info_it->second[0];
         uint64_t length = 0;
-        for (auto &handle : replica.buffer_descriptors) {
-            auto chunk_size = handle.size_;
-            assert(chunk_size <= kMaxSliceSize);
-            auto ptr = client_buffer_allocator_->allocate(chunk_size);
-            if (!ptr) {
+        
+        if(replica.is_memory_replica() == false) {
+            auto &disk_descriptor =replica.get_disk_descriptor();
+            length = disk_descriptor.file_size;
+            auto result = allocateSlices(batched_slices[key], length);
+            if(result) {
                 return 1;
             }
-            batched_slices[key].emplace_back(Slice{ptr, chunk_size});
-            length += chunk_size;
+        }else{
+            auto &memory_descriptors = replica.get_memory_descriptor();
+            for (auto &handle : memory_descriptors.buffer_descriptors) {
+                auto chunk_size = handle.size_;
+                assert(chunk_size <= kMaxSliceSize);
+                auto ptr = client_buffer_allocator_->allocate(chunk_size);
+                if (!ptr) {
+                    return 1;
+                }
+                batched_slices[key].emplace_back(Slice{ptr, chunk_size});
+                length += chunk_size;
+            }
         }
         str_length_map.emplace(key, length);
     }
