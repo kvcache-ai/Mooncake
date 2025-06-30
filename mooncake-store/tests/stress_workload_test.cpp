@@ -199,11 +199,9 @@ TEST_F(ClientIntegrationTest, StressPutOperations) {
                 auto entry = rand_gen.get_pair();
                 memcpy(write_buffer, entry.second.data(), entry.second.size());
                 slices[0].size = entry.second.size();
-                ASSERT_EQ(client_->Put(entry.first.data(), slices, config),
-                          ErrorCode::OK);
-                ASSERT_EQ(client_->Get(entry.first.data(), slices),
-                          ErrorCode::OK);
-                ASSERT_EQ(client_->Remove(entry.first.data()), ErrorCode::OK);
+                ASSERT_TRUE(client_->Put(entry.first.data(), slices, config));
+                ASSERT_TRUE(client_->Get(entry.first.data(), slices));
+                ASSERT_TRUE(client_->Remove(entry.first.data()));
             }
             pthread_barrier_wait(&barrier);
             client_buffer_allocator_->deallocate(write_buffer, value_length);

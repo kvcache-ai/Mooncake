@@ -176,9 +176,18 @@ MasterClient::BatchPutStart(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
 
+    auto send_start = std::chrono::high_resolution_clock::now();
     auto request_result =
         client_.send_request<&WrappedMasterService::BatchPutStart>(
             keys, value_lengths, slice_lengths, config);
+    auto send_end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "BatchPutStart send_request took "
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     send_end - send_start)
+                     .count()
+              << "us";
+
+    auto await_start = std::chrono::high_resolution_clock::now();
     auto result = coro::syncAwait(
         [&]() -> coro::Lazy<std::vector<
                   tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> {
@@ -195,6 +204,13 @@ MasterClient::BatchPutStart(
             }
             co_return result->result();
         }());
+    auto await_end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "BatchPutStart syncAwait took "
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     await_end - await_start)
+                     .count()
+              << "us";
+
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

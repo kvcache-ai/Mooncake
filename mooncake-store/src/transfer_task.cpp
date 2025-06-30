@@ -280,26 +280,55 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 std::optional<TransferFuture> TransferSubmitter::submit(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    auto submit_start = std::chrono::high_resolution_clock::now();
+
     if (!validateTransferParams(handles, slices)) {
         return std::nullopt;
     }
 
+    auto validate_end = std::chrono::high_resolution_clock::now();
+
     TransferStrategy strategy = selectStrategy(handles, slices);
 
+    auto strategy_end = std::chrono::high_resolution_clock::now();
+
+    std::optional<TransferFuture> result;
     switch (strategy) {
         case TransferStrategy::LOCAL_MEMCPY:
-            return submitMemcpyOperation(handles, slices, op_code);
+            result = submitMemcpyOperation(handles, slices, op_code);
+            break;
         case TransferStrategy::TRANSFER_ENGINE:
-            return submitTransferEngineOperation(handles, slices, op_code);
+            result = submitTransferEngineOperation(handles, slices, op_code);
+            break;
         default:
             LOG(ERROR) << "Unknown transfer strategy: " << strategy;
             return std::nullopt;
     }
+
+    auto submit_end = std::chrono::high_resolution_clock::now();
+
+    VLOG(3) << "TransferSubmitter::submit - validate: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   validate_end - submit_start)
+                   .count()
+            << "us, strategy: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   strategy_end - validate_end)
+                   .count()
+            << "us, submit: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   submit_end - strategy_end)
+                   .count()
+            << "us, strategy=" << static_cast<int>(strategy);
+
+    return result;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    auto memcpy_start = std::chrono::high_resolution_clock::now();
+
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
@@ -328,12 +357,23 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         operations.emplace_back(dest, src, handle.size_);
     }
 
+    auto prepare_end = std::chrono::high_resolution_clock::now();
+
     // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << handles.size() << " operations";
+    auto submit_end = std::chrono::high_resolution_clock::now();
+
+    VLOG(2) << "Memcpy operation - prepare: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   prepare_end - memcpy_start)
+                   .count()
+            << "us, submit: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   submit_end - prepare_end)
+                   .count()
+            << "us, operations: " << handles.size();
 
     return TransferFuture(state);
 }
@@ -341,6 +381,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    auto engine_start = std::chrono::high_resolution_clock::now();
+
     // Create transfer requests
     std::vector<Transport::TransferRequest> requests;
     requests.reserve(handles.size());
@@ -366,6 +408,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         requests.emplace_back(request);
     }
 
+    auto prepare_end = std::chrono::high_resolution_clock::now();
+
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -373,6 +417,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
     }
+
+    auto allocate_end = std::chrono::high_resolution_clock::now();
 
     // Submit transfer
     Status s = engine_.submitTransfer(batch_id, requests);
@@ -386,10 +432,32 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         return std::nullopt;
     }
 
+    auto submit_end = std::chrono::high_resolution_clock::now();
+
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
+
+    auto create_end = std::chrono::high_resolution_clock::now();
+
+    VLOG(2) << "TransferEngine operation - prepare: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   prepare_end - engine_start)
+                   .count()
+            << "us, allocate: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   allocate_end - prepare_end)
+                   .count()
+            << "us, submit: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   submit_end - allocate_end)
+                   .count()
+            << "us, create: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   create_end - submit_end)
+                   .count()
+            << "us, requests: " << requests.size();
 
     return TransferFuture(state);
 }

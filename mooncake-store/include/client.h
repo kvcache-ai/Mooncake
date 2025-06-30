@@ -16,6 +16,8 @@
 
 namespace mooncake {
 
+class PutOperation;
+
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
@@ -229,6 +231,18 @@ class Client {
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
         std::vector<AllocatedBuffer::Descriptor>& handles);
+
+    /**
+     * @brief Batch put helper methods for structured approach
+     */
+    std::vector<PutOperation> CreatePutOperations(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices);
+    void StartBatchPut(std::vector<PutOperation>& ops, const ReplicateConfig& config);
+    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void WaitForTransfers(std::vector<PutOperation>& ops);
+    void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(const std::vector<PutOperation>& ops);
 
     // Core components
     TransferEngine transfer_engine_;
