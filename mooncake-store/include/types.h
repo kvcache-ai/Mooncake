@@ -27,7 +27,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     200;  // in milliseconds
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
-static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5; // in seconds
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 
 // Forward declarations
@@ -77,8 +77,8 @@ enum class ErrorCode : int32_t {
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
-    SEGMENT_NOT_FOUND = -101,   ///< No available segments found.
-    SEGMENT_ALREADY_EXISTS = -102,   ///< Segment already exists.
+    SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
+    SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE = -200,  ///< No available handles.

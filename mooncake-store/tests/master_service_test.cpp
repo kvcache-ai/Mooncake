@@ -34,28 +34,37 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
         std::vector<Replica::Descriptor> replica_list;
 
         // Check if the key already exists.
-        if (service->ExistKey(key) == ErrorCode::OK) {
+        auto exist_result = service->ExistKey(key);
+        if (exist_result && exist_result.value()) {
             continue;  // Retry if the key already exists
         }
 
         // Attempt to put the key.
-        ErrorCode code = service->PutStart(key, 1024, {1024},
-                                           {.replica_num = 1}, replica_list);
+        auto put_result =
+            service->PutStart(key, 1024, {1024}, {.replica_num = 1});
 
-        if (code == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            continue;  // Retry if the key already exists
+        if (!put_result) {
+            if (put_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                continue;  // Retry if the key already exists
+            }
+            throw std::runtime_error(
+                "PutStart failed with code: " +
+                std::to_string(static_cast<int>(put_result.error())));
         }
-        if (code != ErrorCode::OK) {
-            throw std::runtime_error("PutStart failed with code: " +
-                                     std::to_string(static_cast<int>(code)));
+        replica_list = std::move(put_result.value());
+        auto end_result = service->PutEnd(key);
+        if (!end_result) {
+            throw std::runtime_error("PutEnd failed");
         }
-        service->PutEnd(key);
         if (replica_list[0].buffer_descriptors[0].segment_name_ ==
             segment_name) {
             return key;
         }
         // Clean up failed attempt
-        service->Remove(key);
+        auto remove_result = service->Remove(key);
+        if (!remove_result) {
+            // Ignore remove errors during cleanup
+        }
     }
 }
 
@@ -76,51 +85,61 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     // Invalid buffer address (0).
     segment.base = 0;
     segment.size = kSegmentSize;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(segment, client_id));
+    auto result = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
 
     // Invalid segment size (0).
     segment.base = kBufferAddress;
     segment.size = 0;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(segment, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
 
     // Base is not aligned
     segment.base = kBufferAddress + 1;
     segment.size = kSegmentSize;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(segment, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
 
     // Size is not aligned
     segment.base = kBufferAddress;
     segment.size = kSegmentSize + 1;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->MountSegment(segment, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
 
     // Test normal mount operation.
     segment.base = kBufferAddress;
     segment.size = kSegmentSize;
-    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(result.has_value());
 
     // Test mounting the same segment again (idempotent request should succeed).
-    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(result.has_value());
 
     // Test unmounting the segment.
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    auto unmount_result = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result.has_value());
 
     // Test unmounting the same segment again (idempotent request should
     // succeed).
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    unmount_result = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result.has_value());
 
     // Test unmounting a non-existent segment (idempotent request should
     // succeed).
     UUID non_existent_id = generate_uuid();
-    EXPECT_EQ(ErrorCode::OK,
-              service_->UnmountSegment(non_existent_id, client_id));
+    unmount_result = service_->UnmountSegment(non_existent_id, client_id);
+    EXPECT_TRUE(unmount_result.has_value());
 
     // Test remounting after unmount.
-    EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    result = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(result.has_value());
+    unmount_result = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result.has_value());
 }
 
 TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
@@ -144,9 +163,10 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize);
 
         // Test remounting after unmount.
-        EXPECT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
-        EXPECT_EQ(ErrorCode::OK,
-                  service_->UnmountSegment(segment.id, client_id));
+        auto mount_result = service_->MountSegment(segment, client_id);
+        EXPECT_TRUE(mount_result.has_value());
+        auto unmount_result = service_->UnmountSegment(segment.id, client_id);
+        EXPECT_TRUE(unmount_result.has_value());
     }
 }
 
@@ -168,10 +188,11 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
             UUID client_id = generate_uuid();
 
             for (size_t j = 0; j < iterations; j++) {
-                if (service_->MountSegment(segment, client_id) ==
-                    ErrorCode::OK) {
-                    EXPECT_EQ(ErrorCode::OK,
-                              service_->UnmountSegment(segment.id, client_id));
+                auto mount_result = service_->MountSegment(segment, client_id);
+                if (mount_result.has_value()) {
+                    auto unmount_result =
+                        service_->UnmountSegment(segment.id, client_id);
+                    EXPECT_TRUE(unmount_result.has_value());
                     success_count++;
                 }
             }
@@ -196,26 +217,28 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
     ReplicateConfig config;
 
     // Test invalid replica_num
     config.replica_num = 0;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->PutStart(key, 1024, {1024}, config, replica_list));
+    auto result1 = service_->PutStart(key, 1024, {1024}, config);
+    EXPECT_FALSE(result1.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result1.error());
 
     // Test empty slice_lengths
     config.replica_num = 1;
     std::vector<uint64_t> empty_slices;
-    EXPECT_EQ(
-        ErrorCode::INVALID_PARAMS,
-        service_->PutStart(key, 1024, empty_slices, config, replica_list));
+    auto result2 = service_->PutStart(key, 1024, empty_slices, config);
+    EXPECT_FALSE(result2.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result2.error());
 
     // Test slice_lengths sum mismatch
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              service_->PutStart(key, 1024, {512}, config, replica_list));
+    auto result3 = service_->PutStart(key, 1024, {512}, config);
+    EXPECT_FALSE(result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result3.error());
 }
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
@@ -227,7 +250,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Test PutStart
     std::string key = "test_key";
@@ -236,22 +259,26 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    EXPECT_EQ(ErrorCode::OK,
-              service_->PutStart(key, value_length, slice_lengths, config,
-                                 replica_list));
+    auto put_result =
+        service_->PutStart(key, value_length, slice_lengths, config);
+    EXPECT_TRUE(put_result.has_value());
+    replica_list = std::move(put_result.value());
     EXPECT_FALSE(replica_list.empty());
     EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
 
     // During put, Get/Remove should fail
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY,
-              service_->GetReplicaList(key, replica_list));
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, service_->Remove(key));
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, service_->Remove(key).error());
 
     // Test PutEnd
-    EXPECT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_TRUE(service_->PutEnd(key));
 
     // Verify replica list after PutEnd
-    EXPECT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    auto get_result_after = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result_after.has_value());
+    replica_list = std::move(get_result_after.value());
     EXPECT_EQ(1, replica_list.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
@@ -265,7 +292,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Test PutStart
     std::string key = "test_key";
@@ -277,19 +304,23 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::uniform_int_distribution<> dis(1, 5);
     int random_number = dis(gen);
     config.replica_num = random_number;
-    EXPECT_EQ(ErrorCode::OK,
-              service_->PutStart(key, value_length, slice_lengths, config,
-                                 replica_list));
+    auto put_result =
+        service_->PutStart(key, value_length, slice_lengths, config);
+    EXPECT_TRUE(put_result.has_value());
+    replica_list = std::move(put_result.value());
     EXPECT_FALSE(replica_list.empty());
     EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
     // During put, Get/Remove should fail
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY,
-              service_->GetReplicaList(key, replica_list));
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, service_->Remove(key));
+    auto get_result_during = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result_during.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result_during.error());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, service_->Remove(key).error());
     // Test PutEnd
-    EXPECT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_TRUE(service_->PutEnd(key));
     // Verify replica list after PutEnd
-    EXPECT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    auto get_result_after = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result_after.has_value());
+    replica_list = std::move(get_result_after.value());
     EXPECT_EQ(random_number, replica_list.size());
     for (int i = 0; i < random_number; ++i) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[i].status);
@@ -299,10 +330,9 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
 TEST_F(MasterServiceTest, GetReplicaList) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Test getting non-existent key
-    std::vector<Replica::Descriptor> replica_list_local;
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList("non_existent", replica_list_local));
-    EXPECT_TRUE(replica_list_local.empty());
+    auto get_result_nonexistent = service_->GetReplicaList("non_existent");
+    EXPECT_FALSE(get_result_nonexistent.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result_nonexistent.error());
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -312,20 +342,20 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<Replica::Descriptor> replica_list;
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    auto put_result = service_->PutStart(key, 1024, slice_lengths, config);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(service_->PutEnd(key));
 
     // Test getting existing key
-    EXPECT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list_local));
-    EXPECT_FALSE(replica_list_local.empty());
+    auto get_result_existing = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result_existing.has_value());
+    EXPECT_FALSE(get_result_existing.value().empty());
 }
 
 TEST_F(MasterServiceTest, RemoveObject) {
@@ -338,27 +368,26 @@ TEST_F(MasterServiceTest, RemoveObject) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<Replica::Descriptor> replica_list;
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+    EXPECT_TRUE(service_->PutEnd(key));
 
     // Test removing the object
-    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+    EXPECT_TRUE(service_->Remove(key));
 
     // Verify object is removed
-    std::vector<Replica::Descriptor> replica_list_local;
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList(key, replica_list_local));
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 
     // Test removing non-existent object
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove("non_existent"));
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
+              service_->Remove("non_existent").error());
 }
 
 TEST_F(MasterServiceTest, RandomRemoveObject) {
@@ -371,7 +400,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
     int times = 10;
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -381,18 +410,16 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                    config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+        EXPECT_TRUE(service_->PutEnd(key));
 
         // Test removing the object
-        EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+        EXPECT_TRUE(service_->Remove(key));
 
         // Verify object is removed
-        std::vector<Replica::Descriptor> replica_list_local;
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-                  service_->GetReplicaList(key, replica_list_local));
+        auto get_result = service_->GetReplicaList(key);
+        EXPECT_FALSE(get_result.has_value());
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
 }
 
@@ -408,18 +435,16 @@ TEST_F(MasterServiceTest, RemoveAll) {
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
     int times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                    config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-        ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+        EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+        EXPECT_TRUE(service_->PutEnd(key));
+        EXPECT_TRUE(service_->ExistKey(key));
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
@@ -427,7 +452,9 @@ TEST_F(MasterServiceTest, RemoveAll) {
     times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+        auto exist_result = service_->ExistKey(key);
+        EXPECT_TRUE(exist_result.has_value());
+        EXPECT_FALSE(exist_result.value());
     }
 }
 
@@ -443,7 +470,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     Segment segment(generate_uuid(), segment_name, buffer, segment_size);
     UUID client_id = generate_uuid();
 
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Test parameters
     std::string key = "multi_slice_object";
@@ -468,11 +495,10 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Configure replication
     ReplicateConfig config;
     config.replica_num = num_replicas;
-    std::vector<Replica::Descriptor> replica_list;
-
-    // Test PutStart with multiple slices and replicas
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, total_size, slice_lengths,
-                                                config, replica_list));
+    auto put_result =
+        service_->PutStart(key, total_size, slice_lengths, config);
+    EXPECT_TRUE(put_result.has_value());
+    replica_list = std::move(put_result.value());
 
     // Verify replica list properties
     ASSERT_EQ(num_replicas, replica_list.size());
@@ -493,15 +519,14 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     }
 
     // Test GetReplicaList during processing (should fail)
-    std::vector<Replica::Descriptor> retrieved_replicas;
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY,
-              service_->GetReplicaList(key, retrieved_replicas));
+              service_->GetReplicaList(key).error());
 
     // Complete the put operation
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    ASSERT_TRUE(service_->PutEnd(key));
 
     // Test GetReplicaList after completion
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, retrieved_replicas));
+    auto retrieved_replicas = service_->GetReplicaList(key).value();
     ASSERT_EQ(num_replicas, retrieved_replicas.size());
 
     // Verify final state of all replicas
@@ -515,11 +540,11 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
 
     // Sleep for 2 seconds to ensure the object is marked for GC
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key));
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key).error());
 
     // Verify object is truly removed
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList(key, retrieved_replicas));
+              service_->GetReplicaList(key).error());
 }
 
 TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
@@ -532,7 +557,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     std::string segment_name = "concurrent_gc_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     constexpr size_t num_threads = 4;
     constexpr size_t objects_per_thread = 25;
@@ -558,10 +583,9 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
                     std::vector<Replica::Descriptor> replica_list;
 
                     // Create the object
-                    ASSERT_EQ(ErrorCode::OK,
-                              service_->PutStart(key, 1024, slice_lengths,
-                                                 config, replica_list));
-                    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+                    EXPECT_TRUE(
+                        service_->PutStart(key, 1024, slice_lengths, config));
+                    EXPECT_TRUE(service_->PutEnd(key));
 
                     // Add the key to the tracking list
                     {
@@ -583,8 +607,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     // Check that all objects exist
     for (const auto& key : all_keys) {
         std::vector<Replica::Descriptor> retrieved_replicas;
-        EXPECT_EQ(ErrorCode::OK,
-                  service_->GetReplicaList(key, retrieved_replicas));
+        EXPECT_TRUE(service_->GetReplicaList(key));
     }
 
     // Sleep for 2 seconds to ensure the object is marked for GC
@@ -593,9 +616,8 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     // Verify all objects are gone after GC
     size_t found_count = 0;
     for (const auto& key : all_keys) {
-        std::vector<Replica::Descriptor> retrieved_replicas;
-        if (service_->GetReplicaList(key, retrieved_replicas) ==
-            ErrorCode::OK) {
+        auto get_result = service_->GetReplicaList(key);
+        if (get_result) {
             found_count++;
         }
     }
@@ -616,7 +638,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     UUID client_id = generate_uuid();
 
     // Mount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Create an object that will be stored in the segment
     std::string key = "segment_object";
@@ -626,45 +648,41 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Create the object
     std::vector<Replica::Descriptor> replica_list;
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024 * 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_TRUE(service_->PutStart(key, 1024 * 1024, slice_lengths, config));
+    EXPECT_TRUE(service_->PutEnd(key));
 
     // Verify object exists
-    std::vector<Replica::Descriptor> retrieved_replicas;
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, retrieved_replicas));
+    std::vector<Replica::Descriptor> retrieved_replicas =
+        service_->GetReplicaList(key).value();
     ASSERT_EQ(1, retrieved_replicas.size());
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    ASSERT_TRUE(service_->UnmountSegment(segment.id, client_id));
 
     // Try to get the object - it should be automatically removed since the
     // replica is invalid
     retrieved_replicas.clear();
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList(key, retrieved_replicas));
+              service_->GetReplicaList(key).error());
     EXPECT_TRUE(retrieved_replicas.empty());
 
     // Mount the segment again
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Create another object
     std::string key2 = "another_segment_object";
-    ASSERT_EQ(ErrorCode::OK,
-              service_->PutStart(key2, 1024 * 1024, slice_lengths, config,
-                                 replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key2));
+    EXPECT_TRUE(service_->PutStart(key2, 1024 * 1024, slice_lengths, config));
+    ASSERT_TRUE(service_->PutEnd(key2));
 
     // Verify we can get it
     retrieved_replicas.clear();
-    ASSERT_EQ(ErrorCode::OK,
-              service_->GetReplicaList(key2, retrieved_replicas));
+    EXPECT_TRUE(service_->GetReplicaList(key2));
 
     // Unmount the segment
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    EXPECT_TRUE(service_->UnmountSegment(segment.id, client_id));
 
     // Try to remove the object that should already be cleaned up
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key2));
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->Remove(key2).error());
 }
 
 TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
@@ -674,7 +692,7 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
     std::string segment_name = "concurrent_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     constexpr int num_threads = 4;
     constexpr int objects_per_thread = 100;
@@ -692,11 +710,9 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
                 std::vector<uint64_t> slice_lengths = {1024};
                 ReplicateConfig config;
                 config.replica_num = 1;
-                std::vector<Replica::Descriptor> replica_list;
 
-                if (service_->PutStart(key, 1024, slice_lengths, config,
-                                       replica_list) == ErrorCode::OK &&
-                    service_->PutEnd(key) == ErrorCode::OK) {
+                if (service_->PutStart(key, 1024, slice_lengths, config) &&
+                    service_->PutEnd(key)) {
                     success_writes++;
                 }
 
@@ -747,7 +763,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     std::string segment_name = "concurrent_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Pre-populate with test data
     constexpr int num_objects = 1000;
@@ -757,10 +773,8 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         ReplicateConfig config;
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
-
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                    config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+        EXPECT_TRUE(service_->PutEnd(key));
     }
 
     std::atomic<int> success_reads(0);
@@ -769,12 +783,11 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     // Reader threads
     std::vector<std::thread> readers;
     for (int i = 0; i < 4; ++i) {
-        readers.emplace_back([&, i]() {
+        readers.emplace_back([&]() {
             std::vector<Replica::Descriptor> replica_list;
             for (int j = 0; j < num_objects; ++j) {
                 std::string key = "pre_key_" + std::to_string(j);
-                if (service_->GetReplicaList(key, replica_list) ==
-                    ErrorCode::OK) {
+                if (service_->GetReplicaList(key)) {
                     success_reads++;
                 }
 
@@ -816,7 +829,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-                  service_->GetReplicaList(key, replica_list));
+                  service_->GetReplicaList(key).error());
     }
 }
 
@@ -828,7 +841,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     std::string segment_name = "concurrent_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Pre-populate with test data
     constexpr int num_objects = 1000000;
@@ -839,9 +852,8 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
         config.replica_num = 1;
         std::vector<Replica::Descriptor> replica_list;
 
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                    config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+        EXPECT_TRUE(service_->PutEnd(key));
     }
 
     std::atomic<int> remove_all_count(0);
@@ -865,11 +877,10 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     EXPECT_EQ(num_objects, remove_all_count);
 
     // Verify all objects were removed
-    std::vector<Replica::Descriptor> replica_list;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-                  service_->GetReplicaList(key, replica_list));
+                  service_->GetReplicaList(key).error());
     }
 }
 
@@ -884,8 +895,8 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     Segment segment1(generate_uuid(), "segment1", buffer1, size);
     Segment segment2(generate_uuid(), "segment2", buffer2, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment1, client_id));
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment2, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id));
 
     // Create two objects in the two segments
     std::string key1 = GenerateKeyForSegment(service_, segment1.name);
@@ -895,22 +906,24 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     config.replica_num = 1;
 
     // Unmount segment1
-    ASSERT_EQ(ErrorCode::OK, service_->UnmountSegment(segment1.id, client_id));
+    ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id));
     // Umount will remove all objects in the segment, include the key1
     ASSERT_EQ(1, service_->GetKeyCount());
     // Verify objects in segment1 is gone
     std::vector<Replica::Descriptor> retrieved;
     ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList(key1, retrieved));
+              service_->GetReplicaList(key1).error());
 
     // Verify objects in segment2 is still there
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key2, retrieved));
+    EXPECT_TRUE(service_->GetReplicaList(key2));
 
     // Verify put key1 will put into segment2 rather than segment1
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key1, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key1));
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key1, retrieved));
+    auto put_result = service_->PutStart(key1, 1024, slice_lengths, config);
+    EXPECT_TRUE(put_result);
+    EXPECT_TRUE(service_->PutEnd(key1));
+    auto get_result = service_->GetReplicaList(key1);
+    EXPECT_TRUE(get_result);
+    replica_list = std::move(get_result.value());
     ASSERT_EQ(replica_list[0].buffer_descriptors[0].segment_name_,
               segment2.name);
 }
@@ -925,7 +938,7 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     UUID client_id = generate_uuid();
 
     // Mount a segment for testing
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Create 10000 keys for testing
     constexpr int kNumKeys = 1000;
@@ -944,7 +957,7 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
 
     // Execute unmount operation and record operation time
     auto unmount_start = std::chrono::steady_clock::now();
-    EXPECT_EQ(ErrorCode::OK, service_->UnmountSegment(segment.id, client_id));
+    EXPECT_TRUE(service_->UnmountSegment(segment.id, client_id));
     auto unmount_end = std::chrono::steady_clock::now();
 
     auto unmount_duration =
@@ -957,10 +970,9 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
         << "ms which exceeds 1 second limit";
 
     // Verify all keys are gone
-    std::vector<Replica::Descriptor> retrieved;
     for (const auto& key : keys) {
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-                  service_->GetReplicaList(key, retrieved));
+                  service_->GetReplicaList(key).error());
     }
 
     // Output performance report
@@ -983,57 +995,59 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     std::string key = "test_key";
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<Replica::Descriptor> replica_list;
 
     // Verify lease is granted on ExistsKey
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+    EXPECT_TRUE(service_->PutEnd(key));
+    EXPECT_TRUE(service_->ExistKey(key).value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key).error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+    EXPECT_TRUE(service_->Remove(key));
 
     // Verify lease is extended on successive ExistsKey
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+    EXPECT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+    EXPECT_TRUE(service_->PutEnd(key));
+    EXPECT_TRUE(service_->ExistKey(key).value());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    EXPECT_TRUE(service_->ExistKey(key).value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key).error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+    EXPECT_TRUE(service_->Remove(key));
 
     // Verify lease is granted on GetReplicaList
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    auto put_result1 = service_->PutStart(key, 1024, slice_lengths, config);
+    ASSERT_TRUE(put_result1.has_value());
+    ASSERT_TRUE(service_->PutEnd(key));
+    auto get_result1 = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result1.has_value());
+    replica_list = std::move(get_result1.value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key).error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+    EXPECT_TRUE(service_->Remove(key));
 
     // Verify lease is extended on successive GetReplicaList
-    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                config, replica_list));
-    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    auto put_result2 = service_->PutStart(key, 1024, slice_lengths, config);
+    ASSERT_TRUE(put_result2.has_value());
+    ASSERT_TRUE(service_->PutEnd(key));
+    auto get_result2 = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result2.has_value());
+    replica_list = std::move(get_result2.value());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key));
+    auto get_result3 = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result3.has_value());
+    replica_list = std::move(get_result3.value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, service_->Remove(key).error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+    EXPECT_TRUE(service_->Remove(key));
 
     // Verify object is removed
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND,
-              service_->GetReplicaList(key, replica_list));
+    EXPECT_FALSE(service_->GetReplicaList(key));
 }
 
 TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
@@ -1046,31 +1060,30 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
     for (int i = 0; i < 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-        ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
-                                                    config, replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        ASSERT_TRUE(service_->PutStart(key, 1024, slice_lengths, config));
+        ASSERT_TRUE(service_->PutEnd(key));
         if (i >= 5) {
-            ASSERT_EQ(ErrorCode::OK, service_->ExistKey(key));
+            ASSERT_TRUE(service_->ExistKey(key));
         }
     }
     ASSERT_EQ(5, service_->RemoveAll());
     for (int i = 0; i < 5; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+        // Should not exist anymore
+        EXPECT_FALSE(service_->ExistKey(key).value());
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     ASSERT_EQ(5, service_->RemoveAll());
     for (int i = 5; i < 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, service_->ExistKey(key));
+        EXPECT_FALSE(service_->ExistKey(key).value());
     }
 }
 
@@ -1089,7 +1102,7 @@ TEST_F(MasterServiceTest, EvictObject) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Verify if we can put objects more than the segment can hold
     int success_puts = 0;
@@ -1098,10 +1111,10 @@ TEST_F(MasterServiceTest, EvictObject) {
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-        if (ErrorCode::OK == service_->PutStart(key, object_size, slice_lengths,
-                                                config, replica_list)) {
-            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        auto put_result =
+            service_->PutStart(key, object_size, slice_lengths, config);
+        if (put_result) {
+            ASSERT_TRUE(service_->PutEnd(key));
             success_puts++;
         } else {
             // wait for gc thread to work
@@ -1124,7 +1137,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     // Verify leased object will not be evicted.
     int success_puts = 0;
@@ -1135,13 +1148,12 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<Replica::Descriptor> replica_list;
-        if (ErrorCode::OK == service_->PutStart(key, object_size, slice_lengths,
-                                                config, replica_list)) {
-            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+        auto put_result =
+            service_->PutStart(key, object_size, slice_lengths, config);
+        if (put_result) {
+            ASSERT_TRUE(service_->PutEnd(key));
             // the object is leased
-            ASSERT_EQ(ErrorCode::OK,
-                      service_->GetReplicaList(key, replica_list));
+            ASSERT_TRUE(service_->GetReplicaList(key));
             leased_keys.push_back(key);
             success_puts++;
         } else {
@@ -1154,8 +1166,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     // All leased objects should be accessible
     for (const auto& key : leased_keys) {
-        std::vector<Replica::Descriptor> replica_list;
-        ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+        ASSERT_TRUE(service_->GetReplicaList(key));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
@@ -1170,7 +1181,7 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     std::string segment_name = "test_segment";
     Segment segment(generate_uuid(), segment_name, buffer, size);
     UUID client_id = generate_uuid();
-    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+    ASSERT_TRUE(service_->MountSegment(segment, client_id));
 
     int test_object_num = 10;
     std::vector<std::string> test_keys;
@@ -1179,25 +1190,24 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
         ReplicateConfig config;
         config.replica_num = 1;
         std::vector<uint64_t> slice_lengths = {1024};
-        std::vector<Replica::Descriptor> replica_list;
-        ASSERT_EQ(ErrorCode::OK,
-                  service_->PutStart(test_keys[i], 1024, slice_lengths, config,
-                                     replica_list));
-        ASSERT_EQ(ErrorCode::OK, service_->PutEnd(test_keys[i]));
+        auto put_result =
+            service_->PutStart(test_keys[i], 1024, slice_lengths, config);
+        ASSERT_TRUE(put_result);
+        ASSERT_TRUE(service_->PutEnd(test_keys[i]));
     }
 
     // Test individual ExistKey calls to verify the underlying functionality
     for (int i = 0; i < test_object_num; ++i) {
-        EXPECT_EQ(ErrorCode::OK, service_->ExistKey(test_keys[i]));
+        EXPECT_TRUE(service_->ExistKey(test_keys[i]));
     }
 
     // Tets batch
     test_keys.push_back("non_existent_key");
     auto exist_resp = service_->BatchExistKey(test_keys);
     for (int i = 0; i < test_object_num; ++i) {
-        ASSERT_EQ(ErrorCode::OK, exist_resp[i]);
+        ASSERT_TRUE(exist_resp[i].value());
     }
-    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, exist_resp[test_object_num]);
+    ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
 }  // namespace mooncake::test
