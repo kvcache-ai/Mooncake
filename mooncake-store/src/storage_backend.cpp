@@ -209,7 +209,7 @@ StorageBackend::BatchQueryKey(const std::vector<ObjectKey>& keys) {
 
         if (!fs::exists(path)) {
             LOG(WARNING) << "Key not found: " << key << ", skipping...";
-            return std::nullopt; 
+            return {}; 
         }
 
         Replica::Descriptor desc;

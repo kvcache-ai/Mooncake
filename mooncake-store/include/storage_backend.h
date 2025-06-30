@@ -100,7 +100,7 @@ class StorageBackend  {
      * 
      * This method retrieves the file path and size for the given object key.
      */
-    std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key);
+    std::optional<Replica::Descriptor> Querykey(const ObjectKey& key);
 
     /**
      * @brief Batch queries metadata for multiple object keys
