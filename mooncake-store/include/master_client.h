@@ -187,24 +187,25 @@ class MasterClient {
     class RpcClientAccessor {
        public:
         void SetClient(std::shared_ptr<coro_rpc_client> client) {
-            std::atomic_store_explicit(&client_, client,
-                                       std::memory_order_release);
+            std::lock_guard<std::shared_mutex> lock(client_mutex_);
+            client_ = client;
         }
 
         std::shared_ptr<coro_rpc_client> GetClient() {
-            return std::atomic_load_explicit(&client_,
-                                             std::memory_order_acquire);
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            return client_;
         }
 
        private:
-        std::shared_ptr<coro_rpc_client> client_{nullptr};
+        mutable std::shared_mutex client_mutex_;
+        std::shared_ptr<coro_rpc_client> client_ GUARDED_BY(client_mutex_);
     };
     RpcClientAccessor client_accessor_;
 
     // Mutex to insure the Connect function is atomic.
     mutable std::mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
-    std::string client_addr_param_;
+    std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 };
 
 }  // namespace mooncake

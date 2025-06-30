@@ -44,6 +44,30 @@ class ChaosTest : public ::testing::Test {
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
+    void SetUp() override {
+        // Start masters
+        const int master_num = 3;
+        for (int i = 0; i < master_num; ++i) {
+            masters_.emplace_back(
+                std::make_unique<mooncake::testing::MasterProcessHandler>(
+                    FLAGS_master_path, FLAGS_etcd_endpoints,
+                    master_port_base + i, i, FLAGS_out_dir));
+            ASSERT_TRUE(masters_.back()->start());
+        }
+
+        // Wait for the leader to be elected
+        WaitMasterViewChange();
+
+        // Get leader index
+        GetLeaderIndex(leader_index_);
+        ASSERT_TRUE(leader_index_ >= 0 && leader_index_ < master_num);
+    }
+
+    void TearDown() override {
+        // Release masters
+        masters_.clear();
+    }
+
     static std::shared_ptr<ClientTestWrapper> CreateClientWrapper(
         const std::string& host_name) {
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
@@ -97,31 +121,17 @@ class ChaosTest : public ::testing::Test {
     }
 
     static std::shared_ptr<MasterViewHelper> master_view_helper_;
+
+    // Instance members for master management
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters_;
+    int leader_index_;
 };
 
 std::shared_ptr<MasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
 
 // Verify the system failover after the leader is killed.
 TEST_F(ChaosTest, LeaderKilledFailover) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
-
-    int leader_index;
-    GetLeaderIndex(leader_index);
-    ASSERT_TRUE(leader_index >= 0 && leader_index < master_num);
-
     // Create a client
     std::shared_ptr<ClientTestWrapper> client =
         CreateClientWrapper("0.0.0.0:" + std::to_string(client_port_base));
@@ -137,7 +147,7 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
     ASSERT_EQ(client->Put(key, value), ErrorCode::OK);
 
     // Kill the leader and wait for the new leader to be elected
-    ASSERT_TRUE(masters[leader_index]->kill());
+    ASSERT_TRUE(masters_[leader_index_]->kill());
     WaitMasterViewChange();
 
     // Verify the segment is remounted by trying to put a new key-value pair
@@ -153,24 +163,7 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
 
 // Verify the client won't be affected if non-leader masters are killed.
 TEST_F(ChaosTest, BackupMasterKilled) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
-
-    int leader_index;
-    GetLeaderIndex(leader_index);
-    ASSERT_TRUE(leader_index >= 0 && leader_index < master_num);
+    const int master_num = static_cast<int>(masters_.size());
 
     // Create a client
     std::shared_ptr<ClientTestWrapper> client =
@@ -188,8 +181,8 @@ TEST_F(ChaosTest, BackupMasterKilled) {
 
     // Kill the non-leader masters
     for (int i = 0; i < master_num; ++i) {
-        if (i != leader_index) {
-            ASSERT_TRUE(masters[i]->kill());
+        if (i != leader_index_) {
+            ASSERT_TRUE(masters_[i]->kill());
         }
     }
 
@@ -202,24 +195,7 @@ TEST_F(ChaosTest, BackupMasterKilled) {
 // Verify the client can automatically remount after all masters other than one
 // backed up master are killed.
 TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
-
-    int leader_index;
-    GetLeaderIndex(leader_index);
-    ASSERT_TRUE(leader_index >= 0 && leader_index < master_num);
+    const int master_num = static_cast<int>(masters_.size());
 
     // Create a client
     std::shared_ptr<ClientTestWrapper> client =
@@ -233,10 +209,10 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
     // Kill all masters other than one backed up master
     bool find_one_backup = false;
     for (int i = 0; i < master_num; ++i) {
-        if (i != leader_index && !find_one_backup) {
+        if (i != leader_index_ && !find_one_backup) {
             find_one_backup = true;
         } else {
-            ASSERT_TRUE(masters[i]->kill());
+            ASSERT_TRUE(masters_[i]->kill());
         }
     }
 
@@ -256,20 +232,7 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
 
 // Verify the client can automatically remount after all masters are killed.
 TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
+    const int master_num = static_cast<int>(masters_.size());
 
     // Create a client
     std::shared_ptr<ClientTestWrapper> client =
@@ -282,12 +245,12 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
 
     // Kill all masters
     for (int i = 0; i < master_num; ++i) {
-        ASSERT_TRUE(masters[i]->kill());
+        ASSERT_TRUE(masters_[i]->kill());
     }
 
     // Restart the masters
     for (int i = 0; i < master_num; ++i) {
-        ASSERT_TRUE(masters[i]->start());
+        ASSERT_TRUE(masters_[i]->start());
     }
 
     // Wait for the leader to be elected
@@ -306,21 +269,6 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
 
 // Verify system soundness when a client gracefully closes.
 TEST_F(ChaosTest, ClientGracefulClose) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
-
     // Create two clients
     std::shared_ptr<ClientTestWrapper> to_close_client =
         CreateClientWrapper("0.0.0.0:" + std::to_string(client_port_base));
@@ -351,21 +299,6 @@ TEST_F(ChaosTest, ClientGracefulClose) {
 
 // Verify system soundness when a client is killed.
 TEST_F(ChaosTest, ClientKilledFailover) {
-    // Start masters
-    const int master_num = 3;
-    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
-        masters;
-    for (int i = 0; i < master_num; ++i) {
-        masters.emplace_back(
-            std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
-        ASSERT_TRUE(masters.back()->start());
-    }
-
-    // Wait for the leader to be elected
-    WaitMasterViewChange();
-
     // Create two clients
     ClientRunnerConfig clt_runner_cfg = {
         .put_prob = 0,
