@@ -36,7 +36,7 @@ namespace v1 {
 // and more features (such as the last-resort method of data transfer)
 
 using RpcRawData = std::vector<char>;
-enum RpcErrorCode { OK = 0, ErrIncompleted, ErrInvalidFunc };
+enum RpcErrorCode { OK = 0, ErrIncompleted, ErrInvalidFunc, ErrConnectFailed };
 enum RpcFuncID { GetSegmentDesc = 1, BootstrapRdma, SendData, RecvData };
 
 class AsioRpcServer {
@@ -57,15 +57,10 @@ class AsioRpcServer {
 
     Status stop();
 
+    int process(int func_id, const RpcRawData &request, RpcRawData &response);
+
    private:
     void doAccept();
-
-    void readRequest(asio::ip::tcp::socket &socket);
-
-    void writeResponse(asio::ip::tcp::socket &socket, int error_code);
-
-    void writeResponse(asio::ip::tcp::socket &socket,
-                       const RpcRawData &response);
 
    private:
     std::atomic<bool> running_;
@@ -78,22 +73,25 @@ class AsioRpcServer {
 
 class AsioRpcClient {
    public:
-    AsioRpcClient(const std::string &hostname_port);
-
-    AsioRpcClient(const std::string &hostname, uint16_t port);
-
-    ~AsioRpcClient();
+    AsioRpcClient() {}
+    ~AsioRpcClient() {}
 
     AsioRpcClient(const AsioRpcClient &) = delete;
     AsioRpcClient &operator=(const AsioRpcClient &) = delete;
 
+    static AsioRpcClient &Get() {
+        static AsioRpcClient instance;
+        return instance;
+    }
+
    public:
-    RpcErrorCode call(int func_id, const RpcRawData &request,
-                      RpcRawData &response);
+    RpcErrorCode call(const std::string &server_addr, int func_id,
+                      const RpcRawData &request, RpcRawData &response);
 
    private:
     asio::io_context io_context_;
-    asio::ip::tcp::socket socket_;
+    std::mutex mutex_;
+    std::unordered_map<std::string, asio::ip::tcp::socket> socket_;
 };
 
 }  // namespace v1

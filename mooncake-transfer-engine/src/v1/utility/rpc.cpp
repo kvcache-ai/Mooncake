@@ -12,10 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO the implementation needs to be updated
+// - Caching sockets, and supporting multiple calls
+// - Keep it lightweighted and tidy
+
 #include "v1/utility/rpc.h"
 
 namespace mooncake {
 namespace v1 {
+
+using tcpsocket = asio::ip::tcp::socket;
+struct Session : public std::enable_shared_from_this<Session> {
+   public:
+    struct Header {
+        uint16_t func_id;
+        uint16_t error_code;
+        uint32_t length;
+    };
+
+   public:
+    explicit Session(tcpsocket socket, AsioRpcServer *server)
+        : socket_(std::move(socket)), server_(server) {}
+
+    void start() {
+        auto self(shared_from_this());
+        asio::async_read(
+            socket_, asio::buffer(&request_header_, sizeof(Header)),
+            [this, self](const asio::error_code &ec, std::size_t len) {
+                if (ec || len != sizeof(Header)) {
+                    LOG(ERROR) << "Failed to read header: " << ec.message()
+                               << " (" << ec.value() << ")";
+                    return;
+                }
+                if (request_header_.length == 0)
+                    process();
+                else
+                    readContent();
+            });
+    }
+
+    void readContent() {
+        auto self(shared_from_this());
+        request_data_.resize(request_header_.length);
+        asio::async_read(
+            socket_, asio::buffer(request_data_.data(), request_data_.size()),
+            [this, self](const asio::error_code &ec, std::size_t len) {
+                if (ec || len != request_data_.size()) {
+                    LOG(ERROR) << "Failed to read content: " << ec.message()
+                               << " (" << ec.value() << ")";
+                    return;
+                }
+                process();
+            });
+    }
+
+    void process() {
+        Header response_header;
+        response_header.func_id = request_header_.func_id;
+        response_header.error_code = server_->process(
+            request_header_.func_id, request_data_, response_data_);
+        response_header.length = response_data_.size();
+        response_data_.resize(response_header.length + sizeof(Header));
+        if (response_header.length)
+            memmove(&response_data_[sizeof(Header)], &response_data_[0],
+                    response_header.length);
+        memmove(&response_data_[0], &response_header, sizeof(Header));
+        writeHeaderAndContent();
+    }
+
+    void writeHeaderAndContent() {
+        auto self(shared_from_this());
+        asio::async_write(
+            socket_, asio::buffer(response_data_.data(), response_data_.size()),
+            [this, self](const asio::error_code &ec, std::size_t len) {
+                if (ec || len != response_data_.size()) {
+                    LOG(ERROR) << "Failed to write header and content: "
+                               << ec.message() << " (" << ec.value() << ")";
+                    return;
+                }
+            });
+    }
+
+   private:
+    tcpsocket socket_;
+    Header request_header_;
+    RpcRawData request_data_, response_data_;
+    AsioRpcServer *server_;
+};
 
 AsioRpcServer::AsioRpcServer() {}
 
@@ -29,17 +112,16 @@ Status AsioRpcServer::registerFunction(int func_id, const Function &func) {
 }
 
 Status AsioRpcServer::start(uint16_t &port) {
-    const static uint16_t kStartPort = 15000;
-    const static uint16_t kPortRange = 2000;
-    const static int kMaxRetry = 10;
-
-    if (running_)
-        return Status::InvalidArgument(
-            "Builtin RPC server is already started" LOC_MARK);
-
-    for (int retry = 0; retry < kMaxRetry; ++retry) {
-        if (port == 0) port = kStartPort + SimpleRandom::Get().next(kPortRange);
-        try {
+    try {
+        const static uint16_t kStartPort = 15000;
+        const static uint16_t kPortRange = 2000;
+        const static int kMaxRetry = 10;
+        if (running_)
+            return Status::InvalidArgument(
+                "Builtin RPC server is already started" LOC_MARK);
+        for (int retry = 0; retry < kMaxRetry; ++retry) {
+            if (port == 0)
+                port = kStartPort + SimpleRandom::Get().next(kPortRange);
             acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
                 io_context_,
                 asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
@@ -47,7 +129,6 @@ Status AsioRpcServer::start(uint16_t &port) {
             worker_ = std::thread([this]() {
                 while (running_) {
                     try {
-                        doAccept();
                         io_context_.run();
                     } catch (const std::exception &e) {
                         LOG(WARNING) << "[TE RPC] Detect exception in worker: "
@@ -55,15 +136,15 @@ Status AsioRpcServer::start(uint16_t &port) {
                     }
                 }
             });
+            doAccept();
             return Status::OK();
-        } catch (const std::exception &e) {
-            LOG(WARNING) << "[TE RPC] Port " << port
-                         << " is occupied, try other ports";
-            port = 0;
         }
+        return Status::RpcServiceError("No available tcp port" LOC_MARK);
+    } catch (const std::exception &e) {
+        port = 0;
+        LOG(INFO) << "RPC exception: " << e.what();
+        return Status::RpcServiceError("Rpc module internal error" LOC_MARK);
     }
-
-    return Status::RpcServiceError("No available tcp port" LOC_MARK);
 }
 
 Status AsioRpcServer::stop() {
@@ -78,126 +159,77 @@ Status AsioRpcServer::stop() {
 void AsioRpcServer::doAccept() {
     acceptor_->async_accept(
         [this](asio::error_code ec, asio::ip::tcp::socket socket) {
-            if (!ec) readRequest(socket);
+            if (!ec) {
+                std::make_shared<Session>(std::move(socket), this)->start();
+            }
             doAccept();
         });
 }
 
-struct RequestHeader {
-    int func_id;
-    int payload_len;
-};
-
-struct ResponseHeader {
-    int error_code;
-    int payload_len;
-};
-
-void AsioRpcServer::readRequest(asio::ip::tcp::socket &socket) {
-    RequestHeader header;
-    if (asio::read(socket, asio::buffer(&header, sizeof(RequestHeader))) !=
-        sizeof(RequestHeader)) {
-        writeResponse(socket, ErrIncompleted);
-        return;
-    }
-
-    RpcRawData request(header.payload_len);
-    RpcRawData response;
-    if (!request.empty()) {
-        if (asio::read(socket,
-                       asio::buffer(request.data(), header.payload_len)) !=
-            (size_t)header.payload_len) {
-            writeResponse(socket, ErrIncompleted);
-            return;
-        }
-    }
-
-    if (!func_map_.count(header.func_id)) {
-        writeResponse(socket, ErrInvalidFunc);
-        return;
-    }
-
-    auto func = func_map_.at(header.func_id);
+int AsioRpcServer::process(int func_id, const RpcRawData &request,
+                           RpcRawData &response) {
+    if (!func_map_.count(func_id)) return ErrInvalidFunc;
+    auto func = func_map_.at(func_id);
     func(request, response);
-    writeResponse(socket, response);
+    return 0;
 }
 
-void AsioRpcServer::writeResponse(asio::ip::tcp::socket &socket,
-                                  int error_code) {
-    ResponseHeader header;
-    header.error_code = error_code;
-    header.payload_len = 0;
-    asio::write(socket, asio::buffer(&header, sizeof(ResponseHeader)));
-}
-
-void AsioRpcServer::writeResponse(asio::ip::tcp::socket &socket,
-                                  const RpcRawData &response) {
-    ResponseHeader header;
-    header.error_code = OK;
-    header.payload_len = (int)response.size();
-    asio::write(socket, asio::buffer(&header, sizeof(ResponseHeader)));
-    if (!response.empty())
-        asio::write(socket, asio::buffer(response.data(), response.size()));
-}
-
-AsioRpcClient::AsioRpcClient(const std::string &hostname_port) 
-    : socket_(io_context_) {
-    size_t pos = hostname_port.find(':');
-    if (pos == std::string::npos) return;
-    auto hostname = hostname_port.substr(0, pos);
-    auto port = hostname_port.substr(pos + 1);
-    asio::ip::tcp::resolver resolver(io_context_);
-    auto endpoints = resolver.resolve(hostname, port);
-    asio::connect(socket_, endpoints);
-}
-
-AsioRpcClient::AsioRpcClient(const std::string &hostname, uint16_t port)
-    : socket_(io_context_) {
-    asio::ip::tcp::resolver resolver(io_context_);
-    auto endpoints = resolver.resolve(hostname, std::to_string(port));
-    asio::connect(socket_, endpoints);
-}
-
-AsioRpcClient::~AsioRpcClient() {}
-
-RpcErrorCode AsioRpcClient::call(int func_id, const RpcRawData &request,
+RpcErrorCode AsioRpcClient::call(const std::string &server_addr, int func_id,
+                                 const RpcRawData &request,
                                  RpcRawData &response) {
-    RequestHeader request_header;
-    request_header.func_id = func_id;
-    request_header.payload_len = (int)request.size();
-    if (asio::write(socket_,
-                    asio::buffer(&request_header, sizeof(RequestHeader))) !=
-        sizeof(RequestHeader)) {
-        return ErrIncompleted;
-    }
-    if (!request.empty()) {
-        if (asio::write(socket_,
-                        asio::buffer(request.data(), request.size())) !=
-            request.size()) {
+    try {
+        size_t pos = server_addr.find(':');
+        assert(pos != std::string::npos);
+        auto hostname = server_addr.substr(0, pos);
+        auto port = server_addr.substr(pos + 1);
+
+        asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(hostname, port);
+        asio::ip::tcp::socket socket(io_context_);
+        asio::connect(socket, endpoints);
+
+        Session::Header request_header;
+        request_header.func_id = func_id;
+        request_header.length = (int)request.size();
+
+        if (asio::write(socket, asio::buffer(&request_header,
+                                             sizeof(Session::Header))) !=
+            sizeof(Session::Header)) {
             return ErrIncompleted;
         }
-    }
 
-    ResponseHeader response_header;
-    if (asio::read(socket_,
-                   asio::buffer(&response_header, sizeof(ResponseHeader))) !=
-        sizeof(ResponseHeader)) {
-        return ErrIncompleted;
-    }
+        if (!request.empty()) {
+            if (asio::write(socket,
+                            asio::buffer(request.data(), request.size())) !=
+                request.size()) {
+                return ErrIncompleted;
+            }
+        }
 
-    if (response_header.error_code)
-        return (RpcErrorCode)response_header.error_code;
-
-    response.resize(response_header.payload_len);
-    if (!response.empty()) {
-        if (asio::read(socket_,
-                       asio::buffer(response.data(), response.size())) !=
-            response.size()) {
+        Session::Header response_header;
+        if (asio::read(socket, asio::buffer(&response_header,
+                                            sizeof(Session::Header))) !=
+            sizeof(Session::Header)) {
             return ErrIncompleted;
         }
-    }
 
-    return OK;
+        if (response_header.error_code)
+            return (RpcErrorCode)response_header.error_code;
+
+        response.resize(response_header.length);
+        if (!response.empty()) {
+            if (asio::read(socket,
+                           asio::buffer(response.data(), response.size())) !=
+                response.size()) {
+                return ErrIncompleted;
+            }
+        }
+
+        return OK;
+    } catch (const std::exception &e) {
+        LOG(INFO) << "RPC exception: " << e.what();
+        return ErrConnectFailed;
+    }
 }
 
 }  // namespace v1

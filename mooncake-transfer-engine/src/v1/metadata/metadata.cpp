@@ -220,10 +220,9 @@ Status CentralMetadataStore::deleteSegmentDesc(
 
 Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
                                         const std::string &segment_name) {
-    client_ = std::make_unique<AsioRpcClient>(segment_name);
     RpcRawData request, response;
-
-    RpcErrorCode errcode = client_->call(GetSegmentDesc, request, response);
+    RpcErrorCode errcode = AsioRpcClient::Get().call(
+        segment_name, GetSegmentDesc, request, response);
     if (errcode) {
         return Status::MetadataError("RPC error: " + std::to_string(errcode) +
                                      LOC_MARK);
@@ -304,14 +303,13 @@ Status deserializeBootstrapDesc(BootstrapDesc &desc, const RpcRawData &stream) {
 Status RpcClient::bootstrap(const std::string &server_addr,
                             const BootstrapDesc &request,
                             BootstrapDesc &response) {
-    client_ = std::make_unique<AsioRpcClient>(server_addr);
     RpcRawData request_raw, response_raw;
 
     auto status = serializeBootstrapDesc(request, request_raw);
     if (!status.ok()) return status;
 
-    RpcErrorCode err_code =
-        client_->call(BootstrapRdma, request_raw, response_raw);
+    RpcErrorCode err_code = AsioRpcClient::Get().call(
+        server_addr, BootstrapRdma, request_raw, response_raw);
     if (err_code)
         return Status::MetadataError(
             "RPC error found: " + std::to_string(err_code) + LOC_MARK);
@@ -322,13 +320,13 @@ Status RpcClient::bootstrap(const std::string &server_addr,
 Status RpcClient::sendData(const std::string &server_addr,
                            uint64_t peer_mem_addr, void *local_mem_addr,
                            size_t length) {
-    client_ = std::make_unique<AsioRpcClient>(server_addr);
     RpcRawData request, response;
     XferDataDesc desc{peer_mem_addr, length};
     request.resize(sizeof(XferDataDesc) + length);
     memcpy(&request[0], &desc, sizeof(desc));
     genericMemcpy(&request[sizeof(desc)], local_mem_addr, length);
-    RpcErrorCode err_code = client_->call(SendData, request, response);
+    RpcErrorCode err_code =
+        AsioRpcClient::Get().call(server_addr, SendData, request, response);
     if (err_code)
         return Status::MetadataError(
             "RPC error found: " + std::to_string(err_code) + LOC_MARK);
@@ -339,12 +337,12 @@ Status RpcClient::sendData(const std::string &server_addr,
 Status RpcClient::recvData(const std::string &server_addr,
                            uint64_t peer_mem_addr, void *local_mem_addr,
                            size_t length) {
-    client_ = std::make_unique<AsioRpcClient>(server_addr);
     RpcRawData request, response;
     XferDataDesc desc{peer_mem_addr, length};
     request.resize(sizeof(XferDataDesc) + length);
     memcpy(&request[0], &desc, sizeof(desc));
-    RpcErrorCode err_code = client_->call(RecvData, request, response);
+    RpcErrorCode err_code =
+        AsioRpcClient::Get().call(server_addr, RecvData, request, response);
     if (err_code)
         return Status::MetadataError(
             "RPC error found: " + std::to_string(err_code) + LOC_MARK);

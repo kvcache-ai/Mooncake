@@ -124,9 +124,6 @@ class RpcClient {
 
     Status recvData(const std::string &server_addr, uint64_t peer_mem_addr,
                     void *local_mem_addr, size_t length);
-
-   private:
-    std::unique_ptr<AsioRpcClient> client_;
 };
 
 class MetadataService {
