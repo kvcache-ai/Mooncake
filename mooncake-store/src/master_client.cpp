@@ -52,7 +52,7 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
             co_return result->result();
         }());
 
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -103,7 +103,7 @@ MasterClient::GetReplicaList(const std::string& object_key) {
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -167,7 +167,7 @@ MasterClient::PutStart(const std::string& key,
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -235,7 +235,7 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -282,7 +282,7 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key) {
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -328,7 +328,7 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -349,7 +349,7 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
             co_return result->result();
         }());
 
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -372,7 +372,7 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
         }
         co_return result->result();
     }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -395,7 +395,7 @@ tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
         }
         co_return result->result();
     }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -417,7 +417,7 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
             }
             co_return result->result();
         }());
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -439,7 +439,7 @@ MasterClient::Ping(const UUID& client_id) {
             co_return result->result();
         }());
 
-    timer.LogResponseExpected(result, "result=");
+    timer.LogResponseExpected(result);
     return result;
 }
 

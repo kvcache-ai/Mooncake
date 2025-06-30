@@ -1,16 +1,25 @@
 #pragma once
 
-#include <functional>
+#include <ylt/struct_json/json_writer.h>
+
 #include <string_view>
 #include <type_traits>
-#include <utility>
+#include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/util/tl/expected.hpp>
 
-#include "master_metric_manager.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
-#include "ylt/util/tl/expected.hpp"
 
 namespace mooncake {
+
+template <typename T>
+struct is_tl_expected : std::false_type {};
+
+template <typename T>
+struct is_tl_expected<tl::expected<T, ErrorCode>> : std::true_type {};
+
+template <typename T>
+concept TlExpected = is_tl_expected<std::decay_t<T>>::value;
 
 /**
  * @brief A helper function to execute a single RPC call, handling common tasks
@@ -27,31 +36,20 @@ namespace mooncake {
  * @param inc_fail_metric A function to increment the failure counter metric.
  * @return The result of the RPC call, a tl::expected object.
  */
-template <typename RpcCallable, typename LogRequestCallable>
+template <typename RpcCallable, typename LogRequestCallable,
+          typename IncReqMetric, typename IncFailMetric>
 auto execute_rpc(std::string_view rpc_name, RpcCallable&& rpc_call,
                  LogRequestCallable&& log_request,
-                 std::function<void()> inc_req_metric,
-                 std::function<void()> inc_fail_metric) {
+                 IncReqMetric&& inc_req_metric, IncFailMetric&& inc_fail_metric)
+    requires TlExpected<std::invoke_result_t<RpcCallable>>
+{
     ScopedVLogTimer timer(1, rpc_name.data());
     log_request(timer);
 
     inc_req_metric();
 
     auto result = rpc_call();
-
-    if (result) {
-        using ResultType = typename decltype(result)::value_type;
-        // Special handling for bool to log the value, similar to the original
-        // implementation of ExistKey.
-        if constexpr (std::is_same_v<ResultType, bool>) {
-            timer.LogResponse("success=true, exist=", result.value());
-        } else {
-            timer.LogResponse("success=true");
-        }
-    } else {
-        inc_fail_metric();
-        timer.LogResponse("success=false, error=", toString(result.error()));
-    }
+    timer.LogResponseExpected(result);
 
     return result;
 }

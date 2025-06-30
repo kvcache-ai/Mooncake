@@ -6,9 +6,11 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>  // Required for std::true_type, std::false_type
 #include <utility>
 
 #include "types.h"
+#include "utils.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/util/tl/expected.hpp"
@@ -19,10 +21,10 @@ namespace mooncake {
  * @brief RAII-style timer class for VLOG logging with request/response timing
  *
  * Usage example:
- *   ScopedVLogTimer timer(1, "GetReplicaList");
- *   timer.LogRequest("key=", key);
- *   // ... do work ...
- *   timer.LogResponse("replica_list=", replica_list);
+ * ScopedVLogTimer timer(1, "GetReplicaList");
+ * timer.LogRequest("key=", key);
+ * // ... do work ...
+ * timer.LogResponse("replica_list=", replica_list);
  */
 class ScopedVLogTimer {
    public:
@@ -40,7 +42,7 @@ class ScopedVLogTimer {
     void LogRequest(Args&&... args) {
         if (active_) {
             std::ostringstream oss;
-            (oss << ... << std::forward<Args>(args));
+            static_cast<void>((oss << ... << std::forward<Args>(args)));
             VLOG(level_) << function_name_ << " request: " << oss.str();
         }
     }
@@ -76,8 +78,7 @@ class ScopedVLogTimer {
 
     // Specialized method for logging tl::expected types efficiently
     template <typename T, typename... Args>
-    void LogResponseExpected(const tl::expected<T, ErrorCode>& expected,
-                             Args&&... args) {
+    void LogResponseExpected(const tl::expected<T, ErrorCode>& expected) {
         if (active_) {
             auto end_time = std::chrono::steady_clock::now();
             auto latency =
@@ -85,29 +86,7 @@ class ScopedVLogTimer {
                     end_time - start_time_);
 
             std::ostringstream oss;
-            (oss << ... << std::forward<Args>(args));
-
-            if (expected.has_value()) {
-                oss << "success, resp=";
-                if constexpr (iguana::ylt_refletable_v<T>) {
-                    struct_json::to_json(expected.value(), oss);
-                } else if constexpr (std::is_same_v<T, std::string>) {
-                    oss << expected.value();
-                } else if constexpr (std::is_same_v<T,
-                                                    std::vector<std::string>>) {
-                    oss << "[";
-                    for (const auto& item : expected.value()) {
-                        oss << item << ",";
-                    }
-                    oss << "]";
-                } else if constexpr (std::is_same_v<T, void>) {
-                    // For tl::expected<void, ErrorCode>
-                    oss << "void";
-                }
-            } else {
-                oss << "error=" << toString(expected.error());
-            }
-
+            oss << expected_to_str(expected);
             VLOG(level_) << function_name_ << " response: " << oss.str()
                          << ", latency=" << latency.count() << "us";
             logged_response_ = true;

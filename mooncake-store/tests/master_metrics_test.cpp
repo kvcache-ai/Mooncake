@@ -61,6 +61,18 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_eviction_attempts(), 0);
     ASSERT_EQ(metrics.get_evicted_key_count(), 0);
     ASSERT_EQ(metrics.get_evicted_size(), 0);
+
+    // Batch RPC Metrics
+    ASSERT_EQ(metrics.get_batch_exist_key_requests(), 0);
+    ASSERT_EQ(metrics.get_batch_exist_key_failures(), 0);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 0);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 0);
+    ASSERT_EQ(metrics.get_batch_put_start_requests(), 0);
+    ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
+    ASSERT_EQ(metrics.get_batch_put_end_requests(), 0);
+    ASSERT_EQ(metrics.get_batch_put_end_failures(), 0);
+    ASSERT_EQ(metrics.get_batch_put_revoke_requests(), 0);
+    ASSERT_EQ(metrics.get_batch_put_revoke_failures(), 0);
 }
 
 TEST_F(MasterMetricsTest, BasicRequestTest) {
@@ -96,7 +108,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
     // Test PutStart and PutRevoke request
-    auto put_start_result1 = service_.PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result1 =
+        service_.PutStart(key, value_length, slice_lengths, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
@@ -110,7 +123,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_revoke_failures(), 0);
 
     // Test PutStart and PutEnd request
-    auto put_start_result2 = service_.PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result2 =
+        service_.PutStart(key, value_length, slice_lengths, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
@@ -146,7 +160,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_size(), 0);
 
     // Test RemoveAll request
-    auto put_start_result3 = service_.PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result3 =
+        service_.PutStart(key, value_length, slice_lengths, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result2 = service_.PutEnd(key);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -158,7 +173,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_size(), 0);
 
     // Test UnmountSegment request
-    auto put_start_result4 = service_.PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result4 =
+        service_.PutStart(key, value_length, slice_lengths, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result3 = service_.PutEnd(key);
     ASSERT_TRUE(put_end_result3.has_value());
@@ -170,6 +186,76 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_size(), 0);
     ASSERT_EQ(metrics.get_total_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
+}
+
+TEST_F(MasterMetricsTest, BatchRequestTest) {
+    const uint64_t default_kv_lease_ttl = 100;
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterService service_(false, default_kv_lease_ttl, true);
+
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 64;
+    std::string segment_name = "test_segment";
+    UUID segment_id = generate_uuid();
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = segment_name;
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+
+    std::vector<std::string> keys = {"test_key1", "test_key2", "test_key3"};
+    std::vector<uint64_t> value_lengths = {1024, 2048, 512};
+    std::vector<std::vector<uint64_t>> slice_lengths = {{1024}, {2048}, {512}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Mount segment
+    auto mount_result = service_.MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    // Test BatchExistKey request (should all return false initially)
+    auto batch_exist_result = service_.BatchExistKey(keys);
+    ASSERT_EQ(batch_exist_result.size(), 3);
+    ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
+    ASSERT_EQ(metrics.get_batch_exist_key_failures(), 0);
+
+    // Test BatchPutStart request
+    auto batch_put_start_result =
+        service_.BatchPutStart(keys, value_lengths, slice_lengths, config);
+    ASSERT_EQ(batch_put_start_result.size(), 3);
+    ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
+    ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
+
+    // Test BatchGetReplicaList request (should all fail)
+    auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
+    ASSERT_EQ(batch_get_replica_result.size(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 3);
+
+    // Test BatchPutEnd request
+    auto batch_put_end_result = service_.BatchPutEnd(keys);
+    ASSERT_EQ(batch_put_end_result.size(), 3);
+    ASSERT_EQ(metrics.get_batch_put_end_requests(), 1);
+    ASSERT_EQ(metrics.get_batch_put_end_failures(), 0);
+
+    // Test BatchExistKey again (should all return true now)
+    auto batch_exist_result2 = service_.BatchExistKey(keys);
+    ASSERT_EQ(batch_exist_result2.size(), 3);
+    ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
+    ASSERT_EQ(metrics.get_batch_exist_key_failures(), 0);
+
+    // Test BatchGetReplicaList again (should all succeed now)
+    auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
+    ASSERT_EQ(batch_get_replica_result2.size(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 3);
+
+    // Test BatchPutRevoke request (should all fail)
+    auto batch_put_revoke_result = service_.BatchPutRevoke(keys);
+    ASSERT_EQ(batch_put_revoke_result.size(), 3);
+    ASSERT_EQ(metrics.get_batch_put_revoke_requests(), 1);
+    ASSERT_EQ(metrics.get_batch_put_revoke_failures(), 3);
 }
 
 }  // namespace mooncake::test
