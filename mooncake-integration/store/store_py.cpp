@@ -949,6 +949,26 @@ std::vector<int> DistributedObjectStore::batch_put_from(
     }
 
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    
+    // Create slices from user buffers
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const std::string &key = keys[i];
+        void *buffer = buffers[i];
+        size_t size = sizes[i];
+        
+        std::vector<mooncake::Slice> slices;
+        uint64_t offset = 0;
+        
+        while (offset < size) {
+            auto chunk_size = std::min(size - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+        
+        all_slices[key] = std::move(slices);
+    }
+    
     ReplicateConfig config;
     config.replica_num = 1;                           // Make configurable
     config.preferred_segment = this->local_hostname;  // Make configurable
@@ -981,7 +1001,7 @@ std::vector<int> DistributedObjectStore::batch_put_from(
             results[i] = 0;
         }
     }
-
+    
     return results;
 }
 
