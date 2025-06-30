@@ -330,7 +330,6 @@ Status RdmaTransport::submitTransferTask(
                 auto source_addr = slice->source_addr;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) getSliceCache().deallocate(s);
-                nr_slices = 0;
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
