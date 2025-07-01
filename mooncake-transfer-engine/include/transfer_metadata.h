@@ -16,7 +16,11 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>  // Ubuntu
+#else
+#include <json/json.h>  // CentOS
+#endif
 #include <netdb.h>
 
 #include <atomic>
