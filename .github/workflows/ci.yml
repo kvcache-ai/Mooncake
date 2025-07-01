@@ -187,12 +187,19 @@ jobs:
         deactivate
       shell: bash
 
+    - name: Restart metadata server
+      run: |
+        pkill mooncake_http_metadata_server || true
+        source test_env/bin/activate
+        mooncake_http_metadata_server --port 8080 &
+      shell: bash
+
     - name: Run tests with ssd
       run: |
         source test_env/bin/activate
         mkdir -p /tmp/mooncake_test_ssd
         export MOONCAKE_STORAGE_ROOT_DIR=/tmp/mooncake_test_ssd
-        ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
         deactivate
         rm -rf /tmp/mooncake_test_ssd
       shell: bash
