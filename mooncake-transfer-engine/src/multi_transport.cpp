@@ -24,6 +24,9 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
+#ifdef USE_ASCEND
+#include "transport/ascend_transport/hccl_transport/hccl_transport.h"
+#endif
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
@@ -197,6 +200,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
+    }
+#endif
+#ifdef USE_ASCEND
+    else if (std::string(proto) == "ascend") {
+        transport = new HcclTransport();
     }
 #endif
 #ifdef USE_MNNVL
