@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SHM_TRANSPORT_H_
-#define SHM_TRANSPORT_H_
+#ifndef MNNVL_TRANSPORT_H_
+#define MNNVL_TRANSPORT_H_
 
 #include <asio.hpp>
 #include <boost/thread.hpp>
@@ -27,28 +27,27 @@
 
 namespace mooncake {
 namespace v1 {
-class ShmThreadPool;
+class MnnvlThreadPool;
 
-struct ShmTask {
+struct MnnvlTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
-    bool is_cuda_ipc;
 };
 
-struct ShmSubBatch : public Transport::SubBatch {
-    std::vector<ShmTask> task_list;
+struct MnnvlSubBatch : public Transport::SubBatch {
+    std::vector<MnnvlTask> task_list;
     size_t max_size;
 };
 
-class ShmTransport : public Transport {
-    friend class ShmThreadPool;
+class MnnvlTransport : public Transport {
+    friend class MnnvlThreadPool;
 
    public:
-    ShmTransport();
+    MnnvlTransport();
 
-    ~ShmTransport();
+    ~MnnvlTransport();
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<MetadataService> metadata,
@@ -75,7 +74,7 @@ class ShmTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    virtual const char *getName() const { return "shm"; }
+    virtual const char *getName() const { return "mnnvl"; }
 
     virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
                                        const Location &location);
@@ -85,30 +84,30 @@ class ShmTransport : public Transport {
     virtual bool precheck(const Request &request);
 
    private:
-    void startTransfer(ShmTask *task);
+    void startTransfer(MnnvlTask *task);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
-                                       uint64_t target_id, bool &is_cuda_ipc);
+                                       uint64_t target_id);
 
    private:
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;
-    std::unique_ptr<ShmThreadPool> workers_;
+    std::unique_ptr<MnnvlThreadPool> workers_;
 
-    struct OpenedShmEntry {
-        int shm_fd;
-        void *shm_addr;
+    struct OpenedMnnvlEntry {
+        int mnnvl_fd;
+        void *mnnvl_addr;
         uint64_t length;
         bool is_cuda_ipc;
     };
 
     using HashMap =
         std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedShmEntry>>;
+                           std::unordered_map<uint64_t, OpenedMnnvlEntry>>;
 
     std::mutex relocate_mutex_;
     HashMap relocate_map_;
@@ -119,4 +118,4 @@ class ShmTransport : public Transport {
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // SHM_TRANSPORT_H_
+#endif  // MNNVL_TRANSPORT_H_

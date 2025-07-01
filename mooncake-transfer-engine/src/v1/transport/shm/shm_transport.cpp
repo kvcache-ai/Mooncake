@@ -99,14 +99,16 @@ Status ShmTransport::uninstall() {
         workers_->stop();
         workers_.reset();
         metadata_.reset();
-        for (auto &entry : relocate_map_) {
-            if (entry.second.is_cuda_ipc) {
+        for (auto &relocate_map : relocate_map_) {
+            for (auto &entry : relocate_map.second) {
+                if (entry.second.is_cuda_ipc) {
 #ifdef USE_CUDA
-                cudaIpcCloseMemHandle(entry.second.shm_addr);
+                    cudaIpcCloseMemHandle(entry.second.shm_addr);
 #endif
-            } else {
-                munmap(entry.second.shm_addr, entry.second.length);
-                close(entry.second.shm_fd);
+                } else {
+                    munmap(entry.second.shm_addr, entry.second.length);
+                    close(entry.second.shm_fd);
+                }
             }
         }
         relocate_map_.clear();
@@ -143,13 +145,15 @@ Status ShmTransport::submitTransferTasks(
         shm_batch->task_list.push_back(ShmTask{});
         auto &task = shm_batch->task_list[shm_batch->task_list.size() - 1];
         uint64_t target_addr = request.target_offset;
+        bool is_cuda_ipc = true;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
-                target_addr, request.length, request.target_id);
+                target_addr, request.length, request.target_id, is_cuda_ipc);
             if (!status.ok()) return status;
         }
         task.target_addr = target_addr;
         task.request = request;
+        task.is_cuda_ipc = is_cuda_ipc;
         task.status_word = TransferStatusEnum::PENDING;
         startTransfer(&task);
     }
@@ -158,25 +162,35 @@ Status ShmTransport::submitTransferTasks(
 
 void ShmTransport::startTransfer(ShmTask *task) {
     workers_->submit([task]() {
+        if (task->is_cuda_ipc) {
 #ifdef USE_CUDA
-        if (task->request.target_id == LOCAL_SEGMENT_ID) {
+            cudaError_t err;
             if (task->request.opcode == Request::READ)
-                cudaMemcpy(slice->source_addr, (void *)task->target_addr,
-                           slice->length, cudaMemcpyDefault);
+                err =
+                    cudaMemcpy(task->request.source, (void *)task->target_addr,
+                               task->request.length, cudaMemcpyDefault);
             else
-                cudaMemcpy((void *)task->target_addr, slice->source_addr,
-                           slice->length, cudaMemcpyDefault);
-        }
+                err =
+                    cudaMemcpy((void *)task->target_addr, task->request.source,
+                               task->request.length, cudaMemcpyDefault);
+            if (err == cudaSuccess) {
+                task->transferred_bytes = task->request.length;
+                task->status_word = TransferStatusEnum::COMPLETED;
+            } else
+                task->status_word = TransferStatusEnum::FAILED;
 #else
-        if (task->request.opcode == Request::READ)
-            memcpy(task->request.source, (void *)task->target_addr,
-                   task->request.length);
-        else
-            memcpy((void *)task->target_addr, task->request.source,
-                   task->request.length);
+            assert(0);
 #endif
-        task->transferred_bytes = task->request.length;
-        task->status_word = TransferStatusEnum::COMPLETED;
+        } else {
+            if (task->request.opcode == Request::READ)
+                memcpy(task->request.source, (void *)task->target_addr,
+                       task->request.length);
+            else
+                memcpy((void *)task->target_addr, task->request.source,
+                       task->request.length);
+            task->transferred_bytes = task->request.length;
+            task->status_word = TransferStatusEnum::COMPLETED;
+        }
     });
 }
 
@@ -292,17 +306,19 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
 
 Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
-                                                 uint64_t target_id) {
+                                                 uint64_t target_id,
+                                                 bool &is_cuda_ipc) {
     SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return status;
     int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    auto &relocate_map = relocate_map_[target_id];
     for (auto &entry : detail.buffers) {
         if (!entry.shm_path.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             std::lock_guard<std::mutex> lock(relocate_mutex_);
-            if (!relocate_map_.count(entry.addr)) {
+            if (!relocate_map.count(entry.addr)) {
                 void *shm_addr = nullptr;
                 if (entry.location.starts_with("cuda")) {
 #ifdef USE_CUDA
@@ -323,7 +339,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
                     shm_entry.is_cuda_ipc = true;
-                    relocate_map_[entry.addr] = shm_entry;
+                    relocate_map[entry.addr] = shm_entry;
 #else
                     return Status::NotImplemented(
                         "CUDA supported not enabled in this package " LOC_MARK);
@@ -347,11 +363,12 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
                     shm_entry.is_cuda_ipc = false;
-                    relocate_map_[entry.addr] = shm_entry;
+                    relocate_map[entry.addr] = shm_entry;
                 }
             }
-            auto shm_addr = relocate_map_[entry.addr].shm_addr;
+            auto shm_addr = relocate_map[entry.addr].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+            is_cuda_ipc = relocate_map[entry.addr].is_cuda_ipc;
             return Status::OK();
         }
         index++;
