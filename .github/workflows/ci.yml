@@ -180,20 +180,6 @@ jobs:
         mooncake_http_metadata_server --port 8080 &
       shell: bash
 
-    - name: Run tests
-      run: |
-        source test_env/bin/activate
-        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
-        deactivate
-      shell: bash
-
-    - name: Restart metadata server
-      run: |
-        pkill mooncake_http_metadata_server || true
-        source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
-      shell: bash
-
     - name: Run tests with ssd
       run: |
         source test_env/bin/activate
@@ -203,6 +189,21 @@ jobs:
         deactivate
         rm -rf /tmp/mooncake_test_ssd
       shell: bash
+
+    - name: Restart metadata server
+      run: |
+        PID=$(pgrep -f "mooncake_http_metadata_server"); kill -9 $PID
+        source test_env/bin/activate
+        mooncake_http_metadata_server --port 8080 &
+      shell: bash
+
+    - name: Run tests
+      run: |
+        source test_env/bin/activate
+        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
+        deactivate
+      shell: bash
+
 
   build-flags:
     runs-on: ubuntu-22.04
