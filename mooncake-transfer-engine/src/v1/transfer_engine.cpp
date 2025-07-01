@@ -142,27 +142,30 @@ Status TransferEngine::construct() {
 
     CHECK_STATUS(setupLocalSegment());
 
-    LOG(INFO) << "========== Transfer Engine Parameters ==========";
-    LOG(INFO) << " - Segment Name:       " << local_segment_name_;
-    LOG(INFO) << " - RPC Server Address: "
-              << buildIpAddrWithPort(hostname_, port_, ipv6_);
-    LOG(INFO) << " - Metadata Type:      " << metadata_type;
-    LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
-    LOG(INFO) << "================================================";
-
     if (!topology_->getHcaList().empty()) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();
     }
     transport_list_[TCP] = std::make_shared<TcpTransport>();
     transport_list_[SHM] = std::make_shared<ShmTransport>();
 
+    std::string transport_string;
     for (auto &transport : transport_list_) {
         if (transport) {
             CHECK_STATUS(transport->install(local_segment_name_, metadata_,
                                             topology_, conf_));
-            LOG(INFO) << "Transport " << transport->getName() << " loaded";
+            transport_string += transport->getName();
+            transport_string += " ";
         }
     }
+
+    LOG(INFO) << "========== Transfer Engine Parameters ==========";
+    LOG(INFO) << " - Segment Name:       " << local_segment_name_;
+    LOG(INFO) << " - RPC Server Address: "
+              << buildIpAddrWithPort(hostname_, port_, ipv6_);
+    LOG(INFO) << " - Metadata Type:      " << metadata_type;
+    LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
+    LOG(INFO) << " - Loaded Transports:  " << transport_string;
+    LOG(INFO) << "================================================";
 
     return Status::OK();
 }
