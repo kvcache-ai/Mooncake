@@ -125,5 +125,4 @@ endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(gflags REQUIRED)
-find_package(glog REQUIRED)
 find_package(yalantinglibs CONFIG REQUIRED)
