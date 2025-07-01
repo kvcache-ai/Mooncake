@@ -127,16 +127,20 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_MNNVL
+        if (local_topology_->getHcaList().size() > 0 && !getenv("MC_FORCE_MNNVL")) {
+            multi_transports_->installTransport("rdma", local_topology_);
+        } else {
+            multi_transports_->installTransport("nvlink", nullptr);
+        }
+#else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
-#ifdef USE_MNNVL
-            multi_transports_->installTransport("nvlink", nullptr);
-#else
             multi_transports_->installTransport("tcp", nullptr);
-#endif
         }
+#endif
         // TODO: install other transports automatically
     }
 
@@ -194,7 +198,8 @@ std::string TransferEngine::getLocalIpAndPort() {
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
-int TransferEngine::getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies) {
+int TransferEngine::getNotifies(
+    std::vector<TransferMetadata::NotifyDesc> &notifies) {
     return metadata_->getNotifies(notifies);
 }
 
