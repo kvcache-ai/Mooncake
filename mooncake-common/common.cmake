@@ -35,6 +35,9 @@ endif()
 
 message(CMAKE_BUILD_TYPE ": ${CMAKE_BUILD_TYPE}")
 
+include(mooncake-common/FindJsonCpp.cmake)
+include(mooncake-common/FindGLOG.cmake)
+
 # Necessary if you are using Alibaba Cloud eRDMA
 add_definitions(-DCONFIG_ERDMA)
 
@@ -125,5 +128,4 @@ endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(gflags REQUIRED)
-find_package(glog REQUIRED)
 find_package(yalantinglibs CONFIG REQUIRED)
