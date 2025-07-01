@@ -13,7 +13,8 @@ Key features of Mooncake Store include:
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
 - **Eventual consistency**: Mooncake Store ensures that `Get` operations read complete and correct data, but does not guarantee the latest written data. This eventual consistency model ensures high performance while simplifying system design.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
-- **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management (to be refined in future versions).
+- **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
+- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
 
 ## Architecture
 
@@ -21,9 +22,15 @@ Mooncake Store is managed by a global **Master Service** responsible for allocat
 
 ![architecture](../../image/mooncake-store-preview.png)
 
-As shown in the figure above, there are two key components in Mooncake Store Preview:
+As shown in the figure above, there are two key components in Mooncake Store:
 1. **Master Service**: Manages the logical storage space pool of the entire cluster and maintains node entry and exit. This is an independently running process that provides RPC services externally. Note that the metadata service required by the Transfer Engine (via etcd, Redis, or HTTP, etc.) is not included in the Master Service and needs to be deployed separately.
 2. **Client**: Shares a process with the vLLM instance (at least in the current version). Each Client is allocated a certain size of DRAM space, serving as part of the logical storage space pool. Therefore, data transfer is actually from one Client to another, bypassing the Master.
+
+Mooncake store supports two deployment methods to accommodate different availability requirements:
+1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
+2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
+If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
+The leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
 ## Client C++ API
 
@@ -34,7 +41,7 @@ ErrorCode Init(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
                void** protocol_args,
-               const std::string& master_addr);
+               const std::string& master_server_entry);
 ```
 
 Initializes the Mooncake Store client. The parameters are as follows:
@@ -42,7 +49,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 - `metadata_connstring`: The address of the metadata service (e.g., etcd/Redis) required for Transfer Engine initialization
 - `protocol`: The protocol supported by the Transfer Engine, including RDMA and TCP
 - `protocol_args`: Protocol parameters required by the Transfer Engine
-- `master_addr`: The address information (`IP:Port`) of the Master
+- `master_server_entry`: The address information of the Master (`IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
 
 ### Get
 
@@ -399,7 +406,7 @@ Initializes storage configuration and network parameters.
 - `local_buffer_size`: Local buffer allocation size (default 16MB)
 - `protocol`: Communication protocol ("tcp" or "rdma")
 - `rdma_devices`: RDMA device spec (format depends on implementation)
-- `master_server_addr`: Master server address (host:port format)
+- `master_server_addr`: The address information of the Master (format: `IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
 
 **Returns**  
 - `int`: Status code (0 = success, non-zero = error)
@@ -523,10 +530,19 @@ store.close()
 
 ## Compilation and Usage
 Mooncake Store is compiled together with other related components (such as the Transfer Engine).
+
+For default mode:
 ```
-mkdir build
-cd build
-cmake ..
+mkdir build && cd build
+cmake .. # default mode
+make
+sudo make install # Install Python interface support package
+```
+
+High availability mode:
+```
+mkdir build && cd build
+cmake .. -DSTORE_USE_ETCD # compile etcd wrapper that depends on go
 make
 sudo make install # Install Python interface support package
 ```
@@ -543,10 +559,34 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+**High availability mode**:
+
+HA mode relies on an etcd service for coordination. If Transfer Engine also uses etcd as its metadata service, the etcd cluster used by Mooncake Store can either be shared with or separate from the one used by Transfer Engine.
+
+HA mode allows deployment of multiple master instances to eliminate the single point of failure. Each master instance must be started with the following parameters:
+```
+--enable-ha: enables high availability mode
+--etcd-endpoints: specifies endpoints for etcd service, separated by ';'
+--rpc-address: the RPC address of this instance
+```
+
+For example:
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-address=10.0.0.1
+```
+
 ### Starting the Sample Program
 Mooncake Store provides various sample programs, including interface forms based on C++ and Python. Below is an example of how to run using `stress_cluster_benchmark`.
 
-1. Open `stress_cluster_benchmark.py` and modify the initialization code according to the network situation, focusing on `local_hostname` (corresponding to the local machine IP address), `metadata_server` (corresponding to the Transfer Engine metadata service), `master_server_address` (corresponding to the Master Service address and port), etc.:
+1. Open `stress_cluster_benchmark.py` and update the initialization settings based on your network environment. Pay particular attention to the following fields:
+`local_hostname`: the IP address of the local machine
+`metadata_server`: the address of the Transfer Engine metadata service
+`master_server_address`: the address of the Master Service
+**Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
+For example: 
 ```python
 import os
 import time
@@ -590,7 +630,7 @@ retcode = store.setup(
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
    For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
 
-No error messages indicate successful data transfer.
+The absence of error messages indicates successful data transfer.
 
 ## Example Code
 
