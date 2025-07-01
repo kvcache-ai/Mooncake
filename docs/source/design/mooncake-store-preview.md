@@ -20,7 +20,7 @@ Key features of Mooncake Store include:
 
 Mooncake Store is managed by a global **Master Service** responsible for allocating storage space pools. The specific allocation details are implemented by the `BufferAllocator` class, coordinated by the `AllocationStrategy` strategy class.
 
-![architecture](../../image/mooncake-store-preview.png)
+![architecture](../image/mooncake-store-preview.png)
 
 As shown in the figure above, there are two key components in Mooncake Store:
 1. **Master Service**: Manages the logical storage space pool of the entire cluster and maintains node entry and exit. This is an independently running process that provides RPC services externally. Note that the metadata service required by the Transfer Engine (via etcd, Redis, or HTTP, etc.) is not included in the Master Service and needs to be deployed separately.
@@ -58,7 +58,7 @@ ErrorCode Get(const std::string& object_key,
               std::vector<Slice>& slices);
 ```
 
-![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
+![mooncake-store-simple-get](../image/mooncake-store-simple-get.png)
 
 
 Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.
@@ -73,7 +73,7 @@ ErrorCode Put(const ObjectKey& key,
               const ReplicateConfig& config);
 ```
 
-![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
+![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
 Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter. The data structure details of `ReplicateConfig` are as follows:
 
