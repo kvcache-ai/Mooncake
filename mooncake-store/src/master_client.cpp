@@ -616,8 +616,15 @@ GetFsdirResponse MasterClient::GetFsdir() {
     ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
     timer.LogRequest("action=get_fsdir");
 
+    auto client = client_accessor_.GetClient();
+    if(!client){
+        LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
+        return GetFsdirResponse{"", ErrorCode::RPC_FAIL};
+    }
+
     auto request_result =
-        client_.send_request<&WrappedMasterService::GetFsdir>();
+        client->send_request<&WrappedMasterService::GetFsdir>();
     std::optional<GetFsdirResponse> result =
         coro::syncAwait([&]() -> coro::Lazy<std::optional<GetFsdirResponse>> {
             auto result = co_await co_await request_result;
