@@ -120,6 +120,9 @@ class Transport {
                 void *remote_addr;
                 size_t remote_offset;
             } cxl;
+            struct {
+                uint64_t dest_addr;
+            } hccl;
         };
 
        public:
