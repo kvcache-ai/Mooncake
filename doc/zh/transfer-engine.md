@@ -409,3 +409,4 @@ int init(const std::string &metadata_conn_string,
 - `MC_LOG_DIR` 该选项指定存放日志重定向文件的目录路径。如果路径无效，glog将回退到向标准错误[stderr]输出日志。
 - `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
+- `MC_FRAGMENT_RATIO` 在将RdmaTransport::submitTransferTask中切割传输任务为传输块时，当切割完成后最后一块数据大小小于等于切割块大小的1/MC_FRAGMENT_RATIO，最后一块数据将合并进前一块的切割块进行传输以减少开销，默认值为4。
