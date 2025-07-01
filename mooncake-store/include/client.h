@@ -50,9 +50,9 @@ class Client {
     ErrorCode Get(const std::string& object_key, std::vector<Slice>& slices);
 
     /**
-     * @brief Gets object metadata without transferring data
+     * @brief Batch retrieve data for multiple keys
      * @param object_keys Keys to query
-     * @param slices Output parameter for the retrieved data
+     * @param slices Map of object keys to their data slices
      */
     ErrorCode BatchGet(
         const std::vector<std::string>& object_keys,
@@ -102,7 +102,7 @@ class Client {
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
      * @param object_infos Previously queried object metadata
-     * @param slices Vector of slices to store the data
+     * @param slices Map of object keys to their data slices
      * @return ErrorCode indicating success/failure
      */
     ErrorCode BatchGet(
@@ -123,7 +123,7 @@ class Client {
     /**
      * @brief Batch put data with replication
      * @param keys Object keys
-     * @param batched_slices Vector of data slices to store
+     * @param batched_slices Map of object keys to their data slices
      * @param config Replication configuration
      */
     ErrorCode BatchPut(
