@@ -50,15 +50,17 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
+#ifdef USE_ASCEND
+    int device_id = -1;
+    auto [host_name, port] = parseHostNameWithPortAscend(local_server_name, &device_id);
+    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: " << host_name << " port: "
+    << port << " device_id: " << device_id;
+#endif
+
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
-#ifdef USE_ASCEND
-        int device_id = -1;
-        auto [host_name, port] = parseHostNameWithPortAscend(local_server_name, &device_id);
-        LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: " << host_name << " port: "
-        << port << " device_id: " << device_id;
-#else
+#ifndef USE_ASCEND
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
 #endif
         desc.ip_or_host_name = host_name;
@@ -116,7 +118,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-
+#ifdef USE_ASCEND
+    local_server_name_ = desc.ip_or_host_name + ":" + std::to_string(port);
+#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 #ifdef USE_ASCEND

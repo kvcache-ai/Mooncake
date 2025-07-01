@@ -12,7 +12,7 @@ set_target_properties(ascend_transport
 
 target_compile_options(ascend_transport PRIVATE
                        -O2
-                       -std=c++17
+                       -std=c++20
                        -Xlinker -export-dynamic     
                     )
 

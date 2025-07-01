@@ -10,6 +10,7 @@ set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
 set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
 
 file(GLOB MPI_INCLUDE_DIR "/usr/include/mpich-*")
+file(GLOB MPI_INCLUDE_ARM_DIR "/usr/include/aarch64-linux-gnu/mpich*/")
 file(GLOB MPI_LOCAL_INCLUDE_DIR "/usr/local/mpich-*/include")
 
 link_directories(${ASCEND_LIB_DIR})
@@ -25,6 +26,7 @@ include_directories(/usr/local/include
                     ${ASCEND_INCLUDE_DIR}/experiment/msprof
                     ${MPI_INCLUDE_DIR}
                     ${MPI_LOCAL_INCLUDE_DIR}
+                    ${MPI_INCLUDE_ARM_DIR}
                     /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/
                     )
 add_library(ascend_transport_mem SHARED  ${ASCEND_TRANSPORT_MEM_SOURCES})

@@ -92,7 +92,7 @@ class HcclTransport : public Transport {
     std::atomic_bool running_;
     std::thread allInitiatorThreads_[THREAD_NUM];
     std::thread allAcceptThreads_[THREAD_NUM];
-    std::queue<Slice*> allReqQueues_[THREAD_NUM];
+    std::queue<std::vector<Slice *>> allReqQueues_[THREAD_NUM];
     std::mutex initiator_mutex_;
     std::condition_variable initiator_cond_;
     RankInfo local_rank_info_;

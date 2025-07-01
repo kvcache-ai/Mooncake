@@ -44,27 +44,33 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
     aclrtStream stream;
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: aclrtSetDevice error, ret:" << ret;
+        LOG(ERROR) << "HcclTransport: aclrtSetDevice error, ret: " << ret;
     }
 
     ret = aclrtCreateStream(&stream);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret:" << ret;
+        LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret: " << ret;
     }
     
-    while(running_) {
+    while(1) {
+        auto waitlock = std::chrono::high_resolution_clock::now();
         std::unique_lock<std::mutex> lock(initiator_mutex_);
-        if (allReqQueues_[selfIdx].empty()) {
+        if (allReqQueues_[selfIdx].empty()){
             initiator_cond_.wait(lock);
         }
-
-        auto slice = std::move(allReqQueues_[selfIdx].front());
+        auto start = std::chrono::high_resolution_clock::now();
+        auto slice_list = std::move(allReqQueues_[selfIdx].front());
         allReqQueues_[selfIdx].pop();
         lock.unlock();
-        auto segment_desc = metadata_->getSegmentDescByID(slice->target_id);
+        if (slice_list.empty()) {
+            LOG(ERROR) << "HcclTransport: empty transfer request batch";
+        }
+        auto segment_desc = metadata_->getSegmentDescByID(slice_list[0]->target_id);
         if (!segment_desc) {
-            LOG(ERROR) << "Unable to get target segment ID, please recheck, segment ID:" << slice->target_id;
-            slice->markFailed();
+            LOG(ERROR) << "Unable to get target segment ID, please recheck, segment ID: " << slice_list[0]->target_id;
+            for (auto slice : slice_list) {
+                slice->markFailed();
+            }
             continue;
         }
 
@@ -78,14 +84,76 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         remote_rank_info_.serverIdx = 0;
         remote_rank_info_.pid = segment_desc->rank_info.pid;
 
-        ret = transportMemTask(&local_rank_info_, &remote_rank_info_, slice->opcode,
-            slice->hccl.dest_addr, slice->length, slice->source_addr, stream);
+        for (auto slice : slice_list) {
+            ret = transportMemTask(&local_rank_info_, &remote_rank_info_, slice->opcode,
+                slice->hccl.dest_addr, slice->length, slice->source_addr, stream);
+            if (ret) {
+                LOG(ERROR) << "HcclTransport: transportMemTask error, local devicePhyId: "
+                        << local_rank_info_.devicePhyId
+                        << ", remote devicePhyId: "
+                        << remote_rank_info_.devicePhyId 
+                        << ", source_addr: "
+                        << slice->source_addr
+                        << ", dest_addr: "
+                        << slice->hccl.dest_addr
+                        << ", ret: " << ret;
+                slice->markFailed();
+                slice->status = Slice::SliceStatus::FAILED;
+            }
+        }
+        
+        auto mid = std::chrono::high_resolution_clock::now();
+        ret = transportMemAddOpFence(&remote_rank_info_, stream);
         if (ret) {
-            LOG(ERROR) << "HcclTransport: transportMemTask error, ret:" << ret;
-            slice->markFailed();
+            LOG(ERROR) << "transportMemAddOpFence failed, local devicePhyId: " 
+                    << local_rank_info_.devicePhyId
+                    << ", remote devicePhyId: "
+                    << remote_rank_info_.devicePhyId
+                    << ", ret: " << ret;
+            for (auto slice : slice_list) {
+                slice->markFailed();
+            }
+        }
+        auto addOpfence = std::chrono::high_resolution_clock::now();
+
+        ret = aclrtSynchronizeStream(stream);
+        if (ret) {
+            LOG(ERROR) << "aclrtSynchronizeStream failed, local devicePhyId: " 
+                    << local_rank_info_.devicePhyId
+                    << ", remote devicePhyId: "
+                    << remote_rank_info_.devicePhyId
+                    << ", ret: " << ret;
+            for (auto slice : slice_list) {
+                slice->markFailed();
+            }
+        }
+        for (auto slice : slice_list) {
+            if (slice->status != Slice::SliceStatus::FAILED) {
+                slice->markSuccess();
+                slice->task->transferred_bytes = slice->length;
+            }   
+        }
+        auto stop = std::chrono::high_resolution_clock::now();
+        if (printEnabled()) {
+            pid_t pid = getpid();
+            auto duration_wait = std::chrono::duration_cast<std::chrono::milliseconds>(start - waitlock);
+            auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(mid - start);
+            auto duration_addOpfence = std::chrono::duration_cast<std::chrono::microseconds>(addOpfence - mid);
+            auto duration_sync = std::chrono::duration_cast<std::chrono::microseconds>(stop - addOpfence);
+            LOG(INFO) << "pid: " << pid
+            << ", target hostIp: " << segment_desc->rank_info.hostIp.c_str()
+            << ", local devicePhyId: " << local_rank_info_.devicePhyId 
+            << ", target devicePhyId: " << remote_rank_info_.devicePhyId
+            << ", batch waitlock spent: "<< duration_wait.count() << "ms"
+            << ", batch call spent: "<< duration_call.count() << "us"
+            << ", batch addOpfence spent: " << duration_addOpfence.count() << "us"
+            << ", batch sync spent: " << duration_sync.count() << "us";
         } else {
-            slice->markSuccess();
-            slice->task->transferred_bytes += slice->length;
+            (void)waitlock;
+            (void)start;
+            (void)mid;
+            (void)addOpfence;
+            (void)stop;
         }
     }
 }
@@ -93,24 +161,23 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
 void HcclTransport::acceptLoop(int deviceLogicId) {
     int ret = aclrtSetDevice(deviceLogicId);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: aclrtSetDevice failed ret:" << ret;
+        LOG(ERROR) << "HcclTransport: aclrtSetDevice failed ret: " << ret;
     }
     while(running_) {
         ret = transportMemAccept(&local_rank_info_);
         if (ret) {
-            LOG(ERROR) << "HcclTransport: transportMemAccept failed ret:" << ret;
+            LOG(ERROR) << "HcclTransport: transportMemAccept failed ret: " << ret;
         } 
     }
 }
 
 int HcclTransport::initPdThread() {
     pid_t pid = getpid();
-
     int ret = 0;
     int deviceLogicId;
     ret = aclrtGetDevice(&deviceLogicId);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: aclrtGetDevice failed, ret:" << ret;
+        LOG(ERROR) << "HcclTransport: aclrtGetDevice failed, ret: " << ret;
         return ret;
     } 
 
@@ -168,7 +235,7 @@ int HcclTransport::rankInfoParse(int devicePhyId, std::string hostIp) {
     int deviceLogicId = 0;
     ret = aclrtGetDevice(&deviceLogicId);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: aclrtGetDevice failed, ret:" << ret;
+        LOG(ERROR) << "HcclTransport: aclrtGetDevice failed, ret: " << ret;
         return ret;
     }
     
@@ -206,10 +273,10 @@ int HcclTransport::rankInfoParse(int devicePhyId, std::string hostIp) {
                         LOG(ERROR) << "HcclTransport: Invalid Device IP format: " << deviceIp;
                         return -1;
                     }
-                    LOG(INFO) << "rankInfoParse Success, hostIp: " << hostIp << " rankId: " << local_rank_info_.rankId
-                    << " serverIdx: " << local_rank_info_.serverIdx << " devicePhyId: " << local_rank_info_.devicePhyId
-                    << " hostPort: " << local_rank_info_.hostPort << " deviceLogicId: " << local_rank_info_.deviceLogicId
-                    << " devicePort: " << local_rank_info_.devicePort << " deviceIp: " << deviceIp << " pid:" << local_rank_info_.pid;
+                    LOG(INFO) << "rankInfoParse Success, hostIp: " << hostIp << ", rankId: " << local_rank_info_.rankId
+                    << ", serverIdx: " << local_rank_info_.serverIdx << ", devicePhyId: " << local_rank_info_.devicePhyId
+                    << ", hostPort: " << local_rank_info_.hostPort << ", deviceLogicId: " << local_rank_info_.deviceLogicId
+                    << ", devicePort: " << local_rank_info_.devicePort << ", deviceIp: " << deviceIp << ", device pid: " << local_rank_info_.pid;
                     // Exit after finishing rankInfoParse
                     return 0;
                 }
@@ -284,7 +351,8 @@ Status HcclTransport::submitTransfer(
 
     int task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-
+    std::vector<Slice *> slice_list;
+    slice_list.reserve(entries.size());
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
@@ -300,10 +368,14 @@ Status HcclTransport::submitTransfer(
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         std::unique_lock<std::mutex> lock(initiator_mutex_);
-        allReqQueues_[0].push(slice);
+        slice_list.push_back(slice);
         lock.unlock();
         initiator_cond_.notify_one();
     }
+    std::unique_lock<std::mutex> lock(initiator_mutex_);
+    allReqQueues_[0].push(slice_list);
+    lock.unlock();
+    initiator_cond_.notify_one();
 
     return Status::OK();
 }
@@ -311,25 +383,29 @@ Status HcclTransport::submitTransfer(
 Status HcclTransport::submitTransferTask(
     const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        auto &request = *request_list[index];
-        auto &task = *task_list[index];
-        task.total_bytes = request.length;
+    std::vector<Slice *> slice_list;
+    slice_list.reserve(request_list.size());
+    int task_id = 0;
+    for (auto &request : request_list) {
+        TransferTask &task = *task_list[task_id];
+        ++task_id;
+        task.total_bytes = request->length;
         Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->hccl.dest_addr = request.target_offset;
+        slice->source_addr = (char *)request->source;
+        slice->length = request->length;
+        slice->opcode = request->opcode;
+        slice->hccl.dest_addr = request->target_offset;
         slice->task = &task;
-        slice->target_id = request.target_id;
+        slice->target_id = request->target_id;
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
-        std::unique_lock<std::mutex> lock(initiator_mutex_);
-        allReqQueues_[0].push(slice);
-        lock.unlock();
-        initiator_cond_.notify_one();
+        slice_list.push_back(slice);
     }
+    std::unique_lock<std::mutex> lock(initiator_mutex_);
+    allReqQueues_[0].push(slice_list);
+    lock.unlock();
+    initiator_cond_.notify_one();
 
     return Status::OK();
 }
@@ -373,13 +449,13 @@ int HcclTransport::registerLocalMemory(void *addr, size_t length,
     int ret;
     ret = regLocalRmaMem(addr, (uint64_t)length);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: reglocalRmaMem failed, ret:" << ret;
+        LOG(ERROR) << "HcclTransport: reglocalRmaMem failed, ret: " << ret;
         return ret;
     }
 
     ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
-        LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed,ret: " << ret;
+        LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: " << ret;
         return ret;
     }
 
@@ -424,4 +500,3 @@ int HcclTransport::unregisterLocalMemoryBatch(
 }
 
 }
-
