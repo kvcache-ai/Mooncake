@@ -81,6 +81,8 @@ class ShmTransport : public Transport {
 
     virtual Status freeLocalMemory(const BufferEntry &buffer);
 
+    virtual bool precheck(const Request &request);
+
    private:
     void startTransfer(ShmTask *task);
 
@@ -100,11 +102,14 @@ class ShmTransport : public Transport {
         int shm_fd;
         void *shm_addr;
         uint64_t length;
+        bool is_cuda_ipc;
     };
 
     std::mutex relocate_mutex_;
     std::unordered_map<uint64_t, OpenedShmEntry> relocate_map_;
     std::shared_ptr<ConfigManager> conf_;
+    
+    std::string machine_id_;
 };
 }  // namespace v1
 }  // namespace mooncake

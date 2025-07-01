@@ -79,6 +79,7 @@ enum class SegmentType { Memory, File };
 struct SegmentDesc {
     std::string name;
     SegmentType type;
+    std::string machine_id;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 };
 
@@ -105,6 +106,8 @@ class SegmentManager {
     Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
 
     Status invalidateRemote(SegmentID handle);
+
+    bool isSameMachine(SegmentID handle);
 
    public:
     SegmentDescRef getLocal() { return local_desc_; }

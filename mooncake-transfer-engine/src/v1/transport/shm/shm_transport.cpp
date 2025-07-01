@@ -85,6 +85,7 @@ Status ShmTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     conf_ = conf;
+    machine_id_ = metadata->segmentManager().getLocal()->machine_id;
 
     const static size_t kDefaultThreadPoolSize = 1;
     workers_ = std::make_unique<ShmThreadPool>(kDefaultThreadPoolSize);
@@ -98,6 +99,17 @@ Status ShmTransport::uninstall() {
         workers_->stop();
         workers_.reset();
         metadata_.reset();
+        for (auto &entry : relocate_map_) {
+            if (entry.second.is_cuda_ipc) {
+#ifdef USE_CUDA
+                cudaIpcCloseMemHandle(entry.second.shm_addr);
+#endif
+            } else {
+                munmap(entry.second.shm_addr, entry.second.length);
+                close(entry.second.shm_fd);
+            }
+        }
+        relocate_map_.clear();
         installed_ = false;
     }
     return Status::OK();
@@ -194,10 +206,35 @@ void ShmTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
+    auto location = options.location;
+    if (location == kWildcardLocation) {
+        auto entries = getMemoryLocation((void *)desc.addr, desc.length);
+        if (!entries.empty()) location = entries[0].location;
+    }
+    desc.location = location;
+#ifdef USE_CUDA
+    if (location.starts_with("cuda")) {
+        cudaIpcMemHandle_t handle;
+        auto err = cudaIpcGetMemHandle(&handle, desc.addr);
+        if (err != cudaSuccess) {
+            return Status::InternalError("Failed to get cuda memory handle");
+        }
+        desc.shm_path =
+            serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+        return Status::OK();
+    }
+#endif
+    if (options.shm_path.empty())
+        return Status::OK();  // Return sliently but not regard it as valid
+                              // buffer for shared memory transport
+    desc.shm_path = options.shm_path;
+    // desc.shm_offset = options.shm_offset;
     return Status::OK();
 }
 
 Status ShmTransport::removeMemoryBuffer(BufferDesc &desc) {
+    desc.shm_path.clear();
+    // desc.shm_offset = 0;
     return Status::OK();
 }
 
@@ -266,25 +303,52 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             dest_addr + length <= entry.addr + entry.length) {
             std::lock_guard<std::mutex> lock(relocate_mutex_);
             if (!relocate_map_.count(entry.addr)) {
-                int shm_fd =
-                    shm_open(entry.shm_path.c_str(), O_RDWR, 0644);
-                if (shm_fd < 0) {
-                    return Status::InternalError(
-                        std::string("Failed to open shared memory file ") +
-                        entry.shm_path + LOC_MARK);
+                void *shm_addr = nullptr;
+                if (entry.location.starts_with("cuda")) {
+#ifdef USE_CUDA
+                    std::vector<unsigned char> output_buffer;
+                    deserializeBinaryData(entry.shm_name, output_buffer);
+                    cudaIpcMemHandle_t handle;
+                    memcpy(&handle, output_buffer.data(), sizeof(handle));
+                    auto err = cudaIpcOpenMemHandle(
+                        &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
+                    if (err != cudaSuccess) {
+                        LOG(ERROR) << "Failed to open cuda memory handle: "
+                                   << cudaGetErrorString(err);
+                        return Status::InternalError(
+                            "Failed to open cuda memory handle " LOC_MARK);
+                    }
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_fd = -1;
+                    shm_entry.shm_addr = shm_addr;
+                    shm_entry.length = length;
+                    shm_entry.is_cuda_ipc = true;
+                    relocate_map_[entry.addr] = shm_entry;
+#else
+                    return Status::NotImplemented(
+                        "CUDA supported not enabled in this package " LOC_MARK);
+#endif
+                } else {
+                    int shm_fd = shm_open(entry.shm_path.c_str(), O_RDWR, 0644);
+                    if (shm_fd < 0) {
+                        return Status::InternalError(
+                            std::string("Failed to open shared memory file ") +
+                            entry.shm_path + LOC_MARK);
+                    }
+                    shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, shm_fd, 0);
+                    if (shm_addr == MAP_FAILED) {
+                        close(shm_fd);
+                        return Status::InternalError(
+                            "Failed to map shared memory " LOC_MARK);
+                    }
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_fd = shm_fd;
+                    shm_entry.shm_addr = shm_addr;
+                    shm_entry.length = length;
+                    shm_entry.is_cuda_ipc = false;
+                    relocate_map_[entry.addr] = shm_entry;
                 }
-                auto shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
-                                     MAP_SHARED, shm_fd, 0);
-                if (shm_addr == MAP_FAILED) {
-                    close(shm_fd);
-                    return Status::InternalError(
-                        "Failed to map shared memory " LOC_MARK);
-                }
-                OpenedShmEntry shm_entry;
-                shm_entry.shm_fd = shm_fd;
-                shm_entry.shm_addr = shm_addr;
-                shm_entry.length = length;
-                relocate_map_[entry.addr] = shm_entry;
             }
             auto shm_addr = relocate_map_[entry.addr].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
@@ -294,6 +358,24 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     }
     return Status::InvalidArgument(
         "Requested address is not in registered buffer" LOC_MARK);
+}
+
+bool ShmTransport::precheck(const Request &request) {
+    if (request.target_id == LOCAL_SEGMENT_ID) return true;
+    SegmentDescRef desc;
+    auto status =
+        metadata_->segmentManager().getRemote(desc, request.target_id);
+    if (!status.ok()) return false;
+    if (desc->machine_id != machine_id_) return false;
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    for (auto &entry : detail.buffers) {
+        if (!entry.shm_path.empty() && entry.addr <= request.target_offset &&
+            request.target_offset + request.length <=
+                entry.addr + entry.length) {
+            return true;
+        }
+    }
+    return false;
 }
 }  // namespace v1
 }  // namespace mooncake

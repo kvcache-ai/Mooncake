@@ -19,6 +19,7 @@
 
 #include "v1/transport/rdma/rdma_transport.h"
 #include "v1/transport/shm/shm_transport.h"
+#include "v1/transport/tcp/tcp_transport.h"
 #include "v1/utility/ip.h"
 
 #define CHECK_STATUS(cmd)                \
@@ -85,11 +86,27 @@ void setLogLevel(const std::string level) {
         FLAGS_minloglevel = google::ERROR;
 }
 
+std::string getMachineID() {
+    std::ifstream file("/etc/machine-id");
+    if (file) {
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        if (!content.empty() && content.back() == '\n') content.pop_back();
+        return content;
+    } else {
+        std::string content = "undefined_machine_";
+        for (int i = 0; i < 16; ++i)
+            content += 'a' + SimpleRandom::Get().next(26);
+        return content;
+    }
+}
+
 Status TransferEngine::setupLocalSegment() {
     auto &manager = metadata_->segmentManager();
     auto segment = manager.getLocal();
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
+    segment->machine_id = getMachineID();
     auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
     detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
@@ -134,10 +151,17 @@ Status TransferEngine::construct() {
     LOG(INFO) << "================================================";
 
     if (!topology_->getHcaList().empty()) {
-        auto transport = std::make_shared<RdmaTransport>();
-        CHECK_STATUS(transport->install(local_segment_name_, metadata_,
-                                        topology_, conf_));
-        transport_list_[RDMA] = transport;
+        transport_list_[RDMA] = std::make_shared<RdmaTransport>();
+    }
+    transport_list_[TCP] = std::make_shared<TcpTransport>();
+    transport_list_[SHM] = std::make_shared<ShmTransport>();
+
+    for (auto &transport : transport_list_) {
+        if (transport) {
+            CHECK_STATUS(transport->install(local_segment_name_, metadata_,
+                                            topology_, conf_));
+            LOG(INFO) << "Transport " << transport->getName() << " loaded";
+        }
     }
 
     return Status::OK();
@@ -183,7 +207,7 @@ Status TransferEngine::openRemoteSegment(SegmentID &handle,
 }
 
 Status TransferEngine::closeRemoteSegment(SegmentID handle) {
-    return Status::OK();
+    return metadata_->segmentManager().closeRemote(handle);
 }
 
 Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
@@ -213,8 +237,7 @@ Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 if (!transport_list_[type]) continue;
-                CHECK_STATUS(
-                    transport_list_[type]->removeMemoryBuffer(desc));
+                CHECK_STATUS(transport_list_[type]->removeMemoryBuffer(desc));
             }
             return Status::OK();
         });
@@ -265,7 +288,12 @@ void TransferEngine::lazyFreeBatch() {
 }
 
 TransportType TransferEngine::getTransportType(const Request &request) {
-    return RDMA;
+    if (transport_list_[SHM] && transport_list_[SHM]->precheck(request))
+        return SHM;
+    if (transport_list_[RDMA])
+        return RDMA;
+    else
+        return TCP;
 }
 
 Status TransferEngine::submitTransfer(

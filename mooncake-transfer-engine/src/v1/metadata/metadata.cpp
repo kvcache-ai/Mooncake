@@ -55,6 +55,7 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
         Json::Value segmentJSON;
         if (desc.name.empty()) return Json::Value();
         segmentJSON["name"] = desc.name;
+        segmentJSON["machine_id"] = desc.machine_id;
         if (desc.type == SegmentType::Memory) {
             segmentJSON["type"] = "memory";
             auto &detail = std::get<MemorySegmentDesc>(desc.detail);
@@ -111,6 +112,7 @@ static std::shared_ptr<SegmentDesc> importSegmentDesc(
         auto desc = std::make_shared<SegmentDesc>();
         desc->name = getItem(segmentJSON, "name");
         auto type_str = getItem(segmentJSON, "type");
+        desc->machine_id = getItem(segmentJSON, "machine_id");
         if (desc->name.empty() || type_str.empty()) return nullptr;
         if (type_str == "memory") {
             desc->type = SegmentType::Memory;

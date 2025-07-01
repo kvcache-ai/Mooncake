@@ -98,6 +98,15 @@ Status SegmentManager::invalidateRemote(SegmentID handle) {
     return Status::OK();
 }
 
+bool SegmentManager::isSameMachine(SegmentID handle) {
+    if (handle == LOCAL_SEGMENT_ID) return true;
+    RWSpinlock::ReadGuard guard(lock_);
+    if (id_to_desc_map_.count(handle)) {
+        return id_to_desc_map_[handle]->machine_id == local_desc_->machine_id;
+    }
+    return false;
+}
+
 Status SegmentManager::synchronizeLocal() {
     return store_->putSegmentDesc(local_desc_);
 }

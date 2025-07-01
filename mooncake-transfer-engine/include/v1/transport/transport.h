@@ -101,6 +101,8 @@ class Transport {
             "removeMemoryBuffer not implemented" LOC_MARK);
     }
 
+    virtual bool precheck(const Request &request) { return true; }
+
     virtual const char *getName() const { return "<generic>"; }
 };
 }  // namespace v1
