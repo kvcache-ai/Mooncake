@@ -43,10 +43,13 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return 0
 	}
 
+	MaxMsgSize := 32*1024*1024
 	endpoint := C.GoString(endpoints)
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{endpoint},
-		DialTimeout: 5 * time.Second,
+		Endpoints:          []string{endpoint},
+		DialTimeout:        5 * time.Second,
+		MaxCallSendMsgSize: MaxMsgSize,
+		MaxCallRecvMsgSize: MaxMsgSize,
 	})
 
 	if err != nil {
