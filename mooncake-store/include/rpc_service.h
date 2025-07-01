@@ -95,7 +95,7 @@ struct PingResponse {
     ClientStatus client_status = ClientStatus::UNDEFINED;
     ErrorCode error_code = ErrorCode::OK;
 };
-YLT_REFL(PingResponse, view_version, error_code)
+YLT_REFL(PingResponse, view_version, client_status, error_code)
 
 struct BatchExistResponse {
     std::vector<ErrorCode> exist_responses;
@@ -593,6 +593,8 @@ inline void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);

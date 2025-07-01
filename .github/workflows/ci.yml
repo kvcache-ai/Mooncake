@@ -306,7 +306,7 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
-    name: Builcd Docker Image
+    name: Build Docker Image
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4

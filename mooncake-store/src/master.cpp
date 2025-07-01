@@ -36,7 +36,8 @@ DEFINE_int32(rpc_thread_num, 0,
 DEFINE_int32(
     rpc_port, 0,
     "Port for RPC server to listen on (0 = use port, preferred over port)");
-DEFINE_string(rpc_address, "0.0.0.0", "Address for RPC server to bind to");
+DEFINE_string(rpc_address, "0.0.0.0",
+              "Address for RPC server to bind to, required in HA mode");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -50,12 +51,10 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     return true;
 });
 DEFINE_bool(enable_ha, false,
-            "Enable high availability, which depends on ETCD");
+            "Enable high availability, which depends on etcd");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_string(local_hostname, "",
-              "Local host address (IP:Port), required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
@@ -76,7 +75,6 @@ int main(int argc, char* argv[]) {
               << FLAGS_eviction_high_watermark_ratio
               << ", enable_ha=" << FLAGS_enable_ha
               << ", etcd_endpoints=" << FLAGS_etcd_endpoints
-              << ", local_hostname=" << FLAGS_local_hostname
               << ", client_ttl=" << FLAGS_client_ttl
               << ", rpc_thread_num=" << FLAGS_rpc_thread_num
               << ", rpc_port=" << FLAGS_rpc_port
@@ -147,7 +145,7 @@ int main(int argc, char* argv[]) {
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_default_kv_lease_ttl, FLAGS_eviction_ratio,
             FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
-            FLAGS_etcd_endpoints, FLAGS_local_hostname, FLAGS_rpc_address,
+            FLAGS_etcd_endpoints, local_hostname, FLAGS_rpc_address,
             rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay);
 
         return supervisor.Start();
