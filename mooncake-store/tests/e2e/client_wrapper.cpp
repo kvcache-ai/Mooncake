@@ -1,0 +1,179 @@
+#include "client_wrapper.h"
+
+#include <cstring>
+#include <stdexcept>
+
+#include "utils.h"
+
+namespace mooncake {
+namespace testing {
+
+ClientTestWrapper::ClientTestWrapper(std::shared_ptr<Client> client,
+                                     std::shared_ptr<SimpleAllocator> allocator)
+    : client_(client), allocator_(allocator) {}
+
+ClientTestWrapper::~ClientTestWrapper() {
+    for (auto& [base, segment] : segments_) {
+        free(segment.base);
+    }
+}
+
+std::optional<std::shared_ptr<ClientTestWrapper>>
+ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
+                                       const std::string& metadata_connstring,
+                                       const std::string& protocol,
+                                       const std::string& device_name,
+                                       const std::string& master_server_entry,
+                                       size_t local_buffer_size) {
+    void** args = (protocol == "rdma") ? rdma_args(device_name) : nullptr;
+
+    auto client_opt = Client::Create(hostname,  // Local hostname
+                                     metadata_connstring, protocol, args,
+                                     master_server_entry);
+
+    if (!client_opt.has_value()) {
+        return std::nullopt;
+    }
+
+    std::shared_ptr<SimpleAllocator> allocator =
+        std::make_shared<SimpleAllocator>(local_buffer_size);
+    if (!allocator) {
+        LOG(ERROR) << "Failed to create allocator";
+        return std::nullopt;
+    }
+
+    ErrorCode error_code = client_opt.value()->RegisterLocalMemory(
+        allocator->getBase(), local_buffer_size, "cpu:0", false, false);
+    if (error_code != ErrorCode::OK) {
+        LOG(ERROR) << "register_local_memory_failed base="
+                   << allocator->getBase() << " size=" << local_buffer_size
+                   << ", error=" << error_code;
+        return std::nullopt;
+    }
+    return std::make_shared<ClientTestWrapper>(client_opt.value(), allocator);
+}
+
+ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
+    buffer = allocate_buffer_allocator_memory(size);
+    if (!buffer) {
+        LOG(ERROR) << " Failed to allocate memory for segment";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    ErrorCode error_code = client_->MountSegment(buffer, size);
+    if (error_code != ErrorCode::OK) {
+        free(buffer);
+        return error_code;
+    } else {
+        segments_.emplace(reinterpret_cast<uintptr_t>(buffer),
+                          SegmentInfo{buffer, size});
+        return ErrorCode::OK;
+    }
+}
+
+ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
+    auto it = segments_.find(reinterpret_cast<uintptr_t>(buffer));
+    if (it == segments_.end()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    SegmentInfo& segment = it->second;
+    ErrorCode error_code = client_->UnmountSegment(segment.base, segment.size);
+    if (error_code != ErrorCode::OK) {
+        return error_code;
+    } else {
+        // Clear the memory, so any further read will get wrong data
+        memset(segment.base, 0, segment.size);
+        free(segment.base);
+        segments_.erase(it);
+        return ErrorCode::OK;
+    }
+}
+
+ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
+    Client::ObjectInfo object_info;
+    ErrorCode error_code = client_->Query(key, object_info);
+    if (error_code != ErrorCode::OK) {
+        return error_code;
+    }
+
+    // Create slices
+    std::vector<AllocatedBuffer::Descriptor>& descriptors =
+        object_info.replica_list[0].buffer_descriptors;
+    SliceGuard slice_guard(descriptors, allocator_);
+
+    // Perform get operation
+    error_code = client_->Get(key, object_info, slice_guard.slices_);
+    if (error_code != ErrorCode::OK) {
+        return error_code;
+    }
+
+    // Fill value
+    value.clear();
+    for (const auto& slice : slice_guard.slices_) {
+        value.append(static_cast<const char*>(slice.ptr), slice.size);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ClientTestWrapper::Put(const std::string& key,
+                                 const std::string& value) {
+    // Create slices
+    SliceGuard slice_guard(value.size(), allocator_);
+    size_t offset = 0;
+    for (const auto& slice : slice_guard.slices_) {
+        memcpy(slice.ptr, value.data() + offset, slice.size);
+        offset += slice.size;
+    }
+
+    // Configure replication
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Perform put operation
+    ErrorCode error_code = client_->Put(key, slice_guard.slices_, config);
+
+    return error_code;
+}
+
+ErrorCode ClientTestWrapper::Delete(const std::string& key) {
+    return client_->Remove(key);
+}
+
+ClientTestWrapper::SliceGuard::SliceGuard(
+    std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    std::shared_ptr<SimpleAllocator> allocator)
+    : allocator_(allocator) {
+    slices_.resize(descriptors.size());
+    for (size_t i = 0; i < descriptors.size(); i++) {
+        void* buffer = allocator_->allocate(descriptors[i].size_);
+        if (!buffer) {
+            LOG(ERROR) << "Failed to allocate memory for slice";
+            throw std::runtime_error("Failed to allocate memory for slice");
+        }
+        slices_[i] = Slice{buffer, descriptors[i].size_};
+    }
+}
+
+ClientTestWrapper::SliceGuard::SliceGuard(
+    size_t size, std::shared_ptr<SimpleAllocator> allocator)
+    : allocator_(allocator) {
+    while (size != 0) {
+        auto chunk_size = std::min(size, kMaxSliceSize);
+        auto ptr = allocator_->allocate(chunk_size);
+        if (!ptr) {
+            LOG(ERROR) << "Failed to allocate memory for slice";
+            throw std::runtime_error("Failed to allocate memory for slice");
+        }
+        slices_.emplace_back(Slice{ptr, chunk_size});
+        size -= chunk_size;
+    }
+}
+
+ClientTestWrapper::SliceGuard::~SliceGuard() {
+    for (auto& slice : slices_) {
+        allocator_->deallocate(slice.ptr, slice.size);
+    }
+}
+
+}  // namespace testing
+}  // namespace mooncake

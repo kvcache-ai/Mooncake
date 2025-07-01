@@ -72,11 +72,11 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeSegment() {
-        const size_t ram_buffer_size = 512 * 1024 * 1024;  // 512 MB
-        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size);
+        ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
+        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
         LOG_ASSERT(segment_ptr_);
-        ErrorCode rc = segment_provider_client_->MountSegment(
-            "localhost:17812", segment_ptr_, ram_buffer_size);
+        ErrorCode rc = segment_provider_client_->MountSegment(segment_ptr_,
+                                                              ram_buffer_size_);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment: " << toString(rc);
         }
@@ -103,13 +103,12 @@ class ClientIntegrationTest : public ::testing::Test {
         }
 
         // Mount segment for test_client_ as well
-        const size_t test_client_ram_buffer_size = 512 * 1024 * 1024;  // 512 MB
+        test_client_ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
         test_client_segment_ptr_ =
-            allocate_buffer_allocator_memory(test_client_ram_buffer_size);
+            allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
         LOG_ASSERT(test_client_segment_ptr_);
-        ErrorCode rc = test_client_->MountSegment("localhost:17813",
-                                                  test_client_segment_ptr_,
-                                                  test_client_ram_buffer_size);
+        ErrorCode rc = test_client_->MountSegment(test_client_segment_ptr_,
+                                                  test_client_ram_buffer_size_);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment for test_client_: "
                        << toString(rc);
@@ -120,8 +119,8 @@ class ClientIntegrationTest : public ::testing::Test {
     static void CleanupClients() {
         // Unmount test client segment first
         if (test_client_ && test_client_segment_ptr_) {
-            if (test_client_->UnmountSegment("localhost:17813",
-                                             test_client_segment_ptr_) !=
+            if (test_client_->UnmountSegment(test_client_segment_ptr_,
+                                             test_client_ram_buffer_size_) !=
                 ErrorCode::OK) {
                 LOG(ERROR) << "Failed to unmount test client segment";
             }
@@ -137,7 +136,7 @@ class ClientIntegrationTest : public ::testing::Test {
 
     static void CleanupSegment() {
         if (segment_provider_client_->UnmountSegment(
-                "localhost:17812", segment_ptr_) != ErrorCode::OK) {
+                segment_ptr_, ram_buffer_size_) != ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment";
         }
     }
@@ -149,7 +148,9 @@ class ClientIntegrationTest : public ::testing::Test {
     // themselves.
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
     static void* segment_ptr_;
+    static size_t ram_buffer_size_;
     static void* test_client_segment_ptr_;
+    static size_t test_client_ram_buffer_size_;
 };
 
 // Static members initialization
@@ -160,6 +161,8 @@ void* ClientIntegrationTest::segment_ptr_ = nullptr;
 void* ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;
+size_t ClientIntegrationTest::ram_buffer_size_ = 0;
+size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
@@ -466,6 +469,78 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
                   0);
         client_buffer_allocator_->deallocate(
             target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+    }
+}
+
+// Test batch IsExist operations through the client
+TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
+    int batch_size = 50;
+    std::vector<std::string> keys;
+    std::vector<std::string> test_data_list;
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+
+    // Create test keys and data
+    for (int i = 0; i < batch_size; i++) {
+        keys.push_back("test_key_batch_exist_" + std::to_string(i));
+        test_data_list.push_back("test_data_" + std::to_string(i));
+    }
+
+    // Put only the first half of the keys
+    void* buffer = nullptr;
+    for (int i = 0; i < batch_size / 2; i++) {
+        std::vector<Slice> slices;
+        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
+        batched_slices.emplace(keys[i], slices);
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Put the first half of keys
+    std::vector<std::string> existing_keys(keys.begin(),
+                                           keys.begin() + batch_size / 2);
+    ASSERT_EQ(test_client_->BatchPut(existing_keys, batched_slices, config),
+              ErrorCode::OK);
+
+    // Test BatchIsExist with mixed existing and non-existing keys
+    std::vector<ErrorCode> exist_results;
+    ASSERT_EQ(test_client_->BatchIsExist(keys, exist_results), ErrorCode::OK);
+
+    // Verify results
+    ASSERT_EQ(keys.size(), exist_results.size());
+
+    // First half should exist
+    for (int i = 0; i < batch_size / 2; i++) {
+        EXPECT_EQ(ErrorCode::OK, exist_results[i])
+            << "Key " << keys[i]
+            << " should exist but got error: " << toString(exist_results[i]);
+    }
+
+    // Second half should not exist
+    for (int i = batch_size / 2; i < batch_size; i++) {
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, exist_results[i])
+            << "Key " << keys[i]
+            << " should not exist but got: " << toString(exist_results[i]);
+    }
+
+    // Test with empty keys vector
+    std::vector<std::string> empty_keys;
+    std::vector<ErrorCode> empty_results;
+    ASSERT_EQ(test_client_->BatchIsExist(empty_keys, empty_results),
+              ErrorCode::OK);
+    ASSERT_EQ(empty_results.size(), 0);
+
+    // Clean up
+    for (int i = 0; i < batch_size / 2; i++) {
+        client_buffer_allocator_->deallocate(batched_slices[keys[i]][0].ptr,
+                                             test_data_list[i].size());
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+    for (int i = 0; i < batch_size / 2; i++) {
+        ASSERT_EQ(test_client_->Remove(keys[i]), ErrorCode::OK);
     }
 }
 

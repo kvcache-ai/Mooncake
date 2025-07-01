@@ -127,16 +127,20 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_MNNVL
+        if (local_topology_->getHcaList().size() > 0 && !getenv("MC_FORCE_MNNVL")) {
+            multi_transports_->installTransport("rdma", local_topology_);
+        } else {
+            multi_transports_->installTransport("nvlink", nullptr);
+        }
+#else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
-#ifdef USE_NVLINK
-            multi_transports_->installTransport("nvlink", nullptr);
-#else
             multi_transports_->installTransport("tcp", nullptr);
-#endif
         }
+#endif
         // TODO: install other transports automatically
     }
 
@@ -192,6 +196,19 @@ int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
 std::string TransferEngine::getLocalIpAndPort() {
     return metadata_->localRpcMeta().ip_or_host_name + ":" +
            std::to_string(metadata_->localRpcMeta().rpc_port);
+}
+
+int TransferEngine::getNotifies(
+    std::vector<TransferMetadata::NotifyDesc> &notifies) {
+    return metadata_->getNotifies(notifies);
+}
+
+int TransferEngine::sendNotify(SegmentID target_id,
+                               TransferMetadata::NotifyDesc notify_msg) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+    return ret;
 }
 
 Transport::SegmentHandle TransferEngine::openSegment(

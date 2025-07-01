@@ -1,17 +1,18 @@
 #pragma once
 
+#include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "ha_helper.h"
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
-#include "ha_helper.h"
 
 namespace mooncake {
 
@@ -145,21 +146,19 @@ class Client {
 
     /**
      * @brief Registers a memory segment to master for allocation
-     * @param segment_name Unique identifier for the segment
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
-                           size_t size);
+    ErrorCode MountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
-     * @param segment_name Name of the segment to unregister
-     * @param addr Memory address to unregister
+     * @param buffer Memory buffer to unregister
+     * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode UnmountSegment(const std::string& segment_name, void* addr);
+    ErrorCode UnmountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -190,6 +189,15 @@ class Client {
      * exists, other ErrorCode for errors
      */
     ErrorCode IsExist(const std::string& key);
+
+    /**
+     * @brief Checks if multiple objects exist
+     * @param keys Vector of keys to check
+     * @param exist_results Output vector of existence results for each key
+     * @return ErrorCode indicating success/failure of the batch operation
+     */
+    ErrorCode BatchIsExist(const std::vector<std::string>& keys,
+                           std::vector<ErrorCode>& exist_results);
 
    private:
     /**
@@ -233,14 +241,9 @@ class Client {
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
-    // Client local segments
-    struct Segment{
-        void* buffer;
-        size_t size;
-    };
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, Segment> mounted_segments_;
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
@@ -250,7 +253,10 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc(int current_version);
+    void PingThreadFunc();
+
+    // Client identification
+    UUID client_id_;
 };
 
 }  // namespace mooncake

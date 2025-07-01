@@ -104,14 +104,12 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     if (name == kWildcardLocation) {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
-        for (auto &entry : entries) {
-            buffer_desc.name = entry.location;
-            buffer_desc.addr = entry.start;
-            buffer_desc.length = entry.len;
-            int rc =
-                metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-            if (rc) return rc;
-        }
+        if (entries.empty()) return -1;
+        buffer_desc.name = entries[0].location;
+        buffer_desc.addr = (uint64_t)addr;
+        buffer_desc.length = length;
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+        if (rc) return rc;
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
@@ -305,8 +303,10 @@ Status RdmaTransport::submitTransferTask(
                 auto &context = context_list_[device_id];
                 assert(context.get());
                 if (!context->active()) continue;
-                assert(buffer_id >= 0 && buffer_id < local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() == context_list_.size());
+                assert(buffer_id >= 0 &&
+                       buffer_id < local_segment_desc->buffers.size());
+                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
+                       context_list_.size());
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
