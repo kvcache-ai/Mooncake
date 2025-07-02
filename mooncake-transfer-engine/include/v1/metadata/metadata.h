@@ -109,6 +109,8 @@ struct XferDataDesc {
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc &request, BootstrapDesc &response)>;
 
+using OnNotify = std::function<int(const NotifyMessage &)>;
+
 class RpcClient {
    public:
     RpcClient() {}
@@ -127,6 +129,9 @@ class RpcClient {
     static Status recvData(const std::string &server_addr,
                            uint64_t peer_mem_addr, void *local_mem_addr,
                            size_t length);
+
+    static Status notify(const std::string &server_addr,
+                         const NotifyMessage &message);
 };
 
 class MetadataService {
@@ -144,6 +149,10 @@ class MetadataService {
         bootstrap_callback_ = callback;
     }
 
+    void setNotifyCallback(const OnNotify &callback) {
+        notify_callback_ = callback;
+    }
+
     Status start(uint16_t &port);
 
    private:
@@ -155,11 +164,14 @@ class MetadataService {
 
     void onRecvData(const RpcRawData &request, RpcRawData &response);
 
+    void onNotify(const RpcRawData &request, RpcRawData &response);
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<AsioRpcServer> rpc_server_;
 
     OnReceiveBootstrap bootstrap_callback_;
+    OnNotify notify_callback_;
 };
 
 }  // namespace v1

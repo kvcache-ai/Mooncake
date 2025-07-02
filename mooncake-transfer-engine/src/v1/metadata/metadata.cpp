@@ -353,9 +353,22 @@ Status RpcClient::recvData(const std::string &server_addr,
     return Status::OK();
 }
 
+Status RpcClient::notify(const std::string &server_addr,
+                         const NotifyMessage &message) {
+    RpcRawData request, response;
+    request.resize(message.size());
+    memcpy(&request[0], message.c_str(), message.size());
+    RpcErrorCode err_code =
+        AsioRpcClient::Get().call(server_addr, Notify, request, response);
+    if (err_code)
+        return Status::MetadataError(
+            "RPC error found: " + std::to_string(err_code) + LOC_MARK);
+    return Status::OK();
+}
+
 MetadataService::MetadataService(const std::string &type,
                                  const std::string &servers)
-    : bootstrap_callback_(nullptr) {
+    : bootstrap_callback_(nullptr), notify_callback_(nullptr) {
     if (type == "p2p") {
         auto agent = std::make_unique<P2PMetadataStore>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -380,6 +393,10 @@ MetadataService::MetadataService(const std::string &type,
     rpc_server_->registerFunction(
         RecvData, [this](const RpcRawData &request, RpcRawData &response) {
             onRecvData(request, response);
+        });
+    rpc_server_->registerFunction(
+        Notify, [this](const RpcRawData &request, RpcRawData &response) {
+            onNotify(request, response);
         });
 }
 
@@ -420,6 +437,12 @@ void MetadataService::onRecvData(const RpcRawData &request,
     // TODO check validity before copying
     response.resize(desc->length);
     genericMemcpy(response.data(), (void *)desc->peer_mem_addr, desc->length);
+}
+
+void MetadataService::onNotify(const RpcRawData &request,
+                               RpcRawData &response) {
+    std::string message(request.data(), request.size());
+    if (notify_callback_) notify_callback_(message);
 }
 
 }  // namespace v1

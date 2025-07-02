@@ -377,7 +377,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         "Requested address is not in registered buffer" LOC_MARK);
 }
 
-bool ShmTransport::precheck(const Request &request) {
+bool ShmTransport::taskSupported(const Request &request) {
     if (request.target_id == LOCAL_SEGMENT_ID) return true;
     SegmentDescRef desc;
     auto status =

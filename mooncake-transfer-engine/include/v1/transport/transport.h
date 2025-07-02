@@ -101,7 +101,18 @@ class Transport {
             "removeMemoryBuffer not implemented" LOC_MARK);
     }
 
-    virtual bool precheck(const Request &request) { return true; }
+    virtual bool taskSupported(const Request &request) { return true; }
+
+    virtual bool hasNotifyFeature() const { return false; }
+
+    virtual Status sendNotify(SegmentID target_id,
+                              const NotifyMessage &notify) {
+        return Status::NotImplemented("sendNotify not implemented" LOC_MARK);
+    }
+
+    virtual Status getNotifyList(std::vector<NotifyMessage> &notify_list) {
+        return Status::NotImplemented("getNotifyList not implemented" LOC_MARK);
+    }
 
     virtual const char *getName() const { return "<generic>"; }
 };

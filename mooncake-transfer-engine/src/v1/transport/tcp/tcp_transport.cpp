@@ -46,6 +46,11 @@ Status TcpTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     installed_ = true;
+    metadata_->setNotifyCallback([&](const NotifyMessage &message) -> int {
+        RWSpinlock::WriteGuard guard(notify_lock_);
+        notify_list_.push_back(message);
+        return 0;
+    });
     return Status::OK();
 }
 
@@ -159,7 +164,6 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
     SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return status;
-    int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
     for (auto &entry : detail.buffers) {
         if (entry.addr <= dest_addr &&
@@ -167,10 +171,26 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
             rpc_server_addr = detail.rpc_server_addr;
             return Status::OK();
         }
-        index++;
     }
     return Status::InvalidArgument(
         "Requested address is not in registered buffer" LOC_MARK);
+}
+
+Status TcpTransport::sendNotify(SegmentID target_id,
+                                const NotifyMessage &message) {
+    std::string rpc_server_addr;
+    SegmentDescRef desc;
+    auto status = metadata_->segmentManager().getRemote(desc, target_id);
+    if (!status.ok()) return status;
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    rpc_server_addr = detail.rpc_server_addr;
+    return RpcClient::notify(rpc_server_addr, message);
+}
+
+Status TcpTransport::getNotifyList(std::vector<NotifyMessage> &notify_list) {
+    RWSpinlock::ReadGuard guard(notify_lock_);
+    notify_list = notify_list_;
+    return Status::OK();
 }
 
 }  // namespace v1

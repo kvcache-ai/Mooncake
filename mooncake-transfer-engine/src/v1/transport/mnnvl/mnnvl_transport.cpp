@@ -431,7 +431,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         "Requested address is not in registered buffer" LOC_MARK);
 }
 
-bool MnnvlTransport::precheck(const Request &request) {
+bool MnnvlTransport::taskSupported(const Request &request) {
     SegmentDescRef desc;
     auto status =
         metadata_->segmentManager().getRemote(desc, request.target_id);

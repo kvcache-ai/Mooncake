@@ -81,7 +81,7 @@ class MnnvlTransport : public Transport {
 
     virtual Status freeLocalMemory(const BufferEntry &buffer);
 
-    virtual bool precheck(const Request &request);
+    virtual bool taskSupported(const Request &request);
 
    private:
     void startTransfer(MnnvlTask *task);

@@ -72,6 +72,13 @@ class TcpTransport : public Transport {
 
     virtual const char *getName() const { return "tcp"; }
 
+    virtual bool hasNotifyFeature() const { return true; }
+
+    virtual Status sendNotify(SegmentID target_id,
+                              const NotifyMessage &notify);
+
+    virtual Status getNotifyList(std::vector<NotifyMessage> &notify_list);
+
    private:
     void startTransfer(TcpTask *task);
 
@@ -83,6 +90,9 @@ class TcpTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;
+
+    RWSpinlock notify_lock_;
+    std::vector<NotifyMessage> notify_list_;
 };
 }  // namespace v1
 }  // namespace mooncake

@@ -35,6 +35,8 @@ namespace v1 {
 using BatchID = uint64_t;
 using SegmentID = uint64_t;
 
+using NotifyMessage = std::string;
+
 struct Request {
     enum OpCode { READ, WRITE };
     OpCode opcode;

@@ -89,6 +89,10 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request> &request_list);
 
+    Status sendNotify(SegmentID target_id, const NotifyMessage &notify);
+
+    Status getNotifyList(std::vector<NotifyMessage> &notify_list);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 

@@ -291,7 +291,7 @@ void TransferEngine::lazyFreeBatch() {
 }
 
 TransportType TransferEngine::getTransportType(const Request &request) {
-    if (transport_list_[SHM] && transport_list_[SHM]->precheck(request))
+    if (transport_list_[SHM] && transport_list_[SHM]->taskSupported(request))
         return SHM;
     if (transport_list_[RDMA])
         return RDMA;
@@ -327,6 +327,25 @@ Status TransferEngine::submitTransfer(
     }
 
     return Status::OK();
+}
+
+Status TransferEngine::sendNotify(SegmentID target_id,
+                                  const NotifyMessage &notify) {
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto transport = transport_list_[type];
+        if (!transport || !transport->hasNotifyFeature()) continue;
+        return transport->sendNotify(target_id, notify);
+    }
+    return Status::InvalidArgument("Notify feature not supported");
+}
+
+Status TransferEngine::getNotifyList(std::vector<NotifyMessage> &notify_list) {
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto transport = transport_list_[type];
+        if (!transport || !transport->hasNotifyFeature()) continue;
+        return transport->getNotifyList(notify_list);
+    }
+    return Status::InvalidArgument("Notify feature not supported");
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
