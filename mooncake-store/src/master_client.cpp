@@ -612,4 +612,38 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
     return result.value();
 }
 
+GetFsdirResponse MasterClient::GetFsdir() {
+    ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
+    timer.LogRequest("action=get_fsdir");
+
+    auto client = client_accessor_.GetClient();
+    if(!client){
+        LOG(ERROR) << "Client not available";
+        timer.LogResponse("error=Client not available");
+        return GetFsdirResponse{"", ErrorCode::RPC_FAIL};
+    }
+
+    auto request_result =
+        client->send_request<&WrappedMasterService::GetFsdir>();
+    std::optional<GetFsdirResponse> result =
+        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetFsdirResponse>> {
+            auto result = co_await co_await request_result;
+            if (!result) {
+                LOG(ERROR) << "Failed to get fsdir: "
+                          << result.error().msg;
+                co_return std::nullopt;
+            }
+            co_return result->result();
+        }());
+
+    if (!result) {
+        auto response = GetFsdirResponse{{}, ErrorCode::RPC_FAIL};
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    timer.LogResponseJson(result.value());
+    return result.value();
+}
+
 }  // namespace mooncake

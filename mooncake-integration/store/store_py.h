@@ -218,6 +218,9 @@ class DistributedObjectStore {
 
    private:
     int allocateSlices(std::vector<mooncake::Slice> &slices,
+                                           size_t length);
+
+    int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
