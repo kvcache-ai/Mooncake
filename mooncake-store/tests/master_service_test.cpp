@@ -1161,6 +1161,214 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest, RemoveSoftPinObject) {
+    const uint64_t kv_lease_ttl = 200;
+    // set a large soft_pin_ttl so the granted soft pin will not quickly expire
+    const uint64_t kv_soft_pin_ttl = 10000;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl));
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    std::string key = "test_key";
+    std::vector<uint64_t> slice_lengths = {1024};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.with_soft_pin = true;
+    std::vector<Replica::Descriptor> replica_list;
+
+    // Verify soft pin does not block remove
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_EQ(ErrorCode::OK, service_->Remove(key));
+
+    // Verify soft pin does not block RemoveAll
+    ASSERT_EQ(ErrorCode::OK, service_->PutStart(key, 1024, slice_lengths,
+                                                config, replica_list));
+    ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+    EXPECT_EQ(1, service_->RemoveAll());
+}
+
+TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
+    const uint64_t kv_lease_ttl = 200;
+    // set a large soft_pin_ttl so the granted soft pin will not quickly expire
+    const uint64_t kv_soft_pin_ttl = 10000;
+    const double eviction_ratio = 0.5;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl, eviction_ratio));
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    // The eviction has random factors, so test 5 times
+    for (int test_i = 0; test_i < 5; test_i++) {
+        // Put pin_key first
+        for (int i = 0; i < 2; i++) {
+            std::string pin_key = "pin_key" + std::to_string(i);
+            std::vector<uint64_t> slice_lengths = {value_size};
+            ReplicateConfig soft_pin_config;
+            soft_pin_config.replica_num = 1;
+            soft_pin_config.with_soft_pin = true;
+            std::vector<Replica::Descriptor> replica_list;
+
+            ASSERT_EQ(ErrorCode::OK,
+                    service_->PutStart(pin_key, 1024, slice_lengths, soft_pin_config,
+                                        replica_list));
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(pin_key));
+        }
+
+        // Fill the segment to trigger eviction
+        int failed_puts = 0;
+        for (int i = 0; i < 20; i++) {
+            std::string key = "key" + std::to_string(i);
+            std::vector<uint64_t> slice_lengths = {value_size};
+            ReplicateConfig config;
+            config.replica_num = 1;
+            if (ErrorCode::OK == service_->PutStart(key, value_size, slice_lengths, config,
+                               replica_list)) {
+                service_->PutEnd(key);
+            } else {
+                failed_puts++;
+            }
+        }
+        ASSERT_GT(failed_puts, 0);
+        // wait for gc thread to do eviction
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 1000));
+        // pin_key should still be accessible
+        for (int i = 0; i < 2; i++) {
+            std::string pin_key = "pin_key" + std::to_string(i);
+            std::vector<Replica::Descriptor> replica_list;
+            ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(pin_key, replica_list));
+        }
+        service_->RemoveAll();
+    }
+}
+
+TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
+    const uint64_t kv_lease_ttl = 200;
+    // set a large soft_pin_ttl so the granted soft pin will not quickly expire
+    const uint64_t kv_soft_pin_ttl = 10000;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl));
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    // Verify if we can put objects more than the segment can hold
+    int success_puts = 0;
+    for (int i = 0; i < 16 + 50; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {value_size};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_soft_pin = true;
+        std::vector<Replica::Descriptor> replica_list;
+        if (ErrorCode::OK == service_->PutStart(key, value_size, slice_lengths,
+                                                config, replica_list)) {
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+            success_puts++;
+        } else {
+            // wait for gc thread to work
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_GT(success_puts, 16);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
+    const uint64_t kv_lease_ttl = 200;
+    // The soft pin ttl shall not be too large, otherwise the test will take too long
+    const uint64_t kv_soft_pin_ttl = 1000;
+    static_assert(kv_soft_pin_ttl > kv_lease_ttl, "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
+    const double eviction_ratio = 0.5;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl, eviction_ratio));
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    // The eviction has random factors, so test 3 times
+    for (int test_i = 0; test_i < 3; test_i++) {
+        // Put pin_key first
+        for (int i = 0; i < 2; i++) {
+            std::string pin_key = "pin_key";
+            std::vector<uint64_t> slice_lengths = {value_size};
+            ReplicateConfig soft_pin_config;
+            soft_pin_config.replica_num = 1;
+            soft_pin_config.with_soft_pin = true;
+            std::vector<Replica::Descriptor> replica_list;
+   
+            ASSERT_EQ(ErrorCode::OK,
+                    service_->PutStart(pin_key, 1024, slice_lengths, soft_pin_config,
+                                        replica_list));
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(pin_key));
+        }
+
+        // Wait for the soft pin to expire
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_soft_pin_ttl));
+
+        // Get the pin_key to extend the soft pin
+        for (int i = 0; i < 2; i++) {
+            std::string pin_key = "pin_key" + std::to_string(i);
+            std::vector<Replica::Descriptor> replica_list;
+            ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(pin_key, replica_list));
+        }
+
+        // Fill the segment to trigger eviction
+        int failed_puts = 0;
+        for (int i = 0; i < 16; i++) {
+            std::string key = "key" + std::to_string(i);
+            std::vector<uint64_t> slice_lengths = {value_size};
+            ReplicateConfig config;
+            config.replica_num = 1;
+            if (ErrorCode::OK == service_->PutStart(key, value_size, slice_lengths, config,
+                               replica_list)) {
+                service_->PutEnd(key);
+            } else {
+                failed_puts++;
+            }
+        }
+        ASSERT_GT(failed_puts, 0);
+
+        // wait for gc thread to do eviction
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+
+        // pin_key should still be accessible
+        for (int i = 0; i < 2; i++) {
+            std::string pin_key = "pin_key" + std::to_string(i);
+            std::vector<Replica::Descriptor> replica_list;
+            ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(pin_key, replica_list));
+        }
+        service_->RemoveAll();
+    }
+}
+
 TEST_F(MasterServiceTest, BatchExistKeyTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
 

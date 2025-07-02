@@ -58,6 +58,7 @@ class MasterService {
    public:
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
+                  uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
                   double eviction_high_watermark_ratio =
                       DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
@@ -258,11 +259,13 @@ class MasterService {
         size_t size;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
-        std::chrono::steady_clock::time_point lease_timeout;
+        std::chrono::steady_clock::time_point lease_timeout;  // hard lease
+        std::optional<std::chrono::steady_clock::time_point>
+            soft_pin_timeout;  // optional soft pin, only set for vip objects
 
-        // Check if there is some replica with a different status than the given
-        // value. If there is, return the status of the first replica that is
-        // not equal to the given value. Otherwise, return false.
+        // Check if there are some replicas with a different status than the
+        // given value. If there are, return the status of the first replica
+        // that is not equal to the given value. Otherwise, return false.
         std::optional<ReplicaStatus> HasDiffRepStatus(
             ReplicaStatus status) const {
             for (const auto& replica : replicas) {
@@ -273,12 +276,22 @@ class MasterService {
             return {};
         }
 
+        void EnableSoftPin() {
+            soft_pin_timeout.emplace();
+        }
+
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
-        void GrantLease(const uint64_t ttl) {
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) {
+            std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
             lease_timeout =
-                std::max(lease_timeout, std::chrono::steady_clock::now() +
-                                            std::chrono::milliseconds(ttl));
+                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
+            if (soft_pin_timeout) {
+                soft_pin_timeout =
+                    std::max(*soft_pin_timeout,
+                             now + std::chrono::milliseconds(soft_ttl));
+            }
         }
 
         // Check if the lease has expired
@@ -289,6 +302,18 @@ class MasterService {
         // Check if the lease has expired
         bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
             return now >= lease_timeout;
+        }
+
+        // Check if the soft lease has expired
+        bool IsSoftLeaseExpired() const {
+            return !soft_pin_timeout ||
+                   std::chrono::steady_clock::now() >= *soft_pin_timeout;
+        }
+
+        // Check if the soft lease has expired
+        bool IsSoftPinExpired(
+            std::chrono::steady_clock::time_point& now) const {
+            return !soft_pin_timeout || now >= *soft_pin_timeout;
         }
     };
 
@@ -325,6 +350,7 @@ class MasterService {
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;  // in milliseconds
+    const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
 
     // Eviction related members
     std::atomic<bool> need_eviction_{

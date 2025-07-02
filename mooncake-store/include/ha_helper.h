@@ -78,8 +78,9 @@ class MasterServiceSupervisor {
     MasterServiceSupervisor(
         int rpc_port, size_t rpc_thread_num, bool enable_gc,
         bool enable_metric_reporting, int metrics_port,
-        int64_t default_kv_lease_ttl, double eviction_ratio,
-        double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
+        int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
+        double eviction_ratio, double eviction_high_watermark_ratio,
+        int64_t client_live_ttl_sec,
         const std::string& etcd_endpoints = "0.0.0.0:2379",
         const std::string& local_hostname = "0.0.0.0:50051",
         const std::string& rpc_address = "0.0.0.0",
@@ -96,6 +97,7 @@ class MasterServiceSupervisor {
     bool enable_metric_reporting_;
     int metrics_port_;
     int64_t default_kv_lease_ttl_;
+    int64_t default_kv_soft_pin_ttl_;
     double eviction_ratio_;
     double eviction_high_watermark_ratio_;
     int64_t client_live_ttl_sec_;

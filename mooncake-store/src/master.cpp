@@ -23,6 +23,8 @@ DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects");
+DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
+              "Default soft lease time for kv objects");
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when storage space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -70,6 +72,7 @@ int main(int argc, char* argv[]) {
               << ", enable_metric_reporting=" << FLAGS_enable_metric_reporting
               << ", metrics_port=" << FLAGS_metrics_port
               << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
+              << ", default_kv_soft_pin_ttl=" << FLAGS_default_kv_soft_pin_ttl
               << ", eviction_ratio=" << FLAGS_eviction_ratio
               << ", eviction_high_watermark_ratio="
               << FLAGS_eviction_high_watermark_ratio
@@ -143,10 +146,10 @@ int main(int argc, char* argv[]) {
         mooncake::MasterServiceSupervisor supervisor(
             rpc_port, rpc_thread_num, FLAGS_enable_gc,
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
-            FLAGS_default_kv_lease_ttl, FLAGS_eviction_ratio,
-            FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
-            FLAGS_etcd_endpoints, local_hostname, FLAGS_rpc_address,
-            rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay);
+            FLAGS_default_kv_lease_ttl, FLAGS_default_kv_soft_pin_ttl,
+            FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio,
+            FLAGS_client_ttl, FLAGS_etcd_endpoints, local_hostname,
+            FLAGS_rpc_address, rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay);
 
         return supervisor.Start();
     } else {
@@ -157,9 +160,10 @@ int main(int argc, char* argv[]) {
                                          FLAGS_rpc_enable_tcp_no_delay);
         mooncake::WrappedMasterService wrapped_master_service(
             FLAGS_enable_gc, FLAGS_default_kv_lease_ttl,
-            FLAGS_enable_metric_reporting, FLAGS_metrics_port,
-            FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio, version,
-            FLAGS_client_ttl, FLAGS_enable_ha);
+            FLAGS_default_kv_soft_pin_ttl, FLAGS_enable_metric_reporting,
+            FLAGS_metrics_port, FLAGS_eviction_ratio,
+            FLAGS_eviction_high_watermark_ratio, version, FLAGS_client_ttl,
+            FLAGS_enable_ha);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

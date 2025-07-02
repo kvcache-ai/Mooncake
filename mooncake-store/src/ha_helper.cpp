@@ -92,16 +92,17 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
 MasterServiceSupervisor::MasterServiceSupervisor(
     int rpc_port, size_t rpc_thread_num, bool enable_gc,
     bool enable_metric_reporting, int metrics_port,
-    int64_t default_kv_lease_ttl, double eviction_ratio,
-    double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
-    const std::string& etcd_endpoints, const std::string& local_hostname,
-    const std::string& rpc_address,
+    int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
+    double eviction_ratio, double eviction_high_watermark_ratio,
+    int64_t client_live_ttl_sec, const std::string& etcd_endpoints,
+    const std::string& local_hostname, const std::string& rpc_address,
     std::chrono::steady_clock::duration rpc_conn_timeout,
     bool rpc_enable_tcp_no_delay)
     : enable_gc_(enable_gc),
       enable_metric_reporting_(enable_metric_reporting),
       metrics_port_(metrics_port),
       default_kv_lease_ttl_(default_kv_lease_ttl),
+      default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
@@ -148,9 +149,10 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Starting master service...";
         bool enable_ha = true;
         mooncake::WrappedMasterService wrapped_master_service(
-            enable_gc_, default_kv_lease_ttl_, enable_metric_reporting_,
-            metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version, client_live_ttl_sec_, enable_ha);
+            enable_gc_, default_kv_lease_ttl_, default_kv_soft_pin_ttl_,
+            enable_metric_reporting_, metrics_port_, eviction_ratio_,
+            eviction_high_watermark_ratio_, version, client_live_ttl_sec_,
+            enable_ha);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 
