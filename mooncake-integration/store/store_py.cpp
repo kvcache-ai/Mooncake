@@ -1074,7 +1074,7 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
-pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
+pybind11::object DistributedObjectStore::get_tensor(const std::string &key, const std::string dtype) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return pybind11::none();
@@ -1114,7 +1114,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         // Convert bytes to tensor using torch.from_numpy
         pybind11::module numpy = pybind11::module::import("numpy");
         pybind11::object np_array = numpy.attr("frombuffer")(
-            pybind11::bytes(exported_data, total_length), "uint8");
+            pybind11::bytes(exported_data, total_length), dtype);
         
         // Create tensor from numpy array
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
@@ -1245,7 +1245,7 @@ PYBIND11_MODULE(store, m) {
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
         .def("get_tensor", &DistributedObjectStore::get_tensor,
-             py::arg("key"), "Get a PyTorch tensor from the store")
+             py::arg("key"), py::arg("dtype"), "Get a PyTorch tensor from the store")
         .def("put_tensor", &DistributedObjectStore::put_tensor,
              py::arg("key"), py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(

@@ -219,9 +219,10 @@ class DistributedObjectStore {
     /**
      * @brief Get a PyTorch tensor from the store
      * @param key Key of the tensor to get
+     * @param dtype Data type of the tensor
      * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
      */
-    pybind11::object get_tensor(const std::string &key);
+    pybind11::object get_tensor(const std::string &key, const std::string dtype);
 
     /**
      * @brief Put a PyTorch tensor into the store

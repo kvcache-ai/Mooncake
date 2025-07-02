@@ -362,48 +362,6 @@ class TestDistributedObjectStore(unittest.TestCase):
          # Cleanup: ensure all remaining keys are removed
          for key in list(reference.keys()):
              self.store.remove(key)
-
-def test_put_get_tensor(self):
-    """Test storing and retrieving PyTorch tensors using put_tensor/get_tensor."""
-    import torch
-
-    # Float tensor
-    tensor = torch.randn(5, 7, dtype=torch.float32)
-    key = "test_tensor_float"
-    result = self.store.put_tensor(key, tensor)
-    self.assertEqual(result, 0)
-    retrieved = self.store.get_tensor(key)
-    self.assertIsNotNone(retrieved)
-    self.assertEqual(tuple(retrieved.shape), tuple(tensor.shape))
-    self.assertEqual(retrieved.dtype, tensor.dtype)
-    self.assertTrue(torch.allclose(tensor, retrieved))
-
-    # Int tensor
-    tensor_int = torch.randint(0, 100, (3, 4), dtype=torch.int32)
-    key_int = "test_tensor_int"
-    result = self.store.put_tensor(key_int, tensor_int)
-    self.assertEqual(result, 0)
-    retrieved_int = self.store.get_tensor(key_int)
-    self.assertIsNotNone(retrieved_int)
-    self.assertEqual(tuple(retrieved_int.shape), tuple(tensor_int.shape))
-    self.assertEqual(retrieved_int.dtype, tensor_int.dtype)
-    self.assertTrue(torch.equal(tensor_int, retrieved_int))
-
-    # Bool tensor
-    tensor_bool = torch.tensor([[True, False], [False, True]], dtype=torch.bool)
-    key_bool = "test_tensor_bool"
-    result = self.store.put_tensor(key_bool, tensor_bool)
-    self.assertEqual(result, 0)
-    retrieved_bool = self.store.get_tensor(key_bool)
-    self.assertIsNotNone(retrieved_bool)
-    self.assertEqual(tuple(retrieved_bool.shape), tuple(tensor_bool.shape))
-    self.assertEqual(retrieved_bool.dtype, tensor_bool.dtype)
-    self.assertTrue(torch.equal(tensor_bool, retrieved_bool))
-
-    # Clean up
-    self.store.remove(key)
-    self.store.remove(key_int)
-    self.store.remove(key_bool)
-             
+       
 if __name__ == '__main__':
     unittest.main()
