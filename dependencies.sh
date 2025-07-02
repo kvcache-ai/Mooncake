@@ -116,6 +116,7 @@ SYSTEM_PACKAGES="build-essential \
                   libgrpc-dev \
                   libgrpc++-dev \
                   libprotobuf-dev \
+                  libyaml-cpp-dev \
                   protobuf-compiler-grpc \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
