@@ -216,6 +216,21 @@ class DistributedObjectStore {
      */
     int64_t getSize(const std::string &key);
 
+    /**
+     * @brief Get a PyTorch tensor from the store
+     * @param key Key of the tensor to get
+     * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
+     */
+    pybind11::object get_tensor(const std::string &key);
+
+    /**
+     * @brief Put a PyTorch tensor into the store
+     * @param key Key for the tensor
+     * @param tensor PyTorch tensor to store
+     * @return 0 on success, negative value on error
+     */
+    int put_tensor(const std::string &key, pybind11::object tensor);
+
    private:
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);

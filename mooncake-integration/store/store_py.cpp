@@ -1074,6 +1074,114 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
+pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return pybind11::none();
+    }
+
+    try {
+        // Import torch module
+        pybind11::module torch = pybind11::module::import("torch");
+        
+        // Query object info first
+        mooncake::Client::ObjectInfo object_info;
+        ErrorCode error_code = client_->Query(key, object_info);
+        if (error_code != ErrorCode::OK) {
+            return pybind11::none();
+        }
+
+        // Allocate slices for the object
+        SliceGuard guard(*this);
+        uint64_t total_length = 0;
+        int ret = allocateSlices(guard.slices(), object_info, total_length);
+        if (ret) {
+            return pybind11::none();
+        }
+
+        // Get the object data
+        error_code = client_->Get(key, object_info, guard.slices());
+        if (error_code != ErrorCode::OK) {
+            return pybind11::none();
+        }
+
+        // Convert slices to contiguous bytes
+        char *exported_data = exportSlices(guard.slices(), total_length);
+        if (!exported_data) {
+            return pybind11::none();
+        }
+
+        // Convert bytes to tensor using torch.from_numpy
+        pybind11::module numpy = pybind11::module::import("numpy");
+        pybind11::object np_array = numpy.attr("frombuffer")(
+            pybind11::bytes(exported_data, total_length), "uint8");
+        
+        // Create tensor from numpy array
+        pybind11::object tensor = torch.attr("from_numpy")(np_array);
+        
+        // Clean up exported data
+        delete[] exported_data;
+        
+        return tensor;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to convert bytes to tensor: " << e.what();
+        return pybind11::none();
+    }
+}
+
+int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object tensor) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    try {
+        // Import torch module
+        pybind11::module torch = pybind11::module::import("torch");
+        
+        // Check if the object is a tensor
+        if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
+            LOG(ERROR) << "Input is not a PyTorch tensor";
+            return -1;
+        }
+        
+        // Convert tensor to numpy array
+        pybind11::object np_array = tensor.attr("numpy")();
+        
+        // Convert numpy array to bytes
+        pybind11::bytes tensor_bytes = np_array.attr("tobytes")();
+        // tensor_bytes.
+        // Allocate slices for the tensor data
+        SliceGuard slices(*this);
+        std::string tensor_bytes_str = tensor_bytes.cast<std::string>();
+        int ret = allocateSlices(slices.slices(), std::span<const char>(
+            tensor_bytes_str.data(),
+            tensor_bytes_str.size()));
+        // int ret = allocateSlices(slices.slices(), std::span<const char>(
+        //     static_cast<const char *>(tensor_bytes.ptr()),
+        //     tensor_bytes.size()));
+        if (ret) {
+            return -1;
+        }
+
+        // Use client_->Put directly
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = this->local_hostname;
+        
+        ErrorCode error_code = client_->Put(key, slices.slices(), config);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Put operation failed with error: " << toString(error_code);
+            return -toInt(error_code);
+        }
+        
+        return 0;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to convert tensor to bytes: " << e.what();
+        return -1;
+    }
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the SliceBuffer class
     py::class_<SliceBuffer, std::shared_ptr<SliceBuffer>>(m, "SliceBuffer",
@@ -1136,6 +1244,10 @@ PYBIND11_MODULE(store, m) {
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_tensor", &DistributedObjectStore::get_tensor,
+             py::arg("key"), "Get a PyTorch tensor from the store")
+        .def("put_tensor", &DistributedObjectStore::put_tensor,
+             py::arg("key"), py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
             "register_buffer",
             [](DistributedObjectStore &self, uintptr_t buffer_ptr,
