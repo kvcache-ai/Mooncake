@@ -42,8 +42,7 @@ target_link_libraries(stress_workload_test PUBLIC
     cachelib_memory_allocator
     ${ETCD_WRAPPER_LIB}
     glog
-    gtest
-    gtest_main
+    gflags
     pthread
 )
 

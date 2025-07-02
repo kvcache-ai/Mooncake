@@ -251,10 +251,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()) {
     CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
 
-    // Read MC_STORE_MEMCPY environment variable, default to true (enabled)
+    // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
-        memcpy_enabled_ = true;  // Default: enabled
+        memcpy_enabled_ = false;  // Default: disabled
     } else {
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
