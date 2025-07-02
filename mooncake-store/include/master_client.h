@@ -170,6 +170,12 @@ class MasterClient {
                                                         const UUID& client_id);
 
     /**
+     * @brief Gets the cluster ID for the current client to use as subdirectory name
+     * @return GetClusterIdResponse containing the cluster ID
+     */    
+    [[nodiscard]] GetFsdirResponse GetFsdir();
+
+    /**
      * @brief Pings master to check its availability
      * @param client_id The uuid of the client
      * @return current master view version

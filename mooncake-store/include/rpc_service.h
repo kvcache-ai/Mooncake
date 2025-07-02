@@ -90,6 +90,12 @@ struct UnmountSegmentResponse {
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct GetFsdirResponse {
+    std::string fsdir;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(GetFsdirResponse, error_code, fsdir)
+
 struct PingResponse {
     ViewVersionId view_version = 0;
     ClientStatus client_status = ClientStatus::UNDEFINED;
@@ -114,10 +120,11 @@ class WrappedMasterService {
             DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
         ViewVersionId view_version = 0,
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false)
+        bool enable_ha = false,
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID)
         : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
                           eviction_high_watermark_ratio, view_version,
-                          client_live_ttl_sec, enable_ha),
+                          client_live_ttl_sec, enable_ha, cluster_id),
           http_server_(4, http_port),
           metric_report_running_(enable_metric_reporting),
           view_version_(view_version) {
@@ -182,13 +189,15 @@ class WrappedMasterService {
                 response = GetReplicaList(std::string(key));
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                for (size_t i = 0; i < response.replica_list.size(); i++) {
-                    for (const auto& handle :
-                         response.replica_list[i].buffer_descriptors) {
-                        std::string tmp = "";
-                        struct_json::to_json(handle, tmp);
-                        ss += tmp;
-                        ss += "\n";
+                for(size_t i = 0; i < response.replica_list.size(); i++) {
+                    if(response.replica_list[i].is_memory_replica()) {
+                        auto & memory_descriptors = response.replica_list[i].get_memory_descriptor();
+                        for(const auto& handle : memory_descriptors.buffer_descriptors) {
+                            std::string tmp = "";
+                            struct_json::to_json(handle, tmp);
+                            ss += tmp;
+                            ss += "\n";
+                        }
                     }
                 }
                 resp.set_status_and_content(status_type::ok, ss);
@@ -540,6 +549,19 @@ class WrappedMasterService {
         return response;
     }
 
+    GetFsdirResponse GetFsdir() {
+        ScopedVLogTimer timer(1, "GetFsdir");
+        timer.LogRequest("action=get_fsdir");
+
+        GetFsdirResponse response;
+        std::string fsdir;
+        response.error_code = master_service_.GetFsdir(fsdir);
+        response.fsdir = std::move(fsdir);
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
     PingResponse Ping(const UUID& client_id) {
         ScopedVLogTimer timer(1, "Ping");
         timer.LogRequest("client_id=", client_id);
@@ -599,6 +621,8 @@ inline void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);

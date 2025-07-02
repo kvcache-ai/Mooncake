@@ -98,7 +98,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
 
     // Create slices
     std::vector<AllocatedBuffer::Descriptor>& descriptors =
-        object_info.replica_list[0].buffer_descriptors;
+        object_info.replica_list[0].get_memory_descriptor().buffer_descriptors;
     SliceGuard slice_guard(descriptors, allocator_);
 
     // Perform get operation
