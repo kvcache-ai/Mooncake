@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <thread>
@@ -22,7 +23,7 @@ DEFINE_string(device_name, "erdma_0",
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
 DEFINE_int32(num_threads, 8, "Number of concurrent worker threads");
 DEFINE_int32(test_operation_nums, 100, "Number of operations per thread");
-DEFINE_int32(key_size, 128, "Size of keys in bytes");
+
 DEFINE_int32(value_size, 1048576, "Size of values in bytes (default: 1MB)");
 
 // Memory configuration flags
@@ -243,10 +244,10 @@ void calculate_percentiles(std::vector<double>& latencies, double& p50,
     // Use explicit parentheses and floating-point arithmetic for safe
     // percentile calculation This avoids integer division order issues and
     // ensures correct indices
-    p50 = latencies[static_cast<size_t>(size * 0.50)];
-    p90 = latencies[static_cast<size_t>(size * 0.90)];
-    p95 = latencies[static_cast<size_t>(size * 0.95)];
-    p99 = latencies[static_cast<size_t>(size * 0.99)];
+    p50 = latencies[static_cast<size_t>(std::ceil((size * 0.50) - 1))];
+    p90 = latencies[static_cast<size_t>(std::ceil((size * 0.90) - 1))];
+    p95 = latencies[static_cast<size_t>(std::ceil((size * 0.95) - 1))];
+    p99 = latencies[static_cast<size_t>(std::ceil((size * 0.99) - 1))];
 }
 
 void print_results(const std::vector<ThreadStats>& thread_stats,
@@ -305,7 +306,7 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     LOG(INFO) << "=== Benchmark Results ===";
     LOG(INFO) << "Test Duration: " << duration_s << " seconds";
     LOG(INFO) << "Threads: " << FLAGS_num_threads;
-    LOG(INFO) << "Key Size: " << FLAGS_key_size << " bytes";
+    LOG(INFO) << "Key Size: 128 bytes";
     LOG(INFO) << "Value Size: " << FLAGS_value_size << " bytes";
     LOG(INFO) << "Operations per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "";
