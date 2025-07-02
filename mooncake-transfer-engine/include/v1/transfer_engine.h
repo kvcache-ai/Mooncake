@@ -113,6 +113,13 @@ class TransferEngine {
     TransportType getTransportType(const Request &request);
 
    private:
+    struct AllocatedMemory {
+        void *addr;
+        size_t size;
+        std::shared_ptr<Transport> transport;
+    };
+
+   private:
     std::shared_ptr<ConfigManager> conf_;
     std::shared_ptr<MetadataService> metadata_;
     std::shared_ptr<Topology> topology_;
@@ -121,6 +128,7 @@ class TransferEngine {
     std::vector<std::shared_ptr<Transport>> transport_list_;
     std::unordered_set<Batch *> batch_set_;
     std::vector<Batch *> deferred_free_batch_set_;
+    std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
 
     std::shared_ptr<LocalSegmentHelper> local_segment_;

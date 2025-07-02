@@ -12,143 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <bits/stdc++.h>
 #include <fcntl.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <signal.h>
 #include <sys/time.h>
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstdlib>
-#include <fstream>
-#include <iomanip>
-#include <memory>
-#include <sstream>
-#include <unordered_map>
-
 #include "v1/common.h"
 #include "v1/transfer_engine.h"
 #include "v1/transport/transport.h"
 
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
-
-#ifdef USE_NVMEOF
-#include <cufile.h>
 #endif
 
-#include <cassert>
+DEFINE_string(metadata_type, "p2p", "Metadata type: p2p|etcd|redis|http");
+DEFINE_string(metadata_servers, "",
+              "Metadata servers (required unless type is `p2p')");
+DEFINE_string(mode, "initiator", "Running mode: initiator|target");
+DEFINE_string(workload, "read", "Test workload: read|write");
+DEFINE_string(local_segment, "",
+              "Set the custom local segment name (optional)");
+DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
 
-static void checkCudaError(cudaError_t result, const char *message) {
-    if (result != cudaSuccess) {
-        LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << cudaGetErrorString(result) << ")" << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
-#endif
-
-const static int NR_SOCKETS =
-    numa_available() == 0 ? numa_num_configured_nodes() : 1;
-
-DEFINE_string(segment_name, "", "Segment name of this instance");
-DEFINE_string(metadata_type, "p2p", "Metadata type: p2p, etcd, redis or http");
-DEFINE_string(metadata_servers, "127.0.0.1:2379", "Metadata server addresses");
-
-DEFINE_string(mode, "initiator",
-              "Running mode: initiator or target. Initiator node read/write "
-              "data blocks from target node");
-DEFINE_string(operation, "read", "Operation type: read or write");
-
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
-
-DEFINE_string(device_name, "mlx5_2",
-              "Device name to use, valid if protocol=rdma");
-DEFINE_string(nic_priority_matrix, "",
-              "Path to RDMA NIC priority matrix file (Advanced)");
-DEFINE_string(shm_path, "mooncake", "Path of shared memory file");
-
-DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
-DEFINE_uint64(buffer_size, 1ull << 30, "total size of data buffer");
-DEFINE_int32(batch_size, 128, "Batch size");
-DEFINE_uint64(block_size, 4096, "Block size for each transfer request");
+DEFINE_int32(batch, 128, "Number of requests per batch");
+DEFINE_uint64(size, 65536, "Block size for each request");
 DEFINE_int32(duration, 10, "Test duration in seconds");
-DEFINE_int32(threads, 4, "Task submission threads");
+DEFINE_int32(threads, 4, "Test threads to submit requests");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
 #ifdef USE_CUDA
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
-DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
-using namespace mooncake;
+#define CHECK_FAIL(call)                                        \
+    do {                                                        \
+        auto status_ = call;                                    \
+        if (!status_.ok()) {                                    \
+            LOG(INFO) << "Found error: " << status_.ToString(); \
+            exit(EXIT_FAILURE);                                 \
+        }                                                       \
+    } while (0)
+
 using namespace mooncake::v1;
-
-static void *allocateMemoryPool(size_t size, const std::string &shm_path) {
-    int shm_fd = shm_open(shm_path.c_str(), O_CREAT | O_RDWR, 0644);
-    if (shm_fd == -1) {
-        PLOG(ERROR) << "Failed to open shared memory file";
-        return nullptr;
-    }
-
-    if (ftruncate64(shm_fd, size) == -1) {
-        PLOG(ERROR) << "Failed to truncate shared memory file";
-        close(shm_fd);
-        return nullptr;
-    }
-
-    void *mapped_addr =
-        mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (mapped_addr == MAP_FAILED) {
-        PLOG(ERROR) << "Failed to map shared memory file";
-        close(shm_fd);
-        return nullptr;
-    }
-
-    close(shm_fd);
-    return mapped_addr;
-}
-
-static void *allocateMemoryPool(size_t size, int socket_id,
-                                bool from_vram = false) {
-#ifdef USE_CUDA
-    if (from_vram) {
-        int gpu_id = FLAGS_gpu_id;
-        void *d_buf;
-        checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-        checkCudaError(cudaMalloc(&d_buf, size),
-                       "Failed to allocate device memory");
-        return d_buf;
-    }
-#endif
-    return numa_alloc_onnode(size, socket_id);
-}
-
-static void freeMemoryPool(void *addr, size_t size) {
-#ifdef USE_CUDA
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                   "Failed to get pointer attributes");
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(addr, size);
-    } else {
-        LOG(ERROR) << "Unknown memory type, " << addr << " " << attributes.type;
-    }
-#else
-    numa_free(addr, size);
-#endif
-}
 
 const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
     {"GB", 1000ull * 1000ull * 1000ull},
@@ -170,7 +78,7 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
         LOG(WARNING) << "Invalid flag: report_unit only support "
                         "GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb, not support "
                      << FLAGS_report_unit
-                     << " . Now use GB(default) as report_unit";
+                     << ". Now use GB(default) as report_unit";
         FLAGS_report_unit = "GB";
     }
     std::ostringstream oss;
@@ -180,70 +88,75 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
     return oss.str();
 }
 
+int num_buffers = 1;
+int cuda_device_count = 0;
+size_t buffer_capacity = 32 * 1024 * 1024;
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
-                       int thread_id, void *addr) {
-    bindToSocket(thread_id % NR_SOCKETS);
+uint64_t getStartAddress(TransferEngine *engine, SegmentID handle,
+                         int thread_id) {
+    auto segment_desc = engine->getSegmentDesc(handle);
+    if (!segment_desc || segment_desc->type != SegmentType::Memory) {
+        LOG(ERROR) << "Invalid args: cannot find memory segment "
+                   << FLAGS_remote_segment << ", please recheck";
+        exit(EXIT_FAILURE);
+    }
+    auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
+    if (detail.buffers.empty()) {
+        LOG(ERROR) << "Invalid args: remote segment " << FLAGS_remote_segment
+                   << " no registered memory, please recheck";
+        exit(EXIT_FAILURE);
+    }
+    return (uint64_t)detail.buffers[thread_id % detail.buffers.size()].addr;
+}
+
+Status initiatorWorker(TransferEngine *engine, SegmentID handle, int thread_id,
+                       void *addr) {
+    bindToSocket(thread_id % num_buffers);
+    uint64_t remote_base = getStartAddress(engine, handle, thread_id);
+
     Request::OpCode opcode;
-    if (FLAGS_operation == "read")
+    if (FLAGS_workload == "read")
         opcode = Request::READ;
-    else if (FLAGS_operation == "write")
+    else if (FLAGS_workload == "write")
         opcode = Request::WRITE;
     else {
-        LOG(ERROR) << "Unsupported operation: must be 'read' or 'write'";
+        LOG(ERROR) << "Invalid args: workload only support read|write";
         exit(EXIT_FAILURE);
     }
-
-    auto segment_desc = engine->getSegmentDesc(segment_id);
-    if (!segment_desc) {
-        LOG(ERROR) << "Unable to get target segment ID, please recheck";
-        exit(EXIT_FAILURE);
-    }
-    auto &detail =
-        std::get<mooncake::v1::MemorySegmentDesc>(segment_desc->detail);
-    uint64_t remote_base =
-        (uint64_t)detail.buffers[thread_id % NR_SOCKETS].addr;
 
     size_t batch_count = 0;
     while (running) {
-        auto batch_id = engine->allocateBatch(FLAGS_batch_size);
-        Status s;
+        auto batch_id = engine->allocateBatch(FLAGS_batch);
         std::vector<Request> requests;
-        for (int i = 0; i < FLAGS_batch_size; ++i) {
+        for (int i = 0; i < FLAGS_batch; ++i) {
             Request entry;
             entry.opcode = opcode;
-            entry.length = FLAGS_block_size;
+            entry.length = FLAGS_size;
             entry.source = (uint8_t *)(addr) +
-                           FLAGS_block_size * (i * FLAGS_threads + thread_id);
-            entry.target_id = segment_id;
+                           FLAGS_size * (i * FLAGS_threads + thread_id);
+            entry.target_id = handle;
             entry.target_offset =
-                remote_base +
-                FLAGS_block_size * (i * FLAGS_threads + thread_id);
+                remote_base + FLAGS_size * (i * FLAGS_threads + thread_id);
             requests.emplace_back(entry);
         }
-
-        s = engine->submitTransfer(batch_id, requests);
-        LOG_ASSERT(s.ok());
-        for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
+        CHECK_FAIL(engine->submitTransfer(batch_id, requests));
+        for (int task_id = 0; task_id < FLAGS_batch; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
-                Status s = engine->getTransferStatus(batch_id, task_id, status);
-                LOG_ASSERT(s.ok());
+                CHECK_FAIL(
+                    engine->getTransferStatus(batch_id, task_id, status));
                 if (status.s == TransferStatusEnum::COMPLETED)
                     completed = true;
                 else if (status.s == TransferStatusEnum::FAILED) {
-                    LOG(INFO) << "FAILED";
-                    completed = true;
+                    LOG(ERROR) << "Failed transfer detected";
                     exit(EXIT_FAILURE);
                 }
             }
         }
-
-        s = engine->freeBatch(batch_id);
-        LOG_ASSERT(s.ok());
+        CHECK_FAIL(engine->freeBatch(batch_id));
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
@@ -251,49 +164,67 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     return Status::OK();
 }
 
-int initiator() {
+void allocateAllLocalMemory(const std::unique_ptr<TransferEngine> &engine,
+                            std::vector<void *> &addr) {
+    for (int i = 0; i < num_buffers; ++i) {
+        MemoryOptions options;
+#ifdef USE_CUDA
+        if (i < cuda_device_count) {
+            options.location = "cuda:" + std::to_string(i);
+        } else {
+            options.location = "cpu:" + std::to_string(i - cuda_device_count);
+        }
+#else
+        options.location = "cpu:" + std::to_string(i);
+#endif
+        CHECK_FAIL(
+            engine->allocateLocalMemory(&addr[i], buffer_capacity, options));
+        CHECK_FAIL(
+            engine->registerLocalMemory(addr[i], buffer_capacity, options));
+    }
+}
+
+void deallocateAllLocalMemory(const std::unique_ptr<TransferEngine> &engine,
+                              std::vector<void *> &addr) {
+    for (int i = 0; i < num_buffers; ++i) {
+        CHECK_FAIL(engine->unregisterLocalMemory(addr[i], buffer_capacity));
+        CHECK_FAIL(engine->freeLocalMemory(addr[i], buffer_capacity));
+    }
+}
+
+std::shared_ptr<ConfigManager> loadConfig() {
     auto config = std::make_shared<ConfigManager>();
     std::string context;
-    context = "{ \"local_segment_name\": \"" + FLAGS_segment_name +
+    context = "{ \"local_segment_name\": \"" + FLAGS_local_segment +
               "\",\n\"metadata_type\": \"" + FLAGS_metadata_type +
               "\",\"metadata_servers\": \"" + FLAGS_metadata_servers + "\"}";
-    config->loadConfigContent(context);
-    auto engine = std::make_unique<TransferEngine>(config);
-    std::vector<void *> addr(NR_SOCKETS, nullptr);
-    int buffer_num = NR_SOCKETS;
+    CHECK_FAIL(config->loadConfigContent(context));
+    return config;
+}
 
-#ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
-    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
-    for (int i = 0; i < buffer_num; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
-        LOG_ASSERT(status.ok());
-    }
-#else
-    for (int i = 0; i < buffer_num; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
-        LOG_ASSERT(status.ok());
-    }
-#endif
+int initiator() {
+    auto engine = std::make_unique<TransferEngine>(loadConfig());
+    std::vector<void *> addr(num_buffers, nullptr);
+    allocateAllLocalMemory(engine, addr);
 
     SegmentID handle;
-    auto status = engine->openRemoteSegment(handle, FLAGS_segment_id.c_str());
-    LOG_ASSERT(status.ok());
+    if (FLAGS_remote_segment.empty()) {
+        LOG(ERROR) << "Invalid remote segment name from --remote_segment";
+        exit(EXIT_FAILURE);
+    }
+
+    CHECK_FAIL(engine->openRemoteSegment(handle, FLAGS_remote_segment.c_str()));
 
     std::thread workers[FLAGS_threads];
-
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
-
     for (int i = 0; i < FLAGS_threads; ++i)
         workers[i] = std::thread(initiatorWorker, engine.get(), handle, i,
-                                 addr[i % buffer_num]);
+                                 addr[i % num_buffers]);
 
     sleep(FLAGS_duration);
-    running = false;
 
+    running = false;
     for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
 
     gettimeofday(&stop_tv, nullptr);
@@ -301,20 +232,13 @@ int initiator() {
                     (stop_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
     auto batch_count = total_batch_count.load();
 
-    LOG(INFO) << "numa node num: " << NR_SOCKETS;
-
-    LOG(INFO) << "Test completed: duration " << std::fixed
+    LOG(INFO) << "Test completed. duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "
               << batch_count << ", throughput "
-              << calculateRate(
-                     batch_count * FLAGS_batch_size * FLAGS_block_size,
-                     duration);
+              << calculateRate(batch_count * FLAGS_batch * FLAGS_size,
+                               duration);
 
-    for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i], FLAGS_buffer_size);
-        freeMemoryPool(addr[i], FLAGS_buffer_size);
-    }
-
+    deallocateAllLocalMemory(engine, addr);
     return 0;
 }
 
@@ -328,52 +252,30 @@ void signalHandler(int signum) {
 int target() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
-
-    auto config = std::make_shared<ConfigManager>();
-    std::string context;
-    context = "{ \"local_segment_name\": \"" + FLAGS_segment_name +
-              "\",\n\"metadata_type\": \"" + FLAGS_metadata_type +
-              "\",\"metadata_servers\": \"" + FLAGS_metadata_servers + "\"}";
-    config->loadConfigContent(context);
-    auto engine = std::make_unique<TransferEngine>(config);
-    std::vector<void *> addr(NR_SOCKETS, nullptr);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
-        memset(addr[i], 'x', FLAGS_buffer_size);
-        auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
-        LOG_ASSERT(status.ok());
-    }
-
-    LOG(INFO) << "numa node num: " << NR_SOCKETS;
-
+    auto engine = std::make_unique<TransferEngine>(loadConfig());
+    std::vector<void *> addr(num_buffers, nullptr);
+    allocateAllLocalMemory(engine, addr);
     while (target_running) sleep(1);
-    for (int i = 0; i < NR_SOCKETS; ++i) {
-        engine->unregisterLocalMemory(addr[i], FLAGS_buffer_size);
-        freeMemoryPool(addr[i], FLAGS_buffer_size);
-    }
-
+    deallocateAllLocalMemory(engine, addr);
     return 0;
-}
-
-void check_total_buffer_size() {
-    uint64_t require_size = FLAGS_block_size * FLAGS_batch_size * FLAGS_threads;
-    if (FLAGS_buffer_size < require_size) {
-        FLAGS_buffer_size = require_size;
-        LOG(WARNING) << "Invalid flag: buffer size is smaller than "
-                        "require_size, adjust to "
-                     << require_size;
-    }
 }
 
 int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    check_total_buffer_size();
+
+    uint64_t min_capacity = FLAGS_size * FLAGS_batch * FLAGS_threads;
+    buffer_capacity = std::max(buffer_capacity, min_capacity);
+    num_buffers = numa_num_configured_nodes();
+#ifdef USE_CUDA
+    cudaGetDeviceCount(&cuda_device_count);
+    if (FLAGS_use_vram) num_buffers += cuda_device_count;
+#endif
 
     if (FLAGS_mode == "initiator")
         return initiator();
     else if (FLAGS_mode == "target")
         return target();
 
-    LOG(ERROR) << "Unsupported mode: must be 'initiator' or 'target'";
+    LOG(ERROR) << "Invalid args: mode should be initiator|target";
     exit(EXIT_FAILURE);
 }

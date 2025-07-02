@@ -43,18 +43,16 @@ struct DeviceDesc {
     std::string gid;
 };
 
-enum class MemBufferType { RDMA, SHM, NVLINK, TCP, UNKNOWN };
-
 struct BufferDesc {
     uint64_t addr;
     uint64_t length;
     std::string location;
+
     std::vector<uint32_t> rkey;
     std::string shm_path;
     std::string mnnvl_handle;
-    int ref_count;
 
-    MemBufferType type;
+    int ref_count;
 };
 
 struct FileBufferDesc {
@@ -65,7 +63,7 @@ struct FileBufferDesc {
 
 struct MemorySegmentDesc {
     Topology topology;
-    std::vector<DeviceDesc> devices;  // TODO: change to map ...
+    std::vector<DeviceDesc> devices;
     std::vector<BufferDesc> buffers;
     std::string rpc_server_addr;
 };
@@ -130,7 +128,8 @@ class SegmentManager {
 
 class LocalSegmentHelper {
    public:
-    LocalSegmentHelper(const SegmentDescRef &local_desc) : local_desc_(local_desc) {}
+    LocalSegmentHelper(const SegmentDescRef &local_desc)
+        : local_desc_(local_desc) {}
 
     ~LocalSegmentHelper() {}
 
@@ -138,7 +137,8 @@ class LocalSegmentHelper {
     LocalSegmentHelper &operator==(const LocalSegmentHelper &) = delete;
 
    public:
-    Status query(uint64_t base, size_t length, std::vector<BufferDesc *> &result);
+    Status query(uint64_t base, size_t length,
+                 std::vector<BufferDesc *> &result);
 
     Status add(uint64_t base, size_t length,
                std::function<Status(BufferDesc &)> callback);

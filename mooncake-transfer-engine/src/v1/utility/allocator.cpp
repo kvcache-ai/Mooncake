@@ -22,14 +22,13 @@
 namespace mooncake {
 namespace v1 {
 
-std::pair<std::string, int> parseKeyValue(const std::string &input) {
-    size_t colonPos = input.find(':');
+std::pair<std::string, int> parseLocation(const std::string &location) {
+    size_t colonPos = location.find(':');
     if (colonPos == std::string::npos) return std::make_pair("", -1);
-    std::string key = input.substr(0, colonPos);
-    std::string valueStr = input.substr(colonPos + 1);
+    std::string type = location.substr(0, colonPos);
+    std::string indexStr = location.substr(colonPos + 1);
     try {
-        int value = std::stoi(valueStr);
-        return std::make_pair(key, value);
+        return std::make_pair(type, std::stoi(indexStr));
     } catch (const std::exception &e) {
         return std::make_pair("", -1);
     }
@@ -37,7 +36,7 @@ std::pair<std::string, int> parseKeyValue(const std::string &input) {
 
 Status genericAllocateLocalMemory(void **pptr, size_t size,
                                   MemoryOptions &options) {
-    auto result = parseKeyValue(options.location);
+    auto result = parseLocation(options.location);
     if (result.first == "cuda") {
 #ifdef USE_CUDA
         auto ret = cudaSetDevice(result.second);
@@ -50,13 +49,13 @@ Status genericAllocateLocalMemory(void **pptr, size_t size,
 #else
         return Status::NotImplemented("CUDA feature not supported" LOC_MARK);
 #endif
-    } else if (result.first == "cpu") {
-        *pptr = numa_alloc_onnode(size, result.second);
-        if (!(*pptr))
-            return Status::InternalError("Unable to allocate DRAM memory");
     }
-
-    return Status::InternalError("Unknown device type in location");
+    int socket_id = 0;
+    if (result.first == "cpu") socket_id = result.second;
+    *pptr = numa_alloc_onnode(size, socket_id);
+    if (!(*pptr))
+        return Status::InternalError("Unable to allocate DRAM memory");
+    return Status::OK();
 }
 
 Status genericFreeLocalMemory(void *ptr, size_t size) {

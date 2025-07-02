@@ -215,11 +215,28 @@ Status TransferEngine::closeRemoteSegment(SegmentID handle) {
 
 Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
-    return Status::NotImplemented("allocate local memory not implemented");
+    auto transport = transport_list_[options.type];
+    if (!transport)
+        return Status::InvalidArgument(
+            "Not supported type in memory options" LOC_MARK);
+    CHECK_STATUS(transport->allocateLocalMemory(addr, size, options));
+    std::lock_guard<std::mutex> lock(mutex_);
+    AllocatedMemory entry{.addr = *addr, .size = size, .transport = transport};
+    allocated_memory_.push_back(entry);
+    return Status::OK();
 }
 
 Status TransferEngine::freeLocalMemory(void *addr, size_t size) {
-    return Status::NotImplemented("free local memory not implemented");
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
+         ++it) {
+        if (it->addr == addr && it->size == size) {
+            auto status = it->transport->freeLocalMemory(addr, size);
+            allocated_memory_.erase(it);
+            return status;
+        }
+    }
+    return Status::InvalidArgument("Address region not registered" LOC_MARK);
 }
 
 Status TransferEngine::registerLocalMemory(void *addr, size_t size,
@@ -336,7 +353,7 @@ Status TransferEngine::sendNotify(SegmentID target_id,
         if (!transport || !transport->hasNotifyFeature()) continue;
         return transport->sendNotify(target_id, notify);
     }
-    return Status::InvalidArgument("Notify feature not supported");
+    return Status::InvalidArgument("Notify feature not supported" LOC_MARK);
 }
 
 Status TransferEngine::getNotifyList(std::vector<NotifyMessage> &notify_list) {
@@ -345,7 +362,7 @@ Status TransferEngine::getNotifyList(std::vector<NotifyMessage> &notify_list) {
         if (!transport || !transport->hasNotifyFeature()) continue;
         return transport->getNotifyList(notify_list);
     }
-    return Status::InvalidArgument("Notify feature not supported");
+    return Status::InvalidArgument("Notify feature not supported" LOC_MARK);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -386,10 +403,10 @@ Status TransferEngine::getTransferStatus(
 std::shared_ptr<SegmentDesc> TransferEngine::getSegmentDesc(SegmentID handle) {
     auto &manager = metadata_->segmentManager();
     std::shared_ptr<SegmentDesc> desc;
-    if (handle == 0) return manager.getLocal();
+    if (handle == LOCAL_SEGMENT_ID) return manager.getLocal();
     auto status = manager.getRemote(desc, handle);
     if (!status.ok()) {
-        LOG(ERROR) << status.ToString();
+        LOG(ERROR) << "Failed to retrieve segment: " << status.ToString();
         return nullptr;
     }
     return desc;

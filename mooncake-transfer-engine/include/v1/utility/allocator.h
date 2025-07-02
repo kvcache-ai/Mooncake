@@ -20,6 +20,8 @@
 namespace mooncake {
 namespace v1 {
 
+std::pair<std::string, int> parseLocation(const std::string &location);
+
 Status genericAllocateLocalMemory(void **pptr, size_t size,
                                   MemoryOptions &options);
 

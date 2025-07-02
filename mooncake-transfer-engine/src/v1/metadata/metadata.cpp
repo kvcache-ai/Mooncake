@@ -82,6 +82,8 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
                 if (!buffer.rkey.empty()) bufferJSON["rkey"] = rkeyJSON;
                 if (!buffer.shm_path.empty())
                     bufferJSON["shm_path"] = buffer.shm_path;
+                if (!buffer.mnnvl_handle.empty())
+                    bufferJSON["mnnvl_handle"] = buffer.mnnvl_handle;
                 buffersJSON.append(bufferJSON);
             }
             if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
@@ -139,6 +141,7 @@ static std::shared_ptr<SegmentDesc> importSegmentDesc(
                     for (const auto &rkeyJSON : bufferJSON["rkey"])
                         buffer.rkey.push_back(rkeyJSON.asUInt());
                     buffer.shm_path = getItem(bufferJSON, "shm_path");
+                    buffer.mnnvl_handle = getItem(bufferJSON, "mnnvl_handle");
                     if (buffer.location.empty() || !buffer.addr ||
                         !buffer.length ||
                         detail.devices.size() != buffer.rkey.size()) {

@@ -31,9 +31,9 @@
         return Status(Code::k##err, msg);                                \
     }
 
-#define LINE __LINE__
 #define STRINGIFY(x) #x
-#define LOC_MARK     ", location " __FILE__ ":" STRINGIFY(LINE)
+#define TOSTRING(x) STRINGIFY(x)
+#define LOC_MARK ", at " __FILE__ ":" TOSTRING(__LINE__)
 
 namespace mooncake {
 namespace v1 {
