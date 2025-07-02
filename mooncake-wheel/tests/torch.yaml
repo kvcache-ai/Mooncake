@@ -1,0 +1,9 @@
+inference_ip: "192.168.0.145"
+training_ip: "192.168.0.146"
+inference_gpu_id: 6
+training_gpu_id: 7
+port: 5555
+bulk_size: 5 # 5GB
+send_bulk: 15 # 15GB
+threads: 1
+model_path: "little.txt"

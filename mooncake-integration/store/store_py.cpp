@@ -403,6 +403,61 @@ int DistributedObjectStore::allocateBatchedSlices(
     return 0;
 }
 
+int DistributedObjectStore::allocateBatchedSlices(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        &batched_slices) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        uint64_t offset = 0;
+        const auto &value = values[i];
+        std::vector<Slice> slices;
+        while (offset < value.size()) {
+            auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;
+            }
+            memcpy(ptr, value.data() + offset, chunk_size);
+            slices.emplace_back(Slice{ptr, chunk_size});
+            offset += chunk_size;
+        }
+        batched_slices.emplace(keys[i], std::move(slices));
+    }
+    return 0;
+}
+
+int DistributedObjectStore::allocateBatchedSlices(
+    const std::vector<std::string> &keys,
+    std::unordered_map<std::string, std::vector<mooncake::Slice>>
+        &batched_slices,
+    const mooncake::Client::BatchObjectInfo &batched_object_info,
+    std::unordered_map<std::string, uint64_t> &str_length_map) {
+    if (batched_object_info.batch_replica_list.empty()) return -1;
+    for (const auto &key : keys) {
+        auto object_info_it = batched_object_info.batch_replica_list.find(key);
+        if (object_info_it == batched_object_info.batch_replica_list.end()) {
+            LOG(ERROR) << "Key not found: " << key;
+            return 1;
+        }
+        // Get first replica
+        auto &replica = object_info_it->second[0];
+        uint64_t length = 0;
+        for (auto &handle : replica.buffer_descriptors) {
+            auto chunk_size = handle.size_;
+            assert(chunk_size <= kMaxSliceSize);
+            auto ptr = client_buffer_allocator_->allocate(chunk_size);
+            if (!ptr) {
+                return 1;
+            }
+            batched_slices[key].emplace_back(Slice{ptr, chunk_size});
+            length += chunk_size;
+        }
+        str_length_map.emplace(key, length);
+    }
+    return 0;
+}
+
 char *DistributedObjectStore::exportSlices(
     const std::vector<mooncake::Slice> &slices, uint64_t length) {
     char *buf = new char[length + 1];
