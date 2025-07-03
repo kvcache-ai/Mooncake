@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <variant>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -30,8 +31,9 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
-static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5; // in seconds
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
+static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 
 // Forward declarations
 class BufferAllocator;
@@ -80,8 +82,8 @@ enum class ErrorCode : int32_t {
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
-    SEGMENT_NOT_FOUND = -101,   ///< No available segments found.
-    SEGMENT_ALREADY_EXISTS = -102,   ///< Segment already exists.
+    SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
+    SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE = -200,  ///< No available handles.
@@ -122,6 +124,15 @@ enum class ErrorCode : int32_t {
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
         -1011,  ///< Request cannot be done in current mode.
+
+    // FILE errors (Range: -1100 to -1199)
+    FILE_NOT_FOUND = -1100,  ///< File not found.
+    FILE_OPEN_FAIL = -1101,  ///< Error open file or write to a exist file.
+    FILE_READ_FAIL = -1102,  ///< Error reading file.
+    FILE_WRITE_FAIL = -1103,  ///< Error writing file.
+    FILE_INVALID_BUFFER = -1104,  ///< File buffer is wrong.
+    FILE_LOCK_FAIL = -1105,  ///< File lock operation failed.
+    FILE_INVALID_HANDLE = -1106,  ///< Invalid file handle.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -282,6 +293,17 @@ inline std::ostream& operator<<(std::ostream& os,
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
+struct MemoryDescriptor {
+    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors; 
+    YLT_REFL(MemoryDescriptor, buffer_descriptors);
+};
+
+struct DiskDescriptor {
+    std::string file_path{};
+    uint64_t file_size = 0;
+    YLT_REFL(DiskDescriptor, file_path, file_size);
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -319,9 +341,46 @@ class Replica {
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct Descriptor {
-        std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
+        std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, buffer_descriptors, status);
+        YLT_REFL(Descriptor, descriptor_variant, status);
+
+        // Helper functions
+        bool is_memory_replica() noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        bool is_memory_replica() const noexcept {
+            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        MemoryDescriptor& get_memory_descriptor() {
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        DiskDescriptor& get_disk_descriptor() {
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
+
+        const MemoryDescriptor& get_memory_descriptor() const{
+            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryDescriptor");
+        }
+
+        const DiskDescriptor& get_disk_descriptor() const{
+            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DiskDescriptor");
+        }
     };
 
    private:
@@ -332,12 +391,14 @@ class Replica {
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.status = status_;
-    desc.buffer_descriptors.reserve(buffers_.size());
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptors.reserve(buffers_.size());
     for (const auto& buf_ptr : buffers_) {
         if (buf_ptr) {
-            desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
+            mem_desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
         }
     }
+    desc.descriptor_variant = std::move(mem_desc);
     return desc;
 }
 
@@ -390,6 +451,7 @@ enum class ClientStatus {
     NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
                     // need to remount
 };
+YLT_REFL(ClientStatus);
 
 /**
  * @brief Stream operator for ClientStatus

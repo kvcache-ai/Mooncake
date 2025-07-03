@@ -88,6 +88,28 @@ MasterMetricManager::MasterMetricManager()
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
 
+      // Initialize Batch Request Counters
+      batch_exist_key_requests_("master_batch_exist_key_requests_total",
+                                "Total number of BatchExistKey requests received"),
+      batch_exist_key_failures_("master_batch_exist_key_failures_total",
+                                "Total number of failed BatchExistKey requests"),
+      batch_get_replica_list_requests_("master_batch_get_replica_list_requests_total",
+                                       "Total number of BatchGetReplicaList requests received"),
+      batch_get_replica_list_failures_("master_batch_get_replica_list_failures_total",
+                                       "Total number of failed BatchGetReplicaList requests"),
+      batch_put_start_requests_("master_batch_put_start_requests_total",
+                                "Total number of BatchPutStart requests received"),
+      batch_put_start_failures_("master_batch_put_start_failures_total",
+                                "Total number of failed BatchPutStart requests"),
+      batch_put_end_requests_("master_batch_put_end_requests_total",
+                              "Total number of BatchPutEnd requests received"),
+      batch_put_end_failures_("master_batch_put_end_failures_total",
+                              "Total number of failed BatchPutEnd requests"),
+      batch_put_revoke_requests_("master_batch_put_revoke_requests_total",
+                                 "Total number of BatchPutRevoke requests received"),
+      batch_put_revoke_failures_("master_batch_put_revoke_failures_total",
+                                 "Total number of failed BatchPutRevoke requests"),
+
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
                        "Total number of successful eviction operations"),
@@ -232,6 +254,38 @@ void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
 }
 
+// Batch Operation Statistics (Counters)
+void MasterMetricManager::inc_batch_exist_key_requests(int64_t val) {
+    batch_exist_key_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_exist_key_failures(int64_t val) {
+    batch_exist_key_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t val) {
+    batch_get_replica_list_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t val) {
+    batch_get_replica_list_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_start_requests(int64_t val) {
+    batch_put_start_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_start_failures(int64_t val) {
+    batch_put_start_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_end_requests(int64_t val) {
+    batch_put_end_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_end_failures(int64_t val) {
+    batch_put_end_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_revoke_requests(int64_t val) {
+    batch_put_revoke_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_revoke_failures(int64_t val) {
+    batch_put_revoke_failures_.inc(val);
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -320,6 +374,46 @@ int64_t MasterMetricManager::get_ping_failures() {
     return ping_failures_.value();
 }
 
+int64_t MasterMetricManager::get_batch_exist_key_requests() {
+    return batch_exist_key_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_exist_key_failures() {
+    return batch_exist_key_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_requests() {
+    return batch_get_replica_list_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_failures() {
+    return batch_get_replica_list_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_requests() {
+    return batch_put_start_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_failures() {
+    return batch_put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_requests() {
+    return batch_put_end_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_failures() {
+    return batch_put_end_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_requests() {
+    return batch_put_revoke_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_failures() {
+    return batch_put_revoke_failures_.value();
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
     evicted_key_count_.inc(key_count);
@@ -404,6 +498,18 @@ std::string MasterMetricManager::serialize_metrics() {
         serialize_metric(ping_requests_);
         serialize_metric(ping_failures_);
     }
+
+    // Serialize Batch Request Counters
+    serialize_metric(batch_exist_key_requests_);
+    serialize_metric(batch_exist_key_failures_);
+    serialize_metric(batch_get_replica_list_requests_);
+    serialize_metric(batch_get_replica_list_failures_);
+    serialize_metric(batch_put_start_requests_);
+    serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_end_requests_);
+    serialize_metric(batch_put_end_failures_);
+    serialize_metric(batch_put_revoke_requests_);
+    serialize_metric(batch_put_revoke_failures_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);
