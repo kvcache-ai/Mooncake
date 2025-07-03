@@ -16,7 +16,7 @@ Mooncake Store 的主要特性包括：
 *   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
 *   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
-*   **数据持久化**: 支持将RAM中缓存数据卸载到SSD中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
+*   **分级缓存**: 支持将RAM中缓存数据卸载到SSD中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
 
 ## 架构
 
@@ -395,7 +395,7 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
-### 数据持久化功能
+### 分级缓存支持
 
 当用户在启动client时指定了`MOONCAKE_STORAGE_ROOT_DIR`的环境变量，且该路径为一个已存在的有效路径时，则client端的数据持久化功能就会开始工作。同时在client启动时，会向master请求一个`cluster_id`，该id可以在初始化master进行指定，若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`。注意在使用DFS时，需要在各client上分别指定DFS对应的挂载目录，以实现SSD上数据之间的共享。
 
