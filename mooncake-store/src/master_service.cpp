@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <queue>
 #include <shared_mutex>
+#include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
 #include "types.h"
@@ -14,7 +15,8 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
                              ViewVersionId view_version,
-                             int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id)
+                             int64_t client_live_ttl_sec, bool enable_ha,
+                             const std::string& cluster_id)
     : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
@@ -626,15 +628,13 @@ auto MasterService::Ping(const UUID& client_id)
     return std::make_pair(view_version_, client_status);
 }
 
-ErrorCode MasterService::GetFsdir(std::string& fsdir) const{
+tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (cluster_id_.empty()) {
         LOG(ERROR) << "Cluster ID is not initialized";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    fsdir = cluster_id_;
-    return ErrorCode::OK;
+    return cluster_id_;
 }
-
 
 void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_started";

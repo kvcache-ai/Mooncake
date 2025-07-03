@@ -10,11 +10,11 @@
 
 #include "ha_helper.h"
 #include "master_client.h"
+#include "storage_backend.h"
+#include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
-#include "thread_pool.h"
-#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -212,26 +212,26 @@ class Client {
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,
                                  void** protocol_args);
-    ErrorCode TransferData(
-        const Replica::Descriptor &replica,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
-    ErrorCode TransferWrite(
-        const Replica::Descriptor &replica,
-        std::vector<Slice>& slices);
-    ErrorCode TransferRead(
-        const Replica::Descriptor &replica,
-        std::vector<Slice>& slices);
+    ErrorCode TransferData(const Replica::Descriptor& replica,
+                           std::vector<Slice>& slices,
+                           TransferRequest::OpCode op_code);
+    ErrorCode TransferWrite(const Replica::Descriptor& replica,
+                            std::vector<Slice>& slices);
+    ErrorCode TransferRead(const Replica::Descriptor& replica,
+                           std::vector<Slice>& slices);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
      */
-    void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& fsdir);
+    void PrepareStorageBackend(const std::string& storage_root_dir,
+                               const std::string& fsdir);
 
     ErrorCode GetFromLocalFile(const std::string& object_key,
-                             std::vector<Slice>& slices, ObjectInfo& object_info);
-                             
+                               std::vector<Slice>& slices,
+                               std::vector<Replica::Descriptor>& replicas);
+
     void PutToLocalFile(const std::string& object_key,
-                             std::vector<Slice>& slices);
+                        std::vector<Slice>& slices);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -250,11 +250,13 @@ class Client {
     std::vector<PutOperation> CreatePutOperations(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices);
-    void StartBatchPut(std::vector<PutOperation>& ops, const ReplicateConfig& config);
+    void StartBatchPut(std::vector<PutOperation>& ops,
+                       const ReplicateConfig& config);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
-    std::vector<tl::expected<void, ErrorCode>> CollectResults(const std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(
+        const std::vector<PutOperation>& ops);
 
     // Core components
     TransferEngine transfer_engine_;
@@ -268,7 +270,7 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
-    const std::string storage_root_dir_; 
+    const std::string storage_root_dir_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;

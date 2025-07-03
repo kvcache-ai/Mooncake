@@ -65,7 +65,8 @@ class MasterService {
                       DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
                   ViewVersionId view_version = 0,
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-                  bool enable_ha = false, const std::string &cluster_id = DEFAULT_CLUSTER_ID);
+                  bool enable_ha = false,
+                  const std::string& cluster_id = DEFAULT_CLUSTER_ID);
     ~MasterService();
 
     /**
@@ -247,9 +248,10 @@ class MasterService {
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
-     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID is not set
+     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID
+     * is not set
      */
-    ErrorCode GetFsdir(std::string& fsdir) const; 
+    tl::expected<std::string, ErrorCode> GetFsdir() const;
 
    private:
     // GC thread function

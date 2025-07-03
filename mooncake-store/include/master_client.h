@@ -1,9 +1,9 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <atomic>
 #include <memory>
+#include <string>
+#include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
@@ -173,10 +173,11 @@ class MasterClient {
         const UUID& segment_id, const UUID& client_id);
 
     /**
-     * @brief Gets the cluster ID for the current client to use as subdirectory name
+     * @brief Gets the cluster ID for the current client to use as subdirectory
+     * name
      * @return GetClusterIdResponse containing the cluster ID
-     */    
-    [[nodiscard]] GetFsdirResponse GetFsdir();
+     */
+    [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
     /**
      * @brief Pings master to check its availability
@@ -208,12 +209,12 @@ class MasterClient {
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc_client> client_ GUARDED_BY(client_mutex_);
+        std::shared_ptr<coro_rpc_client> client_;
     };
     RpcClientAccessor client_accessor_;
 
     // Mutex to insure the Connect function is atomic.
-    mutable std::mutex connect_mutex_;
+    mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 };

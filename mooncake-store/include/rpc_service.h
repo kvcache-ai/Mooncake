@@ -20,95 +20,6 @@
 
 namespace mooncake {
 
-struct ExistKeyResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(ExistKeyResponse, error_code)
-
-struct GetReplicaListResponse {
-    std::vector<Replica::Descriptor> replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(GetReplicaListResponse, replica_list, error_code)
-
-struct BatchGetReplicaListResponse {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
-        batch_replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchGetReplicaListResponse, batch_replica_list, error_code)
-
-struct PutStartResponse {
-    std::vector<Replica::Descriptor> replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutStartResponse, replica_list, error_code)
-
-struct PutEndResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutEndResponse, error_code)
-struct PutRevokeResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PutRevokeResponse, error_code)
-struct BatchPutStartResponse {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
-        batch_replica_list;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutStartResponse, batch_replica_list, error_code)
-
-struct BatchPutEndResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutEndResponse, error_code)
-
-struct BatchPutRevokeResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(BatchPutRevokeResponse, error_code)
-
-struct RemoveResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(RemoveResponse, error_code)
-struct RemoveAllResponse {
-    long removed_count = 0;
-};
-YLT_REFL(RemoveAllResponse, removed_count)
-struct MountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(MountSegmentResponse, error_code)
-
-struct ReMountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(ReMountSegmentResponse, error_code)
-
-struct UnmountSegmentResponse {
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(UnmountSegmentResponse, error_code)
-
-struct GetFsdirResponse {
-    std::string fsdir;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(GetFsdirResponse, error_code, fsdir)
-
-struct PingResponse {
-    ViewVersionId view_version = 0;
-    ClientStatus client_status = ClientStatus::UNDEFINED;
-    ErrorCode error_code = ErrorCode::OK;
-};
-YLT_REFL(PingResponse, view_version, client_status, error_code)
-
-struct BatchExistResponse {
-    std::vector<ErrorCode> exist_responses;
-};
-YLT_REFL(BatchExistResponse, exist_responses)
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
@@ -190,9 +101,11 @@ class WrappedMasterService {
                 if (get_result) {
                     std::string ss = "";
                     for (size_t i = 0; i < get_result.value().size(); i++) {
-                        if(get_result.value()[i].is_memory_replica()) {
-                            auto & memory_descriptors = get_result.value()[i].get_memory_descriptor();
-                            for(const auto& handle : memory_descriptors.buffer_descriptors) {
+                        if (get_result.value()[i].is_memory_replica()) {
+                            auto& memory_descriptors =
+                                get_result.value()[i].get_memory_descriptor();
+                            for (const auto& handle :
+                                 memory_descriptors.buffer_descriptors) {
                                 std::string tmp = "";
                                 struct_json::to_json(handle, tmp);
                                 ss += tmp;
@@ -305,19 +218,22 @@ class WrappedMasterService {
         MasterMetricManager::instance().inc_batch_exist_key_requests();
 
         auto result = master_service_.BatchExistKey(keys);
-        
+
         // Count failures and log errors
         size_t failure_count = 0;
         for (size_t i = 0; i < result.size(); ++i) {
             if (!result[i].has_value()) {
                 failure_count++;
-                LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '" << keys[i] << "': " 
-                          << toString(result[i].error());
+                LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(result[i].error());
             }
         }
-        MasterMetricManager::instance().inc_batch_exist_key_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_exist_key_failures(
+            failure_count);
 
-        timer.LogResponse("total=", result.size(), ", success=", result.size() - failure_count, ", failures=", failure_count);
+        timer.LogResponse("total=", result.size(),
+                          ", success=", result.size() - failure_count,
+                          ", failures=", failure_count);
         return result;
     }
 
@@ -354,13 +270,17 @@ class WrappedMasterService {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i].has_value()) {
                 failure_count++;
-                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i << "] '" << keys[i] << "': " 
-                          << toString(results[i].error());
+                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                           << "] '" << keys[i]
+                           << "': " << toString(results[i].error());
             }
         }
-        MasterMetricManager::instance().inc_batch_get_replica_list_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
 
-        timer.LogResponse("total=", results.size(), ", success=", results.size() - failure_count, ", failures=", failure_count);
+        timer.LogResponse("total=", results.size(),
+                          ", success=", results.size() - failure_count,
+                          ", failures=", failure_count);
         return results;
     }
 
@@ -425,13 +345,16 @@ class WrappedMasterService {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i].has_value()) {
                 failure_count++;
-                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '" << keys[i] << "': " 
-                          << toString(results[i].error());
+                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(results[i].error());
             }
         }
-        MasterMetricManager::instance().inc_batch_put_start_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_put_start_failures(
+            failure_count);
 
-        timer.LogResponse("total=", results.size(), ", success=", results.size() - failure_count, ", failures=", failure_count);
+        timer.LogResponse("total=", results.size(),
+                          ", success=", results.size() - failure_count,
+                          ", failures=", failure_count);
         return results;
     }
 
@@ -453,13 +376,16 @@ class WrappedMasterService {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i].has_value()) {
                 failure_count++;
-                LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i] << "': " 
-                          << toString(results[i].error());
+                LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(results[i].error());
             }
         }
-        MasterMetricManager::instance().inc_batch_put_end_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            failure_count);
 
-        timer.LogResponse("total=", results.size(), ", success=", results.size() - failure_count, ", failures=", failure_count);
+        timer.LogResponse("total=", results.size(),
+                          ", success=", results.size() - failure_count,
+                          ", failures=", failure_count);
         return results;
     }
 
@@ -481,13 +407,16 @@ class WrappedMasterService {
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i].has_value()) {
                 failure_count++;
-                LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '" << keys[i] << "': " 
-                          << toString(results[i].error());
+                LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(results[i].error());
             }
         }
-        MasterMetricManager::instance().inc_batch_put_revoke_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            failure_count);
 
-        timer.LogResponse("total=", results.size(), ", success=", results.size() - failure_count, ", failures=", failure_count);
+        timer.LogResponse("total=", results.size(),
+                          ", success=", results.size() - failure_count,
+                          ", failures=", failure_count);
         return results;
     }
 
@@ -562,39 +491,27 @@ class WrappedMasterService {
             });
     }
 
-    GetFsdirResponse GetFsdir() {
+    tl::expected<std::string, ErrorCode> GetFsdir() {
         ScopedVLogTimer timer(1, "GetFsdir");
         timer.LogRequest("action=get_fsdir");
 
-        GetFsdirResponse response;
-        std::string fsdir;
-        response.error_code = master_service_.GetFsdir(fsdir);
-        response.fsdir = std::move(fsdir);
+        auto result = master_service_.GetFsdir();
 
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponseExpected(result);
+        return result;
     }
 
-    PingResponse Ping(const UUID& client_id) {
+    tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(
+        const UUID& client_id) {
         ScopedVLogTimer timer(1, "Ping");
         timer.LogRequest("client_id=", client_id);
 
         MasterMetricManager::instance().inc_ping_requests();
 
-        PingResponse response;
         auto result = master_service_.Ping(client_id);
-        
-        if (result.has_value()) {
-            response.error_code = ErrorCode::OK;
-            response.view_version = result.value().first;
-            response.client_status = result.value().second;
-        } else {
-            response.error_code = result.error();
-            MasterMetricManager::instance().inc_ping_failures();
-        }
 
-        timer.LogResponseJson(response);
-        return response;
+        timer.LogResponseExpected(result);
+        return result;
     }
 
    private:
