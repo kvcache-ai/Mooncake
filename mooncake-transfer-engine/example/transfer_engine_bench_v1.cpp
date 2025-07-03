@@ -29,12 +29,12 @@
 
 DEFINE_string(metadata_type, "p2p", "Metadata type: p2p|etcd|redis|http");
 DEFINE_string(metadata_servers, "",
-              "Metadata servers (required unless type is `p2p')");
-DEFINE_string(mode, "initiator", "Running mode: initiator|target");
-DEFINE_string(workload, "read", "Test workload: read|write");
+              "Metadata servers (required unless type is p2p)");
+DEFINE_string(workload, "read", "Test workload: read|write|mix");
 DEFINE_string(local_segment, "",
               "Set the custom local segment name (optional)");
 DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
+DEFINE_bool(integrity_check, false, "Check data integrity if workload is mix");
 
 DEFINE_int32(batch, 128, "Number of requests per batch");
 DEFINE_uint64(size, 65536, "Block size for each request");
@@ -111,53 +111,124 @@ uint64_t getStartAddress(TransferEngine *engine, SegmentID handle,
     return (uint64_t)detail.buffers[thread_id % detail.buffers.size()].addr;
 }
 
+Status submitRequestSync(TransferEngine *engine, SegmentID handle,
+                         int thread_id, void *addr, uint64_t remote_base,
+                         Request::OpCode opcode) {
+    auto batch_id = engine->allocateBatch(FLAGS_batch);
+    std::vector<Request> requests;
+    for (int i = 0; i < FLAGS_batch; ++i) {
+        Request entry;
+        entry.opcode = opcode;
+        entry.length = FLAGS_size;
+        entry.source =
+            (uint8_t *)(addr) + FLAGS_size * (i * FLAGS_threads + thread_id);
+        entry.target_id = handle;
+        entry.target_offset =
+            remote_base + FLAGS_size * (i * FLAGS_threads + thread_id);
+        requests.emplace_back(entry);
+    }
+    CHECK_FAIL(engine->submitTransfer(batch_id, requests));
+    for (int task_id = 0; task_id < FLAGS_batch; ++task_id) {
+        bool completed = false;
+        TransferStatus status;
+        while (!completed) {
+            CHECK_FAIL(engine->getTransferStatus(batch_id, task_id, status));
+            if (status.s == TransferStatusEnum::COMPLETED)
+                completed = true;
+            else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "Failed transfer detected";
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    CHECK_FAIL(engine->freeBatch(batch_id));
+    return Status::OK();
+}
+
+void fillData(int thread_id, void *addr, uint8_t seed) {
+#ifdef USE_CUDA
+    uint8_t *buf = new uint8_t[FLAGS_size];
+    memset(buf, seed, FLAGS_size);
+    for (int i = 0; i < FLAGS_batch; ++i) {
+        uint8_t *local_addr =
+            (uint8_t *)(addr) + FLAGS_size * (i * FLAGS_threads + thread_id);
+        cudaMemcpy(local_addr, buf, FLAGS_size, cudaMemcpyDefault);
+    }
+    delete[] buf;
+#else
+    for (int i = 0; i < FLAGS_batch; ++i) {
+        uint8_t *local_addr =
+            (uint8_t *)(addr) + FLAGS_size * (i * FLAGS_threads + thread_id);
+        memset(local_addr, seed, FLAGS_size);
+    }
+#endif
+}
+
+void checkData(int thread_id, void *addr, uint8_t seed) {
+    uint8_t *ref_buf = new uint8_t[FLAGS_size];
+    uint8_t *user_buf = new uint8_t[FLAGS_size];
+    memset(ref_buf, seed, FLAGS_size);
+    for (int i = 0; i < FLAGS_batch; ++i) {
+        uint8_t *local_addr =
+            (uint8_t *)(addr) + FLAGS_size * (i * FLAGS_threads + thread_id);
+#ifdef USE_CUDA
+        cudaMemcpy(user_buf, local_addr, FLAGS_size, cudaMemcpyDefault);
+        if (memcmp(user_buf, ref_buf, FLAGS_size) != 0) {
+            LOG(ERROR) << "Detect data integrity problem";
+            exit(EXIT_FAILURE);
+        }
+#else
+        if (memcmp(local_addr, ref_buf, FLAGS_size) != 0) {
+            LOG(ERROR) << "Detect data integrity problem";
+            exit(EXIT_FAILURE);
+        }
+#endif
+    }
+    delete[] ref_buf;
+    delete[] user_buf;
+}
+
 Status initiatorWorker(TransferEngine *engine, SegmentID handle, int thread_id,
                        void *addr) {
     bindToSocket(thread_id % num_buffers);
     uint64_t remote_base = getStartAddress(engine, handle, thread_id);
-
+    bool mixture = false;
     Request::OpCode opcode;
     if (FLAGS_workload == "read")
         opcode = Request::READ;
     else if (FLAGS_workload == "write")
         opcode = Request::WRITE;
+    else if (FLAGS_workload == "mix")
+        mixture = true;
     else {
-        LOG(ERROR) << "Invalid args: workload only support read|write";
+        LOG(ERROR) << "Invalid args: workload only support read|write|mix";
         exit(EXIT_FAILURE);
     }
-
     size_t batch_count = 0;
     while (running) {
-        auto batch_id = engine->allocateBatch(FLAGS_batch);
-        std::vector<Request> requests;
-        for (int i = 0; i < FLAGS_batch; ++i) {
-            Request entry;
-            entry.opcode = opcode;
-            entry.length = FLAGS_size;
-            entry.source = (uint8_t *)(addr) +
-                           FLAGS_size * (i * FLAGS_threads + thread_id);
-            entry.target_id = handle;
-            entry.target_offset =
-                remote_base + FLAGS_size * (i * FLAGS_threads + thread_id);
-            requests.emplace_back(entry);
-        }
-        CHECK_FAIL(engine->submitTransfer(batch_id, requests));
-        for (int task_id = 0; task_id < FLAGS_batch; ++task_id) {
-            bool completed = false;
-            TransferStatus status;
-            while (!completed) {
-                CHECK_FAIL(
-                    engine->getTransferStatus(batch_id, task_id, status));
-                if (status.s == TransferStatusEnum::COMPLETED)
-                    completed = true;
-                else if (status.s == TransferStatusEnum::FAILED) {
-                    LOG(ERROR) << "Failed transfer detected";
-                    exit(EXIT_FAILURE);
-                }
+        if (!mixture) {
+            CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
+                                         remote_base, opcode));
+            batch_count++;
+        } else {
+            uint8_t seed = 0;
+            if (FLAGS_integrity_check) {
+                seed = SimpleRandom::Get().next(UINT8_MAX);
+                fillData(thread_id, addr, seed);
+                CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
+                                             remote_base, Request::WRITE));
+                fillData(thread_id, addr, 0);
+                CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
+                                             remote_base, Request::READ));
+                checkData(thread_id, addr, seed);
+            } else {
+                CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
+                                             remote_base, Request::WRITE));
+                CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
+                                             remote_base, Request::READ));
             }
+            batch_count += 2;
         }
-        CHECK_FAIL(engine->freeBatch(batch_id));
-        batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
@@ -169,10 +240,15 @@ void allocateAllLocalMemory(const std::unique_ptr<TransferEngine> &engine,
     for (int i = 0; i < num_buffers; ++i) {
         MemoryOptions options;
 #ifdef USE_CUDA
-        if (i < cuda_device_count) {
-            options.location = "cuda:" + std::to_string(i);
+        if (FLAGS_use_vram) {
+            if (i < cuda_device_count) {
+                options.location = "cuda:" + std::to_string(i);
+            } else {
+                options.location =
+                    "cpu:" + std::to_string(i - cuda_device_count);
+            }
         } else {
-            options.location = "cpu:" + std::to_string(i - cuda_device_count);
+            options.location = "cpu:" + std::to_string(i);
         }
 #else
         options.location = "cpu:" + std::to_string(i);
@@ -208,11 +284,7 @@ int initiator() {
     allocateAllLocalMemory(engine, addr);
 
     SegmentID handle;
-    if (FLAGS_remote_segment.empty()) {
-        LOG(ERROR) << "Invalid remote segment name from --remote_segment";
-        exit(EXIT_FAILURE);
-    }
-
+    assert(!FLAGS_remote_segment.empty());
     CHECK_FAIL(engine->openRemoteSegment(handle, FLAGS_remote_segment.c_str()));
 
     std::thread workers[FLAGS_threads];
@@ -255,6 +327,14 @@ int target() {
     auto engine = std::make_unique<TransferEngine>(loadConfig());
     std::vector<void *> addr(num_buffers, nullptr);
     allocateAllLocalMemory(engine, addr);
+    std::cout << "\033[33mTarget server has been started. "
+                 "You can spawn another terminal and run: "
+              << std::endl
+              << std::endl
+              << "  ./transfer_engine_bench_v1 --remote_segment="
+              << engine->getSegmentName() << std::endl
+              << std::endl
+              << "Press Ctrl+C to terminate.\033[0m" << std::endl;
     while (target_running) sleep(1);
     deallocateAllLocalMemory(engine, addr);
     return 0;
@@ -270,12 +350,8 @@ int main(int argc, char **argv) {
     cudaGetDeviceCount(&cuda_device_count);
     if (FLAGS_use_vram) num_buffers += cuda_device_count;
 #endif
-
-    if (FLAGS_mode == "initiator")
-        return initiator();
-    else if (FLAGS_mode == "target")
+    if (FLAGS_remote_segment.empty())
         return target();
-
-    LOG(ERROR) << "Invalid args: mode should be initiator|target";
-    exit(EXIT_FAILURE);
+    else
+        return initiator();
 }
