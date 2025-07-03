@@ -1258,23 +1258,31 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
         pybind11::module torch = pybind11::module::import("torch");
         
         // Query object info first
-        mooncake::Client::ObjectInfo object_info;
-        ErrorCode error_code = client_->Query(key, object_info);
-        if (error_code != ErrorCode::OK) {
+        // Step 1: Get object info
+        auto query_result = client_->Query(key);
+        if (!query_result) {
+            if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                VLOG(1) << "Object not found for key: " << key;
+                return pybind11::none();
+            }
+            LOG(ERROR) << "Query failed for key: " << key
+                    << " with error: " << toString(query_result.error());
             return pybind11::none();
         }
 
         // Allocate slices for the object
         SliceGuard guard(*this);
         uint64_t total_length = 0;
-        int ret = allocateSlices(guard.slices(), object_info, total_length);
+        int ret = allocateSlices(guard.slices(), total_length);
         if (ret) {
             return pybind11::none();
         }
 
         // Get the object data
-        error_code = client_->Get(key, object_info, guard.slices());
-        if (error_code != ErrorCode::OK) {
+        auto get_result  = client_->Get(key, guard.slices());
+        if (!get_result) {
+            LOG(ERROR) << "Get failed for key: " << key
+                    << " with error: " << toString(get_result.error());
             return pybind11::none();
         }
 
@@ -1342,10 +1350,11 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         config.replica_num = 1;
         config.preferred_segment = this->local_hostname;
         
-        ErrorCode error_code = client_->Put(key, slices.slices(), config);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Put operation failed with error: " << toString(error_code);
-            return -toInt(error_code);
+        auto put_result = client_->Put(key, slices.slices(), config);
+        if (!put_result) {
+            LOG(ERROR) << "Put operation failed with error: "
+                    << toString(put_result.error());
+            return toInt(put_result.error());
         }
         
         return 0;
