@@ -87,11 +87,6 @@ class AsioRpcClient {
    public:
     RpcErrorCode call(const std::string &server_addr, int func_id,
                       const RpcRawData &request, RpcRawData &response);
-
-   private:
-    asio::io_context io_context_;
-    std::mutex mutex_;
-    std::unordered_map<std::string, asio::ip::tcp::socket> socket_;
 };
 
 }  // namespace v1

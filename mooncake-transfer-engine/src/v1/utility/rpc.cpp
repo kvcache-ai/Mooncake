@@ -112,39 +112,43 @@ Status AsioRpcServer::registerFunction(int func_id, const Function &func) {
 }
 
 Status AsioRpcServer::start(uint16_t &port) {
-    try {
-        const static uint16_t kStartPort = 15000;
-        const static uint16_t kPortRange = 2000;
-        const static int kMaxRetry = 10;
-        if (running_)
-            return Status::InvalidArgument(
-                "Builtin RPC server is already started" LOC_MARK);
-        for (int retry = 0; retry < kMaxRetry; ++retry) {
+    const static uint16_t kStartPort = 15000;
+    const static uint16_t kPortRange = 2000;
+    const static int kMaxRetry = 10;
+
+    if (running_)
+        return Status::InvalidArgument("RPC server already started" LOC_MARK);
+
+    for (int retry = 0; retry < kMaxRetry; ++retry) {
+        try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
+
             acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
                 io_context_,
                 asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
+
             running_ = true;
+            io_context_.restart();  // <-- important
+            doAccept();
+
             worker_ = std::thread([this]() {
-                while (running_) {
-                    try {
-                        io_context_.run();
-                    } catch (const std::exception &e) {
-                        LOG(WARNING) << "[TE RPC] Detect exception in worker: "
-                                     << e.what();
-                    }
+                try {
+                    io_context_.run();
+                } catch (const std::exception &e) {
+                    LOG(ERROR) << "RPC Server run exception: " << e.what();
                 }
             });
-            doAccept();
             return Status::OK();
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Failed to start RPC server on port " << port
+                         << ": " << e.what();
+            port = 0;
+            acceptor_.reset();
         }
-        return Status::RpcServiceError("No available tcp port" LOC_MARK);
-    } catch (const std::exception &e) {
-        port = 0;
-        LOG(INFO) << "RPC exception: " << e.what();
-        return Status::RpcServiceError("Rpc module internal error" LOC_MARK);
     }
+
+    return Status::RpcServiceError("Failed to bind any RPC port" LOC_MARK);
 }
 
 Status AsioRpcServer::stop() {
@@ -178,56 +182,42 @@ RpcErrorCode AsioRpcClient::call(const std::string &server_addr, int func_id,
                                  const RpcRawData &request,
                                  RpcRawData &response) {
     try {
-        size_t pos = server_addr.find(':');
-        assert(pos != std::string::npos);
-        auto hostname = server_addr.substr(0, pos);
-        auto port = server_addr.substr(pos + 1);
+        asio::io_context local_context;
+        asio::ip::tcp::resolver resolver(local_context);
+        auto endpoints =
+            resolver.resolve(server_addr.substr(0, server_addr.find(':')),
+                             server_addr.substr(server_addr.find(':') + 1));
 
-        asio::ip::tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(hostname, port);
-        asio::ip::tcp::socket socket(io_context_);
+        asio::ip::tcp::socket socket(local_context);
         asio::connect(socket, endpoints);
 
-        Session::Header request_header;
-        request_header.func_id = func_id;
-        request_header.length = (int)request.size();
+        Session::Header request_header{static_cast<uint16_t>(func_id), 0,
+                                       static_cast<uint32_t>(request.size())};
 
-        if (asio::write(socket, asio::buffer(&request_header,
-                                             sizeof(Session::Header))) !=
-            sizeof(Session::Header)) {
-            return ErrIncompleted;
-        }
-
+        std::vector<asio::const_buffer> buffers;
+        buffers.push_back(
+            asio::buffer(&request_header, sizeof(request_header)));
         if (!request.empty()) {
-            if (asio::write(socket,
-                            asio::buffer(request.data(), request.size())) !=
-                request.size()) {
-                return ErrIncompleted;
-            }
+            buffers.push_back(asio::buffer(request));
         }
+
+        asio::write(socket, buffers);
 
         Session::Header response_header;
-        if (asio::read(socket, asio::buffer(&response_header,
-                                            sizeof(Session::Header))) !=
-            sizeof(Session::Header)) {
-            return ErrIncompleted;
-        }
+        asio::read(socket,
+                   asio::buffer(&response_header, sizeof(response_header)));
 
         if (response_header.error_code)
-            return (RpcErrorCode)response_header.error_code;
+            return static_cast<RpcErrorCode>(response_header.error_code);
 
         response.resize(response_header.length);
         if (!response.empty()) {
-            if (asio::read(socket,
-                           asio::buffer(response.data(), response.size())) !=
-                response.size()) {
-                return ErrIncompleted;
-            }
+            asio::read(socket, asio::buffer(response));
         }
 
         return OK;
     } catch (const std::exception &e) {
-        LOG(INFO) << "RPC exception: " << e.what();
+        LOG(ERROR) << "RPC client exception: " << e.what();
         return ErrConnectFailed;
     }
 }
