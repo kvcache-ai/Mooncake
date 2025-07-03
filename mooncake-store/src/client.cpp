@@ -553,7 +553,8 @@ class PutOperation {
     void SetError(ErrorCode error, const std::string& context = "") {
         result = tl::unexpected(error);
         if (!context.empty()) {
-            failure_context = context;
+            failure_context = toString(error) + ": " + context + "; " +
+                              failure_context.value_or("");
         }
 
         // Update state based on current processing stage
@@ -564,6 +565,8 @@ class PutOperation {
         } else {
             state = PutOperationState::FINALIZE_FAILED;
         }
+        LOG(WARNING) << "Put operation failed for key " << key << ", context: "
+                     << failure_context.value_or("unknown error");
     }
 
     bool IsResolved() const { return state != PutOperationState::PENDING; }
@@ -620,7 +623,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    // Process individual responses with robust error handling
+    // Process individual responses with robust error handlingw
     for (size_t i = 0; i < ops.size(); ++i) {
         if (!start_responses[i]) {
             ops[i].SetError(start_responses[i].error(),
