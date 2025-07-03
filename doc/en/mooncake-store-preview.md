@@ -6,7 +6,7 @@ Mooncake Store is a high-performance **distributed key-value (KV) cache storage 
 
 Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the former, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
 
-Mooncake Store provides low-level object storage and management capabilities, while specific caching strategies (e.g., eviction policies) are left to upper-layer frameworks (like vLLM) or users for implementation, offering higher flexibility and customizability.
+Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
@@ -366,14 +366,28 @@ Currently, an approximate LRU policy is adopted, where the least recently used o
 
 Each time the eviction task is triggered, in default it will try to evict about 10% of objects. This ratio is configurable via a startup parameter of `master_service`.
 
-To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `-eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
-it initiates evict operations. The eviction target is to clean an additional `-eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
+To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `--eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
+it initiates evict operations. The eviction target is to clean an additional `--eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
 
 ### Lease
 
 To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
 
 The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
+
+### Soft Pin
+
+For important and frequently used objects, such as system prompts, Mooncake Store provides a soft pin mechanism. When putting an object, it can be configured to enable soft pin. During eviction, objects that are not soft pinned are prioritized for eviction. Soft pinned objects are only evicted when memory is insufficient and no other objects are eligible for eviction.
+
+If a soft pinned object is not accessed for an extended period, its soft pin status will be removed. If it is accessed again later, it will automatically be soft pinned once more.
+
+There are two startup parameters in `master_service` related to the soft pin mechanism:
+
+- `default_kv_soft_pin_ttl`: The duration (in milliseconds) after which a soft pinned object will have its soft pin status removed if not accessed. The default value is `30 minutes`.
+
+- `allow_evict_soft_pinned_objects`: Whether soft pinned objects are allowed to be evicted. The default value is `true`.
+
+Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
 ## Mooncake Store Python API
 
