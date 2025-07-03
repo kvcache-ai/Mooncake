@@ -373,8 +373,8 @@ Currently, an approximate LRU policy is adopted, where the least recently used o
 
 Each time the eviction task is triggered, in default it will try to evict about 10% of objects. This ratio is configurable via a startup parameter of `master_service`.
 
-To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `--eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
-it initiates evict operations. The eviction target is to clean an additional `--eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
+To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `-eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
+it initiates evict operations. The eviction target is to clean an additional `-eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
 
 ### Lease
 
