@@ -53,7 +53,14 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
+#ifdef USE_ASCEND
+        int device_id = -1;
+        auto [host_name, port] = parseHostNameWithPortAscend(local_server_name, &device_id);
+        LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: " << host_name << " port: "
+        << port << " device_id: " << device_id;
+#else
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
+#endif
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
@@ -68,8 +75,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                     return -1;
                 }
             }
+#ifdef USE_ASCEND
+            local_server_name_ =
+                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port) + ":npu_" + std::to_string(device_id);
+#else
             local_server_name_ =
                 desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -107,6 +119,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
+#ifdef USE_ASCEND
+    multi_transports_->installTransport("ascend", local_topology_);
+#else
 
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
@@ -127,18 +142,23 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_MNNVL
+        if (local_topology_->getHcaList().size() > 0 && !getenv("MC_FORCE_MNNVL")) {
+            multi_transports_->installTransport("rdma", local_topology_);
+        } else {
+            multi_transports_->installTransport("nvlink", nullptr);
+        }
+#else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
-#ifdef USE_MNNVL
-            multi_transports_->installTransport("nvlink", nullptr);
-#else
             multi_transports_->installTransport("tcp", nullptr);
-#endif
         }
+#endif
         // TODO: install other transports automatically
     }
+#endif
 
     return 0;
 }
@@ -194,7 +214,8 @@ std::string TransferEngine::getLocalIpAndPort() {
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
-int TransferEngine::getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies) {
+int TransferEngine::getNotifies(
+    std::vector<TransferMetadata::NotifyDesc> &notifies) {
     return metadata_->getNotifies(notifies);
 }
 

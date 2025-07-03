@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <atomic>
+#include <memory>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
@@ -171,6 +173,12 @@ class MasterClient {
         const UUID& segment_id, const UUID& client_id);
 
     /**
+     * @brief Gets the cluster ID for the current client to use as subdirectory name
+     * @return GetClusterIdResponse containing the cluster ID
+     */    
+    [[nodiscard]] GetFsdirResponse GetFsdir();
+
+    /**
      * @brief Pings master to check its availability
      * @param client_id The uuid of the client
      * @return tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
@@ -181,7 +189,33 @@ class MasterClient {
     Ping(const UUID& client_id);
 
    private:
-    coro_rpc_client client_;
+    /**
+     * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
+     * reconnect to a different address, a new coro_rpc_client is created if
+     * the address is different from the current one.
+     */
+    class RpcClientAccessor {
+       public:
+        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+            std::lock_guard<std::shared_mutex> lock(client_mutex_);
+            client_ = client;
+        }
+
+        std::shared_ptr<coro_rpc_client> GetClient() {
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            return client_;
+        }
+
+       private:
+        mutable std::shared_mutex client_mutex_;
+        std::shared_ptr<coro_rpc_client> client_ GUARDED_BY(client_mutex_);
+    };
+    RpcClientAccessor client_accessor_;
+
+    // Mutex to insure the Connect function is atomic.
+    mutable std::mutex connect_mutex_;
+    // The address which is passed to the coro_rpc_client
+    std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 };
 
 }  // namespace mooncake

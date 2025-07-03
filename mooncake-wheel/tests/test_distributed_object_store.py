@@ -40,6 +40,8 @@ class TestDistributedObjectStore(unittest.TestCase):
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
     
+    @unittest.skipIf(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
+                     "Skipping test_client_tear_down because SSD environment variable is set")
     def test_client_tear_down(self):
         """Test client tear down and re-initialization."""
         test_data = b"Hello, World!"

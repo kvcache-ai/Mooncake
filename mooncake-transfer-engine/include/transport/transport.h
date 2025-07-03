@@ -91,6 +91,7 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
+        bool from_cache;
 
         union {
             struct {
@@ -119,6 +120,9 @@ class Transport {
                 void *remote_addr;
                 size_t remote_offset;
             } cxl;
+            struct {
+                uint64_t dest_addr;
+            } hccl;
         };
 
        public:
@@ -154,12 +158,18 @@ class Transport {
         }
 
         Slice *allocate() {
+            Slice *slice;
+
             if (head_ - tail_ == 0) {
                 allocated_++;
-                return new Slice();
+                slice = new Slice();
+                slice->from_cache = false;
+            } else {
+                slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
+                tail_++;
+                slice->from_cache = true;
             }
-            auto slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
-            tail_++;
+
             return slice;
         }
 

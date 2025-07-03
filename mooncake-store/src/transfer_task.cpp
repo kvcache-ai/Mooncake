@@ -10,12 +10,118 @@
 namespace mooncake {
 
 // ============================================================================
+// FilereadWorkerPool Implementation
+// ============================================================================
+//to fully utilize the available ssd bandwidth, we use a default of 8 worker threads.
+constexpr int kDefaultFilereadWorkers = 8;
+
+FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend) : shutdown_(false) {
+    VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
+            << " workers";
+
+    // Start worker threads
+    workers_.reserve(kDefaultFilereadWorkers);
+    for (int i = 0; i < kDefaultFilereadWorkers; ++i) {
+        workers_.emplace_back(&FilereadWorkerPool::workerThread, this);
+    }
+    backend_ = backend;
+}
+
+FilereadWorkerPool::~FilereadWorkerPool() {
+    // Signal shutdown
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        shutdown_.store(true);
+    }
+    queue_cv_.notify_all();
+
+    // Wait for all workers to finish
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    VLOG(1) << "FilereadWorkerPool destroyed";
+}
+
+void FilereadWorkerPool::submitTask(FilereadTask task) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (shutdown_.load()) {
+            LOG(WARNING)
+                << "Attempting to submit task to shutdown FilereadWorkerPool";
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
+        task_queue_.push(std::move(task));
+    }
+    queue_cv_.notify_one();
+}
+
+void FilereadWorkerPool::workerThread() {
+    VLOG(2) << "FilereadWorkerPool worker thread started";
+
+    while (true) {
+        FilereadTask task("", 0, {}, nullptr);
+
+        // Wait for task or shutdown signal
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] {
+                return shutdown_.load() || !task_queue_.empty();
+            });
+
+            if (shutdown_.load() && task_queue_.empty()) {
+                break;
+            }
+
+            if (!task_queue_.empty()) {
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+        }
+
+        // Execute the task if we have one
+        if (task.state) {
+            try {
+                if (!backend_) {
+                    LOG(ERROR) << "Backend is not initialized, cannot load object";
+                    task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    continue; 
+                }
+
+                auto error_code = backend_->LoadObject("", task.slices, task.file_path);
+                if(error_code == ErrorCode::OK){
+                    VLOG(2) << "Fileread task completed successfully with "
+                            << task.file_path;
+                    task.state->set_completed(ErrorCode::OK);
+                }else{
+                    LOG(ERROR) << "Fileread task failed for file: "
+                               << task.file_path
+                               << " with error code: " << toString(error_code);
+                    task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during async fileread: " << e.what();
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+    }
+
+    VLOG(2) << "FilereadWorkerPool worker thread exiting";
+}
+
+// ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
 // Since memcpy is bound by memory bandwidth, we only need one worker thread.
 constexpr int kDefaultMemcpyWorkers = 1;
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
+    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
+            << " workers";
+
     // Start worker threads
     workers_.reserve(kDefaultMemcpyWorkers);
     for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
@@ -37,6 +143,8 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
             worker.join();
         }
     }
+
+    VLOG(1) << "MemcpyWorkerPool destroyed";
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
@@ -54,6 +162,8 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
 }
 
 void MemcpyWorkerPool::workerThread() {
+    VLOG(2) << "MemcpyWorkerPool worker thread started";
+
     while (true) {
         MemcpyTask task({}, nullptr);
 
@@ -81,6 +191,8 @@ void MemcpyWorkerPool::workerThread() {
                     std::memcpy(op.dest, op.src, op.size);
                 }
 
+                VLOG(2) << "Memcpy task completed successfully with "
+                        << task.operations.size() << " operations";
                 task.state->set_completed(ErrorCode::OK);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
@@ -88,6 +200,8 @@ void MemcpyWorkerPool::workerThread() {
             }
         }
     }
+
+    VLOG(2) << "MemcpyWorkerPool worker thread exiting";
 }
 
 // ============================================================================
@@ -140,6 +254,8 @@ void TransferEngineOperationState::check_task_status() {
     }
 
     if (has_failure) {
+        VLOG(1) << "Setting batch " << batch_id_
+                << " result to TRANSFER_FAIL due to task failures";
         set_result_internal(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -162,7 +278,10 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
         return;  // Don't crash, just return early
     }
 
+    VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
+            << static_cast<int>(error_code);
     result_.emplace(error_code);
+
     cv_.notify_all();
 }
 
@@ -171,6 +290,7 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
+    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
     constexpr int64_t timeout_seconds = 60;
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
@@ -188,9 +308,14 @@ void TransferEngineOperationState::wait_for_completion() {
         std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(result_.value());
             break;
         }
         // Continue polling
+        VLOG(1) << "Transfer engine operation still pending for batch "
+                << batch_id_;
     }
 }
 
@@ -223,16 +348,18 @@ TransferStrategy TransferFuture::strategy() const {
 // ============================================================================
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     const std::string& local_hostname)
+                                     const std::string& local_hostname,
+                                     std::shared_ptr<StorageBackend>& backend)
     : engine_(engine),
       local_hostname_(local_hostname),
-      memcpy_pool_(std::make_unique<MemcpyWorkerPool>()) {
+      memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
+      fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)) {
     CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
 
-    // Read MC_STORE_MEMCPY environment variable, default to true (enabled)
+    // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
-        memcpy_enabled_ = true;  // Default: enabled
+        memcpy_enabled_ = false;  // Default: disabled
     } else {
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
@@ -250,31 +377,38 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             memcpy_enabled_ = true;
         }
     }
+
+    VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
+            << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
-    if (!validateTransferParams(handles, slices)) {
-        return std::nullopt;
-    }
+    const Replica::Descriptor& replica,
+    std::vector<Slice>& slices,  Transport::TransferRequest::OpCode op_code) {
 
-    TransferStrategy strategy = selectStrategy(handles, slices);
+    if(replica.is_memory_replica()) {
+        std::vector<AllocatedBuffer::Descriptor> handles;
+        auto& mem_desc = replica.get_memory_descriptor();
+        handles = mem_desc.buffer_descriptors;
 
-    std::optional<TransferFuture> result;
-    switch (strategy) {
-        case TransferStrategy::LOCAL_MEMCPY:
-            result = submitMemcpyOperation(handles, slices, op_code);
-            break;
-        case TransferStrategy::TRANSFER_ENGINE:
-            result = submitTransferEngineOperation(handles, slices, op_code);
-            break;
-        default:
-            LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+        if (!validateTransferParams(handles, slices)) {
             return std::nullopt;
-    }
+        }
 
-    return result;
+        TransferStrategy strategy = selectStrategy(handles, slices);
+
+        switch (strategy) {
+            case TransferStrategy::LOCAL_MEMCPY:
+                return submitMemcpyOperation(handles, slices, op_code);
+            case TransferStrategy::TRANSFER_ENGINE:
+                return submitTransferEngineOperation(handles, slices, op_code);
+            default:
+                LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+                return std::nullopt;
+        }
+    }else{
+        return submitFileReadOperation(replica, slices, op_code);
+    }
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -311,6 +445,9 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
+
+    VLOG(1) << "Memcpy transfer submitted to worker pool with "
+            << handles.size() << " operations";
 
     return TransferFuture(state);
 }
@@ -371,11 +508,31 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     return TransferFuture(state);
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices, 
+    Transport::TransferRequest::OpCode op_code) {
+    auto state = std::make_shared<FilereadOperationState>();
+    auto disk_replica = replica.get_disk_descriptor();
+    std::string file_path = disk_replica.file_path;
+    size_t file_length = disk_replica.file_size;
+
+    // Submit memcpy operations to worker pool for async execution
+    FilereadTask task(file_path, file_length, slices, state);
+    fileread_pool_->submitTask(std::move(task));
+
+    VLOG(1) << "Fileread transfer submitted to worker pool with "
+            << file_path ;
+
+    return TransferFuture(state);
+}
+
 TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     const std::vector<Slice>& slices) const {
     // Check if memcpy operations are enabled via environment variable
     if (!memcpy_enabled_) {
+        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
+                   "variable";
         return TransferStrategy::TRANSFER_ENGINE;
     }
 

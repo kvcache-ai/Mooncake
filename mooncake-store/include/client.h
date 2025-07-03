@@ -13,6 +13,8 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "thread_pool.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -53,9 +55,9 @@ class Client {
                                       std::vector<Slice>& slices);
 
     /**
-     * @brief Gets object metadata without transferring data
+     * @brief Batch retrieve data for multiple keys
      * @param object_keys Keys to query
-     * @param slices Output parameter for the retrieved data
+     * @param slices Map of object keys to their data slices
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
@@ -82,7 +84,7 @@ class Client {
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
-     * @param object_info Previously queried object metadata
+     * @param replica_list Previously queried replica list
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
@@ -90,12 +92,11 @@ class Client {
         const std::string& object_key,
         const std::vector<Replica::Descriptor>& replica_list,
         std::vector<Slice>& slices);
-
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
      * @param object_infos Previously queried object metadata
-     * @param slices Vector of slices to store the data
+     * @param slices Map of object keys to their data slices
      * @return ErrorCode indicating success/failure
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
@@ -200,7 +201,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::string& storage_root_dir);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -211,26 +213,36 @@ class Client {
                                  const std::string& protocol,
                                  void** protocol_args);
     ErrorCode TransferData(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code);
     ErrorCode TransferWrite(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices);
     ErrorCode TransferRead(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
+        const Replica::Descriptor &replica,
         std::vector<Slice>& slices);
+
+    /**
+     * @brief Prepare and use the storage backend for persisting data
+     */
+    void PrepareStorageBackend(const std::string& storage_root_dir, const std::string& fsdir);
+
+    ErrorCode GetFromLocalFile(const std::string& object_key,
+                             std::vector<Slice>& slices, ObjectInfo& object_info);
+                             
+    void PutToLocalFile(const std::string& object_key,
+                             std::vector<Slice>& slices);
 
     /**
      * @brief Find the first complete replica from a replica list
      * @param replica_list List of replicas to search through
-     * @param handles Output vector to store the buffer handles of the found
-     * replica
+     * @param replica the first complete replica (file or memory)
      * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
      * replica
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<AllocatedBuffer::Descriptor>& handles);
+        Replica::Descriptor& replica);
 
     /**
      * @brief Batch put helper methods for structured approach
@@ -256,6 +268,11 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+    const std::string storage_root_dir_; 
+
+    // Client persistent thread pool for async operations
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
     MasterViewHelper master_view_helper_;
