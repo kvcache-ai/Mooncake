@@ -375,7 +375,7 @@ To avoid data conflicts, a per-object lease will be granted whenever an `ExistKe
 
 The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
 
-### Soft Pin
+### Soft Pin (Upcoming)
 
 For important and frequently used objects, such as system prompts, Mooncake Store provides a soft pin mechanism. When putting an object, it can be configured to enable soft pin. During eviction, objects that are not soft pinned are prioritized for eviction. Soft pinned objects are only evicted when memory is insufficient and no other objects are eligible for eviction.
 

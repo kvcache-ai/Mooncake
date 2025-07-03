@@ -24,7 +24,7 @@ DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects");
 DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
-              "Default soft lease time for kv objects");
+              "Default soft pin ttl for kv objects");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
@@ -76,11 +76,11 @@ int main(int argc, char* argv[]) {
               << ", metrics_port=" << FLAGS_metrics_port
               << ", default_kv_lease_ttl=" << FLAGS_default_kv_lease_ttl
               << ", default_kv_soft_pin_ttl=" << FLAGS_default_kv_soft_pin_ttl
+              << ", allow_evict_soft_pinned_objects="
+              << FLAGS_allow_evict_soft_pinned_objects
               << ", eviction_ratio=" << FLAGS_eviction_ratio
               << ", eviction_high_watermark_ratio="
               << FLAGS_eviction_high_watermark_ratio
-              << ", allow_evict_soft_pinned_objects="
-              << FLAGS_allow_evict_soft_pinned_objects
               << ", enable_ha=" << FLAGS_enable_ha
               << ", etcd_endpoints=" << FLAGS_etcd_endpoints
               << ", client_ttl=" << FLAGS_client_ttl

@@ -312,16 +312,16 @@ class MasterService {
             return now >= lease_timeout;
         }
 
-        // Check if the soft lease has expired
-        bool IsSoftLeaseExpired() const {
-            return !soft_pin_timeout ||
-                   std::chrono::steady_clock::now() >= *soft_pin_timeout;
+        // Check if is in soft pin status
+        bool IsSoftPinned() const {
+            return soft_pin_timeout &&
+                   std::chrono::steady_clock::now() < *soft_pin_timeout;
         }
 
-        // Check if the soft lease has expired
-        bool IsSoftPinExpired(
+        // Check if is in soft pin status
+        bool IsSoftPinned(
             std::chrono::steady_clock::time_point& now) const {
-            return !soft_pin_timeout || now >= *soft_pin_timeout;
+            return soft_pin_timeout && now < *soft_pin_timeout;
         }
     };
 

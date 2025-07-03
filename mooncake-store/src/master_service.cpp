@@ -426,8 +426,8 @@ ErrorCode MasterService::PutEnd(const std::string& key) {
         replica.mark_complete();
     }
     // 1. Set lease timeout to now, indicating that the object has no lease
-    // at beginning. 2. If this object has soft lease enabled, grant a soft
-    // lease to give it
+    // at beginning. 2. If this object has soft pin enabled, set it to be soft
+    // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     return ErrorCode::OK;
 }
@@ -706,7 +706,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                    << ", error=invalid_params";
         evict_ratio_lowerbound = evict_ratio_target;
     }
-    bool allow_evict_soft_pin = allow_evict_soft_pinned_objects_;
 
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
@@ -736,11 +735,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const long ideal_evict_num =
             std::ceil(object_count * evict_ratio_target) - evicted_count;
 
-        if (ideal_evict_num <= 0) {
-            // No need to evict any object in this shard
-            continue;
-        }
-
         std::vector<std::chrono::steady_clock::time_point>
             candidates;  // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end();
@@ -750,17 +744,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                 continue;
             }
-            if (it->second.IsSoftPinExpired(now)) {
-                // first pass candidates
-                candidates.push_back(it->second.lease_timeout);
-            } else if (allow_evict_soft_pin) {
+            if (!it->second.IsSoftPinned(now)) {
+                if (ideal_evict_num > 0) {
+                    // first pass candidates
+                    candidates.push_back(it->second.lease_timeout);
+                } else {
+                    // No need to evict any object in this shard, put to
+                    // second pass candidates
+                    no_pin_objects.push_back(it->second.lease_timeout);
+                }
+            } else if (allow_evict_soft_pinned_objects_) {
                 // second pass candidates, only if
                 // allow_evict_soft_pinned_objects_ is true
                 soft_pin_objects.push_back(it->second.lease_timeout);
             }
         }
 
-        if (!candidates.empty()) {
+        if (ideal_evict_num > 0 && !candidates.empty()) {
             long evict_num = std::min(ideal_evict_num, (long)candidates.size());
             long shard_evicted_count =
                 0;  // number of objects evicted from this shard
@@ -774,7 +774,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 // Skip objects that are not allowed to be evicted in the first
                 // pass
                 if (!it->second.IsLeaseExpired(now) ||
-                    !it->second.IsSoftPinExpired(now) ||
+                    it->second.IsSoftPinned(now) ||
                     it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                     ++it;
                     continue;
@@ -830,7 +830,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
                     if (it->second.lease_timeout <= target_timeout &&
-                        it->second.IsSoftPinExpired(now) &&
+                        !it->second.IsSoftPinned(now) &&
                         !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                         // Evict this object
                         total_freed_size +=
@@ -850,6 +850,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             const long soft_pin_evict_num =
                 target_evict_num - static_cast<long>(no_pin_objects.size());
+            // For soft pin objects, prioritize to evict the ones with smaller
+            // lease timeout.
             std::nth_element(
                 soft_pin_objects.begin(),
                 soft_pin_objects.begin() + (soft_pin_evict_num - 1),
@@ -872,9 +874,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         ++it;
                         continue;
                     }
-                    // Evict objects with 1). no soft pin or 2). with soft pin
+                    // Evict objects with 1). no soft pin OR 2). with soft pin
                     // and lease timeout less than or equal to target.
-                    if (it->second.IsSoftPinExpired(now) ||
+                    if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
                         total_freed_size +=
                             it->second.size * it->second.replicas.size();

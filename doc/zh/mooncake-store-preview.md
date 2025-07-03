@@ -387,7 +387,7 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
-### 软固定机制
+### 软固定机制（即将上线）
 
 对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
 
