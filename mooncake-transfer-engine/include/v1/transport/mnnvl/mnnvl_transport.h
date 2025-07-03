@@ -27,7 +27,6 @@
 
 namespace mooncake {
 namespace v1 {
-class MnnvlThreadPool;
 
 struct MnnvlTask {
     Request request;
@@ -42,8 +41,6 @@ struct MnnvlSubBatch : public Transport::SubBatch {
 };
 
 class MnnvlTransport : public Transport {
-    friend class MnnvlThreadPool;
-
    public:
     MnnvlTransport();
 
@@ -96,7 +93,6 @@ class MnnvlTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;
-    std::unique_ptr<MnnvlThreadPool> workers_;
 
     struct OpenedMnnvlEntry {
         int mnnvl_fd;

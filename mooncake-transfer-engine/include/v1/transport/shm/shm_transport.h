@@ -27,7 +27,6 @@
 
 namespace mooncake {
 namespace v1 {
-class ShmThreadPool;
 
 struct ShmTask {
     Request request;
@@ -43,8 +42,6 @@ struct ShmSubBatch : public Transport::SubBatch {
 };
 
 class ShmTransport : public Transport {
-    friend class ShmThreadPool;
-
    public:
     ShmTransport();
 
@@ -97,7 +94,6 @@ class ShmTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;
-    std::unique_ptr<ShmThreadPool> workers_;
 
     struct OpenedShmEntry {
         int shm_fd;

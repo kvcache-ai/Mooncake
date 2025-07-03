@@ -37,7 +37,7 @@ DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
 DEFINE_bool(integrity_check, false, "Check data integrity if workload is mix");
 DEFINE_bool(shmfs, false, "Enable shmfs");
 
-DEFINE_int32(batch, 128, "Number of requests per batch");
+DEFINE_int32(batch, 16, "Number of requests per batch");
 DEFINE_uint64(size, 65536, "Block size for each request");
 DEFINE_int32(duration, 10, "Test duration in seconds");
 DEFINE_int32(threads, 4, "Test threads to submit requests");

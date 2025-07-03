@@ -153,17 +153,12 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
 
-    const static size_t kDefaultThreadPoolSize = 1;
-    workers_ = std::make_unique<MnnvlThreadPool>(kDefaultThreadPoolSize);
-
     installed_ = true;
     return Status::OK();
 }
 
 Status MnnvlTransport::uninstall() {
     if (installed_) {
-        workers_->stop();
-        workers_.reset();
         metadata_.reset();
         for (auto &entry : relocate_map_) {
             // TBD
@@ -217,7 +212,7 @@ Status MnnvlTransport::submitTransferTasks(
 }
 
 void MnnvlTransport::startTransfer(MnnvlTask *task) {
-    workers_->submit([task]() {
+    ThreadPool::Get().submit([task]() {
         cudaError_t err;
         if (task->request.opcode == Request::READ)
             err = cudaMemcpy(task->request.source, (void *)task->target_addr,

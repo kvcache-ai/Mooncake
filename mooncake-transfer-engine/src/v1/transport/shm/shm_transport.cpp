@@ -35,39 +35,6 @@
 namespace mooncake {
 namespace v1 {
 
-class ShmThreadPool {
-   public:
-    ShmThreadPool(size_t threadCount)
-        : ioService_(),
-          work_(asio::make_work_guard(ioService_)),
-          stopped_(false) {
-        for (size_t i = 0; i < threadCount; ++i) {
-            threads_.create_thread(
-                boost::bind(&asio::io_service::run, &ioService_));
-        }
-    }
-
-    ~ShmThreadPool() { stop(); }
-
-    void submit(std::function<void()> task) {
-        ioService_.post(std::move(task));
-    }
-
-    void stop() {
-        if (!stopped_) {
-            stopped_ = true;
-            ioService_.stop();
-            threads_.join_all();
-        }
-    }
-
-   private:
-    asio::io_service ioService_;
-    asio::executor_work_guard<asio::io_service::executor_type> work_;
-    boost::thread_group threads_;
-    bool stopped_;
-};
-
 ShmTransport::ShmTransport() : installed_(false) {}
 
 ShmTransport::~ShmTransport() { uninstall(); }
@@ -86,18 +53,12 @@ Status ShmTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
-
-    const static size_t kDefaultThreadPoolSize = 1;
-    workers_ = std::make_unique<ShmThreadPool>(kDefaultThreadPoolSize);
-
     installed_ = true;
     return Status::OK();
 }
 
 Status ShmTransport::uninstall() {
     if (installed_) {
-        workers_->stop();
-        workers_.reset();
         metadata_.reset();
         for (auto &relocate_map : relocate_map_) {
             for (auto &entry : relocate_map.second) {
@@ -161,7 +122,7 @@ Status ShmTransport::submitTransferTasks(
 }
 
 void ShmTransport::startTransfer(ShmTask *task) {
-    workers_->submit([task]() {
+    ThreadPool::Get().submit([task]() {
         if (task->is_cuda_ipc) {
 #ifdef USE_CUDA
             cudaError_t err;
