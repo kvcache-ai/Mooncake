@@ -14,7 +14,8 @@ Mooncake Store 的主要特性包括：
 *   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
 *   **最终一致性**：保证 Get 操作读取到完整且正确的数据，但不保证读取到最新写入的数据。这种最终一致性模型在确保高性能的同时，简化了系统设计。
 *   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
-*   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理，将在未来版本中完善实现。
+*   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
+*   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
 
 ## 架构
 
@@ -23,9 +24,15 @@ Mooncake Store 由一个全局的`Master Service` 进行分配存储空间池职
 
 ![architecture](../../image/mooncake-store-preview.png)
 
-如上图所示，在 Mooncake Store Preview 中，有两个关键组件：
+如上图所示，在 Mooncake Store 中，有两个关键组件：
 1. Master Service，用于管理整个集群的逻辑存储空间池（Logical Memory Pool），并维护节点的进入与退出。这是一个独立运行的进程，会对外提供 RPC 服务。需要注意的是，Transfer Engine所需的元数据服务（通过etcd、redis或HTTP等）不包含在Master Service内，需要另行部署。
 2. Client 与 vLLM 实例共享一个进程（至少目前版本是这样）。每个 Client 分配了一定大小的 DRAM 空间，作为逻辑存储空间池（Logical Memory Pool）的一个部分。因此，数据传输实际上是从一个 Client 到另一个 Client，不经过 Master。
+
+Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
+**默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
+**高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
+如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
+leader 通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
 
 ## Client C++ API
 
@@ -36,7 +43,7 @@ ErrorCode Init(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
                void** protocol_args,
-               const std::string& master_addr);
+               const std::string& master_server_entry);
 ```
 
 初始化 Mooncake Store 客户端。其中各参数含义如下：
@@ -44,7 +51,7 @@ ErrorCode Init(const std::string& local_hostname,
 - `metadata_connstring` 表示 Transfer Engine 初始化所需的 etcd/redis 等元数据服务的地址
 - `protocol` 为 Transfer Engine 所支持的协议，包括rdma、tcp
 - `protocol_args` 是Transfer Engine 需要的协议参数
-- `master_addr` 是Master的地址信息IP:Port
+- `master_server_entry` 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
 
 
 ### Get 接口
@@ -411,7 +418,7 @@ def setup(
 - `local_buffer_size`: 本地缓冲区分配大小（默认 16MB）
 - `protocol`: 通信协议 ("tcp" 或 "rdma")
 - `rdma_devices`: RDMA 设备规格（格式取决于具体实现）
-- `master_server_addr`: 主服务器地址 (host:port 格式)
+- `master_server_addr`: 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
 
 **返回值**  
 - `int`: 状态码 (0 = 成功，非零 = 错误)
@@ -535,10 +542,19 @@ store.close()
 
 ## 编译及使用方法
 Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
+
+默认模式:
 ```
-mkdir build
-cd build
-cmake ..
+mkdir build && cd build
+cmake .. # 默认模式
+make
+sudo make install # 安装 Python 接口支持包
+```
+
+高可用模式:
+```
+mkdir build && cd build
+cmake .. -DSTORE_USE_ETCD # 编译 etcd 客户端接口封装模块，依赖 go
 make
 sudo make install # 安装 Python 接口支持包
 ```
@@ -556,10 +572,38 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+**高可用模式**:
+
+高可用模式依赖于 etcd 服务进行协调。如果 Transfer Engine 也使用 etcd 作为其元数据服务，那么 Mooncake Store 使用的 etcd 集群可以与 Transfer Engine 使用的集群共用，也可以是独立的。
+
+高可用模式支持部署多个 master 实例，以消除单点故障。每个 master 实例启动时必须带上以下参数：
+```
+--enable-ha：启用高可用模式
+--etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
+--rpc-address：该实例的 RPC 地址
+```
+
+例如:
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-address=10.0.0.1
+```
+
 ### 启动验证程序
 Mooncake Store 提供了多种验证程序，包括基于 C++ 和 Python 等接口形态。下面以 `stress_cluster_benchmark` 为例介绍一下如何运行。
 
 1. 打开 `stress_cluster_benchmark.py`，结合网络情况修改初始化代码，重点是 local_hostname（对应本机 IP 地址）、metadata_server（对应 Transfer Engine 元数据服务）、master_server_address（对应 Master Service 地址及端口）等：
+
+打开 `stress_cluster_benchmark.py`，根据你的网络环境更新初始化设置。特别注意以下字段：
+```
+local_hostname：本机的 IP 地址
+metadata_server：Transfer Engine 元数据服务的地址
+master_server_address：Master 服务的地址
+```
+**注意**：`master_server_address` 的格式取决于部署模式。在默认模式下，使用格式 `IP:Port`，表示单个 master 节点的地址。在高可用模式下，使用格式 `etcd://IP:Port;IP:Port;...;IP:Port`，表示 etcd 集群各节点的地址。
+例如：
 ```python
 import os
 import time

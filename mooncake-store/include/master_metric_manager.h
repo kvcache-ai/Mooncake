@@ -63,6 +63,18 @@ class MasterMetricManager {
     void inc_ping_requests(int64_t val = 1);
     void inc_ping_failures(int64_t val = 1);
 
+    // Batch Operation Statistics (Counters)
+    void inc_batch_exist_key_requests(int64_t val = 1);
+    void inc_batch_exist_key_failures(int64_t val = 1);
+    void inc_batch_get_replica_list_requests(int64_t val = 1);
+    void inc_batch_get_replica_list_failures(int64_t val = 1);
+    void inc_batch_put_start_requests(int64_t val = 1);
+    void inc_batch_put_start_failures(int64_t val = 1);
+    void inc_batch_put_end_requests(int64_t val = 1);
+    void inc_batch_put_end_failures(int64_t val = 1);
+    void inc_batch_put_revoke_requests(int64_t val = 1);
+    void inc_batch_put_revoke_failures(int64_t val = 1);
+
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -87,6 +99,18 @@ class MasterMetricManager {
     int64_t get_remount_segment_failures();
     int64_t get_ping_requests();
     int64_t get_ping_failures();
+
+    // Batch Operation Statistics Getters
+    int64_t get_batch_exist_key_requests();
+    int64_t get_batch_exist_key_failures();
+    int64_t get_batch_get_replica_list_requests();
+    int64_t get_batch_get_replica_list_failures();
+    int64_t get_batch_put_start_requests();
+    int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_end_requests();
+    int64_t get_batch_put_end_failures();
+    int64_t get_batch_put_revoke_requests();
+    int64_t get_batch_put_revoke_failures();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
@@ -155,6 +179,18 @@ class MasterMetricManager {
     ylt::metric::counter_t remount_segment_failures_;
     ylt::metric::counter_t ping_requests_;
     ylt::metric::counter_t ping_failures_;
+
+    // Batch Operation Statistics
+    ylt::metric::counter_t batch_exist_key_requests_;
+    ylt::metric::counter_t batch_exist_key_failures_;
+    ylt::metric::counter_t batch_get_replica_list_requests_;
+    ylt::metric::counter_t batch_get_replica_list_failures_;
+    ylt::metric::counter_t batch_put_start_requests_;
+    ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_end_requests_;
+    ylt::metric::counter_t batch_put_end_failures_;
+    ylt::metric::counter_t batch_put_revoke_requests_;
+    ylt::metric::counter_t batch_put_revoke_failures_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;

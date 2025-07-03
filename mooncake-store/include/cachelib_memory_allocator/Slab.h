@@ -207,7 +207,7 @@ class SlabReleaseContext {
 
     // movable
     SlabReleaseContext(SlabReleaseContext&&) = default;
-    SlabReleaseContext& operator=(SlabReleaseContext&&) = default;
+    SlabReleaseContext& operator=(SlabReleaseContext&&) = delete;
 
     // create a context where the slab is already released.
     SlabReleaseContext(const Slab* slab, PoolId pid, ClassId cid,
