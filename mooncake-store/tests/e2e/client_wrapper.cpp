@@ -42,8 +42,9 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
         return std::nullopt;
     }
 
-    ErrorCode error_code = client_opt.value()->RegisterLocalMemory(
+    auto register_result = client_opt.value()->RegisterLocalMemory(
         allocator->getBase(), local_buffer_size, "cpu:0", false, false);
+    ErrorCode error_code = register_result.has_value() ? ErrorCode::OK : register_result.error();
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "register_local_memory_failed base="
                    << allocator->getBase() << " size=" << local_buffer_size
@@ -60,7 +61,8 @@ ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    ErrorCode error_code = client_->MountSegment(buffer, size);
+    auto mount_result = client_->MountSegment(buffer, size);
+    ErrorCode error_code = mount_result.has_value() ? ErrorCode::OK : mount_result.error();
     if (error_code != ErrorCode::OK) {
         free(buffer);
         return error_code;
@@ -77,7 +79,8 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
         return ErrorCode::INVALID_PARAMS;
     }
     SegmentInfo& segment = it->second;
-    ErrorCode error_code = client_->UnmountSegment(segment.base, segment.size);
+    auto unmount_result = client_->UnmountSegment(segment.base, segment.size);
+    ErrorCode error_code = unmount_result.has_value() ? ErrorCode::OK : unmount_result.error();
     if (error_code != ErrorCode::OK) {
         return error_code;
     } else {
@@ -90,19 +93,24 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
 }
 
 ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
-    Client::ObjectInfo object_info;
-    ErrorCode error_code = client_->Query(key, object_info);
-    if (error_code != ErrorCode::OK) {
-        return error_code;
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) {
+        return query_result.error();
+    }
+    
+    auto replica_list = query_result.value();
+    if (replica_list.empty()) {
+        return ErrorCode::OBJECT_NOT_FOUND;
     }
 
     // Create slices
     std::vector<AllocatedBuffer::Descriptor>& descriptors =
-        object_info.replica_list[0].get_memory_descriptor().buffer_descriptors;
+        replica_list[0].get_memory_descriptor().buffer_descriptors;
     SliceGuard slice_guard(descriptors, allocator_);
 
     // Perform get operation
-    error_code = client_->Get(key, object_info, slice_guard.slices_);
+    auto get_result = client_->Get(key, replica_list, slice_guard.slices_);
+    ErrorCode error_code = get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {
         return error_code;
     }
@@ -130,13 +138,13 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
     config.replica_num = 1;
 
     // Perform put operation
-    ErrorCode error_code = client_->Put(key, slice_guard.slices_, config);
-
-    return error_code;
+    auto put_result = client_->Put(key, slice_guard.slices_, config);
+    return put_result.has_value() ? ErrorCode::OK : put_result.error();
 }
 
 ErrorCode ClientTestWrapper::Delete(const std::string& key) {
-    return client_->Remove(key);
+    auto remove_result = client_->Remove(key);
+    return remove_result.has_value() ? ErrorCode::OK : remove_result.error();
 }
 
 ClientTestWrapper::SliceGuard::SliceGuard(

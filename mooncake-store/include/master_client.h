@@ -1,9 +1,9 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <atomic>
 #include <memory>
+#include <string>
+#include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
@@ -38,16 +38,17 @@ class MasterClient {
     /**
      * @brief Checks if an object exists
      * @param object_key Key to query
-     * @return ErrorCode indicating exist or not
+     * @return tl::expected<bool, ErrorCode> indicating exist or not
      */
-    [[nodiscard]] ExistKeyResponse ExistKey(const std::string& object_key);
+    [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
+        const std::string& object_key);
 
     /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
-     * @return BatchExistResponse containing existence status for each key
+     * @return Vector containing existence status for each key
      */
-    [[nodiscard]] BatchExistResponse BatchExistKey(
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
 
     /**
@@ -56,8 +57,8 @@ class MasterClient {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] GetReplicaListResponse GetReplicaList(
-        const std::string& object_key);
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    GetReplicaList(const std::string& object_key);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -65,8 +66,9 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::vector<std::string>& object_keys);
+    [[nodiscard]]
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
      * @brief Starts a put operation
@@ -74,12 +76,12 @@ class MasterClient {
      * @param slice_lengths Vector of slice lengths
      * @param value_length Total value length
      * @param config Replication configuration
-     * @param start_response Output parameter for put start response
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+     * indicating success/failure
      */
-    [[nodiscard]] PutStartResponse PutStart(
-        const std::string& key, const std::vector<size_t>& slice_lengths,
-        size_t value_length, const ReplicateConfig& config);
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
+             size_t value_length, const ReplicateConfig& config);
 
     /**
      * @brief Starts a batch of put operations for N objects
@@ -89,64 +91,65 @@ class MasterClient {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchPutStartResponse BatchPutStart(
-        const std::vector<std::string>& keys,
-        const std::unordered_map<std::string, uint64_t>& value_lengths,
-        const std::unordered_map<std::string, std::vector<uint64_t>>&
-            slice_lengths,
-        const ReplicateConfig& config);
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& value_lengths,
+                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Ends a put operation
      * @param key Object key
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] PutEndResponse PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
 
     /**
      * @brief Ends a put operation for a batch of objects
      * @param keys Vector of object keys
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchPutEndResponse BatchPutEnd(
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<std::string>& keys);
 
     /**
      * @brief Revokes a put operation
      * @param key Object key
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] PutRevokeResponse PutRevoke(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
+        const std::string& key);
 
     /**
      * @brief Revokes a put operation for a batch of objects
      * @param keys Vector of object keys
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchPutRevokeResponse BatchPutRevoke(
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys);
 
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] RemoveResponse Remove(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
 
     /**
      * @brief Removes all objects and all its replicas
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    [[nodiscard]] RemoveAllResponse RemoveAll();
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll();
 
     /**
      * @brief Registers a segment to master for allocation
      * @param segment Segment to register
      * @param client_id The uuid of the client
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] MountSegmentResponse MountSegment(const Segment& segment,
-                                                    const UUID& client_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
+        const Segment& segment, const UUID& client_id);
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -155,34 +158,36 @@ class MasterClient {
      * return code is not ErrorCode::OK.
      * @param segments Segments to remount
      * @param client_id The uuid of the client
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] ReMountSegmentResponse ReMountSegment(
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 
     /**
      * @brief Unregisters a memory segment from master
      * @param segment_id ID of the segment to unmount
      * @param client_id The uuid of the client
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
-                                                        const UUID& client_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
+        const UUID& segment_id, const UUID& client_id);
 
     /**
-     * @brief Gets the cluster ID for the current client to use as subdirectory name
+     * @brief Gets the cluster ID for the current client to use as subdirectory
+     * name
      * @return GetClusterIdResponse containing the cluster ID
-     */    
-    [[nodiscard]] GetFsdirResponse GetFsdir();
+     */
+    [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
     /**
      * @brief Pings master to check its availability
      * @param client_id The uuid of the client
-     * @return current master view version
-     * @return client status from the master
-     * @return ErrorCode indicating success/failure
+     * @return tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
+     * containing view version and client status
      */
-    [[nodiscard]] PingResponse Ping(const UUID& client_id);
+    [[nodiscard]] tl::expected<std::pair<ViewVersionId, ClientStatus>,
+                               ErrorCode>
+    Ping(const UUID& client_id);
 
    private:
     /**
@@ -204,12 +209,12 @@ class MasterClient {
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc_client> client_ GUARDED_BY(client_mutex_);
+        std::shared_ptr<coro_rpc_client> client_;
     };
     RpcClientAccessor client_accessor_;
 
     // Mutex to insure the Connect function is atomic.
-    mutable std::mutex connect_mutex_;
+    mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 };

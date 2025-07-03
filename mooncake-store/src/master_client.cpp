@@ -7,7 +7,9 @@
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
+#include <ylt/util/tl/expected.hpp>
 
+#include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
@@ -24,7 +26,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
-    std::lock_guard<std::mutex> lock(connect_mutex_);
+    MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ == master_addr) {
         auto client = client_accessor_.GetClient();
         auto result = coro::syncAwait(client->connect(master_addr));
@@ -36,9 +38,9 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::OK);
         return ErrorCode::OK;
     } else {
-        // Once connected to address A, the coro_rpc_client does not support connect
-        // to a new address B. So we need to create a new coro_rpc_client if the
-        // address is different from the current one.
+        // Once connected to address A, the coro_rpc_client does not support
+        // connect to a new address B. So we need to create a new
+        // coro_rpc_client if the address is different from the current one.
         auto client = std::make_shared<coro_rpc_client>();
         auto result = coro::syncAwait(client->connect(master_addr));
         if (result.val() != 0) {
@@ -54,7 +56,8 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     }
 }
 
-ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
+tl::expected<bool, ErrorCode> MasterClient::ExistKey(
+    const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
@@ -62,33 +65,27 @@ ExistKeyResponse MasterClient::ExistKey(const std::string& object_key) {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return ExistKeyResponse{ErrorCode::RPC_FAIL};
+        return tl::unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::ExistKey>(object_key);
-    std::optional<ExistKeyResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<ExistKeyResponse>> {
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<bool, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to check key existence: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
 
-    if (!result) {
-        auto response = ExistKeyResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-BatchExistResponse MasterClient::BatchExistKey(
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
@@ -96,44 +93,35 @@ BatchExistResponse MasterClient::BatchExistKey(
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
-        BatchExistResponse response;
-        response.exist_responses.resize(object_keys.size());
-        for (auto& exist_response : response.exist_responses) {
-            exist_response = ErrorCode::RPC_FAIL;
-        }
         timer.LogResponse("error=Client not available");
-        return response;
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            object_keys.size(), tl::make_unexpected(ErrorCode::RPC_FAIL));
     }
-
     auto request_result =
         client->send_request<&WrappedMasterService::BatchExistKey>(object_keys);
-    std::optional<BatchExistResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<BatchExistResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::vector<tl::expected<bool, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to check batch key existence: "
                            << result.error().msg;
-                co_return std::nullopt;
+                std::vector<tl::expected<bool, ErrorCode>> error_results;
+                error_results.reserve(object_keys.size());
+                for (size_t i = 0; i < object_keys.size(); ++i) {
+                    error_results.emplace_back(
+                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                co_return error_results;
             }
             co_return result->result();
         }());
 
-    if (!result) {
-        BatchExistResponse response;
-        response.exist_responses.resize(object_keys.size());
-        for (auto& exist_response : response.exist_responses) {
-            exist_response = ErrorCode::RPC_FAIL;
-        }
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
 }
 
-GetReplicaListResponse MasterClient::GetReplicaList(
-    const std::string& object_key) {
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterClient::GetReplicaList(const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
@@ -141,67 +129,77 @@ GetReplicaListResponse MasterClient::GetReplicaList(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::GetReplicaList>(object_key);
-    std::optional<GetReplicaListResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<GetReplicaListResponse>> {
+
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<
+                  tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to get replica list: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = GetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
-    const std::vector<std::string>& object_keys) {
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
-    timer.LogRequest("action=get_batch_replica_list");
+    timer.LogRequest("keys_count=", object_keys.size());
 
     auto client = client_accessor_.GetClient();
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return BatchGetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            error_results;
+        error_results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            error_results.emplace_back(
+                tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        return error_results;
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::BatchGetReplicaList>(
             object_keys);
-    std::optional<BatchGetReplicaListResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<BatchGetReplicaListResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::vector<
+                  tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to get batch replica list: "
                            << result.error().msg;
-                co_return std::nullopt;
+                std::vector<
+                    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+                    error_results;
+                error_results.reserve(object_keys.size());
+                for (size_t i = 0; i < object_keys.size(); ++i) {
+                    error_results.emplace_back(
+                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                co_return error_results;
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = BatchGetReplicaListResponse{{}, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
 }
 
-PutStartResponse MasterClient::PutStart(
-    const std::string& key, const std::vector<size_t>& slice_lengths,
-    size_t value_length, const ReplicateConfig& config) {
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterClient::PutStart(const std::string& key,
+                       const std::vector<size_t>& slice_lengths,
+                       size_t value_length, const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", value_length=", value_length,
                      ", slice_count=", slice_lengths.size());
@@ -210,7 +208,7 @@ PutStartResponse MasterClient::PutStart(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return PutStartResponse{{}, ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     // Convert size_t to uint64_t for RPC
@@ -222,29 +220,26 @@ PutStartResponse MasterClient::PutStart(
 
     auto request_result = client->send_request<&WrappedMasterService::PutStart>(
         key, value_length, rpc_slice_lengths, config);
-    std::optional<PutStartResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutStartResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<
+                  tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to start put operation: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = PutStartResponse{{}, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-BatchPutStartResponse MasterClient::BatchPutStart(
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
-    const std::unordered_map<std::string, uint64_t>& value_lengths,
-    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
+    const std::vector<uint64_t>& value_lengths,
+    const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
@@ -253,32 +248,38 @@ BatchPutStartResponse MasterClient::BatchPutStart(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return BatchPutStartResponse{{}, ErrorCode::RPC_FAIL};
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            error_results(keys.size(),
+                          tl::make_unexpected(ErrorCode::RPC_FAIL));
+        return error_results;
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::BatchPutStart>(
             keys, value_lengths, slice_lengths, config);
-    std::optional<BatchPutStartResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<BatchPutStartResponse>> {
+
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::vector<
+                  tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
-                LOG(ERROR) << "Failed to start batch put operation: "
+                // create a vector full of error
+                std::vector<
+                    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+                    error_results(keys.size(),
+                                  tl::make_unexpected(ErrorCode::RPC_FAIL));
+                LOG(ERROR) << "Failed to start batch put operation, error"
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return error_results;
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = BatchPutStartResponse{{}, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
 }
 
-PutEndResponse MasterClient::PutEnd(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
@@ -286,31 +287,26 @@ PutEndResponse MasterClient::PutEnd(const std::string& key) {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return PutEndResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::PutEnd>(key);
-    std::optional<PutEndResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutEndResponse>> {
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to end put operation: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = PutEndResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-BatchPutEndResponse MasterClient::BatchPutEnd(
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", keys.size());
@@ -319,31 +315,38 @@ BatchPutEndResponse MasterClient::BatchPutEnd(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return BatchPutEndResponse{ErrorCode::RPC_FAIL};
+        std::vector<tl::expected<void, ErrorCode>> error_results;
+        error_results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            error_results.emplace_back(
+                tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        return error_results;
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::BatchPutEnd>(keys);
-    std::optional<BatchPutEndResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<BatchPutEndResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::vector<tl::expected<void, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to end batch put operation: "
                            << result.error().msg;
-                co_return std::nullopt;
+                std::vector<tl::expected<void, ErrorCode>> error_results;
+                error_results.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    error_results.emplace_back(
+                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                co_return error_results;
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = BatchPutEndResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
 }
 
-PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
@@ -351,31 +354,26 @@ PutRevokeResponse MasterClient::PutRevoke(const std::string& key) {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return PutRevokeResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::PutRevoke>(key);
-    std::optional<PutRevokeResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<PutRevokeResponse>> {
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to revoke put operation: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = PutRevokeResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-BatchPutRevokeResponse MasterClient::BatchPutRevoke(
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
@@ -384,31 +382,38 @@ BatchPutRevokeResponse MasterClient::BatchPutRevoke(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return BatchPutRevokeResponse{ErrorCode::RPC_FAIL};
+        std::vector<tl::expected<void, ErrorCode>> error_results;
+        error_results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            error_results.emplace_back(
+                tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        return error_results;
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::BatchPutRevoke>(keys);
-    std::optional<BatchPutRevokeResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<BatchPutRevokeResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<std::vector<tl::expected<void, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to revoke batch put operation: "
                            << result.error().msg;
-                co_return std::nullopt;
+                std::vector<tl::expected<void, ErrorCode>> error_results;
+                error_results.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    error_results.emplace_back(
+                        tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                co_return error_results;
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = BatchPutRevokeResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
 }
 
-RemoveResponse MasterClient::Remove(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
     timer.LogRequest("key=", key);
 
@@ -416,30 +421,25 @@ RemoveResponse MasterClient::Remove(const std::string& key) {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return RemoveResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::Remove>(key);
-    std::optional<RemoveResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<RemoveResponse>> {
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to remove object: " << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = RemoveResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-RemoveAllResponse MasterClient::RemoveAll() {
+tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
     ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
     timer.LogRequest("action=remove_all_objects");
 
@@ -447,34 +447,28 @@ RemoveAllResponse MasterClient::RemoveAll() {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return RemoveAllResponse{toInt(ErrorCode::RPC_FAIL)};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
-        client->template send_request<&WrappedMasterService::RemoveAll>();
-    std::optional<RemoveAllResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<RemoveAllResponse>> {
+        client->send_request<&WrappedMasterService::RemoveAll>();
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<long, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to remove all objects: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
 
-    if (!result) {
-        auto response = RemoveAllResponse{toInt(ErrorCode::RPC_FAIL)};
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
-                                                const UUID& client_id) {
+tl::expected<void, ErrorCode> MasterClient::MountSegment(
+    const Segment& segment, const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("base=", segment.base, ", size=", segment.size,
                      ", name=", segment.name, ", id=", segment.id,
@@ -484,32 +478,26 @@ MountSegmentResponse MasterClient::MountSegment(const Segment& segment,
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return MountSegmentResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
-    std::optional<MountSegmentResponse> result =
-        syncAwait([&]() -> coro::Lazy<std::optional<MountSegmentResponse>> {
-            Lazy<async_rpc_result<MountSegmentResponse>> handler =
-                co_await client
-                    ->send_request<&WrappedMasterService::MountSegment>(
-                        segment, client_id);
-            async_rpc_result<MountSegmentResponse> result = co_await handler;
-            if (!result) {
-                co_return std::nullopt;
-            }
-            co_return result->result();
-        }());
-    if (!result) {
-        LOG(ERROR) << "Failed to mount segment due to rpc error";
-        auto response = MountSegmentResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    auto result = syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
+        Lazy<async_rpc_result<tl::expected<void, ErrorCode>>> handler =
+            co_await client->send_request<&WrappedMasterService::MountSegment>(
+                segment, client_id);
+        async_rpc_result<tl::expected<void, ErrorCode>> result =
+            co_await handler;
+        if (!result) {
+            LOG(ERROR) << "Failed to mount segment due to rpc error";
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        co_return result->result();
+    }());
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-ReMountSegmentResponse MasterClient::ReMountSegment(
+tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
     timer.LogRequest("segments_num=", segments.size(),
@@ -519,33 +507,28 @@ ReMountSegmentResponse MasterClient::ReMountSegment(
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return ReMountSegmentResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
-    std::optional<ReMountSegmentResponse> result =
-        syncAwait([&]() -> coro::Lazy<std::optional<ReMountSegmentResponse>> {
-            Lazy<async_rpc_result<ReMountSegmentResponse>> handler =
-                co_await client
-                    ->send_request<&WrappedMasterService::ReMountSegment>(
-                        segments, client_id);
-            async_rpc_result<ReMountSegmentResponse> result = co_await handler;
-            if (!result) {
-                co_return std::nullopt;
-            }
-            co_return result->result();
-        }());
-    if (!result) {
-        LOG(ERROR) << "Failed to remount segment due to rpc error";
-        auto response = ReMountSegmentResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    auto result = syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
+        Lazy<async_rpc_result<tl::expected<void, ErrorCode>>> handler =
+            co_await client
+                ->send_request<&WrappedMasterService::ReMountSegment>(
+                    segments, client_id);
+        async_rpc_result<tl::expected<void, ErrorCode>> result =
+            co_await handler;
+        if (!result) {
+            LOG(ERROR) << "Failed to remount segment due to rpc error";
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        co_return result->result();
+    }());
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-UnmountSegmentResponse MasterClient::UnmountSegment(const UUID& segment_id,
-                                                    const UUID& client_id) {
+tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
+    const UUID& segment_id, const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
     timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id);
 
@@ -553,32 +536,28 @@ UnmountSegmentResponse MasterClient::UnmountSegment(const UUID& segment_id,
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return UnmountSegmentResponse{ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::UnmountSegment>(segment_id,
                                                                     client_id);
-    std::optional<UnmountSegmentResponse> result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::optional<UnmountSegmentResponse>> {
+    auto result =
+        coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to unmount segment: "
                            << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
-    if (!result) {
-        auto response = UnmountSegmentResponse{ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-PingResponse MasterClient::Ping(const UUID& client_id) {
+tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
+MasterClient::Ping(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id);
 
@@ -586,64 +565,51 @@ PingResponse MasterClient::Ping(const UUID& client_id) {
     if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::Ping>(client_id);
-    std::optional<PingResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<PingResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<tl::expected<std::pair<ViewVersionId, ClientStatus>,
+                                         ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to ping master: " << result.error().msg;
-                co_return std::nullopt;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
 
-    if (!result) {
-        auto response =
-            PingResponse{0, ClientStatus::UNDEFINED, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
-GetFsdirResponse MasterClient::GetFsdir() {
+tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
     timer.LogRequest("action=get_fsdir");
 
     auto client = client_accessor_.GetClient();
-    if(!client){
+    if (!client) {
         LOG(ERROR) << "Client not available";
         timer.LogResponse("error=Client not available");
-        return GetFsdirResponse{"", ErrorCode::RPC_FAIL};
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 
     auto request_result =
         client->send_request<&WrappedMasterService::GetFsdir>();
-    std::optional<GetFsdirResponse> result =
-        coro::syncAwait([&]() -> coro::Lazy<std::optional<GetFsdirResponse>> {
+    auto result = coro::syncAwait(
+        [&]() -> coro::Lazy<tl::expected<std::string, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
-                LOG(ERROR) << "Failed to get fsdir: "
-                          << result.error().msg;
-                co_return std::nullopt;
+                LOG(ERROR) << "Failed to get fsdir: " << result.error().msg;
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             co_return result->result();
         }());
 
-    if (!result) {
-        auto response = GetFsdirResponse{{}, ErrorCode::RPC_FAIL};
-        timer.LogResponseJson(response);
-        return response;
-    }
-
-    timer.LogResponseJson(result.value());
-    return result.value();
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 }  // namespace mooncake

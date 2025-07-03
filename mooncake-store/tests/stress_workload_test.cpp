@@ -71,9 +71,9 @@ bool initialize_segment() {
         return false;
     }
 
-    ErrorCode rc = g_client->MountSegment(g_segment_ptr, g_ram_buffer_size);
-    if (rc != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to mount segment: " << toString(rc);
+    auto result = g_client->MountSegment(g_segment_ptr, g_ram_buffer_size);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Failed to mount segment: " << toString(result.error());
         return false;
     }
 
@@ -84,10 +84,10 @@ bool initialize_segment() {
 
 void cleanup_segment() {
     if (g_segment_ptr && g_client) {
-        ErrorCode rc =
+        auto result =
             g_client->UnmountSegment(g_segment_ptr, g_ram_buffer_size);
-        if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to unmount segment: " << toString(rc);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to unmount segment: " << toString(result.error());
         }
     }
 }
@@ -116,13 +116,13 @@ bool initialize_client() {
     g_client_buffer_allocator =
         std::make_unique<SimpleAllocator>(client_buffer_allocator_size);
 
-    ErrorCode error_code = g_client->RegisterLocalMemory(
+    auto result = g_client->RegisterLocalMemory(
         g_client_buffer_allocator->getBase(), client_buffer_allocator_size,
         "cpu:0", false, false);
 
-    if (error_code != ErrorCode::OK) {
+    if (!result.has_value()) {
         LOG(ERROR) << "Failed to register local memory: "
-                   << toString(error_code);
+                   << toString(result.error());
         return false;
     }
 
@@ -180,14 +180,14 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         std::string key = generate_key(thread_id, i);
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        ErrorCode result = g_client->Put(key.data(), slices, config);
+        auto result = g_client->Put(key.data(), slices, config);
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               end_time - start_time)
                               .count();
 
-        bool success = (result == ErrorCode::OK);
+        bool success = result.has_value();
         stats.operations.push_back(
             {static_cast<double>(latency_us), true, success});
 
@@ -209,14 +209,14 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         std::string key = stored_keys[key_index];
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        ErrorCode result = g_client->Get(key.data(), slices);
+        auto result = g_client->Get(key.data(), slices);
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               end_time - start_time)
                               .count();
 
-        bool success = (result == ErrorCode::OK);
+        bool success = result.has_value();
         stats.operations.push_back(
             {static_cast<double>(latency_us), false, success});
 
