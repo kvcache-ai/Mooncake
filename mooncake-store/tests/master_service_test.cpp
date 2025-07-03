@@ -1165,8 +1165,9 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl));
+    const bool allow_evict_soft_pinned_objects = true;
+    std::unique_ptr<MasterService> service_(new MasterService(
+        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -1200,8 +1201,10 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const double eviction_ratio = 0.5;
-    std::unique_ptr<MasterService> service_(new MasterService(
-        false, kv_lease_ttl, kv_soft_pin_ttl, eviction_ratio));
+    const bool allow_evict_soft_pinned_objects = true;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl,
+                          allow_evict_soft_pinned_objects, eviction_ratio));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1267,8 +1270,9 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl));
+    const bool allow_evict_soft_pinned_objects = true;
+    std::unique_ptr<MasterService> service_(new MasterService(
+        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1311,8 +1315,10 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         kv_soft_pin_ttl > kv_lease_ttl,
         "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
     const double eviction_ratio = 0.5;
-    std::unique_ptr<MasterService> service_(new MasterService(
-        false, kv_lease_ttl, kv_soft_pin_ttl, eviction_ratio));
+    const bool allow_evict_soft_pinned_objects = true;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl,
+                          allow_evict_soft_pinned_objects, eviction_ratio));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1384,6 +1390,53 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         // remove all objects before the next turn
         service_->RemoveAll();
     }
+}
+
+TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
+    const uint64_t kv_lease_ttl = 200;
+    // set a large soft_pin_ttl so the granted soft pin will not quickly expire
+    const uint64_t kv_soft_pin_ttl = 10000;
+    // set allow_evict_soft_pinned_objects to false to disable eviction of soft
+    // pinned objects
+    const bool allow_evict_soft_pinned_objects = false;
+    std::unique_ptr<MasterService> service_(new MasterService(
+        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(ErrorCode::OK, service_->MountSegment(segment, client_id));
+
+    // Put objects more than the segment can hold
+    std::vector<std::string> success_keys;
+    for (int i = 0; i < 16 + 50; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {value_size};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_soft_pin = true;
+        std::vector<Replica::Descriptor> replica_list;
+        if (ErrorCode::OK == service_->PutStart(key, value_size, slice_lengths,
+                                                config, replica_list)) {
+            ASSERT_EQ(ErrorCode::OK, service_->PutEnd(key));
+            success_keys.push_back(key);
+        } else {
+            // wait for gc thread to work
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_LE(success_keys.size(), 17);
+    // All soft pinned objects should be accessible
+    for (const auto& key : success_keys) {
+        std::vector<Replica::Descriptor> replica_list;
+        ASSERT_EQ(ErrorCode::OK, service_->GetReplicaList(key, replica_list));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    service_->RemoveAll();
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {

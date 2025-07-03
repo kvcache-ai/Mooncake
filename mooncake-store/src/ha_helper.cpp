@@ -93,6 +93,7 @@ MasterServiceSupervisor::MasterServiceSupervisor(
     int rpc_port, size_t rpc_thread_num, bool enable_gc,
     bool enable_metric_reporting, int metrics_port,
     int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
+    bool allow_evict_soft_pinned_objects,
     double eviction_ratio, double eviction_high_watermark_ratio,
     int64_t client_live_ttl_sec, const std::string& etcd_endpoints,
     const std::string& local_hostname, const std::string& rpc_address,
@@ -103,6 +104,7 @@ MasterServiceSupervisor::MasterServiceSupervisor(
       metrics_port_(metrics_port),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
+      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
@@ -150,9 +152,9 @@ int MasterServiceSupervisor::Start() {
         bool enable_ha = true;
         mooncake::WrappedMasterService wrapped_master_service(
             enable_gc_, default_kv_lease_ttl_, default_kv_soft_pin_ttl_,
-            enable_metric_reporting_, metrics_port_, eviction_ratio_,
-            eviction_high_watermark_ratio_, version, client_live_ttl_sec_,
-            enable_ha);
+            allow_evict_soft_pinned_objects_, enable_metric_reporting_,
+            metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
+            version, client_live_ttl_sec_, enable_ha);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

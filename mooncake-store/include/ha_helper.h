@@ -79,6 +79,7 @@ class MasterServiceSupervisor {
         int rpc_port, size_t rpc_thread_num, bool enable_gc,
         bool enable_metric_reporting, int metrics_port,
         int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
+        bool allow_evict_soft_pinned_objects,
         double eviction_ratio, double eviction_high_watermark_ratio,
         int64_t client_live_ttl_sec,
         const std::string& etcd_endpoints = "0.0.0.0:2379",
@@ -98,6 +99,7 @@ class MasterServiceSupervisor {
     int metrics_port_;
     int64_t default_kv_lease_ttl_;
     int64_t default_kv_soft_pin_ttl_;
+    bool allow_evict_soft_pinned_objects_;
     double eviction_ratio_;
     double eviction_high_watermark_ratio_;
     int64_t client_live_ttl_sec_;

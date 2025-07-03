@@ -12,6 +12,7 @@ namespace mooncake {
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              uint64_t default_kv_soft_pin_ttl,
+                             bool allow_evict_soft_pinned_objects,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
                              ViewVersionId view_version,
@@ -20,6 +21,7 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
+      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
@@ -704,6 +706,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                    << ", error=invalid_params";
         evict_ratio_lowerbound = evict_ratio_target;
     }
+    bool allow_evict_soft_pin = allow_evict_soft_pinned_objects_;
 
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
@@ -750,8 +753,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             if (it->second.IsSoftPinExpired(now)) {
                 // first pass candidates
                 candidates.push_back(it->second.lease_timeout);
-            } else {
-                // second pass candidates
+            } else if (allow_evict_soft_pin) {
+                // second pass candidates, only if
+                // allow_evict_soft_pinned_objects_ is true
                 soft_pin_objects.push_back(it->second.lease_timeout);
             }
         }

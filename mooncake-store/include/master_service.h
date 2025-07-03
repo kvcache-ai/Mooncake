@@ -59,6 +59,7 @@ class MasterService {
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
                   uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
+                  bool allow_evict_soft_pinned_objects = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
                   double eviction_high_watermark_ratio =
                       DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
@@ -249,11 +250,12 @@ class MasterService {
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects without
-    // soft pin, but also allows to evict soft pinned objects. The first pass tries
-    // fulfill evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to fulfill
-    // evict ratio lowerbound.
+    // evicts objects without soft pin. The second pass prioritizes objects
+    // without soft pin, but also allows to evict soft pinned objects if
+    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
+    // evict ratio target. If the actual evicted ratio is less than
+    // evict_ratio_lowerbound, the second pass will be triggered and try to
+    // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
@@ -357,6 +359,7 @@ class MasterService {
     // Lease related members
     const uint64_t default_kv_lease_ttl_;  // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
     std::atomic<bool> need_eviction_{
