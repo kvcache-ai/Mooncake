@@ -49,6 +49,9 @@ auto execute_rpc(std::string_view rpc_name, RpcCallable&& rpc_call,
     inc_req_metric();
 
     auto result = rpc_call();
+    if (!result.has_value()) {
+        inc_fail_metric();
+    }
     timer.LogResponseExpected(result);
 
     return result;
