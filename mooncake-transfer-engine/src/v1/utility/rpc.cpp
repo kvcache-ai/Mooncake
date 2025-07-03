@@ -18,6 +18,8 @@
 
 #include "v1/utility/rpc.h"
 
+#include "v1/utility/ip.h"
+
 namespace mooncake {
 namespace v1 {
 
@@ -111,7 +113,7 @@ Status AsioRpcServer::registerFunction(int func_id, const Function &func) {
     return Status::OK();
 }
 
-Status AsioRpcServer::start(uint16_t &port) {
+Status AsioRpcServer::start(uint16_t &port, bool ipv6) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
@@ -126,7 +128,8 @@ Status AsioRpcServer::start(uint16_t &port) {
 
             acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
                 io_context_,
-                asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
+                asio::ip::tcp::endpoint(
+                    ipv6 ? asio::ip::tcp::v6() : asio::ip::tcp::v4(), port));
 
             running_ = true;
             io_context_.restart();  // <-- important
@@ -184,9 +187,11 @@ RpcErrorCode AsioRpcClient::call(const std::string &server_addr, int func_id,
     try {
         asio::io_context local_context;
         asio::ip::tcp::resolver resolver(local_context);
+        auto result = parseHostNameWithPort(server_addr, 0);
+        if (result.second == 0) return ErrConnectFailed;
+
         auto endpoints =
-            resolver.resolve(server_addr.substr(0, server_addr.find(':')),
-                             server_addr.substr(server_addr.find(':') + 1));
+            resolver.resolve(result.first, std::to_string(result.second));
 
         asio::ip::tcp::socket socket(local_context);
         asio::connect(socket, endpoints);

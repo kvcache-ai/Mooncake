@@ -133,7 +133,7 @@ Status TransferEngine::construct() {
     metadata_ =
         std::make_shared<MetadataService>(metadata_type, metadata_servers);
 
-    CHECK_STATUS(metadata_->start(port_));
+    CHECK_STATUS(metadata_->start(port_, ipv6_));
 
     if (metadata_type == "p2p")
         local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6_);

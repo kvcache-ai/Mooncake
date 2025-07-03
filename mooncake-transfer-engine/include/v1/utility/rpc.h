@@ -53,7 +53,7 @@ class AsioRpcServer {
                                         RpcRawData & /* response */)>;
     Status registerFunction(int func_id, const Function &func);
 
-    Status start(uint16_t &port);
+    Status start(uint16_t &port, bool ipv6 = false);
 
     Status stop();
 

@@ -153,7 +153,7 @@ class MetadataService {
         notify_callback_ = callback;
     }
 
-    Status start(uint16_t &port);
+    Status start(uint16_t &port, bool ipv6_ = false);
 
    private:
     void onGetSegmentDesc(const RpcRawData &request, RpcRawData &response);

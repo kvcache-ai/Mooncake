@@ -405,8 +405,8 @@ MetadataService::MetadataService(const std::string &type,
 
 MetadataService::~MetadataService() {}
 
-Status MetadataService::start(uint16_t &port) {
-    return rpc_server_->start(port);
+Status MetadataService::start(uint16_t &port, bool ipv6_) {
+    return rpc_server_->start(port, ipv6_);
 }
 
 void MetadataService::onGetSegmentDesc(const RpcRawData &request,
