@@ -96,10 +96,22 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_bool.dtype, tensor_bool.dtype)
         self.assertTrue(torch.equal(tensor_bool, retrieved_bool))
 
+        # Bool tensor
+        tensor_rand = torch.rand(1000, dtype=torch.float32)
+        key_rand = "test_tensor_rand"
+        result = self.store.put_tensor(key_rand, tensor_rand)
+        self.assertEqual(result, 0)
+        retrieved_rand = self.store.get_tensor(key_rand, "float32")
+        self.assertIsNotNone(retrieved_rand)
+        # self.assertEqual(tuple(retrieved_bool.shape), tuple(tensor_bool.shape))
+        self.assertEqual(retrieved_rand.dtype, tensor_rand.dtype)
+        self.assertTrue(torch.equal(tensor_rand, retrieved_rand))
+
         # Clean up
         self.store.remove(key)
         self.store.remove(key_int)
         self.store.remove(key_bool)
+        self.store.remove(key_rand)
              
 if __name__ == '__main__':
     unittest.main()
