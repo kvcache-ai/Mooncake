@@ -11,6 +11,8 @@
 #include "client.h"
 #include "utils.h"
 
+namespace mooncake {
+
 class DistributedObjectStore;
 
 // Forward declarations
@@ -224,7 +226,7 @@ class DistributedObjectStore {
                        const std::string &value);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
-                       const mooncake::Client::ObjectInfo &object_info,
+                       const std::vector<Replica::Descriptor> &handles,
                        uint64_t &length);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
@@ -237,7 +239,8 @@ class DistributedObjectStore {
         const std::vector<std::string> &keys,
         std::unordered_map<std::string, std::vector<mooncake::Slice>>
             &batched_slices,
-        const mooncake::Client::BatchObjectInfo &batched_object_info,
+        const std::vector<std::vector<mooncake::Replica::Descriptor>>
+            &replica_lists,
         std::unordered_map<std::string, uint64_t> &str_length_map);
 
     int allocateBatchedSlices(
@@ -268,3 +271,5 @@ class DistributedObjectStore {
     std::string device_name;
     std::string local_hostname;
 };
+
+}  // namespace mooncake
