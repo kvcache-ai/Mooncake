@@ -132,8 +132,9 @@ class TransferEngine {
         if (!s.ok()) {
             return s;
         }
-        // notify
-        sendNotify(target_id, notify_msg);
+        // store notify
+        RWSpinlock::WriteGuard guard(send_notifies_lock_);
+        notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
         return s;
     }
 
@@ -153,6 +154,13 @@ class TransferEngine {
             }
         }
 #endif
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            // send notify
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            auto value = notifies_to_send_[batch_id];
+            sendNotify(value.first, value.second);
+            notifies_to_send_.erase(batch_id);
+        }
         return result;
     }
 
@@ -200,6 +208,10 @@ class TransferEngine {
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
+    RWSpinlock send_notifies_lock_;
+    std::unordered_map<BatchID,
+                       std::pair<SegmentID, TransferMetadata::NotifyDesc>>
+        notifies_to_send_;
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;
