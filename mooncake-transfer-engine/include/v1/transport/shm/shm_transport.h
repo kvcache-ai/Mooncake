@@ -77,10 +77,10 @@ class ShmTransport : public Transport {
 
     virtual const char *getName() const { return "shm"; }
 
-    virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
-                                       const Location &location);
+    virtual Status allocateLocalMemory(void **addr, size_t size,
+                                       MemoryOptions &options);
 
-    virtual Status freeLocalMemory(const BufferEntry &buffer);
+    virtual Status freeLocalMemory(void *addr, size_t size);
 
     virtual bool taskSupported(const Request &request);
 
@@ -110,11 +110,14 @@ class ShmTransport : public Transport {
         std::unordered_map<SegmentID,
                            std::unordered_map<uint64_t, OpenedShmEntry>>;
 
-    std::mutex relocate_mutex_;
+    RWSpinlock relocate_lock_;
     HashMap relocate_map_;
     std::shared_ptr<ConfigManager> conf_;
 
     std::string machine_id_;
+
+    std::mutex shm_path_mutex_;
+    std::unordered_map<void *, std::string> shm_path_map_;
 };
 }  // namespace v1
 }  // namespace mooncake

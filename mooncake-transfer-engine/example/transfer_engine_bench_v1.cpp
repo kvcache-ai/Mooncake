@@ -35,6 +35,7 @@ DEFINE_string(local_segment, "",
               "Set the custom local segment name (optional)");
 DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
 DEFINE_bool(integrity_check, false, "Check data integrity if workload is mix");
+DEFINE_bool(shmfs, false, "Enable shmfs");
 
 DEFINE_int32(batch, 128, "Number of requests per batch");
 DEFINE_uint64(size, 65536, "Block size for each request");
@@ -44,6 +45,7 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
 #ifdef USE_CUDA
+DEFINE_bool(use_dram, true, "Allocate memory from CPU DRAM");
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 #endif
 
@@ -88,6 +90,7 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
     return oss.str();
 }
 
+int num_sockets = 1;
 int num_buffers = 1;
 int cuda_device_count = 0;
 size_t buffer_capacity = 32 * 1024 * 1024;
@@ -190,7 +193,7 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
 
 Status initiatorWorker(TransferEngine *engine, SegmentID handle, int thread_id,
                        void *addr) {
-    bindToSocket(thread_id % num_buffers);
+    bindToSocket(thread_id % num_sockets);
     uint64_t remote_base = getStartAddress(engine, handle, thread_id);
     bool mixture = false;
     Request::OpCode opcode;
@@ -239,16 +242,14 @@ void allocateAllLocalMemory(const std::unique_ptr<TransferEngine> &engine,
                             std::vector<void *> &addr) {
     for (int i = 0; i < num_buffers; ++i) {
         MemoryOptions options;
+        if (FLAGS_shmfs) options.type = SHM;
 #ifdef USE_CUDA
-        if (FLAGS_use_vram) {
-            if (i < cuda_device_count) {
-                options.location = "cuda:" + std::to_string(i);
-            } else {
-                options.location =
-                    "cpu:" + std::to_string(i - cuda_device_count);
-            }
-        } else {
+        if (FLAGS_use_dram && i < num_sockets) {
             options.location = "cpu:" + std::to_string(i);
+        } else if (FLAGS_use_vram) {
+            int cuda_id = i;
+            if (FLAGS_use_dram) cuda_id -= num_sockets;
+            options.location = "cuda:" + std::to_string(i);
         }
 #else
         options.location = "cpu:" + std::to_string(i);
@@ -285,7 +286,7 @@ int initiator() {
 
     SegmentID handle;
     assert(!FLAGS_remote_segment.empty());
-    CHECK_FAIL(engine->openRemoteSegment(handle, FLAGS_remote_segment.c_str()));
+    CHECK_FAIL(engine->openRemoteSegment(handle, FLAGS_remote_segment));
 
     std::thread workers[FLAGS_threads];
     struct timeval start_tv, stop_tv;
@@ -345,10 +346,13 @@ int main(int argc, char **argv) {
 
     uint64_t min_capacity = FLAGS_size * FLAGS_batch * FLAGS_threads;
     buffer_capacity = std::max(buffer_capacity, min_capacity);
-    num_buffers = numa_num_configured_nodes();
 #ifdef USE_CUDA
+    num_buffers = 0;
     cudaGetDeviceCount(&cuda_device_count);
+    if (FLAGS_use_dram) num_buffers += numa_num_configured_nodes();
     if (FLAGS_use_vram) num_buffers += cuda_device_count;
+#else
+    num_buffers = numa_num_configured_nodes();
 #endif
     if (FLAGS_remote_segment.empty())
         return target();

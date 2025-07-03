@@ -21,6 +21,7 @@
 
 #include "v1/common.h"
 #include "v1/metadata/metadata.h"
+#include "v1/utility/memory_location.h"
 
 namespace mooncake {
 namespace v1 {
@@ -56,10 +57,17 @@ Status SegmentManager::closeRemote(SegmentID handle) {
 }
 
 Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
-    RWSpinlock::ReadGuard guard(lock_);
-    if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+    {
+        RWSpinlock::ReadGuard guard(lock_);
+        if (!id_to_name_map_.count(handle))
+            return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+        if (id_to_desc_map_.count(handle)) {
+            desc = id_to_desc_map_[handle];
+            return Status::OK();
+        }
+    }
 
+    RWSpinlock::WriteGuard guard(lock_);
     if (id_to_desc_map_.count(handle)) {
         desc = id_to_desc_map_[handle];
         return Status::OK();
@@ -74,10 +82,18 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
 
 Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
-    RWSpinlock::ReadGuard guard(lock_);
-    if (!name_to_id_map_.count(segment_name))
-        return store_->getSegmentDesc(desc, segment_name);
+    {
+        RWSpinlock::ReadGuard guard(lock_);
+        if (!name_to_id_map_.count(segment_name))
+            return store_->getSegmentDesc(desc, segment_name);
+        auto handle = name_to_id_map_.at(segment_name);
+        if (id_to_desc_map_.count(handle)) {
+            desc = id_to_desc_map_[handle];
+            return Status::OK();
+        }
+    }
 
+    RWSpinlock::WriteGuard guard(lock_);
     auto handle = name_to_id_map_.at(segment_name);
     if (id_to_desc_map_.count(handle)) {
         desc = id_to_desc_map_[handle];
@@ -146,7 +162,11 @@ Status LocalSegmentHelper::add(uint64_t base, size_t length,
     BufferDesc new_desc;
     new_desc.addr = base;
     new_desc.length = length;
-    new_desc.location = kWildcardLocation;
+    auto entries = getMemoryLocation((void *)base, length);
+    if (!entries.empty())
+        new_desc.location = entries[0].location;
+    else
+        new_desc.location = kWildcardLocation;
     new_desc.ref_count = 1;
     auto status = callback(new_desc);
     if (!status.ok()) return status;

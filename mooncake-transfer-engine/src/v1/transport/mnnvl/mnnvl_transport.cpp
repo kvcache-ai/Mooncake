@@ -260,13 +260,7 @@ void MnnvlTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
-    auto location = options.location;
-    if (location == kWildcardLocation) {
-        auto entries = getMemoryLocation((void *)desc.addr, desc.length);
-        if (!entries.empty()) location = entries[0].location;
-    }
-    desc.location = location;
-    if (!location.starts_with("cuda")) return Status::OK();
+    if (!desc.location.starts_with("cuda")) return Status::OK();
 
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, desc.addr);
@@ -359,6 +353,7 @@ Status MnnvlTransport::freeLocalMemory(const BufferEntry &buffer) {
 Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                    uint64_t length,
                                                    uint64_t target_id) {
+    std::lock_guard<std::mutex> lock(relocate_mutex_);
     SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return status;
@@ -368,7 +363,6 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     for (auto &entry : detail.buffers) {
         if (!entry.mnnvl_handle.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
-            std::lock_guard<std::mutex> lock(relocate_mutex_);
             if (!relocate_map.count(entry.addr)) {
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
@@ -418,7 +412,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
                 OpenedMnnvlEntry mnnvl_entry;
                 mnnvl_entry.mnnvl_addr = mnnvl_addr;
-                mnnvl_entry.length = length;
+                mnnvl_entry.length = entry.length;
                 relocate_map[entry.addr] = mnnvl_entry;
             }
             auto mnnvl_addr = relocate_map[entry.addr].mnnvl_addr;

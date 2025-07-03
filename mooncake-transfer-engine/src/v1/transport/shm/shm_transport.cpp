@@ -220,14 +220,8 @@ void ShmTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
-    auto location = options.location;
-    if (location == kWildcardLocation) {
-        auto entries = getMemoryLocation((void *)desc.addr, desc.length);
-        if (!entries.empty()) location = entries[0].location;
-    }
-    desc.location = location;
 #ifdef USE_CUDA
-    if (location.starts_with("cuda")) {
+    if (desc.location.starts_with("cuda")) {
         cudaIpcMemHandle_t handle;
         auto err = cudaIpcGetMemHandle(&handle, desc.addr);
         if (err != cudaSuccess) {
@@ -243,6 +237,8 @@ Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                               // buffer for shared memory transport
     desc.shm_path = options.shm_path;
     // desc.shm_offset = options.shm_offset;
+    LOG(INFO) << "Registered shared memory: " << (void *)desc.addr << "--"
+              << (void *)(desc.addr + desc.length);
     return Status::OK();
 }
 
@@ -254,28 +250,30 @@ Status ShmTransport::removeMemoryBuffer(BufferDesc &desc) {
 
 static inline std::string makeRandomMmapFileName(const std::string &parent) {
     std::string result = parent;
-    if (result.empty()) result = "/dev/shm/";
-    if (result[result.size() - 1] != '/') result += '/';
+    if (!result.empty() && result[result.size() - 1] != '/') result += '/';
     result += "mooncake_";
     for (int i = 0; i < 8; ++i) result += 'a' + SimpleRandom::Get().next(26);
     return result;
 }
 
-Status ShmTransport::allocateLocalMemory(BufferEntry &buffer, size_t size,
-                                         const Location &location) {
-    buffer.length = size;
-    buffer.location = location;
-    auto base_path = conf_->get("transports/shm/shm_base_path", "/dev/shm/");
-    buffer.shm_path = makeRandomMmapFileName(base_path);
-    buffer.addr = createSharedMemory(buffer.shm_path, size);
-    if (!buffer.addr) {
+Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
+                                         MemoryOptions &options) {
+    auto base_path = conf_->get("transports/shm/shm_base_path", "");
+    options.shm_path = makeRandomMmapFileName(base_path);
+    options.shm_offset = 0;
+    *addr = createSharedMemory(options.shm_path, size);
+    if (!(*addr)) {
         return Status::InternalError("Failed to allocate shared memory");
     }
     return Status::OK();
 }
 
-Status ShmTransport::freeLocalMemory(const BufferEntry &buffer) {
-    munmap(buffer.addr, buffer.length);
+Status ShmTransport::freeLocalMemory(void *addr, size_t size) {
+    std::lock_guard<std::mutex> lock(shm_path_mutex_);
+    if (!shm_path_map_.count(addr)) return Status::OK();
+    munmap(addr, size);
+    shm_unlink(shm_path_map_[addr].c_str());
+    shm_path_map_.erase(addr);
     return Status::OK();
 }
 
@@ -301,6 +299,8 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
     }
 
     close(shm_fd);
+    std::lock_guard<std::mutex> lock(shm_path_mutex_);
+    shm_path_map_[mapped_addr] = path;
     return mapped_addr;
 }
 
@@ -308,16 +308,29 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id,
                                                  bool &is_cuda_ipc) {
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        auto &relocate_map = relocate_map_[target_id];
+        for (auto &entry : relocate_map) {
+            if (entry.first <= dest_addr &&
+                dest_addr + length <= entry.first + entry.second.length) {
+                auto shm_addr = entry.second.shm_addr;
+                dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
+                is_cuda_ipc = entry.second.is_cuda_ipc;
+                return Status::OK();
+            }
+        }
+    }
+
+    RWSpinlock::WriteGuard guard(relocate_lock_);
     SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return status;
-    int index = 0;
     auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    auto &relocate_map = relocate_map_[target_id];
     for (auto &entry : detail.buffers) {
         if (!entry.shm_path.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
-            std::lock_guard<std::mutex> lock(relocate_mutex_);
+            auto &relocate_map = relocate_map_[target_id];
             if (!relocate_map.count(entry.addr)) {
                 void *shm_addr = nullptr;
                 if (entry.location.starts_with("cuda")) {
@@ -337,7 +350,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_fd = -1;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     shm_entry.is_cuda_ipc = true;
                     relocate_map[entry.addr] = shm_entry;
 #else
@@ -351,17 +364,24 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                             std::string("Failed to open shared memory file ") +
                             entry.shm_path + LOC_MARK);
                     }
-                    shm_addr = mmap(nullptr, length, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, shm_fd, 0);
+                    shm_addr =
+                        mmap(nullptr, entry.length, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, shm_fd, 0);
                     if (shm_addr == MAP_FAILED) {
                         close(shm_fd);
                         return Status::InternalError(
                             "Failed to map shared memory " LOC_MARK);
                     }
+                    LOG(INFO)
+                        << "Original shared memory: " << (void *)entry.addr
+                        << "--" << (void *)(entry.addr + entry.length);
+                    LOG(INFO)
+                        << "Remapped shared memory: " << (void *)shm_addr
+                        << "--" << (void *)((uintptr_t)shm_addr + entry.length);
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_fd = shm_fd;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     shm_entry.is_cuda_ipc = false;
                     relocate_map[entry.addr] = shm_entry;
                 }
@@ -369,9 +389,9 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             auto shm_addr = relocate_map[entry.addr].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
             is_cuda_ipc = relocate_map[entry.addr].is_cuda_ipc;
+            // LOG(INFO) << desc.use_count();
             return Status::OK();
         }
-        index++;
     }
     return Status::InvalidArgument(
         "Requested address is not in registered buffer" LOC_MARK);
