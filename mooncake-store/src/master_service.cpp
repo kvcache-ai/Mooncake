@@ -779,14 +779,22 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
         }
     }
 
+    // The ideal number of objects to evict in the second pass
     long target_evict_num =
         std::ceil(object_count * target_eviction_ratio) - evicted_count;
+    // The actual number of objects we can evict in the second pass
+    target_evict_num =
+        std::min(target_evict_num,
+                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
+
     if (target_evict_num > 0) {
         // The evicted number is less than target, do second pass eviction.
         // If there are enough candidates without soft pin, do second pass A.
         // Otherwise, do second pass B.
 
-        if (target_evict_num >= static_cast<long>(no_pin_objects.size())) {
+        if (!no_pin_objects.empty() &&
+            (target_evict_num >= static_cast<long>(no_pin_objects.size()) ||
+             soft_pin_objects.empty())) {
             // Second pass A: only evict objects without soft pin
 
             std::nth_element(no_pin_objects.begin(),
@@ -815,7 +823,7 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
                     }
                 }
             }
-        } else {
+        } else if (!soft_pin_objects.empty()) {
             // Second pass B: Prioritize evicting objects without soft pin, but
             // also allow to evict soft pinned objects
 
