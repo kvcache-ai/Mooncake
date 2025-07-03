@@ -675,9 +675,13 @@ void MasterService::GCThreadFunc() {
             MasterMetricManager::instance().get_global_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
-            BatchEvict(std::max(
+            double evict_ratio_target = std::max(
                 eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_lowerbound =
+                std::max(evict_ratio_target * 0.5,
+                         used_ratio - eviction_high_watermark_ratio_);
+            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
         }
 
         std::this_thread::sleep_for(
@@ -692,7 +696,15 @@ void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_stopped";
 }
 
-void MasterService::BatchEvict(double target_eviction_ratio) {
+void MasterService::BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound) {
+    if (evict_ratio_target < evict_ratio_lowerbound) {
+        LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
+                   << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound
+                   << ", error=invalid_params";
+        evict_ratio_lowerbound = evict_ratio_target;
+    }
+
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
     long object_count = 0;
@@ -716,10 +728,10 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
         // to compute ideal_evict_num
         object_count += shard.metadata.size();
 
-        // To achieve evicted_count / object_count = eviction_ration,
+        // To achieve evicted_count / object_count = evict_ratio_target,
         // ideally how many object should be evicted in this shard
         const long ideal_evict_num =
-            std::ceil(object_count * target_eviction_ratio) - evicted_count;
+            std::ceil(object_count * evict_ratio_target) - evicted_count;
 
         if (ideal_evict_num <= 0) {
             // No need to evict any object in this shard
@@ -781,27 +793,31 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
 
     // The ideal number of objects to evict in the second pass
     long target_evict_num =
-        std::ceil(object_count * target_eviction_ratio) - evicted_count;
+        std::ceil(object_count * evict_ratio_lowerbound) - evicted_count;
     // The actual number of objects we can evict in the second pass
     target_evict_num =
         std::min(target_evict_num,
                  (long)no_pin_objects.size() + (long)soft_pin_objects.size());
 
+    // Do second pass eviction only if 1). there are candidates that can be
+    // evicted AND 2). The evicted number in the first pass is less than
+    // evict_ratio_lowerbound.
     if (target_evict_num > 0) {
-        // The evicted number is less than target, do second pass eviction.
-        // If there are enough candidates without soft pin, do second pass A.
-        // Otherwise, do second pass B.
-
-        if (!no_pin_objects.empty() &&
-            (target_evict_num >= static_cast<long>(no_pin_objects.size()) ||
-             soft_pin_objects.empty())) {
-            // Second pass A: only evict objects without soft pin
+        // If 1). there are enough candidates without soft pin OR 2). soft pin
+        // candidates are empty, then do second pass A. Otherwise, do second
+        // pass B. Note that the second condition is ensured implicitly by the
+        // calculation of target_evict_num.
+        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
+            // Second pass A: only evict objects without soft pin. The following
+            // code is error-prone if target_evict_num > no_pin_objects.size().
 
             std::nth_element(no_pin_objects.begin(),
                              no_pin_objects.begin() + (target_evict_num - 1),
                              no_pin_objects.end());
             auto target_timeout = no_pin_objects[target_evict_num - 1];
+
             // Evict objects with lease timeout less than or equal to target.
+            // Stop when the target is reached.
             for (size_t i = 0;
                  i < metadata_shards_.size() && target_evict_num > 0; i++) {
                 auto& shard =
@@ -825,7 +841,8 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
             }
         } else if (!soft_pin_objects.empty()) {
             // Second pass B: Prioritize evicting objects without soft pin, but
-            // also allow to evict soft pinned objects
+            // also allow to evict soft pinned objects. The following code is
+            // error-prone if the soft pin objects are empty.
 
             const long soft_pin_evict_num =
                 target_evict_num - static_cast<long>(no_pin_objects.size());
@@ -833,9 +850,9 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
                 soft_pin_objects.begin(),
                 soft_pin_objects.begin() + (soft_pin_evict_num - 1),
                 soft_pin_objects.end());
-            auto soft_target_timeout =
-                soft_pin_objects[soft_pin_evict_num - 1];
+            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
+            // Stop when the target is reached.
             for (size_t i = 0;
                  i < metadata_shards_.size() && target_evict_num > 0; i++) {
                 auto& shard =
@@ -865,6 +882,17 @@ void MasterService::BatchEvict(double target_eviction_ratio) {
                     }
                 }
             }
+        } else {
+            // This should not happen.
+            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
+                       << target_evict_num
+                       << ", no_pin_objects.size()=" << no_pin_objects.size()
+                       << ", soft_pin_objects.size()="
+                       << soft_pin_objects.size()
+                       << ", evicted_count=" << evicted_count
+                       << ", object_count=" << object_count
+                       << ", evict_ratio_target=" << evict_ratio_target
+                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
         }
     }
 
