@@ -623,7 +623,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    // Process individual responses with robust error handlingw
+    // Process individual responses with robust error handling
     for (size_t i = 0; i < ops.size(); ++i) {
         if (!start_responses[i]) {
             ops[i].SetError(start_responses[i].error(),
