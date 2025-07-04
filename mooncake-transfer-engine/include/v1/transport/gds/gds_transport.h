@@ -23,7 +23,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include "cufile_context.h"
 #include "cufile_desc_pool.h"
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
@@ -31,15 +30,11 @@
 namespace mooncake {
 namespace v1 {
 
-struct GdsTask {
-    Request request;
-};
+class GdsFileContext;
+class GdsRunner;
 
 struct GdsSubBatch : public Transport::SubBatch {
-    std::vector<GdsTask> task_list;
-    size_t max_size;
-    int desc_idx;
-    std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
+    std::shared_ptr<GdsRunner> runner;
 };
 
 class GdsTransport : public Transport {
@@ -50,7 +45,8 @@ class GdsTransport : public Transport {
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<MetadataService> metadata,
-                           std::shared_ptr<Topology> local_topology);
+                           std::shared_ptr<Topology> local_topology,
+                           std::shared_ptr<ConfigManager> conf = nullptr);
 
     virtual Status uninstall();
 
@@ -67,35 +63,25 @@ class GdsTransport : public Transport {
     virtual void queryOutstandingTasks(SubBatchRef batch,
                                        std::vector<int> &task_id_list);
 
-    virtual Status registerLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status addMemoryBuffer(BufferDesc &desc,
+                                   const MemoryOptions &options);
 
-    virtual Status unregisterLocalMemory(
-        const std::vector<BufferEntry> &buffer_list);
+    virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "gds"; }
 
-   private:
-    void allocateLocalSegmentID();
-
-    void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
-                               uint64_t slice_len, uint64_t desc_id,
-                               Request::OpCode op, CUfileHandle_t fh);
+    virtual bool taskSupported(const Request &request);
 
    private:
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<MetadataService> metadata_;
+    std::shared_ptr<ConfigManager> conf_;
 
-    std::unordered_map<BatchID, int> batch_to_cufile_desc_;
-    std::unordered_map<std::pair<SegmentHandle, uint64_t>,
-                       std::shared_ptr<CuFileContext>, pair_hash>
-        segment_to_context_;
-    std::vector<std::thread> workers_;
-
-    std::shared_ptr<CUFileDescPool> desc_pool_;
-    RWSpinlock context_lock_;
+    RWSpinlock file_context_lock_;
+    std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>
+        file_context_map_;
 };
 }  // namespace v1
 }  // namespace mooncake
