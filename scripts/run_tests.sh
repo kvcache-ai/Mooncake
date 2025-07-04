@@ -28,6 +28,13 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
 kill $MASTER_PID || true
 
+echo "mooncake_master found, running tensor api tests..."
+mooncake_master &
+MASTER_PID=$!
+sleep 1
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_put_get_tensor.py
+kill $MASTER_PID || true
+
 # Disabled for now, need to investigate
 # echo "Running with ssd offload in evict tests..."
 # mooncake_master &
