@@ -12,6 +12,8 @@
 #include "types.h"
 
 namespace py = pybind11;
+pybind11::module numpy = pybind11::module::import("numpy");
+pybind11::module torch = pybind11::module::import("torch");
 
 namespace mooncake {
 
@@ -1255,7 +1257,6 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
 
     try {
         // Import torch module
-        pybind11::module torch = pybind11::module::import("torch");
         
         // Query object info first
         // Step 1: Get object info
@@ -1297,9 +1298,9 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
         }
 
         // Convert bytes to tensor using torch.from_numpy
-        pybind11::module numpy = pybind11::module::import("numpy");
-        pybind11::object np_array = numpy.attr("frombuffer")(
-            pybind11::bytes(exported_data, total_length), dtype);
+
+        py::object py_buffer = py::memoryview::from_memory(exported_data, total_length);
+        pybind11::object np_array = numpy.attr("frombuffer")(py_buffer, dtype);
         
         // Create tensor from numpy array
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
@@ -1322,7 +1323,6 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
 
     try {
         // Import torch module
-        pybind11::module torch = pybind11::module::import("torch");
         // Check if the object is a tensor
         if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
