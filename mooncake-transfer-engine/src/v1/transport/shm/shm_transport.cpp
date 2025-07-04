@@ -182,7 +182,7 @@ void ShmTransport::queryOutstandingTasks(SubBatchRef batch,
 Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
 #ifdef USE_CUDA
-    if (desc.location.starts_with("cuda")) {
+    if (parseLocation(desc.location).first == "cuda") {
         cudaIpcMemHandle_t handle;
         auto err = cudaIpcGetMemHandle(&handle, (void *)desc.addr);
         if (err != cudaSuccess) {
@@ -219,6 +219,9 @@ static inline std::string makeRandomMmapFileName(const std::string &parent) {
 
 Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
                                          MemoryOptions &options) {
+    if (parseLocation(options.location).first == "cuda") {
+        return genericAllocateLocalMemory(addr, size, options);
+    }
     auto base_path = conf_->get("transports/shm/shm_base_path", "");
     options.shm_path = makeRandomMmapFileName(base_path);
     options.shm_offset = 0;
@@ -231,7 +234,9 @@ Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
 
 Status ShmTransport::freeLocalMemory(void *addr, size_t size) {
     std::lock_guard<std::mutex> lock(shm_path_mutex_);
-    if (!shm_path_map_.count(addr)) return Status::OK();
+    if (!shm_path_map_.count(addr)) {
+        return genericFreeLocalMemory(addr, size);
+    }
     munmap(addr, size);
     shm_unlink(shm_path_map_[addr].c_str());
     shm_path_map_.erase(addr);
@@ -294,7 +299,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             auto &relocate_map = relocate_map_[target_id];
             if (!relocate_map.count(entry.addr)) {
                 void *shm_addr = nullptr;
-                if (entry.location.starts_with("cuda")) {
+                if (parseLocation(entry.location).first == "cuda") {
 #ifdef USE_CUDA
                     std::vector<unsigned char> output_buffer;
                     deserializeBinaryData(entry.shm_path, output_buffer);
@@ -350,7 +355,6 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             auto shm_addr = relocate_map[entry.addr].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
             is_cuda_ipc = relocate_map[entry.addr].is_cuda_ipc;
-            // LOG(INFO) << desc.use_count();
             return Status::OK();
         }
     }

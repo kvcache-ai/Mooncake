@@ -255,7 +255,8 @@ void MnnvlTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
-    if (!desc.location.starts_with("cuda")) return Status::OK();
+    if (parseLocation(desc.location).first != "cuda") 
+        return Status::OK();
 
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, desc.addr);
