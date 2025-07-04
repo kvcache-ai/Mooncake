@@ -4,7 +4,7 @@
 
 Mooncake Store 是一款专为LLM推理场景设计的高性能**分布式键值 KV Cache 存储引擎**。
 
-与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于前者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
+与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于后者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
 
 Mooncake Store 提供了底层对象存储和管理功能，而具体的缓存策略（如淘汰策略）则交由上层框架（比如vLLM）或用户实现，从而提供更高的灵活性和可定制性。
 
@@ -12,10 +12,11 @@ Mooncake Store 的主要特性包括：
 
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
 *   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
-*   **最终一致性**：保证 Get 操作读取到完整且正确的数据，但不保证读取到最新写入的数据。这种最终一致性模型在确保高性能的同时，简化了系统设计。
+*   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
 *   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
 *   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
+*   **分级缓存**: 支持将 RAM 中缓存数据卸载到 SSD 中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
 
 ## 架构
 
@@ -64,7 +65,7 @@ ErrorCode Get(const std::string& object_key,
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
 
 
-用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。
+用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。（当启用了持久化功能时，若内存的 `Query` 请求失败，会尝试从SSD中寻找并载入对应的数据）
 
 > 在目前的实现中，Get 接口可选 TTL 功能。当首次获取 `object_key` 对应的值后一段时间（默认为 1s），相应的条目会被自动删除。
 
@@ -78,7 +79,7 @@ ErrorCode Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。
+用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，在内存的 `Put` 请求成功后，会异步发起一次数据向SSD的持久化操作）
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
@@ -394,6 +395,19 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
+### 分级缓存支持
+
+本系统提供了分级缓存架构的支持，通过内存缓存与持久化存储相结合的方式实现高效数据访问。数据首先存储在内存缓存中，并会异步写入分布式文件系统（DFS，Distributed File System）作为备份，形成"内存-SSD持久化存储"的分级缓存结构。
+
+#### 持久化功能启用方法
+
+当用户在启动client时指定了`MOONCAKE_STORAGE_ROOT_DIR`的环境变量，且该路径为一个已存在的有效路径时，则client端的数据持久化功能就会开始工作。同时在client启动时，会向master请求一个`cluster_id`，该id可以在初始化master进行指定，若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`。注意在使用DFS时，需要在各client上分别指定DFS对应的挂载目录，以实现SSD上数据之间的共享。
+
+#### 数据访问机制
+在目前的实现版本中，kvcache object的读\写\查询等操作都是完全在client端完成的，master对其无感知。在文件系统中key -> kvcache object的索引信息是由固定的索引机制来维护的，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
+
+启用持久化功能后，对于每次成功写入memory的 `Put`或`BatchPut` 操作，都会异步地发起一次持久化操作，写入DFS当中。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
+
 ## Mooncake Store Python API
 
 ### setup
@@ -642,9 +656,9 @@ retcode = store.setup(
 ```
 
 2. 在一台机器上运行 `ROLE=prefill python3 ./stress_cluster_benchmark.py`，启动 Prefill 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
 3. 在另一台机器上运行 `ROLE=decode python3 ./stress_cluster_benchmark.py`，启动 Decode 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
 
 无报错信息表示数据传输成功。
 
