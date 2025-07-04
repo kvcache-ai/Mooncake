@@ -15,8 +15,6 @@
 #ifndef SHM_TRANSPORT_H_
 #define SHM_TRANSPORT_H_
 
-#include <asio.hpp>
-#include <boost/thread.hpp>
 #include <functional>
 #include <iostream>
 #include <queue>

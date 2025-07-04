@@ -15,12 +15,11 @@
 #ifndef MNNVL_TRANSPORT_H_
 #define MNNVL_TRANSPORT_H_
 
-#include <asio.hpp>
-#include <boost/thread.hpp>
 #include <functional>
 #include <iostream>
 #include <queue>
 #include <string>
+#include <unordered_set>
 
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
@@ -73,10 +72,10 @@ class MnnvlTransport : public Transport {
 
     virtual const char *getName() const { return "mnnvl"; }
 
-    virtual Status allocateLocalMemory(BufferEntry &buffer, size_t size,
-                                       const Location &location);
+    virtual Status allocateLocalMemory(void **addr, size_t size,
+                                       MemoryOptions &options);
 
-    virtual Status freeLocalMemory(const BufferEntry &buffer);
+    virtual Status freeLocalMemory(void *addr, size_t size);
 
     virtual bool taskSupported(const Request &request);
 
@@ -105,11 +104,14 @@ class MnnvlTransport : public Transport {
         std::unordered_map<SegmentID,
                            std::unordered_map<uint64_t, OpenedMnnvlEntry>>;
 
-    std::mutex relocate_mutex_;
+    RWSpinlock relocate_lock_;
     HashMap relocate_map_;
     std::shared_ptr<ConfigManager> conf_;
 
     std::string machine_id_;
+
+    std::mutex allocate_mutex_;
+    std::unordered_set<void *> allocate_set_;
 };
 }  // namespace v1
 }  // namespace mooncake

@@ -25,7 +25,6 @@
 #include <memory>
 
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
 #endif
 

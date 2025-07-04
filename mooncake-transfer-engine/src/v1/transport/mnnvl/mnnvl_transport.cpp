@@ -25,46 +25,44 @@
 #include <memory>
 
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 
 #include "v1/common.h"
 #include "v1/metadata/metadata.h"
 
+#define CHECK_STATUS(cmd)                \
+    do {                                 \
+        Status status = cmd;             \
+        if (!status.ok()) return status; \
+    } while (0)
+
 namespace mooncake {
 namespace v1 {
 
-static Status getCurrentCudaDevice(CUdevice &currentDev) {
-    int cudaDev;
-    cudaError_t err = cudaGetDevice(&cudaDev);
-    if (err != cudaSuccess)
-        return Status::InternalError("Failed to get cuda device context");
-    CUresult result = cuDeviceGet(&currentDev, cudaDev);
-    if (result != CUDA_SUCCESS)
-        return Status::InternalError("Failed to get cuda device index");
-    return Status::OK();
-}
-
-static Status buildCUmemAllocationProp(CUmemAllocationProp &prop) {
-    CUdevice currentDev;
-    CHECK_STATUS(getCurrentCudaDevice(currentDev));
+static Status buildCUmemAllocationProp(CUmemAllocationProp &prop,
+                                       int device_id) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-    prop.location.id = currentDev;
+    CUdevice device;
+    CUresult result = cuDeviceGet(&device, device_id);
+    if (result != CUDA_SUCCESS)
+        return Status::InternalError("Failed to get cuda device index");
+    prop.location.id = device;
     int flag = 0;
     auto result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
-        currentDev);
+        device);
     if (result != CUDA_SUCCESS)
         return Status::InternalError("Failed to get cuda device attribute");
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
     return Status::OK();
 }
 
-static Status roundGranularity(CUmemAllocationProp &prop, size_t &size) {
-    size_t granularity = 0;
+static Status roundGranularity(CUmemAllocationProp &prop, size_t granularity,
+                               size_t &size) {
     auto result = cuMemGetAllocationGranularity(
         &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (result != CUDA_SUCCESS)
@@ -73,39 +71,6 @@ static Status roundGranularity(CUmemAllocationProp &prop, size_t &size) {
     if (size == 0) size = granularity;
     return Status::OK();
 }
-
-class MnnvlThreadPool {
-   public:
-    MnnvlThreadPool(size_t threadCount)
-        : ioService_(),
-          work_(asio::make_work_guard(ioService_)),
-          stopped_(false) {
-        for (size_t i = 0; i < threadCount; ++i) {
-            threads_.create_thread(
-                boost::bind(&asio::io_service::run, &ioService_));
-        }
-    }
-
-    ~MnnvlThreadPool() { stop(); }
-
-    void submit(std::function<void()> task) {
-        ioService_.post(std::move(task));
-    }
-
-    void stop() {
-        if (!stopped_) {
-            stopped_ = true;
-            ioService_.stop();
-            threads_.join_all();
-        }
-    }
-
-   private:
-    asio::io_service ioService_;
-    asio::executor_work_guard<asio::io_service::executor_type> work_;
-    boost::thread_group threads_;
-    bool stopped_;
-};
 
 static bool supportFabricMem() {
     int num_devices = 0;
@@ -160,9 +125,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 Status MnnvlTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
-        for (auto &entry : relocate_map_) {
-            // TBD
-        }
+        // TODO close all opened entries
         relocate_map_.clear();
         installed_ = false;
     }
@@ -255,21 +218,21 @@ void MnnvlTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
-    if (parseLocation(desc.location).first != "cuda") 
-        return Status::OK();
+    auto location = parseLocation(desc.location);
+    if (location.first != "cuda") return Status::OK();
 
     CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, desc.addr);
+    auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
     if (result != CUDA_SUCCESS) {
-        LOG(WARNING) << "Memory region " << desc.addr
-                     << " not allocated by cuMemCreate, "
-                     << "but it can be used as local buffer";
+        LOG(WARNING) << "Memory region " << (void *)desc.addr
+                     << " not allocated by cuMemCreate";
         return Status::OK();
     }
 
     CUmemAllocationProp prop = {};
-    CHECK_STATUS(buildCUmemAllocationProp(prop));
-    CHECK_STATUS(roundGranularity(prop, desc.length));
+    size_t granularity;
+    CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
+    CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
     CUmemFabricHandle export_handle;
     result = cuMemExportToShareableHandle(&export_handle, handle,
@@ -279,6 +242,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
     desc.mnnvl_handle =
         serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+
     return Status::OK();
 }
 
@@ -288,15 +252,21 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     return Status::OK();
 }
 
-Status MnnvlTransport::allocateLocalMemory(BufferEntry &buffer, size_t size,
-                                           const Location &location) {
+Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
+                                           MemoryOptions &options) {
+    auto location = parseLocation(desc.location);
+    if (location.first != "cuda") {
+        return genericAllocateLocalMemory(addr, size, options);
+    }
+
     CUmemAllocationProp prop = {};
-    CHECK_STATUS(buildCUmemAllocationProp(prop));
-    CHECK_STATUS(roundGranularity(prop, size));
+    size_t granularity;
+    CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
+    CHECK_STATUS(roundGranularity(prop, granularity, size));
 
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
-    result = cuMemCreate(&handle, size, &prop, 0);
+    auto result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         return Status::InternalError("Failed to create cuda memory");
     }
@@ -334,22 +304,42 @@ Status MnnvlTransport::allocateLocalMemory(BufferEntry &buffer, size_t size,
     buffer.addr = (void *)ptr;
     buffer.length = size;
     buffer.location = location;
+    std::lock_guard<std::mutex> lock(allocate_mutex_);
+    allocate_set_.insert(addr);
     return Status::OK();
 }
 
-Status MnnvlTransport::freeLocalMemory(const BufferEntry &buffer) {
+Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
+    std::lock_guard<std::mutex> lock(allocate_mutex_);
+    if (!allocate_set_.count(addr)) {
+        return genericFreeLocalMemory(addr, size);
+    }
     CUmemGenericAllocationHandle handle;
-    cuMemRetainAllocationHandle(&handle, buffer.addr);
-    cuMemUnmap((CUdeviceptr)buffer.addr, buffer.size);
-    cuMemAddressFree((CUdeviceptr)buffer.addr, buffer.size);
+    cuMemRetainAllocationHandle(&handle, addr);
+    cuMemUnmap((CUdeviceptr)addr, size);
+    cuMemAddressFree((CUdeviceptr)addr, size);
     cuMemRelease(handle);
+    allocate_set_.erase(addr);
     return Status::OK();
 }
 
 Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                    uint64_t length,
                                                    uint64_t target_id) {
-    std::lock_guard<std::mutex> lock(relocate_mutex_);
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        auto &relocate_map = relocate_map_[target_id];
+        for (auto &entry : relocate_map) {
+            if (entry.first <= dest_addr &&
+                dest_addr + length <= entry.first + entry.second.length) {
+                auto mnnvl_addr = relocate_map[entry.addr].mnnvl_addr;
+                dest_addr = dest_addr - entry.addr + ((uint64_t)mnnvl_addr);
+                return Status::OK();
+            }
+        }
+    }
+
+    RWSpinlock::WriteGuard guard(relocate_lock_);
     SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return status;
@@ -361,7 +351,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             dest_addr + length <= entry.addr + entry.length) {
             if (!relocate_map.count(entry.addr)) {
                 std::vector<unsigned char> output_buffer;
-                deserializeBinaryData(entry.shm_name, output_buffer);
+                deserializeBinaryData(entry.mnnvl_handle, output_buffer);
                 if (output_buffer.size() != sizeof(CUmemFabricHandle)) {
                     return Status::InternalError(
                         "Received MNNVL handle length incorrect");
