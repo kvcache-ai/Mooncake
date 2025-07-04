@@ -1261,26 +1261,29 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
         // Step 1: Get object info
         auto query_result = client_->Query(key);
         if (!query_result) {
-            if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                VLOG(1) << "Object not found for key: " << key;
-                return pybind11::none();
-            }
-            LOG(ERROR) << "Query failed for key: " << key
-                    << " with error: " << toString(query_result.error());
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+        // Extract replica list from the query result
+        auto replica_list = query_result.value();
+        if (replica_list.empty()) {
+            py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
         // Allocate slices for the object
         SliceGuard guard(*this);
         uint64_t total_length = 0;
-        int ret = allocateSlices(guard.slices(), total_length);
+        int ret = allocateSlices(guard.slices(), replica_list, total_length);
         if (ret) {
+            py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
         // Get the object data
         auto get_result  = client_->Get(key, guard.slices());
         if (!get_result) {
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Get failed for key: " << key
                     << " with error: " << toString(get_result.error());
             return pybind11::none();
@@ -1289,6 +1292,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
         // Convert slices to contiguous bytes
         char *exported_data = exportSlices(guard.slices(), total_length);
         if (!exported_data) {
+            py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
@@ -1319,47 +1323,22 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
     try {
         // Import torch module
         pybind11::module torch = pybind11::module::import("torch");
-        
         // Check if the object is a tensor
         if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
             return -1;
         }
-        
-        // Convert tensor to numpy array
-        pybind11::object np_array = tensor.attr("numpy")();
-        
-        // Convert numpy array to bytes
-        pybind11::bytes tensor_bytes = np_array.attr("tobytes")();
-        // tensor_bytes.
-        // Allocate slices for the tensor data
-        SliceGuard slices(*this);
-        std::string tensor_bytes_str = tensor_bytes.cast<std::string>();
-        int ret = allocateSlices(slices.slices(), std::span<const char>(
-            tensor_bytes_str.data(),
-            tensor_bytes_str.size()));
-        // int ret = allocateSlices(slices.slices(), std::span<const char>(
-        //     static_cast<const char *>(tensor_bytes.ptr()),
-        //     tensor_bytes.size()));
-        if (ret) {
-            return -1;
-        }
+        // Get the data pointer and size directly from the tensor
+        uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        size_t buffer_size = numel * element_size;
 
-        // Use client_->Put directly
-        ReplicateConfig config;
-        config.replica_num = 1;
-        config.preferred_segment = this->local_hostname;
-        
-        auto put_result = client_->Put(key, slices.slices(), config);
-        if (!put_result) {
-            LOG(ERROR) << "Put operation failed with error: "
-                    << toString(put_result.error());
-            return toInt(put_result.error());
-        }
-        
-        return 0;
+        this->register_buffer(reinterpret_cast<void*>(data_ptr), buffer_size);
+        // Use put_from for direct memory access (zero-copy)
+        return this->put_from(key, reinterpret_cast<void*>(data_ptr), buffer_size);
     } catch (const pybind11::error_already_set &e) {
-        LOG(ERROR) << "Failed to convert tensor to bytes: " << e.what();
+        LOG(ERROR) << "Failed to access tensor data: " << e.what();
         return -1;
     }
 }
