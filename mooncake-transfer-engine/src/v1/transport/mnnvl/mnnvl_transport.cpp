@@ -332,8 +332,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         for (auto &entry : relocate_map) {
             if (entry.first <= dest_addr &&
                 dest_addr + length <= entry.first + entry.second.length) {
-                auto mnnvl_addr = relocate_map[entry.addr].mnnvl_addr;
-                dest_addr = dest_addr - entry.addr + ((uint64_t)mnnvl_addr);
+                auto mnnvl_addr = entry.second.mnnvl_addr;
+                dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
                 return Status::OK();
             }
         }

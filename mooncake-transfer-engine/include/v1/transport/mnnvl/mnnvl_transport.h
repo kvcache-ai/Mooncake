@@ -97,7 +97,6 @@ class MnnvlTransport : public Transport {
         int mnnvl_fd;
         void *mnnvl_addr;
         uint64_t length;
-        bool is_cuda_ipc;
     };
 
     using HashMap =
