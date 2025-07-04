@@ -140,8 +140,10 @@ class TransferEngine {
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
 
-    int sendNotify(SegmentID target_id,
-                   TransferMetadata::NotifyDesc notify_msg);
+    int sendNotifyByID(SegmentID target_id,
+                       TransferMetadata::NotifyDesc notify_msg);
+
+    int sendNotifyByName(std::string remote_agent,TransferMetadata::NotifyDesc notify_msg);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
@@ -158,7 +160,7 @@ class TransferEngine {
             // send notify
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
             auto value = notifies_to_send_[batch_id];
-            sendNotify(value.first, value.second);
+            sendNotifyByID(value.first, value.second);
             notifies_to_send_.erase(batch_id);
         }
         return result;
