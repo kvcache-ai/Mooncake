@@ -23,7 +23,8 @@
 #include <unordered_map>
 #include <utility>
 
-#include "cufile_desc_pool.h"
+#include <cufile.h>
+
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 
