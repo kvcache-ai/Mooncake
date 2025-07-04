@@ -52,10 +52,10 @@ static Status buildCUmemAllocationProp(CUmemAllocationProp &prop,
         return Status::InternalError("Failed to get cuda device index");
     prop.location.id = device;
     int flag = 0;
-    auto result = cuDeviceGetAttribute(
+    auto errcode = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
         device);
-    if (result != CUDA_SUCCESS)
+    if (errcode != CUDA_SUCCESS)
         return Status::InternalError("Failed to get cuda device attribute");
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
     return Status::OK();
@@ -254,7 +254,7 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
 
 Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
-    auto location = parseLocation(desc.location);
+    auto location = parseLocation(options.location);
     if (location.first != "cuda") {
         return genericAllocateLocalMemory(addr, size, options);
     }
@@ -301,9 +301,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
         return Status::InternalError("Failed to set cuda memory access");
     }
 
-    buffer.addr = (void *)ptr;
-    buffer.length = size;
-    buffer.location = location;
+    *addr = ptr;
     std::lock_guard<std::mutex> lock(allocate_mutex_);
     allocate_set_.insert(addr);
     return Status::OK();
