@@ -25,9 +25,13 @@ MasterMetricManager::MasterMetricManager()
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_("master_value_size_bytes",
                                "Distribution of object value sizes",
-                               {4096.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
-                                16777216.0, 67108864.0}),
-      // Initialize Counters
+                               {4096, 65536, 262144, 1048576, 4194304,
+                                16777216, 67108864}),
+      // Initialize cluster metrics
+      active_clients_("master_active_clients",
+                      "Total number of active clients"),
+
+      // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
@@ -70,7 +74,27 @@ MasterMetricManager::MasterMetricManager()
           "Total number of UnmountSegment requests received"),
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
-          "Total number of failed UnmountSegment requests") {}
+          "Total number of failed UnmountSegment requests"),
+      remount_segment_requests_(
+          "master_remount_segment_requests_total",
+          "Total number of RemountSegment requests received"),
+      remount_segment_failures_(
+          "master_remount_segment_failures_total",
+          "Total number of failed RemountSegment requests"),
+      ping_requests_("master_ping_requests_total",
+                     "Total number of ping requests received"),
+      ping_failures_("master_ping_failures_total",
+                     "Total number of failed ping requests"),
+
+      // Initialize Eviction Counters
+      eviction_success_("master_successful_evictions_total",
+                       "Total number of successful eviction operations"),
+      eviction_attempts_("master_attempted_evictions_total",
+                         "Total number of attempted eviction operations"),
+      evicted_key_count_("master_evicted_key_count",
+                        "Total number of keys evicted"),
+      evicted_size_("master_evicted_size_bytes",
+                    "Total bytes of evicted objects") {}
 
 // --- Metric Interface Methods ---
 
@@ -89,12 +113,46 @@ void MasterMetricManager::dec_total_capacity(int64_t val) {
     total_capacity_.dec(val);
 }
 
+int64_t MasterMetricManager::get_allocated_size() {
+    return allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_capacity() {
+    return total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_used_ratio(void) {
+    double allocated = allocated_size_.value();
+    double capacity = total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
 // Key/Value Metrics
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
+}
+
+int64_t MasterMetricManager::get_key_count() {
+    return key_count_.value();
+}
+
+// Cluster Metrics
+void MasterMetricManager::inc_active_clients(int64_t val) {
+    active_clients_.inc(val);
+}
+
+void MasterMetricManager::dec_active_clients(int64_t val) {
+    active_clients_.dec(val);
+}
+
+int64_t MasterMetricManager::get_active_clients() {
+    return active_clients_.value();
 }
 
 // Operation Statistics (Counters)
@@ -152,6 +210,139 @@ void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
+    remount_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
+    remount_segment_failures_.inc(val);
+}
+void MasterMetricManager::inc_ping_requests(int64_t val) {
+    ping_requests_.inc(val);
+}
+void MasterMetricManager::inc_ping_failures(int64_t val) {
+    ping_failures_.inc(val);
+}
+
+int64_t MasterMetricManager::get_put_start_requests() {
+    return put_start_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_failures() {
+    return put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_end_requests() {
+    return put_end_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_end_failures() {
+    return put_end_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_revoke_requests() {
+    return put_revoke_requests_.value();
+}
+
+int64_t MasterMetricManager::get_put_revoke_failures() {
+    return put_revoke_failures_.value();
+}
+
+int64_t MasterMetricManager::get_get_replica_list_requests() {
+    return get_replica_list_requests_.value();
+}
+
+int64_t MasterMetricManager::get_get_replica_list_failures() {
+    return get_replica_list_failures_.value();
+}
+
+int64_t MasterMetricManager::get_exist_key_requests() {
+    return exist_key_requests_.value();
+}
+
+int64_t MasterMetricManager::get_exist_key_failures() {
+    return exist_key_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remove_requests() {
+    return remove_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remove_failures() {
+    return remove_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remove_all_requests() {
+    return remove_all_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remove_all_failures() {
+    return remove_all_failures_.value();
+}
+
+int64_t MasterMetricManager::get_mount_segment_requests() {
+    return mount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_mount_segment_failures() {
+    return mount_segment_failures_.value();
+}
+
+int64_t MasterMetricManager::get_unmount_segment_requests() {
+    return unmount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_unmount_segment_failures() {
+    return unmount_segment_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remount_segment_requests() {
+    return remount_segment_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remount_segment_failures() {
+    return remount_segment_failures_.value();
+}
+
+int64_t MasterMetricManager::get_ping_requests() {
+    return ping_requests_.value();
+}
+
+int64_t MasterMetricManager::get_ping_failures() {
+    return ping_failures_.value();
+}
+
+// Eviction Metrics
+void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
+    evicted_key_count_.inc(key_count);
+    evicted_size_.inc(size);
+    eviction_success_.inc();
+    eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_eviction_fail() {
+    eviction_attempts_.inc();
+}
+
+int64_t MasterMetricManager::get_eviction_success() {
+    return eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_attempts() {
+    return eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_evicted_key_count() {
+    return evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_evicted_size() {
+    return evicted_size_.value();
+}
+
+// --- Setters ---
+void MasterMetricManager::set_enable_ha(bool enable_ha) {
+    enable_ha_ = enable_ha;
+}
 
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
@@ -171,11 +362,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(allocated_size_);
     serialize_metric(total_capacity_);
     serialize_metric(key_count_);
+    if (enable_ha_) {
+        serialize_metric(active_clients_);
+    }
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
 
-    // Serialize Counters
+    // Serialize Request Counters
     serialize_metric(exist_key_requests_);
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
@@ -194,6 +388,18 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
     serialize_metric(unmount_segment_failures_);
+    serialize_metric(remount_segment_requests_);
+    serialize_metric(remount_segment_failures_);
+    if (enable_ha_) {
+        serialize_metric(ping_requests_);
+        serialize_metric(ping_failures_);
+    }
+
+    // Serialize Eviction Counters
+    serialize_metric(eviction_success_);
+    serialize_metric(eviction_attempts_);
+    serialize_metric(evicted_key_count_);
+    serialize_metric(evicted_size_);
 
     return ss.str();
 }
@@ -219,47 +425,65 @@ std::string MasterMetricManager::get_summary_string() {
     };
 
     // --- Get current values ---
-    double allocated = allocated_size_.value();
-    double capacity = total_capacity_.value();
-    double keys = key_count_.value();
+    int64_t allocated = allocated_size_.value();
+    int64_t capacity = total_capacity_.value();
+    int64_t keys = key_count_.value();
+    int64_t active_clients = active_clients_.value();
 
     // Request counters
-    double exist_keys = exist_key_requests_.value();
-    double exist_key_fails = exist_key_failures_.value();
-    double put_starts = put_start_requests_.value();
-    double put_start_fails = put_start_failures_.value();
-    double put_ends = put_end_requests_.value();
-    double put_end_fails = put_end_failures_.value();
-    double get_replicas = get_replica_list_requests_.value();
-    double get_replica_fails = get_replica_list_failures_.value();
-    double removes = remove_requests_.value();
-    double remove_fails = remove_failures_.value();
-    double remove_all = remove_all_requests_.value();
-    double remove_all_fails = remove_all_failures_.value();
+    int64_t exist_keys = exist_key_requests_.value();
+    int64_t exist_key_fails = exist_key_failures_.value();
+    int64_t put_starts = put_start_requests_.value();
+    int64_t put_start_fails = put_start_failures_.value();
+    int64_t put_ends = put_end_requests_.value();
+    int64_t put_end_fails = put_end_failures_.value();
+    int64_t get_replicas = get_replica_list_requests_.value();
+    int64_t get_replica_fails = get_replica_list_failures_.value();
+    int64_t removes = remove_requests_.value();
+    int64_t remove_fails = remove_failures_.value();
+    int64_t remove_all = remove_all_requests_.value();
+    int64_t remove_all_fails = remove_all_failures_.value();
+
+    // Eviction counters
+    int64_t eviction_success = eviction_success_.value();
+    int64_t eviction_attempts = eviction_attempts_.value();
+    int64_t evicted_key_count = evicted_key_count_.value();
+    int64_t evicted_size = evicted_size_.value();
+
+    // Ping counters
+    int64_t ping = ping_requests_.value();
+    int64_t ping_fails = ping_failures_.value();
 
     // --- Format the summary string ---
     ss << "Storage: " << format_bytes(allocated) << " / "
        << format_bytes(capacity);
     if (capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
-           << (allocated / capacity * 100.0) << "%)";
+           << ((double) allocated / (double)capacity * 100.0) << "%)";
     }
-    ss << " | Keys: " << static_cast<int64_t>(keys);
+    ss << " | Keys: " << keys;
+    if (enable_ha_) {
+        ss << " | Clients: " << active_clients;
+    }
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
     ss << "Put="
-       << static_cast<int64_t>(put_starts - put_start_fails + put_ends -
-                               put_end_fails)
-       << "/" << static_cast<int64_t>(put_starts + put_ends) << ", ";
-    ss << "Get=" << static_cast<int64_t>(get_replicas - get_replica_fails)
-       << "/" << static_cast<int64_t>(get_replicas) << ", ";
-    ss << "Exist=" << static_cast<int64_t>(exist_keys - exist_key_fails)
-       << "/" << static_cast<int64_t>(exist_keys) << ", ";
-    ss << "Del=" << static_cast<int64_t>(removes - remove_fails) << "/"
-       << static_cast<int64_t>(removes) << ", ";
-    ss << "DelAll=" << static_cast<int64_t>(remove_all - remove_all_fails) << "/"
-       << static_cast<int64_t>(remove_all);
+       << put_starts - put_start_fails + put_ends - put_end_fails
+       << "/" << put_starts + put_ends << ", ";
+    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas << ", ";
+    ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
+    ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
+    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all << ", ";
+    if (enable_ha_) {
+        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
+    }
+
+    // Eviction summary
+    ss << " | Eviction: "
+        << "Success/Attempts=" << eviction_success << "/" << eviction_attempts << ", "
+        << "keys=" << evicted_key_count << ", "
+        << "size=" << format_bytes(evicted_size);
 
     return ss.str();
 }

@@ -49,6 +49,7 @@ class Transport {
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+    using NotifyDesc = TransferMetadata::NotifyDesc;
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
@@ -58,6 +59,7 @@ class Transport {
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
+        int advise_retry_cnt = 0;
     };
 
     enum TransferStatusEnum {
@@ -89,6 +91,7 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
+        bool from_cache;
 
         union {
             struct {
@@ -110,7 +113,7 @@ class Transport {
                 uint64_t offset;
                 int cufile_desc;
                 uint64_t start;
-                const char * file_path;
+                const char *file_path;
             } nvmeof;
             struct {
                 void *remote_filename;
@@ -130,6 +133,8 @@ class Transport {
             status = Slice::FAILED;
             __sync_fetch_and_add(&task->failed_slice_count, 1);
         }
+
+        volatile int64_t ts;
     };
 
     struct ThreadLocalSliceCache {
@@ -144,18 +149,24 @@ class Transport {
                 freed_++;
             }
             if (allocated_ != freed_) {
-                LOG(WARNING) << "detected slice leak: allocated "
-                             << allocated_ << " freed " << freed_;
+                LOG(WARNING) << "detected slice leak: allocated " << allocated_
+                             << " freed " << freed_;
             }
         }
 
         Slice *allocate() {
+            Slice *slice;
+
             if (head_ - tail_ == 0) {
                 allocated_++;
-                return new Slice();
+                slice = new Slice();
+                slice->from_cache = false;
+            } else {
+                slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
+                tail_++;
+                slice->from_cache = true;
             }
-            auto slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
-            tail_++;
+
             return slice;
         }
 

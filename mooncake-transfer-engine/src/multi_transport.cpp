@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+#include <string>
 
+#include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
@@ -22,6 +24,11 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
+#ifdef USE_MNNVL
+#include "transport/nvlink_transport/nvlink_transport.h"
+#endif
+
+#include <cassert>
 
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
@@ -81,6 +88,7 @@ Status MultiTransport::submitTransfer(
         Transport *transport = nullptr;
         auto status = selectTransport(request, transport);
         if (!status.ok()) return status;
+        assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         ++task_id;
@@ -93,8 +101,8 @@ Status MultiTransport::submitTransfer(
         auto status = entry.first->submitTransferTask(entry.second.request_list,
                                                       entry.second.task_list);
         if (!status.ok()) {
-            LOG(ERROR) << "Failed to submit transfer task to "
-                       << entry.first->getName();
+            // LOG(ERROR) << "Failed to submit transfer task to "
+            //            << entry.first->getName();
             overall_status = status;
         }
     }
@@ -112,6 +120,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
+    assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
@@ -120,8 +129,57 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         task.is_finished = true;
     } else {
+        if (globalConfig().slice_timeout > 0) {
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t kPacketDeliveryTimeout =
+                globalConfig().slice_timeout * 1000000000;
+            for (auto &slice : task.slice_list) {
+                auto ts = slice->ts;
+                if (ts > 0 && current_ts > ts &&
+                    current_ts - ts > kPacketDeliveryTimeout) {
+                    LOG(INFO) << "Slice timeout detected";
+                    status.s = Transport::TransferStatusEnum::TIMEOUT;
+                    return Status::OK();
+                }
+            }
+        }
         status.s = Transport::TransferStatusEnum::WAITING;
     }
+    return Status::OK();
+}
+
+Status MultiTransport::getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    const size_t task_count = batch_desc.task_list.size();
+    status.transferred_bytes = 0;
+    
+    if (task_count == 0) {
+        status.s = Transport::TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+    
+    size_t success_count = 0;
+    for (size_t task_id = 0; task_id < task_count; task_id++) {
+        TransferStatus task_status;
+        auto ret = getTransferStatus(batch_id, task_id, task_status);
+        
+        if (!ret.ok()) {
+            status.s = Transport::TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+        
+        if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
+            status.transferred_bytes += task_status.transferred_bytes;
+            success_count++;
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+            status.s = Transport::TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+    }
+    
+    status.s = (success_count == task_count) ? 
+           Transport::TransferStatusEnum::COMPLETED : 
+           Transport::TransferStatusEnum::WAITING;
     return Status::OK();
 }
 
@@ -139,6 +197,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
+    }
+#endif
+#ifdef USE_MNNVL
+    else if (std::string(proto) == "nvlink") {
+        transport = new NvlinkTransport();
     }
 #endif
 
@@ -161,7 +224,7 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
-                                       entry.target_id);
+                                       std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
     if (!transport_map_.count(proto)) {

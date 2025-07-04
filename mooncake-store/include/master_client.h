@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <atomic>
+#include <memory>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "rpc_service.h"
@@ -38,8 +40,15 @@ class MasterClient {
      * @param object_key Key to query
      * @return ErrorCode indicating exist or not
      */
-    [[nodiscard]] ExistKeyResponse ExistKey(
-        const std::string& object_key);
+    [[nodiscard]] ExistKeyResponse ExistKey(const std::string& object_key);
+
+    /**
+     * @brief Checks if multiple objects exist
+     * @param object_keys Vector of keys to query
+     * @return BatchExistResponse containing existence status for each key
+     */
+    [[nodiscard]] BatchExistResponse BatchExistKey(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -49,6 +58,15 @@ class MasterClient {
      */
     [[nodiscard]] GetReplicaListResponse GetReplicaList(
         const std::string& object_key);
+
+    /**
+     * @brief Gets object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param object_infos Output parameter for object metadata
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] BatchGetReplicaListResponse BatchGetReplicaList(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Starts a put operation
@@ -64,6 +82,21 @@ class MasterClient {
         size_t value_length, const ReplicateConfig& config);
 
     /**
+     * @brief Starts a batch of put operations for N objects
+     * @param keys Vector of object key
+     * @param value_lengths Vector of total value lengths
+     * @param slice_lengths Vector of vectors of slice lengths
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] BatchPutStartResponse BatchPutStart(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, uint64_t>& value_lengths,
+        const std::unordered_map<std::string, std::vector<uint64_t>>&
+            slice_lengths,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Ends a put operation
      * @param key Object key
      * @return ErrorCode indicating success/failure
@@ -71,11 +104,27 @@ class MasterClient {
     [[nodiscard]] PutEndResponse PutEnd(const std::string& key);
 
     /**
+     * @brief Ends a put operation for a batch of objects
+     * @param keys Vector of object keys
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] BatchPutEndResponse BatchPutEnd(
+        const std::vector<std::string>& keys);
+
+    /**
      * @brief Revokes a put operation
      * @param key Object key
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] PutRevokeResponse PutRevoke(const std::string& key);
+
+    /**
+     * @brief Revokes a put operation for a batch of objects
+     * @param keys Vector of object keys
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] BatchPutRevokeResponse BatchPutRevoke(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Removes an object and all its replicas
@@ -92,24 +141,71 @@ class MasterClient {
 
     /**
      * @brief Registers a segment to master for allocation
-     * @param segment_name hostname:port of the segment
-     * @param buffer Buffer address of the segment
-     * @param size Size of the segment in bytes
+     * @param segment Segment to register
+     * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] MountSegmentResponse MountSegment(
-        const std::string& segment_name, const void* buffer, size_t size);
+    [[nodiscard]] MountSegmentResponse MountSegment(const Segment& segment,
+                                                    const UUID& client_id);
+
+    /**
+     * @brief Re-mount segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @param client_id The uuid of the client
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] ReMountSegmentResponse ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
     /**
      * @brief Unregisters a memory segment from master
-     * @param segment_name Name which is used to register the segment
+     * @param segment_id ID of the segment to unmount
+     * @param client_id The uuid of the client
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] UnmountSegmentResponse UnmountSegment(
-        const std::string& segment_name);
+    [[nodiscard]] UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
+                                                        const UUID& client_id);
+
+    /**
+     * @brief Pings master to check its availability
+     * @param client_id The uuid of the client
+     * @return current master view version
+     * @return client status from the master
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] PingResponse Ping(const UUID& client_id);
 
    private:
-    coro_rpc_client client_;
+    /**
+     * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
+     * reconnect to a different address, a new coro_rpc_client is created if
+     * the address is different from the current one.
+     */
+    class RpcClientAccessor {
+       public:
+        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+            std::lock_guard<std::shared_mutex> lock(client_mutex_);
+            client_ = client;
+        }
+
+        std::shared_ptr<coro_rpc_client> GetClient() {
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            return client_;
+        }
+
+       private:
+        mutable std::shared_mutex client_mutex_;
+        std::shared_ptr<coro_rpc_client> client_ GUARDED_BY(client_mutex_);
+    };
+    RpcClientAccessor client_accessor_;
+
+    // Mutex to insure the Connect function is atomic.
+    mutable std::mutex connect_mutex_;
+    // The address which is passed to the coro_rpc_client
+    std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 };
 
 }  // namespace mooncake

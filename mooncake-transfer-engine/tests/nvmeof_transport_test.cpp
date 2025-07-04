@@ -24,19 +24,11 @@
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "common.h"
 
 using namespace mooncake;
 
 namespace mooncake {
-
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");

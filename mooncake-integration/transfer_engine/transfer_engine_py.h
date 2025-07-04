@@ -26,6 +26,7 @@
 
 #include "common/base/status.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"
 
@@ -64,17 +65,33 @@ class TransferEnginePy {
     int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
                           uintptr_t peer_buffer_address, size_t length);
 
-    int transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
+    batch_id_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
                             uintptr_t peer_buffer_address, size_t length);
 
-    int transferCheckStatus(int batch_id);
+    int transferCheckStatus(batch_id_t batch_id);
 
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length);
+    
+    int batchTransferSyncWrite(const char *target_hostname,
+                               std::vector<uintptr_t> buffers,
+                               std::vector<uintptr_t> peer_buffer_addresses,
+                               std::vector<size_t> lengths);
+
+    int batchTransferSyncRead(const char *target_hostname,
+                              std::vector<uintptr_t> buffers,
+                              std::vector<uintptr_t> peer_buffer_addresses,
+                              std::vector<size_t> lengths);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode);
+
+    int batchTransferSync(const char *target_hostname,
+                          std::vector<uintptr_t> buffers,
+                          std::vector<uintptr_t> peer_buffer_addresses,
+                          std::vector<size_t> lengths,
+                          TransferOpcode opcode);
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
@@ -97,6 +114,10 @@ class TransferEnginePy {
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
+    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+
+    int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
+
    private:
     char *allocateRawBuffer(size_t capacity);
 
@@ -114,4 +135,6 @@ class TransferEnginePy {
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
+
+    uint64_t transfer_timeout_nsec_;
 };

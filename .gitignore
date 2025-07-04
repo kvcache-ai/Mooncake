@@ -192,4 +192,6 @@ cmake-build
 
 libetcd_wrapper.h
 
+mooncake-wheel/mooncake/allocator.py
 mooncake-wheel/mooncake/mooncake_master
+mooncake-wheel/mooncake/transfer_engine_bench

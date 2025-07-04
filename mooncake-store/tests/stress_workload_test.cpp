@@ -112,18 +112,18 @@ class ClientIntegrationTest : public ::testing::Test {
     }
 
     static void InitializeSegment() {
-        const size_t ram_buffer_size = 3200ull * 1024 * 1024;
-        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size);
+        ram_buffer_size_ = 3200ull * 1024 * 1024;
+        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
         ASSERT_TRUE(segment_ptr_);
-        ErrorCode rc = client_->MountSegment("localhost:12345", segment_ptr_,
-                                             ram_buffer_size);
+        ErrorCode rc = client_->MountSegment(segment_ptr_,
+                                             ram_buffer_size_);
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to mount segment: " << toString(rc);
         }
     }
 
     static void CleanupSegment() {
-        if (client_->UnmountSegment("localhost:12345", segment_ptr_) !=
+        if (client_->UnmountSegment(segment_ptr_, ram_buffer_size_) !=
             ErrorCode::OK) {
             LOG(ERROR) << "Failed to unmount segment";
         }
@@ -162,6 +162,7 @@ class ClientIntegrationTest : public ::testing::Test {
     static std::shared_ptr<Client> client_;
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
     static void* segment_ptr_;
+    static size_t ram_buffer_size_;
 };
 
 // Static members initialization
@@ -169,6 +170,7 @@ std::shared_ptr<Client> ClientIntegrationTest::client_ = nullptr;
 void* ClientIntegrationTest::segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;
+size_t ClientIntegrationTest::ram_buffer_size_ = 0;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, StressPutOperations) {

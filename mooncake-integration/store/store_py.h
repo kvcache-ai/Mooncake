@@ -112,10 +112,72 @@ class DistributedObjectStore {
 
     int put(const std::string &key, std::span<const char> value);
 
+    int register_buffer(void *buffer, size_t size);
+
+    /**
+     * @brief Get object data directly into a pre-allocated buffer
+     * @param key Key of the object to get
+     * @param buffer Pointer to the pre-allocated buffer (must be registered
+     * with register_buffer)
+     * @param size Size of the buffer
+     * @return Number of bytes read on success, negative value on error
+     * @note The buffer address must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    int get_into(const std::string &key, void *buffer, size_t size);
+
+    /**
+     * @brief Get object data directly into pre-allocated buffers for multiple
+     * keys (batch version)
+     * @param keys Vector of keys of the objects to get
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @return Vector of integers, where each element is the number of bytes
+     * read on success, or a negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_get_into(const std::vector<std::string> &keys,
+                                    const std::vector<void *> &buffers,
+                                    const std::vector<size_t> &sizes);
+
+    /**
+     * @brief Put object data directly from a pre-allocated buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the buffer containing data (must be registered
+     * with register_buffer)
+     * @param size Size of the data to put
+     * @return 0 on success, negative value on error
+     * @note The buffer address must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    int put_from(const std::string &key, void *buffer, size_t size);
+
+    /**
+     * @brief Put object data directly from pre-allocated buffers for multiple
+     * keys (batch version)
+     * @param keys Vector of keys of the objects to put
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_put_from(const std::vector<std::string> &keys,
+                                    const std::vector<void *> &buffers,
+                                    const std::vector<size_t> &sizes);
+
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values);
 
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values);
+
     pybind11::bytes get(const std::string &key);
+
+    std::vector<pybind11::bytes> get_batch(
+        const std::vector<std::string> &keys);
 
     /**
      * @brief Get a buffer containing the data for a key
@@ -139,6 +201,14 @@ class DistributedObjectStore {
     int isExist(const std::string &key);
 
     /**
+     * @brief Check if multiple objects exist
+     * @param keys Vector of keys to check
+     * @return Vector of existence results: 1 if exists, 0 if not exists, -1 if
+     * error
+     */
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't
@@ -159,6 +229,19 @@ class DistributedObjectStore {
 
     int allocateSlicesPacked(std::vector<mooncake::Slice> &slices,
                              const std::vector<std::span<const char>> &parts);
+
+    int allocateBatchedSlices(
+        const std::vector<std::string> &keys,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices,
+        const mooncake::Client::BatchObjectInfo &batched_object_info,
+        std::unordered_map<std::string, uint64_t> &str_length_map);
+
+    int allocateBatchedSlices(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            &batched_slices);
 
     char *exportSlices(const std::vector<mooncake::Slice> &slices,
                        uint64_t length);
