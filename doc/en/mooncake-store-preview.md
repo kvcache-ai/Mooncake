@@ -384,11 +384,18 @@ To avoid data conflicts, a per-object lease will be granted whenever an `ExistKe
 The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
 
 ### Multi-layer Storage Support
+
+This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
+
+#### Enabling Persistence Functionality
+
 When a user specifies the environment variable `MOONCAKE_STORAGE_ROOT_DIR` at client startup, and the path is a valid existing directory, the client-side data persistence feature will be activated. During initialization, the client requests a `cluster_id` from the master. This ID can be specified when initializing the master; if not provided, the default value `mooncake_cluster` will be used. The root directory for persistence is then set to `<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`. Note that when using DFS, each client must specify the corresponding DFS mount directory to enable data sharing across SSDs.
+
+#### Data Access Mechanism
 
 In the current implementation, all operations on kvcache objects (e.g., read/write/query) are performed entirely on the client side, with no awareness by the master. The file system maintains the key-to-kvcache-object mapping through a fixed indexing mechanism, where each file corresponds to one kvcache object (the filename is the associated key).
 
-When persistence is enabled, every successful `put/batchput` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `get/batchget` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
+When persistence is enabled, every successful `Put`or`BatchPut` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `Get`or `BatchGet` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
 
 ## Mooncake Store Python API
 
