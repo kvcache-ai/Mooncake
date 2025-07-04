@@ -425,9 +425,9 @@ def setup(
 
 ---
 
-### initAll
+### init_all
 ```python
-def initAll(
+def init_all(
     self,
     protocol: str,
     device_name: str,
