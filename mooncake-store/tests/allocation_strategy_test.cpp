@@ -34,7 +34,7 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>
         empty_allocators_by_name;
     std::vector<std::shared_ptr<BufferAllocator>> empty_allocators;
-    ReplicateConfig config{1, "local"};
+    ReplicateConfig config{1, false, "local"};
 
     auto result = strategy_->Allocate(empty_allocators, empty_allocators_by_name, 100, config);
     EXPECT_EQ(result, nullptr);
@@ -45,7 +45,7 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>
         empty_allocators_by_name;
     std::vector<std::shared_ptr<BufferAllocator>> empty_allocators;
-    ReplicateConfig config{1, "preferred_segment"};
+    ReplicateConfig config{1, false, "preferred_segment"};
 
     auto result = strategy_->Allocate(empty_allocators, empty_allocators_by_name, 100, config);
     EXPECT_EQ(result, nullptr);  // Should return nullptr for empty allocators
@@ -65,7 +65,7 @@ TEST_F(AllocationStrategyTest, PreferredSegmentAllocation) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, "preferred"};
+    ReplicateConfig config{1, false, "preferred"};
     size_t alloc_size = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name, alloc_size, config);
@@ -88,7 +88,7 @@ TEST_F(AllocationStrategyTest, PreferredSegmentNotFound) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, "nonexistent"};
+    ReplicateConfig config{1, false, "nonexistent"};
     size_t alloc_size = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name, alloc_size, config);
@@ -116,7 +116,7 @@ TEST_F(AllocationStrategyTest, MultipleAllocatorsRandomSelection) {
     allocators.push_back(allocator2);
     allocators.push_back(allocator3);
 
-    ReplicateConfig config{1, ""};  // No preferred segment
+    ReplicateConfig config{1, false, ""};  // No preferred segment
     size_t alloc_size = 1024;
 
     // Perform multiple allocations to test randomness
@@ -150,7 +150,7 @@ TEST_F(AllocationStrategyTest, PreferredSegmentInsufficientSpace) {
     allocators.push_back(allocator2);
 
     // First, fill up the preferred allocator
-    ReplicateConfig config{1, "preferred"};
+    ReplicateConfig config{1, false, "preferred"};
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 
     // Allocate most of the space in preferred segment
@@ -183,7 +183,7 @@ TEST_F(AllocationStrategyTest, AllAllocatorsFull) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, ""};
+    ReplicateConfig config{1, false, ""};
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 
     // Fill up both allocators
@@ -211,7 +211,7 @@ TEST_F(AllocationStrategyTest, ZeroSizeAllocation) {
     allocators_by_name["segment1"].push_back(allocator);
     allocators.push_back(allocator);
 
-    ReplicateConfig config{1, ""};
+    ReplicateConfig config{1, false, ""};
 
     auto result = strategy_->Allocate(allocators, allocators_by_name, 0, config);
     // Zero-size allocation behavior depends on BufferAllocator implementation
@@ -231,7 +231,7 @@ TEST_F(AllocationStrategyTest, VeryLargeSizeAllocation) {
     allocators_by_name["segment1"].push_back(allocator);
     allocators.push_back(allocator);
 
-    ReplicateConfig config{1, ""};
+    ReplicateConfig config{1, false, ""};
     size_t huge_size = 100 * 1024 * 1024;  // 100MB (larger than 16MB capacity)
 
     auto result = strategy_->Allocate(allocators, allocators_by_name, huge_size, config);

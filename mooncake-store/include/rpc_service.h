@@ -26,6 +26,9 @@ class WrappedMasterService {
    public:
     WrappedMasterService(
         bool enable_gc, uint64_t default_kv_lease_ttl,
+        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
+        bool allow_evict_soft_pinned_objects =
+            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
         bool enable_metric_reporting = true, uint16_t http_port = 9003,
         double eviction_ratio = DEFAULT_EVICTION_RATIO,
         double eviction_high_watermark_ratio =
@@ -34,7 +37,9 @@ class WrappedMasterService {
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
         bool enable_ha = false,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
+        : master_service_(enable_gc, default_kv_lease_ttl,
+                          default_kv_soft_pin_ttl,
+                          allow_evict_soft_pinned_objects, eviction_ratio,
                           eviction_high_watermark_ratio, view_version,
                           client_live_ttl_sec, enable_ha, cluster_id),
           http_server_(4, http_port),

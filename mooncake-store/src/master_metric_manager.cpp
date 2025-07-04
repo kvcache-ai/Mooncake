@@ -22,6 +22,8 @@ MasterMetricManager::MasterMetricManager()
                       "Total capacity across all mounted segments"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
+      soft_pin_key_count_("master_soft_pin_key_count",
+                          "Total number of soft-pinned keys managed by the master"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_("master_value_size_bytes",
                                "Distribution of object value sizes",
@@ -156,12 +158,19 @@ double MasterMetricManager::get_global_used_ratio(void) {
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
+void MasterMetricManager::inc_soft_pin_key_count(int64_t val) { soft_pin_key_count_.inc(val); }
+void MasterMetricManager::dec_soft_pin_key_count(int64_t val) { soft_pin_key_count_.dec(val); }
+
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
 }
 
 int64_t MasterMetricManager::get_key_count() {
     return key_count_.value();
+}
+
+int64_t MasterMetricManager::get_soft_pin_key_count() {
+    return soft_pin_key_count_.value();
 }
 
 // Cluster Metrics
@@ -456,6 +465,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(allocated_size_);
     serialize_metric(total_capacity_);
     serialize_metric(key_count_);
+    serialize_metric(soft_pin_key_count_);
     if (enable_ha_) {
         serialize_metric(active_clients_);
     }
@@ -534,6 +544,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t allocated = allocated_size_.value();
     int64_t capacity = total_capacity_.value();
     int64_t keys = key_count_.value();
+    int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
 
     // Request counters
@@ -567,7 +578,7 @@ std::string MasterMetricManager::get_summary_string() {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double) allocated / (double)capacity * 100.0) << "%)";
     }
-    ss << " | Keys: " << keys;
+    ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     if (enable_ha_) {
         ss << " | Clients: " << active_clients;
     }
