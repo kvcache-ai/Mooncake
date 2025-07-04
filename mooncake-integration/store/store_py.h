@@ -235,6 +235,9 @@ class DistributedObjectStore {
     int put_tensor(const std::string &key, pybind11::object tensor);
 
    private:
+    pybind11::module numpy = pybind11::module::import("numpy");
+    pybind11::module torch = pybind11::module::import("torch");
+
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                                            size_t length);
 

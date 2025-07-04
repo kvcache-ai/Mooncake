@@ -12,8 +12,6 @@
 #include "types.h"
 
 namespace py = pybind11;
-pybind11::module numpy = pybind11::module::import("numpy");
-pybind11::module torch = pybind11::module::import("torch");
 
 namespace mooncake {
 
