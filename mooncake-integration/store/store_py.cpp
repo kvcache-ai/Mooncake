@@ -325,7 +325,7 @@ int DistributedObjectStore::allocateSlices(
         auto &disk_descriptor =replica.get_disk_descriptor();
         length = disk_descriptor.file_size;
         return allocateSlices(slices, length);
-    }else{
+    } else {
         auto &memory_descriptors = replica.get_memory_descriptor();
         for (auto &handle : memory_descriptors.buffer_descriptors) {
             auto chunk_size = handle.size_;
@@ -337,30 +337,6 @@ int DistributedObjectStore::allocateSlices(
             slices.emplace_back(Slice{ptr, chunk_size});
             length += chunk_size;
         }
-    }
-    return 0;
-}
-
-int DistributedObjectStore::allocateBatchedSlices(
-    const std::vector<std::string> &keys,
-    const std::vector<std::span<const char>> &values,
-    std::unordered_map<std::string, std::vector<mooncake::Slice>>
-        &batched_slices) {
-    for (size_t i = 0; i < keys.size(); ++i) {
-        uint64_t offset = 0;
-        const auto &value = values[i];
-        std::vector<Slice> slices;
-        while (offset < value.size()) {
-            auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
-            auto ptr = client_buffer_allocator_->allocate(chunk_size);
-            if (!ptr) {
-                return 1;
-            }
-            memcpy(ptr, value.data() + offset, chunk_size);
-            slices.emplace_back(Slice{ptr, chunk_size});
-            offset += chunk_size;
-        }
-        batched_slices.emplace(keys[i], std::move(slices));
     }
     return 0;
 }
@@ -392,15 +368,15 @@ int DistributedObjectStore::allocateBatchedSlices(
         // Get first replica
         const auto &replica = replica_list[0];
         uint64_t length = 0;
-        
-        if(replica.is_memory_replica() == false) {
-            auto &disk_descriptor =replica.get_disk_descriptor();
+
+        if (replica.is_memory_replica() == false) {
+            auto &disk_descriptor = replica.get_disk_descriptor();
             length = disk_descriptor.file_size;
             auto result = allocateSlices(batched_slices[key], length);
-            if(result) {
+            if (result) {
                 return 1;
             }
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 auto chunk_size = handle.size_;
@@ -489,13 +465,25 @@ int DistributedObjectStore::put_batch(
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
+        return 1;
     }
-    std::unordered_map<std::string, std::vector<mooncake::Slice>>
-        batched_slices;
-    int ret = allocateBatchedSlices(keys, values, batched_slices);
-    if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put_batch operation";
-        return ret;
+    std::vector<std::unique_ptr<SliceGuard>> slices;
+    slices.reserve(keys.size());
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        slices.emplace_back(std::make_unique<SliceGuard>(*this));
+        int ret = allocateSlices(slices.back()->slices(), value);
+        if (ret) {
+            LOG(ERROR)
+                << "Failed to allocate slices for put_batch operation, key: "
+                << key << ", value size: " << value.size();
+            return ret;
+        }
+        batched_slices.emplace(key, slices.back()->slices());
     }
 
     ReplicateConfig config;
@@ -523,10 +511,6 @@ int DistributedObjectStore::put_batch(
                        << "' with error: " << toString(results[i].error());
             return toInt(results[i].error());
         }
-    }
-
-    for (auto &slice : batched_slices) {
-        freeSlices(slice.second);
     }
     return 0;
 }
@@ -628,6 +612,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     const auto kNullString = pybind11::bytes("\0", 0);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        py::gil_scoped_acquire acquire_gil;
         return {kNullString};
     }
     std::unordered_set<std::string> seen;
@@ -635,6 +620,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         if (!seen.insert(key).second) {
             LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
                        << key;
+            py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
     }
@@ -642,6 +628,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     std::vector<pybind11::bytes> results;
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         batched_slices;
+    batched_slices.reserve(keys.size());
     std::unordered_map<std::string, uint64_t> str_length_map;
     {
         py::gil_scoped_release release_gil;
@@ -663,6 +650,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         int ret = allocateBatchedSlices(keys, batched_slices, replica_lists,
                                         str_length_map);
         if (ret) {
+            for (auto &slice : batched_slices) {
+                freeSlices(slice.second);
+            }
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
@@ -671,12 +661,18 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
             client_->BatchGet(keys, replica_lists, batched_slices);
         for (size_t i = 0; i < get_results.size(); ++i) {
             if (!get_results[i]) {
+                for (auto &slice : batched_slices) {
+                    freeSlices(slice.second);
+                }
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "BatchGet failed for key '" << keys[i]
                            << "': " << toString(get_results[i].error());
                 return {kNullString};
             }
         }
+
+        py::gil_scoped_acquire acquire_gil;
+        std::vector<pybind11::bytes> results;
         for (const auto &key : keys) {
             if (batched_slices[key].size() == 1 &&
                 batched_slices[key][0].size == str_length_map[key]) {
@@ -687,6 +683,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
                 char *exported_str_ptr =
                     exportSlices(batched_slices[key], str_length_map[key]);
                 if (!exported_str_ptr) {
+                    for (auto &slice : batched_slices) {
+                        freeSlices(slice.second);
+                    }
                     return {kNullString};
                 } else {
                     results.push_back(
@@ -697,6 +696,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         }
         if (results.size() != keys.size()) {
             LOG(ERROR) << "Results size does not match keys size";
+            for (auto &slice : batched_slices) {
+                freeSlices(slice.second);
+            }
             return {kNullString};
         }
         for (auto &slice : batched_slices) {
@@ -800,7 +802,7 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
         if(replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 total_size += handle.size_;
@@ -943,8 +945,9 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     if(replica.is_memory_replica() == false) {
         auto &disk_descriptor = replica.get_disk_descriptor();
         total_size = disk_descriptor.file_size;
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             total_size += handle.size_;
         }
     }
@@ -960,15 +963,16 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
 
-    if(replica.is_memory_replica() == false) {
-        while(offset < total_size){
+    if (replica.is_memory_replica() == false) {
+        while (offset < total_size) {
             auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, handle.size_});
             offset += handle.size_;
@@ -1123,11 +1127,12 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         // Calculate required buffer size
         const auto &replica = replica_list[0];
         uint64_t total_size = 0;
-        if(replica.is_memory_replica() == false) {
+        if (replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 total_size += handle.size_;
             }
         }
@@ -1151,8 +1156,9 @@ std::vector<int> DistributedObjectStore::batch_get_into(
                 key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
                 offset += chunk_size;
             }
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
                 offset += handle.size_;

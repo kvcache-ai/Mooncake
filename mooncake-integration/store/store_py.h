@@ -243,12 +243,6 @@ class DistributedObjectStore {
             &replica_lists,
         std::unordered_map<std::string, uint64_t> &str_length_map);
 
-    int allocateBatchedSlices(
-        const std::vector<std::string> &keys,
-        const std::vector<std::span<const char>> &values,
-        std::unordered_map<std::string, std::vector<mooncake::Slice>>
-            &batched_slices);
-
     char *exportSlices(const std::vector<mooncake::Slice> &slices,
                        uint64_t length);
 
