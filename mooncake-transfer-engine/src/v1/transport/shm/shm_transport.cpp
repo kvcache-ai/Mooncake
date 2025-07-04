@@ -184,7 +184,7 @@ Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
 #ifdef USE_CUDA
     if (desc.location.starts_with("cuda")) {
         cudaIpcMemHandle_t handle;
-        auto err = cudaIpcGetMemHandle(&handle, desc.addr);
+        auto err = cudaIpcGetMemHandle(&handle, (void *)desc.addr);
         if (err != cudaSuccess) {
             return Status::InternalError("Failed to get cuda memory handle");
         }
@@ -297,7 +297,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 if (entry.location.starts_with("cuda")) {
 #ifdef USE_CUDA
                     std::vector<unsigned char> output_buffer;
-                    deserializeBinaryData(entry.shm_name, output_buffer);
+                    deserializeBinaryData(entry.shm_path, output_buffer);
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     auto err = cudaIpcOpenMemHandle(

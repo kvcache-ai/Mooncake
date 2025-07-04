@@ -249,7 +249,7 @@ void allocateAllLocalMemory(const std::unique_ptr<TransferEngine> &engine,
         } else if (FLAGS_use_vram) {
             int cuda_id = i;
             if (FLAGS_use_dram) cuda_id -= num_sockets;
-            options.location = "cuda:" + std::to_string(i);
+            options.location = "cuda:" + std::to_string(cuda_id);
         }
 #else
         options.location = "cpu:" + std::to_string(i);
@@ -346,13 +346,15 @@ int main(int argc, char **argv) {
 
     uint64_t min_capacity = FLAGS_size * FLAGS_batch * FLAGS_threads;
     buffer_capacity = std::max(buffer_capacity, min_capacity);
+    num_sockets = numa_num_configured_nodes();
+
 #ifdef USE_CUDA
     num_buffers = 0;
     cudaGetDeviceCount(&cuda_device_count);
-    if (FLAGS_use_dram) num_buffers += numa_num_configured_nodes();
+    if (FLAGS_use_dram) num_buffers += num_sockets;
     if (FLAGS_use_vram) num_buffers += cuda_device_count;
 #else
-    num_buffers = numa_num_configured_nodes();
+    num_buffers = num_sockets;
 #endif
     if (FLAGS_remote_segment.empty())
         return target();

@@ -252,8 +252,10 @@ Status TransferEngine::registerLocalMemory(void *addr, size_t size,
         });
 }
 
+// WARNING: before exiting TE, make sure that all local memory are
+// unregistered, otherwise the CUDA may halt!
 Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
-    return local_segment_->add(
+    return local_segment_->remove(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 if (!transport_list_[type]) continue;
