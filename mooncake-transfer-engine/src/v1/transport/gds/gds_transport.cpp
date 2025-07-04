@@ -160,7 +160,7 @@ TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
 
 Status GdsRunner::getStatus(int task_id, TransferStatus &status) {
     unsigned num_tasks = io_params_.size();
-    if (task_id < 0 || task >= num_tasks)
+    if (task_id < 0 || task_id >= num_tasks)
         return Status::InvalidArgument("Invalid task ID");
     auto result = cuFileBatchIOGetStatus(handle_, 0, &num_tasks,
                                          io_events_.data(), nullptr);
