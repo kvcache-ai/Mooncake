@@ -33,8 +33,5 @@ target_link_libraries(
 
 if (USE_CUDA)
   target_include_directories(transfer_engine_v1 PRIVATE /usr/local/cuda/include)
-  target_link_libraries(transfer_engine_v1 PUBLIC cuda cudart rt)
-  if (USE_NVMEOF)
-    target_link_libraries(transfer_engine_v1 PUBLIC gds_transport_v1 cufile)
-  endif()
+  target_link_libraries(transfer_engine_v1 PUBLIC cuda cudart rt cufile)
 endif()
