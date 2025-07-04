@@ -20,6 +20,9 @@
 #include "v1/transport/rdma/rdma_transport.h"
 #include "v1/transport/shm/shm_transport.h"
 #include "v1/transport/tcp/tcp_transport.h"
+#ifdef USE_CUDA
+#include "v1/transport/mnnvl/mnnvl_transport.h"
+#endif
 #include "v1/utility/ip.h"
 
 #define CHECK_STATUS(cmd)                \
@@ -147,6 +150,9 @@ Status TransferEngine::construct() {
     }
     transport_list_[TCP] = std::make_shared<TcpTransport>();
     transport_list_[SHM] = std::make_shared<ShmTransport>();
+#ifdef USE_CUDA
+    transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
+#endif
 
     std::string transport_string;
     for (auto &transport : transport_list_) {

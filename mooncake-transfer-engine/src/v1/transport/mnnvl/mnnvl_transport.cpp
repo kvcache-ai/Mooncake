@@ -230,7 +230,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     }
 
     CUmemAllocationProp prop = {};
-    size_t granularity;
+    size_t granularity = 0;
     CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
@@ -260,7 +260,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     }
 
     CUmemAllocationProp prop = {};
-    size_t granularity;
+    size_t granularity = 0;
     CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
     CHECK_STATUS(roundGranularity(prop, granularity, size));
 

@@ -12,4 +12,7 @@ target_sources(transport_v1 PUBLIC $<TARGET_OBJECTS:transport_tcp_v1>)
 if (USE_CUDA)
   add_subdirectory(mnnvl)
   target_sources(transport_v1 PUBLIC $<TARGET_OBJECTS:transport_mnnvl_v1>)
+
+  add_subdirectory(gds)
+  target_sources(transport_v1 PUBLIC $<TARGET_OBJECTS:transport_gds_v1>)
 endif()

@@ -79,7 +79,7 @@ struct BufferEntry {
     size_t shm_offset = 0;
 };
 
-enum TransportType { RDMA = 0, SHM, GDS, NVLINK, TCP };
+enum TransportType { RDMA = 0, SHM, GDS, MNNVL, TCP };
 const static int kSupportedTransportTypes = 5;
 
 struct MemoryOptions {

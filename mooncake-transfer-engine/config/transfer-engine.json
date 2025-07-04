@@ -49,6 +49,9 @@
             }
         },
         "gds": {},
-        "shm": {}
+        "shm": {},
+        "mnnvl": {
+            "enable" : false
+        }
     }
 }

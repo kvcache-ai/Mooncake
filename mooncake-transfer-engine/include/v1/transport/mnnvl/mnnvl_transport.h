@@ -94,7 +94,6 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<MetadataService> metadata_;
 
     struct OpenedMnnvlEntry {
-        int mnnvl_fd;
         void *mnnvl_addr;
         uint64_t length;
     };
