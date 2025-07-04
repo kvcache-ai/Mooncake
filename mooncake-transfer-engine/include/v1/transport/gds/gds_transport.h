@@ -74,6 +74,9 @@ class GdsTransport : public Transport {
     virtual bool taskSupported(const Request &request);
 
    private:
+    std::string getGdsFilePath(SegmentID handle);
+
+   private:
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;

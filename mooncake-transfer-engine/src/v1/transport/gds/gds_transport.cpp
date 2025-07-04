@@ -77,7 +77,7 @@ class GdsRunner {
     int size() const { return io_params_.size(); }
 
     Status addTask(void *source, GdsFileContext *context, uint64_t offset,
-                   uint64_t length, TransferRequest::OpCode opcode);
+                   uint64_t length, Request::OpCode opcode);
 
     Status submit();
 
@@ -113,13 +113,13 @@ GdsRunner::~GdsRunner() {
 
 Status GdsRunner::addTask(void *source, GdsFileContext *context,
                           uint64_t offset, uint64_t length,
-                          TransferRequest::OpCode opcode) {
+                          Request::OpCode opcode) {
     if (io_params_.size() == max_tasks_) {
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     }
     CUfileIOParams_t params;
     params.mode = CUFILE_BATCH;
-    params.opcode = op == TransferRequest::READ ? CUFILE_READ : CUFILE_WRITE;
+    params.opcode = (opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
     params.cookie = (void *)0;
     params.u.batch.devPtr_base = source;
     params.u.batch.devPtr_offset = 0;
@@ -158,7 +158,7 @@ TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
     }
 }
 
-Status GdsRunner::getStatus(int task_id, TransferStatus &result) {
+Status GdsRunner::getStatus(int task_id, TransferStatus &status) {
     unsigned num_tasks = io_params_.size();
     if (task_id < 0 || task >= num_tasks)
         return Status::InvalidArgument("Invalid task ID");
@@ -167,8 +167,8 @@ Status GdsRunner::getStatus(int task_id, TransferStatus &result) {
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError("Failed to get GDS batch status");
     auto &event = io_events_[task_id];
-    result.s = parseTransferStatus(event.status);
-    result.transferred_bytes += event.ret;
+    status.s = parseTransferStatus(event.status);
+    status.transferred_bytes += event.ret;
     return Status::OK();
 }
 
@@ -180,14 +180,14 @@ void GdsRunner::reset() {
 
 GdsTransport::GdsTransport() : installed_(false) {
     static std::once_flag g_once_flag;
-    auto fork_init = []() { CUFILE_CHECK(cuFileDriverOpen()); };
+    auto fork_init = []() { cuFileDriverOpen(); };
     std::call_once(g_once_flag, fork_init);
 }
 
 GdsTransport::~GdsTransport() { uninstall(); }
 
 Status GdsTransport::install(std::string &local_segment_name,
-                             std::shared_ptr<TransferMetadata> metadata,
+                             std::shared_ptr<MetadataService> metadata,
                              std::shared_ptr<Topology> local_topology,
                              std::shared_ptr<ConfigManager> conf) {
     if (installed_) {
@@ -227,7 +227,8 @@ Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
-std::string getGdsFilePath(SegmentID handle) {
+std::string GdsTransport::getGdsFilePath(SegmentID target_id) {
+    SegmentDescRef desc;
     auto status = metadata_->segmentManager().getRemote(desc, target_id);
     if (!status.ok()) return "";
     auto &detail = std::get<FileSegmentDesc>(desc->detail);
@@ -243,13 +244,13 @@ Status GdsTransport::submitTransferTasks(
     for (auto &request : request_list) {
         GdsFileContext *context = nullptr;
         {
-            RWSpinlock::ReadGuard(file_context_lock_);
+            RWSpinlock::ReadGuard guard(file_context_lock_);
             if (file_context_map_.count(request.target_id))
                 context = file_context_map_[request.target_id].get();
         }
 
         if (!context) {
-            RWSpinlock::WriteGuard(file_context_lock_);
+            RWSpinlock::WriteGuard guard(file_context_lock_);
             if (!file_context_map_.count(request.target_id)) {
                 std::string path = getGdsFilePath(request.target_id);
                 if (path.empty())
@@ -278,8 +279,10 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 void GdsTransport::queryOutstandingTasks(SubBatchRef batch,
                                          std::vector<int> &task_id_list) {
+    auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     for (int task_id = 0; task_id < gds_batch->runner->size(); ++task_id) {
-        auto status = getTransferStatus(batch, task_id);
+        TransferStatus status;
+        getTransferStatus(batch, task_id, status);
         if (status.s != TransferStatusEnum::COMPLETED) {
             task_id_list.push_back(task_id);
         }
@@ -288,14 +291,14 @@ void GdsTransport::queryOutstandingTasks(SubBatchRef batch,
 
 Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
-    auto result = cuFileBufRegister(desc.addr, desc.length, 0);
+    auto result = cuFileBufRegister((void *)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError("Failed to register GDS buffer");
     return Status::OK();
 }
 
 Status GdsTransport::removeMemoryBuffer(BufferDesc &desc) {
-    auto result = cuFileBufDeregister(desc.addr);
+    auto result = cuFileBufDeregister((void *)desc.addr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError("Failed to register GDS buffer");
     return Status::OK();
