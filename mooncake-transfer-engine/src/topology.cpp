@@ -143,6 +143,12 @@ static int getPciDistance(const char *bus1, const char *bus2) {
         return -1;
     }
 
+    // Remove the last level (the device itself)
+    char *last1 = strrchr(path1, '/');
+    char *last2 = strrchr(path2, '/');
+    if (last1) *last1 = '\0';
+    if (last2) *last2 = '\0';
+
     char *ptr1 = path1;
     char *ptr2 = path2;
     while (*ptr1 && *ptr1 == *ptr2) {
