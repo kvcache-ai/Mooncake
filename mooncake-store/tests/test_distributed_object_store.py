@@ -362,6 +362,6 @@ class TestDistributedObjectStore(unittest.TestCase):
          # Cleanup: ensure all remaining keys are removed
          for key in list(reference.keys()):
              self.store.remove(key)
-             
+       
 if __name__ == '__main__':
     unittest.main()

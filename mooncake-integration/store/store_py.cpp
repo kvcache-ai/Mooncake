@@ -1247,6 +1247,100 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
+pybind11::object DistributedObjectStore::get_tensor(const std::string &key, const std::string dtype) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return pybind11::none();
+    }
+
+    try {
+        // Import torch module
+        
+        // Query object info first
+        // Step 1: Get object info
+        auto query_result = client_->Query(key);
+        if (!query_result) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+        // Extract replica list from the query result
+        auto replica_list = query_result.value();
+        if (replica_list.empty()) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Allocate slices for the object
+        SliceGuard guard(*this);
+        uint64_t total_length = 0;
+        int ret = allocateSlices(guard.slices(), replica_list, total_length);
+        if (ret) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Get the object data
+        auto get_result  = client_->Get(key, guard.slices());
+        if (!get_result) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Get failed for key: " << key
+                    << " with error: " << toString(get_result.error());
+            return pybind11::none();
+        }
+
+        // Convert slices to contiguous bytes
+        char *exported_data = exportSlices(guard.slices(), total_length);
+        if (!exported_data) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Convert bytes to tensor using torch.from_numpy
+
+        py::object py_buffer = py::memoryview::from_memory(exported_data, total_length);
+        pybind11::object np_array = numpy.attr("frombuffer")(py_buffer, dtype);
+        
+        // Create tensor from numpy array
+        pybind11::object tensor = torch.attr("from_numpy")(np_array);
+        
+        // Clean up exported data
+        delete[] exported_data;
+        
+        return tensor;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to convert bytes to tensor: " << e.what();
+        return pybind11::none();
+    }
+}
+
+int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object tensor) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    try {
+        // Import torch module
+        // Check if the object is a tensor
+        if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
+            LOG(ERROR) << "Input is not a PyTorch tensor";
+            return -1;
+        }
+        // Get the data pointer and size directly from the tensor
+        uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        size_t buffer_size = numel * element_size;
+
+        this->register_buffer(reinterpret_cast<void*>(data_ptr), buffer_size);
+        // Use put_from for direct memory access (zero-copy)
+        return this->put_from(key, reinterpret_cast<void*>(data_ptr), buffer_size);
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to access tensor data: " << e.what();
+        return -1;
+    }
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the SliceBuffer class
     py::class_<SliceBuffer, std::shared_ptr<SliceBuffer>>(m, "SliceBuffer",
@@ -1309,6 +1403,10 @@ PYBIND11_MODULE(store, m) {
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_tensor", &DistributedObjectStore::get_tensor,
+             py::arg("key"), py::arg("dtype"), "Get a PyTorch tensor from the store")
+        .def("put_tensor", &DistributedObjectStore::put_tensor,
+             py::arg("key"), py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
             "register_buffer",
             [](DistributedObjectStore &self, uintptr_t buffer_ptr,
