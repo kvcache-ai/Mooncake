@@ -131,5 +131,74 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
 
         print(f"[✓] {circles} rounds of batch_write_read passed, batch size {batch_size}.")
 
+    def test_async_batch_write_read(self):
+        """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
+        import random, string
+
+        def generate_random_string(length):
+            chars = string.ascii_letters + string.digits + string.punctuation
+            return ''.join(random.choices(chars, k=length))
+
+        adaptor = self.adaptor
+        batch_size = 100  # Adjust batch size if needed
+        circles = max(2, self.circle // 100)  # Number of batch test rounds
+
+        base_src_addr = adaptor.get_first_buffer_address(self.initiator_server_name)
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        
+        src_addr_list = []
+        dst_addr_list = []
+        offset_size = 1024  # 1KB offset between each buffer
+        
+        for i in range(batch_size):
+            src_addr_list.append(base_src_addr + i * offset_size)
+            dst_addr_list.append(base_dst_addr + i * offset_size)
+
+        for i in range(circles):
+            # Generate multiple groups of random data
+            data_list = []
+            data_len_list = []
+            for _ in range(batch_size):
+                str_len = random.randint(32, min(128, offset_size))
+                src_data = generate_random_string(str_len).encode('utf-8')
+                data_list.append(src_data)
+                data_len_list.append(len(src_data))
+
+            # Write to local buffers in batch
+            for j in range(batch_size):
+                result = adaptor.write_bytes_to_buffer(src_addr_list[j], data_list[j], data_len_list[j])
+                self.assertEqual(result, 0, f"[{i}-{j}] writeBytesToBuffer failed")
+
+            # Batch write to remote
+            batch_id = adaptor.batch_transfer_async_write(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertNotEqual(batch_id, 0, f"[{i}] batch_transfer_async_write {batch_id} failed in submitting task(s)")
+
+            result = adaptor.get_batch_transfer_status([batch_id])
+            self.assertEqual(result, 0, f"[{i}] batch {batch_id} failed during transferring")
+
+            # Clear local buffers
+            for j in range(batch_size):
+                clear_data = bytes([0] * data_len_list[j])
+                result = adaptor.write_bytes_to_buffer(src_addr_list[j], clear_data, data_len_list[j])
+                self.assertEqual(result, 0, f"[{i}-{j}] Clear buffer failed")
+
+            # Batch read back from remote
+            batch_id = adaptor.batch_transfer_async_read(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertNotEqual(batch_id, 0, f"[{i}] batch_transfer_async_read {batch_id} failed in submitting task(s)")
+
+            result = adaptor.get_batch_transfer_status([batch_id])
+            self.assertEqual(result, 0, f"[{i}] batch {batch_id} failed during transferring")
+
+            # Verify data consistency
+            for j in range(batch_size):
+                read_back = adaptor.read_bytes_from_buffer(src_addr_list[j], data_len_list[j])
+                self.assertEqual(read_back, data_list[j], f"[{i}-{j}] Data mismatch in batch read")
+
+        print(f"[✓] {circles} rounds of batch_write_async_read passed, batch size {batch_size}.")
+
 if __name__ == '__main__':
     unittest.main()

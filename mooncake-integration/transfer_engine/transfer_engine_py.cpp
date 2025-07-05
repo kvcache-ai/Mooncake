@@ -239,6 +239,22 @@ int TransferEnginePy::batchTransferSyncRead(const char *target_hostname,
                              TransferOpcode::READ);
 }
 
+batch_id_t TransferEnginePy::batchTransferAsyncWrite(const char *target_hostname,
+                                              const std::vector<uintptr_t> &buffers,
+                                              const std::vector<uintptr_t> &peer_buffer_addresses,
+                                              const std::vector<size_t> &lengths) {
+    return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses, lengths,
+                             TransferOpcode::WRITE);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncRead(const char *target_hostname,
+                                             const std::vector<uintptr_t> &buffers,
+                                             const std::vector<uintptr_t> &peer_buffer_addresses,
+                                             const std::vector<size_t> &lengths) {
+    return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses, lengths,
+                             TransferOpcode::READ);
+}
+
 int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
@@ -397,6 +413,126 @@ int TransferEnginePy::batchTransferSync(const char *target_hostname,
     return -1;
 }
 
+batch_id_t TransferEnginePy::batchTransferAsync(const char *target_hostname,
+                                                const std::vector<uintptr_t>& buffers,
+                                                const std::vector<uintptr_t>& peer_buffer_addresses,
+                                                const std::vector<size_t>& lengths,
+                                                TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (buffers.size() != peer_buffer_addresses.size() || buffers.size() != lengths.size()) {
+        LOG(ERROR) << "buffers, peer_buffer_addresses and lengths have different size";
+        return 0;
+    }
+
+    const int max_retry = engine_->numContexts() + 1;
+    auto batch_size = buffers.size();
+    std::vector<TransferRequest> entries;
+    batch_id_t batch_id = 0;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = lengths[i];
+        entry.source = (void *)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entry.advise_retry_cnt = 0;
+        entries.push_back(entry);
+    }
+
+    for (int retry = 0; retry < max_retry; ++retry) {
+        batch_id = engine_->allocateBatchID(batch_size);
+        auto batch_desc = reinterpret_cast<BatchDesc *>(batch_id);
+
+        auto start_ts = getCurrentTimeInNano();
+        batch_desc->start_timestamp = start_ts;
+
+        Status s = engine_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
+            return 0;
+        } else {
+            break;
+        }
+    }
+
+    return batch_id;
+}
+
+int TransferEnginePy::getBatchTransferStatus(const std::vector<batch_id_t>& batch_ids) {
+    pybind11::gil_scoped_release release;
+    TransferStatus status;
+    std::unordered_map<batch_id_t, int64_t> timeout_table{};
+    for (auto &batch_id : batch_ids) {
+        int64_t total_length = 0;
+        auto batch_desc = reinterpret_cast<BatchDesc *>(batch_id);
+        const size_t task_count = batch_desc->task_list.size();
+
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            auto &task = batch_desc->task_list[task_id];
+            for (auto &slice : task.slice_list) {
+                total_length += slice->length;
+            }
+        }
+
+        timeout_table[batch_id] = total_length + transfer_timeout_nsec_;
+    }
+
+    bool failed_or_timeout = false;
+    std::unordered_set<batch_id_t> remove_ids {};
+    while (!timeout_table.empty() && !failed_or_timeout) {
+        for (auto &entry : timeout_table) {
+            auto batch_desc = reinterpret_cast<BatchDesc *>(entry.first);
+            Status s = engine_->getBatchTransferStatus(entry.first, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(entry.first);
+                LOG(INFO) << "Batch Transfer completed!";
+                remove_ids.insert(entry.first);
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                failed_or_timeout = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+            }
+            auto current_ts = getCurrentTimeInNano();
+            if (current_ts - batch_desc->start_timestamp > entry.second) {
+                LOG(INFO) << "Sync batch data transfer timeout after " 
+                            << current_ts - batch_desc->start_timestamp << "ns";
+                failed_or_timeout = true;
+            }
+        }
+
+        for (auto &remove_id : remove_ids) {
+            timeout_table.erase(remove_id);
+        }
+
+        remove_ids.clear();
+    }
+
+    if (failed_or_timeout) {
+        for (auto &entry : timeout_table) {
+            engine_->freeBatchID(entry.first);
+        }
+    }
+
+    return failed_or_timeout ? -1 : 0;
+}
+
 batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
                                                  uintptr_t buffer,
                                                  uintptr_t peer_buffer_address,
@@ -507,8 +643,12 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead)
             .def("batch_transfer_sync_write", &TransferEnginePy::batchTransferSyncWrite)
             .def("batch_transfer_sync_read", &TransferEnginePy::batchTransferSyncRead)
+            .def("batch_transfer_async_write", &TransferEnginePy::batchTransferAsyncWrite)
+            .def("batch_transfer_async_read", &TransferEnginePy::batchTransferAsyncRead)
             .def("transfer_sync", &TransferEnginePy::transferSync)
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
+            .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
+            .def("get_batch_transfer_status", &TransferEnginePy::getBatchTransferStatus)
             .def("transfer_submit_write",
                  &TransferEnginePy::transferSubmitWrite)
             .def("transfer_check_status",
