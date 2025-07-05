@@ -7,8 +7,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <vector>
 #include <variant>
+#include <vector>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -123,12 +123,12 @@ enum class ErrorCode : int32_t {
         -1011,  ///< Request cannot be done in current mode.
 
     // FILE errors (Range: -1100 to -1199)
-    FILE_NOT_FOUND = -1100,  ///< File not found.
-    FILE_OPEN_FAIL = -1101,  ///< Error open file or write to a exist file.
-    FILE_READ_FAIL = -1102,  ///< Error reading file.
-    FILE_WRITE_FAIL = -1103,  ///< Error writing file.
+    FILE_NOT_FOUND = -1100,       ///< File not found.
+    FILE_OPEN_FAIL = -1101,       ///< Error open file or write to a exist file.
+    FILE_READ_FAIL = -1102,       ///< Error reading file.
+    FILE_WRITE_FAIL = -1103,      ///< Error writing file.
     FILE_INVALID_BUFFER = -1104,  ///< File buffer is wrong.
-    FILE_LOCK_FAIL = -1105,  ///< File lock operation failed.
+    FILE_LOCK_FAIL = -1105,       ///< File lock operation failed.
     FILE_INVALID_HANDLE = -1106,  ///< Invalid file handle.
 };
 
@@ -289,7 +289,7 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 struct MemoryDescriptor {
-    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors; 
+    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
     YLT_REFL(MemoryDescriptor, buffer_descriptors);
 };
 
@@ -325,11 +325,15 @@ class Replica {
     }
 
     void mark_complete() {
-        // prev status should be PROCESSING
-        CHECK_EQ(status_, ReplicaStatus::PROCESSING);
-        status_ = ReplicaStatus::COMPLETE;
-        for (const auto& buf_ptr : buffers_) {
-            buf_ptr->mark_complete();
+        if (status_ == ReplicaStatus::PROCESSING) {
+            status_ = ReplicaStatus::COMPLETE;
+            for (const auto& buf_ptr : buffers_) {
+                buf_ptr->mark_complete();
+            }
+        } else if (status_ == ReplicaStatus::COMPLETE) {
+            LOG(WARNING) << "Replica already marked as complete";
+        } else {
+            LOG(ERROR) << "Invalid replica status: " << status_;
         }
     }
 
@@ -350,7 +354,8 @@ class Replica {
         }
 
         MemoryDescriptor& get_memory_descriptor() {
-            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+            if (auto* desc =
+                    std::get_if<MemoryDescriptor>(&descriptor_variant)) {
                 return *desc;
             }
             throw std::runtime_error("Expected MemoryDescriptor");
@@ -363,14 +368,15 @@ class Replica {
             throw std::runtime_error("Expected DiskDescriptor");
         }
 
-        const MemoryDescriptor& get_memory_descriptor() const{
-            if (auto* desc = std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+        const MemoryDescriptor& get_memory_descriptor() const {
+            if (auto* desc =
+                    std::get_if<MemoryDescriptor>(&descriptor_variant)) {
                 return *desc;
             }
             throw std::runtime_error("Expected MemoryDescriptor");
         }
 
-        const DiskDescriptor& get_disk_descriptor() const{
+        const DiskDescriptor& get_disk_descriptor() const {
             if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
                 return *desc;
             }
