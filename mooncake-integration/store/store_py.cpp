@@ -183,7 +183,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         std::make_unique<SimpleAllocator>(local_buffer_size);
     auto result = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), local_buffer_size,
-        kWildcardLocation, false, false);
+        kWildcardLocation, true, true);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to register local memory: "
                    << toString(result.error());
@@ -321,11 +321,11 @@ int DistributedObjectStore::allocateSlices(
     length = 0;
     if (replica_list.empty()) return -1;
     auto &replica = replica_list[0];
-    if(replica.is_memory_replica() == false) {
-        auto &disk_descriptor =replica.get_disk_descriptor();
+    if (replica.is_memory_replica() == false) {
+        auto &disk_descriptor = replica.get_disk_descriptor();
         length = disk_descriptor.file_size;
         return allocateSlices(slices, length);
-    }else{
+    } else {
         auto &memory_descriptors = replica.get_memory_descriptor();
         for (auto &handle : memory_descriptors.buffer_descriptors) {
             auto chunk_size = handle.size_;
@@ -392,15 +392,15 @@ int DistributedObjectStore::allocateBatchedSlices(
         // Get first replica
         const auto &replica = replica_list[0];
         uint64_t length = 0;
-        
-        if(replica.is_memory_replica() == false) {
-            auto &disk_descriptor =replica.get_disk_descriptor();
+
+        if (replica.is_memory_replica() == false) {
+            auto &disk_descriptor = replica.get_disk_descriptor();
             length = disk_descriptor.file_size;
             auto result = allocateSlices(batched_slices[key], length);
-            if(result) {
+            if (result) {
                 return 1;
             }
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 auto chunk_size = handle.size_;
@@ -797,10 +797,10 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     int64_t total_size = 0;
     if (!replica_list.empty()) {
         auto &replica = replica_list[0];
-        if(replica.is_memory_replica() == false) {
+        if (replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 total_size += handle.size_;
@@ -899,8 +899,8 @@ int DistributedObjectStore::register_buffer(void *buffer, size_t size) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    auto register_result =
-        client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false, false);
+    auto register_result = client_->RegisterLocalMemory(
+        buffer, size, kWildcardLocation, true, true);
     if (!register_result) {
         LOG(ERROR) << "Register buffer failed with error: "
                    << toString(register_result.error());
@@ -914,8 +914,7 @@ int DistributedObjectStore::unregister_buffer(void *buffer) {
         LOG(ERROR) << "Client is not initialized";
         return 1;
     }
-    auto unregister_result =
-        client_->unregisterLocalMemory(buffer, false);
+    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
     if (!unregister_result) {
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
@@ -955,11 +954,12 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     }
 
     auto &replica = replica_list[0];
-    if(replica.is_memory_replica() == false) {
+    if (replica.is_memory_replica() == false) {
         auto &disk_descriptor = replica.get_disk_descriptor();
         total_size = disk_descriptor.file_size;
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             total_size += handle.size_;
         }
     }
@@ -975,15 +975,16 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
 
-    if(replica.is_memory_replica() == false) {
-        while(offset < total_size){
+    if (replica.is_memory_replica() == false) {
+        while (offset < total_size) {
             auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, handle.size_});
             offset += handle.size_;
@@ -1015,26 +1016,26 @@ std::vector<int> DistributedObjectStore::batch_put_from(
     }
 
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
-    
+
     // Create slices from user buffers
     for (size_t i = 0; i < keys.size(); ++i) {
         const std::string &key = keys[i];
         void *buffer = buffers[i];
         size_t size = sizes[i];
-        
+
         std::vector<mooncake::Slice> slices;
         uint64_t offset = 0;
-        
+
         while (offset < size) {
             auto chunk_size = std::min(size - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-        
+
         all_slices[key] = std::move(slices);
     }
-    
+
     ReplicateConfig config;
     config.replica_num = 1;                           // Make configurable
     config.preferred_segment = this->local_hostname;  // Make configurable
@@ -1067,7 +1068,7 @@ std::vector<int> DistributedObjectStore::batch_put_from(
             results[i] = 0;
         }
     }
-    
+
     return results;
 }
 
@@ -1138,11 +1139,12 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         // Calculate required buffer size
         const auto &replica = replica_list[0];
         uint64_t total_size = 0;
-        if(replica.is_memory_replica() == false) {
+        if (replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 total_size += handle.size_;
             }
         }
@@ -1159,15 +1161,16 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         // Create slices for this key's buffer
         std::vector<Slice> key_slices;
         uint64_t offset = 0;
-        if(replica.is_memory_replica() == false) {
-            while(offset < total_size){
+        if (replica.is_memory_replica() == false) {
+            while (offset < total_size) {
                 auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
                 void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
                 offset += chunk_size;
             }
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
                 offset += handle.size_;
@@ -1343,8 +1346,9 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release release;
                 return self.unregister_buffer(buffer);
             },
-            py::arg("buffer_ptr"), "Unregister a previously registered memory "
-                                   "buffer for direct access operations")
+            py::arg("buffer_ptr"),
+            "Unregister a previously registered memory "
+            "buffer for direct access operations")
         .def(
             "get_into",
             [](DistributedObjectStore &self, const std::string &key,
