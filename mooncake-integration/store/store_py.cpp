@@ -79,14 +79,16 @@ void ResourceTracker::cleanupAllResources() {
         DistributedObjectStore *store =
             static_cast<DistributedObjectStore *>(instance);
         if (store) {
-            LOG(INFO) << "Cleaning up DistributedObjectStore instance";
+            LOG(INFO) << "ResourceTracker::cleanupAllResources - cleaning up "
+                         "DistributedObjectStore instance";
             store->tearDownAll();
         }
     }
 }
 
 void ResourceTracker::signalHandler(int signal) {
-    LOG(INFO) << "Received signal " << signal << ", cleaning up resources";
+    LOG(INFO) << "ResourceTracker::signalHandler - received signal=" << signal
+              << ", cleaning up resources";
     getInstance().cleanupAllResources();
 
     // Re-raise the signal with default handler to allow normal termination
@@ -130,7 +132,10 @@ static int getRandomAvailablePort(int min_port = 12300, int max_port = 14300) {
             return port;
         }
     }
-    return -1;  // Failed to find available port
+    LOG(ERROR) << "getRandomAvailablePort - failed to find available port "
+                  "after 10 attempts, range=["
+               << min_port << ", " << max_port << "]";
+    return toInt(ErrorCode::INTERNAL_ERROR);  // Failed to find available port
 }
 
 DistributedObjectStore::DistributedObjectStore() {
@@ -160,7 +165,8 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         // Get a random available port
         int port = getRandomAvailablePort();
         if (port < 0) {
-            LOG(ERROR) << "Failed to find available port";
+            LOG(ERROR) << "DistributedObjectStore::setup - failed to find "
+                          "available port";
             return 1;
         }
         // Combine hostname with port
@@ -174,7 +180,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         mooncake::Client::Create(this->local_hostname, metadata_server,
                                  protocol, args, master_server_addr);
     if (!client_opt) {
-        LOG(ERROR) << "Failed to create client";
+        LOG(ERROR) << "DistributedObjectStore::setup - failed to create client";
         return 1;
     }
     client_ = *client_opt;
@@ -185,7 +191,8 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         client_buffer_allocator_->getBase(), local_buffer_size,
         kWildcardLocation, false, false);
     if (!result.has_value()) {
-        LOG(ERROR) << "Failed to register local memory: "
+        LOG(ERROR) << "DistributedObjectStore::setup - failed to register "
+                      "local memory, error="
                    << toString(result.error());
         return 1;
     }
@@ -195,15 +202,17 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     }
     void *ptr = allocate_buffer_allocator_memory(global_segment_size);
     if (!ptr) {
-        LOG(ERROR) << "Failed to allocate segment memory";
+        LOG(ERROR) << "DistributedObjectStore::setup - failed to allocate "
+                      "segment memory";
         return 1;
     }
     segment_ptr_.reset(ptr);
     auto mount_result =
         client_->MountSegment(segment_ptr_.get(), global_segment_size);
     if (!mount_result.has_value()) {
-        LOG(ERROR) << "Failed to mount segment: "
-                   << toString(mount_result.error());
+        LOG(ERROR)
+            << "DistributedObjectStore::setup - failed to mount segment, error="
+            << toString(mount_result.error());
         return 1;
     }
 
@@ -214,7 +223,8 @@ int DistributedObjectStore::initAll(const std::string &protocol_,
                                     const std::string &device_name,
                                     size_t mount_segment_size) {
     if (client_) {
-        LOG(ERROR) << "Client is already initialized";
+        LOG(ERROR) << "DistributedObjectStore::initAll - client is already "
+                      "initialized";
         return 1;
     }
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
@@ -319,13 +329,17 @@ int DistributedObjectStore::allocateSlices(
     std::vector<mooncake::Slice> &slices,
     const std::vector<Replica::Descriptor> &replica_list, uint64_t &length) {
     length = 0;
-    if (replica_list.empty()) return -1;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "DistributedObjectStore::allocateSlices - empty replica "
+                      "list provided";
+        return toInt(ErrorCode::INVALID_PARAMS);
+    }
     auto &replica = replica_list[0];
-    if(replica.is_memory_replica() == false) {
-        auto &disk_descriptor =replica.get_disk_descriptor();
+    if (replica.is_memory_replica() == false) {
+        auto &disk_descriptor = replica.get_disk_descriptor();
         length = disk_descriptor.file_size;
         return allocateSlices(slices, length);
-    }else{
+    } else {
         auto &memory_descriptors = replica.get_memory_descriptor();
         for (auto &handle : memory_descriptors.buffer_descriptors) {
             auto chunk_size = handle.size_;
@@ -372,11 +386,16 @@ int DistributedObjectStore::allocateBatchedSlices(
     const std::vector<std::vector<mooncake::Replica::Descriptor>>
         &replica_lists,
     std::unordered_map<std::string, uint64_t> &str_length_map) {
-    if (replica_lists.empty()) return -1;
+    if (replica_lists.empty()) {
+        LOG(ERROR) << "DistributedObjectStore::allocateBatchedSlices - empty "
+                      "replica lists provided";
+        return toInt(ErrorCode::INVALID_PARAMS);
+    }
     if (keys.size() != replica_lists.size()) {
-        LOG(ERROR) << "Keys size (" << keys.size()
-                   << ") doesn't match replica lists size ("
-                   << replica_lists.size() << ")";
+        LOG(ERROR) << "DistributedObjectStore::allocateBatchedSlices - keys "
+                      "size mismatch, keys_size="
+                   << keys.size()
+                   << ", replica_lists_size=" << replica_lists.size();
         return 1;
     }
 
@@ -385,22 +404,24 @@ int DistributedObjectStore::allocateBatchedSlices(
         const auto &replica_list = replica_lists[i];
 
         if (replica_list.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
+            LOG(ERROR) << "DistributedObjectStore::allocateBatchedSlices - "
+                          "empty replica list, key="
+                       << key;
             return 1;
         }
 
         // Get first replica
         const auto &replica = replica_list[0];
         uint64_t length = 0;
-        
-        if(replica.is_memory_replica() == false) {
-            auto &disk_descriptor =replica.get_disk_descriptor();
+
+        if (replica.is_memory_replica() == false) {
+            auto &disk_descriptor = replica.get_disk_descriptor();
             length = disk_descriptor.file_size;
             auto result = allocateSlices(batched_slices[key], length);
-            if(result) {
+            if (result) {
                 return 1;
             }
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 auto chunk_size = handle.size_;
@@ -440,7 +461,8 @@ int DistributedObjectStore::freeSlices(
 
 int DistributedObjectStore::tearDownAll() {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR) << "DistributedObjectStore::tearDownAll - client is not "
+                      "initialized";
         return 1;
     }
     // Reset all resources
@@ -456,14 +478,15 @@ int DistributedObjectStore::tearDownAll() {
 int DistributedObjectStore::put(const std::string &key,
                                 std::span<const char> value) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR) << "DistributedObjectStore::put - client is not initialized";
         return 1;
     }
     SliceGuard slices(*this);
     int ret = allocateSlices(slices.slices(), value);
     if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put operation, key: "
-                   << key << ", value size: " << value.size();
+        LOG(ERROR)
+            << "DistributedObjectStore::put - failed to allocate slices, key="
+            << key << ", value_size=" << value.size();
         return ret;
     }
 
@@ -472,8 +495,9 @@ int DistributedObjectStore::put(const std::string &key,
     config.preferred_segment = this->local_hostname;
     auto put_result = client_->Put(key, slices.slices(), config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
-                   << toString(put_result.error());
+        LOG(ERROR)
+            << "DistributedObjectStore::put - put operation failed, error="
+            << toString(put_result.error());
         return toInt(put_result.error());
     }
 
@@ -484,17 +508,21 @@ int DistributedObjectStore::put_batch(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR)
+            << "DistributedObjectStore::put_batch - client is not initialized";
         return 1;
     }
     if (keys.size() != values.size()) {
-        LOG(ERROR) << "Key and value size mismatch";
+        LOG(ERROR) << "DistributedObjectStore::put_batch - key and value size "
+                      "mismatch, keys_size="
+                   << keys.size() << ", values_size=" << values.size();
     }
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         batched_slices;
     int ret = allocateBatchedSlices(keys, values, batched_slices);
     if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put_batch operation";
+        LOG(ERROR)
+            << "DistributedObjectStore::put_batch - failed to allocate slices";
         return ret;
     }
 
@@ -509,7 +537,9 @@ int DistributedObjectStore::put_batch(
         if (it != batched_slices.end()) {
             ordered_batched_slices.emplace_back(it->second);
         } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
+            LOG(ERROR)
+                << "DistributedObjectStore::put_batch - missing slices, key="
+                << key;
             return 1;
         }
     }
@@ -519,8 +549,9 @@ int DistributedObjectStore::put_batch(
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
-            LOG(ERROR) << "BatchPut operation failed for key '" << keys[i]
-                       << "' with error: " << toString(results[i].error());
+            LOG(ERROR) << "DistributedObjectStore::put_batch - BatchPut "
+                          "operation failed, key="
+                       << keys[i] << ", error=" << toString(results[i].error());
             return toInt(results[i].error());
         }
     }
@@ -534,14 +565,16 @@ int DistributedObjectStore::put_batch(
 int DistributedObjectStore::put_parts(
     const std::string &key, std::vector<std::span<const char>> values) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR)
+            << "DistributedObjectStore::put_parts - client is not initialized";
         return 1;
     }
     SliceGuard slices(*this);
     int ret = allocateSlicesPacked(slices.slices(), values);
     if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put operation, key: "
-                   << key << ", values size: " << values.size();
+        LOG(ERROR) << "DistributedObjectStore::put_parts - failed to allocate "
+                      "slices, key="
+                   << key << ", values_size=" << values.size();
         return ret;
     }
     ReplicateConfig config;
@@ -549,7 +582,8 @@ int DistributedObjectStore::put_parts(
     config.preferred_segment = this->local_hostname;
     auto put_result = client_->Put(key, slices.slices(), config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
+        LOG(ERROR) << "DistributedObjectStore::put_parts - put operation "
+                      "failed, error="
                    << toString(put_result.error());
         return toInt(put_result.error());
     }
@@ -558,7 +592,7 @@ int DistributedObjectStore::put_parts(
 
 pybind11::bytes DistributedObjectStore::get(const std::string &key) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR) << "DistributedObjectStore::get - client is not initialized";
         return pybind11::bytes("\0", 0);
     }
 
@@ -583,6 +617,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
             py::gil_scoped_acquire acquire_gil;
             return kNullString;
         }
+
         int ret = allocateSlices(guard.slices(), replica_list, str_length);
         if (ret) {
             py::gil_scoped_acquire acquire_gil;
@@ -627,13 +662,15 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     const std::vector<std::string> &keys) {
     const auto kNullString = pybind11::bytes("\0", 0);
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR)
+            << "DistributedObjectStore::get_batch - client is not initialized";
         return {kNullString};
     }
     std::unordered_set<std::string> seen;
     for (const auto &key : keys) {
         if (!seen.insert(key).second) {
-            LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
+            LOG(ERROR) << "DistributedObjectStore::get_batch - duplicate key "
+                          "not supported, key="
                        << key;
             return {kNullString};
         }
@@ -653,8 +690,10 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         for (size_t i = 0; i < query_results.size(); ++i) {
             if (!query_results[i]) {
                 py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Query failed for key '" << keys[i]
-                           << "': " << toString(query_results[i].error());
+                LOG(ERROR)
+                    << "DistributedObjectStore::get_batch - query failed, key="
+                    << keys[i]
+                    << ", error=" << toString(query_results[i].error());
                 return {kNullString};
             }
             replica_lists.emplace_back(query_results[i].value());
@@ -672,8 +711,10 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         for (size_t i = 0; i < get_results.size(); ++i) {
             if (!get_results[i]) {
                 py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "BatchGet failed for key '" << keys[i]
-                           << "': " << toString(get_results[i].error());
+                LOG(ERROR) << "DistributedObjectStore::get_batch - BatchGet "
+                              "failed, key="
+                           << keys[i]
+                           << ", error=" << toString(get_results[i].error());
                 return {kNullString};
             }
         }
@@ -696,7 +737,8 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
             }
         }
         if (results.size() != keys.size()) {
-            LOG(ERROR) << "Results size does not match keys size";
+            LOG(ERROR) << "DistributedObjectStore::get_batch - results size "
+                          "does not match keys size";
             return {kNullString};
         }
         for (auto &slice : batched_slices) {
@@ -718,21 +760,22 @@ int DistributedObjectStore::remove(const std::string &key) {
 
 long DistributedObjectStore::removeAll() {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return -1;
+        LOG(ERROR) << "removeAll: Client is not initialized";
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
     auto result = client_->RemoveAll();
     if (!result) {
-        LOG(ERROR) << "RemoveAll failed: " << result.error();
-        return -1;
+        LOG(ERROR) << "removeAll failed with error: "
+                   << toString(result.error());
+        return toInt(result.error());
     }
     return result.value();
 }
 
 int DistributedObjectStore::isExist(const std::string &key) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return -1;
+        LOG(ERROR) << "isExist: Client is not initialized for key: " << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
     auto exist_result = client_->IsExist(key);
     if (!exist_result) {
@@ -748,8 +791,10 @@ std::vector<int> DistributedObjectStore::batchIsExist(
     std::vector<int> results;
 
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        results.resize(keys.size(), -1);  // Fill with error codes
+        LOG(ERROR) << "batchIsExist: Client is not initialized";
+        results.resize(
+            keys.size(),
+            toInt(ErrorCode::INTERNAL_ERROR));  // Fill with error codes
         return results;
     }
 
@@ -781,13 +826,15 @@ std::vector<int> DistributedObjectStore::batchIsExist(
 
 int64_t DistributedObjectStore::getSize(const std::string &key) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return -1;
+        LOG(ERROR) << "getSize: Client is not initialized for key: " << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
 
     auto query_result = client_->Query(key);
 
     if (!query_result) {
+        LOG(ERROR) << "getSize: Query failed for key: " << key
+                   << " with error: " << toString(query_result.error());
         return toInt(query_result.error());
     }
 
@@ -797,18 +844,20 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     int64_t total_size = 0;
     if (!replica_list.empty()) {
         auto &replica = replica_list[0];
-        if(replica.is_memory_replica() == false) {
+        if (replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
+        } else {
             auto &memory_descriptors = replica.get_memory_descriptor();
             for (auto &handle : memory_descriptors.buffer_descriptors) {
                 total_size += handle.size_;
             }
         }
     } else {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return -1;  // Internal error
+        LOG(ERROR)
+            << "getSize: Internal error - replica_list is empty for key: "
+            << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
 
     return total_size;
@@ -874,8 +923,8 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
     // Get the object data
     auto get_result = client_->Get(key, replica_list, guard.slices());
     if (!get_result) {
-        LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(get_result.error());
+        LOG(ERROR) << "DistributedObjectStore::get_buffer - get failed, key="
+                   << key << ", error=" << toString(get_result.error());
         return nullptr;
     }
 
@@ -896,13 +945,15 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
 
 int DistributedObjectStore::register_buffer(void *buffer, size_t size) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+        LOG(ERROR) << "DistributedObjectStore::register_buffer - client is not "
+                      "initialized";
         return 1;
     }
     auto register_result =
         client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false, false);
     if (!register_result) {
-        LOG(ERROR) << "Register buffer failed with error: "
+        LOG(ERROR) << "DistributedObjectStore::register_buffer - register "
+                      "buffer failed, error="
                    << toString(register_result.error());
         return toInt(register_result.error());
     }
@@ -929,8 +980,8 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return -1;
+        LOG(ERROR) << "get_into: Client is not initialized for key: " << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
 
     // Step 1: Get object info
@@ -938,11 +989,11 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
             VLOG(1) << "Object not found for key: " << key;
-            return -toInt(query_result.error());
+            return toInt(query_result.error());
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
-        return -toInt(query_result.error());
+        return toInt(query_result.error());
     }
 
     auto replica_list = query_result.value();
@@ -950,40 +1001,44 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     // Calculate total size from replica list
     uint64_t total_size = 0;
     if (replica_list.empty()) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return -1;
+        LOG(ERROR)
+            << "get_into: Internal error - replica_list is empty for key: "
+            << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
 
     auto &replica = replica_list[0];
-    if(replica.is_memory_replica() == false) {
+    if (replica.is_memory_replica() == false) {
         auto &disk_descriptor = replica.get_disk_descriptor();
         total_size = disk_descriptor.file_size;
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             total_size += handle.size_;
         }
     }
 
     // Check if user buffer is large enough
     if (size < total_size) {
-        LOG(ERROR) << "User buffer too small. Required: " << total_size
-                   << ", provided: " << size;
-        return -1;
+        LOG(ERROR) << "get_into: User buffer too small for key: " << key
+                   << ". Required: " << total_size << ", provided: " << size;
+        return toInt(ErrorCode::BUFFER_OVERFLOW);
     }
 
     // Step 2: Split user buffer according to object info and create slices
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
 
-    if(replica.is_memory_replica() == false) {
-        while(offset < total_size){
+    if (replica.is_memory_replica() == false) {
+        while (offset < total_size) {
             auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-    }else{
-        for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, handle.size_});
             offset += handle.size_;
@@ -995,7 +1050,7 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
-        return -toInt(get_result.error());
+        return toInt(get_result.error());
     }
 
     return static_cast<int>(total_size);
@@ -1005,36 +1060,38 @@ std::vector<int> DistributedObjectStore::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<int>(keys.size(), -1);
+        LOG(ERROR) << "batch_put_from: Client is not initialized";
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INTERNAL_ERROR));
     }
 
     if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
-        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
-        return std::vector<int>(keys.size(), -1);
+        LOG(ERROR) << "batch_put_from: Mismatched sizes - keys: " << keys.size()
+                   << ", buffers: " << buffers.size()
+                   << ", sizes: " << sizes.size();
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
 
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
-    
+
     // Create slices from user buffers
     for (size_t i = 0; i < keys.size(); ++i) {
         const std::string &key = keys[i];
         void *buffer = buffers[i];
         size_t size = sizes[i];
-        
+
         std::vector<mooncake::Slice> slices;
         uint64_t offset = 0;
-        
+
         while (offset < size) {
             auto chunk_size = std::min(size - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-        
+
         all_slices[key] = std::move(slices);
     }
-    
+
     ReplicateConfig config;
     config.replica_num = 1;                           // Make configurable
     config.preferred_segment = this->local_hostname;  // Make configurable
@@ -1046,8 +1103,9 @@ std::vector<int> DistributedObjectStore::batch_put_from(
         if (it != all_slices.end()) {
             ordered_batched_slices.emplace_back(it->second);
         } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return std::vector<int>(keys.size(), -1);
+            LOG(ERROR) << "batch_put_from: Missing slices for key: " << key;
+            return std::vector<int>(keys.size(),
+                                    toInt(ErrorCode::INTERNAL_ERROR));
         }
     }
 
@@ -1062,12 +1120,12 @@ std::vector<int> DistributedObjectStore::batch_put_from(
             LOG(ERROR) << "BatchPut operation failed for key '" << keys[i]
                        << "' with error: "
                        << toString(batch_put_results[i].error());
-            results[i] = -toInt(batch_put_results[i].error());
+            results[i] = toInt(batch_put_results[i].error());
         } else {
             results[i] = 0;
         }
     }
-    
+
     return results;
 }
 
@@ -1076,15 +1134,15 @@ std::vector<int> DistributedObjectStore::batch_get_into(
     const std::vector<size_t> &sizes) {
     // Validate preconditions
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<int>(keys.size(), -1);
+        LOG(ERROR) << "batch_get_into: Client is not initialized";
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INTERNAL_ERROR));
     }
 
     if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
-        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
-                   << ", buffers=" << buffers.size()
+        LOG(ERROR) << "batch_get_into: Input vector sizes mismatch - keys="
+                   << keys.size() << ", buffers=" << buffers.size()
                    << ", sizes=" << sizes.size();
-        return std::vector<int>(keys.size(), -1);
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
 
     const size_t num_keys = keys.size();
@@ -1116,8 +1174,8 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         if (!query_results[i]) {
             const auto error = query_results[i].error();
             results[i] = (error == ErrorCode::OBJECT_NOT_FOUND)
-                             ? -toInt(ErrorCode::OBJECT_NOT_FOUND)
-                             : -toInt(error);
+                             ? toInt(ErrorCode::OBJECT_NOT_FOUND)
+                             : toInt(error);
 
             if (error != ErrorCode::OBJECT_NOT_FOUND) {
                 LOG(ERROR) << "Query failed for key '" << key
@@ -1129,8 +1187,8 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         // Validate replica list
         auto replica_list = query_results[i].value();
         if (replica_list.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
-            results[i] = -1;
+            LOG(ERROR) << "batch_get_into: Empty replica list for key: " << key;
+            results[i] = toInt(ErrorCode::INTERNAL_ERROR);
             // TODO: We could early return here for prefix match case
             continue;
         }
@@ -1138,36 +1196,38 @@ std::vector<int> DistributedObjectStore::batch_get_into(
         // Calculate required buffer size
         const auto &replica = replica_list[0];
         uint64_t total_size = 0;
-        if(replica.is_memory_replica() == false) {
+        if (replica.is_memory_replica() == false) {
             auto &disk_descriptor = replica.get_disk_descriptor();
             total_size = disk_descriptor.file_size;
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 total_size += handle.size_;
             }
         }
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
-            LOG(ERROR) << "Buffer too small for key '" << key
+            LOG(ERROR) << "batch_get_into: Buffer too small for key '" << key
                        << "': required=" << total_size
                        << ", available=" << sizes[i];
-            results[i] = -1;
+            results[i] = toInt(ErrorCode::BUFFER_OVERFLOW);
             continue;
         }
 
         // Create slices for this key's buffer
         std::vector<Slice> key_slices;
         uint64_t offset = 0;
-        if(replica.is_memory_replica() == false) {
-            while(offset < total_size){
+        if (replica.is_memory_replica() == false) {
+            while (offset < total_size) {
                 auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
                 void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
                 offset += chunk_size;
             }
-        }else{
-            for (auto &handle : replica.get_memory_descriptor().buffer_descriptors) {
+        } else {
+            for (auto &handle :
+                 replica.get_memory_descriptor().buffer_descriptors) {
                 void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
                 offset += handle.size_;
@@ -1216,7 +1276,7 @@ std::vector<int> DistributedObjectStore::batch_get_into(
             const auto error = batch_get_results[j].error();
             LOG(ERROR) << "BatchGet failed for key '" << op.key
                        << "': " << toString(error);
-            results[op.original_index] = -toInt(error);
+            results[op.original_index] = toInt(error);
         }
     }
 
@@ -1228,8 +1288,8 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return -1;
+        LOG(ERROR) << "put_from: Client is not initialized for key: " << key;
+        return toInt(ErrorCode::INTERNAL_ERROR);
     }
 
     if (size == 0) {
@@ -1256,7 +1316,7 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
-        return -toInt(put_result.error());
+        return toInt(put_result.error());
     }
 
     return 0;

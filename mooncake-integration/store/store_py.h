@@ -124,7 +124,7 @@ class DistributedObjectStore {
      * @param buffer Pointer to the pre-allocated buffer (must be registered
      * with register_buffer)
      * @param size Size of the buffer
-     * @return Number of bytes read on success, negative value on error
+     * @return Number of bytes read on success, negative error code on error
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
@@ -137,7 +137,7 @@ class DistributedObjectStore {
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
-     * read on success, or a negative value on error
+     * read on success, or a negative error code on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
@@ -151,7 +151,7 @@ class DistributedObjectStore {
      * @param buffer Pointer to the buffer containing data (must be registered
      * with register_buffer)
      * @param size Size of the data to put
-     * @return 0 on success, negative value on error
+     * @return 0 on success, negative error code on error
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
@@ -164,7 +164,7 @@ class DistributedObjectStore {
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
      * @return Vector of integers, where each element is 0 on success, or a
-     * negative value on error
+     * negative error code on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
@@ -200,23 +200,21 @@ class DistributedObjectStore {
     /**
      * @brief Check if an object exists
      * @param key Key to check
-     * @return 1 if exists, 0 if not exists, -1 if error
+     * @return 1 if exists, 0 if not exists, negative error code on error
      */
     int isExist(const std::string &key);
 
     /**
      * @brief Check if multiple objects exist
      * @param keys Vector of keys to check
-     * @return Vector of existence results: 1 if exists, 0 if not exists, -1 if
-     * error
+     * @return Vector of existence results: 1 if exists, 0 if not exists, negative error code on error
      */
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     /**
      * @brief Get the size of an object
      * @param key Key of the object
-     * @return Size of the object in bytes, or -1 if error or object doesn't
-     * exist
+     * @return Size of the object in bytes, or negative error code on error/not found
      */
     int64_t getSize(const std::string &key);
 
