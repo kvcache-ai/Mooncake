@@ -116,6 +116,8 @@ class DistributedObjectStore {
 
     int register_buffer(void *buffer, size_t size);
 
+    int unregister_buffer(void *buffer);
+
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
