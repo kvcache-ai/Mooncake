@@ -1349,7 +1349,9 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
 
         this->register_buffer(reinterpret_cast<void*>(data_ptr), buffer_size);
         // Use put_from for direct memory access (zero-copy)
-        return this->put_from(key, reinterpret_cast<void*>(data_ptr), buffer_size);
+        int result = this->put_from(key, reinterpret_cast<void*>(data_ptr), buffer_size);
+        this->unregister_buffer(reinterpret_cast<void*>(data_ptr));
+        return result;
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
         return -1;
