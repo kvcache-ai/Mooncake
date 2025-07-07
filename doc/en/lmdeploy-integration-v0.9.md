@@ -47,7 +47,7 @@ pip install -e .
 
 ```bash
 lmdeploy serve proxy \
-	--server-name 192.168.0.147 \
+	--server-name <IP1> \
 	--server-port 8000 \
     --routing-strategy "min_expected_latency" \
 	--serving-strategy DistServe \
@@ -63,10 +63,10 @@ lmdeploy serve proxy \
 
 ```bash
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.101 \ 
+	--server-name <IP1> \ 
 	--server-port 23333 \  
 	--role Prefill \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--proxy-url http://<IP1>:8000 \   
 	--backend pytorch \
 	--migration-backend Mooncake
 ```
@@ -80,10 +80,10 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 
 ```bash
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.147 \ 
+	--server-name <IP2> \ 
 	--server-port 23334 \  
 	--role Decode \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--proxy-url http://<IP1>:8000 \   
 	--backend pytorch \
 	--migration-backend Mooncake
 ```
@@ -91,7 +91,7 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 #### Test Inference:
 
 ```bash
-curl -X POST "http://192.168.0.147:8000/v1/completions" \
+curl -X POST "http://<IP1>:8000/v1/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-8B",
@@ -110,7 +110,7 @@ curl -X POST "http://192.168.0.147:8000/v1/completions" \
 
 ```bash
 lmdeploy serve proxy \
-	--server-name 192.168.0.147 \
+	--server-name <IP> \
 	--server-port 8000 \
     --routing-strategy "min_expected_latency" \
 	--serving-strategy DistServe \
@@ -122,10 +122,10 @@ lmdeploy serve proxy \
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 lmdeploy serve api_server Qwen/Qwen3-8B \
-    --server-name 192.168.0.147 \
+    --server-name <IP> \
     --server-port 23333 \
     --role Prefill \
-    --proxy-url http://192.168.0.147:8000 \
+    --proxy-url http://<IP>:8000 \
     --backend pytorch \
     --migration-backend Mooncake
 ```
@@ -137,10 +137,10 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.147 \ 
+	--server-name <IP> \ 
 	--server-port 23334 \  
 	--role Decode \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--proxy-url http://<IP>:8000 \   
 	--backend pytorch \
 	--migration-backend Mooncake
 ```
@@ -148,7 +148,7 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 #### Test Inference:
 
 ```bash
-curl -X POST "http://192.168.0.147:8000/v1/completions" \
+curl -X POST "http://<IP>:8000/v1/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-8B",
