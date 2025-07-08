@@ -884,6 +884,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     auto result = master_client_.Remove(key);
+    if(storage_backend_) {
+        storage_backend_->RemoveFile(key);
+    }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -891,6 +894,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
+    if(storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
     return master_client_.RemoveAll();
 }
 

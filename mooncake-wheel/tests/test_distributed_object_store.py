@@ -187,6 +187,8 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Cleanup
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0, "Buffer unregistration should succeed")
+        self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
 
     def test_batch_get_into_operations(self):
@@ -261,6 +263,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Cleanup
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
@@ -333,6 +336,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Cleanup
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 

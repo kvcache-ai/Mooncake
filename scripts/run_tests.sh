@@ -28,13 +28,19 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
 kill $MASTER_PID || true
 
-# Disabled for now, need to investigate
-# echo "Running with ssd offload in evict tests..."
-# mooncake_master &
-# MASTER_PID=$!
-# sleep 1
-# MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_ssd_offload_in_evict.py
-# kill $MASTER_PID || true
+
+# Check if MOONCAKE_STORAGE_ROOT_DIR is set and not empty
+if [ -n "$MOONCAKE_STORAGE_ROOT_DIR" ]; then
+    echo "MOONCAKE_STORAGE_ROOT_DIR is set to: $MOONCAKE_STORAGE_ROOT_DIR"
+    echo "Running with ssd offload in evict tests..."
+    mooncake_master &
+    MASTER_PID=$!
+    sleep 1
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_ssd_offload_in_evict.py
+    kill $MASTER_PID || true
+else
+    echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
+fi
 
 echo "Running CLI entry point tests..."
 python test_cli.py

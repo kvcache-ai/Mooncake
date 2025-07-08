@@ -900,11 +900,26 @@ int DistributedObjectStore::register_buffer(void *buffer, size_t size) {
         return 1;
     }
     auto register_result =
-        client_->RegisterLocalMemory(buffer, size, kWildcardLocation);
+        client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false, false);
     if (!register_result) {
         LOG(ERROR) << "Register buffer failed with error: "
                    << toString(register_result.error());
         return toInt(register_result.error());
+    }
+    return 0;
+}
+
+int DistributedObjectStore::unregister_buffer(void *buffer) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return 1;
+    }
+    auto unregister_result =
+        client_->unregisterLocalMemory(buffer, false);
+    if (!unregister_result) {
+        LOG(ERROR) << "Unregister buffer failed with error: "
+                   << toString(unregister_result.error());
+        return toInt(unregister_result.error());
     }
     return 0;
 }
@@ -1320,6 +1335,16 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("buffer_ptr"), py::arg("size"),
             "Register a memory buffer for direct access operations")
+        .def(
+            "unregister_buffer",
+            [](DistributedObjectStore &self, uintptr_t buffer_ptr) {
+                // Unregister memory buffer
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.unregister_buffer(buffer);
+            },
+            py::arg("buffer_ptr"), "Unregister a previously registered memory "
+                                   "buffer for direct access operations")
         .def(
             "get_into",
             [](DistributedObjectStore &self, const std::string &key,

@@ -4,17 +4,18 @@
 
 Mooncake Store is a high-performance **distributed key-value (KV) cache storage engine** designed specifically for LLM inference scenarios.
 
-Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the former, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
+Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
 
 Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
-- **Eventual consistency**: Mooncake Store ensures that `Get` operations read complete and correct data, but does not guarantee the latest written data. This eventual consistency model ensures high performance while simplifying system design.
+- **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
 - **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
+​- **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
 
@@ -61,7 +62,7 @@ ErrorCode Get(const std::string& object_key,
 ![mooncake-store-simple-get](../image/mooncake-store-simple-get.png)
 
 
-Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.
+Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.​​(When persistence is enabled, if a query request fails in memory, the system will attempt to locate and load the corresponding data from SSD.)​
 
 > In the current implementation, the Get interface has an optional TTL feature. When the value corresponding to `object_key` is fetched for the first time, the corresponding entry is automatically deleted after a certain period of time (1s by default).
 
@@ -75,7 +76,7 @@ ErrorCode Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter. The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, after a successful in-memory put request, an asynchronous persistence operation to SSD will be initiated.)​ The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
 enum class MediaType {
@@ -396,6 +397,20 @@ There are two startup parameters in `master_service` related to the soft pin mec
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Multi-layer Storage Support
+
+This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
+
+#### Enabling Persistence Functionality
+
+When a user specifies the environment variable `MOONCAKE_STORAGE_ROOT_DIR` at client startup, and the path is a valid existing directory, the client-side data persistence feature will be activated. During initialization, the client requests a `cluster_id` from the master. This ID can be specified when initializing the master; if not provided, the default value `mooncake_cluster` will be used. The root directory for persistence is then set to `<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`. Note that when using DFS, each client must specify the corresponding DFS mount directory to enable data sharing across SSDs.
+
+#### Data Access Mechanism
+
+In the current implementation, all operations on kvcache objects (e.g., read/write/query) are performed entirely on the client side, with no awareness by the master. The file system maintains the key-to-kvcache-object mapping through a fixed indexing mechanism, where each file corresponds to one kvcache object (the filename is the associated key).
+
+When persistence is enabled, every successful `Put`or`BatchPut` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `Get`or `BatchGet` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
+
 ## Mooncake Store Python API
 
 ### setup
@@ -639,10 +654,14 @@ retcode = store.setup(
 ```
 
 2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
+   To enable the persistence feature, run:
+`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
+   To enable the persistence feature, run:
+`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 The absence of error messages indicates successful data transfer.
 
