@@ -271,6 +271,16 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
+    bool inject_failure = false;
+    if (getenv("MC_INJECT_FAILURE")) {
+        if (context_.nicPath() == getenv("MC_INJECT_FAILURE")) {
+            inject_failure = (SimpleRandom::Get().next(100) % 100 == 0);
+        }
+        if (inject_failure) {
+            LOG(WARNING) << "Injecting a failure on device "
+                         << context_.nicPath();
+        }
+    }
     size_t qp_list_size = has_diag_cq_ ? qp_list_.size() - 1 : qp_list_.size();
     int qp_index = SimpleRandom::Get().next(qp_list_size);
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
@@ -299,7 +309,7 @@ int RdmaEndPoint::submitPostSend(
         wr.send_flags = IBV_SEND_SIGNALED;
         wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
         wr.imm_data = 0;
-        wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
+        wr.wr.rdma.remote_addr = inject_failure ? 0 : slice->rdma.dest_addr;
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
