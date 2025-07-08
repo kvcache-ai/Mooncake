@@ -602,11 +602,11 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
-    // Initialize Google's flags library
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
-
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);
+
+    // Initialize Google's flags library
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
 
     // Run all tests
     return RUN_ALL_TESTS();

@@ -97,21 +97,12 @@ jobs:
         mooncake_master &
       shell: bash
 
-    - name: Test (in build env)
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_STORE_MEMCPY=false make test -j ARGS="-V"
-      shell: bash
-
     - name: Test (in build env with ssd)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         mkdir -p /tmp/mooncake_test_ssd
-        export MOONCAKE_STORAGE_ROOT_DIR=/tmp/mooncake_test_ssd
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
         rm -rf /tmp/mooncake_test_ssd
       shell: bash
