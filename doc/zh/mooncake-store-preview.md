@@ -6,7 +6,7 @@ Mooncake Store 是一款专为LLM推理场景设计的高性能**分布式键值
 
 与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于后者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
 
-Mooncake Store 提供了底层对象存储和管理功能，而具体的缓存策略（如淘汰策略）则交由上层框架（比如vLLM）或用户实现，从而提供更高的灵活性和可定制性。
+Mooncake Store 提供了底层的对象存储和管理能力，包括可配置的缓存与淘汰策略，具有高内存利用率，专为加速LLM推理性能而设计。
 
 Mooncake Store 的主要特性包括：
 
@@ -394,6 +394,20 @@ virtual std::shared_ptr<BufHandle> Allocate(
 为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
+
+### 软固定机制（即将上线）
+
+对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
+
+如果某个软固定的对象长时间未被访问，其软固定状态将被解除。而后当该对象再次被访问时，它将自动重新进入软固定状态。
+
+`master_service` 中有两个与软固定机制相关的启动参数：
+
+* `default_kv_soft_pin_ttl`：表示一个被软固定的对象在多长时间（毫秒）未被访问后会自动解除软固定状态。默认值为`30 分钟`。
+
+* `allow_evict_soft_pinned_objects`：是否允许替换已被软固定的对象。默认值为 `true`。
+
+被软固定的对象仍然可以通过 `Remove`、`RemoveAll` 等 API 主动删除。
 
 ### 分级缓存支持
 
