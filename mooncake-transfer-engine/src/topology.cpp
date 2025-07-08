@@ -177,10 +177,27 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
+        
+        // Find HCAs with minimum distance in one pass
+        int min_distance = INT_MAX;
+        std::vector<std::string> min_distance_hcas;
+        
         for (const auto &hca : all_hca) {
-            // FIXME: currently we only identify the NICs connected to the same
-            // PCIe switch/RC with GPU as preferred.
-            if (getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id) == 0) {
+            int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
+            if (distance >= 0) {
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    min_distance_hcas.clear();
+                    min_distance_hcas.push_back(hca.name);
+                } else if (distance == min_distance) {
+                    min_distance_hcas.push_back(hca.name);
+                }
+            }
+        }
+        
+        // Add HCAs with minimum distance to preferred_hca, others to avail_hca
+        for (const auto &hca : all_hca) {
+            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(), hca.name) != min_distance_hcas.end()) {
                 preferred_hca.push_back(hca.name);
             } else {
                 avail_hca.push_back(hca.name);
