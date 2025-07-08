@@ -297,5 +297,4 @@ class TestDistributedObjectStore(unittest.TestCase):
     
 
 if __name__ == "__main__":
-    os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = "/tmp/mooncake_test_ssd"
     unittest.main()
