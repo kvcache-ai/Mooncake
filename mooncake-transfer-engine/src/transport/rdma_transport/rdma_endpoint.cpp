@@ -273,7 +273,7 @@ int RdmaEndPoint::submitPostSend(
     if (!active_) return 0;
     bool inject_failure = false;
     if (getenv("MC_INJECT_FAILURE")) {
-        if (context_.nicPath() == getenv("MC_INJECT_FAILURE")) {
+        if (context_.deviceName() == getenv("MC_INJECT_FAILURE")) {
             inject_failure = (SimpleRandom::Get().next(100) % 100 == 0);
         }
         if (inject_failure) {
