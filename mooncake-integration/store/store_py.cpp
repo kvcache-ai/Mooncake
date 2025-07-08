@@ -1262,6 +1262,17 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
+template <typename T>
+py::array create_typed_array(char* exported_data, size_t total_length) {
+    py::capsule free_when_done(exported_data, [](void* p) { delete[] static_cast<T*>(p); });
+    
+    return py::array_t<T>(
+                {static_cast<ssize_t>(total_length/sizeof(T))},
+                (T*)exported_data,
+                free_when_done
+            );
+}
+
 pybind11::object DistributedObjectStore::get_tensor(const std::string &key, const std::string dtype) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1313,14 +1324,33 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key, cons
         // Convert bytes to tensor using torch.from_numpy
 
         py::object py_buffer = py::memoryview::from_memory(exported_data, total_length);
-        pybind11::object np_array = numpy.attr("frombuffer")(py_buffer, dtype);
-        
+        pybind11::object np_array;
+        if(dtype=="float32") {
+            np_array = create_typed_array<float>(exported_data, total_length);
+        }else if(dtype=="float64") {
+            np_array = create_typed_array<double>(exported_data, total_length);
+        }else if(dtype=="int8") {
+            np_array = create_typed_array<int8_t>(exported_data, total_length);
+        }else if(dtype=="uint8") {
+            np_array = create_typed_array<uint8_t>(exported_data, total_length);
+        }else if(dtype=="int16") {
+            np_array = create_typed_array<int16_t>(exported_data, total_length);
+        }else if(dtype=="uint16") {
+            np_array = create_typed_array<uint16_t>(exported_data, total_length);
+        }else if(dtype=="int32") {
+            np_array = create_typed_array<int32_t>(exported_data, total_length);
+        }else if(dtype=="uint32") {
+            np_array = create_typed_array<uint32_t>(exported_data, total_length);
+        }else if(dtype=="int64") {
+            np_array = create_typed_array<int64_t>(exported_data, total_length);
+        }else if(dtype=="uint64") {
+            np_array = create_typed_array<uint64_t>(exported_data, total_length);
+        }else if(dtype=="bool") {
+            np_array = create_typed_array<bool>(exported_data, total_length);
+        }
+
         // Create tensor from numpy array
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
-        
-        // Clean up exported data
-        delete[] exported_data;
-        
         return tensor;
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to convert bytes to tensor: " << e.what();
