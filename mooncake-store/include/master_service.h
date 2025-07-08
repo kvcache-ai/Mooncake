@@ -60,6 +60,8 @@ class MasterService {
    public:
     MasterService(bool enable_gc = true,
                   uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
+                  uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
+                  bool allow_evict_soft_pinned_objects = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
                   double eviction_ratio = DEFAULT_EVICTION_RATIO,
                   double eviction_high_watermark_ratio =
                       DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
@@ -257,8 +259,15 @@ class MasterService {
     // GC thread function
     void GCThreadFunc();
 
-    // Check all shards and try to evict some keys
-    void BatchEvict(double eviction_ratio);
+    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
+    // object with smaller lease timeout. It has two passes. The first pass only
+    // evicts objects without soft pin. The second pass prioritizes objects
+    // without soft pin, but also allows to evict soft pinned objects if
+    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
+    // evict ratio target. If the actual evicted ratio is less than
+    // evict_ratio_lowerbound, the second pass will be triggered and try to
+    // fulfill evict ratio lowerbound.
+    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
@@ -266,15 +275,25 @@ class MasterService {
     // Internal data structures
     struct ObjectMetadata {
         // RAII-style metric management
-        ~ObjectMetadata() { MasterMetricManager::instance().dec_key_count(1); }
+        ~ObjectMetadata() {
+            MasterMetricManager::instance().dec_key_count(1);
+            if (soft_pin_timeout) {
+                MasterMetricManager::instance().dec_soft_pin_key_count(1);
+            }
+        }
 
         ObjectMetadata() = delete;
 
-        ObjectMetadata(size_t value_length, std::vector<Replica>&& reps)
+        ObjectMetadata(size_t value_length, std::vector<Replica>&& reps, bool enable_soft_pin)
             : replicas(std::move(reps)),
               size(value_length),
-              lease_timeout(std::chrono::steady_clock::now()) {
+              lease_timeout(),
+              soft_pin_timeout(std::nullopt) {
             MasterMetricManager::instance().inc_key_count(1);
+            if (enable_soft_pin) {
+                soft_pin_timeout.emplace();
+                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+            }
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -284,11 +303,15 @@ class MasterService {
 
         std::vector<Replica> replicas;
         size_t size;
-        std::chrono::steady_clock::time_point lease_timeout;
+        // Default constructor, creates a time_point representing
+        // the Clock's epoch (i.e., time_since_epoch() is zero).
+        std::chrono::steady_clock::time_point lease_timeout;  // hard lease
+        std::optional<std::chrono::steady_clock::time_point>
+            soft_pin_timeout;  // optional soft pin, only set for vip objects
 
-        // Check if there is some replica with a different status than the given
-        // value. If there is, return the status of the first replica that is
-        // not equal to the given value. Otherwise, return false.
+        // Check if there are some replicas with a different status than the
+        // given value. If there are, return the status of the first replica
+        // that is not equal to the given value. Otherwise, return false.
         std::optional<ReplicaStatus> HasDiffRepStatus(
             ReplicaStatus status) const {
             for (const auto& replica : replicas) {
@@ -301,10 +324,16 @@ class MasterService {
 
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
-        void GrantLease(const uint64_t ttl) {
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) {
+            std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
             lease_timeout =
-                std::max(lease_timeout, std::chrono::steady_clock::now() +
-                                            std::chrono::milliseconds(ttl));
+                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
+            if (soft_pin_timeout) {
+                soft_pin_timeout =
+                    std::max(*soft_pin_timeout,
+                             now + std::chrono::milliseconds(soft_ttl));
+            }
         }
 
         // Check if the lease has expired
@@ -315,6 +344,18 @@ class MasterService {
         // Check if the lease has expired
         bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
             return now >= lease_timeout;
+        }
+
+        // Check if is in soft pin status
+        bool IsSoftPinned() const {
+            return soft_pin_timeout &&
+                   std::chrono::steady_clock::now() < *soft_pin_timeout;
+        }
+
+        // Check if is in soft pin status
+        bool IsSoftPinned(
+            std::chrono::steady_clock::time_point& now) const {
+            return soft_pin_timeout && now < *soft_pin_timeout;
         }
     };
 
@@ -351,6 +392,8 @@ class MasterService {
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;  // in milliseconds
+    const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
     std::atomic<bool> need_eviction_{
