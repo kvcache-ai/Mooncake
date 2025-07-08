@@ -14,6 +14,8 @@
 
 #include "multi_transport.h"
 
+#include <string>
+
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
@@ -22,6 +24,9 @@
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
+#endif
+#ifdef USE_ASCEND
+#include "transport/ascend_transport/hccl_transport/hccl_transport.h"
 #endif
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -198,6 +203,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new NVMeoFTransport();
     }
 #endif
+#ifdef USE_ASCEND
+    else if (std::string(proto) == "ascend") {
+        transport = new HcclTransport();
+    }
+#endif
 #ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
@@ -223,7 +233,7 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
-                                       entry.target_id);
+                                       std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
     if (!transport_map_.count(proto)) {

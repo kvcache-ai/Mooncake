@@ -16,7 +16,11 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>  // Ubuntu
+#else
+#include <json/json.h>  // CentOS
+#endif
 #include <netdb.h>
 
 #include <atomic>
@@ -59,6 +63,18 @@ class TransferMetadata {
         std::unordered_map<std::string, std::string> local_path_map;
     };
 
+    struct RankInfoDesc {
+        uint64_t rankId = 0xFFFFFFFF; // rank id, user rank
+        std::string hostIp;
+        uint64_t hostPort;
+        uint64_t deviceLogicId;
+        uint64_t devicePhyId;
+        uint64_t deviceType = 5; // default
+        std::string deviceIp;
+        uint64_t devicePort;
+        uint64_t pid;
+    };
+
     using SegmentID = uint64_t;
 
     struct SegmentDesc {
@@ -72,6 +88,8 @@ class TransferMetadata {
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
+        // this is for ascend
+        RankInfoDesc rank_info;
 
         void dump() const;
     };

@@ -228,7 +228,8 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->active()) {
-            context_.deleteEndpoint(entry.first);
+            if (endpoint->inactiveTime() > 1.0)
+                context_.deleteEndpoint(entry.first); // enable for re-establishation
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -347,7 +348,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 
     for (auto &slice : slice_list) {
-        if (slice->rdma.retry_cnt == slice->rdma.max_retry_cnt) {
+        if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
@@ -415,6 +416,7 @@ int WorkerPool::doProcessContextEvents() {
                event.event_type == IBV_EVENT_PORT_ERR ||
                event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
+        context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now inactive";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {

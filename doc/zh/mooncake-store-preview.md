@@ -4,7 +4,7 @@
 
 Mooncake Store 是一款专为LLM推理场景设计的高性能**分布式键值 KV Cache 存储引擎**。
 
-与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于前者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
+与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于后者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
 
 Mooncake Store 提供了底层对象存储和管理功能，而具体的缓存策略（如淘汰策略）则交由上层框架（比如vLLM）或用户实现，从而提供更高的灵活性和可定制性。
 
@@ -12,9 +12,11 @@ Mooncake Store 的主要特性包括：
 
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
 *   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
-*   **最终一致性**：保证 Get 操作读取到完整且正确的数据，但不保证读取到最新写入的数据。这种最终一致性模型在确保高性能的同时，简化了系统设计。
+*   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
 *   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
-*   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理，将在未来版本中完善实现。
+*   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
+*   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
+*   **分级缓存**: 支持将 RAM 中缓存数据卸载到 SSD 中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
 
 ## 架构
 
@@ -23,9 +25,15 @@ Mooncake Store 由一个全局的`Master Service` 进行分配存储空间池职
 
 ![architecture](../../image/mooncake-store-preview.png)
 
-如上图所示，在 Mooncake Store Preview 中，有两个关键组件：
+如上图所示，在 Mooncake Store 中，有两个关键组件：
 1. Master Service，用于管理整个集群的逻辑存储空间池（Logical Memory Pool），并维护节点的进入与退出。这是一个独立运行的进程，会对外提供 RPC 服务。需要注意的是，Transfer Engine所需的元数据服务（通过etcd、redis或HTTP等）不包含在Master Service内，需要另行部署。
 2. Client 与 vLLM 实例共享一个进程（至少目前版本是这样）。每个 Client 分配了一定大小的 DRAM 空间，作为逻辑存储空间池（Logical Memory Pool）的一个部分。因此，数据传输实际上是从一个 Client 到另一个 Client，不经过 Master。
+
+Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
+**默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
+**高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
+如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
+leader 通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
 
 ## Client C++ API
 
@@ -36,7 +44,7 @@ ErrorCode Init(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
                void** protocol_args,
-               const std::string& master_addr);
+               const std::string& master_server_entry);
 ```
 
 初始化 Mooncake Store 客户端。其中各参数含义如下：
@@ -44,7 +52,7 @@ ErrorCode Init(const std::string& local_hostname,
 - `metadata_connstring` 表示 Transfer Engine 初始化所需的 etcd/redis 等元数据服务的地址
 - `protocol` 为 Transfer Engine 所支持的协议，包括rdma、tcp
 - `protocol_args` 是Transfer Engine 需要的协议参数
-- `master_addr` 是Master的地址信息IP:Port
+- `master_server_entry` 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
 
 
 ### Get 接口
@@ -57,7 +65,7 @@ ErrorCode Get(const std::string& object_key,
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
 
 
-用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。
+用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。（当启用了持久化功能时，若内存的 `Query` 请求失败，会尝试从SSD中寻找并载入对应的数据）
 
 > 在目前的实现中，Get 接口可选 TTL 功能。当首次获取 `object_key` 对应的值后一段时间（默认为 1s），相应的条目会被自动删除。
 
@@ -71,7 +79,7 @@ ErrorCode Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。
+用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，在内存的 `Put` 请求成功后，会异步发起一次数据向SSD的持久化操作）
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
@@ -387,6 +395,19 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
+### 分级缓存支持
+
+本系统提供了分级缓存架构的支持，通过内存缓存与持久化存储相结合的方式实现高效数据访问。数据首先存储在内存缓存中，并会异步写入分布式文件系统（DFS，Distributed File System）作为备份，形成"内存-SSD持久化存储"的分级缓存结构。
+
+#### 持久化功能启用方法
+
+当用户在启动client时指定了`MOONCAKE_STORAGE_ROOT_DIR`的环境变量，且该路径为一个已存在的有效路径时，则client端的数据持久化功能就会开始工作。同时在client启动时，会向master请求一个`cluster_id`，该id可以在初始化master进行指定，若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`。注意在使用DFS时，需要在各client上分别指定DFS对应的挂载目录，以实现SSD上数据之间的共享。
+
+#### 数据访问机制
+在目前的实现版本中，kvcache object的读\写\查询等操作都是完全在client端完成的，master对其无感知。在文件系统中key -> kvcache object的索引信息是由固定的索引机制来维护的，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
+
+启用持久化功能后，对于每次成功写入memory的 `Put`或`BatchPut` 操作，都会异步地发起一次持久化操作，写入DFS当中。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
+
 ## Mooncake Store Python API
 
 ### setup
@@ -411,16 +432,16 @@ def setup(
 - `local_buffer_size`: 本地缓冲区分配大小（默认 16MB）
 - `protocol`: 通信协议 ("tcp" 或 "rdma")
 - `rdma_devices`: RDMA 设备规格（格式取决于具体实现）
-- `master_server_addr`: 主服务器地址 (host:port 格式)
+- `master_server_addr`: 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
 
 **返回值**  
 - `int`: 状态码 (0 = 成功，非零 = 错误)
 
 ---
 
-### initAll
+### init_all
 ```python
-def initAll(
+def init_all(
     self,
     protocol: str,
     device_name: str,
@@ -535,10 +556,19 @@ store.close()
 
 ## 编译及使用方法
 Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
+
+默认模式:
 ```
-mkdir build
-cd build
-cmake ..
+mkdir build && cd build
+cmake .. # 默认模式
+make
+sudo make install # 安装 Python 接口支持包
+```
+
+高可用模式:
+```
+mkdir build && cd build
+cmake .. -DSTORE_USE_ETCD # 编译 etcd 客户端接口封装模块，依赖 go
 make
 sudo make install # 安装 Python 接口支持包
 ```
@@ -556,10 +586,38 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+**高可用模式**:
+
+高可用模式依赖于 etcd 服务进行协调。如果 Transfer Engine 也使用 etcd 作为其元数据服务，那么 Mooncake Store 使用的 etcd 集群可以与 Transfer Engine 使用的集群共用，也可以是独立的。
+
+高可用模式支持部署多个 master 实例，以消除单点故障。每个 master 实例启动时必须带上以下参数：
+```
+--enable-ha：启用高可用模式
+--etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
+--rpc-address：该实例的 RPC 地址
+```
+
+例如:
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-address=10.0.0.1
+```
+
 ### 启动验证程序
 Mooncake Store 提供了多种验证程序，包括基于 C++ 和 Python 等接口形态。下面以 `stress_cluster_benchmark` 为例介绍一下如何运行。
 
 1. 打开 `stress_cluster_benchmark.py`，结合网络情况修改初始化代码，重点是 local_hostname（对应本机 IP 地址）、metadata_server（对应 Transfer Engine 元数据服务）、master_server_address（对应 Master Service 地址及端口）等：
+
+打开 `stress_cluster_benchmark.py`，根据你的网络环境更新初始化设置。特别注意以下字段：
+```
+local_hostname：本机的 IP 地址
+metadata_server：Transfer Engine 元数据服务的地址
+master_server_address：Master 服务的地址
+```
+**注意**：`master_server_address` 的格式取决于部署模式。在默认模式下，使用格式 `IP:Port`，表示单个 master 节点的地址。在高可用模式下，使用格式 `etcd://IP:Port;IP:Port;...;IP:Port`，表示 etcd 集群各节点的地址。
+例如：
 ```python
 import os
 import time
@@ -598,9 +656,9 @@ retcode = store.setup(
 ```
 
 2. 在一台机器上运行 `ROLE=prefill python3 ./stress_cluster_benchmark.py`，启动 Prefill 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
 3. 在另一台机器上运行 `ROLE=decode python3 ./stress_cluster_benchmark.py`，启动 Decode 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
 
 无报错信息表示数据传输成功。
 

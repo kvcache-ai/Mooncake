@@ -242,6 +242,18 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (std::getenv("MC_USE_IPV6")) {
         config.use_ipv6 = true;
     }
+
+    const char *fragment_ratio = std::getenv("MC_FRAGMENT_RATIO");
+    if (fragment_ratio) {
+        size_t val = atoi(fragment_ratio);
+        if (val > 0 && val < config.slice_size)
+            config.fragment_limit = config.slice_size / val;
+        else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_FRAGMENT_RATIO and set it to 4 as default";
+            config.fragment_limit = config.slice_size / 4;
+        }
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

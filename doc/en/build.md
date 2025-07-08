@@ -1,6 +1,11 @@
 # Build Guide
 
-This document describes how to build Mooncake.
+This document describes how to build Mooncake from source.
+
+- Note: we have prebuild the pypi wheel for Ubuntu 22.04/24.04, you can simply install mooncake with pip/pip3.
+   ```bash
+   pip3 install mooncake-transfer-engine --upgrade
+   ```
 
 ## Automatic
 
