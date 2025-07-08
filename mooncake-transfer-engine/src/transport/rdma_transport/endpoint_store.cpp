@@ -49,9 +49,9 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(context->cq(), config.num_qp_per_ep,
+                                  config.max_sge, config.max_wr,
+                                  config.max_inline, context->diagnosticCq());
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -143,9 +143,9 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(context->cq(), config.num_qp_per_ep,
+                                  config.max_sge, config.max_wr,
+                                  config.max_inline, context->diagnosticCq());
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();

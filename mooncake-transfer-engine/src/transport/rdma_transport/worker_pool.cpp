@@ -89,9 +89,11 @@ int WorkerPool::submitPostSend(
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id))
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id);
+        if (!segment_desc_map.count(target_id)) {
+            auto desc = context_.engine().meta()->getSegmentDescByID(target_id);
+            segment_desc_map[target_id] = desc;
+            connectivityTest(target_id, *desc);
+        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
@@ -142,6 +144,13 @@ int WorkerPool::submitPostSend(
         auto peer_nic_path =
             MakeNicPath(peer_segment_desc->name,
                         peer_segment_desc->devices[device_id].name);
+        {
+            RWSpinlock::ReadGuard guard(probe_lock);
+            if (probe_unconnected_list.count(peer_nic_path)) {
+                slice->markFailed();
+                continue;
+            }
+        }
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
         slice_list_map[shard_id].push_back(slice);
@@ -229,7 +238,8 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(entry.first); // enable for re-establishation
+                context_.deleteEndpoint(
+                    entry.first);  // enable for re-establishation
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -451,5 +461,49 @@ void WorkerPool::monitorWorker() {
         if (event.data.fd == context_.context()->async_fd)
             doProcessContextEvents();
     }
+}
+
+void WorkerPool::connectivityTest(int segment_id,
+                                  RdmaTransport::SegmentDesc &remote_desc) {
+    if (probe_completed) return;
+    RWSpinlock::WriteGuard guard(probe_lock);
+    if (probe_completed) return;
+    int num_packets = 0;
+    for (auto &device : remote_desc.devices) {
+        auto peer_nic_path = MakeNicPath(remote_desc.name, device.name);
+        auto endpoint = context_.endpoint(peer_nic_path);
+        if (endpoint->connected()) continue;
+        if (endpoint->setupConnectionsByActive() ||
+            endpoint->submitZeroByteMessage()) {
+            probe_unconnected_list.insert(peer_nic_path);
+            continue;
+        }
+        num_packets++;
+    }
+    while (num_packets) {
+        ibv_wc wc_list[16];
+        int nr_poll = ibv_poll_cq(context_.diagnosticCq(), 16, wc_list);
+        if (nr_poll < 0) {
+            LOG(ERROR) << "ConnectivityTest: Failed to poll completion queues";
+            for (auto &device : remote_desc.devices) {
+                auto peer_nic_path = MakeNicPath(remote_desc.name, device.name);
+                probe_unconnected_list.insert(peer_nic_path);
+            }
+            return;
+        }
+        for (int i = 0; i < nr_poll; ++i) {
+            if (wc_list[i].status != IBV_WC_SUCCESS) {
+                auto context = (RdmaContext *)wc_list[i].wr_id;
+                auto peer_nic_path =
+                    MakeNicPath(remote_desc.name, context->deviceName());
+                probe_unconnected_list.insert(peer_nic_path);
+            }
+        }
+        num_packets -= nr_poll;
+    }
+    for (auto &entry : probe_unconnected_list) {
+        context_.deleteEndpoint(entry);
+    }
+    probe_completed = true;
 }
 }  // namespace mooncake

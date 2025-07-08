@@ -117,6 +117,8 @@ class RdmaContext {
 
     ibv_cq *cq();
 
+    ibv_cq *diagnosticCq() { return diag_cq_; }
+
     volatile int *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
@@ -175,6 +177,8 @@ class RdmaContext {
     std::shared_ptr<WorkerPool> worker_pool_;
 
     volatile bool active_;
+
+    ibv_cq *diag_cq_; // CQ for diagnostic purpose
 };
 
 }  // namespace mooncake

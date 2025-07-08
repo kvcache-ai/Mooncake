@@ -50,7 +50,8 @@ class RdmaEndPoint {
     ~RdmaEndPoint();
 
     int construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
-                  size_t max_wr = 256, size_t max_inline = 64);
+                  size_t max_wr = 256, size_t max_inline = 64,
+                  ibv_cq *diag_cq = nullptr);
 
    private:
     int deconstruct();
@@ -73,9 +74,9 @@ class RdmaEndPoint {
 
     bool active() const { return active_; }
 
-    void set_active(bool flag) { 
+    void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag; 
+        active_ = flag;
         if (!flag) inactive_time_ = getCurrentTimeInNano();
     }
 
@@ -109,6 +110,8 @@ class RdmaEndPoint {
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
+    
+    int submitZeroByteMessage();
 
    private:
     std::vector<uint32_t> qpNum() const;
@@ -136,6 +139,7 @@ class RdmaEndPoint {
     volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
+    bool has_diag_cq_;
 };
 
 }  // namespace mooncake
