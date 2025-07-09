@@ -22,7 +22,8 @@ Mooncake Store 的主要特性包括：
 ### Get 接口
 
 ```C++
-StatusCode Get(const String& object_key, std::vector<Slice>* slices);
+tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+                                  std::vector<Slice>& slices);
 ```
 ![mooncake-store-client-get](../../image/mooncake-store-client-get.png)
 用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的，但不保证是最新版本的数据。
@@ -35,14 +36,16 @@ struct ReplicateConfig {
     uint64_t replica_num; // 指定对象的副本数量
 };
 
-StatusCode Put(const ObjectKey& key, const std::vector<Slice>& slices, const ReplicateConfig& config);
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
 ```
 ![mooncake-store-client-put](../../image/mooncake-store-client-put.png)
 用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量，系统中的 Leader 节点将**尽最大努力**完成数据复制。
 
 ### Remove 接口
 ```C++
-StatusCode Remove(const ObjectKey& key);
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 用于删除指定 key 对应的对象。该接口会移除存储引擎中与 key 关联的所有数据副本。如果删除操作成功，相关的资源将被释放，确保后续的存储空间可以被重新利用。
 

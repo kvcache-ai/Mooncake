@@ -55,8 +55,8 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-ErrorCode Get(const std::string& object_key, 
-              std::vector<Slice>& slices);
+tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+                                  std::vector<Slice>& slices);
 ```
 
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
@@ -69,9 +69,9 @@ Used to retrieve the value corresponding to `object_key`. The retrieved data is 
 ### Put
 
 ```C++
-ErrorCode Put(const ObjectKey& key,
-              std::vector<Slice>& slices,
-              const ReplicateConfig& config);
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
 ```
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
@@ -99,7 +99,7 @@ struct ReplicateConfig {
 ### Remove
 
 ```C++
-ErrorCode Remove(const ObjectKey& key);
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
@@ -269,9 +269,9 @@ The Master Service needs to maintain mappings related to `BufferAllocator` and o
 - MountSegment
 
 ```C++
-ErrorCode MountSegment(uint64_t buffer,
-                       uint64_t size,
-                       const std::string& segment_name);
+tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
+                                          uint64_t size,
+                                          const std::string& segment_name);
 ```
 
 The storage node (Client) registers the storage segment space with the Master Service.
@@ -279,7 +279,7 @@ The storage node (Client) registers the storage segment space with the Master Se
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
 ```
 
 The storage node (Client) unregisters the storage segment space with the Master Service.
@@ -312,7 +312,7 @@ The Client requests the Master Service to retrieve the replica list for a specif
 - Remove
 
 ```C++
-ErrorCode Remove(const std::string& key);
+tl::expected<void, ErrorCode> Remove(const std::string& key);
 ```
 
 The Client requests the Master Service to delete all replicas corresponding to the specified key.

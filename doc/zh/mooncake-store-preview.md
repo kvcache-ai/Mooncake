@@ -58,8 +58,8 @@ ErrorCode Init(const std::string& local_hostname,
 ### Get 接口
 
 ```C++
-ErrorCode Get(const std::string& object_key, 
-              std::vector<Slice>& slices);
+tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+                                  std::vector<Slice>& slices);
 ```
 
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
@@ -72,9 +72,9 @@ ErrorCode Get(const std::string& object_key,
 ### Put 接口
 
 ```C++
-ErrorCode Put(const ObjectKey& key,
-              std::vector<Slice>& slices,
-              const ReplicateConfig& config);
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
 ```
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
@@ -103,7 +103,7 @@ struct ReplicateConfig {
 ### Remove 接口
 
 ```C++
-ErrorCode Remove(const ObjectKey& key);
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
@@ -276,9 +276,9 @@ message UnMountSegmentResponse {
 - MountSegment
 
 ```C++
-ErrorCode MountSegment(uint64_t buffer,
-                       uint64_t size,
-                       const std::string& segment_name);
+tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
+                                          uint64_t size,
+                                          const std::string& segment_name);
 ```
 
 存储节点(Client)向`Master Service`注册存储段空间。
@@ -286,7 +286,7 @@ ErrorCode MountSegment(uint64_t buffer,
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
 ```
 
 存储节点(Client)向`Master Service`注销存储段空间。
@@ -320,7 +320,7 @@ ErrorCode GetReplicaList(const std::string& key,
 - Remove
 
 ```C++
-ErrorCode Remove(const std::string& key);
+tl::expected<void, ErrorCode> Remove(const std::string& key);
 ```
 
 `Client`向`Master Service`请求删除指定key的所有副本。
