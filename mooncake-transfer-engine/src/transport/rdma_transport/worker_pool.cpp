@@ -467,10 +467,12 @@ void WorkerPool::connectivityTest(int segment_id,
                                   RdmaTransport::SegmentDesc &remote_desc) {
     if (probe_completed) return;
     RWSpinlock::WriteGuard guard(probe_lock);
-    LOG(INFO) << "Start connectivity test";
     if (probe_completed) return;
+    LOG(INFO) << "Start connectivity test";
     int num_packets = 0;
     for (auto &device : remote_desc.devices) {
+        // eRDMA doesn't support zero byte message
+        if (device.name.starts_with("erdma")) continue;
         auto peer_nic_path = MakeNicPath(remote_desc.name, device.name);
         auto endpoint = context_.endpoint(peer_nic_path);
         if (endpoint->connected()) continue;
