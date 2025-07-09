@@ -876,7 +876,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices, ReplicateConfig& config) {
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     StartBatchPut(ops, config);
     SubmitTransfers(ops);
@@ -887,7 +888,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     auto result = master_client_.Remove(key);
-    if(storage_backend_) {
+    if (storage_backend_) {
         storage_backend_->RemoveFile(key);
     }
     if (!result) {
@@ -897,7 +898,7 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
-    if(storage_backend_) {
+    if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
     return master_client_.RemoveAll();

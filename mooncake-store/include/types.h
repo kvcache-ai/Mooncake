@@ -208,10 +208,9 @@ inline std::ostream& operator<<(std::ostream& os,
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
-    size_t replica_num{0};
+    size_t replica_num{1};
     bool with_soft_pin{false};
-    std::string preferred_segment{};  // Preferred segment for allocation,
-                                      // defaults to client's local hostname
+    std::string preferred_segment{};  // Preferred segment for allocation
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
