@@ -126,6 +126,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
+    segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma") {
@@ -254,6 +255,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
+    desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
