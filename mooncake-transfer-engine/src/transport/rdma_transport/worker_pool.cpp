@@ -110,9 +110,10 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        buffer_id, device_id)) {
+        auto hint = globalConfig().enable_dest_device_affinity ? context_.deviceName() : "";
+        if (RdmaTransport::selectDevice(
+                peer_segment_desc.get(), slice->rdma.dest_addr, slice->length,
+                hint, buffer_id, device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -125,7 +126,7 @@ int WorkerPool::submitPostSend(
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, buffer_id, device_id)) {
+                    slice->length, hint, buffer_id, device_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
