@@ -9,7 +9,6 @@
 
 #include "allocator.h"
 #include "client.h"
-#include "utils.h"
 
 namespace mooncake {
 
@@ -221,8 +220,7 @@ class DistributedObjectStore {
     int64_t getSize(const std::string &key);
 
    private:
-    int allocateSlices(std::vector<mooncake::Slice> &slices,
-                                           size_t length);
+    int allocateSlices(std::vector<mooncake::Slice> &slices, size_t length);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);
