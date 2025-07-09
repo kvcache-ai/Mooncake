@@ -467,6 +467,7 @@ void WorkerPool::connectivityTest(int segment_id,
                                   RdmaTransport::SegmentDesc &remote_desc) {
     if (probe_completed) return;
     RWSpinlock::WriteGuard guard(probe_lock);
+    LOG(INFO) << "Start connectivity test";
     if (probe_completed) return;
     int num_packets = 0;
     for (auto &device : remote_desc.devices) {
@@ -503,7 +504,9 @@ void WorkerPool::connectivityTest(int segment_id,
     }
     for (auto &entry : probe_unconnected_list) {
         context_.deleteEndpoint(entry);
+        LOG(INFO) << "Endpoint " << entry << " is banned";
     }
+    LOG(INFO) << "Connectivity test completed";
     probe_completed = true;
 }
 }  // namespace mooncake
