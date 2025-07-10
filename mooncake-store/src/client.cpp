@@ -465,15 +465,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           const ReplicateConfig& config) {
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
-    size_t slice_size = 0;
     for (size_t i = 0; i < slices.size(); ++i) {
         slice_lengths.emplace_back(slices[i].size);
-        slice_size += slices[i].size;
     }
 
     // Start put operation
-    auto start_result =
-        master_client_.PutStart(key, slice_lengths, slice_size, config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, config);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -590,16 +587,13 @@ std::vector<PutOperation> Client::CreatePutOperations(
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
-    std::vector<size_t> value_lengths;
     std::vector<std::vector<uint64_t>> slice_lengths;
 
     keys.reserve(ops.size());
-    value_lengths.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
-        value_lengths.emplace_back(op.value_length);
 
         std::vector<uint64_t> slice_sizes;
         slice_sizes.reserve(op.slices.size());
@@ -609,8 +603,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         slice_lengths.emplace_back(std::move(slice_sizes));
     }
 
-    auto start_responses = master_client_.BatchPutStart(keys, value_lengths,
-                                                        slice_lengths, config);
+    auto start_responses =
+        master_client_.BatchPutStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
     if (start_responses.size() != ops.size()) {
@@ -887,7 +881,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     auto result = master_client_.Remove(key);
-    if(storage_backend_) {
+    if (storage_backend_) {
         storage_backend_->RemoveFile(key);
     }
     if (!result) {
@@ -897,7 +891,7 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
-    if(storage_backend_) {
+    if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
     return master_client_.RemoveAll();

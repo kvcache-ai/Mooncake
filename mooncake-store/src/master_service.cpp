@@ -325,13 +325,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
     return results;
 }
 
-auto MasterService::PutStart(const std::string& key, uint64_t value_length,
+auto MasterService::PutStart(const std::string& key,
                              const std::vector<uint64_t>& slice_lengths,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    if (config.replica_num == 0 || value_length == 0 || key.empty()) {
+    if (config.replica_num == 0 || key.empty() || slice_lengths.empty()) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
-                   << ", value_length=" << value_length
+                   << ", slice_count=" << slice_lengths.size()
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -349,14 +349,7 @@ auto MasterService::PutStart(const std::string& key, uint64_t value_length,
         total_length += slice_lengths[i];
     }
 
-    if (total_length != value_length) {
-        LOG(ERROR) << "key=" << key << ", total_length=" << total_length
-                   << ", expected_length=" << value_length
-                   << ", error=slice_length_mismatch";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    VLOG(1) << "key=" << key << ", value_length=" << value_length
+    VLOG(1) << "key=" << key << ", value_length=" << total_length
             << ", slice_count=" << slice_lengths.size() << ", config=" << config
             << ", action=put_start_begin";
 
@@ -422,7 +415,7 @@ auto MasterService::PutStart(const std::string& key, uint64_t value_length,
     // PutEnd is called.
     metadata_shards_[shard_idx].metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(value_length, std::move(replicas),
+        std::forward_as_tuple(total_length, std::move(replicas),
                               config.with_soft_pin));
     return replica_list;
 }
@@ -463,29 +456,6 @@ auto MasterService::PutRevoke(const std::string& key)
 
     accessor.Erase();
     return {};
-}
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchPutStart(
-    const std::vector<std::string>& keys,
-    const std::vector<uint64_t>& value_lengths,
-    const std::vector<std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config) {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    results.reserve(keys.size());
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i >= value_lengths.size() || i >= slice_lengths.size()) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-
-        results.emplace_back(
-            PutStart(keys[i], value_lengths[i], slice_lengths[i], config));
-    }
-    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
