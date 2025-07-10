@@ -111,7 +111,8 @@ class DistributedObjectStore {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
-    int put(const std::string &key, std::span<const char> value);
+    int put(const std::string &key, std::span<const char> value,
+            const ReplicateConfig &config = ReplicateConfig{});
 
     int register_buffer(void *buffer, size_t size);
 
@@ -154,7 +155,8 @@ class DistributedObjectStore {
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int put_from(const std::string &key, void *buffer, size_t size);
+    int put_from(const std::string &key, void *buffer, size_t size,
+                 const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put object data directly from pre-allocated buffers for multiple
@@ -162,20 +164,24 @@ class DistributedObjectStore {
      * @param keys Vector of keys of the objects to put
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
+     * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    std::vector<int> batch_put_from(const std::vector<std::string> &keys,
-                                    const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes);
+    std::vector<int> batch_put_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     int put_parts(const std::string &key,
-                  std::vector<std::span<const char>> values);
+                  std::vector<std::span<const char>> values,
+                  const ReplicateConfig &config = ReplicateConfig{});
 
     int put_batch(const std::vector<std::string> &keys,
-                  const std::vector<std::span<const char>> &values);
+                  const std::vector<std::span<const char>> &values,
+                  const ReplicateConfig &config = ReplicateConfig{});
 
     pybind11::bytes get(const std::string &key);
 
