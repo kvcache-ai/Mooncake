@@ -6,18 +6,16 @@
 #include <unistd.h>
 #include <sys/file.h>
 
-#include "local_file.h"
+#include "file_interface.h"
 
 namespace mooncake {
-LocalFile::LocalFile(const std::string& filename,FILE *file,ErrorCode ec) : filename_(filename),file_(file),error_code_(ec) {
+PosixFile::PosixFile(const std::string& filename, FILE *file) : StorageFile(filename), file_(file){
     if (!file_ || ferror(file_)) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;  
-    } else if (ec != ErrorCode::OK) {
-        error_code_ = ec;  
-    }
+    } 
 }
 
-LocalFile::~LocalFile() {
+PosixFile::~PosixFile() {
     if (file_) {
         release_lock();
         if (fclose(file_) != 0) {
@@ -36,7 +34,7 @@ LocalFile::~LocalFile() {
     file_ = nullptr;
 }
 
-ssize_t LocalFile::write(const std::string &buffer, size_t length){
+ssize_t PosixFile::write(const std::string &buffer, size_t length){
     if (file_ == nullptr) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -86,7 +84,7 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
     return written_bytes;
 }
 
-ssize_t LocalFile::read(std::string &buffer, size_t length){
+ssize_t PosixFile::read(std::string &buffer, size_t length){
     if (file_ == nullptr) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -124,7 +122,7 @@ ssize_t LocalFile::read(std::string &buffer, size_t length){
     return read_bytes;
 }
 
-ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
+ssize_t PosixFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
     if(!file_){
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -163,7 +161,7 @@ ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
 }
 
 
-ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
+ssize_t PosixFile::preadv(const iovec *iov, int iovcnt, off_t offset){
     if(!file_){
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -196,7 +194,7 @@ ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
     return ret;
 }
 
-int LocalFile::acquire_write_lock(){
+int PosixFile::acquire_write_lock(){
     if (flock(fileno(file_), LOCK_EX) == -1) {
         return -1;
     }
@@ -204,7 +202,7 @@ int LocalFile::acquire_write_lock(){
     return 0;
 }
 
-int LocalFile::acquire_read_lock(){
+int PosixFile::acquire_read_lock(){
     if (flock(fileno(file_), LOCK_SH) == -1) {
         return -1;
     }
@@ -212,7 +210,7 @@ int LocalFile::acquire_read_lock(){
     return 0;
 }
 
-int LocalFile::release_lock(){
+int PosixFile::release_lock(){
     if (!is_locked_) return 0;
     if (flock(fileno(file_), LOCK_UN) == -1) {
         return -1;

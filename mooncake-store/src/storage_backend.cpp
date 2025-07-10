@@ -18,24 +18,21 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    FILE* file = fopen(path.c_str(), "wb");
-    size_t slices_total_size = 0;
-    std::vector<iovec> iovs;
-
+    auto file = create_file(path, "wb");
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
-    }    
+    }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
-
+    std::vector<iovec> iovs;
+    size_t slices_total_size = 0;
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
         iovs.push_back(io);
         slices_total_size += slice.size;
     }
 
-    ssize_t ret = local_file.pwritev(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->pwritev(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
         LOG(INFO) << "pwritev failed for: " << path;
@@ -66,17 +63,14 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
     
-    FILE* file = fopen(path.c_str(), "wb");
-    size_t file_total_size=str.size();
-
+    auto file = create_file(path, "wb");
     if (!file) {
-        LOG(INFO) << "Failed to open file for reading: " << path;
+        LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
-
-    ssize_t ret = local_file.write(str, file_total_size);
+    size_t file_total_size = str.size();
+    ssize_t ret = file->write(str, file_total_size);
 
     if (ret < 0) {
         LOG(INFO) << "pwritev failed for: " << path;
@@ -106,18 +100,80 @@ ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
     return LoadObjectInPath(path, slices);
 }
 
+// ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
+//                                         std::vector<Slice>& slices) {
+//     // 总耗时统计
+//     auto total_start = std::chrono::high_resolution_clock::now();
+    
+//     // 阶段1: 文件打开耗时
+//     auto open_start = std::chrono::high_resolution_clock::now();
+//     auto file = create_file(path, "rb");
+//     auto open_end = std::chrono::high_resolution_clock::now();
+    
+//     if (!file) {
+//         LOG(INFO) << "Failed to open file for reading: " << path;
+//         return ErrorCode::FILE_OPEN_FAIL;
+//     }
+
+//     // 阶段2: 准备IO向量耗时
+//     auto prepare_start = std::chrono::high_resolution_clock::now();
+//     std::vector<iovec> iovs;
+//     size_t slices_total_size = 0;                                        
+//     for (const auto& slice : slices) {
+//         iovec io{ slice.ptr, slice.size };
+//         iovs.push_back(io);
+//         slices_total_size += slice.size;
+//     }
+//     auto prepare_end = std::chrono::high_resolution_clock::now();
+
+//     // 阶段3: 实际读取耗时
+//     auto read_start = std::chrono::high_resolution_clock::now();
+//     ssize_t ret = file->preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
+//     auto read_end = std::chrono::high_resolution_clock::now();
+
+//     if (ret < 0) {
+//         LOG(INFO) << "preadv failed for: " << path;
+//         return ErrorCode::FILE_READ_FAIL;
+//     }
+//     if (ret != static_cast<ssize_t>(slices_total_size)) {
+//         LOG(INFO) << "Read size mismatch for: " << path
+//                  << ", expected: " << slices_total_size
+//                  << ", got: " << ret;
+//         return ErrorCode::FILE_READ_FAIL;
+//     }
+
+//     // 计算各阶段耗时
+//     auto total_end = std::chrono::high_resolution_clock::now();
+    
+//     auto open_duration = std::chrono::duration_cast<std::chrono::microseconds>(open_end - open_start);
+//     auto prepare_duration = std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
+//     auto read_duration = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start);
+//     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
+
+//     // 记录耗时日志
+//     LOG(INFO) << "LoadObjectInPath timing for " << path << ": "
+//               << "Total=" << total_duration.count() << "μs ("
+//               << "Open=" << open_duration.count() << "μs ("
+//               << (open_duration.count() * 100.0 / total_duration.count()) << "%), "
+//               << "Prepare=" << prepare_duration.count() << "μs ("
+//               << (prepare_duration.count() * 100.0 / total_duration.count()) << "%), "
+//               << "Read=" << read_duration.count() << "μs ("
+//               << (read_duration.count() * 100.0 / total_duration.count()) << "%))";
+
+//     return ErrorCode::OK;
+// }
+
 ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
                                     std::vector<Slice>& slices) {
-    FILE* file = fopen(path.c_str(), "rb");
-    size_t slices_total_size=0;
-    std::vector<iovec> iovs;
 
+    auto file = create_file(path, "rb");
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
+    std::vector<iovec> iovs;
+    size_t slices_total_size = 0;                                        
 
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
@@ -125,7 +181,7 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
         slices_total_size += slice.size;
     }
 
-    ssize_t ret = local_file.preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
         LOG(INFO) << "preadv failed for: " << path;
@@ -148,23 +204,20 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
 ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
                                     std::string& str) {
     std::string path = ResolvePath(key);
-    FILE* file = fopen(path.c_str(), "rb");
-    size_t file_total_size=0;
 
+    auto file = create_file(path, "rb");
     if (!file) {
+        LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    fseek(file, 0, SEEK_END);
-    file_total_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    size_t file_total_size = file->length();
 
-    LocalFile local_file(path,file,ErrorCode::OK);
-
-    ssize_t ret = local_file.read(str, file_total_size);
+    ssize_t ret = file->read(str, file_total_size);
+    
 
     if (ret < 0) {
-        LOG(INFO) << "preadv failed for: " << path;
+        LOG(INFO) << "read failed for: " << path;
         return ErrorCode::FILE_READ_FAIL;
     }
     if (ret != static_cast<ssize_t>(file_total_size)) {
@@ -179,6 +232,58 @@ ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
 
     return ErrorCode::OK;
 }
+
+// std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
+//     // 开始总耗时计时
+//     auto total_start = std::chrono::high_resolution_clock::now();
+    
+//     std::string path = ResolvePath(key);
+//     namespace fs = std::filesystem;
+
+//     // 文件存在性检查耗时
+//     auto exists_start = std::chrono::high_resolution_clock::now();
+//     bool file_exists = fs::exists(path);
+//     auto exists_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+//         std::chrono::high_resolution_clock::now() - exists_start);
+    
+//     if (!file_exists) {
+//         // 记录总耗时（仅存在性检查）
+//         auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+//             std::chrono::high_resolution_clock::now() - total_start);
+//         LOG(INFO) << "[Latency] QueryKey failed - exists_check: " << exists_duration.count() 
+//                   << "us, total: " << total_duration.count() << "us";
+//         return std::nullopt;
+//     }
+
+//     // 文件元数据获取耗时
+//     Replica::Descriptor desc;
+//     auto metadata_start = std::chrono::high_resolution_clock::now();
+//     try {
+//         auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+//         disk_desc.file_path = path;
+//         disk_desc.file_size = fs::file_size(path);  // 可能抛出异常
+//         desc.status = ReplicaStatus::COMPLETE;
+//     } catch (const fs::filesystem_error& e) {
+//         // 记录异常情况耗时
+//         auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+//             std::chrono::high_resolution_clock::now() - total_start);
+//         LOG(ERROR) << "[Latency] QueryKey failed - metadata_error: " << e.what()
+//                    << ", exists_check: " << exists_duration.count() 
+//                    << "us, total: " << total_duration.count() << "us";
+//         return std::nullopt;
+//     }
+//     auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+//         std::chrono::high_resolution_clock::now() - metadata_start);
+
+//     // 记录成功情况总耗时
+//     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+//         std::chrono::high_resolution_clock::now() - total_start);
+//     LOG(INFO) << "[Latency] QueryKey success - exists_check: " << exists_duration.count() 
+//               << "us, metadata: " << metadata_duration.count() 
+//               << "us, total: " << total_duration.count() << "us";
+
+//     return desc;
+// }
 
 std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
     std::string path = ResolvePath(key);
@@ -308,6 +413,64 @@ std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
     fs::path full_path = dir_path / SanitizeKey(key);
     
     return full_path.lexically_normal().string();
+}
+
+std::pair<int, int> StorageBackend::parse_mode_flags(const std::string& mode) const{
+    int flags = O_CLOEXEC;
+    int access_mode = 0;
+    
+    if (mode.find('w') != std::string::npos) {
+        access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+    } else if (mode.find('r') != std::string::npos) {
+        access_mode = O_RDONLY;
+    } else if (mode.find('a') != std::string::npos) {
+        access_mode = O_APPEND | O_CREAT;
+    }
+    
+    if (mode.find('+') != std::string::npos) {
+        access_mode = O_RDWR;
+    }
+    if (mode.find('x') != std::string::npos) {
+        flags |= O_EXCL;
+    }
+    
+    return {flags | access_mode, access_mode};
+}
+
+std::unique_ptr<StorageFile> StorageBackend::create_posix_file(
+    const std::string& path, const std::string& mode) const 
+{
+    FILE* file = fopen(path.c_str(), mode.c_str());
+    return file ? std::make_unique<PosixFile>(path, file) : nullptr;
+}
+#ifdef USE_3FS
+std::unique_ptr<StorageFile> StorageBackend::create_3fs_file(
+    const std::string& path, const std::string& mode) const 
+{
+    // 转换模式字符串到flags
+    auto [flags, access_mode] = parse_mode_flags(mode);
+    
+    // 打开文件描述符
+    int fd = open(path.c_str(), flags, 0644);
+    if (fd < 0) return nullptr;
+    
+    // 注册到3FS
+    if (hf3fs_reg_fd(fd, 0) > 0) {
+        close(fd);
+        return nullptr;
+    }
+    
+    return ThreeFSFile::create(path, fd, resource_manager_.get());
+}
+#endif
+std::unique_ptr<StorageFile> StorageBackend::create_file(
+    const std::string& path, const std::string& mode) const {
+#ifdef USE_3FS
+    if (is_3fs_dir_) {
+        return create_3fs_file(path, mode); // 3FS专用逻辑
+    }
+#endif
+    return create_posix_file(path, mode);   // 默认POSIX逻辑
 }
 
 }  // namespace mooncake

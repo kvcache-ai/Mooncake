@@ -67,6 +67,7 @@ option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
+option(USE_3FS "option for using 3FS storage backend" ON)
 
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
@@ -139,6 +140,10 @@ if (WITH_METRICS)
   message(STATUS "metrics is enabled")
 endif()
 
+if(USE_3FS)
+  add_compile_definitions(USE_3FS)
+  message(STATUS "3FS storage backend is enabled")
+endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(gflags REQUIRED)

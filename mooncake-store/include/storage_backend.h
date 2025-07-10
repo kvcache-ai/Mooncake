@@ -5,7 +5,7 @@
 #include <mutex>
 #include <fstream>
 #include <types.h>
-#include <local_file.h>
+#include <file_interface.h>
 #include <filesystem>
 #include <thread>
 #include <chrono>
@@ -25,7 +25,18 @@ class StorageBackend  {
      * @param fsdir  subdirectory name
      * @note Directory existence is not checked in constructor
      */
-    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir): root_dir_(root_dir), fsdir_(fsdir) {}
+    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir, bool is_3fs_dir)
+        : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
+            #ifdef USE_3FS
+            resource_manager_ = std::make_unique<USRBIOResourceManager>();
+            ThreeFSParams params;
+            params.mount_root = root_dir;
+            params.iov_size = 16 << 20; // 16MB
+            params.ior_entries = 16;
+            params.io_depth = 0;
+            resource_manager_->setDefaultParams(params);
+            #endif
+        }
 
     /**
      * @brief Factory method to create a StorageBackend instance
@@ -49,8 +60,13 @@ class StorageBackend  {
             LOG(INFO) << "FSDIR cannot be empty";
             return nullptr;
         }
+
+        fs::path root_path(root_dir);
+
+        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") && 
+                    fs::is_directory(root_path / "3fs-virt");
         std::string real_fsdir = "moon_" + fsdir;
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir);
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir, is_3fs_dir);
     }  
     
     /**
@@ -132,7 +148,10 @@ class StorageBackend  {
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
-    
+    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS directory structure
+    #ifdef USE_3FS
+    std::unique_ptr<USRBIOResourceManager> resource_manager_;
+    #endif
    private:
     /**
      * @brief Sanitizes object key for filesystem safety
@@ -146,6 +165,17 @@ class StorageBackend  {
 
     ErrorCode LoadObjectInPath(const std::string& path,
                                     std::vector<Slice>& slices);
+    
+    std::pair<int, int> parse_mode_flags(const std::string& mode) const;
+
+    std::unique_ptr<StorageFile> create_posix_file(
+    const std::string& path, const std::string& mode) const ;
+    #ifdef USE_3FS
+    std::unique_ptr<StorageFile> create_3fs_file(
+    const std::string& path, const std::string& mode) const ;
+    #endif
+    std::unique_ptr<StorageFile> create_file(const std::string& path, 
+                                           const std::string& mode) const;
 
 };
 
