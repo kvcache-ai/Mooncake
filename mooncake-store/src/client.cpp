@@ -870,7 +870,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices, ReplicateConfig& config) {
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     StartBatchPut(ops, config);
     SubmitTransfers(ops);
