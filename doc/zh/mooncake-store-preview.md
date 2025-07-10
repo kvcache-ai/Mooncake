@@ -20,18 +20,32 @@ Mooncake Store 的主要特性包括：
 
 ## 架构
 
-Mooncake Store 由一个全局的`Master Service` 进行分配存储空间池职责。
-具体的分配细节由 `BufferAllocator` 类实现，结合 `AllocationStrategy` 策略类协调分配行为。
-
 ![architecture](../../image/mooncake-store-preview.png)
 
-如上图所示，在 Mooncake Store 中，有两个关键组件：
-1. Master Service，用于管理整个集群的逻辑存储空间池（Logical Memory Pool），并维护节点的进入与退出。这是一个独立运行的进程，会对外提供 RPC 服务。需要注意的是，Transfer Engine所需的元数据服务（通过etcd、redis或HTTP等）不包含在Master Service内，需要另行部署。
-2. Client 与 vLLM 实例共享一个进程（至少目前版本是这样）。每个 Client 分配了一定大小的 DRAM 空间，作为逻辑存储空间池（Logical Memory Pool）的一个部分。因此，数据传输实际上是从一个 Client 到另一个 Client，不经过 Master。
+如上图所示，Mooncake Store 中有两个关键组件：**Master Service** 和 **Client**。
+
+**Master Service**：`Master Service` 负责管理整个集群的逻辑存储空间池，并处理节点的加入与退出事件。它负责为对象分配存储空间，并维护对象的元数据。具体的分配逻辑由 `BufferAllocator` 类实现，并通过 `AllocationStrategy` 类进行协调。
+
+`Master Service` 作为一个独立进程运行，并向外部组件提供 RPC 服务。需要注意的是，`Transfer Engine` 所依赖的 `metadata service`（可通过 etcd、Redis 或 HTTP 等方式实现）不包含在 `Master Service` 中，需要单独部署。
+
+**Client**：在 Mooncake Store 中，`Client` 类是唯一用于表示客户端逻辑的类，但它承担着**两种不同的角色**：
+
+1. 作为 **客户端**，由上层应用调用，用于发起 `Put`、`Get` 等请求。
+2. 作为 **存储服务器**，它托管一段连续的内存区域，作为分布式 KV 缓存的一部分，使其内存可以被其他 `Client` 实例访问。数据传输实际上是发生在不同 `Client` 实例之间，绕过了 `Master Service`。
+
+可以通过配置使 `Client` 实例仅执行上述两种角色中的一种：
+
+* 如果将 `global_segment_size` 设置为 0，则该实例作为 **纯客户端**，只发起请求，但不贡献内存给系统。
+* 如果将 `local_buffer_size` 设置为 0，则该实例作为 **纯服务器**，仅提供内存用于存储。在这种情况下，该实例不允许发起 `Get` 或 `Put` 等请求操作。
+
+`Client` 有两种运行模式：
+
+1. **嵌入式模式**：作为共享库（`.so`）被导入，与 LLM 推理程序（例如 vLLM 实例）运行在同一进程中。
+2. **独立模式**：作为一个独立进程运行。
 
 Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
-**默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
-**高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
+1. **默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
+2. **高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
 如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
 leader 通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
 
@@ -395,7 +409,7 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
-### 软固定机制（即将上线）
+### 软固定机制
 
 对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
 

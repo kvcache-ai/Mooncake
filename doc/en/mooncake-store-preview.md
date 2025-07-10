@@ -19,13 +19,25 @@ Key features of Mooncake Store include:
 
 ## Architecture
 
-Mooncake Store is managed by a global **Master Service** responsible for allocating storage space pools. The specific allocation details are implemented by the `BufferAllocator` class, coordinated by the `AllocationStrategy` strategy class.
-
 ![architecture](../../image/mooncake-store-preview.png)
 
-As shown in the figure above, there are two key components in Mooncake Store:
-1. **Master Service**: Manages the logical storage space pool of the entire cluster and maintains node entry and exit. This is an independently running process that provides RPC services externally. Note that the metadata service required by the Transfer Engine (via etcd, Redis, or HTTP, etc.) is not included in the Master Service and needs to be deployed separately.
-2. **Client**: Shares a process with the vLLM instance (at least in the current version). Each Client is allocated a certain size of DRAM space, serving as part of the logical storage space pool. Therefore, data transfer is actually from one Client to another, bypassing the Master.
+As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
+
+**Master Service**: The `Master Service` manages the logical storage space pool for the entire cluster and handles node join and leave events. It is responsible for allocating space for objects and maintaining their metadata. The actual allocation logic is implemented by the `BufferAllocator` class and coordinated through the `AllocationStrategy` class.
+
+The `Master Service` runs as an independent process and exposes RPC services to external components. Note that the `metadata service` required by the `Transfer Engine` (via etcd, Redis, or HTTP, etc.) is not included in the `Master Service` and needs to be deployed separately.
+
+**Client**: In Mooncake Store, the `Client` class is the only class defined to represent the client-side logic, but it serves **two distinct roles**:
+1. As a **client**, it is invoked by upper-layer applications to issue `Put`, `Get` and other requests.
+2. As a **store server**, it hosts a segment of contiguous memory that contributes to the distributed KV cache, making its memory available to other `Clients`. Data transfer is actually from one `Client` to another, bypassing the `Master Service`.
+
+It is possible to configure a `Client` instance to act in only one of its two roles:
+* If `global_segment_size` is set to zero, the instance functions as a **pure client**, issuing requests but not contributing memory to the system.
+* If `local_buffer_size` is set to zero, it acts as a **pure server**, providing memory for storage. In this case, request operations such as `Get` or `Put` are not permitted from this instance.
+
+The `Client` can be used in two modes:
+1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library (`.so`).
+2. **Standalone mode**: Runs as an independent process.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
@@ -383,7 +395,7 @@ To avoid data conflicts, a per-object lease will be granted whenever an `ExistKe
 
 The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
 
-### Soft Pin (Upcoming)
+### Soft Pin
 
 For important and frequently used objects, such as system prompts, Mooncake Store provides a soft pin mechanism. When putting an object, it can be configured to enable soft pin. During eviction, objects that are not soft pinned are prioritized for eviction. Soft pinned objects are only evicted when memory is insufficient and no other objects are eligible for eviction.
 
@@ -442,9 +454,9 @@ Initializes storage configuration and network parameters.
 
 ---
 
-### init_all
+### initAll
 ```python
-def init_all(
+def initAll(
     self,
     protocol: str,
     device_name: str,
