@@ -40,8 +40,7 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
         }
 
         // Attempt to put the key.
-        auto put_result =
-            service->PutStart(key, 1024, {1024}, {.replica_num = 1});
+        auto put_result = service->PutStart(key, {1024}, {.replica_num = 1});
         if (put_result.has_value()) {
             replica_list = std::move(put_result.value());
         }
@@ -230,21 +229,16 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 
     // Test invalid replica_num
     config.replica_num = 0;
-    auto put_result1 = service_->PutStart(key, 1024, {1024}, config);
+    auto put_result1 = service_->PutStart(key, {1024}, config);
     EXPECT_FALSE(put_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
 
     // Test empty slice_lengths
     config.replica_num = 1;
     std::vector<uint64_t> empty_slices;
-    auto put_result2 = service_->PutStart(key, 1024, empty_slices, config);
+    auto put_result2 = service_->PutStart(key, empty_slices, config);
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
-
-    // Test slice_lengths sum mismatch
-    auto put_result3 = service_->PutStart(key, 1024, {512}, config);
-    EXPECT_FALSE(put_result3.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
 }
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
@@ -266,8 +260,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    auto put_start_result =
-        service_->PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
@@ -315,8 +308,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::uniform_int_distribution<> dis(1, 5);
     int random_number = dis(gen);
     config.replica_num = random_number;
-    auto put_start_result =
-        service_->PutStart(key, value_length, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
@@ -363,8 +355,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result.has_value());
@@ -393,8 +384,7 @@ TEST_F(MasterServiceTest, RemoveObject) {
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result.has_value());
@@ -435,8 +425,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result =
-            service_->PutStart(key, 1024, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(key);
         ASSERT_TRUE(put_end_result.has_value());
@@ -472,8 +461,7 @@ TEST_F(MasterServiceTest, RemoveAll) {
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result =
-            service_->PutStart(key, 1024, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(key);
         ASSERT_TRUE(put_end_result.has_value());
@@ -533,8 +521,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     std::vector<Replica::Descriptor> replica_list;
 
     // Test PutStart with multiple slices and replicas
-    auto put_start_result =
-        service_->PutStart(key, total_size, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
 
@@ -636,7 +623,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
 
                     // Create the object
                     auto put_start_result =
-                        service_->PutStart(key, 1024, slice_lengths, config);
+                        service_->PutStart(key, slice_lengths, config);
                     ASSERT_TRUE(put_start_result.has_value());
                     auto put_end_result = service_->PutEnd(key);
                     ASSERT_TRUE(put_end_result.has_value());
@@ -702,8 +689,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     config.replica_num = 1;  // One replica
 
     // Create the object
-    auto put_start_result =
-        service_->PutStart(key, 1024 * 1024, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result.has_value());
@@ -730,8 +716,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Create another object
     std::string key2 = "another_segment_object";
-    auto put_start_result2 =
-        service_->PutStart(key2, 1024 * 1024, slice_lengths, config);
+    auto put_start_result2 = service_->PutStart(key2, slice_lengths, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 = service_->PutEnd(key2);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -779,7 +764,7 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
                 std::vector<Replica::Descriptor> replica_list;
 
                 auto put_start_result =
-                    service_->PutStart(key, 1024, slice_lengths, config);
+                    service_->PutStart(key, slice_lengths, config);
                 if (put_start_result.has_value()) {
                     auto put_end_result = service_->PutEnd(key);
                     if (put_end_result.has_value()) {
@@ -845,8 +830,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         ReplicateConfig config;
         config.replica_num = 1;
 
-        auto put_start_result =
-            service_->PutStart(key, 1024, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(key);
         ASSERT_TRUE(put_end_result.has_value());
@@ -927,8 +911,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
         ReplicateConfig config;
         config.replica_num = 1;
 
-        auto put_start_result =
-            service_->PutStart(key, 1024, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(key);
         ASSERT_TRUE(put_end_result.has_value());
@@ -1001,8 +984,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ASSERT_TRUE(get_result2.has_value());
 
     // Verify put key1 will put into segment2 rather than segment1
-    auto put_start_result =
-        service_->PutStart(key1, 1024, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key1, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     auto put_end_result = service_->PutEnd(key1);
@@ -1096,8 +1078,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     config.replica_num = 1;
 
     // Verify lease is granted on ExistsKey
-    auto put_start_result =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result.has_value());
@@ -1111,8 +1092,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     EXPECT_TRUE(remove_result2.has_value());
 
     // Verify lease is extended on successive ExistsKey
-    auto put_start_result2 =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result2 = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -1129,8 +1109,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     EXPECT_TRUE(remove_result4.has_value());
 
     // Verify lease is granted on GetReplicaList
-    auto put_start_result3 =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result3 = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result3 = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result3.has_value());
@@ -1144,8 +1123,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     EXPECT_TRUE(remove_result6.has_value());
 
     // Verify lease is extended on successive GetReplicaList
-    auto put_start_result4 =
-        service_->PutStart(key, 1024, slice_lengths, config);
+    auto put_start_result4 = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result4 = service_->PutEnd(key);
     ASSERT_TRUE(put_end_result4.has_value());
@@ -1184,8 +1162,7 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
         std::vector<uint64_t> slice_lengths = {1024};
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result =
-            service_->PutStart(key, 1024, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(key);
         ASSERT_TRUE(put_end_result.has_value());
@@ -1235,8 +1212,7 @@ TEST_F(MasterServiceTest, EvictObject) {
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result =
-            service_->PutStart(key, object_size, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         if (put_start_result.has_value()) {
             auto put_end_result = service_->PutEnd(key);
             ASSERT_TRUE(put_end_result.has_value());
@@ -1274,8 +1250,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
         std::vector<uint64_t> slice_lengths = {object_size};
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result =
-            service_->PutStart(key, object_size, slice_lengths, config);
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
         if (put_start_result.has_value()) {
             auto put_end_result = service_->PutEnd(key);
             ASSERT_TRUE(put_end_result.has_value());
@@ -1323,12 +1298,12 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     config.with_soft_pin = true;
 
     // Verify soft pin does not block remove
-    ASSERT_TRUE(service_->PutStart(key, 1024, slice_lengths, config).has_value());
+    ASSERT_TRUE(service_->PutStart(key, slice_lengths, config).has_value());
     ASSERT_TRUE(service_->PutEnd(key).has_value());
     EXPECT_TRUE(service_->Remove(key).has_value());
 
     // Verify soft pin does not block RemoveAll
-    ASSERT_TRUE(service_->PutStart(key, 1024, slice_lengths, config).has_value());
+    ASSERT_TRUE(service_->PutStart(key, slice_lengths, config).has_value());
     ASSERT_TRUE(service_->PutEnd(key).has_value());
     EXPECT_EQ(1, service_->RemoveAll());
 }
@@ -1362,8 +1337,9 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_->PutStart(pin_key, value_size, slice_lengths,
-                                           soft_pin_config).has_value());
+            ASSERT_TRUE(
+                service_->PutStart(pin_key, slice_lengths, soft_pin_config)
+                    .has_value());
             ASSERT_TRUE(service_->PutEnd(pin_key).has_value());
         }
 
@@ -1374,8 +1350,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             std::vector<uint64_t> slice_lengths = {value_size};
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(key, value_size, slice_lengths, config)
-                    .has_value()) {
+            if (service_->PutStart(key, slice_lengths, config).has_value()) {
                 ASSERT_TRUE(service_->PutEnd(key).has_value());
             } else {
                 failed_puts++;
@@ -1423,8 +1398,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(key, value_size, slice_lengths, config)
-                .has_value()) {
+        if (service_->PutStart(key, slice_lengths, config).has_value()) {
             ASSERT_TRUE(service_->PutEnd(key).has_value());
             success_puts++;
         } else {
@@ -1470,8 +1444,8 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_->PutStart(pin_key, value_size, slice_lengths,
-                                           soft_pin_config).has_value());
+            ASSERT_TRUE(
+                service_->PutStart(pin_key, slice_lengths, soft_pin_config));
             ASSERT_TRUE(service_->PutEnd(pin_key).has_value());
         }
 
@@ -1491,8 +1465,7 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             std::vector<uint64_t> slice_lengths = {value_size};
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(key, value_size, slice_lengths, config)
-                    .has_value()) {
+            if (service_->PutStart(key, slice_lengths, config).has_value()) {
                 ASSERT_TRUE(service_->PutEnd(key).has_value());
             } else {
                 failed_puts++;
@@ -1543,8 +1516,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(key, value_size, slice_lengths, config)
-                .has_value()) {
+        if (service_->PutStart(key, slice_lengths, config).has_value()) {
             ASSERT_TRUE(service_->PutEnd(key).has_value());
             success_keys.push_back(key);
         } else {
@@ -1582,7 +1554,7 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
         config.replica_num = 1;
         std::vector<uint64_t> slice_lengths = {value_size};
         auto put_start_result =
-            service_->PutStart(test_keys[i], value_size, slice_lengths, config);
+            service_->PutStart(test_keys[i], slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result = service_->PutEnd(test_keys[i]);
         ASSERT_TRUE(put_end_result.has_value());

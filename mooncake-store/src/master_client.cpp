@@ -199,10 +199,9 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::PutStart(const std::string& key,
                        const std::vector<size_t>& slice_lengths,
-                       size_t value_length, const ReplicateConfig& config) {
+                       const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
-    timer.LogRequest("key=", key, ", value_length=", value_length,
-                     ", slice_count=", slice_lengths.size());
+    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
     auto client = client_accessor_.GetClient();
     if (!client) {
@@ -219,7 +218,7 @@ MasterClient::PutStart(const std::string& key,
     }
 
     auto request_result = client->send_request<&WrappedMasterService::PutStart>(
-        key, value_length, rpc_slice_lengths, config);
+        key, rpc_slice_lengths, config);
     auto result = coro::syncAwait(
         [&]() -> coro::Lazy<
                   tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> {
@@ -238,7 +237,6 @@ MasterClient::PutStart(const std::string& key,
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
-    const std::vector<uint64_t>& value_lengths,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
@@ -256,7 +254,7 @@ MasterClient::BatchPutStart(
 
     auto request_result =
         client->send_request<&WrappedMasterService::BatchPutStart>(
-            keys, value_lengths, slice_lengths, config);
+            keys, slice_lengths, config);
 
     auto result = coro::syncAwait(
         [&]() -> coro::Lazy<std::vector<
