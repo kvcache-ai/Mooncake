@@ -1298,14 +1298,12 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     config.with_soft_pin = true;
 
     // Verify soft pin does not block remove
-    ASSERT_TRUE(
-        service_->PutStart(key, 1024, slice_lengths, config).has_value());
+    ASSERT_TRUE(service_->PutStart(key, slice_lengths, config).has_value());
     ASSERT_TRUE(service_->PutEnd(key).has_value());
     EXPECT_TRUE(service_->Remove(key).has_value());
 
     // Verify soft pin does not block RemoveAll
-    ASSERT_TRUE(
-        service_->PutStart(key, 1024, slice_lengths, config).has_value());
+    ASSERT_TRUE(service_->PutStart(key, slice_lengths, config).has_value());
     ASSERT_TRUE(service_->PutEnd(key).has_value());
     EXPECT_EQ(1, service_->RemoveAll());
 }
@@ -1339,10 +1337,9 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_
-                            ->PutStart(pin_key, value_size, slice_lengths,
-                                       soft_pin_config)
-                            .has_value());
+            ASSERT_TRUE(
+                service_->PutStart(pin_key, slice_lengths, soft_pin_config)
+                    .has_value());
             ASSERT_TRUE(service_->PutEnd(pin_key).has_value());
         }
 
@@ -1353,8 +1350,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             std::vector<uint64_t> slice_lengths = {value_size};
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(key, value_size, slice_lengths, config)
-                    .has_value()) {
+            if (service_->PutStart(key, slice_lengths, config).has_value()) {
                 ASSERT_TRUE(service_->PutEnd(key).has_value());
             } else {
                 failed_puts++;
@@ -1402,8 +1398,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(key, value_size, slice_lengths, config)
-                .has_value()) {
+        if (service_->PutStart(key, slice_lengths, config).has_value()) {
             ASSERT_TRUE(service_->PutEnd(key).has_value());
             success_puts++;
         } else {
@@ -1449,10 +1444,8 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_
-                            ->PutStart(pin_key, value_size, slice_lengths,
-                                       soft_pin_config)
-                            .has_value());
+            ASSERT_TRUE(
+                service_->PutStart(pin_key, slice_lengths, soft_pin_config));
             ASSERT_TRUE(service_->PutEnd(pin_key).has_value());
         }
 
@@ -1472,8 +1465,7 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             std::vector<uint64_t> slice_lengths = {value_size};
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(key, value_size, slice_lengths, config)
-                    .has_value()) {
+            if (service_->PutStart(key, slice_lengths, config).has_value()) {
                 ASSERT_TRUE(service_->PutEnd(key).has_value());
             } else {
                 failed_puts++;
@@ -1524,8 +1516,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(key, value_size, slice_lengths, config)
-                .has_value()) {
+        if (service_->PutStart(key, slice_lengths, config).has_value()) {
             ASSERT_TRUE(service_->PutEnd(key).has_value());
             success_keys.push_back(key);
         } else {
