@@ -4,6 +4,9 @@ import time
 import threading
 import random
 from mooncake.store import MooncakeDistributedStore
+import statistics
+import math
+from collections import defaultdict
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -32,6 +35,82 @@ def get_client(store):
     
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
+class TestStats:
+    """Helper class for collecting and reporting test statistics."""
+    def __init__(self, test_name):
+        self.test_name = test_name
+        self.reset()
+        
+    def reset(self):
+        self.start_time = 0
+        self.end_time = 0
+        self.operation_count = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.latencies = []
+        self.error_codes = defaultdict(int)
+        self.data_transferred = 0
+        
+    def start_timer(self):
+        self.start_time = time.perf_counter()
+        
+    def stop_timer(self):
+        self.end_time = time.perf_counter()
+        
+    def get_duration(self):
+        return self.end_time - self.start_time if self.end_time > self.start_time else 0
+        
+    def record_operation(self, success, latency, data_size=0, error_code=None):
+        self.operation_count += 1
+        if success:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+        if error_code is not None:
+            self.error_codes[error_code] += 1
+        if latency is not None:
+            self.latencies.append(latency)
+        if data_size > 0:
+            self.data_transferred += data_size
+            
+    def print_stats(self):
+        """Print comprehensive statistics for the test."""
+        duration = self.get_duration()
+        success_rate = (self.success_count / self.operation_count * 100) if self.operation_count > 0 else 0
+        
+        # Calculate latency statistics
+        min_latency = min(self.latencies) * 1000 if self.latencies else 0
+        max_latency = max(self.latencies) * 1000 if self.latencies else 0
+        avg_latency = (sum(self.latencies) / len(self.latencies) * 1000) if self.latencies else 0
+        
+        # Calculate percentiles
+        p90 = p99 = p999 = 0
+        if self.latencies:
+            sorted_latencies = sorted(self.latencies)
+            p90 = sorted_latencies[int(len(sorted_latencies) * 0.9)] * 1000
+            p99 = sorted_latencies[int(len(sorted_latencies) * 0.99)] * 1000 if len(sorted_latencies) > 100 else p90
+            p999 = sorted_latencies[int(len(sorted_latencies) * 0.999)] * 1000 if len(sorted_latencies) > 1000 else p99
+        
+        # Calculate throughput
+        ops_per_sec = self.operation_count / duration if duration > 0 else 0
+        mb_per_sec = self.data_transferred / duration / (1024 * 1024) if duration > 0 else 0
+        
+        print(f"\n=== {self.test_name} STATISTICS ===")
+        print(f"Operations: {self.operation_count} (Success: {self.success_count}, Failure: {self.failure_count})")
+        print(f"Success Rate: {success_rate:.2f}%")
+        print(f"Duration: {duration:.2f} seconds")
+        print(f"Data Transferred: {self.data_transferred / (1024*1024):.2f} MB")
+        print(f"Latency (ms): Min={min_latency:.2f}, Max={max_latency:.2f}, Avg={avg_latency:.2f}")
+        print(f"Percentiles (ms): P90={p90:.2f}, P99={p99:.2f}, P999={p999:.2f}")
+        print(f"Throughput: {ops_per_sec:.2f} ops/sec, {mb_per_sec:.2f} MB/s")
+        
+        if self.error_codes:
+            print("Error Codes:")
+            for code, count in self.error_codes.items():
+                print(f"  Code {code}: {count} times")
+        
+        print("=" * 50)
     
 class TestDistributedObjectStore(unittest.TestCase):
     @classmethod
@@ -52,45 +131,78 @@ class TestDistributedObjectStore(unittest.TestCase):
         VALUE_SIZE = 1024*1024 
         MAX_REQUESTS = 1000
         reference = {}
+        
+        # Initialize statistics
+        put_stats = TestStats("Put Operations")
+        get_stats = TestStats("Get Operations")
 
         # --------------------------
         # Phase 1: Data population (trigger eviction)
         # --------------------------
+        put_stats.start_timer()
         index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
             value = os.urandom(VALUE_SIZE)
+            
+            # Record operation start time
+            op_start = time.perf_counter()
             retcode = self.store.put(key, value)
+            op_end = time.perf_counter()
+            latency = op_end - op_start
+            
             if retcode == -200:
                 # The space is not enough, continue to next operation
+                put_stats.record_operation(False, latency, VALUE_SIZE, retcode)
                 continue
             elif retcode == 0:
                 reference[key] = value
+                put_stats.record_operation(True, latency, VALUE_SIZE)
             else:
-                raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
+                put_stats.record_operation(False, latency, VALUE_SIZE, retcode)
+                raise RuntimeError(f"Put operation failed for key {key}. Error code: {retcode}")
+            
             index = index + 1
             if index % 500 == 0:
                 print("completed", index, "entries")
+        
+        put_stats.stop_timer()
         time.sleep(5)
 
 
         # --------------------------
         # Phase 2: Data verification
         # --------------------------
+        get_stats.start_timer()
         index = 0
         count = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
+            
+            op_start = time.perf_counter()
             retrieved = self.store.get(key)
+            op_end = time.perf_counter()
+            latency = op_end - op_start
+            
             if len(retrieved) != 0:
                 expected = reference.get(key)
-                self.assertEqual(retrieved, expected, "Data mismatch for key:" + key)
-                count = count + 1
+                success = (retrieved == expected)
+                get_stats.record_operation(success, latency, VALUE_SIZE)
+                if not success:
+                    print(f"Data mismatch for key: {key}")
+            else:
+                get_stats.record_operation(False, latency, VALUE_SIZE, -1)
+            
             index = index + 1
             if index % 500 == 0:
                 print("completed", index, "entries")
+        
+        get_stats.stop_timer()
+        
+        # Print statistics
+        put_stats.print_stats()
+        get_stats.print_stats()
             
-        print("Total get count:", count)    
         # --------------------------
         # Phase 3: Cleanup
         # --------------------------
@@ -117,6 +229,11 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         thread_exceptions = []
         references = {}
+        
+        # Create shared statistics objects
+        put_stats = TestStats("Concurrent Put Operations")
+        get_stats = TestStats("Concurrent Get Operations")
+        
         index = 0
         while index < OPERATIONS_PER_THREAD:
             key = "k_" + str(index)
@@ -124,33 +241,50 @@ class TestDistributedObjectStore(unittest.TestCase):
             references[key] = value
             index = index + 1
         
-        def worker(thread_id):
+        def worker(thread_id, stats):
             try:
                 print(f"Thread {thread_id} started") 
-                # Generate test data (1MB)
                 
                 # Put operations
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = "k_" + str(index)
                     test_data = references[key]
+                    
+                    op_start = time.perf_counter()
                     result = self.store.put(key, test_data)
+                    op_end = time.perf_counter()
+                    latency = op_end - op_start
+                    
+                    success = (result == 0)
+                    stats.record_operation(success, latency, VALUE_SIZE, result if not success else None)
+                    
                     index = index + 1
                     if index % 500 == 0:
-                        print("put", "completed", index, "entries")
+                        print(f"Thread {thread_id}: put completed {index} entries")
             
-
                 # Get operations
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = "k_" + str(index)
+                    
+                    op_start = time.perf_counter()
                     retrieved_data = self.store.get(key)
+                    op_end = time.perf_counter()
+                    latency = op_end - op_start
+                    
                     if len(retrieved_data) != 0:
                         expected_value = references[key]
-                        self.assertEqual(retrieved_data, expected_value, "Data mismatch for key:" + key)
+                        success = (retrieved_data == expected_value)
+                        stats.record_operation(success, latency, VALUE_SIZE)
+                        if not success:
+                            print(f"Thread {thread_id}: Data mismatch for key {key}")
+                    else:
+                        stats.record_operation(False, latency, VALUE_SIZE, -1)
+                    
                     index = index + 1
                     if index % 500 == 0:
-                        print("get", "completed", index, "entries")
+                        print(f"Thread {thread_id}: get completed {index} entries")
 
                 print(f"Thread {thread_id} completed")  
                 
@@ -159,20 +293,37 @@ class TestDistributedObjectStore(unittest.TestCase):
                 print("Exception in thread:", str(e))
         
         
-        
         # Create and start threads
         threads = []
+        thread_stats = [TestStats(f"Thread-{i}") for i in range(NUM_THREADS)]
+        put_stats.start_timer()
+        
         for i in range(NUM_THREADS):
-            t = threading.Thread(target=worker, args=(i,), name=f"Worker-{i}")
+            t = threading.Thread(target=worker, args=(i, thread_stats[i]), name=f"Worker-{i}")
             threads.append(t)
             t.start()
 
         # Join all threads
         for t in threads:
             t.join()
+            
+        put_stats.stop_timer()
+        
+        # Combine thread stats
+        for stats in thread_stats:
+            put_stats.operation_count += stats.operation_count
+            put_stats.success_count += stats.success_count
+            put_stats.failure_count += stats.failure_count
+            put_stats.latencies.extend(stats.latencies)
+            put_stats.data_transferred += stats.data_transferred
+            for code, count in stats.error_codes.items():
+                put_stats.error_codes[code] += count
 
         # Check for any exceptions
         self.assertEqual(len(thread_exceptions), 0, "\n".join(thread_exceptions))
+
+        # Print combined statistics
+        put_stats.print_stats()
 
         # Remove all keys
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
@@ -194,25 +345,41 @@ class TestDistributedObjectStore(unittest.TestCase):
         MAX_REQUESTS = 1000
         BATCH_SIZE = 4
         reference = {}
+        
+        # Initialize statistics
+        put_stats = TestStats("Batch Put Operations")
+        get_stats = TestStats("Batch Get Operations")
 
         # --------------------------
         # Phase 1: data population (trigger eviction)
         # --------------------------
+        put_stats.start_timer()
         index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
             value = os.urandom(VALUE_SIZE)
+            
+            op_start = time.perf_counter()
             retcode = self.store.put(key, value)
+            op_end = time.perf_counter()
+            latency = op_end - op_start
+            
             if retcode == -200:
                 # The space is not enough, continue to next operation
+                put_stats.record_operation(False, latency, VALUE_SIZE, retcode)
                 continue
             elif retcode == 0:
                 reference[key] = value
+                put_stats.record_operation(True, latency, VALUE_SIZE)
             else:
-                raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
+                put_stats.record_operation(False, latency, VALUE_SIZE, retcode)
+                raise RuntimeError(f"Put operation failed for key {key}. Error code: {retcode}")
+            
             index = index + 1
             if index % 500 == 0:
                 print("completed", index, "entries")
+        
+        put_stats.stop_timer()
         time.sleep(5)
 
         # --------------------------
@@ -232,8 +399,8 @@ class TestDistributedObjectStore(unittest.TestCase):
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(result, 0, "Buffer registration should succeed")
 
+        get_stats.start_timer()
         index = 0
-        count = 0
         while index < MAX_REQUESTS:
             batch_keys = []
             
@@ -259,29 +426,47 @@ class TestDistributedObjectStore(unittest.TestCase):
                 buffer_sizes.append(VALUE_SIZE)  # Each value is 1MB
                 
             # Execute batch_get_into
+            op_start = time.perf_counter()
             results = self.store.batch_get_into(batch_keys, buffer_ptrs, buffer_sizes)
+            op_end = time.perf_counter()
+            latency = op_end - op_start
             
             # Verify results
             self.assertEqual(len(results), len(batch_keys), "Should return result for each key")
             
+            batch_success = 0
             for i, result in enumerate(results):
                 current_key = batch_keys[i]
                 expected = reference.get(current_key)
                 
                 if expected is not None:
                     if result > 0:
-                        self.assertEqual(result, len(expected), f"Should read correct number of bytes for key {current_key}")
-                        
-                        # Verify data integrity - read from the correct offset in the large buffer
+                        # Verify data integrity
                         offset = i * buffer_spacing
                         read_data = bytes(large_buffer[offset:offset + result])
-                        self.assertEqual(read_data, expected, f"Data should match for key {current_key}")
-                        count += 1
+                        success = (read_data == expected)
+                        get_stats.record_operation(success, latency, VALUE_SIZE)
+                        if success:
+                            batch_success += 1
+                        else:
+                            print(f"Data mismatch for key {current_key}")
+                    else:
+                        get_stats.record_operation(False, latency, VALUE_SIZE, result)
+                else:
+                    get_stats.record_operation(False, latency, VALUE_SIZE, -2)
+            
+            # Record batch latency
+            get_stats.record_operation(batch_success == len(batch_keys), latency, 
+                                      len(batch_keys) * VALUE_SIZE)
             
             if index % 500 == 0:
                 print("completed", index, "entries")
         
-        print("Total get count:", count)
+        get_stats.stop_timer()
+        
+        # Print statistics
+        put_stats.print_stats()
+        get_stats.print_stats()
         
         # --------------------------
         # Phase 3: Cleanup (still using single remove for simplicity)

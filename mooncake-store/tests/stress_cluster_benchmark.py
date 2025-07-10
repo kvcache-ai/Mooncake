@@ -9,6 +9,9 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 import os
 from mooncake.store import MooncakeDistributedStore
+import threading
+import queue
+import copy
 
 # Disable memcpy optimization
 os.environ["MC_STORE_MEMCPY"] = "0"
@@ -77,6 +80,11 @@ class PerformanceTracker:
         """Record a single operation's performance."""
         self.operation_latencies.append(latency_seconds)
         self.operation_sizes.append(data_size_bytes)
+        
+    def extend(self, other: 'PerformanceTracker'):
+        """Combine data from another tracker."""
+        self.operation_latencies.extend(other.operation_latencies)
+        self.operation_sizes.extend(other.operation_sizes)
 
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate and return comprehensive performance statistics."""
@@ -281,6 +289,26 @@ class TestInstance:
         logger.info(f"===============================================\n")
 
 
+def worker_thread(args, results_queue):
+    """Worker thread function for executing tests."""
+    try:
+        logger.info(f"Starting worker thread {threading.current_thread().name}")
+        tester = TestInstance(args)
+        tester.setup()
+
+        if args.role == "decode":
+            tester.decode()
+        else:
+            tester.prefill()
+
+        # Put results in the queue
+        results_queue.put(tester.performance_tracker)
+        logger.info(f"Worker thread {threading.current_thread().name} completed successfully")
+    except Exception as e:
+        logger.error(f"Worker thread {threading.current_thread().name} failed: {e}")
+        results_queue.put(PerformanceTracker())  # Put empty tracker on failure
+
+
 def parse_arguments():
     """Parse command-line arguments for the stress test."""
     parser = argparse.ArgumentParser(
@@ -308,6 +336,10 @@ def parse_arguments():
     parser.add_argument("--value-length", type=int, default=4*1024*1024, help="Size of each value in bytes")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for operations")
     parser.add_argument("--wait-time", type=int, default=20, help="Wait time in seconds after operations complete")
+    
+    # Multi-threading parameters
+    parser.add_argument("--num-workers", type=int, default=1,
+                       help="Number of worker threads to use for concurrent operations")
 
     return parser.parse_args()
 
@@ -322,16 +354,61 @@ def main():
     logger.info(f"Max requests: {args.max_requests}")
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Value size: {args.value_length // (1024*1024)} MB")
+    logger.info(f"Number of workers: {args.num_workers}")
     logger.info("=" * 50)
 
     try:
-        tester = TestInstance(args)
-        tester.setup()
-
-        if args.role == "decode":
-            tester.decode()
+        if args.num_workers > 1:
+            # Multi-threaded execution
+            results_queue = queue.Queue()
+            threads = []
+            
+            # Adjust requests per worker
+            requests_per_worker = args.max_requests // args.num_workers
+            remainder = args.max_requests % args.num_workers
+            
+            # Create and start worker threads
+            for i in range(args.num_workers):
+                worker_args = copy.copy(args)
+                worker_args.max_requests = requests_per_worker + (1 if i < remainder else 0)
+                
+                thread = threading.Thread(
+                    target=worker_thread,
+                    args=(worker_args, results_queue),
+                    name=f"Worker-{i+1}"
+                )
+                threads.append(thread)
+                thread.start()
+            
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+            
+            # Combine results
+            combined_tracker = PerformanceTracker()
+            while not results_queue.empty():
+                tracker = results_queue.get()
+                combined_tracker.extend(tracker)
+            
+            # Print combined statistics
+            logger.info("\n=== COMBINED PERFORMANCE STATISTICS ===")
+            stats = combined_tracker.get_statistics()
+            logger.info(f"Total operations: {stats['total_operations']}")
+            logger.info(f"Total time: {stats['total_time_seconds']:.2f} seconds")
+            logger.info(f"Total data transferred: {stats['total_bytes'] / (1024*1024):.2f} MB")
+            logger.info(f"Mean latency: {stats['mean_latency_ms']:.2f} ms")
+            logger.info(f"Operations/sec: {stats['operations_per_second']:.2f}")
+            logger.info(f"Throughput: {stats['throughput_mbps']:.2f} MB/s")
+            logger.info("=" * 50)
         else:
-            tester.prefill()
+            # Single-threaded execution
+            tester = TestInstance(args)
+            tester.setup()
+
+            if args.role == "decode":
+                tester.decode()
+            else:
+                tester.prefill()
 
         logger.info("Test completed successfully!")
 
