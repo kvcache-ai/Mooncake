@@ -690,6 +690,31 @@ retcode = store.setup(
 
 无报错信息表示数据传输成功。
 
+### 以独立进程方式启动 Client
+
+使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 `Client`。
+
+首先，创建并保存一个 JSON 格式的配置文件。例如：
+
+```
+{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "global_segment_size": 268435456,
+    "local_buffer_size": 268435456,
+    "protocol": "tcp",
+    "device_name": "",
+    "master_server_address": "localhost:50051"
+}
+```
+
+然后运行 `mooncake_store_service.py`。该程序在启动 `Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
+
+程序的主要启动参数包括：
+
+* `config`：配置文件路径
+* `port`：HTTP 服务的端口号
+
 ## 范例代码
 
 #### Python 使用示例

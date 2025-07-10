@@ -677,6 +677,31 @@ retcode = store.setup(
 
 The absence of error messages indicates successful data transfer.
 
+### Starting the Client as Standalone Process
+
+Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start the `Client` as a standalone process.
+
+First, create and save a configuration file in JSON format. For example:
+
+```
+{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "global_segment_size": 268435456,
+    "local_buffer_size": 268435456,
+    "protocol": "tcp",
+    "device_name": "",
+    "master_server_address": "localhost:50051"
+}
+```
+
+Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
+
+The main startup parameters include:
+
+* `config`: Path to the configuration file.
+* `port`: Port number for the HTTP server.
+
 ## Example Code
 
 #### Python Usage Example
