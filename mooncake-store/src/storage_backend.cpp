@@ -88,18 +88,6 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
 
     return ErrorCode::OK;
 }
-      
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::vector<Slice>& slices) {
-    std::string path = ResolvePath(key);
-    return LoadObjectInPath(path,slices);
-}
-
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::vector<Slice>& slices, std::string& path) {
-    return LoadObjectInPath(path, slices);
-}
-
 // ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
 //                                         std::vector<Slice>& slices) {
 //     // 总耗时统计
@@ -163,8 +151,8 @@ ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
 //     return ErrorCode::OK;
 // }
 
-ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
-                                    std::vector<Slice>& slices) {
+ErrorCode StorageBackend::LoadObject(std::string& path,
+                                    std::vector<Slice>& slices, size_t length) {
 
     auto file = create_file(path, "rb");
     if (!file) {
@@ -172,13 +160,11 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    std::vector<iovec> iovs;
-    size_t slices_total_size = 0;                                        
+    std::vector<iovec> iovs;                                    
 
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
         iovs.push_back(io);
-        slices_total_size += slice.size;
     }
 
     ssize_t ret = file->preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
@@ -188,9 +174,9 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
 
         return ErrorCode::FILE_READ_FAIL;
     }
-    if (ret != static_cast<ssize_t>(slices_total_size)) {
+    if (ret != static_cast<ssize_t>(length)) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << slices_total_size
+                   << ", expected: " << length
                    << ", got: " << ret;
 
         return ErrorCode::FILE_READ_FAIL;
@@ -201,9 +187,8 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
     return ErrorCode::OK;
 }
 
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::string& str) {
-    std::string path = ResolvePath(key);
+ErrorCode StorageBackend::LoadObject(std::string& path,
+                                    std::string& str, size_t length) {
 
     auto file = create_file(path, "rb");
     if (!file) {
@@ -211,18 +196,16 @@ ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    size_t file_total_size = file->length();
+    ssize_t ret = file->read(str, length);
 
-    ssize_t ret = file->read(str, file_total_size);
-    
 
     if (ret < 0) {
         LOG(INFO) << "read failed for: " << path;
         return ErrorCode::FILE_READ_FAIL;
     }
-    if (ret != static_cast<ssize_t>(file_total_size)) {
+    if (ret != static_cast<ssize_t>(length)) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << file_total_size
+                   << ", expected: " << length
                    << ", got: " << ret;
 
         return ErrorCode::FILE_READ_FAIL;

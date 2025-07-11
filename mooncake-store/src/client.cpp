@@ -1069,21 +1069,6 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
     }
 }
 
-ErrorCode Client::GetFromLocalFile(const std::string& object_key,
-                                   std::vector<Slice>& slices,
-                                   std::vector<Replica::Descriptor>& replicas) {
-    if (!storage_backend_) {
-        return ErrorCode::FILE_READ_FAIL;
-    }
-
-    ErrorCode err = storage_backend_->LoadObject(object_key, slices);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    return ErrorCode::OK;
-}
-
 void Client::PutToLocalFile(const std::string& key,
                             const std::vector<Slice>& slices) {
     if (!storage_backend_) return;

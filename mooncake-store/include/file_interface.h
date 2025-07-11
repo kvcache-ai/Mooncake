@@ -146,13 +146,6 @@ public:
     virtual ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) = 0;
 
     /**
-     * @brief Gets the current length/size of the file
-     * @return File size in bytes on success, -1 on error
-     * @note Thread-safe operation
-     */
-    virtual ssize_t length() = 0;
-
-    /**
      * @brief Gets the current error code
      * @return Current error code
      */
@@ -187,40 +180,6 @@ public:
     int acquire_read_lock() override;
     int release_lock() override;
 
-    ssize_t length() override {
-        if (!file_) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        // Save current position
-        long current_pos = ftell(file_);
-        if (current_pos == -1) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        // Seek to end to get size
-        if (fseek(file_, 0, SEEK_END) != 0) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        long size = ftell(file_);
-        if (size == -1) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        // Restore original position
-        if (fseek(file_, current_pos, SEEK_SET) != 0) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        return static_cast<ssize_t>(size);
-    }
-
 private:
     FILE *file_;
 
@@ -244,21 +203,6 @@ public:
     int release_lock() override;
 
     // static long get_elapsed_us(const struct timespec& start);
-
-    ssize_t length() override {
-        if (fd_ < 0) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        struct stat st;
-        if (fstat(fd_, &st) != 0) {
-            error_code_ = ErrorCode::FILE_INVALID_HANDLE;
-            return -1;
-        }
-
-        return static_cast<ssize_t>(st.st_size);
-    }
 
 private:
 

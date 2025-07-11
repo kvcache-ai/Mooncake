@@ -91,7 +91,7 @@ void FilereadWorkerPool::workerThread() {
                     continue; 
                 }
 
-                auto error_code = backend_->LoadObject("", task.slices, task.file_path);
+                auto error_code = backend_->LoadObject(task.file_path, task.slices, task.file_size);
                 if(error_code == ErrorCode::OK){
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;

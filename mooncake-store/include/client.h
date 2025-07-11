@@ -226,10 +226,6 @@ class Client {
     void PrepareStorageBackend(const std::string& storage_root_dir,
                                const std::string& fsdir);
 
-    ErrorCode GetFromLocalFile(const std::string& object_key,
-                               std::vector<Slice>& slices,
-                               std::vector<Replica::Descriptor>& replicas);
-
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices);
 

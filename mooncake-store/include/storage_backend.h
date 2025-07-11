@@ -87,27 +87,21 @@ class StorageBackend  {
     
     /**
      * @brief Loads an object into slices
-     * @param key Object identifier
+     * @param path KVCache File path to load from
      * @param slices Output vector for loaded data slices
+     * @param length Expected length of data to read
      * @return ErrorCode indicating operation status
      */
-    ErrorCode LoadObject(const ObjectKey& key, std::vector<Slice>& slices) ;
-
-    /**
-     * @brief Loads an object into slices
-     * @param key Object identifier
-     * @param slices Output vector for loaded data slices
-     * @return ErrorCode indicating operation status
-     */
-    ErrorCode LoadObject(const ObjectKey& key, std::vector<Slice>& slices, std::string& path) ;
+    ErrorCode LoadObject(std::string& path, std::vector<Slice>& slices, size_t length) ;
     
     /**
      * @brief Loads an object as a string
-     * @param key Object identifier
+     * @param path KVCache File path to load from
      * @param str Output string for loaded data
+     * @param length Expected length of data to read
      * @return ErrorCode indicating operation status
      */
-    ErrorCode LoadObject(const ObjectKey& key, std::string& str) ;
+    ErrorCode LoadObject(std::string& path, std::string& str, size_t length) ;
 
     /**
      * @brief Queries metadata for an object by key
@@ -162,9 +156,6 @@ class StorageBackend  {
      * @brief Resolves full filesystem path for an object
      */
     std::string ResolvePath(const ObjectKey& key) const;
-
-    ErrorCode LoadObjectInPath(const std::string& path,
-                                    std::vector<Slice>& slices);
     
     std::pair<int, int> parse_mode_flags(const std::string& mode) const;
 
