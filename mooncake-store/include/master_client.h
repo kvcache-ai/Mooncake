@@ -101,7 +101,8 @@ class MasterClient {
      * @param key Object key
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, const std::vector<PutResult>& put_results);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -109,23 +110,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
-
-    /**
-     * @brief Revokes a put operation
-     * @param key Object key
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key);
-
-    /**
-     * @brief Revokes a put operation for a batch of objects
-     * @param keys Vector of object keys
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<PutResult>>& put_results);
 
     /**
      * @brief Removes an object and all its replicas

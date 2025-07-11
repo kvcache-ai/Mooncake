@@ -22,6 +22,8 @@ namespace mooncake {
 
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
+enum class PutResult : uint8_t { SUCCESS = 0, FAILED = 1 };
+
 class WrappedMasterService {
    public:
     WrappedMasterService(
@@ -57,20 +59,17 @@ class WrappedMasterService {
         const std::string& key, const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, const std::vector<PutResult>& put_success);
 
-    tl::expected<void, ErrorCode> PutRevoke(const std::string& key);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<PutResult>>& put_success);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 

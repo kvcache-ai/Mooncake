@@ -19,6 +19,7 @@
 namespace mooncake {
 
 class PutOperation;
+struct PutOp;
 
 /**
  * @brief Client for interacting with the mooncake distributed object store
@@ -247,16 +248,14 @@ class Client {
     /**
      * @brief Batch put helper methods for structured approach
      */
-    std::vector<PutOperation> CreatePutOperations(
+    std::vector<PutOp> makeOps(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices);
-    void StartBatchPut(std::vector<PutOperation>& ops,
-                       const ReplicateConfig& config);
-    void SubmitTransfers(std::vector<PutOperation>& ops);
-    void WaitForTransfers(std::vector<PutOperation>& ops);
-    void FinalizeBatchPut(std::vector<PutOperation>& ops);
-    std::vector<tl::expected<void, ErrorCode>> CollectResults(
-        const std::vector<PutOperation>& ops);
+    void stageStart(std::vector<PutOp>& ops, const ReplicateConfig& config);
+    void stageTransfer(std::vector<PutOp>& ops);
+    void stageEnd(std::vector<PutOp>& ops);
+    std::vector<tl::expected<void, ErrorCode>> collect(
+        const std::vector<PutOp>& ops);
 
     // Core components
     TransferEngine transfer_engine_;

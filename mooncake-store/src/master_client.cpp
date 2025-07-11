@@ -277,7 +277,8 @@ MasterClient::BatchPutStart(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::PutEnd(
+    const std::string& key, const std::vector<PutResult>& put_results) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
@@ -289,7 +290,7 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
     }
 
     auto request_result =
-        client->send_request<&WrappedMasterService::PutEnd>(key);
+        client->send_request<&WrappedMasterService::PutEnd>(key, put_results);
     auto result =
         coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
@@ -305,7 +306,14 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<PutResult>>& put_results) {
+    if (keys.size() != put_results.size()) {
+        LOG(ERROR) << "BatchPutEnd failed: keys.size() != put_results.size()";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -323,79 +331,13 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     }
 
     auto request_result =
-        client->send_request<&WrappedMasterService::BatchPutEnd>(keys);
+        client->send_request<&WrappedMasterService::BatchPutEnd>(keys,
+                                                                 put_results);
     auto result = coro::syncAwait(
         [&]() -> coro::Lazy<std::vector<tl::expected<void, ErrorCode>>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to end batch put operation: "
-                           << result.error().msg;
-                std::vector<tl::expected<void, ErrorCode>> error_results;
-                error_results.reserve(keys.size());
-                for (size_t i = 0; i < keys.size(); ++i) {
-                    error_results.emplace_back(
-                        tl::make_unexpected(ErrorCode::RPC_FAIL));
-                }
-                co_return error_results;
-            }
-            co_return result->result();
-        }());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
-    timer.LogRequest("key=", key);
-
-    auto client = client_accessor_.GetClient();
-    if (!client) {
-        LOG(ERROR) << "Client not available";
-        timer.LogResponse("error=Client not available");
-        return tl::make_unexpected(ErrorCode::RPC_FAIL);
-    }
-
-    auto request_result =
-        client->send_request<&WrappedMasterService::PutRevoke>(key);
-    auto result =
-        coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
-            auto result = co_await co_await request_result;
-            if (!result) {
-                LOG(ERROR) << "Failed to revoke put operation: "
-                           << result.error().msg;
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            co_return result->result();
-        }());
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
-    timer.LogRequest("keys_count=", keys.size());
-
-    auto client = client_accessor_.GetClient();
-    if (!client) {
-        LOG(ERROR) << "Client not available";
-        timer.LogResponse("error=Client not available");
-        std::vector<tl::expected<void, ErrorCode>> error_results;
-        error_results.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            error_results.emplace_back(
-                tl::make_unexpected(ErrorCode::RPC_FAIL));
-        }
-        return error_results;
-    }
-
-    auto request_result =
-        client->send_request<&WrappedMasterService::BatchPutRevoke>(keys);
-    auto result = coro::syncAwait(
-        [&]() -> coro::Lazy<std::vector<tl::expected<void, ErrorCode>>> {
-            auto result = co_await co_await request_result;
-            if (!result) {
-                LOG(ERROR) << "Failed to revoke batch put operation: "
                            << result.error().msg;
                 std::vector<tl::expected<void, ErrorCode>> error_results;
                 error_results.reserve(keys.size());

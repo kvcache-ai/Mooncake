@@ -266,21 +266,15 @@ WrappedMasterService::PutStart(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const std::string& key) {
+    const std::string& key, const std::vector<PutResult>& put_results) {
     return execute_rpc(
-        "PutEnd", [&] { return master_service_.PutEnd(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "PutEnd", [&] { return master_service_.PutEnd(key, put_results); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key,
+                             ", put_results_size=", put_results.size());
+        },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
-    const std::string& key) {
-    return execute_rpc(
-        "PutRevoke", [&] { return master_service_.PutRevoke(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
-        [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
-        [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -319,7 +313,8 @@ WrappedMasterService::BatchPutStart(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<PutResult>>& put_results) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     timer.LogRequest("keys_count=", keys.size());
     MasterMetricManager::instance().inc_batch_put_end_requests();
@@ -327,8 +322,14 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
 
-    for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutEnd(key));
+    if (keys.size() != put_results.size()) {
+        LOG(ERROR) << "BatchPutEnd failed: keys.size() != put_results.size()";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.emplace_back(master_service_.PutEnd(keys[i], put_results[i]));
     }
 
     // Count failures and log errors
@@ -341,37 +342,6 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         }
     }
     MasterMetricManager::instance().inc_batch_put_end_failures(failure_count);
-
-    timer.LogResponse("total=", results.size(),
-                      ", success=", results.size() - failure_count,
-                      ", failures=", failure_count);
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "BatchPutRevoke");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_put_revoke_requests();
-
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutRevoke(key));
-    }
-
-    // Count failures and log errors
-    size_t failure_count = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].has_value()) {
-            failure_count++;
-            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(results[i].error());
-        }
-    }
-    MasterMetricManager::instance().inc_batch_put_revoke_failures(
-        failure_count);
 
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
@@ -474,13 +444,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
         &wrapped_master_service);
