@@ -7,8 +7,6 @@
 #include "types.h"
 #include <atomic>
 #include <thread>
-#include <sys/stat.h>  // for fstat(), struct stat
-#include <unistd.h>    // for file descriptor operations
 
 #ifdef USE_3FS
 #include <hf3fs_usrbio.h>
@@ -108,15 +106,6 @@ public:
     virtual ~StorageFile() = default;
 
     /**
-     * @brief Reads data from file into buffer
-     * @param buffer Output buffer for read data
-     * @param length Maximum number of bytes to read
-     * @return Number of bytes read on success, -1 on error
-     * @note Thread-safe operation with read locking
-     */
-    virtual ssize_t read(std::string &buffer, size_t length) = 0;
-
-    /**
      * @brief Writes data from buffer to file
      * @param buffer Input buffer containing data to write
      * @param length Number of bytes to write
@@ -126,14 +115,13 @@ public:
     virtual ssize_t write(const std::string &buffer, size_t length) = 0;
 
     /**
-     * @brief Scattered read from specified file offset
-     * @param iov Array of I/O vectors
-     * @param iovcnt Number of elements in iov array
-     * @param offset File offset to read from
-     * @return Total bytes read on success, -1 on error
+     * @brief Reads data from file into buffer
+     * @param buffer Output buffer for read data
+     * @param length Maximum number of bytes to read
+     * @return Number of bytes read on success, -1 on error
      * @note Thread-safe operation with read locking
      */
-    virtual ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual ssize_t read(std::string &buffer, size_t length) = 0;
 
     /**
      * @brief Scattered write at specified file offset
@@ -144,6 +132,16 @@ public:
      * @note Thread-safe operation with write locking
      */
     virtual ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) = 0;
+
+    /**
+     * @brief Scattered read from specified file offset
+     * @param iov Array of I/O vectors
+     * @param iovcnt Number of elements in iov array
+     * @param offset File offset to read from
+     * @return Total bytes read on success, -1 on error
+     * @note Thread-safe operation with read locking
+     */
+    virtual ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) = 0;
 
     /**
      * @brief Gets the current error code
@@ -171,10 +169,10 @@ public:
     PosixFile(const std::string &filename, FILE *file);
     ~PosixFile() override;
 
-    ssize_t read(std::string &buffer, size_t length) override;
     ssize_t write(const std::string &buffer, size_t length) override;
-    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t read(std::string &buffer, size_t length) override;
     ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
 
     int acquire_write_lock() override;
     int acquire_read_lock() override;
@@ -190,13 +188,11 @@ class ThreeFSFile : public StorageFile {
 public:
     ThreeFSFile(const std::string &filename, int fd, USRBIOResourceManager* resource_manager);
     ~ThreeFSFile() override;
-    static std::unique_ptr<ThreeFSFile> create(
-    const std::string& filename, int fd, USRBIOResourceManager* resource_manager);
 
-    ssize_t read(std::string &buffer, size_t length) override;
     ssize_t write(const std::string &buffer, size_t length) override;  
-    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t read(std::string &buffer, size_t length) override;
     ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
 
     int acquire_write_lock() override;
     int acquire_read_lock() override;

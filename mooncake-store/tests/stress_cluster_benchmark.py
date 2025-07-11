@@ -122,6 +122,10 @@ class TestInstance:
 
     def setup(self):
         """Initialize the MooncakeDistributedStore and allocate registered memory."""
+        if self.args.root_dir:
+            os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = self.args.root_dir
+            logger.info(f"Set storage root directory to: {self.args.root_dir}")
+
         self.store = MooncakeDistributedStore()
 
         # Setup store
@@ -308,6 +312,7 @@ def parse_arguments():
     parser.add_argument("--value-length", type=int, default=4*1024*1024, help="Size of each value in bytes")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for operations")
     parser.add_argument("--wait-time", type=int, default=20, help="Wait time in seconds after operations complete")
+    parser.add_argument("--root-dir", type=str, default="", help="Root directory for storage (sets MOONCAKE_STORAGE_ROOT_DIR)")
 
     return parser.parse_args()
 

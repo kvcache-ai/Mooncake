@@ -88,68 +88,6 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
 
     return ErrorCode::OK;
 }
-// ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
-//                                         std::vector<Slice>& slices) {
-//     // 总耗时统计
-//     auto total_start = std::chrono::high_resolution_clock::now();
-    
-//     // 阶段1: 文件打开耗时
-//     auto open_start = std::chrono::high_resolution_clock::now();
-//     auto file = create_file(path, "rb");
-//     auto open_end = std::chrono::high_resolution_clock::now();
-    
-//     if (!file) {
-//         LOG(INFO) << "Failed to open file for reading: " << path;
-//         return ErrorCode::FILE_OPEN_FAIL;
-//     }
-
-//     // 阶段2: 准备IO向量耗时
-//     auto prepare_start = std::chrono::high_resolution_clock::now();
-//     std::vector<iovec> iovs;
-//     size_t slices_total_size = 0;                                        
-//     for (const auto& slice : slices) {
-//         iovec io{ slice.ptr, slice.size };
-//         iovs.push_back(io);
-//         slices_total_size += slice.size;
-//     }
-//     auto prepare_end = std::chrono::high_resolution_clock::now();
-
-//     // 阶段3: 实际读取耗时
-//     auto read_start = std::chrono::high_resolution_clock::now();
-//     ssize_t ret = file->preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
-//     auto read_end = std::chrono::high_resolution_clock::now();
-
-//     if (ret < 0) {
-//         LOG(INFO) << "preadv failed for: " << path;
-//         return ErrorCode::FILE_READ_FAIL;
-//     }
-//     if (ret != static_cast<ssize_t>(slices_total_size)) {
-//         LOG(INFO) << "Read size mismatch for: " << path
-//                  << ", expected: " << slices_total_size
-//                  << ", got: " << ret;
-//         return ErrorCode::FILE_READ_FAIL;
-//     }
-
-//     // 计算各阶段耗时
-//     auto total_end = std::chrono::high_resolution_clock::now();
-    
-//     auto open_duration = std::chrono::duration_cast<std::chrono::microseconds>(open_end - open_start);
-//     auto prepare_duration = std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
-//     auto read_duration = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start);
-//     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
-
-//     // 记录耗时日志
-//     LOG(INFO) << "LoadObjectInPath timing for " << path << ": "
-//               << "Total=" << total_duration.count() << "μs ("
-//               << "Open=" << open_duration.count() << "μs ("
-//               << (open_duration.count() * 100.0 / total_duration.count()) << "%), "
-//               << "Prepare=" << prepare_duration.count() << "μs ("
-//               << (prepare_duration.count() * 100.0 / total_duration.count()) << "%), "
-//               << "Read=" << read_duration.count() << "μs ("
-//               << (read_duration.count() * 100.0 / total_duration.count()) << "%))";
-
-//     return ErrorCode::OK;
-// }
 
 ErrorCode StorageBackend::LoadObject(std::string& path,
                                     std::vector<Slice>& slices, size_t length) {
@@ -198,7 +136,6 @@ ErrorCode StorageBackend::LoadObject(std::string& path,
 
     ssize_t ret = file->read(str, length);
 
-
     if (ret < 0) {
         LOG(INFO) << "read failed for: " << path;
         return ErrorCode::FILE_READ_FAIL;
@@ -215,58 +152,6 @@ ErrorCode StorageBackend::LoadObject(std::string& path,
 
     return ErrorCode::OK;
 }
-
-// std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
-//     // 开始总耗时计时
-//     auto total_start = std::chrono::high_resolution_clock::now();
-    
-//     std::string path = ResolvePath(key);
-//     namespace fs = std::filesystem;
-
-//     // 文件存在性检查耗时
-//     auto exists_start = std::chrono::high_resolution_clock::now();
-//     bool file_exists = fs::exists(path);
-//     auto exists_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-//         std::chrono::high_resolution_clock::now() - exists_start);
-    
-//     if (!file_exists) {
-//         // 记录总耗时（仅存在性检查）
-//         auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-//             std::chrono::high_resolution_clock::now() - total_start);
-//         LOG(INFO) << "[Latency] QueryKey failed - exists_check: " << exists_duration.count() 
-//                   << "us, total: " << total_duration.count() << "us";
-//         return std::nullopt;
-//     }
-
-//     // 文件元数据获取耗时
-//     Replica::Descriptor desc;
-//     auto metadata_start = std::chrono::high_resolution_clock::now();
-//     try {
-//         auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
-//         disk_desc.file_path = path;
-//         disk_desc.file_size = fs::file_size(path);  // 可能抛出异常
-//         desc.status = ReplicaStatus::COMPLETE;
-//     } catch (const fs::filesystem_error& e) {
-//         // 记录异常情况耗时
-//         auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-//             std::chrono::high_resolution_clock::now() - total_start);
-//         LOG(ERROR) << "[Latency] QueryKey failed - metadata_error: " << e.what()
-//                    << ", exists_check: " << exists_duration.count() 
-//                    << "us, total: " << total_duration.count() << "us";
-//         return std::nullopt;
-//     }
-//     auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-//         std::chrono::high_resolution_clock::now() - metadata_start);
-
-//     // 记录成功情况总耗时
-//     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-//         std::chrono::high_resolution_clock::now() - total_start);
-//     LOG(INFO) << "[Latency] QueryKey success - exists_check: " << exists_duration.count() 
-//               << "us, metadata: " << metadata_duration.count() 
-//               << "us, total: " << total_duration.count() << "us";
-
-//     return desc;
-// }
 
 std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
     std::string path = ResolvePath(key);
@@ -428,32 +313,31 @@ std::unique_ptr<StorageFile> StorageBackend::create_posix_file(
 }
 #ifdef USE_3FS
 std::unique_ptr<StorageFile> StorageBackend::create_3fs_file(
-    const std::string& path, const std::string& mode) const 
-{
-    // 转换模式字符串到flags
+    const std::string& path, const std::string& mode) const {
+
     auto [flags, access_mode] = parse_mode_flags(mode);
     
-    // 打开文件描述符
     int fd = open(path.c_str(), flags, 0644);
     if (fd < 0) return nullptr;
     
-    // 注册到3FS
     if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);
         return nullptr;
     }
-    
-    return ThreeFSFile::create(path, fd, resource_manager_.get());
+
+    return resource_manager_ ? 
+                std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get()) : nullptr;
 }
 #endif
+
 std::unique_ptr<StorageFile> StorageBackend::create_file(
     const std::string& path, const std::string& mode) const {
 #ifdef USE_3FS
     if (is_3fs_dir_) {
-        return create_3fs_file(path, mode); // 3FS专用逻辑
+        return create_3fs_file(path, mode); 
     }
 #endif
-    return create_posix_file(path, mode);   // 默认POSIX逻辑
+    return create_posix_file(path, mode);   
 }
 
 }  // namespace mooncake

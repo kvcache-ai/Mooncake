@@ -39,7 +39,7 @@ ssize_t PosixFile::write(const std::string &buffer, size_t length){
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
     }
-    if (length == 0 || buffer.empty()) {
+    if (length == 0) {
         error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
