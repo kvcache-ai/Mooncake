@@ -336,10 +336,15 @@ int RdmaEndPoint::submitZeroByteMessage() {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_ || !has_diag_cq_) return 0;
     ibv_send_wr wr, *bad_wr = nullptr;
+    ibv_sge sge;
+    sge.addr = 0;
+    sge.length = 0;
+    sge.lkey = 0;
     memset(&wr, 0, sizeof(ibv_send_wr));
     wr.wr_id = (uint64_t)this;
     wr.opcode = IBV_WR_RDMA_READ;
     wr.num_sge = 0;
+    wr.sg_list = &sge;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.next = nullptr;
     wr.imm_data = 0;

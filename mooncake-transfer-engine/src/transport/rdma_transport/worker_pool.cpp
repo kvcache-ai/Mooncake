@@ -468,16 +468,30 @@ void WorkerPool::connectivityTest(int segment_id,
     if (probe_completed) return;
     RWSpinlock::WriteGuard guard(probe_lock);
     if (probe_completed) return;
-    LOG(INFO) << "Start connectivity test";
+    LOG(INFO) << "Context " << context_.deviceName()
+              << ", start connectivity test";
     int num_packets = 0;
     for (auto &device : remote_desc.devices) {
         // eRDMA doesn't support zero byte message
         if (device.name.starts_with("erdma")) continue;
         auto peer_nic_path = MakeNicPath(remote_desc.name, device.name);
         auto endpoint = context_.endpoint(peer_nic_path);
-        if (endpoint->connected()) continue;
-        if (endpoint->setupConnectionsByActive() ||
-            endpoint->submitZeroByteMessage()) {
+        if (!endpoint) {
+            LOG(INFO) << "Context " << context_.deviceName()
+                      << ", cannot allocate endpoint for " << peer_nic_path;
+            probe_unconnected_list.insert(peer_nic_path);
+            continue;
+        }
+        if (endpoint->setupConnectionsByActive()) {
+            LOG(INFO) << "Context " << context_.deviceName()
+                      << ", cannot setup connection for " << peer_nic_path;
+            probe_unconnected_list.insert(peer_nic_path);
+            continue;
+        }
+        if (endpoint->submitZeroByteMessage()) {
+            LOG(INFO) << "Context " << context_.deviceName()
+                      << ", cannot submit zero byte message for "
+                      << peer_nic_path;
             probe_unconnected_list.insert(peer_nic_path);
             continue;
         }
@@ -487,7 +501,8 @@ void WorkerPool::connectivityTest(int segment_id,
         ibv_wc wc_list[16];
         int nr_poll = ibv_poll_cq(context_.diagnosticCq(), 16, wc_list);
         if (nr_poll < 0) {
-            LOG(ERROR) << "ConnectivityTest: Failed to poll completion queues";
+            LOG(INFO) << "Context " << context_.deviceName()
+                      << ", found ibv_poll_cq error for all devices";
             for (auto &device : remote_desc.devices) {
                 auto peer_nic_path = MakeNicPath(remote_desc.name, device.name);
                 probe_unconnected_list.insert(peer_nic_path);
@@ -500,13 +515,16 @@ void WorkerPool::connectivityTest(int segment_id,
                 auto peer_nic_path =
                     MakeNicPath(remote_desc.name, context->deviceName());
                 probe_unconnected_list.insert(peer_nic_path);
+                LOG(INFO) << "Context " << context_.deviceName()
+                          << ", found work completion error for "
+                          << peer_nic_path;
             }
         }
         num_packets -= nr_poll;
     }
+    LOG(INFO) << "Connectivity test detected phase completed";
     for (auto &entry : probe_unconnected_list) {
         context_.deleteEndpoint(entry);
-        LOG(INFO) << "Endpoint " << entry << " is banned";
     }
     LOG(INFO) << "Connectivity test completed";
     probe_completed = true;
