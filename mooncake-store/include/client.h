@@ -125,7 +125,7 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        ReplicateConfig& config);
+        const ReplicateConfig& config);
 
     /**
      * @brief Removes an object and all its replicas

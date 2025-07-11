@@ -290,24 +290,18 @@ class WrappedMasterService {
     }
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
-        const std::string& key, uint64_t value_length,
-        const std::vector<uint64_t>& slice_lengths,
+        const std::string& key, const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config) {
         return execute_rpc(
             "PutStart",
             [&] {
-                return master_service_.PutStart(key, value_length,
-                                                slice_lengths, config);
+                return master_service_.PutStart(key, slice_lengths, config);
             },
             [&](auto& timer) {
-                timer.LogRequest("key=", key, ", value_length=", value_length,
+                timer.LogRequest("key=", key,
                                  ", slice_lengths=", slice_lengths.size());
             },
-            [&] {
-                MasterMetricManager::instance().inc_put_start_requests();
-                MasterMetricManager::instance().observe_value_size(
-                    value_length);
-            },
+            [&] { MasterMetricManager::instance().inc_put_start_requests(); },
             [] { MasterMetricManager::instance().inc_put_start_failures(); });
     }
 
@@ -329,7 +323,6 @@ class WrappedMasterService {
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& value_lengths,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config) {
         ScopedVLogTimer timer(1, "BatchPutStart");
@@ -341,8 +334,8 @@ class WrappedMasterService {
         results.reserve(keys.size());
 
         for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(master_service_.PutStart(
-                keys[i], value_lengths[i], slice_lengths[i], config));
+            results.emplace_back(
+                master_service_.PutStart(keys[i], slice_lengths[i], config));
         }
 
         // Count failures and log errors
