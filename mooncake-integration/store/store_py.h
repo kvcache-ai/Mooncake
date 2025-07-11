@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h> 
 
 #include <csignal>
 #include <mutex>
@@ -225,8 +226,28 @@ class DistributedObjectStore {
      */
     int64_t getSize(const std::string &key);
 
+    /**
+     * @brief Get a PyTorch tensor from the store
+     * @param key Key of the tensor to get
+     * @param dtype Data type of the tensor
+     * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
+     */
+    pybind11::object get_tensor(const std::string &key, const std::string dtype);
+
+    /**
+     * @brief Put a PyTorch tensor into the store
+     * @param key Key for the tensor
+     * @param tensor PyTorch tensor to store
+     * @return 0 on success, negative value on error
+     */
+    int put_tensor(const std::string &key, pybind11::object tensor);
+
    private:
-    int allocateSlices(std::vector<mooncake::Slice> &slices, size_t length);
+    pybind11::module numpy = pybind11::module::import("numpy");
+    pybind11::module torch = pybind11::module::import("torch");
+
+    int allocateSlices(std::vector<mooncake::Slice> &slices,
+                                           size_t length);
 
     int allocateSlices(std::vector<mooncake::Slice> &slices,
                        const std::string &value);
