@@ -184,6 +184,8 @@ class DistributedObjectStore {
                   const std::vector<std::span<const char>> &values,
                   const ReplicateConfig &config = ReplicateConfig{});
 
+    [[nodiscard]] std::string get_hostname() const;
+
     pybind11::bytes get(const std::string &key);
 
     std::vector<pybind11::bytes> get_batch(
