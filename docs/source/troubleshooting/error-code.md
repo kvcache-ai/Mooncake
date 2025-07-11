@@ -35,7 +35,7 @@ Mooncake Store may generate various types of errors during execution. For most A
 | Segment Selection        | SHARD_INDEX_OUT_OF_RANGE (-100)| Shard index is out of bounds                                                                              |
 |                          | SEGMENT_NOT_FOUND (-101)       | No available segments found                                                                               |
 |                          | SEGMENT_ALREADY_EXISTS (-102)  | Segment already exists                                                                                    |
-| Handle Selection         | NO_AVAILABLE_HANDLE (-200)     | No available handles                                                                                      |
+| Handle Selection         | NO_AVAILABLE_HANDLE (-200)     | Memory allocation failed due to insufficient space.          |
 | Version                  | INVALID_VERSION (-300)         | Invalid version                                                                                           |
 | Key                      | INVALID_KEY (-400)             | Invalid key                                                                                              |
 | Engine                   | WRITE_FAIL (-500)              | Write operation failed                                                                                    |

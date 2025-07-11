@@ -35,7 +35,7 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 | 分片选择  | SHARD\_INDEX\_OUT\_OF\_RANGE (-100)      | 分片索引超出范围         |
 |       | SEGMENT\_NOT\_FOUND (-101)               | 未找到可用的分片         |
 |       | SEGMENT\_ALREADY\_EXISTS (-102)          | 分片已存在            |
-| 句柄选择  | NO\_AVAILABLE\_HANDLE (-200)             | 无可用句柄            |
+| 句柄选择  | NO\_AVAILABLE\_HANDLE (-200)             | 由于空间不足，内存分配失败      |
 | 版本相关  | INVALID\_VERSION (-300)                  | 无效的版本            |
 | 键相关   | INVALID\_KEY (-400)                      | 无效的键             |
 | 引擎相关  | WRITE\_FAIL (-500)                       | 写入操作失败           |
