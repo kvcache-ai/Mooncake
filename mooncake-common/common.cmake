@@ -105,6 +105,10 @@ if (USE_TCP)
 endif()
 
 if (USE_ASCEND)
+  find_package(MPI REQUIRED)
+  if (NOT MPI_FOUND)
+    message(FATAL "MPI package is not found")
+  endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
 
@@ -116,7 +120,7 @@ if (USE_ASCEND)
   message(STATUS "Found include directories: ${ASCEND_INCLUDE_DIR}")
 
   add_compile_definitions(USE_ASCEND)
-  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR} /usr/include/jsoncpp)
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR} /usr/include/jsoncpp ${MPI_CXX_INCLUDE_DIRS})
   link_directories(${ASCEND_LIB_DIR})
 endif()
 

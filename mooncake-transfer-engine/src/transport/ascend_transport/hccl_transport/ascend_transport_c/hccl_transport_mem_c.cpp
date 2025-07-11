@@ -512,9 +512,9 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
         }
         char *desc = nullptr;
         uint64_t desc_len = 0;
-        ret = HcclMemExport(&buf, &desc, &desc_len);
+        ret = HcclMemGetDesc(&buf, &desc, &desc_len);
         if (ret) {
-            LOG(ERROR) << "HcclMemExport failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemGetDesc failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
             return ret;
         }
         
@@ -870,9 +870,9 @@ int transportMemAccept(RankInfo *local_rank_info) {
         }
         char *desc = nullptr;
         uint64_t desc_len = 0;
-        ret = HcclMemExport(&buf, &desc, &desc_len);
+        ret = HcclMemGetDesc(&buf, &desc, &desc_len);
         if (ret) {
-            LOG(ERROR) << "HcclMemExport failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemGetDesc failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
             return ret;
         }
         
