@@ -26,6 +26,10 @@ mooncake_master &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
+sleep 1
+
+pip install torch numpy
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_put_get_tensor.py
 kill $MASTER_PID || true
 
 
