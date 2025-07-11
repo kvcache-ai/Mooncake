@@ -36,7 +36,7 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 * If `local_buffer_size` is set to zero, it acts as a **pure server**, providing memory for storage. In this case, request operations such as `Get` or `Put` are not permitted from this instance.
 
 The `Client` can be used in two modes:
-1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library (`.so`).
+1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
 2. **Standalone mode**: Runs as an independent process.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
