@@ -83,7 +83,7 @@ class WrappedMasterService {
                 std::string metrics =
                     MasterMetricManager::instance().serialize_metrics();
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::ok, metrics);
+                resp.set_status_and_content(status_type::ok, std::move(metrics));
             });
 
         // Endpoint for human-readable metrics summary
@@ -93,7 +93,7 @@ class WrappedMasterService {
                 std::string summary =
                     MasterMetricManager::instance().get_summary_string();
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::ok, summary);
+                resp.set_status_and_content(status_type::ok, std::move(summary));
             });
 
         // Endpoint for query a key's location
@@ -118,7 +118,7 @@ class WrappedMasterService {
                             }
                         }
                     }
-                    resp.set_status_and_content(status_type::ok, ss);
+                    resp.set_status_and_content(status_type::ok, std::move(ss));
                 } else {
                     resp.set_status_and_content(status_type::not_found,
                                                 toString(get_result.error()));
@@ -139,7 +139,7 @@ class WrappedMasterService {
                         ss += key;
                         ss += "\n";
                     }
-                    resp.set_status_and_content(status_type::ok, ss);
+                    resp.set_status_and_content(status_type::ok, std::move(ss));
                 } else {
                     resp.set_status_and_content(
                         status_type::internal_server_error,
@@ -160,7 +160,7 @@ class WrappedMasterService {
                         ss += segment_name;
                         ss += "\n";
                     }
-                    resp.set_status_and_content(status_type::ok, ss);
+                    resp.set_status_and_content(status_type::ok, std::move(ss));
                 } else {
                     resp.set_status_and_content(
                         status_type::internal_server_error,
@@ -187,7 +187,7 @@ class WrappedMasterService {
                     ss += "\nCapacity(bytes) : ";
                     ss += std::to_string(capacity);
                     ss += "\n";
-                    resp.set_status_and_content(status_type::ok, ss);
+                    resp.set_status_and_content(status_type::ok, std::move(ss));
                 } else {
                     resp.set_status_and_content(
                         status_type::internal_server_error,
