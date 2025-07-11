@@ -3,7 +3,6 @@
 #include <ylt/struct_json/json_writer.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -12,16 +11,15 @@
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "master_metric_manager.h"
 #include "master_service.h"
-#include "rpc_helper.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
 
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
+// We use this enum instead because std::vector<bool> can't be serialized
+// properly over RPC.
 enum class PutResult : uint8_t { SUCCESS = 0, FAILED = 1 };
 
 class WrappedMasterService {

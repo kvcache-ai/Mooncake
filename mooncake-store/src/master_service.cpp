@@ -459,7 +459,8 @@ auto MasterService::PutEnd(const std::string& key,
         metadata.replicas.end());
 
     if (metadata.replicas.empty()) {
-        LOG(ERROR) << "key=" << key << ", error=put_failed";
+        VLOG(1) << "key=" << key
+                << ", does not have any valid replicas, remove it";
         accessor.Erase();
     } else {
         // 1. Set lease timeout to now, indicating that the object has no lease

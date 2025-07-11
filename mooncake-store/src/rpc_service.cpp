@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "rpc_helper.h"
+
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
