@@ -715,6 +715,11 @@ retcode = store.setup(
 * `config`：配置文件路径
 * `port`：HTTP 服务的端口号
 
+假设 `mooncake_transfer_engine` 的 wheel 包已经安装，通过下列命令可以启动程序：
+```bash
+python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
+```
+
 ## 范例代码
 
 #### Python 使用示例

@@ -702,6 +702,11 @@ The main startup parameters include:
 * `config`: Path to the configuration file.
 * `port`: Port number for the HTTP server.
 
+Suppose the `mooncake_transfer_engine` wheel package is already installed, the following command starts the program:
+```bash
+python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
+```
+
 ## Example Code
 
 #### Python Usage Example
