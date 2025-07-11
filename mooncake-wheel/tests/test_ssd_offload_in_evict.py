@@ -287,6 +287,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Phase 3: Cleanup (still using single remove for simplicity)
         # --------------------------
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
@@ -297,5 +298,3 @@ class TestDistributedObjectStore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
