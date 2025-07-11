@@ -997,6 +997,10 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     return static_cast<int>(total_size);
 }
 
+std::string DistributedObjectStore::get_hostname() const {
+    return local_hostname;
+}
+
 std::vector<int> DistributedObjectStore::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
@@ -1473,7 +1477,8 @@ PYBIND11_MODULE(store, m) {
                 return self.put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
-            py::arg("config") = ReplicateConfig{});
+            py::arg("config") = ReplicateConfig{})
+        .def("get_hostname", &DistributedObjectStore::get_hostname);
 }
 
 }  // namespace mooncake
