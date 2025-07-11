@@ -26,6 +26,7 @@ namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+enum class PutResult : uint8_t;
 
 // Structure to store garbage collection tasks
 struct GCTask {
@@ -178,34 +179,13 @@ class MasterService {
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
-     * @brief Complete a put operation
+     * @brief Complete a put operation of a replica
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key) -> tl::expected<void, ErrorCode>;
-
-    /**
-     * @brief Revoke a put operation
-     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
-     * found, ErrorCode::INVALID_WRITE if replica status is invalid
-     */
-    auto PutRevoke(const std::string& key) -> tl::expected<void, ErrorCode>;
-
-    /**
-     * @brief Complete a batch of put operations
-     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
-     * found, ErrorCode::INVALID_WRITE if replica status is invalid
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
-
-    /**
-     * @brief Revoke a batch of put operations
-     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
-     * found, ErrorCode::INVALID_WRITE if replica status is invalid
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+    auto PutEnd(const std::string& key,
+                const std::vector<PutResult>& put_success)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Remove an object and its replicas
@@ -442,6 +422,7 @@ class MasterService {
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
+    std::atomic_uint64_t replica_id_allocator_{0};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
     // boost lockfree queue requires trivial assignment operator

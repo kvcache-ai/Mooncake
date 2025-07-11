@@ -1,19 +1,21 @@
+#include "local_file.h"
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
 #include <fstream>
 #include <string>
 #include <vector>
-#include <sys/uio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/file.h>
-
-#include "local_file.h"
 
 namespace mooncake {
-LocalFile::LocalFile(const std::string& filename,FILE *file,ErrorCode ec) : filename_(filename),file_(file),error_code_(ec) {
+LocalFile::LocalFile(const std::string &filename, FILE *file, ErrorCode ec)
+    : filename_(filename), file_(file), error_code_(ec) {
     if (!file_ || ferror(file_)) {
-        error_code_ = ErrorCode::FILE_INVALID_HANDLE;  
+        error_code_ = ErrorCode::FILE_INVALID_HANDLE;
     } else if (ec != ErrorCode::OK) {
-        error_code_ = ec;  
+        error_code_ = ec;
     }
 }
 
@@ -31,12 +33,12 @@ LocalFile::~LocalFile() {
             } else {
                 LOG(INFO) << "Deleted corrupted file: " << filename_;
             }
-        } 
+        }
     }
     file_ = nullptr;
 }
 
-ssize_t LocalFile::write(const std::string &buffer, size_t length){
+ssize_t LocalFile::write(const std::string &buffer, size_t length) {
     if (file_ == nullptr) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -46,7 +48,7 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
         return -1;
     }
 
-    if(length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    if (length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
         error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
@@ -58,11 +60,11 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
 
     size_t remaining = length;
     size_t written_bytes = 0;
-    const char* ptr = buffer.data();
+    const char *ptr = buffer.data();
 
     while (remaining > 0) {
         size_t written = fwrite(ptr, 1, remaining, file_);
-        if (written == 0) break;  
+        if (written == 0) break;
         remaining -= written;
         ptr += written;
         written_bytes += written;
@@ -71,7 +73,7 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
     if (remaining > 0) {
         error_code_ = ErrorCode::FILE_WRITE_FAIL;
         return -1;
-    }   
+    }
 
     if (release_lock() == -1) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
@@ -86,7 +88,7 @@ ssize_t LocalFile::write(const std::string &buffer, size_t length){
     return written_bytes;
 }
 
-ssize_t LocalFile::read(std::string &buffer, size_t length){
+ssize_t LocalFile::read(std::string &buffer, size_t length) {
     if (file_ == nullptr) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -96,7 +98,7 @@ ssize_t LocalFile::read(std::string &buffer, size_t length){
         return -1;
     }
 
-    if(length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    if (length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
         error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
@@ -120,17 +122,17 @@ ssize_t LocalFile::read(std::string &buffer, size_t length){
         return -1;
     }
 
-    buffer.resize(read_bytes); // shrink to actual read size
+    buffer.resize(read_bytes);  // shrink to actual read size
     return read_bytes;
 }
 
-ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
-    if(!file_){
+ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset) {
+    if (!file_) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
     }
 
-    int fd=fileno(file_);
+    int fd = fileno(file_);
 
     if (fd == -1) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
@@ -162,14 +164,13 @@ ssize_t LocalFile::pwritev(const iovec *iov, int iovcnt, off_t offset){
     return ret;
 }
 
-
-ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
-    if(!file_){
+ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset) {
+    if (!file_) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
     }
 
-    int fd=fileno(file_);
+    int fd = fileno(file_);
 
     if (fd == -1) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
@@ -196,7 +197,7 @@ ssize_t LocalFile::preadv(const iovec *iov, int iovcnt, off_t offset){
     return ret;
 }
 
-int LocalFile::acquire_write_lock(){
+int LocalFile::acquire_write_lock() {
     if (flock(fileno(file_), LOCK_EX) == -1) {
         return -1;
     }
@@ -204,7 +205,7 @@ int LocalFile::acquire_write_lock(){
     return 0;
 }
 
-int LocalFile::acquire_read_lock(){
+int LocalFile::acquire_read_lock() {
     if (flock(fileno(file_), LOCK_SH) == -1) {
         return -1;
     }
@@ -212,7 +213,7 @@ int LocalFile::acquire_read_lock(){
     return 0;
 }
 
-int LocalFile::release_lock(){
+int LocalFile::release_lock() {
     if (!is_locked_) return 0;
     if (flock(fileno(file_), LOCK_UN) == -1) {
         return -1;
@@ -221,4 +222,4 @@ int LocalFile::release_lock(){
     return 0;
 }
 
-}
+}  // namespace mooncake

@@ -47,8 +47,6 @@ class MasterMetricManager {
     void inc_put_start_failures(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
     void inc_put_end_failures(int64_t val = 1);
-    void inc_put_revoke_requests(int64_t val = 1);
-    void inc_put_revoke_failures(int64_t val = 1);
     void inc_get_replica_list_requests(int64_t val = 1);
     void inc_get_replica_list_failures(int64_t val = 1);
     void inc_exist_key_requests(int64_t val = 1);
@@ -75,17 +73,12 @@ class MasterMetricManager {
     void inc_batch_put_start_failures(int64_t val = 1);
     void inc_batch_put_end_requests(int64_t val = 1);
     void inc_batch_put_end_failures(int64_t val = 1);
-    void inc_batch_put_revoke_requests(int64_t val = 1);
-    void inc_batch_put_revoke_failures(int64_t val = 1);
-
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
     int64_t get_put_end_requests();
     int64_t get_put_end_failures();
-    int64_t get_put_revoke_requests();
-    int64_t get_put_revoke_failures();
     int64_t get_get_replica_list_requests();
     int64_t get_get_replica_list_failures();
     int64_t get_exist_key_requests();
@@ -112,12 +105,10 @@ class MasterMetricManager {
     int64_t get_batch_put_start_failures();
     int64_t get_batch_put_end_requests();
     int64_t get_batch_put_end_failures();
-    int64_t get_batch_put_revoke_requests();
-    int64_t get_batch_put_revoke_failures();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
-    void inc_eviction_fail(); // not a single object is evicted
+    void inc_eviction_fail();  // not a single object is evicted
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();
@@ -165,8 +156,6 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_failures_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
-    ylt::metric::counter_t put_revoke_requests_;
-    ylt::metric::counter_t put_revoke_failures_;
     ylt::metric::counter_t get_replica_list_requests_;
     ylt::metric::counter_t get_replica_list_failures_;
     ylt::metric::counter_t exist_key_requests_;
@@ -193,8 +182,6 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_start_failures_;
     ylt::metric::counter_t batch_put_end_requests_;
     ylt::metric::counter_t batch_put_end_failures_;
-    ylt::metric::counter_t batch_put_revoke_requests_;
-    ylt::metric::counter_t batch_put_revoke_failures_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;

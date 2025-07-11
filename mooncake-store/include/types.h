@@ -307,19 +307,22 @@ class Replica {
    public:
     struct Descriptor;
 
-    Replica() = default;
-    Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
-            ReplicaStatus status)
-        : buffers_(std::move(buffers)), status_(status) {}
+    Replica() = delete;
+    Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers)
+        : buffers_(std::move(buffers)), status_(ReplicaStatus::PROCESSING) {}
+    Replica(const Replica&) = delete;
+    Replica& operator=(const Replica&) = delete;
 
-    void reset() noexcept {
-        buffers_.clear();
-        status_ = ReplicaStatus::UNDEFINED;
-    }
+    Replica(Replica&&) noexcept = default;
+    Replica& operator=(Replica&&) noexcept = default;
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
+
+    [[nodiscard]] bool completed() const {
+        return status_ == ReplicaStatus::COMPLETE;
+    }
 
     [[nodiscard]] bool has_invalid_handle() const {
         return std::any_of(buffers_.begin(), buffers_.end(),

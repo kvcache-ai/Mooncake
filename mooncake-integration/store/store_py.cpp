@@ -10,6 +10,7 @@
 #include <random>
 
 #include "types.h"
+#include "utils.h"
 
 namespace py = pybind11;
 

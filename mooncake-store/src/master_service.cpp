@@ -7,6 +7,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
+#include "rpc_service.h"
 #include "types.h"
 
 namespace mooncake {
@@ -160,23 +161,28 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 }
 
 void MasterService::ClearInvalidHandles() {
+    // Drop replicas whose handles are no longer valid; since we do not have
+    // replica re-scheduling yet, an object is erased entirely once all of its
+    // replicas are gone.
+
+    // TODO: We should have replica re-scheduling
+
+    // TODO: Since we iterate all shards and all objects, this is a very
+    // expensive operation. We could do it parallelly.
     for (auto& shard : metadata_shards_) {
         MutexLocker lock(&shard.mutex);
-        auto it = shard.metadata.begin();
-        while (it != shard.metadata.end()) {
-            // Check if the object has any invalid replicas
-            bool has_invalid = false;
-            for (auto& replica : it->second.replicas) {
-                if (replica.has_invalid_handle()) {
-                    has_invalid = true;
-                    break;
-                }
-            }
-            // Remove the object if it has no valid replicas
-            if (has_invalid || CleanupStaleHandles(it->second)) {
-                it = shard.metadata.erase(it);
+        auto obj_it = shard.metadata.begin();
+        while (obj_it != shard.metadata.end()) {
+            auto& meta = obj_it->second;
+            auto& reps = meta.replicas;
+
+            std::erase_if(
+                reps, [](const Replica& r) { return r.has_invalid_handle(); });
+
+            if (reps.empty()) {
+                obj_it = shard.metadata.erase(obj_it);
             } else {
-                ++it;
+                ++obj_it;
             }
         }
     }
@@ -372,6 +378,7 @@ auto MasterService::PutStart(const std::string& key,
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
+
         for (size_t i = 0; i < config.replica_num; ++i) {
             std::vector<std::unique_ptr<AllocatedBuffer>> handles;
             handles.reserve(slice_lengths.size());
@@ -399,9 +406,7 @@ auto MasterService::PutStart(const std::string& key,
                         << ", action=slice_allocated";
                 handles.emplace_back(std::move(handle));
             }
-
-            replicas.emplace_back(std::move(handles),
-                                  ReplicaStatus::PROCESSING);
+            replicas.emplace_back(std::move(handles));
         }
     }
 
@@ -420,7 +425,8 @@ auto MasterService::PutStart(const std::string& key,
     return replica_list;
 }
 
-auto MasterService::PutEnd(const std::string& key)
+auto MasterService::PutEnd(const std::string& key,
+                           const std::vector<PutResult>& put_success)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -429,53 +435,41 @@ auto MasterService::PutEnd(const std::string& key)
     }
 
     auto& metadata = accessor.Get();
-    for (auto& replica : metadata.replicas) {
-        replica.mark_complete();
+    if (put_success.size() != metadata.replicas.size()) {
+        LOG(ERROR) << "key=" << key << ", error=invalid_params";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // 1. Set lease timeout to now, indicating that the object has no lease
-    // at beginning. 2. If this object has soft pin enabled, set it to be soft
-    // pinned.
-    metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+
+    auto replica_it = metadata.replicas.begin();
+    auto success_it = put_success.begin();
+    while (replica_it != metadata.replicas.end() &&
+           success_it != put_success.end()) {
+        if (*success_it == PutResult::SUCCESS) {
+            replica_it->mark_complete();
+        }
+        ++replica_it;
+        ++success_it;
+    }
+
+    // remove failed replicas
+    metadata.replicas.erase(
+        std::remove_if(
+            metadata.replicas.begin(), metadata.replicas.end(),
+            [](const auto& replica) { return !replica.completed(); }),
+        metadata.replicas.end());
+
+    if (metadata.replicas.empty()) {
+        VLOG(1) << "key=" << key
+                << ", does not have any valid replicas, remove it";
+        accessor.Erase();
+    } else {
+        // 1. Set lease timeout to now, indicating that the object has no lease
+        // at beginning. 2. If this object has soft pin enabled, set it to be
+        // soft pinned.
+        metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    }
+
     return {};
-}
-
-auto MasterService::PutRevoke(const std::string& key)
-    -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    auto& metadata = accessor.Get();
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
-        LOG(ERROR) << "key=" << key << ", status=" << *status
-                   << ", error=invalid_replica_status";
-        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
-
-    accessor.Erase();
-    return {};
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const std::vector<std::string>& keys) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(key));
-    }
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(key));
-    }
-    return results;
 }
 
 auto MasterService::Remove(const std::string& key)
