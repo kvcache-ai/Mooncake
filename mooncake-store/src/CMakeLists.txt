@@ -18,6 +18,7 @@ set(MOONCAKE_STORE_SOURCES
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
+    rpc_service.cpp
 )
 
 # The cache_allocator library
