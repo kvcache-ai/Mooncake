@@ -1388,7 +1388,6 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         return -1;
     }
 }
-
 int DistributedObjectStore::put_tensor_with_metadata(const std::string &key, pybind11::object tensor, const std::string &shape, const std::string &dtype){
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1396,42 +1395,51 @@ int DistributedObjectStore::put_tensor_with_metadata(const std::string &key, pyb
     }
 
     try {
-        // Check if the object is a tensor
         if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
             return -1;
         }
 
-        // 1. Create metadata as JSON
-        nlohmann::json metadata;
-        metadata["shape"] = shape;
-        metadata["dtype"] = dtype;
-        std::string metadata_str = metadata.dump();
-        uint32_t metadata_size = static_cast<uint32_t>(metadata_str.size());
-        
-        // Get tensor information
         uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = tensor.attr("numel")().cast<size_t>();
         size_t element_size = tensor.attr("element_size")().cast<size_t>();
         size_t tensor_size = numel * element_size;
         
-        // 2. Calculate total buffer size and allocate
-        size_t total_size = sizeof(uint32_t) + metadata_str.size() + tensor_size;
+        uint32_t shape_size = static_cast<uint32_t>(shape.size());
+        uint32_t dtype_size = static_cast<uint32_t>(dtype.size());
+        
+        // Calculate total buffer size: 
+        size_t total_size = sizeof(uint32_t) + shape_size + sizeof(uint32_t) + dtype_size + tensor_size;
         char* combined_buffer = new char[total_size];
         
-        // 3. Write metadata size
-        std::memcpy(combined_buffer, &metadata_size, sizeof(uint32_t));
+        size_t offset = 0;
         
-        // 4. Write metadata content
-        std::memcpy(combined_buffer + sizeof(uint32_t), metadata_str.data(), metadata_size);
+        // Write shape size
+        std::memcpy(combined_buffer + offset, &shape_size, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
         
-        // 5. Register tensor buffer and copy tensor data
+        // Write shape data
+        std::memcpy(combined_buffer + offset, shape.data(), shape_size);
+        offset += shape_size;
+        
+        // Write dtype size
+        std::memcpy(combined_buffer + offset, &dtype_size, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Write dtype data
+        std::memcpy(combined_buffer + offset, dtype.data(), dtype_size);
+        offset += dtype_size;
+        
+        // Register tensor buffer and copy tensor data
         void* tensor_data = reinterpret_cast<void*>(data_ptr);
         this->register_buffer(tensor_data, tensor_size);
-        std::memcpy(combined_buffer + sizeof(uint32_t) + metadata_size, tensor_data, tensor_size);
+        std::memcpy(combined_buffer + offset, tensor_data, tensor_size);
         this->unregister_buffer(tensor_data);
         
+        // Register combined buffer and put
+        this->register_buffer(combined_buffer, total_size);
         int result = this->put_from(key, combined_buffer, total_size);
+        this->unregister_buffer(combined_buffer);
         
         delete[] combined_buffer;
         
@@ -1439,14 +1447,8 @@ int DistributedObjectStore::put_tensor_with_metadata(const std::string &key, pyb
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
         return -1;
-    } catch (const nlohmann::json::exception& e) {
-        LOG(ERROR) << "Failed to create metadata JSON: " << e.what();
-        return -1;
     }
-
 }
-
-
 
 std::vector<int> DistributedObjectStore::batch_put_tensors(
     const std::vector<std::string> &keys,
@@ -1617,7 +1619,6 @@ std::vector<pybind11::object> DistributedObjectStore::batch_get_tensors(
         return std::vector<pybind11::object>(keys.size(), pybind11::none());
     }
 }
-
 std::tuple<pybind11::object, std::string, std::string> 
 DistributedObjectStore::get_tensor_with_metadata(const std::string &key) {
     if (!client_) {
@@ -1657,23 +1658,59 @@ DistributedObjectStore::get_tensor_with_metadata(const std::string &key) {
             return std::make_tuple(pybind11::none(), "", "");
         }
 
-        // 3. Read metadata size
-        uint32_t metadata_size;
-        std::memcpy(&metadata_size, data, sizeof(uint32_t));
-
-        // 4. Read and parse metadata
-        std::string metadata_str(data + sizeof(uint32_t), metadata_size);
-        auto metadata = nlohmann::json::parse(metadata_str);
-        std::string shape = metadata["shape"].get<std::string>();
-        std::string dtype = metadata["dtype"].get<std::string>();
-
-        // 5. Get tensor data
-        size_t tensor_offset = sizeof(uint32_t) + metadata_size;
-        size_t tensor_size = total_length - tensor_offset;
+        // 3. Parse binary format:
+        // [shape_size] [shape_data] [dtype_size] [dtype_data] [tensor_data]
+        size_t offset = 0;
         
-        // 6. Create numpy array from tensor data
+        // Read shape size
+        uint32_t shape_size;
+        if (offset + sizeof(uint32_t) > total_length) {
+            delete[] data;
+            LOG(ERROR) << "Invalid data format: insufficient data for shape size";
+            return std::make_tuple(pybind11::none(), "", "");
+        }
+        std::memcpy(&shape_size, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Read shape data
+        if (offset + shape_size > total_length) {
+            delete[] data;
+            LOG(ERROR) << "Invalid data format: insufficient data for shape";
+            return std::make_tuple(pybind11::none(), "", "");
+        }
+        std::string shape(data + offset, shape_size);
+        offset += shape_size;
+        
+        // Read dtype size
+        uint32_t dtype_size;
+        if (offset + sizeof(uint32_t) > total_length) {
+            delete[] data;
+            LOG(ERROR) << "Invalid data format: insufficient data for dtype size";
+            return std::make_tuple(pybind11::none(), "", "");
+        }
+        std::memcpy(&dtype_size, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Read dtype data
+        if (offset + dtype_size > total_length) {
+            delete[] data;
+            LOG(ERROR) << "Invalid data format: insufficient data for dtype";
+            return std::make_tuple(pybind11::none(), "", "");
+        }
+        std::string dtype(data + offset, dtype_size);
+        offset += dtype_size;
+
+        // 4. Get tensor data
+        size_t tensor_size = total_length - offset;
+        if (tensor_size == 0) {
+            delete[] data;
+            LOG(ERROR) << "Invalid data format: no tensor data found";
+            return std::make_tuple(pybind11::none(), "", "");
+        }
+        
+        // 5. Create numpy array from tensor data
         char* tensor_data = new char[tensor_size];
-        std::memcpy(tensor_data, data + tensor_offset, tensor_size);
+        std::memcpy(tensor_data, data + offset, tensor_size);
         delete[] data;  // Free the original data buffer
 
         pybind11::object np_array;
@@ -1701,18 +1738,16 @@ DistributedObjectStore::get_tensor_with_metadata(const std::string &key) {
             np_array = create_typed_array<bool>(tensor_data, tensor_size);
         } else {
             delete[] tensor_data;
+            LOG(ERROR) << "Unsupported dtype: " << dtype;
             return std::make_tuple(pybind11::none(), "", "");
         }
 
-        // 7. Create tensor from numpy array
+        // 6. Create tensor from numpy array
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
         return std::make_tuple(std::move(tensor), shape, dtype);
 
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to get tensor data: " << e.what();
-        return std::make_tuple(pybind11::none(), "", "");
-    } catch (const nlohmann::json::exception& e) {
-        LOG(ERROR) << "Failed to parse metadata JSON: " << e.what();
         return std::make_tuple(pybind11::none(), "", "");
     }
 }
