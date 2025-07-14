@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -90,8 +89,7 @@ class WrappedMasterService {
     std::atomic<bool> metric_report_running_;
 };
 
-void RegisterRpcService(
-    coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service);
+void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        mooncake::WrappedMasterService& wrapped_master_service);
 
 }  // namespace mooncake
