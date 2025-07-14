@@ -8,14 +8,9 @@
 namespace mooncake {
 
 ThreeFSFile::ThreeFSFile(const std::string& filename, int fd, USRBIOResourceManager* resource_manager) 
-    : StorageFile(filename), fd_(fd), resource_manager_(resource_manager) {}
+    : StorageFile(filename, fd), resource_manager_(resource_manager) {}
 
 ThreeFSFile::~ThreeFSFile() {
-    // Release lock resources
-    if (is_locked_) {
-        release_lock();
-    }
-
     // Deregister and close file descriptor
     if (fd_ >= 0) {
         hf3fs_dereg_fd(fd_);
@@ -37,15 +32,7 @@ ThreeFSFile::~ThreeFSFile() {
 
 ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
     // 1. Parameter validation
-    if (buffer.empty() || length == 0) {
-        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-        return -1;
-    }
-    if (length > buffer.size()) {
-        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-        return -1;
-    }
-    if (length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
         error_code_ = ErrorCode::FILE_INVALID_BUFFER;
         return -1;
     }
@@ -57,13 +44,9 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
         return -1;
     }
 
-    if (fd_ < 0) {
-        error_code_ = ErrorCode::FILE_NOT_FOUND;
-        return -1;
-    }
-
     // 3. Acquire write lock
-    if (acquire_write_lock() == -1) {
+    auto lock = acquire_write_lock();
+    if (!lock.is_locked()) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
         return -1;
     }
@@ -88,7 +71,6 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
                                threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -96,7 +78,6 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
         ret = hf3fs_submit_ios(&ior_write);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -105,7 +86,6 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
         ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -118,36 +98,27 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
         }
     }
 
-    // 5. Release lock
-    if (release_lock() == -1) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        LOG(INFO) << "Failed to release lock on file: " << filename_;
-    }
-
-    // 6. Return result
+    // 5. Return result
     return total_bytes_written > 0 ? static_cast<ssize_t>(total_bytes_written) : -1;
 }
 
 ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
-    // 1. Get thread resources
+    // 1. Parameter validation
+    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
+        return -1;
+    }
+
+    // 2. Get thread resources
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         error_code_ = ErrorCode::FILE_OPEN_FAIL;
         return -1;
     }
 
-    // 2. Parameter validation
-    if (fd_ < 0) {
-        error_code_ = ErrorCode::FILE_NOT_FOUND;
-        return -1;
-    }
-    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
-        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-        return -1;
-    }
-
     // 3. Acquire read lock
-    if (acquire_read_lock() == -1) {
+    auto lock = acquire_read_lock();
+    if (!lock.is_locked()) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
         return -1;
     }
@@ -173,7 +144,6 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
                                threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -181,7 +151,6 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
         ret = hf3fs_submit_ios(&ior_read);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -190,7 +159,6 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
         ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -209,17 +177,11 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
         }
     }
 
-    // 6. Release lock
-    if (release_lock() == -1) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        LOG(INFO) << "Failed to release lock on file: " << filename_;
-    }
-
-    // 7. Return result
+    // 6. Return result
     return total_bytes_read > 0 ? static_cast<ssize_t>(total_bytes_read) : -1;
 }
 
-ssize_t ThreeFSFile::pwritev(const iovec* iov, int iovcnt, off_t offset) {
+ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         error_code_ = ErrorCode::FILE_OPEN_FAIL;
@@ -229,24 +191,14 @@ ssize_t ThreeFSFile::pwritev(const iovec* iov, int iovcnt, off_t offset) {
     auto& threefs_iov = resource->iov_;
     auto& ior_write = resource->ior_write_;
 
-    if (fd_ < 0) {
-        error_code_ = ErrorCode::FILE_NOT_FOUND;
-        return -1;
-    }
-
-    if (acquire_write_lock() == -1) {
+    auto lock = acquire_write_lock();
+    if (!lock.is_locked()) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
         return -1;
     }
-
-    // 1. Calculate total length and validate buffers
+    // 1. Calculate total length
     size_t total_length = 0;
     for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_base == nullptr || iov[i].iov_len == 0) {
-            error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-            release_lock();
-            return -1;
-        }
         total_length += iov[i].iov_len;
     }
 
@@ -294,14 +246,12 @@ ssize_t ThreeFSFile::pwritev(const iovec* iov, int iovcnt, off_t offset) {
                                threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
         ret = hf3fs_submit_ios(&ior_write);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -310,7 +260,6 @@ ssize_t ThreeFSFile::pwritev(const iovec* iov, int iovcnt, off_t offset) {
         ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -324,15 +273,10 @@ ssize_t ThreeFSFile::pwritev(const iovec* iov, int iovcnt, off_t offset) {
         }
     }
 
-    if (release_lock() == -1) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        LOG(INFO) << "Failed to release lock on file: " << filename_;
-    }
-
     return total_bytes_written > 0 ? total_bytes_written : -1;
 }
 
-ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
+ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         error_code_ = ErrorCode::FILE_OPEN_FAIL;
@@ -342,12 +286,8 @@ ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
     auto& threefs_iov = resource->iov_;
     auto& ior_read = resource->ior_read_;
 
-    if (fd_ < 0) {
-        error_code_ = ErrorCode::FILE_NOT_FOUND;
-        return -1;
-    }
-
-    if (acquire_read_lock() == -1) {
+    auto lock = acquire_read_lock();
+    if (!lock.is_locked()) {
         error_code_ = ErrorCode::FILE_LOCK_FAIL;
         return -1;
     }
@@ -374,7 +314,6 @@ ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
                             threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -382,7 +321,6 @@ ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
         ret = hf3fs_submit_ios(&ior_read);
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -392,7 +330,6 @@ ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
         size_t bytes_read = cqe.result;
         if (ret < 0) {
             error_code_ = ErrorCode::FILE_READ_FAIL;
-            release_lock();
             return -1;
         }
 
@@ -431,41 +368,12 @@ ssize_t ThreeFSFile::preadv(const iovec* iov, int iovcnt, off_t offset) {
         }
     }
 
-    if (release_lock() == -1) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        LOG(INFO) << "Failed to release lock on file: " << filename_;
-    }
-
     return total_bytes_read > 0 ? total_bytes_read : -1;
 }
 
-int ThreeFSFile::acquire_write_lock() {
-    if (flock(fd_, LOCK_EX) == -1) {
-        return -1;
-    }
-    is_locked_ = true;
-    return 0;
-}
-
-int ThreeFSFile::acquire_read_lock() {
-    if (flock(fd_, LOCK_SH) == -1) {
-        return -1;
-    }
-    is_locked_ = true;
-    return 0;
-}
-
-int ThreeFSFile::release_lock() {
-    if (!is_locked_) return 0;
-    if (flock(fd_, LOCK_UN) == -1) {
-        return -1;
-    }
-    is_locked_ = false;
-    return 0;
-}
-
-// USRBIO Resource manager implementation
-
+// ============================================================================
+// USRBIO Resource manager Implementation
+// ============================================================================
 bool ThreadUSRBIOResource::Initialize(const ThreeFSParams &params) {
     if (initialized) {
     return true;
@@ -490,7 +398,7 @@ bool ThreadUSRBIOResource::Initialize(const ThreeFSParams &params) {
     }
 
     // Create write I/O ring
-    ret = hf3fs_iorcreate4(&ior_write, params.mount_root.c_str(),
+    ret = hf3fs_iorcreate4(&ior_write_, params.mount_root.c_str(),
                             params.ior_entries, false, params.io_depth,
                             params.ior_timeout, -1, 0);
     if (ret < 0) {

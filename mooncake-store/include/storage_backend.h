@@ -159,12 +159,6 @@ class StorageBackend  {
     
     std::pair<int, int> parse_mode_flags(const std::string& mode) const;
 
-    std::unique_ptr<StorageFile> create_posix_file(
-    const std::string& path, const std::string& mode) const ;
-    #ifdef USE_3FS
-    std::unique_ptr<StorageFile> create_3fs_file(
-    const std::string& path, const std::string& mode) const ;
-    #endif
     std::unique_ptr<StorageFile> create_file(const std::string& path, 
                                            const std::string& mode) const;
 

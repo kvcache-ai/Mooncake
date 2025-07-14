@@ -32,10 +32,10 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         slices_total_size += slice.size;
     }
 
-    ssize_t ret = file->pwritev(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
+        LOG(INFO) << "vector_write failed for: " << path;
         return ErrorCode::FILE_WRITE_FAIL;
     }
 
@@ -105,10 +105,10 @@ ErrorCode StorageBackend::LoadObject(std::string& path,
         iovs.push_back(io);
     }
 
-    ssize_t ret = file->preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
-        LOG(INFO) << "preadv failed for: " << path;
+        LOG(INFO) << "vector_read failed for: " << path;
 
         return ErrorCode::FILE_READ_FAIL;
     }
@@ -305,39 +305,28 @@ std::pair<int, int> StorageBackend::parse_mode_flags(const std::string& mode) co
     return {flags | access_mode, access_mode};
 }
 
-std::unique_ptr<StorageFile> StorageBackend::create_posix_file(
-    const std::string& path, const std::string& mode) const 
-{
-    FILE* file = fopen(path.c_str(), mode.c_str());
-    return file ? std::make_unique<PosixFile>(path, file) : nullptr;
-}
-#ifdef USE_3FS
-std::unique_ptr<StorageFile> StorageBackend::create_3fs_file(
+std::unique_ptr<StorageFile> StorageBackend::create_file(
     const std::string& path, const std::string& mode) const {
 
     auto [flags, access_mode] = parse_mode_flags(mode);
     
     int fd = open(path.c_str(), flags, 0644);
-    if (fd < 0) return nullptr;
-    
-    if (hf3fs_reg_fd(fd, 0) > 0) {
-        close(fd);
-        return nullptr;
+    if (fd < 0) {
+        return nullptr;  
     }
 
-    return resource_manager_ ? 
-                std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get()) : nullptr;
-}
-#endif
-
-std::unique_ptr<StorageFile> StorageBackend::create_file(
-    const std::string& path, const std::string& mode) const {
 #ifdef USE_3FS
     if (is_3fs_dir_) {
-        return create_3fs_file(path, mode); 
+        if (hf3fs_reg_fd(fd, 0) > 0) {
+            close(fd);
+            return nullptr;
+        }
+        return resource_manager_ ? 
+            std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get()) : nullptr;
     }
 #endif
-    return create_posix_file(path, mode);   
+
+    return std::make_unique<PosixFile>(path, fd);
 }
 
 }  // namespace mooncake

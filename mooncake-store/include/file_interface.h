@@ -7,6 +7,7 @@
 #include "types.h"
 #include <atomic>
 #include <thread>
+#include <sys/file.h>
 
 #ifdef USE_3FS
 #include <hf3fs_usrbio.h>
@@ -87,6 +88,41 @@ struct ThreadUSRBIOResource {
   ~ThreadUSRBIOResource() { Cleanup(); }
 };
 #endif // USE_3FS
+
+class FileLockRAII {
+public:
+    enum class LockType { READ, WRITE };
+
+    FileLockRAII(int fd, LockType type) : fd_(fd), locked_(false) {
+        if (type == LockType::READ) {
+            locked_ = (flock(fd_, LOCK_SH) == 0);
+        } else {
+            locked_ = (flock(fd_, LOCK_EX) == 0);
+        }
+    }
+
+    ~FileLockRAII() {
+        if (locked_) {
+            flock(fd_, LOCK_UN);
+        }
+    }
+
+
+    FileLockRAII(const FileLockRAII&) = delete;
+    FileLockRAII& operator=(const FileLockRAII&) = delete;
+
+    FileLockRAII(FileLockRAII&& other) noexcept 
+        : fd_(other.fd_), locked_(other.locked_) {
+        other.locked_ = false;
+    }
+
+    bool is_locked() const { return locked_; }
+
+private:
+    int fd_;
+    bool locked_;
+};
+
 /**
  * @class LocalFile
  * @brief RAII wrapper for file operations with thread-safe locking support
@@ -97,8 +133,8 @@ struct ThreadUSRBIOResource {
 class StorageFile {
 public:    
 
-    StorageFile(const std::string &filename)
-        : filename_(filename), error_code_(ErrorCode::OK), is_locked_(false) {}
+    StorageFile(const std::string &filename, int fd)
+        : filename_(filename), fd_(fd), error_code_(ErrorCode::OK), is_locked_(false) {}
     /**
      * @brief Destructor
      * @note Automatically closes the file and releases resources
@@ -131,7 +167,7 @@ public:
      * @return Total bytes written on success, -1 on error
      * @note Thread-safe operation with write locking
      */
-    virtual ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) = 0;
 
     /**
      * @brief Scattered read from specified file offset
@@ -141,7 +177,18 @@ public:
      * @return Total bytes read on success, -1 on error
      * @note Thread-safe operation with read locking
      */
-    virtual ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) = 0;
+
+    /**
+     * @brief file locking mechanism
+     */
+    FileLockRAII acquire_write_lock() {
+        return FileLockRAII(fd_, FileLockRAII::LockType::WRITE);
+    }
+
+    FileLockRAII acquire_read_lock() {
+        return FileLockRAII(fd_, FileLockRAII::LockType::READ);
+    }
 
     /**
      * @brief Gets the current error code
@@ -151,35 +198,22 @@ public:
         return error_code_;
     }
 
-    /**
-     * @brief file locking mechanism
-     */
-    virtual int acquire_write_lock() = 0;
-    virtual int acquire_read_lock() = 0;
-    virtual int release_lock() = 0;
-
 protected:
     std::string filename_;
+    int fd_;
     ErrorCode error_code_;
     std::atomic<bool> is_locked_{false};
 };
 
 class PosixFile : public StorageFile {
 public:
-    PosixFile(const std::string &filename, FILE *file);
+    PosixFile(const std::string &filename, int fd);
     ~PosixFile() override;
 
     ssize_t write(const std::string &buffer, size_t length) override;
     ssize_t read(std::string &buffer, size_t length) override;
-    ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) override;
-    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
-
-    int acquire_write_lock() override;
-    int acquire_read_lock() override;
-    int release_lock() override;
-
-private:
-    FILE *file_;
+    ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
 
 };
 
@@ -191,18 +225,10 @@ public:
 
     ssize_t write(const std::string &buffer, size_t length) override;  
     ssize_t read(std::string &buffer, size_t length) override;
-    ssize_t pwritev(const iovec *iov, int iovcnt, off_t offset) override;
-    ssize_t preadv(const iovec *iov, int iovcnt, off_t offset) override;
-
-    int acquire_write_lock() override;
-    int acquire_read_lock() override;
-    int release_lock() override;
-
-    // static long get_elapsed_us(const struct timespec& start);
+    ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
 
 private:
-
-    int fd_;
     USRBIOResourceManager* resource_manager_;
 };
 #endif // USE_3FS
