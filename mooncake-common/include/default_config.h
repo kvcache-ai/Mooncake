@@ -8,6 +8,16 @@
 namespace mooncake {
 class DefaultConfig {
 public:
+    struct Node {
+        YAML::Node yaml_node_;
+    };
+
+    enum ConfigType {
+        YAML = 1,
+        JSON = 2,
+        UNKnown = 3,
+    };
+public:
     void Load();
     /**
      * @brief GetInt32 retrieves an integer value from the configuration
@@ -88,10 +98,10 @@ private:
 
     void loadFromYAML();
 
-    bool getValue(const std::string& key, std::string* value) {
+    bool getValue(const std::string& key, Node* node) {
         auto it = data_.find(key);
         if (it != data_.end()) {
-            *value = it->second;
+            *node = it->second;
             return true;
         }
         return false;
@@ -99,7 +109,8 @@ private:
 
 private:
     std::string path_;
-    std::unordered_map<std::string, std::string> data_;
+    ConfigType type_;
+    std::unordered_map<std::string, Node> data_;
 };
 
 } // namespace mooncake
