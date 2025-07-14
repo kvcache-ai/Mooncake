@@ -183,13 +183,6 @@ If you need to obtain information about whether each transport request is cross-
 export ASCEND_TRANSPORT_PRINT=1
 ```
 
-### Notes
-ascend_transport will establish a TCP connection on the host side. This connection uses port (10000 + deviceId). Please avoid using this port for other services to prevent conflicts.
-
-ascend_transport has an automatic reconnection mechanism in place that triggers after a transfer is completed, in case the remote end goes offline and restarts. There is no need to manually restart the local service.
-
-Note If the target end goes offline and restarts, the initiating end will attempt to re-establish the connection when it sends the next request. The target must complete its restart and become ready within 5 seconds after the initiator sends the request. If the target does not become available within this window, the connection will fail and an error will be returned.
-
 ### Timeout Configuration
 Ascend Transport uses TCP-based out-of-band communication on the host side, with a receive timeout set to 120 seconds.
 
