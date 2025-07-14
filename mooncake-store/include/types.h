@@ -86,7 +86,7 @@ enum class ErrorCode : int32_t {
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
-    NO_AVAILABLE_HANDLE = -200,  ///< No available handles.
+    NO_AVAILABLE_HANDLE = -200,  ///< Memory allocation failed due to insufficient space.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
