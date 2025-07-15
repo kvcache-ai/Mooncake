@@ -251,17 +251,15 @@ class DistributedObjectStore {
      * @return 0 on success, negative value on error
      */
 
-    int put_tensor_with_metadata(const std::string &key, pybind11::object tensor,
-                                  const std::string &shape,
-                                  const std::string &dtype);
+    int put_tensor_with_metadata(const std::string &key, pybind11::object tensor);
 
     /**
      * @brief Get a PyTorch tensor from the store with its metadata
      * @param key Key of the tensor to get
-     * @return A tuple with PyTorch Tensor, its shape and its dtype, or nullptr if error or tensor doesn't exist
+     * @return A PyTorch Tensor, just as if it was put into the store
      */
 
-    std::tuple<pybind11::object, std::string, std::string> get_tensor_with_metadata(const std::string &key);
+    pybind11::object get_tensor_with_metadata(const std::string &key);
 
     /**
      * @brief Get multiple PyTorch tensors from the store

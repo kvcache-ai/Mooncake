@@ -123,7 +123,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         shape_str = str(list(tensor_2d.shape))
         dtype_str = str(tensor_2d.dtype)
         
-        result = self.store.put_tensor_with_metadata(key_2d, tensor_2d, shape_str, dtype_str)
+        result = self.store.put_tensor_with_metadata(key_2d, tensor_2d)
         self.assertEqual(result, 0)
         
         retrieved_tensor, retrieved_shape, retrieved_dtype = self.store.get_tensor_with_metadata(key_2d)
@@ -139,7 +139,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         shape_str_3d = str(list(tensor_3d.shape))
         dtype_str_3d = str(tensor_3d.dtype)
         
-        result = self.store.put_tensor_with_metadata(key_3d, tensor_3d, shape_str_3d, dtype_str_3d)
+        result = self.store.put_tensor_with_metadata(key_3d, tensor_3d)
         self.assertEqual(result, 0)
         
         retrieved_tensor_3d, retrieved_shape_3d, retrieved_dtype_3d = self.store.get_tensor_with_metadata(key_3d)
