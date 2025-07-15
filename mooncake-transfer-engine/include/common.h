@@ -15,6 +15,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <arpa/inet.h>
 #include <glog/logging.h>
 #include <numa.h>
 #include <sys/mman.h>
@@ -121,6 +122,29 @@ uint16_t getDefaultHandshakePort();
 static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     const std::string &server_name) {
     uint16_t port = getDefaultHandshakePort();
+
+    // IPv6 check
+    in6_addr addr;
+    if (inet_pton(AF_INET6, server_name.c_str(), &addr) == 1)
+        return {server_name, port};
+
+    size_t start_pos = 0;
+    size_t end_pos = server_name.find_last_of(']');
+    size_t port_pos = server_name.find_last_of(':');
+    if (server_name.front() == '[' && end_pos != std::string::npos &&
+        port_pos > end_pos) {
+        auto ip = server_name.substr(start_pos + 1, end_pos - start_pos - 1);
+        std::string port_str = server_name.substr(port_pos + 1);
+        int val = std::atoi(port_str.c_str());
+        if (val <= 0 || val > 65535) {
+            LOG(WARNING) << "Illegal port number in " << server_name
+                         << ". Use default port " << port << " instead";
+        } else {
+            port = static_cast<uint16_t>(val);
+        }
+        return std::make_pair(port_str, port);
+    }
+
     auto pos = server_name.find(':');
     if (pos == server_name.npos) return std::make_pair(server_name, port);
     auto trimmed_server_name = server_name.substr(0, pos);
