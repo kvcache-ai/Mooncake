@@ -1020,12 +1020,18 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
 }
 
 template <typename T>
-py::array create_typed_array(char *ptr, size_t total_length) {
-    py::capsule free_when_done(ptr,
-                               [](void *p) { delete[] static_cast<T *>(p); });
+py::array create_typed_array(offset_allocator::AllocationHandle &&handle,
+                             size_t total_length) {
+    auto *handle_ptr =
+        new offset_allocator::AllocationHandle(std::move(handle));
+    py::capsule free_when_done(handle_ptr, [](void *h) {
+        delete static_cast<offset_allocator::AllocationHandle *>(h);
+    });
 
     return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)ptr, free_when_done);
+                          static_cast<T *>(handle_ptr->ptr()),
+                          free_when_done  // Free buffer when array is GCed
+    );
 }
 
 pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
@@ -1073,31 +1079,41 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
         }
 
         // Convert bytes to tensor using torch.from_numpy
-
-        py::object py_buffer = py::memoryview::from_memory(ptr, value_length);
         pybind11::object np_array;
+        auto handle = std::move(alloc_result.value());
         if (dtype == "float32") {
-            np_array = create_typed_array<float>(ptr, value_length);
+            np_array =
+                create_typed_array<float>(std::move(handle), value_length);
         } else if (dtype == "float64") {
-            np_array = create_typed_array<double>(ptr, value_length);
+            np_array =
+                create_typed_array<double>(std::move(handle), value_length);
         } else if (dtype == "int8") {
-            np_array = create_typed_array<int8_t>(ptr, value_length);
+            np_array =
+                create_typed_array<int8_t>(std::move(handle), value_length);
         } else if (dtype == "uint8") {
-            np_array = create_typed_array<uint8_t>(ptr, value_length);
+            np_array =
+                create_typed_array<uint8_t>(std::move(handle), value_length);
         } else if (dtype == "int16") {
-            np_array = create_typed_array<int16_t>(ptr, value_length);
+            np_array =
+                create_typed_array<int16_t>(std::move(handle), value_length);
         } else if (dtype == "uint16") {
-            np_array = create_typed_array<uint16_t>(ptr, value_length);
+            np_array =
+                create_typed_array<uint16_t>(std::move(handle), value_length);
         } else if (dtype == "int32") {
-            np_array = create_typed_array<int32_t>(ptr, value_length);
+            np_array =
+                create_typed_array<int32_t>(std::move(handle), value_length);
         } else if (dtype == "uint32") {
-            np_array = create_typed_array<uint32_t>(ptr, value_length);
+            np_array =
+                create_typed_array<uint32_t>(std::move(handle), value_length);
         } else if (dtype == "int64") {
-            np_array = create_typed_array<int64_t>(ptr, value_length);
+            np_array =
+                create_typed_array<int64_t>(std::move(handle), value_length);
         } else if (dtype == "uint64") {
-            np_array = create_typed_array<uint64_t>(ptr, value_length);
+            np_array =
+                create_typed_array<uint64_t>(std::move(handle), value_length);
         } else if (dtype == "bool") {
-            np_array = create_typed_array<bool>(ptr, value_length);
+            np_array =
+                create_typed_array<bool>(std::move(handle), value_length);
         }
 
         // Create tensor from numpy array
