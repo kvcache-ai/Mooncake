@@ -17,11 +17,6 @@ protected:
         test_filename = "test_file.txt";
         test_fd = open(test_filename.c_str(), O_CREAT | O_RDWR, 0644);
         ASSERT_GE(test_fd, 0) << "Failed to open test file";
-        
-        // Write initial content
-        const char* init_data = "Initial test content";
-        write(test_fd, init_data, strlen(init_data));
-        lseek(test_fd, 0, SEEK_SET);
     }
 
     void TearDown() override {
@@ -56,10 +51,15 @@ TEST_F(PosixFileTest, BasicWrite) {
 
 // Test basic read operation
 TEST_F(PosixFileTest, BasicRead) {
-    // First write some data
+    // Clear file content
+    ASSERT_EQ(ftruncate(test_fd, 0), 0) << "Failed to truncate file";
+    ASSERT_NE(lseek(test_fd, 0, SEEK_SET), -1) << "Seek failed";
+
+    // Write test data
     const char* test_data = "Test read data";
-    write(test_fd, test_data, strlen(test_data));
-    lseek(test_fd, 0, SEEK_SET);
+    ssize_t written = write(test_fd, test_data, strlen(test_data));
+    ASSERT_EQ(written, static_cast<ssize_t>(strlen(test_data))) << "Write failed";
+    ASSERT_NE(lseek(test_fd, 0, SEEK_SET), -1) << "Seek failed";
     
     PosixFile posix_file(test_filename, test_fd);
     
@@ -92,21 +92,26 @@ TEST_F(PosixFileTest, VectorizedWrite) {
 
 // Test vectorized read operation
 TEST_F(PosixFileTest, VectorizedRead) {
-    // First write some data
+    // Clear file content
+    ASSERT_EQ(ftruncate(test_fd, 0), 0) << "Failed to truncate file";
+    ASSERT_NE(lseek(test_fd, 0, SEEK_SET), -1) << "Seek failed";
+
+    // Write test data
     const char* test_data = "Vectorized read test data";
-    write(test_fd, test_data, strlen(test_data));
-    lseek(test_fd, 0, SEEK_SET);
+    ssize_t written = write(test_fd, test_data, strlen(test_data));
+    ASSERT_EQ(written, static_cast<ssize_t>(strlen(test_data))) << "Write failed";
+    ASSERT_NE(lseek(test_fd, 0, SEEK_SET), -1) << "Seek failed";
     
     PosixFile posix_file(test_filename, test_fd);
     
-    char buf1[10] = {0};
-    char buf2[15] = {0};
+    char buf1[11] = {0};  // "Vectorized" + null
+    char buf2[16] = {0};  // " read test data" + null
     
     iovec iov[2];
     iov[0].iov_base = buf1;
-    iov[0].iov_len = sizeof(buf1)-1; // Leave space for null terminator
+    iov[0].iov_len = 10;  // Exact length of "Vectorized"
     iov[1].iov_base = buf2;
-    iov[1].iov_len = sizeof(buf2)-1;
+    iov[1].iov_len = 15;  // Exact length of " read test data"
     
     ssize_t result = posix_file.vector_read(iov, 2, 0);
     
