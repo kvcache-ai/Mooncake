@@ -63,6 +63,14 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(key, test_data), 0)
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
+            
+    def test_basic_get_hostname(self):
+        # No port is set in the config, so it should pick a random one between 12300 and 14300
+        hostname = self.store.get_hostname()
+        self.assertTrue(hostname.startswith("localhost:"))
+        port = int(hostname.split(":")[1])
+        self.assertTrue(12300 <= port <= 14300)
+
 
     def test_basic_put_get_exist_operations(self):
         """Test basic Put/Get/Exist operations through the Python interface."""

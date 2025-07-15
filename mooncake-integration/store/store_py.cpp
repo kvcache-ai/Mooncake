@@ -10,6 +10,7 @@
 #include <random>
 
 #include "types.h"
+#include "utils.h"
 
 namespace py = pybind11;
 
@@ -343,30 +344,6 @@ int DistributedObjectStore::allocateSlices(
 
 int DistributedObjectStore::allocateBatchedSlices(
     const std::vector<std::string> &keys,
-    const std::vector<std::span<const char>> &values,
-    std::unordered_map<std::string, std::vector<mooncake::Slice>>
-        &batched_slices) {
-    for (size_t i = 0; i < keys.size(); ++i) {
-        uint64_t offset = 0;
-        const auto &value = values[i];
-        std::vector<Slice> slices;
-        while (offset < value.size()) {
-            auto chunk_size = std::min(value.size() - offset, kMaxSliceSize);
-            auto ptr = client_buffer_allocator_->allocate(chunk_size);
-            if (!ptr) {
-                return 1;
-            }
-            memcpy(ptr, value.data() + offset, chunk_size);
-            slices.emplace_back(Slice{ptr, chunk_size});
-            offset += chunk_size;
-        }
-        batched_slices.emplace(keys[i], std::move(slices));
-    }
-    return 0;
-}
-
-int DistributedObjectStore::allocateBatchedSlices(
-    const std::vector<std::string> &keys,
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         &batched_slices,
     const std::vector<std::vector<mooncake::Replica::Descriptor>>
@@ -488,13 +465,25 @@ int DistributedObjectStore::put_batch(
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
+        return 1;
     }
-    std::unordered_map<std::string, std::vector<mooncake::Slice>>
-        batched_slices;
-    int ret = allocateBatchedSlices(keys, values, batched_slices);
-    if (ret) {
-        LOG(ERROR) << "Failed to allocate slices for put_batch operation";
-        return ret;
+    std::vector<std::unique_ptr<SliceGuard>> slices;
+    slices.reserve(keys.size());
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        slices.emplace_back(std::make_unique<SliceGuard>(*this));
+        int ret = allocateSlices(slices.back()->slices(), value);
+        if (ret) {
+            LOG(ERROR)
+                << "Failed to allocate slices for put_batch operation, key: "
+                << key << ", value size: " << value.size();
+            return ret;
+        }
+        batched_slices.emplace(key, slices.back()->slices());
     }
 
     // Convert unordered_map to vector format expected by BatchPut
@@ -519,10 +508,6 @@ int DistributedObjectStore::put_batch(
                        << "' with error: " << toString(results[i].error());
             return toInt(results[i].error());
         }
-    }
-
-    for (auto &slice : batched_slices) {
-        freeSlices(slice.second);
     }
     return 0;
 }
@@ -623,6 +608,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     const auto kNullString = pybind11::bytes("\0", 0);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        py::gil_scoped_acquire acquire_gil;
         return {kNullString};
     }
     std::unordered_set<std::string> seen;
@@ -630,6 +616,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         if (!seen.insert(key).second) {
             LOG(ERROR) << "Duplicate key not supported for Batch API, key: "
                        << key;
+            py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
     }
@@ -637,6 +624,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
     std::vector<pybind11::bytes> results;
     std::unordered_map<std::string, std::vector<mooncake::Slice>>
         batched_slices;
+    batched_slices.reserve(keys.size());
     std::unordered_map<std::string, uint64_t> str_length_map;
     {
         py::gil_scoped_release release_gil;
@@ -658,6 +646,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         int ret = allocateBatchedSlices(keys, batched_slices, replica_lists,
                                         str_length_map);
         if (ret) {
+            for (auto &slice : batched_slices) {
+                freeSlices(slice.second);
+            }
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
@@ -666,12 +657,18 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
             client_->BatchGet(keys, replica_lists, batched_slices);
         for (size_t i = 0; i < get_results.size(); ++i) {
             if (!get_results[i]) {
+                for (auto &slice : batched_slices) {
+                    freeSlices(slice.second);
+                }
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "BatchGet failed for key '" << keys[i]
                            << "': " << toString(get_results[i].error());
                 return {kNullString};
             }
         }
+
+        py::gil_scoped_acquire acquire_gil;
+        std::vector<pybind11::bytes> results;
         for (const auto &key : keys) {
             if (batched_slices[key].size() == 1 &&
                 batched_slices[key][0].size == str_length_map[key]) {
@@ -682,6 +679,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
                 char *exported_str_ptr =
                     exportSlices(batched_slices[key], str_length_map[key]);
                 if (!exported_str_ptr) {
+                    for (auto &slice : batched_slices) {
+                        freeSlices(slice.second);
+                    }
                     return {kNullString};
                 } else {
                     results.push_back(
@@ -692,6 +692,9 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
         }
         if (results.size() != keys.size()) {
             LOG(ERROR) << "Results size does not match keys size";
+            for (auto &slice : batched_slices) {
+                freeSlices(slice.second);
+            }
             return {kNullString};
         }
         for (auto &slice : batched_slices) {
@@ -997,6 +1000,10 @@ int DistributedObjectStore::get_into(const std::string &key, void *buffer,
     return static_cast<int>(total_size);
 }
 
+std::string DistributedObjectStore::get_hostname() const {
+    return local_hostname;
+}
+
 std::vector<int> DistributedObjectStore::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
@@ -1253,6 +1260,140 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
+template <typename T>
+py::array create_typed_array(char *exported_data, size_t total_length) {
+    py::capsule free_when_done(exported_data,
+                               [](void *p) { delete[] static_cast<T *>(p); });
+
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                          (T *)exported_data, free_when_done);
+}
+
+pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
+                                                    const std::string dtype) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return pybind11::none();
+    }
+
+    try {
+        // Import torch module
+
+        // Query object info first
+        // Step 1: Get object info
+        auto query_result = client_->Query(key);
+        if (!query_result) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+        // Extract replica list from the query result
+        auto replica_list = query_result.value();
+        if (replica_list.empty()) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Allocate slices for the object
+        SliceGuard guard(*this);
+        uint64_t total_length = 0;
+        int ret = allocateSlices(guard.slices(), replica_list, total_length);
+        if (ret) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Get the object data
+        auto get_result = client_->Get(key, guard.slices());
+        if (!get_result) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Get failed for key: " << key
+                       << " with error: " << toString(get_result.error());
+            return pybind11::none();
+        }
+
+        // Convert slices to contiguous bytes
+        char *exported_data = exportSlices(guard.slices(), total_length);
+        if (!exported_data) {
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Convert bytes to tensor using torch.from_numpy
+
+        py::object py_buffer =
+            py::memoryview::from_memory(exported_data, total_length);
+        pybind11::object np_array;
+        if (dtype == "float32") {
+            np_array = create_typed_array<float>(exported_data, total_length);
+        } else if (dtype == "float64") {
+            np_array = create_typed_array<double>(exported_data, total_length);
+        } else if (dtype == "int8") {
+            np_array = create_typed_array<int8_t>(exported_data, total_length);
+        } else if (dtype == "uint8") {
+            np_array = create_typed_array<uint8_t>(exported_data, total_length);
+        } else if (dtype == "int16") {
+            np_array = create_typed_array<int16_t>(exported_data, total_length);
+        } else if (dtype == "uint16") {
+            np_array =
+                create_typed_array<uint16_t>(exported_data, total_length);
+        } else if (dtype == "int32") {
+            np_array = create_typed_array<int32_t>(exported_data, total_length);
+        } else if (dtype == "uint32") {
+            np_array =
+                create_typed_array<uint32_t>(exported_data, total_length);
+        } else if (dtype == "int64") {
+            np_array = create_typed_array<int64_t>(exported_data, total_length);
+        } else if (dtype == "uint64") {
+            np_array =
+                create_typed_array<uint64_t>(exported_data, total_length);
+        } else if (dtype == "bool") {
+            np_array = create_typed_array<bool>(exported_data, total_length);
+        }
+
+        // Create tensor from numpy array
+        pybind11::object tensor = torch.attr("from_numpy")(np_array);
+        return tensor;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to convert bytes to tensor: " << e.what();
+        return pybind11::none();
+    }
+}
+
+int DistributedObjectStore::put_tensor(const std::string &key,
+                                       pybind11::object tensor) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    try {
+        // Import torch module
+        // Check if the object is a tensor
+        if (!(tensor.attr("__class__")
+                  .attr("__name__")
+                  .cast<std::string>()
+                  .find("Tensor") != std::string::npos)) {
+            LOG(ERROR) << "Input is not a PyTorch tensor";
+            return -1;
+        }
+        // Get the data pointer and size directly from the tensor
+        uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        size_t buffer_size = numel * element_size;
+
+        this->register_buffer(reinterpret_cast<void *>(data_ptr), buffer_size);
+        // Use put_from for direct memory access (zero-copy)
+        int result = this->put_from(key, reinterpret_cast<void *>(data_ptr),
+                                    buffer_size);
+        this->unregister_buffer(reinterpret_cast<void *>(data_ptr));
+        return result;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to access tensor data: " << e.what();
+        return -1;
+    }
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
@@ -1327,6 +1468,10 @@ PYBIND11_MODULE(store, m) {
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_tensor", &DistributedObjectStore::get_tensor, py::arg("key"),
+             py::arg("dtype"), "Get a PyTorch tensor from the store")
+        .def("put_tensor", &DistributedObjectStore::put_tensor, py::arg("key"),
+             py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
             "register_buffer",
             [](DistributedObjectStore &self, uintptr_t buffer_ptr,
@@ -1473,7 +1618,8 @@ PYBIND11_MODULE(store, m) {
                 return self.put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
-            py::arg("config") = ReplicateConfig{});
+            py::arg("config") = ReplicateConfig{})
+        .def("get_hostname", &DistributedObjectStore::get_hostname);
 }
 
 }  // namespace mooncake
