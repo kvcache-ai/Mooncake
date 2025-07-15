@@ -68,7 +68,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         key = "test_tensor_float"
         result = self.store.put_tensor(key, tensor)
         self.assertEqual(result, 0)
-        retrieved = self.store.get_tensor(key, "float32")
+        retrieved = self.store.get_tensor(key)
         self.assertIsNotNone(retrieved)
         # self.assertEqual(tuple(retrieved.shape), tuple(tensor.shape))
         self.assertEqual(retrieved.dtype, tensor.dtype)
@@ -79,7 +79,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
-        retrieved_int = self.store.get_tensor(key_int, "int32")
+        retrieved_int = self.store.get_tensor(key_int)
         self.assertIsNotNone(retrieved_int)
         # self.assertEqual(tuple(retrieved_int.shape), tuple(tensor_int.shape))
         self.assertEqual(retrieved_int.dtype, tensor_int.dtype)
@@ -90,7 +90,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         key_bool = "test_tensor_bool"
         result = self.store.put_tensor(key_bool, tensor_bool)
         self.assertEqual(result, 0)
-        retrieved_bool = self.store.get_tensor(key_bool, "bool")
+        retrieved_bool = self.store.get_tensor(key_bool)
         self.assertIsNotNone(retrieved_bool)
         # self.assertEqual(tuple(retrieved_bool.shape), tuple(tensor_bool.shape))
         self.assertEqual(retrieved_bool.dtype, tensor_bool.dtype)
@@ -101,7 +101,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         key_rand = "test_tensor_rand"
         result = self.store.put_tensor(key_rand, tensor_rand)
         self.assertEqual(result, 0)
-        retrieved_rand = self.store.get_tensor(key_rand, "float32")
+        retrieved_rand = self.store.get_tensor(key_rand)
         self.assertIsNotNone(retrieved_rand)
         # self.assertEqual(tuple(retrieved_bool.shape), tuple(tensor_bool.shape))
         self.assertEqual(retrieved_rand.dtype, tensor_rand.dtype)
@@ -120,32 +120,25 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Test with 2D float tensor
         tensor_2d = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
         key_2d = "test_tensor_with_metadata_2d"
-        shape_str = str(list(tensor_2d.shape))
-        dtype_str = str(tensor_2d.dtype)
-        
         result = self.store.put_tensor(key_2d, tensor_2d)
         self.assertEqual(result, 0)
-        
-        retrieved_tensor, retrieved_shape, retrieved_dtype = self.store.get_tensor(key_2d)
+
+        retrieved_tensor = self.store.get_tensor(key_2d)
         self.assertIsNotNone(retrieved_tensor)
-        self.assertEqual(retrieved_shape, shape_str)
-        self.assertEqual(retrieved_dtype, dtype_str)
+        self.assertEqual(retrieved_tensor.shape, tensor_2d.shape)
         self.assertEqual(retrieved_tensor.dtype, tensor_2d.dtype)
         self.assertTrue(torch.allclose(tensor_2d, retrieved_tensor))
 
         # Test with 3D int tensor
         tensor_3d = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64)
         key_3d = "test_tensor_with_metadata_3d"
-        shape_str_3d = str(list(tensor_3d.shape))
-        dtype_str_3d = str(tensor_3d.dtype)
         
         result = self.store.put_tensor(key_3d, tensor_3d)
         self.assertEqual(result, 0)
-        
-        retrieved_tensor_3d, retrieved_shape_3d, retrieved_dtype_3d = self.store.get_tensor(key_3d)
+
+        retrieved_tensor_3d = self.store.get_tensor(key_3d)
         self.assertIsNotNone(retrieved_tensor_3d)
-        self.assertEqual(retrieved_shape_3d, shape_str_3d)
-        self.assertEqual(retrieved_dtype_3d, dtype_str_3d)
+        self.assertEqual(retrieved_tensor_3d.shape, tensor_3d.shape)
         self.assertEqual(retrieved_tensor_3d.dtype, tensor_3d.dtype)
         self.assertTrue(torch.equal(tensor_3d, retrieved_tensor_3d))
 
