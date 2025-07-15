@@ -629,12 +629,12 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     return ERR_SOCKET;
                 }
             }
-        }
 
-        if (listen(listen_fd_, listen_backlog_)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: listen()";
-            closeListen();
-            return ERR_SOCKET;
+            if (listen(listen_fd_, listen_backlog_)) {
+                PLOG(ERROR) << "SocketHandShakePlugin: listen()";
+                closeListen();
+                return ERR_SOCKET;
+            }
         }
 
         listener_running_ = true;
@@ -1117,6 +1117,14 @@ uint16_t findAvailableTcpPort(int &sockfd) {
                 sockfd = -1;
                 continue;
             }
+        }
+
+        auto &config = globalConfig();
+        auto listen_backlog_ = config.handshake_listen_backlog;
+        if (listen(sockfd, listen_backlog_)) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
         }
 
         return port;
