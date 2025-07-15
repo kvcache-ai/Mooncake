@@ -150,6 +150,8 @@ public:
      */
     virtual ssize_t write(const std::string &buffer, size_t length) = 0;
 
+    virtual ssize_t write(std::span<const char> data) = 0;
+
     /**
      * @brief Reads data from file into buffer
      * @param buffer Output buffer for read data
@@ -214,6 +216,8 @@ public:
     ssize_t read(std::string &buffer, size_t length) override;
     ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
     ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t write(std::span<const char> data) override;
+
 
 };
 
@@ -227,6 +231,9 @@ public:
     ssize_t read(std::string &buffer, size_t length) override;
     ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
     ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
+    ssize_t write(std::span<const char> data) override {
+        return 0;
+    } ;
 
 private:
     USRBIOResourceManager* resource_manager_;

@@ -31,7 +31,7 @@ class StorageBackend  {
             resource_manager_ = std::make_unique<USRBIOResourceManager>();
             ThreeFSParams params;
             params.mount_root = root_dir;
-            params.iov_size = 16 << 20; // 16MB
+            params.iov_size = 32 << 20; // 32MB
             params.ior_entries = 16;
             params.io_depth = 0;
             resource_manager_->setDefaultParams(params);
@@ -84,6 +84,9 @@ class StorageBackend  {
      * @return ErrorCode indicating operation status
      */
     ErrorCode StoreObject(const ObjectKey& key, const std::string& str) ;
+
+    ErrorCode StoreObject(const ObjectKey& key,
+                                    std::span<const char> data);
     
     /**
      * @brief Loads an object into slices

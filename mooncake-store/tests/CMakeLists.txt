@@ -46,16 +46,16 @@ target_link_libraries(stress_workload_test PUBLIC
     pthread
 )
 
-# add_executable(local_file_test local_file_test.cpp)
-# target_link_libraries(local_file_test PUBLIC
-#     mooncake_store
-#     cachelib_memory_allocator
-#     glog
-#     gtest
-#     gtest_main
-#     pthread
-# )
-# add_test(NAME local_file_test COMMAND local_file_test)
+add_executable(posix_file_test posix_file_test.cpp)
+target_link_libraries(posix_file_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME posix_file_test COMMAND posix_file_test)
 
 add_executable(thread_pool_test thread_pool_test.cpp)
 target_link_libraries(thread_pool_test PUBLIC

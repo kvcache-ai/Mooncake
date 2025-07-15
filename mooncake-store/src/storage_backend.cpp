@@ -89,6 +89,40 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
+ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+                                    std::span<const char> data) {
+    std::string path = ResolvePath(key);
+
+    if(std::filesystem::exists(path) == true) {
+        return ErrorCode::FILE_OPEN_FAIL;
+    }
+    
+    auto file = create_file(path, "wb");
+    if (!file) {
+        LOG(INFO) << "Failed to open file for writing: " << path;
+        return ErrorCode::FILE_OPEN_FAIL;
+    }
+
+    size_t file_total_size = data.size();
+    ssize_t ret = file->write(data);
+
+    if (ret < 0) {
+        LOG(INFO) << "pwritev failed for: " << path;
+
+        return ErrorCode::FILE_WRITE_FAIL;
+    }
+    if (ret != static_cast<ssize_t>(file_total_size)) {
+        LOG(INFO) << "Write size mismatch for: " << path
+                   << ", expected: " << file_total_size
+                   << ", got: " << ret;
+
+        return ErrorCode::FILE_WRITE_FAIL;
+    }
+    // Note: fclose is not necessary here as LocalFile destructor will handle it
+
+    return ErrorCode::OK;
+}
+
 ErrorCode StorageBackend::LoadObject(std::string& path,
                                     std::vector<Slice>& slices, size_t length) {
 
