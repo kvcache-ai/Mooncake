@@ -1,13 +1,3 @@
-include(FetchContent)
-
-FetchContent_Declare(
-  json
-  GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG v3.11.2 
-)
-
-FetchContent_MakeAvailable(json)
-
 file(GLOB SOURCES "*.cpp")
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
@@ -103,5 +93,3 @@ if (WITH_STORE)
 endif()
 
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-
-target_link_libraries(store PRIVATE nlohmann_json::nlohmann_json)

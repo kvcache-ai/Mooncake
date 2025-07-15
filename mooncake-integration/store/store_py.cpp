@@ -8,8 +8,6 @@
 
 #include <cstdlib>  // for atexit
 #include <random>
-#include <nlohmann/json.hpp>
-
 #include "types.h"
 #include "utils.h"
 
@@ -1980,8 +1978,7 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
-        .def("get_hostname", &DistributedObjectStore::get_hostname);
-            py::arg("keys"), py::arg("values"))
+        .def("get_hostname", &DistributedObjectStore::get_hostname)
         .def("batch_put_tensors", &DistributedObjectStore::batch_put_tensors,
              py::arg("keys"), py::arg("tensors"),
              "Put multiple PyTorch tensors into the store")

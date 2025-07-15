@@ -7,8 +7,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
-#include <nlohmann/json.hpp>
-
 #include "allocator.h"
 #include "client.h"
 
