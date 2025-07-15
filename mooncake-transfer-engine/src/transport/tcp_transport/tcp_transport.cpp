@@ -28,6 +28,11 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
