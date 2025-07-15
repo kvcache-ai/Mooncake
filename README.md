@@ -17,6 +17,7 @@ Now both the Transfer Engine and Mooncake Store are open-sourced!
 This repository also hosts its technical report and the open sourced traces. 
 
 <h2 id="updates">🔄 Updates</h2>
+
  - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmdeploy-integration-v0.9.md) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
  - **May 8, 2025**: Mooncake x LMCache <a href="doc/en/lmcache-integration.md" target="_blank">unite</a> to pioneer KVCache-centric LLM serving system.
