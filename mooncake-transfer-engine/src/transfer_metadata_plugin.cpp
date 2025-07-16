@@ -601,7 +601,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             }
 
             int one = 1;
-            if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
+            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
                 PLOG(ERROR)
                     << "SocketHandShakePlugin: setsockopt(SO_REUSEPORT)";
                 closeListen();
@@ -1102,7 +1102,7 @@ uint16_t findAvailableTcpPort(int &sockfd) {
         }
 
         int one = 1;
-        if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
             close(sockfd);
             sockfd = -1;
             continue;
