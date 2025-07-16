@@ -1325,56 +1325,6 @@ py::array create_typed_array(char *exported_data, size_t total_length) {
                           (T *)exported_data, free_when_done);
 }
 
-namespace {
-    enum class TensorDtype : int32_t {
-        FLOAT32 = 0,
-        FLOAT64 = 1,
-        INT8 = 2,
-        UINT8 = 3,
-        INT16 = 4,
-        UINT16 = 5,
-        INT32 = 6,
-        UINT32 = 7,
-        INT64 = 8,
-        UINT64 = 9,
-        BOOL = 10,
-        UNKNOWN = -1
-    };
-
-    TensorDtype dtypeStringToEnum(const std::string& dtype_str) {
-        if (dtype_str.find("float32") != std::string::npos) return TensorDtype::FLOAT32;
-        if (dtype_str.find("float64") != std::string::npos) return TensorDtype::FLOAT64;
-        if (dtype_str.find("int8") != std::string::npos) return TensorDtype::INT8;
-        if (dtype_str.find("uint8") != std::string::npos) return TensorDtype::UINT8;
-        if (dtype_str.find("int16") != std::string::npos) return TensorDtype::INT16;
-        if (dtype_str.find("uint16") != std::string::npos) return TensorDtype::UINT16;
-        if (dtype_str.find("int32") != std::string::npos) return TensorDtype::INT32;
-        if (dtype_str.find("uint32") != std::string::npos) return TensorDtype::UINT32;
-        if (dtype_str.find("int64") != std::string::npos) return TensorDtype::INT64;
-        if (dtype_str.find("uint64") != std::string::npos) return TensorDtype::UINT64;
-        if (dtype_str.find("bool") != std::string::npos) return TensorDtype::BOOL;
-        return TensorDtype::UNKNOWN;
-    }
-
-    std::string dtypeEnumToString(TensorDtype dtype) {
-        switch (dtype) {
-            case TensorDtype::FLOAT32: return "torch.float32";
-            case TensorDtype::FLOAT64: return "torch.float64";
-            case TensorDtype::INT8: return "torch.int8";
-            case TensorDtype::UINT8: return "torch.uint8";
-            case TensorDtype::INT16: return "torch.int16";
-            case TensorDtype::UINT16: return "torch.uint16";
-            case TensorDtype::INT32: return "torch.int32";
-            case TensorDtype::UINT32: return "torch.uint32";
-            case TensorDtype::INT64: return "torch.int64";
-            case TensorDtype::UINT64: return "torch.uint64";
-            case TensorDtype::BOOL: return "torch.bool";
-            default: return "unknown";
-        }
-    }
-}
-
-
 int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object tensor){
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
