@@ -148,9 +148,6 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
 notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
               int* size);
 
-int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
-              notify_msg_t notify_msg);
-
 int getTransferStatus(transfer_engine_t engine,
                       batch_id_t batch_id, size_t task_id,
                       struct transfer_status *status);
