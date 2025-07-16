@@ -1424,7 +1424,6 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
             np_array = array_creators[dtype_index](tensor_data, tensor_size);   
         } else {
-            delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
             return pybind11::none();
