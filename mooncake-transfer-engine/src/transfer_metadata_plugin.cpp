@@ -688,11 +688,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 // old protocol equals Connection type
                 if (type == HandShakeRequestType::Connection ||
                     type == HandShakeRequestType::OldProtocol) {
-                    on_connection_callback_(peer, local);
+                    if (on_connection_callback_) on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
-                    on_metadata_callback_(peer, local);
+                    if (on_metadata_callback_) on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
-                    on_notify_callback_(peer, local);
+                    if (on_notify_callback_) on_notify_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
