@@ -12,12 +12,14 @@ mkdir -p "$OUTPUT_DIR"
 CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path, under same dir with this script
 
 if command -v nvcc &> /dev/null; then
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -Xcompiler -fPIC
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -Xcompiler -fPIC -lcuda
 else
     g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda  -I/usr/local/cuda/include
 fi
 
 if [ $? -eq 0 ]; then
+    # pip installing gives this executable permissions so we add the chmod here as well
+    chmod +x "$OUTPUT_DIR/nvlink_allocator.so"
     echo "Successfully built nvlink_allocator.so in $OUTPUT_DIR"
 else
     echo "Failed to build nvlink_allocator.so"
