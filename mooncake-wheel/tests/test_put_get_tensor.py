@@ -123,10 +123,10 @@ class TestDistributedObjectStore(unittest.TestCase):
         shape_str = str(list(tensor_2d.shape))
         dtype_str = str(tensor_2d.dtype)
         
-        result = self.store.put_tensor_with_metadata(key_2d, tensor_2d)
+        result = self.store.put_tensor(key_2d, tensor_2d)
         self.assertEqual(result, 0)
         
-        retrieved_tensor, retrieved_shape, retrieved_dtype = self.store.get_tensor_with_metadata(key_2d)
+        retrieved_tensor, retrieved_shape, retrieved_dtype = self.store.get_tensor(key_2d)
         self.assertIsNotNone(retrieved_tensor)
         self.assertEqual(retrieved_shape, shape_str)
         self.assertEqual(retrieved_dtype, dtype_str)
@@ -139,10 +139,10 @@ class TestDistributedObjectStore(unittest.TestCase):
         shape_str_3d = str(list(tensor_3d.shape))
         dtype_str_3d = str(tensor_3d.dtype)
         
-        result = self.store.put_tensor_with_metadata(key_3d, tensor_3d)
+        result = self.store.put_tensor(key_3d, tensor_3d)
         self.assertEqual(result, 0)
         
-        retrieved_tensor_3d, retrieved_shape_3d, retrieved_dtype_3d = self.store.get_tensor_with_metadata(key_3d)
+        retrieved_tensor_3d, retrieved_shape_3d, retrieved_dtype_3d = self.store.get_tensor(key_3d)
         self.assertIsNotNone(retrieved_tensor_3d)
         self.assertEqual(retrieved_shape_3d, shape_str_3d)
         self.assertEqual(retrieved_dtype_3d, dtype_str_3d)
@@ -153,54 +153,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_2d)
         self.store.remove(key_3d)
 
-    def test_batch_put_get_tensors(self):
-        """Test batch storing and retrieving PyTorch tensors using batch_put_tensors/batch_get_tensors."""
-        import torch
-
-        # Prepare multiple tensors
-        tensor1 = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
-        tensor2 = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-        tensor3 = torch.tensor([True, False, True], dtype=torch.bool)
-        tensor4 = torch.randn(5, 10, dtype=torch.float64)
-        tensor5 = torch.tensor([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]], dtype=torch.int64)
-        
-        tensors = [tensor1, tensor2, tensor3, tensor4, tensor5]
-        keys = ["batch_tensor_1", "batch_tensor_2", "batch_tensor_3", "batch_tensor_4", "batch_tensor_5"]
-        dtypes = ["float32", "int32", "bool", "float64", "int64"]
-
-        # Test batch put
-        results = self.store.batch_put_tensors(keys, tensors)
-        self.assertEqual(len(results), len(keys))
-        for result in results:
-            self.assertEqual(result, 0)  # All operations should succeed
-
-        # Test batch get
-        retrieved_tensors = self.store.batch_get_tensors(keys, dtypes)
-        self.assertEqual(len(retrieved_tensors), len(keys))
-        
-        for i, (original, retrieved) in enumerate(zip(tensors, retrieved_tensors)):
-            self.assertIsNotNone(retrieved)
-            self.assertEqual(original.dtype, retrieved.dtype)
-            if original.dtype == torch.float32 or original.dtype == torch.float64:
-                self.assertTrue(torch.allclose(original, retrieved))
-            else:
-                self.assertTrue(torch.equal(original, retrieved))
-
-        # Test with partial failures (non-existent keys)
-        mixed_keys = keys + ["non_existent_key"]
-        mixed_dtypes = dtypes + ["float32"]
-        retrieved_mixed = self.store.batch_get_tensors(mixed_keys, mixed_dtypes)
-        self.assertEqual(len(retrieved_mixed), len(mixed_keys))
-        
-        # First 5 should be valid tensors, last one should be None
-        for i in range(5):
-            self.assertIsNotNone(retrieved_mixed[i])
-        # The non-existent key should return None
-        self.assertIsNone(retrieved_mixed[5])
-
-        # Clean up
-        for key in keys:
-            self.store.remove(key)
              
 if __name__ == '__main__':
     unittest.main()

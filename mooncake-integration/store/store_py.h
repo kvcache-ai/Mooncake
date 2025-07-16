@@ -233,7 +233,7 @@ class DistributedObjectStore {
      * @param dtype Data type of the tensor
      * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
      */
-    pybind11::object get_tensor(const std::string &key, const std::string dtype);
+    pybind11::object get_tensor(const std::string &key);
 
     /**
      * @brief Put a PyTorch tensor into the store
@@ -242,43 +242,6 @@ class DistributedObjectStore {
      * @return 0 on success, negative value on error
      */
     int put_tensor(const std::string &key, pybind11::object tensor);
-    /**
-     * @brief Put a PyTorch tensor into the store with its metadata
-     * @param key Key for the tensor
-     * @param tensor PyTorch tensor to store
-     * @param shape Shape of the tensor as a string (e.g., "2,3,4")
-     * @param dtype Data type of the tensor (e.g., "float32", "int64")
-     * @return 0 on success, negative value on error
-     */
-
-    int put_tensor_with_metadata(const std::string &key, pybind11::object tensor);
-
-    /**
-     * @brief Get a PyTorch tensor from the store with its metadata
-     * @param key Key of the tensor to get
-     * @return A PyTorch Tensor, just as if it was put into the store
-     */
-
-    pybind11::object get_tensor_with_metadata(const std::string &key);
-
-    /**
-     * @brief Get multiple PyTorch tensors from the store
-     * @param keys Vector of keys for the tensors to get
-     * @param dtypes Vector of data types for the tensors
-     * @return Vector of PyTorch tensors, or empty vector if error or tensors don't exist
-     */
-    std::vector<pybind11::object> batch_get_tensors(const std::vector<std::string> &keys, const std::vector<std::string> &dtypes);
-    /**
-     * @brief Put multiple PyTorch tensors into the store
-     * @param keys Vector of keys for the tensors
-     * @param tensors Vector of PyTorch tensors to store
-     * @return Vector of integers, where each element is 0 on success, or a negative value on error
-     */
-    std::vector<int> batch_put_tensors(const std::vector<std::string> &keys, const std::vector<pybind11::object> &tensors);
-
-    
-
-
 
    private:
     pybind11::module numpy = pybind11::module::import("numpy");
