@@ -25,7 +25,8 @@ set(MOONCAKE_STORE_SOURCES
 set(EXTRA_LIBS "")
 
 if(USE_3FS)
-  list(APPEND MOONCAKE_STORE_SOURCES threefs_file.cpp)
+  add_subdirectory(hf3fs)
+  list(APPEND MOONCAKE_STORE_SOURCES  ${THREEFS_SOURCES})
   find_library(HF3FS_API_LIB hf3fs_api_shared PATHS /usr/lib NO_DEFAULT_PATH)
   if(NOT HF3FS_API_LIB)
     message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
