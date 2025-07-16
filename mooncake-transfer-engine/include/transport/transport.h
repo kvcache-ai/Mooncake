@@ -158,16 +158,18 @@ class Transport {
         }
 
         Slice *allocate() {
-            Slice *slice;
+            Slice *slice = nullptr;
 
-            if (head_ - tail_ == 0) {
-                allocated_++;
-                slice = new Slice();
-                slice->from_cache = false;
-            } else {
+            if (head_ != tail_) {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+            }
+
+            if (!slice) {
+                allocated_++;
+                slice = new Slice();
+                slice->from_cache = false;
             }
 
             return slice;
