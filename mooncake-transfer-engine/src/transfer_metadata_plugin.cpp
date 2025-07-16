@@ -600,6 +600,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return ERR_SOCKET;
             }
 
+            int one = 1;
+            if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
+                PLOG(ERROR)
+                    << "SocketHandShakePlugin: setsockopt(SO_REUSEPORT)";
+                closeListen();
+                return ERR_SOCKET;
+            }
+
             if (globalConfig().use_ipv6) {
                 sockaddr_in6 bind_address;
                 memset(&bind_address, 0, sizeof(sockaddr_in6));
@@ -1088,6 +1096,13 @@ uint16_t findAvailableTcpPort(int &sockfd) {
 
         int on = 1;
         if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        int one = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
             close(sockfd);
             sockfd = -1;
             continue;
