@@ -41,11 +41,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &local_server_name,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
-    LOG(INFO) << "Transfer Engine starting. Server: " << local_server_name
-              << ", Metadata: " << metadata_conn_string
-              << ", ip_or_host_name: " << ip_or_host_name
-              << ", rpc_port: " << rpc_port;
-
     local_server_name_ = local_server_name;
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;

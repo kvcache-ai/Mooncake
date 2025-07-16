@@ -120,6 +120,13 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i].native = cq;
     }
 
+    diag_cq_ = ibv_create_cq(context_, max_cqe, nullptr, nullptr, 0);
+    if (!diag_cq_) {
+        PLOG(ERROR) << "Failed to create diagnostic completion queue";
+        close(event_fd_);
+        return ERR_CONTEXT;
+    }
+
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
     LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
@@ -164,6 +171,11 @@ int RdmaContext::deconstruct() {
         }
     }
     cq_list_.clear();
+
+    int ret = ibv_destroy_cq(diag_cq_);
+    if (ret) {
+        PLOG(ERROR) << "Failed to destroy completion queue";
+    }
 
     if (event_fd_ >= 0) {
         if (close(event_fd_)) LOG(ERROR) << "Failed to close epoll fd";

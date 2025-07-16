@@ -43,6 +43,9 @@ class WorkerPool {
 
     int doProcessContextEvents();
 
+    void connectivityTest(int segment_id,
+                          RdmaTransport::SegmentDesc &remote_desc);
+
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
@@ -69,6 +72,9 @@ class WorkerPool {
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
 
     uint64_t success_nr_polls = 0, failed_nr_polls = 0;
+    std::unordered_set<std::string> probe_unconnected_list;
+    std::atomic<bool> probe_completed = false;
+    RWSpinlock probe_lock;
 };
 }  // namespace mooncake
 

@@ -38,12 +38,14 @@ RdmaEndPoint::~RdmaEndPoint() {
 
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
-                            size_t max_inline_bytes) {
+                            size_t max_inline_bytes, ibv_cq *diag_cq) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "Endpoint has already been constructed";
         return ERR_ENDPOINT;
     }
 
+    has_diag_cq_ = (diag_cq != nullptr);
+    if (has_diag_cq_) num_qp_list++;
     qp_list_.resize(num_qp_list);
     cq_outstanding_ = (volatile int *)cq->cq_context;
 
@@ -57,6 +59,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         wr_depth_list_[i] = 0;
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
+        if (i + 1 == num_qp_list && has_diag_cq_) cq = diag_cq;
         attr.send_cq = cq;
         attr.recv_cq = cq;
         attr.sq_sig_all = false;
@@ -86,8 +89,8 @@ int RdmaEndPoint::deconstruct() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
@@ -236,8 +239,8 @@ void RdmaEndPoint::disconnectUnlocked() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
@@ -268,7 +271,18 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
-    int qp_index = SimpleRandom::Get().next(qp_list_.size());
+    bool inject_failure = false;
+    if (getenv("MC_INJECT_FAILURE")) {
+        if (context_.deviceName() == getenv("MC_INJECT_FAILURE")) {
+            inject_failure = (SimpleRandom::Get().next(100) % 100 == 0);
+        }
+        if (inject_failure) {
+            LOG(WARNING) << "Injecting a failure on device "
+                         << context_.nicPath();
+        }
+    }
+    size_t qp_list_size = has_diag_cq_ ? qp_list_.size() - 1 : qp_list_.size();
+    int qp_index = SimpleRandom::Get().next(qp_list_size);
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());
     wr_count =
@@ -295,7 +309,7 @@ int RdmaEndPoint::submitPostSend(
         wr.send_flags = IBV_SEND_SIGNALED;
         wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
         wr.imm_data = 0;
-        wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
+        wr.wr.rdma.remote_addr = inject_failure ? 0 : slice->rdma.dest_addr;
         wr.wr.rdma.rkey = slice->rdma.dest_rkey;
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
@@ -315,6 +329,30 @@ int RdmaEndPoint::submitPostSend(
         }
     }
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);
+    return 0;
+}
+
+int RdmaEndPoint::submitZeroByteMessage() {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (!active_ || !has_diag_cq_) return 0;
+    ibv_send_wr wr, *bad_wr = nullptr;
+    ibv_sge sge;
+    sge.addr = 0;
+    sge.length = 0;
+    sge.lkey = 0;
+    memset(&wr, 0, sizeof(ibv_send_wr));
+    wr.wr_id = (uint64_t)this;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.num_sge = 0;
+    wr.sg_list = &sge;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.next = nullptr;
+    wr.imm_data = 0;
+    int rc = ibv_post_send(qp_list_[qp_list_.size() - 1], &wr, &bad_wr);
+    if (rc) {
+        PLOG(ERROR) << "Failed to ibv_post_send";
+        return -1;
+    }
     return 0;
 }
 
