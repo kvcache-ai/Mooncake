@@ -30,6 +30,9 @@
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
+#ifdef USE_CXL
+#include "transport/cxl_transport/cxl_transport.h"
+#endif
 
 #include <cassert>
 
@@ -210,6 +213,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
+    }
+#endif
+#ifdef USE_CXL
+    else if (std::string(proto) == "cxl") {
+        transport = new CxlTransport();
     }
 #endif
 
