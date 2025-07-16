@@ -34,25 +34,6 @@ PosixFile::~PosixFile() {
     fd_ = -1;
 }
 
-ssize_t PosixFile::write(std::span<const char> data) {
-    if (fd_ < 0) return -1;
-    if (data.empty()) return -1;
-
-    auto lock = acquire_write_lock();
-    if (!lock.is_locked()) return -1;
-
-    size_t written = 0;
-    while (written < data.size()) {
-        ssize_t ret = ::write(fd_, data.data() + written, data.size() - written);
-        if (ret == -1) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        written += ret;
-    }
-    return written;
-}
-
 ssize_t PosixFile::write(const std::string &buffer, size_t length) {
     if (fd_ < 0) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;

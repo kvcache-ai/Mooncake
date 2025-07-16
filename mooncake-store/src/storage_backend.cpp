@@ -18,7 +18,7 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    auto file = create_file(path, "wb");
+    auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
@@ -63,7 +63,7 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
     
-    auto file = create_file(path, "wb");
+    auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
@@ -89,44 +89,10 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
     return ErrorCode::OK;
 }
 
-ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
-                                    std::span<const char> data) {
-    std::string path = ResolvePath(key);
-
-    if(std::filesystem::exists(path) == true) {
-        return ErrorCode::FILE_OPEN_FAIL;
-    }
-    
-    auto file = create_file(path, "wb");
-    if (!file) {
-        LOG(INFO) << "Failed to open file for writing: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
-    }
-
-    size_t file_total_size = data.size();
-    ssize_t ret = file->write(data);
-
-    if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
-
-        return ErrorCode::FILE_WRITE_FAIL;
-    }
-    if (ret != static_cast<ssize_t>(file_total_size)) {
-        LOG(INFO) << "Write size mismatch for: " << path
-                   << ", expected: " << file_total_size
-                   << ", got: " << ret;
-
-        return ErrorCode::FILE_WRITE_FAIL;
-    }
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
-
-    return ErrorCode::OK;
-}
-
 ErrorCode StorageBackend::LoadObject(std::string& path,
                                     std::vector<Slice>& slices, size_t length) {
 
-    auto file = create_file(path, "rb");
+    auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
@@ -162,7 +128,7 @@ ErrorCode StorageBackend::LoadObject(std::string& path,
 ErrorCode StorageBackend::LoadObject(std::string& path,
                                     std::string& str, size_t length) {
 
-    auto file = create_file(path, "rb");
+    auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
@@ -317,34 +283,20 @@ std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
     return full_path.lexically_normal().string();
 }
 
-std::pair<int, int> StorageBackend::parse_mode_flags(const std::string& mode) const{
+std::unique_ptr<StorageFile> StorageBackend::create_file(
+    const std::string& path, FileMode mode) const {
     int flags = O_CLOEXEC;
     int access_mode = 0;
-    
-    if (mode.find('w') != std::string::npos) {
-        access_mode = O_WRONLY | O_CREAT | O_TRUNC;
-    } else if (mode.find('r') != std::string::npos) {
-        access_mode = O_RDONLY;
-    } else if (mode.find('a') != std::string::npos) {
-        access_mode = O_APPEND | O_CREAT;
+    switch (mode) {
+        case FileMode::Read:
+            access_mode = O_RDONLY;
+            break;
+        case FileMode::Write:
+            access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+            break;
     }
     
-    if (mode.find('+') != std::string::npos) {
-        access_mode = O_RDWR;
-    }
-    if (mode.find('x') != std::string::npos) {
-        flags |= O_EXCL;
-    }
-    
-    return {flags | access_mode, access_mode};
-}
-
-std::unique_ptr<StorageFile> StorageBackend::create_file(
-    const std::string& path, const std::string& mode) const {
-
-    auto [flags, access_mode] = parse_mode_flags(mode);
-    
-    int fd = open(path.c_str(), flags, 0644);
+    int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
         return nullptr;  
     }

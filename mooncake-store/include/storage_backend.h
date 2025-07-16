@@ -84,9 +84,6 @@ class StorageBackend  {
      * @return ErrorCode indicating operation status
      */
     ErrorCode StoreObject(const ObjectKey& key, const std::string& str) ;
-
-    ErrorCode StoreObject(const ObjectKey& key,
-                                    std::span<const char> data);
     
     /**
      * @brief Loads an object into slices
@@ -142,6 +139,10 @@ class StorageBackend  {
      */
     void RemoveAll() ;
 
+    enum class FileMode {
+        Read,
+        Write
+    };
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
@@ -149,6 +150,7 @@ class StorageBackend  {
     #ifdef USE_3FS
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
     #endif
+
    private:
     /**
      * @brief Sanitizes object key for filesystem safety
@@ -159,11 +161,15 @@ class StorageBackend  {
      * @brief Resolves full filesystem path for an object
      */
     std::string ResolvePath(const ObjectKey& key) const;
-    
-    std::pair<int, int> parse_mode_flags(const std::string& mode) const;
 
+    /**
+     * @brief Creates a file object for the specified path and mode
+     * @param path Filesystem path for the file
+     * @param mode File access mode (read/write)
+     * @return Unique pointer to the created StorageFile, or nullptr on failure
+     */
     std::unique_ptr<StorageFile> create_file(const std::string& path, 
-                                           const std::string& mode) const;
+                                           FileMode mode) const;
 
 };
 
