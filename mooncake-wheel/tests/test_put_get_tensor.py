@@ -79,7 +79,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
-        retrieved_int = self.store.get_tensor(key_int, "int32")
+        retrieved_int = self.store.get_tensor(key_int)
         self.assertIsNotNone(retrieved_int)
         # self.assertEqual(tuple(retrieved_int.shape), tuple(tensor_int.shape))
         self.assertEqual(retrieved_int.dtype, tensor_int.dtype)
