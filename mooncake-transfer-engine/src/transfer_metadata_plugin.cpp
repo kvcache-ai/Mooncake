@@ -644,7 +644,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK)
+                    if (errno != EWOULDBLOCK && errno != EINTR)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
                     continue;
                 }

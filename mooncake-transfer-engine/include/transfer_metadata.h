@@ -91,6 +91,8 @@ class TransferMetadata {
         // this is for ascend
         RankInfoDesc rank_info;
 
+        int tcp_data_port;
+
         void dump() const;
     };
 
