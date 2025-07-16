@@ -11,7 +11,7 @@ mkdir -p "$OUTPUT_DIR"
 
 CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path, under same dir with this script
 
-g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda  -I/usr/local/cuda/include
+g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -lcudart -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -L/usr/local/cuda/lib
 
 if [ $? -eq 0 ]; then
     chmod +x $OUTPUT_DIR/nvlink_allocator.so
