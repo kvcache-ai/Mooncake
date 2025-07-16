@@ -1102,6 +1102,7 @@ uint16_t findAvailableTcpPort(int &sockfd) {
         }
 
         int one = 1;
+
         if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
             close(sockfd);
             sockfd = -1;
