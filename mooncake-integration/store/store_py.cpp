@@ -30,6 +30,29 @@ namespace {
             UNKNOWN = -1
         };
 
+        template <typename T>
+        py::array create_typed_array(char *exported_data, size_t total_length) {
+            py::capsule free_when_done(exported_data,
+                                       [](void *p) { delete[] static_cast<char *>(p); });
+            return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                                  (T *)exported_data, free_when_done);
+        }
+
+        using ArrayCreatorFunc = std::function<py::array(char*, size_t)>;
+
+        static const std::array<ArrayCreatorFunc, 11> array_creators = {{
+            create_typed_array<float>,      // FLOAT32 = 0
+            create_typed_array<double>,     // FLOAT64 = 1
+            create_typed_array<int8_t>,     // INT8 = 2
+            create_typed_array<uint8_t>,    // UINT8 = 3
+            create_typed_array<int16_t>,    // INT16 = 4
+            create_typed_array<uint16_t>,   // UINT16 = 5
+            create_typed_array<int32_t>,    // INT32 = 6
+            create_typed_array<uint32_t>,   // UINT32 = 7
+            create_typed_array<int64_t>,    // INT64 = 8
+            create_typed_array<uint64_t>,   // UINT64 = 9
+            create_typed_array<bool>        // BOOL = 10
+        }};
         TensorDtype dtypeStringToEnum(const std::string& dtype_str) {
             if (dtype_str.find("float32") != std::string::npos) return TensorDtype::FLOAT32;
             if (dtype_str.find("float64") != std::string::npos) return TensorDtype::FLOAT64;
@@ -1316,15 +1339,6 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
-template <typename T>
-py::array create_typed_array(char *exported_data, size_t total_length) {
-    py::capsule free_when_done(exported_data,
-                               [](void *p) { delete[] static_cast<T *>(p); });
-
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)exported_data, free_when_done);
-}
-
 pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1337,32 +1351,42 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
 
         auto query_result = client_->Query(key);
         if (!query_result) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Query failed: " << query_result.error();
             return pybind11::none();
         }
 
         auto replica_list = query_result.value();
         if (replica_list.empty()) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "No replicas found for key: " << key;
             return pybind11::none();
         }
 
         int ret = allocateSlices(guard.slices(), replica_list, total_length);
         if (ret) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Failed to allocate slices for key: " << key;
             return pybind11::none();
         }
 
         auto get_result = client_->Get(key, replica_list, guard.slices());
         if (!get_result) {
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Get failed for key: " << key;
             return pybind11::none();
         }
 
         char *data = exportSlices(guard.slices(), total_length);
         if (!data) {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Failed to export slices";
             return pybind11::none();
         }
 
         if (total_length < sizeof(TensorMetadata)) {
             delete[] data;
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -1372,6 +1396,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         
         if (metadata.ndim < 0 || metadata.ndim > 4) {
             delete[] data;
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid tensor dimensions: " << metadata.ndim;
             return pybind11::none();
         }
@@ -1380,6 +1405,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         std::string dtype_str = dtypeEnumToString(dtype_enum);
         if (dtype_str == "unknown") {
             delete[] data;
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unknown tensor dtype: " << metadata.dtype;
             return pybind11::none();
         }
@@ -1387,40 +1413,21 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         size_t tensor_size = total_length - sizeof(TensorMetadata);
         if (tensor_size == 0) {
             delete[] data;
+            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid data format: no tensor data found";
             return pybind11::none();
         }
-        
-        char* tensor_data = new char[tensor_size];
-        std::memcpy(tensor_data, data + sizeof(TensorMetadata), tensor_size);
-        delete[] data;  
 
+        char *tensor_data = data + sizeof(TensorMetadata);
+        
         pybind11::object np_array;
-        if (dtype_enum == TensorDtype::FLOAT32) {
-            np_array = create_typed_array<float>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::FLOAT64) {
-            np_array = create_typed_array<double>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::INT8) {
-            np_array = create_typed_array<int8_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::UINT8) {
-            np_array = create_typed_array<uint8_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::INT16) {
-            np_array = create_typed_array<int16_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::UINT16) {
-            np_array = create_typed_array<uint16_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::INT32) {
-            np_array = create_typed_array<int32_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::UINT32) {
-            np_array = create_typed_array<uint32_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::INT64) {
-            np_array = create_typed_array<int64_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::UINT64) {
-            np_array = create_typed_array<uint64_t>(tensor_data, tensor_size);
-        } else if (dtype_enum == TensorDtype::BOOL) {
-            np_array = create_typed_array<bool>(tensor_data, tensor_size);
+        int dtype_index = static_cast<int>(dtype_enum);
+        if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
+            np_array = array_creators[dtype_index](tensor_data, tensor_size);   
         } else {
-            delete[] tensor_data;
-            LOG(ERROR) << "Unsupported dtype enum: " << static_cast<int>(dtype_enum);
+            delete[] data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
             return pybind11::none();
         }
 
@@ -1429,15 +1436,16 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             for (int i = 0; i < metadata.ndim; i++) {
                 shape_vec.push_back(metadata.shape[i]);
             }
-            
             py::tuple shape_tuple = py::cast(shape_vec);
             np_array = np_array.attr("reshape")(shape_tuple);
         }
-
+        delete[] data;
+        py::gil_scoped_acquire acquire_gil;
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
         return tensor;
 
     } catch (const pybind11::error_already_set &e) {
+        py::gil_scoped_acquire acquire_gil;
         LOG(ERROR) << "Failed to get tensor data: " << e.what();
         return pybind11::none();
     }
