@@ -68,9 +68,9 @@ class AllocationHandle {
     bool isValid() const { return !m_released && m_allocator; }
 
     // Get offset
-    uint64_t offset() const { return m_base + m_allocation.offset; }
+    uint64_t address() const { return m_base + m_allocation.offset; }
 
-    void* ptr() const { return reinterpret_cast<void*>(offset()); }
+    void* ptr() const { return reinterpret_cast<void*>(address()); }
 
     // Get size
     uint32_t size() const { return m_size; }
@@ -143,9 +143,6 @@ class Allocator : public std::enable_shared_from_this<Allocator> {
 
     // Destructor
     ~Allocator() = default;
-
-    // Reset the allocator
-    void reset();
 
     // Allocate memory and return a Handle (thread-safe)
     std::optional<AllocationHandle> allocate(uint32 size);

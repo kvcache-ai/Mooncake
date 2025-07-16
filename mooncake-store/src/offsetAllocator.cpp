@@ -517,13 +517,6 @@ Allocator::Allocator(uint64_t base, uint32 size, uint32 maxAllocs)
     : m_allocator(std::make_shared<__Allocator>(size, maxAllocs)),
       m_base(base) {}
 
-void Allocator::reset() {
-    MutexLocker guard(&m_mutex);
-    if (m_allocator) {
-        m_allocator->reset();
-    }
-}
-
 std::optional<AllocationHandle> Allocator::allocate(uint32 size) {
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
