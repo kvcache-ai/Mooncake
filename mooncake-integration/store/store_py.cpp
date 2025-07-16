@@ -31,14 +31,14 @@ namespace {
         };
 
         template <typename T>
-        py::array create_typed_array(char *exported_data, size_t total_length) {
+        py::array create_typed_array(char *exported_data, size_t offset, size_t total_length) {
             py::capsule free_when_done(exported_data,
                                        [](void *p) { delete[] static_cast<char *>(p); });
             return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                                  (T *)exported_data, free_when_done);
+                                  (T *)(exported_data + offset), free_when_done);
         }
 
-        using ArrayCreatorFunc = std::function<py::array(char*, size_t)>;
+        using ArrayCreatorFunc = std::function<py::array(char*, size_t, size_t)>;
 
         static const std::array<ArrayCreatorFunc, 11> array_creators = {{
             create_typed_array<float>,      // FLOAT32 = 0
@@ -1418,12 +1418,12 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
-        char *tensor_data = data + sizeof(TensorMetadata);
-        
+        //char *tensor_data = data + sizeof(TensorMetadata);
+
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
-            np_array = array_creators[dtype_index](tensor_data, tensor_size);   
+            np_array = array_creators[dtype_index](data, sizeof(TensorMetadata), tensor_size);   
         } else {
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
