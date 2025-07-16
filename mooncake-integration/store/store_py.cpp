@@ -1439,7 +1439,6 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             py::tuple shape_tuple = py::cast(shape_vec);
             np_array = np_array.attr("reshape")(shape_tuple);
         }
-        delete[] data;
         py::gil_scoped_acquire acquire_gil;
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
         return tensor;
