@@ -1511,6 +1511,74 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
 }
 
 
+int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object tensor){
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+    try{
+        if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
+            LOG(ERROR) << "Input is not a PyTorch tensor";
+            return -1;
+        }
+
+        uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        size_t tensor_size = numel * element_size;
+        
+        pybind11::object shape_obj = tensor.attr("shape");
+        pybind11::object dtype_obj = tensor.attr("dtype");
+        std::string dtype_str = pybind11::str(dtype_obj).cast<std::string>();
+        
+        TensorDtype dtype_enum = dtypeStringToEnum(dtype_str);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            LOG(ERROR) << "Unsupported tensor dtype: " << dtype_str;
+            return -1;
+        }
+
+
+        pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+        int32_t ndim = static_cast<int32_t>(shape_tuple.size());
+        if (ndim > 4) {
+            LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
+            return -1;
+        }
+
+        TensorMetadata metadata;
+        metadata.dtype = static_cast<int32_t>(dtype_enum);
+        metadata.ndim = ndim;
+        
+        for (int i = 0; i < 4; i++) {
+            if (i < ndim) {
+                metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+            } else {
+                metadata.shape[i] = -1;
+            }
+        }
+        
+        size_t total_size = sizeof(TensorMetadata) + tensor_size;
+        char* combined_buffer = new char[total_size];
+        
+        std::memcpy(combined_buffer, &metadata, sizeof(TensorMetadata));
+        std::memcpy(combined_buffer + sizeof(TensorMetadata), 
+                reinterpret_cast<void*>(data_ptr), tensor_size);
+        
+
+        this->register_buffer(combined_buffer, total_size);
+        int result = this->put_from(key, combined_buffer, total_size);
+        this->unregister_buffer(combined_buffer);
+        
+        delete[] combined_buffer;
+
+        return result;
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to access tensor data: " << e.what();
+        return -1;
+    }
+    
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
