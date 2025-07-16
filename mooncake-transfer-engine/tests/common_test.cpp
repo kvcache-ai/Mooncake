@@ -130,7 +130,7 @@ TEST(ParsePortAndDevice, PortAndDevice) {
     EXPECT_EQ(dev, 2);
 }
 
-TEST(ParsePortAndDevice, InvlidDeviceFormatKeepsDefault) {
+TEST(ParsePortAndDevice, InvalidDeviceFormatKeepsDefault) {
     int dev = -1;
     EXPECT_EQ(parsePortAndDevice("9000:npu2", kDefaultPort, &dev), 9000);
     EXPECT_EQ(dev, -1);
