@@ -55,9 +55,11 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         rpc_binding_method = "legacy/P2P";
 #ifdef USE_ASCEND
         int device_id = -1;
-        auto [host_name, port] = parseHostNameWithPortAscend(local_server_name, &device_id);
-        LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: " << host_name << " port: "
-        << port << " device_id: " << device_id;
+        auto [host_name, port] =
+            parseHostNameWithPortAscend(local_server_name, &device_id);
+        LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: "
+                  << host_name << " port: " << port
+                  << " device_id: " << device_id;
 #else
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
 #endif
@@ -67,17 +69,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            if (port == getDefaultHandshakePort()) {
-                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-                if (desc.rpc_port == 0) {
-                    LOG(ERROR)
-                        << "P2P: No valid port found for local TCP service.";
-                    return -1;
-                }
+            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            if (desc.rpc_port == 0) {
+                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                return -1;
             }
 #ifdef USE_ASCEND
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port) + ":npu_" + std::to_string(device_id);
+            local_server_name_ = desc.ip_or_host_name + ":" +
+                                 std::to_string(desc.rpc_port) + ":npu_" +
+                                 std::to_string(device_id);
 #else
             local_server_name_ =
                 desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
@@ -143,7 +143,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                   << local_topology_->getHcaList().size() << " HCAs.";
 
 #ifdef USE_MNNVL
-        if (local_topology_->getHcaList().size() > 0 && !getenv("MC_FORCE_MNNVL")) {
+        if (local_topology_->getHcaList().size() > 0 &&
+            !getenv("MC_FORCE_MNNVL")) {
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
             multi_transports_->installTransport("nvlink", nullptr);
