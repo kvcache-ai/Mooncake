@@ -115,7 +115,7 @@ uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
     uint32 maskBeforeStartIndex = (1 << startBitIndex) - 1;
     uint32 maskAfterStartIndex = ~maskBeforeStartIndex;
     uint32 bitsAfter = bitMask & maskAfterStartIndex;
-    if (bitsAfter == 0) return Allocation::NO_SPACE;
+    if (bitsAfter == 0) return OffsetAllocation::NO_SPACE;
     return tzcnt_nonzero(bitsAfter);
 }
 
@@ -179,11 +179,11 @@ __Allocator::~__Allocator() {
     delete[] m_freeNodes;
 }
 
-Allocation __Allocator::allocate(uint32 size) {
+OffsetAllocation __Allocator::allocate(uint32 size) {
     // Out of allocations?
     if (m_freeOffset == 0) {
-        return {.offset = Allocation::NO_SPACE,
-                .metadata = Allocation::NO_SPACE};
+        return {.offset = OffsetAllocation::NO_SPACE,
+                .metadata = OffsetAllocation::NO_SPACE};
     }
 
     // Round up to bin index to ensure that alloc >= bin
@@ -194,7 +194,7 @@ Allocation __Allocator::allocate(uint32 size) {
     uint32 minLeafBinIndex = minBinIndex & LEAF_BINS_INDEX_MASK;
 
     uint32 topBinIndex = minTopBinIndex;
-    uint32 leafBinIndex = Allocation::NO_SPACE;
+    uint32 leafBinIndex = OffsetAllocation::NO_SPACE;
 
     // If top bin exists, scan its leaf bin. This can fail (NO_SPACE).
     if (m_usedBinsTop & (1 << topBinIndex)) {
@@ -203,13 +203,13 @@ Allocation __Allocator::allocate(uint32 size) {
     }
 
     // If we didn't find space in top bin, we search top bin from +1
-    if (leafBinIndex == Allocation::NO_SPACE) {
+    if (leafBinIndex == OffsetAllocation::NO_SPACE) {
         topBinIndex = findLowestSetBitAfter(m_usedBinsTop, minTopBinIndex + 1);
 
         // Out of space?
-        if (topBinIndex == Allocation::NO_SPACE) {
-            return {.offset = Allocation::NO_SPACE,
-                    .metadata = Allocation::NO_SPACE};
+        if (topBinIndex == OffsetAllocation::NO_SPACE) {
+            return {.offset = OffsetAllocation::NO_SPACE,
+                    .metadata = OffsetAllocation::NO_SPACE};
         }
 
         // All leaf bins here fit the alloc, since the top bin was rounded up.
@@ -269,8 +269,8 @@ Allocation __Allocator::allocate(uint32 size) {
     return {.offset = node.dataOffset, .metadata = nodeIndex};
 }
 
-void __Allocator::free(Allocation allocation) {
-    ASSERT(allocation.metadata != Allocation::NO_SPACE);
+void __Allocator::free(OffsetAllocation allocation) {
+    ASSERT(allocation.metadata != OffsetAllocation::NO_SPACE);
     if (!m_nodes) return;
 
     uint32 nodeIndex = allocation.metadata;
@@ -420,14 +420,14 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
 #endif
 }
 
-uint32 __Allocator::allocationSize(Allocation allocation) const {
-    if (allocation.metadata == Allocation::NO_SPACE) return 0;
+uint32 __Allocator::allocationSize(OffsetAllocation allocation) const {
+    if (allocation.metadata == OffsetAllocation::NO_SPACE) return 0;
     if (!m_nodes) return 0;
 
     return m_nodes[allocation.metadata].dataSize;
 }
 
-StorageReport __Allocator::storageReport() const {
+OffsetAllocStorageReport __Allocator::storageReport() const {
     uint32 largestFreeRegion = 0;
     uint32 freeStorage = 0;
 
@@ -447,8 +447,8 @@ StorageReport __Allocator::storageReport() const {
             .largestFreeRegion = largestFreeRegion};
 }
 
-StorageReportFull __Allocator::storageReportFull() const {
-    StorageReportFull report;
+OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
+    OffsetAllocStorageReportFull report;
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
         uint32 count = 0;
         uint32 nodeIndex = m_binIndices[i];
@@ -462,27 +462,27 @@ StorageReportFull __Allocator::storageReportFull() const {
     return report;
 }
 
-// AllocationHandle implementation
-AllocationHandle::AllocationHandle(std::shared_ptr<Allocator> allocator,
-                                   Allocation allocation, uint64_t base,
+// OffsetAllocationHandle implementation
+OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
+                                   OffsetAllocation allocation, uint64_t base,
                                    uint32_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
       real_size(size) {}
 
-AllocationHandle::AllocationHandle(AllocationHandle&& other) noexcept
+OffsetAllocationHandle::OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
       real_size(other.real_size) {
-    other.m_allocation = {Allocation::NO_SPACE, Allocation::NO_SPACE};
+    other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
     other.real_base = 0;
     other.real_size = 0;
 }
 
-AllocationHandle& AllocationHandle::operator=(
-    AllocationHandle&& other) noexcept {
+OffsetAllocationHandle& OffsetAllocationHandle::operator=(
+    OffsetAllocationHandle&& other) noexcept {
     if (this != &other) {
         // Free current allocation if valid{
         auto allocator = m_allocator.lock();
@@ -497,35 +497,35 @@ AllocationHandle& AllocationHandle::operator=(
         real_size = other.real_size;
 
         // Reset other
-        other.m_allocation = {Allocation::NO_SPACE, Allocation::NO_SPACE};
+        other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
         other.real_base = 0;
         other.real_size = 0;
     }
     return *this;
 }
 
-AllocationHandle::~AllocationHandle() {
+OffsetAllocationHandle::~OffsetAllocationHandle() {
     auto allocator = m_allocator.lock();
     if (allocator) {
         allocator->freeAllocation(m_allocation);
     }
 }
 
-// Thread-safe Allocator implementation
-std::shared_ptr<Allocator> Allocator::create(uint64_t base, size_t size,
+// Thread-safe OffsetAllocator implementation
+std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t size,
                                              uint32 maxAllocs) {
     // Use a custom deleter to allow private constructor
-    return std::shared_ptr<Allocator>(new Allocator(base, size, maxAllocs));
+    return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(base, size, maxAllocs));
 }
 
-Allocator::Allocator(uint64_t base, size_t size, uint32 maxAllocs)
+OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
     : m_base(base) {
     const uint64_t max_bin_size = 4026531840ull;  // 3.75GB
     for (m_multiplier = 1; max_bin_size * m_multiplier < size; m_multiplier *= 2) {}
     m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
 }
 
-std::optional<AllocationHandle> Allocator::allocate(size_t size) {
+std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
         return std::nullopt;
     }
@@ -538,18 +538,18 @@ std::optional<AllocationHandle> Allocator::allocate(size_t size) {
     size_t fake_size =
         m_multiplier > 1 ? (size + m_multiplier - 1) / m_multiplier : size;
 
-    Allocation allocation = m_allocator->allocate(fake_size);
-    if (allocation.offset == Allocation::NO_SPACE) {
+    OffsetAllocation allocation = m_allocator->allocate(fake_size);
+    if (allocation.offset == OffsetAllocation::NO_SPACE) {
         return std::nullopt;
     }
 
-    // Use shared_from_this to get a shared_ptr to this Allocator
-    return AllocationHandle(shared_from_this(), allocation,
+    // Use shared_from_this to get a shared_ptr to this OffsetAllocator
+    return OffsetAllocationHandle(shared_from_this(), allocation,
                             m_base + allocation.offset * m_multiplier,
                             size);
 }
 
-uint32 Allocator::allocationSize(const Allocation& allocation) const {
+uint32 OffsetAllocator::allocationSize(const OffsetAllocation& allocation) const {
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
         return 0;
@@ -557,23 +557,23 @@ uint32 Allocator::allocationSize(const Allocation& allocation) const {
     return m_allocator->allocationSize(allocation);
 }
 
-StorageReport Allocator::storageReport() const {
+OffsetAllocStorageReport OffsetAllocator::storageReport() const {
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
         return {0, 0};
     }
-    StorageReport report = m_allocator->storageReport();
+    OffsetAllocStorageReport report = m_allocator->storageReport();
     return {report.totalFreeSpace * m_multiplier,
             report.largestFreeRegion * m_multiplier};
 }
 
-StorageReportFull Allocator::storageReportFull() const {
+OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
     MutexLocker lock(&m_mutex);
     if (!m_allocator) {
-        StorageReportFull report{};
+        OffsetAllocStorageReportFull report{};
         return report;
     }
-    StorageReportFull report = m_allocator->storageReportFull();
+    OffsetAllocStorageReportFull report = m_allocator->storageReportFull();
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
         report.freeRegions[i] = {.size = report.freeRegions[i].size * m_multiplier,
                                  .count = report.freeRegions[i].count};
@@ -581,7 +581,7 @@ StorageReportFull Allocator::storageReportFull() const {
     return report;
 }
 
-void Allocator::freeAllocation(const Allocation& allocation) {
+void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);

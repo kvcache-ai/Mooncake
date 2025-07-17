@@ -12,7 +12,7 @@ class OffsetAllocatorBenchHelper {
     OffsetAllocatorBenchHelper(uint64_t baseAddress, uint32_t poolSize, uint32_t maxAllocs)
         : pool_size_(poolSize),
           allocated_size_(0),
-          allocator_(Allocator::create(baseAddress, poolSize, maxAllocs)),
+          allocator_(OffsetAllocator::create(baseAddress, poolSize, maxAllocs)),
           rd_(),
           gen_(rd_()) {}
 
@@ -46,8 +46,8 @@ class OffsetAllocatorBenchHelper {
    private:
     uint64_t pool_size_;
     uint64_t allocated_size_;
-    std::shared_ptr<Allocator> allocator_;
-    std::vector<AllocationHandle> allocated_;
+    std::shared_ptr<OffsetAllocator> allocator_;
+    std::vector<OffsetAllocationHandle> allocated_;
     std::vector<uint32_t> allocated_sizes_;
     std::random_device rd_;
     std::mt19937 gen_;

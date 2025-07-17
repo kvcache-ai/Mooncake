@@ -14,7 +14,7 @@ typedef unsigned int uint32;
 using NodeIndex = uint32;
 
 // Forward declarations
-class Allocator;
+class OffsetAllocator;
 class __Allocator;
 
 static constexpr uint32 NUM_TOP_BINS = 32;
@@ -23,19 +23,19 @@ static constexpr uint32 TOP_BINS_INDEX_SHIFT = 3;
 static constexpr uint32 LEAF_BINS_INDEX_MASK = 0x7;
 static constexpr uint32 NUM_LEAF_BINS = NUM_TOP_BINS * BINS_PER_LEAF;
 
-struct Allocation {
+struct OffsetAllocation {
     static constexpr uint32 NO_SPACE = 0xffffffff;
 
     uint32 offset = NO_SPACE;
     NodeIndex metadata = NO_SPACE;  // internal: node index
 };
 
-struct StorageReport {
+struct OffsetAllocStorageReport {
     uint64_t totalFreeSpace;
     uint64_t largestFreeRegion;
 };
 
-struct StorageReportFull {
+struct OffsetAllocStorageReportFull {
     struct Region {
         uint64_t size;
         uint64_t count;
@@ -45,24 +45,24 @@ struct StorageReportFull {
 };
 
 // RAII Handle class for automatic deallocation
-class AllocationHandle {
+class OffsetAllocationHandle {
    public:
     // Constructor for valid allocation
-    AllocationHandle(std::shared_ptr<Allocator> allocator,
-                     Allocation allocation, uint64_t base, uint32_t size);
+    OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
+                     OffsetAllocation allocation, uint64_t base, uint32_t size);
 
     // Move constructor
-    AllocationHandle(AllocationHandle&& other) noexcept;
+    OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept;
 
     // Move assignment operator
-    AllocationHandle& operator=(AllocationHandle&& other) noexcept;
+    OffsetAllocationHandle& operator=(OffsetAllocationHandle&& other) noexcept;
 
     // Disable copy constructor and copy assignment
-    AllocationHandle(const AllocationHandle&) = delete;
-    AllocationHandle& operator=(const AllocationHandle&) = delete;
+    OffsetAllocationHandle(const OffsetAllocationHandle&) = delete;
+    OffsetAllocationHandle& operator=(const OffsetAllocationHandle&) = delete;
 
     // Destructor - automatically deallocates
-    ~AllocationHandle();
+    ~OffsetAllocationHandle();
 
     // Check if the allocation handle is valid
     bool isValid() const { return !m_allocator.expired(); }
@@ -76,8 +76,8 @@ class AllocationHandle {
     uint64_t size() const { return real_size; }
 
    private:
-    std::weak_ptr<Allocator> m_allocator;
-    Allocation m_allocation;
+    std::weak_ptr<OffsetAllocator> m_allocator;
+    OffsetAllocation m_allocation;
     uint64_t real_base;
     uint64_t real_size;
 };
@@ -89,12 +89,12 @@ class __Allocator {
     ~__Allocator();
     void reset();
 
-    Allocation allocate(uint32 size);
-    void free(Allocation allocation);
+    OffsetAllocation allocate(uint32 size);
+    void free(OffsetAllocation allocation);
 
-    uint32 allocationSize(Allocation allocation) const;
-    StorageReport storageReport() const;
-    StorageReportFull storageReportFull() const;
+    uint32 allocationSize(OffsetAllocation allocation) const;
+    OffsetAllocStorageReport storageReport() const;
+    OffsetAllocStorageReportFull storageReportFull() const;
 
    private:
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
@@ -126,40 +126,40 @@ class __Allocator {
 };
 
 // Thread-safe wrapper class for __Allocator
-class Allocator : public std::enable_shared_from_this<Allocator> {
+class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
    public:
-    // Factory method to create shared_ptr<Allocator>
-    static std::shared_ptr<Allocator> create(uint64_t base, size_t size,
+    // Factory method to create shared_ptr<OffsetAllocator>
+    static std::shared_ptr<OffsetAllocator> create(uint64_t base, size_t size,
                                              uint32 maxAllocs = 128 * 1024);
 
     // Disable copy constructor and copy assignment
-    Allocator(const Allocator&) = delete;
-    Allocator& operator=(const Allocator&) = delete;
+    OffsetAllocator(const OffsetAllocator&) = delete;
+    OffsetAllocator& operator=(const OffsetAllocator&) = delete;
 
     // Disable move constructor and move assignment
-    Allocator(Allocator&& other) noexcept = delete;
-    Allocator& operator=(Allocator&& other) noexcept = delete;
+    OffsetAllocator(OffsetAllocator&& other) noexcept = delete;
+    OffsetAllocator& operator=(OffsetAllocator&& other) noexcept = delete;
 
     // Destructor
-    ~Allocator() = default;
+    ~OffsetAllocator() = default;
 
     // Allocate memory and return a Handle (thread-safe)
-    std::optional<AllocationHandle> allocate(size_t size);
+    std::optional<OffsetAllocationHandle> allocate(size_t size);
 
     // Get allocation size (thread-safe)
-    uint32 allocationSize(const Allocation& allocation) const;
+    uint32 allocationSize(const OffsetAllocation& allocation) const;
 
     // Get storage report (thread-safe)
-    StorageReport storageReport() const;
+    OffsetAllocStorageReport storageReport() const;
 
     // Get full storage report (thread-safe)
-    StorageReportFull storageReportFull() const;
+    OffsetAllocStorageReportFull storageReportFull() const;
 
    private:
-    friend class AllocationHandle;
+    friend class OffsetAllocationHandle;
 
     // Internal method for Handle to free allocation (thread-safe)
-    void freeAllocation(const Allocation& allocation);
+    void freeAllocation(const OffsetAllocation& allocation);
 
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     const uint64_t m_base;
@@ -169,6 +169,6 @@ class Allocator : public std::enable_shared_from_this<Allocator> {
     mutable Mutex m_mutex;
 
     // Private constructor - use create() factory method instead
-    Allocator(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024);
+    OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024);
 };
 }  // namespace mooncake::offset_allocator
