@@ -86,8 +86,7 @@ enum class ErrorCode : int32_t {
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
-    NO_AVAILABLE_HANDLE =
-        -200,  ///< Memory allocation failed due to insufficient space.
+    NO_AVAILABLE_HANDLE = -200,  ///< Memory allocation failed due to insufficient space.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
@@ -295,15 +294,6 @@ inline std::ostream& operator<<(std::ostream& os,
 
 struct MemoryDescriptor {
     std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
-
-    size_t value_length() const {
-        size_t length = 0;
-        for (const auto& desc : buffer_descriptors) {
-            length += desc.size_;
-        }
-        return length;
-    }
-
     YLT_REFL(MemoryDescriptor, buffer_descriptors);
 };
 
