@@ -468,60 +468,64 @@ AllocationHandle::AllocationHandle(std::shared_ptr<Allocator> allocator,
                                    uint32_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
-      m_base(base),
-      m_size(size),
-      m_released(false) {}
+      real_base(base),
+      real_size(size) {}
 
 AllocationHandle::AllocationHandle(AllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
-      m_base(other.m_base),
-      m_size(other.m_size),
-      m_released(other.m_released) {
+      real_base(other.real_base),
+      real_size(other.real_size) {
     other.m_allocation = {Allocation::NO_SPACE, Allocation::NO_SPACE};
-    other.m_released = true;
+    other.real_base = 0;
+    other.real_size = 0;
 }
 
 AllocationHandle& AllocationHandle::operator=(
     AllocationHandle&& other) noexcept {
     if (this != &other) {
-        // Free current allocation if valid
-        if (!m_released && m_allocator &&
-            m_allocation.offset != Allocation::NO_SPACE) {
-            m_allocator->freeAllocation(m_allocation);
+        // Free current allocation if valid{
+        auto allocator = m_allocator.lock();
+        if (allocator) {
+            allocator->freeAllocation(m_allocation);
         }
 
         // Move from other
         m_allocator = std::move(other.m_allocator);
         m_allocation = other.m_allocation;
-        m_released = other.m_released;
+        real_base = other.real_base;
+        real_size = other.real_size;
 
         // Reset other
         other.m_allocation = {Allocation::NO_SPACE, Allocation::NO_SPACE};
-        other.m_released = true;
+        other.real_base = 0;
+        other.real_size = 0;
     }
     return *this;
 }
 
 AllocationHandle::~AllocationHandle() {
-    if (!m_released && m_allocator &&
-        m_allocation.offset != Allocation::NO_SPACE) {
-        m_allocator->freeAllocation(m_allocation);
+    auto allocator = m_allocator.lock();
+    if (allocator) {
+        allocator->freeAllocation(m_allocation);
     }
 }
 
 // Thread-safe Allocator implementation
-std::shared_ptr<Allocator> Allocator::create(uint64_t base, uint32 size,
+std::shared_ptr<Allocator> Allocator::create(uint64_t base, size_t size,
                                              uint32 maxAllocs) {
     // Use a custom deleter to allow private constructor
     return std::shared_ptr<Allocator>(new Allocator(base, size, maxAllocs));
 }
 
-Allocator::Allocator(uint64_t base, uint32 size, uint32 maxAllocs)
-    : m_allocator(std::make_shared<__Allocator>(size, maxAllocs)),
-      m_base(base) {}
+Allocator::Allocator(uint64_t base, size_t size, uint32 maxAllocs)
+    : m_base(base) {
+    const uint64_t max_bin_size = 4026531840ull;  // 3.75GB
+    for (m_multiplier = 1; max_bin_size * m_multiplier < size; m_multiplier *= 2) {}
+    m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
+}
 
-std::optional<AllocationHandle> Allocator::allocate(uint32 size) {
+std::optional<AllocationHandle> Allocator::allocate(size_t size) {
     if (size == 0) {
         return std::nullopt;
     }
@@ -531,13 +535,18 @@ std::optional<AllocationHandle> Allocator::allocate(uint32 size) {
         return std::nullopt;
     }
 
-    Allocation allocation = m_allocator->allocate(size);
+    size_t fake_size =
+        m_multiplier > 1 ? (size + m_multiplier - 1) / m_multiplier : size;
+
+    Allocation allocation = m_allocator->allocate(fake_size);
     if (allocation.offset == Allocation::NO_SPACE) {
         return std::nullopt;
     }
 
     // Use shared_from_this to get a shared_ptr to this Allocator
-    return AllocationHandle(shared_from_this(), allocation, m_base, size);
+    return AllocationHandle(shared_from_this(), allocation,
+                            m_base + allocation.offset * m_multiplier,
+                            size);
 }
 
 uint32 Allocator::allocationSize(const Allocation& allocation) const {
@@ -553,7 +562,9 @@ StorageReport Allocator::storageReport() const {
     if (!m_allocator) {
         return {0, 0};
     }
-    return m_allocator->storageReport();
+    StorageReport report = m_allocator->storageReport();
+    return {report.totalFreeSpace * m_multiplier,
+            report.largestFreeRegion * m_multiplier};
 }
 
 StorageReportFull Allocator::storageReportFull() const {
@@ -562,7 +573,12 @@ StorageReportFull Allocator::storageReportFull() const {
         StorageReportFull report{};
         return report;
     }
-    return m_allocator->storageReportFull();
+    StorageReportFull report = m_allocator->storageReportFull();
+    for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
+        report.freeRegions[i] = {.size = report.freeRegions[i].size * m_multiplier,
+                                 .count = report.freeRegions[i].count};
+    }
+    return report;
 }
 
 void Allocator::freeAllocation(const Allocation& allocation) {
@@ -571,4 +587,5 @@ void Allocator::freeAllocation(const Allocation& allocation) {
         m_allocator->free(allocation);
     }
 }
+
 }  // namespace mooncake::offset_allocator

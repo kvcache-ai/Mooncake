@@ -31,14 +31,14 @@ struct Allocation {
 };
 
 struct StorageReport {
-    uint32 totalFreeSpace;
-    uint32 largestFreeRegion;
+    uint64_t totalFreeSpace;
+    uint64_t largestFreeRegion;
 };
 
 struct StorageReportFull {
     struct Region {
-        uint32 size;
-        uint32 count;
+        uint64_t size;
+        uint64_t count;
     };
 
     Region freeRegions[NUM_LEAF_BINS];
@@ -65,22 +65,21 @@ class AllocationHandle {
     ~AllocationHandle();
 
     // Check if the allocation handle is valid
-    bool isValid() const { return !m_released && m_allocator; }
+    bool isValid() const { return !m_allocator.expired(); }
 
     // Get offset
-    uint64_t address() const { return m_base + m_allocation.offset; }
+    uint64_t address() const { return real_base; }
 
     void* ptr() const { return reinterpret_cast<void*>(address()); }
 
     // Get size
-    uint32_t size() const { return m_size; }
+    uint64_t size() const { return real_size; }
 
    private:
-    std::shared_ptr<Allocator> m_allocator;
+    std::weak_ptr<Allocator> m_allocator;
     Allocation m_allocation;
-    const uint64_t m_base;
-    const uint32_t m_size;
-    bool m_released;
+    uint64_t real_base;
+    uint64_t real_size;
 };
 
 class __Allocator {
@@ -130,7 +129,7 @@ class __Allocator {
 class Allocator : public std::enable_shared_from_this<Allocator> {
    public:
     // Factory method to create shared_ptr<Allocator>
-    static std::shared_ptr<Allocator> create(uint64_t base, uint32 size,
+    static std::shared_ptr<Allocator> create(uint64_t base, size_t size,
                                              uint32 maxAllocs = 128 * 1024);
 
     // Disable copy constructor and copy assignment
@@ -145,7 +144,7 @@ class Allocator : public std::enable_shared_from_this<Allocator> {
     ~Allocator() = default;
 
     // Allocate memory and return a Handle (thread-safe)
-    std::optional<AllocationHandle> allocate(uint32 size);
+    std::optional<AllocationHandle> allocate(size_t size);
 
     // Get allocation size (thread-safe)
     uint32 allocationSize(const Allocation& allocation) const;
@@ -162,11 +161,14 @@ class Allocator : public std::enable_shared_from_this<Allocator> {
     // Internal method for Handle to free allocation (thread-safe)
     void freeAllocation(const Allocation& allocation);
 
-    std::shared_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
+    std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     const uint64_t m_base;
+    // The real offset and size of the allocated memory need to be multiplied by
+    // m_multiplier
+    uint64_t m_multiplier;
     mutable Mutex m_mutex;
 
     // Private constructor - use create() factory method instead
-    Allocator(uint64_t base, uint32 size, uint32 maxAllocs = 128 * 1024);
+    Allocator(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024);
 };
 }  // namespace mooncake::offset_allocator

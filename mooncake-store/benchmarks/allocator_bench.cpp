@@ -54,8 +54,8 @@ class OffsetAllocatorBenchHelper {
 };
 
 template <typename BenchHelper>
-void same_size_allocation_benchmark() {
-    std::cout << std::endl << "=== Same Size Allocation Benchmark ===" << std::endl;
+void uniform_size_allocation_benchmark() {
+    std::cout << std::endl << "=== Uniform Size Allocation Benchmark ===" << std::endl;
     const size_t max_pool_size = 2ull * 1024 * 1024 * 1024;
     std::vector<uint32_t> allocation_sizes;
     for (uint32_t i = 32; i < (1 << 26); i *= 4) {
@@ -152,6 +152,6 @@ void random_size_allocation_benchmark() {
 
 int main() {
     std::cout << "=== OffsetAllocator Benchmark ===" << std::endl;
-    same_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
+    uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
     random_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
 }
