@@ -181,7 +181,7 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     client_ = *client_opt;
 
     client_buffer_allocator_ =
-        std::make_unique<SimpleAllocator>(local_buffer_size);
+        std::make_shared<SimpleAllocator>(local_buffer_size);
     auto result = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), local_buffer_size,
         kWildcardLocation, false, true);
@@ -818,13 +818,16 @@ SliceBuffer::SliceBuffer(DistributedObjectStore &store, void *buffer,
     : store_(store),
       buffer_(buffer),
       size_(size),
-      use_allocator_free_(use_allocator_free) {}
+      use_allocator_free_(use_allocator_free),
+      allocator_(store.client_buffer_allocator_) {}
 
 SliceBuffer::~SliceBuffer() {
     if (buffer_) {
         if (use_allocator_free_) {
             // Use SimpleAllocator to deallocate memory
-            store_.client_buffer_allocator_->deallocate(buffer_, size_);
+            if (allocator_) {
+                allocator_->deallocate(buffer_, size_);
+            }
         } else {
             // Use delete[] for memory allocated with new[]
             delete[] static_cast<char *>(buffer_);
