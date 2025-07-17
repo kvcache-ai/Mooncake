@@ -77,10 +77,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             }
 #ifdef USE_ASCEND
             local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port) + ":npu_" + std::to_string(device_id);
+                maybeWrapIpV6(desc.ip_or_host_name) + ":" + std::to_string(desc.rpc_port) + ":npu_" + std::to_string(device_id);
 #else
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" + std::to_string(desc.rpc_port);
 #endif
         }
     } else {
