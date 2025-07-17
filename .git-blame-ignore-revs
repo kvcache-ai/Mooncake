@@ -1,0 +1,12 @@
+# This file contains a list of revisions that should be ignored by git blame.
+# These are typically large formatting changes that don't provide meaningful
+# information when looking at the history of a line.
+#
+# To use this file, run:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Or for a one-time use:
+#   git blame --ignore-revs-file=.git-blame-ignore-revs <file>
+
+# Large formatting change - add format check for code quality
+95bbd61f6d5bf7927ec4b8123fc5b871616e4825

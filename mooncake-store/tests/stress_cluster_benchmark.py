@@ -15,9 +15,7 @@ os.environ["MC_STORE_MEMCPY"] = "0"
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('stress_cluster_benchmark')
 
@@ -25,11 +23,11 @@ logger = logging.getLogger('stress_cluster_benchmark')
 @dataclass
 class BatchResult:
     """Encapsulates the results of a batch operation with error handling."""
-    
+
     keys: List[str]
     return_codes: List[int]
     operation_type: str
-    
+
     def num_succeeded(self) -> int:
         """Return the number of successful operations."""
         if self.operation_type == "prefill":
@@ -38,11 +36,11 @@ class BatchResult:
         else:
             # For get operations: positive = success (bytes read), negative = error
             return sum(1 for code in self.return_codes if code > 0)
-    
+
     def num_failed(self) -> int:
         """Return the number of failed operations."""
         return len(self.return_codes) - self.num_succeeded()
-    
+
     def get_failed_keys_with_codes(self) -> List[tuple[str, int]]:
         """Return a list of (key, error_code) tuples for failed operations."""
         failed = []
@@ -51,17 +49,17 @@ class BatchResult:
             if is_failed:
                 failed.append((self.keys[i], code))
         return failed
-    
+
     def log_failures(self, max_failures_to_log: int = 10):
         """Log detailed information about failed operations."""
         failed_ops = self.get_failed_keys_with_codes()
         if not failed_ops:
             return
-        
+
         logger.warning(f"Batch {self.operation_type} had {len(failed_ops)} failures:")
         for i, (key, error_code) in enumerate(failed_ops[:max_failures_to_log]):
             logger.warning(f"  {key}: error_code={error_code}")
-        
+
         if len(failed_ops) > max_failures_to_log:
             logger.warning(f"  ... and {len(failed_ops) - max_failures_to_log} more failures")
 
@@ -108,7 +106,7 @@ class PerformanceTracker:
             "mean_latency_ms": statistics.mean(latencies_ms),
             "operations_per_second": ops_per_second,
             "throughput_mbps": mbps,
-            "throughput_bytes_per_second": bytes_per_second
+            "throughput_bytes_per_second": bytes_per_second,
         }
 
 
@@ -138,8 +136,15 @@ class TestInstance:
         logger.info(f"  Global segment: {global_segment_size // (1024*1024)} MB")
         logger.info(f"  Local buffer: {local_buffer_size // (1024*1024)} MB")
 
-        retcode = self.store.setup(local_hostname, metadata_server, global_segment_size,
-                                  local_buffer_size, protocol, device_name, master_server_address)
+        retcode = self.store.setup(
+            local_hostname,
+            metadata_server,
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            device_name,
+            master_server_address,
+        )
         if retcode:
             logger.error(f"Store setup failed with return code {retcode}")
             exit(1)
@@ -169,35 +174,34 @@ class TestInstance:
         total_operations = 0
         total_failed_operations = 0
         total_batches = self._calculate_total_batches()
-        
+
         # Initialize progress bar for batch tracking
-        with tqdm(total=total_batches, 
-                  desc=f"{operation_type.capitalize()} batches",
-                  unit="batch",
-                  postfix={"failed_ops": 0}) as pbar:
-            
+        with tqdm(
+            total=total_batches, desc=f"{operation_type.capitalize()} batches", unit="batch", postfix={"failed_ops": 0}
+        ) as pbar:
+
             while total_operations < self.args.max_requests:
                 # Calculate batch size for this iteration
                 remaining = self.args.max_requests - total_operations
                 current_batch_size = min(self.args.batch_size, remaining)
-                
+
                 # Prepare batch data
                 keys = [f"key{total_operations + i}" for i in range(current_batch_size)]
-                
+
                 # Measure batch operation latency
                 op_start = time.perf_counter()
                 return_codes = operation_func(keys, current_batch_size)
                 op_end = time.perf_counter()
 
                 operation_latency = op_end - op_start
-                
+
                 # Process results using BatchResult
                 batch_result = BatchResult(keys, return_codes, operation_type)
-                
+
                 # Log failures if any (but limit verbosity)
                 if batch_result.num_failed() > 0:
                     batch_result.log_failures(max_failures_to_log=3)
-                
+
                 successful_ops = batch_result.num_succeeded()
                 failed_ops = batch_result.num_failed()
                 total_failed_operations += failed_ops
@@ -208,25 +212,26 @@ class TestInstance:
                     self.performance_tracker.record_operation(operation_latency, total_data_size)
 
                 total_operations += current_batch_size
-                
+
                 # Update progress bar
                 pbar.update(1)
                 pbar.set_postfix({"failed_ops": total_failed_operations})
 
         logger.info(f"{operation_type.capitalize()} phase completed. Failed operations: {total_failed_operations}")
         self._print_performance_stats(operation_type.upper())
-        
+
         logger.info(f"Waiting {self.args.wait_time} seconds...")
         time.sleep(self.args.wait_time)
 
     def prefill(self):
         """Execute prefill operations using zero-copy batch put."""
+
         def put_batch(keys: List[str], batch_size: int) -> List[int]:
             # Prepare data in the registered buffer using numpy operations
             for i in range(batch_size):
                 start_idx = i * self.args.value_length
                 end_idx = start_idx + self.args.value_length
-                
+
                 # Simple pattern: fill with key index for each key
                 key_index = int(keys[i].replace("key", ""))
                 pattern = key_index % 256
@@ -246,6 +251,7 @@ class TestInstance:
 
     def decode(self):
         """Execute decode operations using zero-copy batch get."""
+
         def get_batch(keys: List[str], batch_size: int) -> List[int]:
             # Prepare buffer pointers and sizes for batch operation
             buffer_ptrs = []
@@ -285,18 +291,25 @@ def parse_arguments():
     """Parse command-line arguments for the stress test."""
     parser = argparse.ArgumentParser(
         description="Mooncake Distributed Store Zero-Copy Batch Benchmark",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Role configuration
-    parser.add_argument("--role", type=str, choices=["prefill", "decode"], required=True,
-                       help="Role of this instance: prefill (producer) or decode (consumer)")
+    parser.add_argument(
+        "--role",
+        type=str,
+        choices=["prefill", "decode"],
+        required=True,
+        help="Role of this instance: prefill (producer) or decode (consumer)",
+    )
 
     # Network and connection settings
     parser.add_argument("--protocol", type=str, default="rdma", help="Communication protocol to use")
     parser.add_argument("--device-name", type=str, default="erdma_0", help="Network device name for RDMA")
     parser.add_argument("--local-hostname", type=str, default="localhost", help="Local hostname")
-    parser.add_argument("--metadata-server", type=str, default="http://127.0.0.1:8080/metadata", help="Metadata server address")
+    parser.add_argument(
+        "--metadata-server", type=str, default="http://127.0.0.1:8080/metadata", help="Metadata server address"
+    )
     parser.add_argument("--master-server", type=str, default="localhost:50051", help="Master server address")
 
     # Memory and storage settings
@@ -305,7 +318,7 @@ def parse_arguments():
 
     # Test parameters
     parser.add_argument("--max-requests", type=int, default=1200, help="Maximum number of requests to process")
-    parser.add_argument("--value-length", type=int, default=4*1024*1024, help="Size of each value in bytes")
+    parser.add_argument("--value-length", type=int, default=4 * 1024 * 1024, help="Size of each value in bytes")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for operations")
     parser.add_argument("--wait-time", type=int, default=20, help="Wait time in seconds after operations complete")
 

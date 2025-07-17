@@ -31,16 +31,12 @@ class NVLinkAllocator:
             if os.path.exists(so_path):
                 return so_path
         except (ImportError, FileNotFoundError, TypeError):
-            raise ImportError(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
-            )
+            raise ImportError("SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2.")
 
     @classmethod
     def get_allocator(cls, device: torch_device) -> CUDAPluggableAllocator:
         with cls._lock:
             if device not in cls._instances:
                 so_path = cls._get_so_path()
-                cls._instances[device] = CUDAPluggableAllocator(
-                    so_path, "mc_nvlink_malloc", "mc_nvlink_free"
-                )
+                cls._instances[device] = CUDAPluggableAllocator(so_path, "mc_nvlink_malloc", "mc_nvlink_free")
             return cls._instances[device]

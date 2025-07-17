@@ -21,14 +21,31 @@ import argparse
 import json
 import logging
 import time
-from llm_datadist import LLMDataDist, LLMRole, LLMConfig, CacheDesc, Cache, DataType, RegisterMemStatus, BlocksCacheKey, \
-    Placement
+from llm_datadist import (
+    LLMDataDist,
+    LLMRole,
+    LLMConfig,
+    CacheDesc,
+    Cache,
+    DataType,
+    RegisterMemStatus,
+    BlocksCacheKey,
+    Placement,
+)
 import torch
 import torch_npu
 import torchair
 
-NPU_IP_LIST = ['192.168.1.1', '192.168.1.2', '192.168.1.3', '192.168.1.4',
-                  '192.168.1.5', '192.168.1.6', '192.168.1.7', '192.168.1.8']
+NPU_IP_LIST = [
+    '192.168.1.1',
+    '192.168.1.2',
+    '192.168.1.3',
+    '192.168.1.4',
+    '192.168.1.5',
+    '192.168.1.6',
+    '192.168.1.7',
+    '192.168.1.8',
+]
 BLOCK_SIZE = 64 * 1024
 TARGRT_DEVICE_ID = 1
 
@@ -44,6 +61,7 @@ def init_llm_datadist(role: LLMRole, cluster_id, device_id: int) -> LLMDataDist:
     datadist.init(llm_options)
     return datadist
 
+
 def link(datadist, prefill_device_id, decode_device_id):
     rank_table_dict = {
         "server_count": "1",
@@ -52,20 +70,12 @@ def link(datadist, prefill_device_id, decode_device_id):
         "server_list": [
             {
                 "device": [
-                    {
-                        "device_id": str(prefill_device_id),
-                        "device_ip": NPU_IP_LIST[prefill_device_id],
-                        "rank_id": "0"
-                    },
-                    {
-                        "device_id": str(decode_device_id),
-                        "device_ip": NPU_IP_LIST[decode_device_id],
-                        "rank_id": "1"
-                    }
+                    {"device_id": str(prefill_device_id), "device_ip": NPU_IP_LIST[prefill_device_id], "rank_id": "0"},
+                    {"device_id": str(decode_device_id), "device_ip": NPU_IP_LIST[decode_device_id], "rank_id": "1"},
                 ],
-                "server_id": "0"
+                "server_id": "0",
             },
-        ]
+        ],
     }
 
     cluster_rank_info = {1: 0, 2: 1}
@@ -91,15 +101,17 @@ def _allocate_cpu_cache(block_size, num_block, num_tensors):
         kv_tensor = torch.rand(size=(num_block, block_size), dtype=torch.float32, device="cpu")
         cpu_addrs.append(kv_tensor.data_ptr())
         cpu_tensors.append(kv_tensor)
-    cpu_cache_desc = CacheDesc(num_tensors=num_tensors, shape=[num_block, block_size],
-                               data_type=DataType.DT_FLOAT, placement=Placement.HOST)
+    cpu_cache_desc = CacheDesc(
+        num_tensors=num_tensors, shape=[num_block, block_size], data_type=DataType.DT_FLOAT, placement=Placement.HOST
+    )
     return Cache.create_cpu_cache(cpu_cache_desc, cpu_addrs), cpu_tensors
 
 
 def run_decoder_sample(datadist, device_id: int):
     cache_manager = datadist.cache_manager
-    cache_desc = CacheDesc(num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
-                           placement=Placement.DEVICE)
+    cache_desc = CacheDesc(
+        num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT, placement=Placement.DEVICE
+    )
     tensor = torch.ones(20, BLOCK_SIZE // 4, dtype=torch.float).npu()
     addr = int(tensor.data_ptr())
     cache = cache_manager.register_blocks_cache(cache_desc, [addr])
@@ -128,7 +140,7 @@ def run_decoder_sample(datadist, device_id: int):
     total_data_transferred = tensor.numel() * element_size  # in bytes
     print(num_blocks, tensor.numel())
     duration = end_time - start_time  # in seconds
-    bandwidth = total_data_transferred / duration / (1024 ** 3)  # in GB/s
+    bandwidth = total_data_transferred / duration / (1024**3)  # in GB/s
     print(total_data_transferred)
     logging.info(f"after pull, tensor={tensor}")
     logging.info(f"[pull_blocks] duration: {duration * 1000:.4f} ms, bandwidth: {bandwidth:.2f} GB/s")
@@ -145,8 +157,9 @@ def run_decoder_sample(datadist, device_id: int):
 
 def run_prompt_sample(datadist, device_id: int):
     cache_manager = datadist.cache_manager
-    cache_desc = CacheDesc(num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
-                           placement=Placement.DEVICE)
+    cache_desc = CacheDesc(
+        num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT, placement=Placement.DEVICE
+    )
     tensor = torch.ones(20, BLOCK_SIZE // 4, dtype=torch.float).npu()
     addr = int(tensor.data_ptr())
     cache = cache_manager.register_blocks_cache(cache_desc, [addr], BlocksCacheKey(1, 0))
@@ -181,4 +194,3 @@ if __name__ == '__main__':
     else:
         run_decoder_sample(datadist, args.device_id)
     logging.info('Sample end')
-                                                         

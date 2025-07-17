@@ -20,6 +20,7 @@ def _timed_handler(operation_name, handler):
         finally:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             logging.info(f"{operation_name} operation completed in {elapsed_ms:.2f} ms")
+
     return wrapper
 
 
@@ -71,10 +72,7 @@ class MooncakeStoreService:
             raise
 
     def _setup_logging(self):
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     async def start_store_service(self):
         try:
@@ -86,7 +84,7 @@ class MooncakeStoreService:
                 self.config.local_buffer_size,
                 self.config.protocol,
                 self.config.device_name,
-                self.config.master_server_address
+                self.config.master_server_address,
             )
             if ret != 0:
                 raise RuntimeError("Store initialization failed")
@@ -98,13 +96,15 @@ class MooncakeStoreService:
 
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
-        app.add_routes([
-            web.put('/api/put', _timed_handler("PUT", self.handle_put)),
-            web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
-            web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
-            web.delete('/api/remove/{key}', _timed_handler("REMOVE", self.handle_remove)),
-            web.delete('/api/remove_all', _timed_handler("REMOVE_ALL", self.handle_remove_all))
-        ])
+        app.add_routes(
+            [
+                web.put('/api/put', _timed_handler("PUT", self.handle_put)),
+                web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
+                web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
+                web.delete('/api/remove/{key}', _timed_handler("REMOVE", self.handle_remove)),
+                web.delete('/api/remove_all', _timed_handler("REMOVE_ALL", self.handle_remove_all)),
+            ]
+        )
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', port)
@@ -121,31 +121,19 @@ class MooncakeStoreService:
 
             if not key or not value:
                 return web.Response(
-                    status=400,
-                    text=json.dumps({'error': 'Missing key or value'}),
-                    content_type='application/json'
+                    status=400, text=json.dumps({'error': 'Missing key or value'}), content_type='application/json'
                 )
 
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(
-                    status=500,
-                    text=json.dumps({'error': 'PUT operation failed'}),
-                    content_type='application/json'
+                    status=500, text=json.dumps({'error': 'PUT operation failed'}), content_type='application/json'
                 )
 
-            return web.Response(
-                status=200,
-                text=json.dumps({'status': 'success'}),
-                content_type='application/json'
-            )
+            return web.Response(status=200, text=json.dumps({'status': 'success'}), content_type='application/json')
         except Exception as e:
             logging.error("PUT error: %s", e)
-            return web.Response(
-                status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
-            )
+            return web.Response(status=500, text=json.dumps({'error': str(e)}), content_type='application/json')
 
     async def handle_get(self, request):
         try:
@@ -154,41 +142,23 @@ class MooncakeStoreService:
 
             if not value:
                 return web.Response(
-                    status=404,
-                    text=json.dumps({'error': 'Key not found'}),
-                    content_type='application/json'
+                    status=404, text=json.dumps({'error': 'Key not found'}), content_type='application/json'
                 )
 
-            return web.Response(
-                status=200,
-                body=value,
-                content_type='application/octet-stream'
-            )
+            return web.Response(status=200, body=value, content_type='application/octet-stream')
         except Exception as e:
             logging.error("GET error: %s", e)
-            return web.Response(
-                status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
-            )
+            return web.Response(status=500, text=json.dumps({'error': str(e)}), content_type='application/json')
 
     async def handle_exist(self, request):
         try:
             key = request.match_info['key']
             exists = self.store.is_exist(key)
 
-            return web.Response(
-                status=200,
-                text=json.dumps({'exists': bool(exists)}),
-                content_type='application/json'
-            )
+            return web.Response(status=200, text=json.dumps({'exists': bool(exists)}), content_type='application/json')
         except Exception as e:
             logging.error("EXIST error: %s", e)
-            return web.Response(
-                status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
-            )
+            return web.Response(status=500, text=json.dumps({'error': str(e)}), content_type='application/json')
 
     async def handle_remove(self, request):
         try:
@@ -197,23 +167,13 @@ class MooncakeStoreService:
 
             if ret != 0:
                 return web.Response(
-                    status=500,
-                    text=json.dumps({'error': 'Remove operation failed'}),
-                    content_type='application/json'
+                    status=500, text=json.dumps({'error': 'Remove operation failed'}), content_type='application/json'
                 )
 
-            return web.Response(
-                status=200,
-                text=json.dumps({'status': 'success'}),
-                content_type='application/json'
-            )
+            return web.Response(status=200, text=json.dumps({'status': 'success'}), content_type='application/json')
         except Exception as e:
             logging.error("REMOVE error: %s", e)
-            return web.Response(
-                status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
-            )
+            return web.Response(status=500, text=json.dumps({'error': str(e)}), content_type='application/json')
 
     async def handle_remove_all(self, request):
         try:
@@ -223,40 +183,37 @@ class MooncakeStoreService:
                 return web.Response(
                     status=500,
                     text=json.dumps({'error': 'RemoveAll operation failed'}),
-                    content_type='application/json'
+                    content_type='application/json',
                 )
 
             return web.Response(
                 status=200,
                 text=json.dumps({'status': 'success removed ' + str(ret) + ' keys'}),
-                content_type='application/json'
+                content_type='application/json',
             )
         except Exception as e:
             logging.error("REMOVE_ALL error: %s", e)
-            return web.Response(
-                status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
-            )
+            return web.Response(status=500, text=json.dumps({'error': str(e)}), content_type='application/json')
 
     async def stop(self):
         if self.store:
             self.store.close()
             logging.info("Mooncake service stopped")
 
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Mooncake Store Service with REST API')
-    parser.add_argument('--config', type=str,
-                        help='Path to Mooncake config file',
-                        required=False)
-    parser.add_argument('-D', '--define', action='append',
-                        help='Override configuration with key=value pairs (e.g., -Dlocal_hostname=example.com)',
-                        default=[])
-    parser.add_argument('--port', type=int,
-                        help='HTTP API port (default: 8080)',
-                        default=8080,
-                        required=False)
+    parser.add_argument('--config', type=str, help='Path to Mooncake config file', required=False)
+    parser.add_argument(
+        '-D',
+        '--define',
+        action='append',
+        help='Override configuration with key=value pairs (e.g., -Dlocal_hostname=example.com)',
+        default=[],
+    )
+    parser.add_argument('--port', type=int, help='HTTP API port (default: 8080)', default=8080, required=False)
     return parser.parse_args()
+
 
 async def main():
     args = parse_arguments()
@@ -287,6 +244,7 @@ async def main():
     except Exception as e:
         logging.error("Service error: %s", e)
         await service.stop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -7,7 +7,8 @@ from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_KV_LEASE_TTL = 200 # 200 milliseconds
+DEFAULT_KV_LEASE_TTL = 200  # 200 milliseconds
+
 
 def get_client(store):
     """Initialize and setup the distributed store client."""
@@ -16,19 +17,19 @@ def get_client(store):
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
+        local_hostname,
+        metadata_server,
         global_segment_size,
-        local_buffer_size, 
-        protocol, 
+        local_buffer_size,
+        protocol,
         device_name,
-        master_server_address
+        master_server_address,
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -39,38 +40,38 @@ class TestDistributedObjectStore(unittest.TestCase):
         """Initialize the store once for all tests."""
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
-    
-    @unittest.skipIf(os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), 
-                     "Skipping test_client_tear_down because SSD environment variable is set")
+
+    @unittest.skipIf(
+        os.getenv("MOONCAKE_STORAGE_ROOT_DIR"), "Skipping test_client_tear_down because SSD environment variable is set"
+    )
     def test_client_tear_down(self):
         """Test client tear down and re-initialization."""
         test_data = b"Hello, World!"
         key = "test_teardown_key"
-        
+
         # Put data and verify teardown clears it
         self.assertEqual(self.store.put(key, test_data), 0)
         self.assertEqual(self.store.close(), 0)
         time.sleep(1)  # Allow time for teardown to complete
-        
+
         # Re-initialize the store
         get_client(self.store)
-        
+
         # Verify data is gone after teardown
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, b"")
-        
+
         # Verify store is functional after re-initialization
         self.assertEqual(self.store.put(key, test_data), 0)
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
-            
+
     def test_basic_get_hostname(self):
         # No port is set in the config, so it should pick a random one between 12300 and 14300
         hostname = self.store.get_hostname()
         self.assertTrue(hostname.startswith("localhost:"))
         port = int(hostname.split(":")[1])
         self.assertTrue(12300 <= port <= 14300)
-
 
     def test_basic_put_get_exist_operations(self):
         """Test basic Put/Get/Exist operations through the Python interface."""
@@ -101,7 +102,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         keys = [f"test_batch_exist_key_{i}" for i in range(batch_size)]
 
         # Put only the first half of the keys
-        existing_keys = keys[:batch_size // 2]
+        existing_keys = keys[: batch_size // 2]
         for key in existing_keys:
             self.assertEqual(self.store.put(key, test_data), 0)
 
@@ -132,14 +133,12 @@ class TestDistributedObjectStore(unittest.TestCase):
         non_existent_result = self.store.batch_is_exist(["non_existent_key"])
         self.assertEqual(len(non_existent_result), 1)
         self.assertEqual(non_existent_result[0], 0)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         for key in existing_keys:
             self.assertEqual(self.store.remove(key), 0)
-        
 
-    
     def test_zero_copy_operations(self):
         """Test zero-copy get_into and put_from operations."""
         import ctypes
@@ -219,12 +218,12 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Use a large spacing between buffers to avoid any overlap detection
         buffer_spacing = 1024 * 1024  # 1MB spacing between buffers
-        
+
         # Allocate one large buffer with significant spacing
         total_buffer_size = buffer_spacing * batch_size
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-        
+
         # Register the entire large buffer once
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(result, 0, "Buffer registration should succeed")
@@ -255,7 +254,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
             # Verify data integrity - read from the correct offset in the large buffer
             offset = i * buffer_spacing
-            read_data = bytes(large_buffer[offset:offset + result])
+            read_data = bytes(large_buffer[offset : offset + result])
             self.assertEqual(read_data, expected_data, f"Data should match for key {keys[i]}")
 
         # Test error cases
@@ -290,12 +289,12 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Use a large spacing between buffers to avoid any overlap detection
         buffer_spacing = 1024 * 1024  # 1MB spacing between buffers
-        
+
         # Allocate one large buffer with significant spacing
         total_buffer_size = buffer_spacing * batch_size
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-        
+
         # Register the entire large buffer once
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(result, 0, "Buffer registration should succeed")
@@ -309,7 +308,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             # Calculate offset with large spacing to avoid any overlap issues
             offset = i * buffer_spacing
             buffer_ptr = large_buffer_ptr + offset
-            
+
             # Copy test data to buffer
             ctypes.memmove(ctypes.c_void_p(buffer_ptr), data, len(data))
 
@@ -348,102 +347,92 @@ class TestDistributedObjectStore(unittest.TestCase):
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
-
     def test_concurrent_stress_with_barrier(self):
         """Test concurrent Put/Get operations with multiple threads using barrier."""
         NUM_THREADS = 8
         VALUE_SIZE = 1024 * 1024  # 1MB
         OPERATIONS_PER_THREAD = 100
-        
+
         # Create barriers for synchronization
         start_barrier = threading.Barrier(NUM_THREADS + 1)  # +1 for main thread
-        put_barrier = threading.Barrier(NUM_THREADS + 1)    # Barrier after put operations
-        get_barrier = threading.Barrier(NUM_THREADS + 1)    # Barrier after get operations
-        
+        put_barrier = threading.Barrier(NUM_THREADS + 1)  # Barrier after put operations
+        get_barrier = threading.Barrier(NUM_THREADS + 1)  # Barrier after get operations
+
         # Statistics for system-wide timing
-        system_stats = {
-            'put_start': 0,
-            'put_end': 0,
-            'get_start': 0,
-            'get_end': 0
-        }
+        system_stats = {'put_start': 0, 'put_end': 0, 'get_start': 0, 'get_end': 0}
         thread_exceptions = []
-        
+
         def worker(thread_id):
             try:
                 # Generate test data (1MB)
                 test_data = os.urandom(VALUE_SIZE)
                 thread_keys = [f"key_{thread_id}_{i}" for i in range(OPERATIONS_PER_THREAD)]
-                
+
                 # Wait for all threads to be ready
                 start_barrier.wait()
-                
+
                 # Put operations
                 for key in thread_keys:
                     result = self.store.put(key, test_data)
                     self.assertEqual(result, 0, f"Put operation failed for key {key}")
-                
+
                 # Wait for all threads to complete put operations
                 put_barrier.wait()
-                
+
                 # Get operations
                 for key in thread_keys:
                     retrieved_data = self.store.get(key)
-                    self.assertEqual(len(retrieved_data), VALUE_SIZE, 
-                                    f"Retrieved data size mismatch for key {key}")
-                    self.assertEqual(retrieved_data, test_data, 
-                                    f"Retrieved data content mismatch for key {key}")
-                
+                    self.assertEqual(len(retrieved_data), VALUE_SIZE, f"Retrieved data size mismatch for key {key}")
+                    self.assertEqual(retrieved_data, test_data, f"Retrieved data content mismatch for key {key}")
+
                 # Wait for all threads to complete get operations
                 get_barrier.wait()
-                
+
                 # Remove all keys
                 time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
                 for key in thread_keys:
                     self.assertEqual(self.store.remove(key), 0)
-                
-                
+
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
-        
+
         # Create and start threads
         threads = []
         for i in range(NUM_THREADS):
             t = threading.Thread(target=worker, args=(i,), name=f"Worker-{i}")
             threads.append(t)
             t.start()
-        
+
         # Wait for all threads to be ready and start the test
         start_barrier.wait()
-        
+
         # Record put start time
         system_stats['put_start'] = time.time()
-        
+
         # Wait for all put operations to complete
         put_barrier.wait()
         system_stats['put_end'] = time.time()
-        
+
         # Record get start time
         system_stats['get_start'] = time.time()
-        
+
         # Wait for all get operations to complete
         get_barrier.wait()
         system_stats['get_end'] = time.time()
-        
-        
+
         # Join all threads
         for t in threads:
             t.join()
-        
+
         # Check for any exceptions
         self.assertEqual(len(thread_exceptions), 0, "\n".join(thread_exceptions))
-        
+
         # Calculate system-wide statistics
         total_operations = NUM_THREADS * OPERATIONS_PER_THREAD
         put_duration = system_stats['put_end'] - system_stats['put_start']
         get_duration = system_stats['get_end'] - system_stats['get_start']
         total_data_size_gb = (VALUE_SIZE * total_operations) / (1024**3)
-        
+
         print(f"\nConcurrent Stress Test Results:")
         print(f"Total threads: {NUM_THREADS}")
         print(f"Operations per thread: {OPERATIONS_PER_THREAD}")
@@ -459,87 +448,88 @@ class TestDistributedObjectStore(unittest.TestCase):
 
     # Mark this test as zzz_ so that it is the last test to run
     def zzz_test_dict_fuzz_e2e(self):
-         """End-to-end fuzz test comparing distributed store behavior with dict.
-         Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
-         After testing, all keys are removed.
-         """
-         import random
-         # Local reference dict to simulate expected dict behavior
-         reference = {}
-         operations = 1000
-         # Use a pool of keys to limit memory consumption
-         keys_pool = [f"key_{i}" for i in range(100)]
-         # Track which keys have values assigned to ensure consistency
-         key_values = {}
-         # Fuzz record for debugging in case of errors
-         fuzz_record = []
-         try:
-             for i in range(operations):
-                 op = random.choice(["put", "get", "remove"])
-                 key = random.choice(keys_pool)
-                 if op == "put":
-                     # If key already exists, use the same value to ensure consistency
-                     if key in key_values:
-                         value = key_values[key]
-                         size = len(value)
-                     else:
-                         size = random.randint(1, 64 * 1024 * 1024)
-                         value = os.urandom(size)
-                         key_values[key] = value
-                     
-                     fuzz_record.append(f"{i}: put {key} [size: {size}]")
-                     error_code = self.store.put(key, value)
-                     if error_code == -200: 
-                         # The space is not enough, continue to next operation
-                         continue
-                     elif error_code == 0:
-                         reference[key] = value
-                     else:
-                         raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
-                 elif op == "get":
-                     fuzz_record.append(f"{i}: get {key}")
-                     retrieved = self.store.get(key)
-                     if retrieved != b"": # Otherwise the key may have been evicted
+        """End-to-end fuzz test comparing distributed store behavior with dict.
+        Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
+        After testing, all keys are removed.
+        """
+        import random
+
+        # Local reference dict to simulate expected dict behavior
+        reference = {}
+        operations = 1000
+        # Use a pool of keys to limit memory consumption
+        keys_pool = [f"key_{i}" for i in range(100)]
+        # Track which keys have values assigned to ensure consistency
+        key_values = {}
+        # Fuzz record for debugging in case of errors
+        fuzz_record = []
+        try:
+            for i in range(operations):
+                op = random.choice(["put", "get", "remove"])
+                key = random.choice(keys_pool)
+                if op == "put":
+                    # If key already exists, use the same value to ensure consistency
+                    if key in key_values:
+                        value = key_values[key]
+                        size = len(value)
+                    else:
+                        size = random.randint(1, 64 * 1024 * 1024)
+                        value = os.urandom(size)
+                        key_values[key] = value
+
+                    fuzz_record.append(f"{i}: put {key} [size: {size}]")
+                    error_code = self.store.put(key, value)
+                    if error_code == -200:
+                        # The space is not enough, continue to next operation
+                        continue
+                    elif error_code == 0:
+                        reference[key] = value
+                    else:
+                        raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
+                elif op == "get":
+                    fuzz_record.append(f"{i}: get {key}")
+                    retrieved = self.store.get(key)
+                    if retrieved != b"":  # Otherwise the key may have been evicted
                         expected = reference.get(key, b"")
                         self.assertEqual(retrieved, expected)
-                 elif op == "remove":
-                     fuzz_record.append(f"{i}: remove {key}")
-                     error_code = self.store.remove(key)
-                     # if remove did not fail due to the key has a lease
-                     if error_code != -706:
+                elif op == "remove":
+                    fuzz_record.append(f"{i}: remove {key}")
+                    error_code = self.store.remove(key)
+                    # if remove did not fail due to the key has a lease
+                    if error_code != -706:
                         reference.pop(key, None)
                         # Also remove from key_values to allow new value if key is reused
                         key_values.pop(key, None)
-         except Exception as e:
-             print(f"Error: {e}")
-             print('\nFuzz record (operations so far):')
-             for record in fuzz_record:
-                 print(record)
-             raise e
-         # Cleanup: ensure all remaining keys are removed
-         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-         for key in list(reference.keys()):
-             self.store.remove(key)
+        except Exception as e:
+            print(f"Error: {e}")
+            print('\nFuzz record (operations so far):')
+            for record in fuzz_record:
+                print(record)
+            raise e
+        # Cleanup: ensure all remaining keys are removed
+        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        for key in list(reference.keys()):
+            self.store.remove(key)
 
     def test_replicate_config_creation_and_properties(self):
         """Test ReplicateConfig class creation and property access."""
         from mooncake.store import ReplicateConfig
-        
+
         # Test default constructor
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
         self.assertEqual(config.with_soft_pin, False)
         self.assertEqual(config.preferred_segment, "")
-        
+
         # Test property assignment
         config.replica_num = 3
         config.with_soft_pin = True
         config.preferred_segment = "node1:12345"
-        
+
         self.assertEqual(config.replica_num, 3)
         self.assertEqual(config.with_soft_pin, True)
         self.assertEqual(config.preferred_segment, "node1:12345")
-        
+
         # Test string representation
         config_str = str(config)
         self.assertIsInstance(config_str, str)
@@ -548,82 +538,81 @@ class TestDistributedObjectStore(unittest.TestCase):
     def test_put_with_config_parameter(self):
         """Test put method with config parameter."""
         from mooncake.store import ReplicateConfig
-        
+
         test_data = b"Hello, Config World!"
         key = "test_put_config_key"
-        
+
         # Test with default config (backward compatibility)
         result = self.store.put(key=key, value=test_data)
         self.assertEqual(result, 0)
-        
+
         # Verify data
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key), 0)
-        
+
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = 2
-        
+
         key2 = "test_put_config_key2"
         result = self.store.put(key=key2, value=test_data, config=config)
         self.assertEqual(result, 0)
-        
+
         # Verify data
         retrieved_data = self.store.get(key2)
         self.assertEqual(retrieved_data, test_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key2), 0)
-        
+
         with self.assertRaises(TypeError):
             result = self.store.put(key_arg_name_error=key, value=test_data, config=config)
-        
+
         with self.assertRaises(TypeError):
             result = self.store.put(key=key, value_arg_name_error=test_data, config=config)
-            
+
         with self.assertRaises(TypeError):
             result = self.store.put(key=key, value=test_data, config_arg_name_error=config)
-
 
     def test_put_batch_with_config_parameter(self):
         """Test put_batch method with config parameter."""
         from mooncake.store import ReplicateConfig
-        
+
         keys = ["test_batch_config_key1", "test_batch_config_key2", "test_batch_config_key3"]
         values = [b"Batch Data 1", b"Batch Data 2", b"Batch Data 3"]
-        
+
         # Test with default config (backward compatibility)
         result = self.store.put_batch(keys, values)
         self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_value in zip(keys, values):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_value)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
-        
+
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = 2
-        
+
         keys2 = ["test_batch_config_key4", "test_batch_config_key5", "test_batch_config_key6"]
         result = self.store.put_batch(keys=keys2, values=values, config=config)
         self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_value in zip(keys2, values):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_value)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         for key in keys2:
@@ -633,46 +622,46 @@ class TestDistributedObjectStore(unittest.TestCase):
         """Test put_from method with config parameter."""
         import ctypes
         from mooncake.store import ReplicateConfig
-        
+
         test_data = b"Hello, put_from config world!"
         key = "test_put_from_config_key"
         buffer_size = len(test_data)
-        
+
         # Allocate and register buffer
         buffer = (ctypes.c_ubyte * buffer_size)()
         buffer_ptr = ctypes.addressof(buffer)
-        
+
         result = self.store.register_buffer(buffer_ptr, buffer_size)
         self.assertEqual(result, 0)
-        
+
         # Copy test data to buffer
         ctypes.memmove(buffer, test_data, len(test_data))
-        
+
         # Test with default config (backward compatibility)
         result = self.store.put_from(key=key, buffer_ptr=buffer_ptr, size=len(test_data))
         self.assertEqual(result, 0)
-        
+
         # Verify data
         retrieved_data = self.store.get(key)
         self.assertEqual(retrieved_data, test_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.remove(key), 0)
-        
+
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = 2
         config.with_soft_pin = False
-        
+
         key2 = "test_put_from_config_key2"
         result = self.store.put_from(key=key2, buffer_ptr=buffer_ptr, size=len(test_data), config=config)
         self.assertEqual(result, 0)
-        
+
         # Verify data
         retrieved_data = self.store.get(key2)
         self.assertEqual(retrieved_data, test_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
@@ -682,71 +671,71 @@ class TestDistributedObjectStore(unittest.TestCase):
         """Test batch_put_from method with config parameter."""
         import ctypes
         from mooncake.store import ReplicateConfig
-        
+
         # Test data
-        test_data = [
-            b"Batch Config Data 1",
-            b"Batch Config Data 2", 
-            b"Batch Config Data 3"
-        ]
+        test_data = [b"Batch Config Data 1", b"Batch Config Data 2", b"Batch Config Data 3"]
         keys = ["test_batch_put_from_config_key1", "test_batch_put_from_config_key2", "test_batch_put_from_config_key3"]
-        
+
         # Use large spacing between buffers
         buffer_spacing = 1024 * 1024  # 1MB spacing
         total_buffer_size = buffer_spacing * len(test_data)
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-        
+
         # Register buffer
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(result, 0)
-        
+
         # Prepare individual buffers
         buffer_ptrs = []
         buffer_sizes = []
-        
+
         for i, data in enumerate(test_data):
             offset = i * buffer_spacing
             buffer_ptr = large_buffer_ptr + offset
-            
+
             # Copy test data to buffer
             ctypes.memmove(ctypes.c_void_p(buffer_ptr), data, len(data))
-            
+
             buffer_ptrs.append(buffer_ptr)
             buffer_sizes.append(len(data))
-        
+
         # Test with default config (backward compatibility)
         results = self.store.batch_put_from(keys=keys, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes)
         self.assertEqual(len(results), len(keys))
         for result in results:
             self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_data in zip(keys, test_data):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
-        
+
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = 2
         config.with_soft_pin = False
-        
-        keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]
+
+        keys2 = [
+            "test_batch_put_from_config_key4",
+            "test_batch_put_from_config_key5",
+            "test_batch_put_from_config_key6",
+        ]
         results = self.store.batch_put_from(keys=keys2, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes, config=config)
         self.assertEqual(len(results), len(keys2))
         for result in results:
             self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_data in zip(keys2, test_data):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_data)
-        
+
         # Clean up
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0)

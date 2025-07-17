@@ -13,8 +13,7 @@
 #include "utils.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
+DEFINE_string(device_name, "ibp6s0", "Device name to use, valid if protocol=rdma");
 DEFINE_string(transfer_engine_metadata_url, "http://localhost:8080/metadata",
               "Metadata connection string for transfer engine");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
@@ -25,640 +24,563 @@ namespace mooncake {
 namespace testing {
 
 class ClientIntegrationTest : public ::testing::Test {
-   protected:
-    static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        void** args =
-            (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
+protected:
+	static std::shared_ptr<Client> CreateClient(const std::string &host_name) {
+		void **args = (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
 
-        auto client_opt = Client::Create(
-            host_name,                           // Local hostname
-            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
-            FLAGS_protocol, args,
-            "localhost:50051"  // Master server address
-        );
+		auto client_opt = Client::Create(host_name,                          // Local hostname
+		                                 FLAGS_transfer_engine_metadata_url, // Metadata connection string
+		                                 FLAGS_protocol, args,
+		                                 "localhost:50051" // Master server address
+		);
 
-        EXPECT_TRUE(client_opt.has_value())
-            << "Failed to create client with host_name: " << host_name;
-        if (!client_opt.has_value()) {
-            return nullptr;
-        }
-        return client_opt.value();
-    }
+		EXPECT_TRUE(client_opt.has_value()) << "Failed to create client with host_name: " << host_name;
+		if (!client_opt.has_value()) {
+			return nullptr;
+		}
+		return client_opt.value();
+	}
 
-    static void SetUpTestSuite() {
-        // Initialize glog
-        google::InitGoogleLogging("ClientIntegrationTest");
+	static void SetUpTestSuite() {
+		// Initialize glog
+		google::InitGoogleLogging("ClientIntegrationTest");
 
-        FLAGS_logtostderr = 1;
+		FLAGS_logtostderr = 1;
 
-        // Override flags from environment variables if present
-        if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
-        if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
-        if (getenv("MC_METADATA_SERVER"))
-            FLAGS_transfer_engine_metadata_url = getenv("MC_METADATA_SERVER");
+		// Override flags from environment variables if present
+		if (getenv("PROTOCOL"))
+			FLAGS_protocol = getenv("PROTOCOL");
+		if (getenv("DEVICE_NAME"))
+			FLAGS_device_name = getenv("DEVICE_NAME");
+		if (getenv("MC_METADATA_SERVER"))
+			FLAGS_transfer_engine_metadata_url = getenv("MC_METADATA_SERVER");
 
-        LOG(INFO) << "Protocol: " << FLAGS_protocol
-                  << ", Device name: " << FLAGS_device_name
-                  << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
+		LOG(INFO) << "Protocol: " << FLAGS_protocol << ", Device name: " << FLAGS_device_name
+		          << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
 
-        InitializeClients();
-        InitializeSegment();
-    }
+		InitializeClients();
+		InitializeSegment();
+	}
 
-    static void TearDownTestSuite() {
-        CleanupSegment();
-        CleanupClients();
-        google::ShutdownGoogleLogging();
-    }
+	static void TearDownTestSuite() {
+		CleanupSegment();
+		CleanupClients();
+		google::ShutdownGoogleLogging();
+	}
 
-    static void InitializeSegment() {
-        ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
-        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
-        LOG_ASSERT(segment_ptr_);
-        auto mount_result = segment_provider_client_->MountSegment(
-            segment_ptr_, ram_buffer_size_);
-        if (!mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount segment: "
-                       << toString(mount_result.error());
-        }
-        LOG(INFO) << "Segment mounted successfully";
-    }
+	static void InitializeSegment() {
+		ram_buffer_size_ = 512 * 1024 * 1024; // 512 MB
+		segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
+		LOG_ASSERT(segment_ptr_);
+		auto mount_result = segment_provider_client_->MountSegment(segment_ptr_, ram_buffer_size_);
+		if (!mount_result.has_value()) {
+			LOG(ERROR) << "Failed to mount segment: " << toString(mount_result.error());
+		}
+		LOG(INFO) << "Segment mounted successfully";
+	}
 
-    static void InitializeClients() {
-        // This client is used for testing purposes.
-        test_client_ = CreateClient("localhost:17813");
-        ASSERT_TRUE(test_client_ != nullptr);
+	static void InitializeClients() {
+		// This client is used for testing purposes.
+		test_client_ = CreateClient("localhost:17813");
+		ASSERT_TRUE(test_client_ != nullptr);
 
-        // This client is used to provide segments.
-        segment_provider_client_ = CreateClient("localhost:17812");
-        ASSERT_TRUE(segment_provider_client_ != nullptr);
+		// This client is used to provide segments.
+		segment_provider_client_ = CreateClient("localhost:17812");
+		ASSERT_TRUE(segment_provider_client_ != nullptr);
 
-        client_buffer_allocator_ =
-            std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
-        auto register_result = test_client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), 128 * 1024 * 1024, "cpu:0",
-            false, false);
-        if (!register_result.has_value()) {
-            LOG(ERROR) << "Failed to register local memory: "
-                       << toString(register_result.error());
-        }
+		client_buffer_allocator_ = std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
+		auto register_result = test_client_->RegisterLocalMemory(client_buffer_allocator_->getBase(), 128 * 1024 * 1024,
+		                                                         "cpu:0", false, false);
+		if (!register_result.has_value()) {
+			LOG(ERROR) << "Failed to register local memory: " << toString(register_result.error());
+		}
 
-        // Mount segment for test_client_ as well
-        test_client_ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
-        test_client_segment_ptr_ =
-            allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
-        LOG_ASSERT(test_client_segment_ptr_);
-        auto test_client_mount_result = test_client_->MountSegment(
-            test_client_segment_ptr_, test_client_ram_buffer_size_);
-        if (!test_client_mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount segment for test_client_: "
-                       << toString(test_client_mount_result.error());
-        }
-        LOG(INFO) << "Test client segment mounted successfully";
-    }
+		// Mount segment for test_client_ as well
+		test_client_ram_buffer_size_ = 512 * 1024 * 1024; // 512 MB
+		test_client_segment_ptr_ = allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
+		LOG_ASSERT(test_client_segment_ptr_);
+		auto test_client_mount_result =
+		    test_client_->MountSegment(test_client_segment_ptr_, test_client_ram_buffer_size_);
+		if (!test_client_mount_result.has_value()) {
+			LOG(ERROR) << "Failed to mount segment for test_client_: " << toString(test_client_mount_result.error());
+		}
+		LOG(INFO) << "Test client segment mounted successfully";
+	}
 
-    static void CleanupClients() {
-        // Unmount test client segment first
-        if (test_client_ && test_client_segment_ptr_) {
-            if (!test_client_
-                     ->UnmountSegment(test_client_segment_ptr_,
-                                      test_client_ram_buffer_size_)
-                     .has_value()) {
-                LOG(ERROR) << "Failed to unmount test client segment";
-            }
-        }
+	static void CleanupClients() {
+		// Unmount test client segment first
+		if (test_client_ && test_client_segment_ptr_) {
+			if (!test_client_->UnmountSegment(test_client_segment_ptr_, test_client_ram_buffer_size_).has_value()) {
+				LOG(ERROR) << "Failed to unmount test client segment";
+			}
+		}
 
-        if (test_client_) {
-            test_client_.reset();
-        }
-        if (segment_provider_client_) {
-            segment_provider_client_.reset();
-        }
-    }
+		if (test_client_) {
+			test_client_.reset();
+		}
+		if (segment_provider_client_) {
+			segment_provider_client_.reset();
+		}
+	}
 
-    static void CleanupSegment() {
-        if (!segment_provider_client_
-                 ->UnmountSegment(segment_ptr_, ram_buffer_size_)
-                 .has_value()) {
-            LOG(ERROR) << "Failed to unmount segment";
-        }
-    }
+	static void CleanupSegment() {
+		if (!segment_provider_client_->UnmountSegment(segment_ptr_, ram_buffer_size_).has_value()) {
+			LOG(ERROR) << "Failed to unmount segment";
+		}
+	}
 
-    static std::shared_ptr<Client> test_client_;
-    static std::shared_ptr<Client> segment_provider_client_;
-    // Here we use a simple allocator for the client buffer. In a real
-    // application, user should manage the memory allocation and deallocation
-    // themselves.
-    static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
-    static void* segment_ptr_;
-    static size_t ram_buffer_size_;
-    static void* test_client_segment_ptr_;
-    static size_t test_client_ram_buffer_size_;
+	static std::shared_ptr<Client> test_client_;
+	static std::shared_ptr<Client> segment_provider_client_;
+	// Here we use a simple allocator for the client buffer. In a real
+	// application, user should manage the memory allocation and deallocation
+	// themselves.
+	static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
+	static void *segment_ptr_;
+	static size_t ram_buffer_size_;
+	static void *test_client_segment_ptr_;
+	static size_t test_client_ram_buffer_size_;
 };
 
 // Static members initialization
 std::shared_ptr<Client> ClientIntegrationTest::test_client_ = nullptr;
-std::shared_ptr<Client> ClientIntegrationTest::segment_provider_client_ =
-    nullptr;
-void* ClientIntegrationTest::segment_ptr_ = nullptr;
-void* ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
-std::unique_ptr<SimpleAllocator>
-    ClientIntegrationTest::client_buffer_allocator_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::segment_provider_client_ = nullptr;
+void *ClientIntegrationTest::segment_ptr_ = nullptr;
+void *ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
+std::unique_ptr<SimpleAllocator> ClientIntegrationTest::client_buffer_allocator_ = nullptr;
 size_t ClientIntegrationTest::ram_buffer_size_ = 0;
 size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
-    const std::string test_data = "Hello, World!";
-    const std::string key = "test_key";
-    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+	const std::string test_data = "Hello, World!";
+	const std::string key = "test_key";
+	void *buffer = client_buffer_allocator_->allocate(test_data.size());
 
-    // write
-    memcpy(buffer, test_data.data(), test_data.size());
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{buffer, test_data.size()});
+	// write
+	memcpy(buffer, test_data.data(), test_data.size());
+	std::vector<Slice> slices;
+	slices.emplace_back(Slice {buffer, test_data.size()});
 
-    // Test Put operation
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Put operation failed: " << toString(put_result.error());
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	// Test Put operation
+	ReplicateConfig config;
+	config.replica_num = 1;
+	auto put_result = test_client_->Put(key, slices, config);
+	ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
-    // Verify data through Get operation
-    auto get_result = test_client_->Get(key, slices);
-    ASSERT_TRUE(get_result.has_value())
-        << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(slices.size(), 1);
-    ASSERT_EQ(slices[0].size, test_data.size());
-    ASSERT_EQ(slices[0].ptr, buffer);
-    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
+	slices.clear();
+	slices.emplace_back(Slice {buffer, test_data.size()});
+	// Verify data through Get operation
+	auto get_result = test_client_->Get(key, slices);
+	ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+	ASSERT_EQ(slices.size(), 1);
+	ASSERT_EQ(slices[0].size, test_data.size());
+	ASSERT_EQ(slices[0].ptr, buffer);
+	ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    // Put again with the same key, should succeed
-    buffer = client_buffer_allocator_->allocate(test_data.size());
-    memcpy(buffer, test_data.data(), test_data.size());
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
-    auto put_result2 = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result2.has_value())
-        << "Second Put operation failed: " << toString(put_result2.error());
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
-    auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value())
-        << "Remove operation failed: " << toString(remove_result.error());
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	// Put again with the same key, should succeed
+	buffer = client_buffer_allocator_->allocate(test_data.size());
+	memcpy(buffer, test_data.data(), test_data.size());
+	slices.clear();
+	slices.emplace_back(Slice {buffer, test_data.size()});
+	auto put_result2 = test_client_->Put(key, slices, config);
+	ASSERT_TRUE(put_result2.has_value()) << "Second Put operation failed: " << toString(put_result2.error());
+	std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+	auto remove_result = test_client_->Remove(key);
+	ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
 
 // Test Remove operation
 TEST_F(ClientIntegrationTest, RemoveOperation) {
-    const std::string test_data = "Test data for removal";
-    const std::string key = "remove_test_key";
-    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+	const std::string test_data = "Test data for removal";
+	const std::string key = "remove_test_key";
+	void *buffer = client_buffer_allocator_->allocate(test_data.size());
 
-    // Put data first
-    memcpy(buffer, test_data.data(), test_data.size());
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{buffer, test_data.size()});
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Put operation failed: " << toString(put_result.error());
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	// Put data first
+	memcpy(buffer, test_data.data(), test_data.size());
+	std::vector<Slice> slices;
+	slices.emplace_back(Slice {buffer, test_data.size()});
+	ReplicateConfig config;
+	config.replica_num = 1;
+	auto put_result = test_client_->Put(key, slices, config);
+	ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    // Remove the data
-    auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value())
-        << "Remove operation failed: " << toString(remove_result.error());
+	// Remove the data
+	auto remove_result = test_client_->Remove(key);
+	ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
 
-    // Try to get the removed data - should fail
-    buffer = client_buffer_allocator_->allocate(test_data.size());
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
-    auto get_result = test_client_->Get(key, slices);
-    ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	// Try to get the removed data - should fail
+	buffer = client_buffer_allocator_->allocate(test_data.size());
+	slices.clear();
+	slices.emplace_back(Slice {buffer, test_data.size()});
+	auto get_result = test_client_->Get(key, slices);
+	ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
 
 // Test local preferred allocation strategy
 TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
-    const std::string test_data = "Test data for local preferred allocation";
-    const std::string key = "local_preferred_test_key";
-    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+	const std::string test_data = "Test data for local preferred allocation";
+	const std::string key = "local_preferred_test_key";
+	void *buffer = client_buffer_allocator_->allocate(test_data.size());
 
-    // Put data with preferred segment set to local hostname
-    memcpy(buffer, test_data.data(), test_data.size());
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{buffer, test_data.size()});
+	// Put data with preferred segment set to local hostname
+	memcpy(buffer, test_data.data(), test_data.size());
+	std::vector<Slice> slices;
+	slices.emplace_back(Slice {buffer, test_data.size()});
 
-    ReplicateConfig config;
-    config.replica_num = 1;
-    // Although there is only one segment now, in order to test the preferred
-    // allocation logic, we still set it. This will prevent potential
-    // compatibility issues in the future.
-    config.preferred_segment = "localhost:17812";  // Local segment
+	ReplicateConfig config;
+	config.replica_num = 1;
+	// Although there is only one segment now, in order to test the preferred
+	// allocation logic, we still set it. This will prevent potential
+	// compatibility issues in the future.
+	config.preferred_segment = "localhost:17812"; // Local segment
 
-    auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Put operation failed: " << toString(put_result.error());
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	auto put_result = test_client_->Put(key, slices, config);
+	ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    // Verify data through Get operation
-    buffer = client_buffer_allocator_->allocate(test_data.size());
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
+	// Verify data through Get operation
+	buffer = client_buffer_allocator_->allocate(test_data.size());
+	slices.clear();
+	slices.emplace_back(Slice {buffer, test_data.size()});
 
-    auto query_result = test_client_->Query(key);
-    ASSERT_TRUE(query_result.has_value())
-        << "Query operation failed: " << toString(query_result.error());
-    auto replica_list = query_result.value();
-    ASSERT_EQ(replica_list.size(), 1);
-    ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(),
-              1);
-    ASSERT_EQ(replica_list[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptors[0]
-                  .segment_name_,
-              "localhost:17812");
+	auto query_result = test_client_->Query(key);
+	ASSERT_TRUE(query_result.has_value()) << "Query operation failed: " << toString(query_result.error());
+	auto replica_list = query_result.value();
+	ASSERT_EQ(replica_list.size(), 1);
+	ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(), 1);
+	ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors[0].segment_name_, "localhost:17812");
 
-    auto get_result = test_client_->Get(key, replica_list, slices);
-    ASSERT_TRUE(get_result.has_value())
-        << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(slices.size(), 1);
-    ASSERT_EQ(slices[0].size, test_data.size());
-    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
-    client_buffer_allocator_->deallocate(buffer, test_data.size());
+	auto get_result = test_client_->Get(key, replica_list, slices);
+	ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+	ASSERT_EQ(slices.size(), 1);
+	ASSERT_EQ(slices[0].size, test_data.size());
+	ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+	client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    // Clean up
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
-    auto remove_result2 = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result2.has_value())
-        << "Remove operation failed: " << toString(remove_result2.error());
+	// Clean up
+	std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+	auto remove_result2 = test_client_->Remove(key);
+	ASSERT_TRUE(remove_result2.has_value()) << "Remove operation failed: " << toString(remove_result2.error());
 }
 
 // Test heavy workload operations
 TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
-    const size_t data_size = 1 * 1024 * 1024;  // 1MB
-    std::string large_data(data_size, 'A');    // Fill with 'A's
-    const int num_operations = 13;
+	const size_t data_size = 1 * 1024 * 1024; // 1MB
+	std::string large_data(data_size, 'A');   // Fill with 'A's
+	const int num_operations = 13;
 
-    // Configure with 1 replicas for high availability
-    ReplicateConfig config;
-    config.replica_num = 1;
+	// Configure with 1 replicas for high availability
+	ReplicateConfig config;
+	config.replica_num = 1;
 
-    // Perform multiple Put/Get operations
-    for (int i = 0; i < num_operations; i++) {
-        std::string key = "heavy_test_key_" + std::to_string(i);
-        void* buffer = client_buffer_allocator_->allocate(data_size);
-        ASSERT_TRUE(buffer);
+	// Perform multiple Put/Get operations
+	for (int i = 0; i < num_operations; i++) {
+		std::string key = "heavy_test_key_" + std::to_string(i);
+		void *buffer = client_buffer_allocator_->allocate(data_size);
+		ASSERT_TRUE(buffer);
 
-        // Put operation with large data
-        memcpy(buffer, large_data.data(), data_size);
-        std::vector<Slice> put_slices;
-        put_slices.emplace_back(Slice{buffer, data_size});
-        auto put_result = test_client_->Put(key, put_slices, config);
-        if (!put_result.has_value()) break;
-        client_buffer_allocator_->deallocate(buffer, data_size);
-        // Get and verify data
-        buffer = client_buffer_allocator_->allocate(data_size);
-        std::vector<Slice> get_slices;
-        get_slices.emplace_back(Slice{buffer, data_size});
-        auto get_result = test_client_->Get(key, get_slices);
-        ASSERT_TRUE(get_result.has_value())
-            << "Get operation failed: " << toString(get_result.error());
-        ASSERT_EQ(get_slices[0].size, data_size);
+		// Put operation with large data
+		memcpy(buffer, large_data.data(), data_size);
+		std::vector<Slice> put_slices;
+		put_slices.emplace_back(Slice {buffer, data_size});
+		auto put_result = test_client_->Put(key, put_slices, config);
+		if (!put_result.has_value())
+			break;
+		client_buffer_allocator_->deallocate(buffer, data_size);
+		// Get and verify data
+		buffer = client_buffer_allocator_->allocate(data_size);
+		std::vector<Slice> get_slices;
+		get_slices.emplace_back(Slice {buffer, data_size});
+		auto get_result = test_client_->Get(key, get_slices);
+		ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+		ASSERT_EQ(get_slices[0].size, data_size);
 
-        std::string retrieved_data(static_cast<const char*>(get_slices[0].ptr),
-                                   get_slices[0].size);
-        EXPECT_EQ(retrieved_data, large_data);
-        client_buffer_allocator_->deallocate(buffer, data_size);
-    }
+		std::string retrieved_data(static_cast<const char *>(get_slices[0].ptr), get_slices[0].size);
+		EXPECT_EQ(retrieved_data, large_data);
+		client_buffer_allocator_->deallocate(buffer, data_size);
+	}
 
-    std::string allocate_failed_key = "heavy_test_failed_key";
-    void* failed_buffer = client_buffer_allocator_->allocate(data_size);
-    std::vector<Slice> failed_slices;
-    failed_slices.emplace_back(Slice{failed_buffer, data_size});
-    memcpy(failed_buffer, large_data.data(), data_size);
-    auto failed_put_result =
-        test_client_->Put(allocate_failed_key, failed_slices, config);
-    ASSERT_FALSE(failed_put_result.has_value())
-        << "Put operation should have failed";
-    client_buffer_allocator_->deallocate(failed_buffer, data_size);
+	std::string allocate_failed_key = "heavy_test_failed_key";
+	void *failed_buffer = client_buffer_allocator_->allocate(data_size);
+	std::vector<Slice> failed_slices;
+	failed_slices.emplace_back(Slice {failed_buffer, data_size});
+	memcpy(failed_buffer, large_data.data(), data_size);
+	auto failed_put_result = test_client_->Put(allocate_failed_key, failed_slices, config);
+	ASSERT_FALSE(failed_put_result.has_value()) << "Put operation should have failed";
+	client_buffer_allocator_->deallocate(failed_buffer, data_size);
 
-    // sleep for 2 seconds to ensure the object is marked for GC
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+	// sleep for 2 seconds to ensure the object is marked for GC
+	std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // After removing all keys, we should be able to allocate the failed key
-    void* success_buffer = client_buffer_allocator_->allocate(data_size);
-    std::vector<Slice> success_slices;
-    success_slices.emplace_back(Slice{success_buffer, data_size});
-    memcpy(success_buffer, large_data.data(), data_size);
-    auto success_put_result =
-        test_client_->Put(allocate_failed_key, success_slices, config);
-    ASSERT_TRUE(success_put_result.has_value())
-        << "Put operation failed: " << toString(success_put_result.error());
-    client_buffer_allocator_->deallocate(success_buffer, data_size);
-    auto success_remove_result = test_client_->Remove(allocate_failed_key);
-    ASSERT_TRUE(success_remove_result.has_value())
-        << "Remove operation failed: "
-        << toString(success_remove_result.error());
+	// After removing all keys, we should be able to allocate the failed key
+	void *success_buffer = client_buffer_allocator_->allocate(data_size);
+	std::vector<Slice> success_slices;
+	success_slices.emplace_back(Slice {success_buffer, data_size});
+	memcpy(success_buffer, large_data.data(), data_size);
+	auto success_put_result = test_client_->Put(allocate_failed_key, success_slices, config);
+	ASSERT_TRUE(success_put_result.has_value()) << "Put operation failed: " << toString(success_put_result.error());
+	client_buffer_allocator_->deallocate(success_buffer, data_size);
+	auto success_remove_result = test_client_->Remove(allocate_failed_key);
+	ASSERT_TRUE(success_remove_result.has_value())
+	    << "Remove operation failed: " << toString(success_remove_result.error());
 }
 
 // Test large allocation operations
 TEST_F(ClientIntegrationTest, LargeAllocateTest) {
-    const size_t data_size = 1 * 1024 * 1024;  // 1MB
-    const uint64_t kNumBuffers = 5;
-    const std::string key = "large_test_key";
+	const size_t data_size = 1 * 1024 * 1024; // 1MB
+	const uint64_t kNumBuffers = 5;
+	const std::string key = "large_test_key";
 
-    // Configure with 1 replicas for high availability
-    ReplicateConfig config;
-    config.replica_num = 1;
+	// Configure with 1 replicas for high availability
+	ReplicateConfig config;
+	config.replica_num = 1;
 
-    // Allocate buffers and fill with data
-    std::vector<void*> buffers(kNumBuffers);
-    for (size_t i = 0; i < kNumBuffers; ++i) {
-        buffers[i] = client_buffer_allocator_->allocate(data_size);
-        ASSERT_NE(buffers[i], nullptr);
-        std::string large_data(data_size, 'A' + i);
-        memcpy(buffers[i], large_data.data(), data_size);
-    }
+	// Allocate buffers and fill with data
+	std::vector<void *> buffers(kNumBuffers);
+	for (size_t i = 0; i < kNumBuffers; ++i) {
+		buffers[i] = client_buffer_allocator_->allocate(data_size);
+		ASSERT_NE(buffers[i], nullptr);
+		std::string large_data(data_size, 'A' + i);
+		memcpy(buffers[i], large_data.data(), data_size);
+	}
 
-    // Create slices from buffers
-    std::vector<Slice> slices;
-    for (size_t i = 0; i < kNumBuffers; ++i) {
-        slices.emplace_back(Slice{buffers[i], data_size});
-    }
+	// Create slices from buffers
+	std::vector<Slice> slices;
+	for (size_t i = 0; i < kNumBuffers; ++i) {
+		slices.emplace_back(Slice {buffers[i], data_size});
+	}
 
-    // Put operation
-    auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Put operation failed: " << toString(put_result.error());
+	// Put operation
+	auto put_result = test_client_->Put(key, slices, config);
+	ASSERT_TRUE(put_result.has_value()) << "Put operation failed: " << toString(put_result.error());
 
-    // Clear buffers before Get
-    for (size_t i = 0; i < kNumBuffers; ++i) {
-        memset(buffers[i], 0, data_size);
-    }
+	// Clear buffers before Get
+	for (size_t i = 0; i < kNumBuffers; ++i) {
+		memset(buffers[i], 0, data_size);
+	}
 
-    // Get operation
-    auto get_result = test_client_->Get(key, slices);
-    ASSERT_TRUE(get_result.has_value())
-        << "Get operation failed: " << toString(get_result.error());
+	// Get operation
+	auto get_result = test_client_->Get(key, slices);
+	ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
 
-    // Verify data and deallocate buffers
-    for (size_t i = 0; i < kNumBuffers; ++i) {
-        ASSERT_EQ(slices[i].size, data_size);
-        std::string retrieved_data(static_cast<const char*>(slices[i].ptr),
-                                   slices[i].size);
-        std::string expected_data(data_size, 'A' + i);
-        EXPECT_EQ(
-            memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
-        client_buffer_allocator_->deallocate(buffers[i], data_size);
-    }
+	// Verify data and deallocate buffers
+	for (size_t i = 0; i < kNumBuffers; ++i) {
+		ASSERT_EQ(slices[i].size, data_size);
+		std::string retrieved_data(static_cast<const char *>(slices[i].ptr), slices[i].size);
+		std::string expected_data(data_size, 'A' + i);
+		EXPECT_EQ(memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
+		client_buffer_allocator_->deallocate(buffers[i], data_size);
+	}
 
-    // Remove the key
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
-    auto remove_result = test_client_->Remove(key);
-    ASSERT_TRUE(remove_result.has_value())
-        << "Remove operation failed: " << toString(remove_result.error());
+	// Remove the key
+	std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+	auto remove_result = test_client_->Remove(key);
+	ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
 }
 
 // Test batch Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
-    int batch_sz = 100;
-    std::vector<std::string> keys;
-    std::vector<std::string> test_data_list;
-    std::vector<std::vector<Slice>> batched_slices;
-    for (int i = 0; i < batch_sz; i++) {
-        keys.push_back("test_key_batch_put_" + std::to_string(i));
-        test_data_list.push_back("test_data_" + std::to_string(i));
-    }
-    void* buffer = nullptr;
-    void* target_buffer = nullptr;
-    batched_slices.reserve(batch_sz);
-    for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> slices;
-        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
-        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
-        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
-        batched_slices.push_back(std::move(slices));
-    }
-    // Test Batch Put operation
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto start = std::chrono::high_resolution_clock::now();
-    auto batch_put_results =
-        test_client_->BatchPut(keys, batched_slices, config);
-    // Check that all operations succeeded
-    for (const auto& result : batch_put_results) {
-        ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-    LOG(INFO) << "Time taken for BatchPut: "
-              << std::chrono::duration_cast<std::chrono::microseconds>(end -
-                                                                       start)
-                     .count()
-              << "us";
+	int batch_sz = 100;
+	std::vector<std::string> keys;
+	std::vector<std::string> test_data_list;
+	std::vector<std::vector<Slice>> batched_slices;
+	for (int i = 0; i < batch_sz; i++) {
+		keys.push_back("test_key_batch_put_" + std::to_string(i));
+		test_data_list.push_back("test_data_" + std::to_string(i));
+	}
+	void *buffer = nullptr;
+	void *target_buffer = nullptr;
+	batched_slices.reserve(batch_sz);
+	for (int i = 0; i < batch_sz; i++) {
+		std::vector<Slice> slices;
+		buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+		memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+		slices.emplace_back(Slice {buffer, test_data_list[i].size()});
+		batched_slices.push_back(std::move(slices));
+	}
+	// Test Batch Put operation
+	ReplicateConfig config;
+	config.replica_num = 1;
+	auto start = std::chrono::high_resolution_clock::now();
+	auto batch_put_results = test_client_->BatchPut(keys, batched_slices, config);
+	// Check that all operations succeeded
+	for (const auto &result : batch_put_results) {
+		ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
+	}
+	auto end = std::chrono::high_resolution_clock::now();
+	LOG(INFO) << "Time taken for BatchPut: "
+	          << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << "us";
 
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> slices;
-        target_buffer =
-            client_buffer_allocator_->allocate(test_data_list[i].size());
-        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
-        auto get_result = test_client_->Get(keys[i], slices);
-        ASSERT_TRUE(get_result.has_value())
-            << "Get operation failed: " << toString(get_result.error());
-        client_buffer_allocator_->deallocate(target_buffer,
-                                             test_data_list[i].size());
-    }
-    end = std::chrono::high_resolution_clock::now();
-    LOG(INFO) << "Time taken for single Get: "
-              << std::chrono::duration_cast<std::chrono::microseconds>(end -
-                                                                       start)
-                     .count()
-              << "us";
+	start = std::chrono::high_resolution_clock::now();
+	for (int i = 0; i < batch_sz; i++) {
+		std::vector<Slice> slices;
+		target_buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+		slices.emplace_back(Slice {target_buffer, test_data_list[i].size()});
+		auto get_result = test_client_->Get(keys[i], slices);
+		ASSERT_TRUE(get_result.has_value()) << "Get operation failed: " << toString(get_result.error());
+		client_buffer_allocator_->deallocate(target_buffer, test_data_list[i].size());
+	}
+	end = std::chrono::high_resolution_clock::now();
+	LOG(INFO) << "Time taken for single Get: "
+	          << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << "us";
 
-    start = std::chrono::high_resolution_clock::now();
-    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
-    for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> target_slices;
-        target_buffer =
-            client_buffer_allocator_->allocate(test_data_list[i].size());
-        target_slices.emplace_back(
-            Slice{target_buffer, test_data_list[i].size()});
-        target_batched_slices.emplace(keys[i], target_slices);
-    }
-    auto batch_get_results =
-        test_client_->BatchGet(keys, target_batched_slices);
-    for (const auto& result : batch_get_results) {
-        ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
-    }
-    end = std::chrono::high_resolution_clock::now();
-    LOG(INFO) << "Time taken for BatchGet: "
-              << std::chrono::duration_cast<std::chrono::microseconds>(end -
-                                                                       start)
-                     .count()
-              << "us";
+	start = std::chrono::high_resolution_clock::now();
+	std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
+	for (int i = 0; i < batch_sz; i++) {
+		std::vector<Slice> target_slices;
+		target_buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+		target_slices.emplace_back(Slice {target_buffer, test_data_list[i].size()});
+		target_batched_slices.emplace(keys[i], target_slices);
+	}
+	auto batch_get_results = test_client_->BatchGet(keys, target_batched_slices);
+	for (const auto &result : batch_get_results) {
+		ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
+	}
+	end = std::chrono::high_resolution_clock::now();
+	LOG(INFO) << "Time taken for BatchGet: "
+	          << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << "us";
 
-    for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
-                  test_data_list[i].size());
-        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
-                         test_data_list[i].data(), test_data_list[i].size()),
-                  0);
-        client_buffer_allocator_->deallocate(
-            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
-    }
+	for (int i = 0; i < batch_sz; i++) {
+		ASSERT_EQ(target_batched_slices[keys[i]][0].size, test_data_list[i].size());
+		ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr, test_data_list[i].data(), test_data_list[i].size()), 0);
+		client_buffer_allocator_->deallocate(target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+	}
 }
 
 // Test batch IsExist operations through the client
 TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
-    int batch_size = 50;
-    std::vector<std::string> keys;
-    std::vector<std::string> test_data_list;
-    std::vector<std::vector<Slice>> batched_slices;
+	int batch_size = 50;
+	std::vector<std::string> keys;
+	std::vector<std::string> test_data_list;
+	std::vector<std::vector<Slice>> batched_slices;
 
-    // Create test keys and data
-    for (int i = 0; i < batch_size; i++) {
-        keys.push_back("test_key_batch_exist_" + std::to_string(i));
-        test_data_list.push_back("test_data_" + std::to_string(i));
-    }
+	// Create test keys and data
+	for (int i = 0; i < batch_size; i++) {
+		keys.push_back("test_key_batch_exist_" + std::to_string(i));
+		test_data_list.push_back("test_data_" + std::to_string(i));
+	}
 
-    // Put only the first half of the keys
-    void* buffer = nullptr;
-    batched_slices.reserve(batch_size / 2);
-    for (int i = 0; i < batch_size / 2; i++) {
-        std::vector<Slice> slices;
-        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
-        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
-        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
-        batched_slices.push_back(std::move(slices));
-    }
+	// Put only the first half of the keys
+	void *buffer = nullptr;
+	batched_slices.reserve(batch_size / 2);
+	for (int i = 0; i < batch_size / 2; i++) {
+		std::vector<Slice> slices;
+		buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+		memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+		slices.emplace_back(Slice {buffer, test_data_list[i].size()});
+		batched_slices.push_back(std::move(slices));
+	}
 
-    ReplicateConfig config;
-    config.replica_num = 1;
+	ReplicateConfig config;
+	config.replica_num = 1;
 
-    // Put the first half of keys
-    std::vector<std::string> existing_keys(keys.begin(),
-                                           keys.begin() + batch_size / 2);
-    auto batch_put_results =
-        test_client_->BatchPut(existing_keys, batched_slices, config);
-    // Check that all operations succeeded
-    for (const auto& result : batch_put_results) {
-        ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
-    }
+	// Put the first half of keys
+	std::vector<std::string> existing_keys(keys.begin(), keys.begin() + batch_size / 2);
+	auto batch_put_results = test_client_->BatchPut(existing_keys, batched_slices, config);
+	// Check that all operations succeeded
+	for (const auto &result : batch_put_results) {
+		ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
+	}
 
-    // Test BatchIsExist with mixed existing and non-existing keys
-    auto exist_results = test_client_->BatchIsExist(keys);
+	// Test BatchIsExist with mixed existing and non-existing keys
+	auto exist_results = test_client_->BatchIsExist(keys);
 
-    // Verify results
-    ASSERT_EQ(keys.size(), exist_results.size());
+	// Verify results
+	ASSERT_EQ(keys.size(), exist_results.size());
 
-    // First half should exist
-    for (int i = 0; i < batch_size / 2; i++) {
-        ASSERT_TRUE(exist_results[i].has_value())
-            << "BatchIsExist failed for key " << keys[i];
-        ASSERT_TRUE(exist_results[i].value())
-            << "Key " << keys[i] << " should exist";
-    }
+	// First half should exist
+	for (int i = 0; i < batch_size / 2; i++) {
+		ASSERT_TRUE(exist_results[i].has_value()) << "BatchIsExist failed for key " << keys[i];
+		ASSERT_TRUE(exist_results[i].value()) << "Key " << keys[i] << " should exist";
+	}
 
-    // Second half should not exist
-    for (int i = batch_size / 2; i < batch_size; i++) {
-        ASSERT_TRUE(exist_results[i].has_value())
-            << "BatchIsExist failed for key " << keys[i];
-        ASSERT_FALSE(exist_results[i].value())
-            << "Key " << keys[i] << " should not exist";
-    }
+	// Second half should not exist
+	for (int i = batch_size / 2; i < batch_size; i++) {
+		ASSERT_TRUE(exist_results[i].has_value()) << "BatchIsExist failed for key " << keys[i];
+		ASSERT_FALSE(exist_results[i].value()) << "Key " << keys[i] << " should not exist";
+	}
 
-    // Test with empty keys vector
-    std::vector<std::string> empty_keys;
-    auto empty_results = test_client_->BatchIsExist(empty_keys);
-    ASSERT_EQ(empty_results.size(), 0);
+	// Test with empty keys vector
+	std::vector<std::string> empty_keys;
+	auto empty_results = test_client_->BatchIsExist(empty_keys);
+	ASSERT_EQ(empty_results.size(), 0);
 
-    // Clean up
-    for (int i = 0; i < batch_size / 2; i++) {
-        client_buffer_allocator_->deallocate(batched_slices[i][0].ptr,
-                                             test_data_list[i].size());
-    }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
-    for (int i = 0; i < batch_size / 2; i++) {
-        auto remove_result = test_client_->Remove(keys[i]);
-        ASSERT_TRUE(remove_result.has_value())
-            << "Remove operation failed: " << toString(remove_result.error());
-    }
+	// Clean up
+	for (int i = 0; i < batch_size / 2; i++) {
+		client_buffer_allocator_->deallocate(batched_slices[i][0].ptr, test_data_list[i].size());
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+	for (int i = 0; i < batch_size / 2; i++) {
+		auto remove_result = test_client_->Remove(keys[i]);
+		ASSERT_TRUE(remove_result.has_value()) << "Remove operation failed: " << toString(remove_result.error());
+	}
 }
 
 // Test batch put with duplicate keys
 TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
-    const std::string test_data = "test_data_duplicate";
-    const std::string key = "duplicate_key";
+	const std::string test_data = "test_data_duplicate";
+	const std::string key = "duplicate_key";
 
-    // Create two identical keys
-    std::vector<std::string> keys = {key, key};
-    std::vector<std::vector<Slice>> batched_slices;
+	// Create two identical keys
+	std::vector<std::string> keys = {key, key};
+	std::vector<std::vector<Slice>> batched_slices;
 
-    // Prepare data for both keys
-    for (int i = 0; i < 2; i++) {
-        std::vector<Slice> slices;
-        void* buffer = client_buffer_allocator_->allocate(test_data.size());
-        memcpy(buffer, test_data.data(), test_data.size());
-        slices.emplace_back(Slice{buffer, test_data.size()});
-        batched_slices.push_back(std::move(slices));
-    }
+	// Prepare data for both keys
+	for (int i = 0; i < 2; i++) {
+		std::vector<Slice> slices;
+		void *buffer = client_buffer_allocator_->allocate(test_data.size());
+		memcpy(buffer, test_data.data(), test_data.size());
+		slices.emplace_back(Slice {buffer, test_data.size()});
+		batched_slices.push_back(std::move(slices));
+	}
 
-    ReplicateConfig config;
-    config.replica_num = 1;
+	ReplicateConfig config;
+	config.replica_num = 1;
 
-    // Test batch put with duplicate keys
-    auto batch_put_results =
-        test_client_->BatchPut(keys, batched_slices, config);
+	// Test batch put with duplicate keys
+	auto batch_put_results = test_client_->BatchPut(keys, batched_slices, config);
 
-    // Check that we got results for both operations
-    ASSERT_EQ(batch_put_results.size(), 2);
+	// Check that we got results for both operations
+	ASSERT_EQ(batch_put_results.size(), 2);
 
-    // Both of them should success
-    // Because we currently consider `OBJECT_ALREADY_EXISTS` as success
+	// Both of them should success
+	// Because we currently consider `OBJECT_ALREADY_EXISTS` as success
 
-    for (const auto& result : batch_put_results) {
-        ASSERT_TRUE(result.has_value())
-            << "BatchPut operation failed: " << toString(result.error());
-    }
+	for (const auto &result : batch_put_results) {
+		ASSERT_TRUE(result.has_value()) << "BatchPut operation failed: " << toString(result.error());
+	}
 
-    // Clean up allocated memory
-    for (const auto& slices : batched_slices) {
-        for (const auto& slice : slices) {
-            client_buffer_allocator_->deallocate(slice.ptr, slice.size);
-        }
-    }
+	// Clean up allocated memory
+	for (const auto &slices : batched_slices) {
+		for (const auto &slice : slices) {
+			client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+		}
+	}
 
-    // Clean up the key that was successfully put
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
-    auto remove_result = test_client_->Remove(key);
-    // Remove might fail if the key wasn't actually put, which is fine
-    ASSERT_TRUE(remove_result);
+	// Clean up the key that was successfully put
+	std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+	auto remove_result = test_client_->Remove(key);
+	// Remove might fail if the key wasn't actually put, which is fine
+	ASSERT_TRUE(remove_result);
 }
 
-}  // namespace testing
+} // namespace testing
 
-}  // namespace mooncake
+} // namespace mooncake
 
-int main(int argc, char** argv) {
-    // Initialize Google Test
-    ::testing::InitGoogleTest(&argc, argv);
+int main(int argc, char **argv) {
+	// Initialize Google Test
+	::testing::InitGoogleTest(&argc, argv);
 
-    // Initialize Google's flags library
-    gflags::ParseCommandLineFlags(&argc, &argv, false);
+	// Initialize Google's flags library
+	gflags::ParseCommandLineFlags(&argc, &argv, false);
 
-    // Run all tests
-    return RUN_ALL_TESTS();
+	// Run all tests
+	return RUN_ALL_TESTS();
 }

@@ -22,176 +22,160 @@
 
 using namespace mooncake;
 
-transfer_engine_t createTransferEngine(const char *metadata_conn_string,
-                                       const char *local_server_name,
-                                       const char *ip_or_host_name,
-                                       uint64_t rpc_port,
-                                       int auto_discover) {
-    TransferEngine *native = new TransferEngine(auto_discover);
-    int ret = native->init(metadata_conn_string, local_server_name,
-                           ip_or_host_name, rpc_port);
-    if (ret) {
-        delete native;
-        return nullptr;
-    }
-    return (transfer_engine_t)native;
+transfer_engine_t createTransferEngine(const char *metadata_conn_string, const char *local_server_name,
+                                       const char *ip_or_host_name, uint64_t rpc_port, int auto_discover) {
+	TransferEngine *native = new TransferEngine(auto_discover);
+	int ret = native->init(metadata_conn_string, local_server_name, ip_or_host_name, rpc_port);
+	if (ret) {
+		delete native;
+		return nullptr;
+	}
+	return (transfer_engine_t)native;
 }
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
-    TransferEngine *native = (TransferEngine *)engine;
-    auto str = native->getLocalIpAndPort();
-    strncpy(buf_out, str.c_str(), buf_len);
-    return 0;
+	TransferEngine *native = (TransferEngine *)engine;
+	auto str = native->getLocalIpAndPort();
+	strncpy(buf_out, str.c_str(), buf_len);
+	return 0;
 }
 
-transport_t installTransport(transfer_engine_t engine, const char *proto,
-                             void **args) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return (transport_t)native->installTransport(proto, args);
+transport_t installTransport(transfer_engine_t engine, const char *proto, void **args) {
+	TransferEngine *native = (TransferEngine *)engine;
+	return (transport_t)native->installTransport(proto, args);
 }
 
 int uninstallTransport(transfer_engine_t engine, const char *proto) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->uninstallTransport(proto);
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->uninstallTransport(proto);
 }
 
 void destroyTransferEngine(transfer_engine_t engine) {
-    TransferEngine *native = (TransferEngine *)engine;
-    delete native;
+	TransferEngine *native = (TransferEngine *)engine;
+	delete native;
 }
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->openSegment(segment_name);
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->openSegment(segment_name);
 }
 
 segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_name) {
-    TransferEngine *native = (TransferEngine *)engine;
-    int rc = native->syncSegmentCache(segment_name);
-    if (rc) return rc;
-    return native->openSegment(segment_name);
+	TransferEngine *native = (TransferEngine *)engine;
+	int rc = native->syncSegmentCache(segment_name);
+	if (rc)
+		return rc;
+	return native->openSegment(segment_name);
 }
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->closeSegment(segment_id);
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->closeSegment(segment_id);
 }
 
 int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->removeLocalSegment(segment_name);
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->removeLocalSegment(segment_name);
 }
 
-int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
-                        const char *location, int remote_accessible) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->registerLocalMemory(addr, length, location,
-                                       remote_accessible, true);
+int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length, const char *location,
+                        int remote_accessible) {
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->registerLocalMemory(addr, length, location, remote_accessible, true);
 }
 
 int unregisterLocalMemory(transfer_engine_t engine, void *addr) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->unregisterLocalMemory(addr);
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->unregisterLocalMemory(addr);
 }
 
-int registerLocalMemoryBatch(transfer_engine_t engine,
-                             buffer_entry_t *buffer_list, size_t buffer_len,
+int registerLocalMemoryBatch(transfer_engine_t engine, buffer_entry_t *buffer_list, size_t buffer_len,
                              const char *location) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<BufferEntry> native_buffer_list;
-    for (size_t i = 0; i < buffer_len; ++i) {
-        BufferEntry entry;
-        entry.addr = buffer_list[i].addr;
-        entry.length = buffer_list[i].length;
-        native_buffer_list.push_back(entry);
-    }
-    return native->registerLocalMemoryBatch(native_buffer_list, location);
+	TransferEngine *native = (TransferEngine *)engine;
+	std::vector<BufferEntry> native_buffer_list;
+	for (size_t i = 0; i < buffer_len; ++i) {
+		BufferEntry entry;
+		entry.addr = buffer_list[i].addr;
+		entry.length = buffer_list[i].length;
+		native_buffer_list.push_back(entry);
+	}
+	return native->registerLocalMemoryBatch(native_buffer_list, location);
 }
 
-int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
-                               size_t addr_len) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<void *> native_addr_list;
-    for (size_t i = 0; i < addr_len; ++i)
-        native_addr_list.push_back(addr_list[i]);
-    return native->unregisterLocalMemoryBatch(native_addr_list);
+int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list, size_t addr_len) {
+	TransferEngine *native = (TransferEngine *)engine;
+	std::vector<void *> native_addr_list;
+	for (size_t i = 0; i < addr_len; ++i)
+		native_addr_list.push_back(addr_list[i]);
+	return native->unregisterLocalMemoryBatch(native_addr_list);
 }
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return (batch_id_t)native->allocateBatchID(batch_size);
+	TransferEngine *native = (TransferEngine *)engine;
+	return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
-int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries,
-                   size_t count) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<Transport::TransferRequest> native_entries;
-    native_entries.resize(count);
-    for (size_t index = 0; index < count; index++) {
-        native_entries[index].opcode =
-            (Transport::TransferRequest::OpCode)entries[index].opcode;
-        native_entries[index].source = entries[index].source;
-        native_entries[index].target_id = entries[index].target_id;
-        native_entries[index].target_offset = entries[index].target_offset;
-        native_entries[index].length = entries[index].length;
-    }
-    Status s =
-        native->submitTransfer((Transport::BatchID)batch_id, native_entries);
-    return (int)s.code();
+int submitTransfer(transfer_engine_t engine, batch_id_t batch_id, struct transfer_request *entries, size_t count) {
+	TransferEngine *native = (TransferEngine *)engine;
+	std::vector<Transport::TransferRequest> native_entries;
+	native_entries.resize(count);
+	for (size_t index = 0; index < count; index++) {
+		native_entries[index].opcode = (Transport::TransferRequest::OpCode)entries[index].opcode;
+		native_entries[index].source = entries[index].source;
+		native_entries[index].target_id = entries[index].target_id;
+		native_entries[index].target_offset = entries[index].target_offset;
+		native_entries[index].length = entries[index].length;
+	}
+	Status s = native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+	return (int)s.code();
 }
 
-int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
-                             struct transfer_request *entries, size_t count,
-                             notify_msg_t notify_msg) {
-    uint64_t target_id = entries[0].target_id;
-    int rc = submitTransfer(engine, batch_id, entries, count);
-    if (rc) {
-        return rc;
-    }
-    // notify
-    TransferEngine *native = (TransferEngine *)engine;
-    TransferMetadata::NotifyDesc notify;
-    notify.name = notify_msg.name;
-    notify.notify_msg = notify_msg.msg;
-    return native->sendNotify((SegmentID)target_id, notify);
+int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id, struct transfer_request *entries,
+                             size_t count, notify_msg_t notify_msg) {
+	uint64_t target_id = entries[0].target_id;
+	int rc = submitTransfer(engine, batch_id, entries, count);
+	if (rc) {
+		return rc;
+	}
+	// notify
+	TransferEngine *native = (TransferEngine *)engine;
+	TransferMetadata::NotifyDesc notify;
+	notify.name = notify_msg.name;
+	notify.notify_msg = notify_msg.msg;
+	return native->sendNotify((SegmentID)target_id, notify);
 }
 
-int getTransferStatus(transfer_engine_t engine,
-                      batch_id_t batch_id, size_t task_id,
-                      struct transfer_status *status) {
-    TransferEngine *native = (TransferEngine *)engine;
-    Transport::TransferStatus native_status;
-    Status s = native->getTransferStatus((Transport::BatchID)batch_id,
-                                                    task_id, native_status);
-    if (s.ok()) {
-        status->status = (int)native_status.s;
-        status->transferred_bytes = native_status.transferred_bytes;
-    }
-    return (int)s.code();
+int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id, size_t task_id, struct transfer_status *status) {
+	TransferEngine *native = (TransferEngine *)engine;
+	Transport::TransferStatus native_status;
+	Status s = native->getTransferStatus((Transport::BatchID)batch_id, task_id, native_status);
+	if (s.ok()) {
+		status->status = (int)native_status.s;
+		status->transferred_bytes = native_status.transferred_bytes;
+	}
+	return (int)s.code();
 }
 
-notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
-              int *size) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<TransferMetadata::NotifyDesc> notifies_desc;
-    native->getNotifies(notifies_desc);
-    *size = notifies_desc.size();
-    notify_msg_t* notifies = (notify_msg_t*)malloc(*size * sizeof(notify_msg_t));
-    for (int i = 0 ;i < *size;i++) {
-        notifies[i].name = const_cast<char*>(notifies_desc[i].name.c_str());
-        notifies[i].msg = const_cast<char*>(notifies_desc[i].notify_msg.c_str());
-    }
-    return notifies;
+notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
+	TransferEngine *native = (TransferEngine *)engine;
+	std::vector<TransferMetadata::NotifyDesc> notifies_desc;
+	native->getNotifies(notifies_desc);
+	*size = notifies_desc.size();
+	notify_msg_t *notifies = (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
+	for (int i = 0; i < *size; i++) {
+		notifies[i].name = const_cast<char *>(notifies_desc[i].name.c_str());
+		notifies[i].msg = const_cast<char *>(notifies_desc[i].notify_msg.c_str());
+	}
+	return notifies;
 }
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
-    TransferEngine *native = (TransferEngine *)engine;
-    Status s = native->freeBatchID(batch_id);
-    return (int)s.code();
+	TransferEngine *native = (TransferEngine *)engine;
+	Status s = native->freeBatchID(batch_id);
+	return (int)s.code();
 }
 
 int syncSegmentCache(transfer_engine_t engine) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return native->syncSegmentCache();
+	TransferEngine *native = (TransferEngine *)engine;
+	return native->syncSegmentCache();
 }

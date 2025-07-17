@@ -15,81 +15,65 @@ namespace mooncake {
 extern const uint64_t kMetricReportIntervalSeconds;
 
 class WrappedMasterService {
-   public:
-    WrappedMasterService(
-        bool enable_gc, uint64_t default_kv_lease_ttl,
-        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-        bool allow_evict_soft_pinned_objects =
-            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-        bool enable_metric_reporting = true, uint16_t http_port = 9003,
-        double eviction_ratio = DEFAULT_EVICTION_RATIO,
-        double eviction_high_watermark_ratio =
-            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        ViewVersionId view_version = 0,
-        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+public:
+	WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
+	                     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
+	                     bool allow_evict_soft_pinned_objects = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
+	                     bool enable_metric_reporting = true, uint16_t http_port = 9003,
+	                     double eviction_ratio = DEFAULT_EVICTION_RATIO,
+	                     double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+	                     ViewVersionId view_version = 0, int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+	                     bool enable_ha = false, const std::string &cluster_id = DEFAULT_CLUSTER_ID);
 
-    ~WrappedMasterService();
+	~WrappedMasterService();
 
-    void init_http_server();
+	void init_http_server();
 
-    tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
+	tl::expected<bool, ErrorCode> ExistKey(const std::string &key);
 
-    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys);
+	std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(const std::vector<std::string> &keys);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
-        const std::string& key);
+	tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(const std::string &key);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
+	std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+	BatchGetReplicaList(const std::vector<std::string> &keys);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
-        const std::string& key, const std::vector<uint64_t>& slice_lengths,
-        const ReplicateConfig& config);
+	tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+	PutStart(const std::string &key, const std::vector<uint64_t> &slice_lengths, const ReplicateConfig &config);
 
-    tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+	tl::expected<void, ErrorCode> PutEnd(const std::string &key);
 
-    tl::expected<void, ErrorCode> PutRevoke(const std::string& key);
+	tl::expected<void, ErrorCode> PutRevoke(const std::string &key);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const std::vector<std::string>& keys,
-                  const std::vector<std::vector<uint64_t>>& slice_lengths,
-                  const ReplicateConfig& config);
+	std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+	BatchPutStart(const std::vector<std::string> &keys, const std::vector<std::vector<uint64_t>> &slice_lengths,
+	              const ReplicateConfig &config);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+	std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(const std::vector<std::string> &keys);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+	std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(const std::vector<std::string> &keys);
 
-    tl::expected<void, ErrorCode> Remove(const std::string& key);
+	tl::expected<void, ErrorCode> Remove(const std::string &key);
 
-    long RemoveAll();
+	long RemoveAll();
 
-    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
-                                               const UUID& client_id);
+	tl::expected<void, ErrorCode> MountSegment(const Segment &segment, const UUID &client_id);
 
-    tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id);
+	tl::expected<void, ErrorCode> ReMountSegment(const std::vector<Segment> &segments, const UUID &client_id);
 
-    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
-                                                 const UUID& client_id);
+	tl::expected<void, ErrorCode> UnmountSegment(const UUID &segment_id, const UUID &client_id);
 
-    tl::expected<std::string, ErrorCode> GetFsdir();
+	tl::expected<std::string, ErrorCode> GetFsdir();
 
-    tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(
-        const UUID& client_id);
+	tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(const UUID &client_id);
 
-   private:
-    MasterService master_service_;
-    std::thread metric_report_thread_;
-    coro_http::coro_http_server http_server_;
-    std::atomic<bool> metric_report_running_;
+private:
+	MasterService master_service_;
+	std::thread metric_report_thread_;
+	coro_http::coro_http_server http_server_;
+	std::atomic<bool> metric_report_running_;
 };
 
-void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+void RegisterRpcService(coro_rpc::coro_rpc_server &server, mooncake::WrappedMasterService &wrapped_master_service);
 
-}  // namespace mooncake
+} // namespace mooncake

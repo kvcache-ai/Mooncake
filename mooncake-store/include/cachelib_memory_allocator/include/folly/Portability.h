@@ -57,12 +57,12 @@ constexpr bool kHasUnalignedAccess = false;
 /* nolint */
 #define _USE_ATTRIBUTES_FOR_SAL 1
 #include <sal.h> // @manual
-#define FOLLY_PRINTF_FORMAT _Printf_format_string_
+#define FOLLY_PRINTF_FORMAT                                _Printf_format_string_
 #define FOLLY_PRINTF_FORMAT_ATTR(format_param, dots_param) /**/
 #else
 #define FOLLY_PRINTF_FORMAT /**/
-#define FOLLY_PRINTF_FORMAT_ATTR(format_param, dots_param) \
-  __attribute__((__format__(__printf__, format_param, dots_param)))
+#define FOLLY_PRINTF_FORMAT_ATTR(format_param, dots_param)                                                             \
+	__attribute__((__format__(__printf__, format_param, dots_param)))
 #endif
 
 // warn unused result
@@ -170,15 +170,15 @@ constexpr bool kIsSanitize = false;
 #ifdef _MSC_VER
 #define FOLLY_PACK_ATTR /**/
 #define FOLLY_PACK_PUSH __pragma(pack(push, 1))
-#define FOLLY_PACK_POP __pragma(pack(pop))
+#define FOLLY_PACK_POP  __pragma(pack(pop))
 #elif defined(__GNUC__)
 #define FOLLY_PACK_ATTR __attribute__((__packed__))
 #define FOLLY_PACK_PUSH /**/
-#define FOLLY_PACK_POP /**/
+#define FOLLY_PACK_POP  /**/
 #else
 #define FOLLY_PACK_ATTR /**/
 #define FOLLY_PACK_PUSH /**/
-#define FOLLY_PACK_POP /**/
+#define FOLLY_PACK_POP  /**/
 #endif
 
 // It turns out that GNU libstdc++ and LLVM libc++ differ on how they implement
@@ -186,18 +186,17 @@ constexpr bool kIsSanitize = false;
 // up in a macro to make forward-declarations easier.
 #if defined(_LIBCPP_VERSION)
 #define FOLLY_NAMESPACE_STD_BEGIN _LIBCPP_BEGIN_NAMESPACE_STD
-#define FOLLY_NAMESPACE_STD_END _LIBCPP_END_NAMESPACE_STD
+#define FOLLY_NAMESPACE_STD_END   _LIBCPP_END_NAMESPACE_STD
 #else
 #define FOLLY_NAMESPACE_STD_BEGIN namespace std {
-#define FOLLY_NAMESPACE_STD_END }
+#define FOLLY_NAMESPACE_STD_END   }
 #endif
 
 // If the new c++ ABI is used, __cxx11 inline namespace needs to be added to
 // some types, e.g. std::list.
 #if defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI
-#define FOLLY_GLIBCXX_NAMESPACE_CXX11_BEGIN \
-  inline _GLIBCXX_BEGIN_NAMESPACE_CXX11
-#define FOLLY_GLIBCXX_NAMESPACE_CXX11_END _GLIBCXX_END_NAMESPACE_CXX11
+#define FOLLY_GLIBCXX_NAMESPACE_CXX11_BEGIN inline _GLIBCXX_BEGIN_NAMESPACE_CXX11
+#define FOLLY_GLIBCXX_NAMESPACE_CXX11_END   _GLIBCXX_END_NAMESPACE_CXX11
 #else
 #define FOLLY_GLIBCXX_NAMESPACE_CXX11_BEGIN
 #define FOLLY_GLIBCXX_NAMESPACE_CXX11_END
@@ -229,8 +228,7 @@ constexpr bool kIsSanitize = false;
 #endif
 
 // Define FOLLY_HAS_EXCEPTIONS
-#if (defined(__cpp_exceptions) && __cpp_exceptions >= 199711) || \
-    FOLLY_HAS_FEATURE(cxx_exceptions)
+#if (defined(__cpp_exceptions) && __cpp_exceptions >= 199711) || FOLLY_HAS_FEATURE(cxx_exceptions)
 #define FOLLY_HAS_EXCEPTIONS 1
 #elif __GNUC__
 #if defined(__EXCEPTIONS) && __EXCEPTIONS
@@ -292,25 +290,25 @@ constexpr auto kHasWeakSymbols = false;
 
 #ifndef FOLLY_SSE
 #if defined(__SSE4_2__)
-#define FOLLY_SSE 4
+#define FOLLY_SSE       4
 #define FOLLY_SSE_MINOR 2
 #elif defined(__SSE4_1__)
-#define FOLLY_SSE 4
+#define FOLLY_SSE       4
 #define FOLLY_SSE_MINOR 1
 #elif defined(__SSE4__)
-#define FOLLY_SSE 4
+#define FOLLY_SSE       4
 #define FOLLY_SSE_MINOR 0
 #elif defined(__SSE3__)
-#define FOLLY_SSE 3
+#define FOLLY_SSE       3
 #define FOLLY_SSE_MINOR 0
 #elif defined(__SSE2__)
-#define FOLLY_SSE 2
+#define FOLLY_SSE       2
 #define FOLLY_SSE_MINOR 0
 #elif defined(__SSE__)
-#define FOLLY_SSE 1
+#define FOLLY_SSE       1
 #define FOLLY_SSE_MINOR 0
 #else
-#define FOLLY_SSE 0
+#define FOLLY_SSE       0
 #define FOLLY_SSE_MINOR 0
 #endif
 #endif
@@ -323,8 +321,7 @@ constexpr auto kHasWeakSymbols = false;
 #endif
 #endif
 
-#define FOLLY_SSE_PREREQ(major, minor) \
-  (FOLLY_SSE > major || FOLLY_SSE == major && FOLLY_SSE_MINOR >= minor)
+#define FOLLY_SSE_PREREQ(major, minor) (FOLLY_SSE > major || FOLLY_SSE == major && FOLLY_SSE_MINOR >= minor)
 
 #ifndef FOLLY_NEON
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
@@ -343,8 +340,7 @@ constexpr auto kHasWeakSymbols = false;
 #endif
 
 // RTTI may not be enabled for this compilation unit.
-#if defined(__GXX_RTTI) || defined(__cpp_rtti) || \
-    (defined(_MSC_VER) && defined(_CPPRTTI))
+#if defined(__GXX_RTTI) || defined(__cpp_rtti) || (defined(_MSC_VER) && defined(_CPPRTTI))
 #define FOLLY_HAS_RTTI 1
 #else
 #define FOLLY_HAS_RTTI 0
@@ -556,11 +552,10 @@ constexpr auto kCpplibVer = 0;
 // NOTE: MSVC 2017 does not currently support the full Coroutines TS since it
 // does not yet support symmetric-transfer.
 #define FOLLY_HAS_COROUTINES 0
-#elif (                                                                    \
-    (defined(__cpp_coroutines) && __cpp_coroutines >= 201703L) ||          \
-    (defined(__cpp_impl_coroutine) && __cpp_impl_coroutine >= 201902L)) && \
+#elif ((defined(__cpp_coroutines) && __cpp_coroutines >= 201703L) ||                                                   \
+       (defined(__cpp_impl_coroutine) && __cpp_impl_coroutine >= 201902L)) &&                                          \
     (__has_include(<coroutine>) || __has_include(<experimental/coroutine>))
-#define FOLLY_HAS_COROUTINES 1
+#define FOLLY_HAS_COROUTINES                           1
 // This is mainly to workaround bugs triggered by LTO, when stack allocated
 // variables in await_suspend end up on a coroutine frame.
 #define FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES FOLLY_NOINLINE
@@ -573,14 +568,13 @@ constexpr auto kCpplibVer = 0;
 #endif // FOLLY_CFG_NO_COROUTINES
 
 // MSVC 2017.5 && C++17
-#if __cpp_noexcept_function_type >= 201510 || \
-    (_MSC_FULL_VER >= 191225816 && _MSVC_LANG > 201402)
+#if __cpp_noexcept_function_type >= 201510 || (_MSC_FULL_VER >= 191225816 && _MSVC_LANG > 201402)
 #define FOLLY_HAVE_NOEXCEPT_FUNCTION_TYPE 1
 #endif
 
 #if __cpp_inline_variables >= 201606L || FOLLY_CPLUSPLUS >= 201703L
 #define FOLLY_HAS_INLINE_VARIABLES 1
-#define FOLLY_INLINE_VARIABLE inline
+#define FOLLY_INLINE_VARIABLE      inline
 #else
 #define FOLLY_HAS_INLINE_VARIABLES 0
 #define FOLLY_INLINE_VARIABLE

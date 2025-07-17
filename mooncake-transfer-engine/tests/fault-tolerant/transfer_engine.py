@@ -57,14 +57,10 @@ class MooncakeTransferEngine:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
-    def transfer_sync(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
-    ) -> int:
+    def transfer_sync(self, session_id: str, buffer: int, peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
 
-        ret = self.engine.transfer_sync_write(
-            session_id, buffer, peer_buffer_address, length
-        )
+        ret = self.engine.transfer_sync_write(session_id, buffer, peer_buffer_address, length)
         if ret < 0:
             logger.error("Mooncake Transfer Engine Return Error.")
             raise RuntimeError("Mooncake Transfer Engine Return Error.")

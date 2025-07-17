@@ -48,177 +48,166 @@ using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
-   public:
-    TransferEngine(bool auto_discover = false)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover) {
+public:
+	TransferEngine(bool auto_discover = false)
+	    : metadata_(nullptr), local_topology_(std::make_shared<Topology>()), auto_discover_(auto_discover) {
 #ifdef WITH_METRICS
-        InitializeMetricsConfig();
-        StartMetricsReportingThread();
+		InitializeMetricsConfig();
+		StartMetricsReportingThread();
 #endif
-    }
+	}
 
-    TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover),
-          filter_(filter) {
+	TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
+	    : metadata_(nullptr), local_topology_(std::make_shared<Topology>()), auto_discover_(auto_discover),
+	      filter_(filter) {
 #ifdef WITH_METRICS
-        InitializeMetricsConfig();
-        StartMetricsReportingThread();
+		InitializeMetricsConfig();
+		StartMetricsReportingThread();
 #endif
-    }
+	}
 
-    ~TransferEngine() {
+	~TransferEngine() {
 #ifdef WITH_METRICS
-        StopMetricsReportingThread();
+		StopMetricsReportingThread();
 #endif
-        freeEngine();
-    }
+		freeEngine();
+	}
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name,
-             const std::string &ip_or_host_name = "",
-             uint64_t rpc_port = 12345);
+	int init(const std::string &metadata_conn_string, const std::string &local_server_name,
+	         const std::string &ip_or_host_name = "", uint64_t rpc_port = 12345);
 
-    int freeEngine();
+	int freeEngine();
 
-    // Only for testing.
-    Transport *installTransport(const std::string &proto, void **args);
+	// Only for testing.
+	Transport *installTransport(const std::string &proto, void **args);
 
-    int uninstallTransport(const std::string &proto);
+	int uninstallTransport(const std::string &proto);
 
-    std::string getLocalIpAndPort();
+	std::string getLocalIpAndPort();
 
-    int getRpcPort();
+	int getRpcPort();
 
-    SegmentHandle openSegment(const std::string &segment_name);
+	SegmentHandle openSegment(const std::string &segment_name);
 
-    int closeSegment(SegmentHandle handle);
+	int closeSegment(SegmentHandle handle);
 
-    int removeLocalSegment(const std::string &segment_name);
+	int removeLocalSegment(const std::string &segment_name);
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location = kWildcardLocation,
-                            bool remote_accessible = true,
-                            bool update_metadata = true);
+	int registerLocalMemory(void *addr, size_t length, const std::string &location = kWildcardLocation,
+	                        bool remote_accessible = true, bool update_metadata = true);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true);
+	int unregisterLocalMemory(void *addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location);
+	int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list, const std::string &location);
 
-    int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+	int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
 
-    BatchID allocateBatchID(size_t batch_size) {
-        return multi_transports_->allocateBatchID(batch_size);
-    }
+	BatchID allocateBatchID(size_t batch_size) {
+		return multi_transports_->allocateBatchID(batch_size);
+	}
 
-    Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
-    }
+	Status freeBatchID(BatchID batch_id) {
+		return multi_transports_->freeBatchID(batch_id);
+	}
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) {
-        return multi_transports_->submitTransfer(batch_id, entries);
-    }
+	Status submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries) {
+		return multi_transports_->submitTransfer(batch_id, entries);
+	}
 
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest> &entries,
-                                    TransferMetadata::NotifyDesc notify_msg) {
-        auto target_id = entries[0].target_id;
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-        if (!s.ok()) {
-            return s;
-        }
-        // notify
-        sendNotify(target_id, notify_msg);
-        return s;
-    }
+	Status submitTransferWithNotify(BatchID batch_id, const std::vector<TransferRequest> &entries,
+	                                TransferMetadata::NotifyDesc notify_msg) {
+		auto target_id = entries[0].target_id;
+		Status s = multi_transports_->submitTransfer(batch_id, entries);
+		if (!s.ok()) {
+			return s;
+		}
+		// notify
+		sendNotify(target_id, notify_msg);
+		return s;
+	}
 
-    int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
+	int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
 
-    int sendNotify(SegmentID target_id,
-                   TransferMetadata::NotifyDesc notify_msg);
+	int sendNotify(SegmentID target_id, TransferMetadata::NotifyDesc notify_msg);
 
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) {
-        Status result =
-            multi_transports_->getTransferStatus(batch_id, task_id, status);
+	Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status) {
+		Status result = multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
-            }
-        }
+		if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+			if (status.transferred_bytes > 0) {
+				transferred_bytes_counter_.inc(status.transferred_bytes);
+			}
+		}
 #endif
-        return result;
-    }
+		return result;
+	}
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
-        Status result = multi_transports_->getBatchTransferStatus(batch_id, status);
+	Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+		Status result = multi_transports_->getBatchTransferStatus(batch_id, status);
 #ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
-            }
-        }
+		if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+			if (status.transferred_bytes > 0) {
+				transferred_bytes_counter_.inc(status.transferred_bytes);
+			}
+		}
 #endif
-        return result;
-    }
+		return result;
+	}
 
-    int syncSegmentCache(const std::string &segment_name = "") {
-        return metadata_->syncSegmentCache(segment_name);
-    }
+	int syncSegmentCache(const std::string &segment_name = "") {
+		return metadata_->syncSegmentCache(segment_name);
+	}
 
-    std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
+	std::shared_ptr<TransferMetadata> getMetadata() {
+		return metadata_;
+	}
 
-    bool checkOverlap(void *addr, uint64_t length);
+	bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
+	void setAutoDiscover(bool auto_discover) {
+		auto_discover_ = auto_discover;
+	}
 
-    void setWhitelistFilters(std::vector<std::string> &&filters) {
-        filter_ = std::move(filters);
-    }
+	void setWhitelistFilters(std::vector<std::string> &&filters) {
+		filter_ = std::move(filters);
+	}
 
-    int numContexts() const {
-        return (int)local_topology_->getHcaList().size();
-    }
+	int numContexts() const {
+		return (int)local_topology_->getHcaList().size();
+	}
 
-   private:
-    struct MemoryRegion {
-        void *addr;
-        uint64_t length;
-        std::string location;
-        bool remote_accessible;
-    };
+private:
+	struct MemoryRegion {
+		void *addr;
+		uint64_t length;
+		std::string location;
+		bool remote_accessible;
+	};
 
-    std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::shared_ptr<MultiTransport> multi_transports_;
-    std::shared_mutex mutex_;
-    std::vector<MemoryRegion> local_memory_regions_;
-    std::shared_ptr<Topology> local_topology_;
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
-    bool auto_discover_;
-    std::vector<std::string> filter_;
+	std::shared_ptr<TransferMetadata> metadata_;
+	std::string local_server_name_;
+	std::shared_ptr<MultiTransport> multi_transports_;
+	std::shared_mutex mutex_;
+	std::vector<MemoryRegion> local_memory_regions_;
+	std::shared_ptr<Topology> local_topology_;
+	// Discover topology and install transports automatically when it's true.
+	// Set it to false only for testing.
+	bool auto_discover_;
+	std::vector<std::string> filter_;
 
 #ifdef WITH_METRICS
-    ylt::metric::counter_t transferred_bytes_counter_{
-        "transferred bytes", "Measure transferred bytes"};
-    std::thread metrics_reporting_thread_;
-    std::atomic<bool> should_stop_metrics_thread_{false};
-    bool metrics_enabled_{false};
-    uint64_t metrics_interval_seconds_{5};
+	ylt::metric::counter_t transferred_bytes_counter_ {"transferred bytes", "Measure transferred bytes"};
+	std::thread metrics_reporting_thread_;
+	std::atomic<bool> should_stop_metrics_thread_ {false};
+	bool metrics_enabled_ {false};
+	uint64_t metrics_interval_seconds_ {5};
 
-    // Helper methods for metrics reporting thread management
-    void InitializeMetricsConfig();
-    void StartMetricsReportingThread();
-    void StopMetricsReportingThread();
+	// Helper methods for metrics reporting thread management
+	void InitializeMetricsConfig();
+	void StartMetricsReportingThread();
+	void StopMetricsReportingThread();
 #endif
 };
-}  // namespace mooncake
+} // namespace mooncake
 
 #endif

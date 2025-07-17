@@ -24,8 +24,7 @@
 #if FOLLY_HAS_BUILTIN(__builtin_unpredictable)
 #define FOLLY_BUILTIN_UNPREDICTABLE(exp) __builtin_unpredictable(exp)
 #else
-#define folly_builtin_unpredictable(exp) \
-  ::folly::builtin::detail::predict_<long long>(exp)
+#define folly_builtin_unpredictable(exp) ::folly::builtin::detail::predict_<long long>(exp)
 #endif
 
 //  FOLLY_BUILTIN_EXPECT
@@ -34,19 +33,16 @@
 #if FOLLY_HAS_BUILTIN(__builtin_expect)
 #define FOLLY_BUILTIN_EXPECT(exp, c) __builtin_expect(static_cast<bool>(exp), c)
 #else
-#define FOLLY_BUILTIN_EXPECT(exp, c) \
-  ::folly::builtin::detail::predict_<long>(exp, c)
+#define FOLLY_BUILTIN_EXPECT(exp, c) ::folly::builtin::detail::predict_<long>(exp, c)
 #endif
 
 //  FOLLY_BUILTIN_EXPECT_WITH_PROBABILITY
 //
 //  mimic: __builtin_expect_with_probability, gcc/clang
 #if FOLLY_HAS_BUILTIN(__builtin_expect_with_probability)
-#define FOLLY_BUILTIN_EXPECT_WITH_PROBABILITY(exp, c, p) \
-  __builtin_expect_with_probability(exp, c, p)
+#define FOLLY_BUILTIN_EXPECT_WITH_PROBABILITY(exp, c, p) __builtin_expect_with_probability(exp, c, p)
 #else
-#define FOLLY_BUILTIN_EXPECT_WITH_PROBABILITY(exp, c, p) \
-  ::folly::builtin::detail::predict_<long>(exp, c, p)
+#define FOLLY_BUILTIN_EXPECT_WITH_PROBABILITY(exp, c, p) ::folly::builtin::detail::predict_<long>(exp, c, p)
 #endif
 
 namespace folly {
@@ -56,16 +52,14 @@ namespace detail {
 
 template <typename V>
 struct predict_constinit_ {
-  FOLLY_ERASE FOLLY_CONSTEVAL /* implicit */ predict_constinit_(
-      V /* anonymous */) noexcept {}
+	FOLLY_ERASE FOLLY_CONSTEVAL /* implicit */ predict_constinit_(V /* anonymous */) noexcept {
+	}
 };
 
 template <typename E>
-FOLLY_ERASE constexpr E predict_(
-    E exp,
-    predict_constinit_<long> /* anonymous */ = 0,
-    predict_constinit_<double> /* anonymous */ = 0.) {
-  return exp;
+FOLLY_ERASE constexpr E predict_(E exp, predict_constinit_<long> /* anonymous */ = 0,
+                                 predict_constinit_<double> /* anonymous */ = 0.) {
+	return exp;
 }
 
 } // namespace detail

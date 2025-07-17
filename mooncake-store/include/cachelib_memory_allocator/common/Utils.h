@@ -22,10 +22,9 @@ namespace util {
 
 // @return size aligned up to the next multiple of _alignment_
 template <typename T>
-std::enable_if_t<std::is_arithmetic<T>::value, T> getAlignedSize(
-    T size, uint32_t alignment) {
-  const T rem = size % alignment;
-  return rem == 0 ? size : size + alignment - rem;
+std::enable_if_t<std::is_arithmetic<T>::value, T> getAlignedSize(T size, uint32_t alignment) {
+	const T rem = size % alignment;
+	return rem == 0 ? size : size + alignment - rem;
 }
 
 } // namespace util

@@ -39,81 +39,71 @@ class TransferMetadata;
 class WorkerPool;
 
 class RdmaTransport : public Transport {
-    friend class RdmaContext;
-    friend class RdmaEndPoint;
-    friend class WorkerPool;
+	friend class RdmaContext;
+	friend class RdmaEndPoint;
+	friend class WorkerPool;
 
-   public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
+public:
+	using BufferDesc = TransferMetadata::BufferDesc;
+	using SegmentDesc = TransferMetadata::SegmentDesc;
+	using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
-   public:
-    RdmaTransport();
+public:
+	RdmaTransport();
 
-    ~RdmaTransport();
+	~RdmaTransport();
 
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo) override;
+	int install(std::string &local_server_name, std::shared_ptr<TransferMetadata> meta,
+	            std::shared_ptr<Topology> topo) override;
 
-    const char *getName() const override { return "rdma"; }
+	const char *getName() const override {
+		return "rdma";
+	}
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata) override;
+	int registerLocalMemory(void *addr, size_t length, const std::string &location, bool remote_accessible,
+	                        bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
+	int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location) override;
+	int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list, const std::string &location) override;
 
-    int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override;
+	int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list) override;
 
-    // TRANSFER
+	// TRANSFER
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) override;
+	Status submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries) override;
 
-    Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
-        const std::vector<TransferTask *> &task_list) override;
+	Status submitTransferTask(const std::vector<TransferRequest *> &request_list,
+	                          const std::vector<TransferTask *> &task_list) override;
 
-    Status getTransferStatus(BatchID batch_id,
-                             std::vector<TransferStatus> &status);
+	Status getTransferStatus(BatchID batch_id, std::vector<TransferStatus> &status);
 
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
+	Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status) override;
 
-    SegmentID getSegmentID(const std::string &segment_name);
+	SegmentID getSegmentID(const std::string &segment_name);
 
-   private:
-    int allocateLocalSegmentID();
+private:
+	int allocateLocalSegmentID();
 
-   public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+public:
+	int onSetupRdmaConnections(const HandShakeDesc &peer_desc, HandShakeDesc &local_desc);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
-        return metadata_->sendHandshake(peer_server_name, local_desc,
-                                        peer_desc);
-    }
+	int sendHandshake(const std::string &peer_server_name, const HandShakeDesc &local_desc, HandShakeDesc &peer_desc) {
+		return metadata_->sendHandshake(peer_server_name, local_desc, peer_desc);
+	}
 
-   private:
-    int initializeRdmaResources();
+private:
+	int initializeRdmaResources();
 
-    int startHandshakeDaemon(std::string &local_server_name);
+	int startHandshakeDaemon(std::string &local_server_name);
 
-   public:
-    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            int &buffer_id, int &device_id, int retry_cnt = 0);
+public:
+	static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length, int &buffer_id, int &device_id,
+	                        int retry_cnt = 0);
 
-   private:
-    std::vector<std::shared_ptr<RdmaContext>> context_list_;
-    std::shared_ptr<Topology> local_topology_;
+private:
+	std::vector<std::shared_ptr<RdmaContext>> context_list_;
+	std::shared_ptr<Topology> local_topology_;
 };
 
 using TransferRequest = Transport::TransferRequest;
@@ -122,6 +112,6 @@ using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 
-}  // namespace mooncake
+} // namespace mooncake
 
-#endif  // RDMA_TRANSPORT_H_
+#endif // RDMA_TRANSPORT_H_

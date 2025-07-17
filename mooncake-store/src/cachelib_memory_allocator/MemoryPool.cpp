@@ -39,8 +39,7 @@ MemoryPool::MemoryPool(PoolId id,
 
 void MemoryPool::checkState() const {
   if (id_ < 0) {
-    throw std::invalid_argument(
-        fmt::format("Invalid MemoryPool id {}", id_));
+    throw std::invalid_argument(fmt::format("Invalid MemoryPool id {}", id_));
   }
 
   const size_t currAlloc = currAllocSize_;
@@ -48,8 +47,8 @@ void MemoryPool::checkState() const {
   if (currAlloc > currSlabAlloc) {
     throw std::invalid_argument(
         fmt::format("Alloc size {} is more than total slab alloc size {}",
-                       currAlloc,
-                       currSlabAlloc));
+                    currAlloc,
+                    currSlabAlloc));
   }
 
   if (acSizes_.empty() || ac_.empty()) {
@@ -86,7 +85,8 @@ void MemoryPool::checkState() const {
 
   for (const auto slab : freeSlabs_) {
     if (!slabAllocator_.isValidSlab(slab)) {
-      throw std::invalid_argument(fmt::format("Invalid free slab {}", (void*) slab));
+      throw std::invalid_argument(
+          fmt::format("Invalid free slab {}", (void*)slab));
     }
   }
 }
