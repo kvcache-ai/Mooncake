@@ -224,7 +224,10 @@ Allocation __Allocator::allocate(uint32 size) {
     uint32 nodeIndex = m_binIndices[binIndex];
     Node& node = m_nodes[nodeIndex];
     uint32 nodeTotalSize = node.dataSize;
-    node.dataSize = size;
+    // Round up to bin size. Otherwise when this node is freed, if it cannot be
+    // merged with neighbors, it will be inserted to a smaller bin.
+    uint32 roundupSize = SmallFloat::floatToUint(minBinIndex);
+    node.dataSize = roundupSize;
     node.used = true;
     m_binIndices[binIndex] = node.binListNext;
     if (node.binListNext != Node::unused)
@@ -247,10 +250,10 @@ Allocation __Allocator::allocate(uint32 size) {
     }
 
     // Push back reminder N elements to a lower bin
-    uint32 reminderSize = nodeTotalSize - size;
+    uint32 reminderSize = nodeTotalSize - roundupSize;
     if (reminderSize > 0) {
         uint32 newNodeIndex =
-            insertNodeIntoBin(reminderSize, node.dataOffset + size);
+            insertNodeIntoBin(reminderSize, node.dataOffset + roundupSize);
 
         // Link nodes next to each other so that we can merge them later if both
         // are free And update the old next neighbor to point to the new node
@@ -518,6 +521,10 @@ Allocator::Allocator(uint64_t base, uint32 size, uint32 maxAllocs)
       m_base(base) {}
 
 std::optional<AllocationHandle> Allocator::allocate(uint32 size) {
+    if (size == 0) {
+        return std::nullopt;
+    }
+
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
         return std::nullopt;
