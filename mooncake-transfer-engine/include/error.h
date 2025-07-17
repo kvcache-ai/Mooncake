@@ -15,25 +15,25 @@
 #ifndef ERROR_H
 #define ERROR_H
 
-#define ERR_INVALID_ARGUMENT (-1)
-#define ERR_TOO_MANY_REQUESTS (-2)
+#define ERR_INVALID_ARGUMENT       (-1)
+#define ERR_TOO_MANY_REQUESTS      (-2)
 #define ERR_ADDRESS_NOT_REGISTERED (-3)
-#define ERR_BATCH_BUSY (-4)
-#define ERR_DEVICE_NOT_FOUND (-6)
-#define ERR_ADDRESS_OVERLAPPED (-7)
+#define ERR_BATCH_BUSY             (-4)
+#define ERR_DEVICE_NOT_FOUND       (-6)
+#define ERR_ADDRESS_OVERLAPPED     (-7)
 
-#define ERR_DNS (-101)
-#define ERR_SOCKET (-102)
-#define ERR_MALFORMED_JSON (-103)
+#define ERR_DNS              (-101)
+#define ERR_SOCKET           (-102)
+#define ERR_MALFORMED_JSON   (-103)
 #define ERR_REJECT_HANDSHAKE (-104)
 
 #define ERR_METADATA (-200)
 #define ERR_ENDPOINT (-201)
-#define ERR_CONTEXT (-202)
+#define ERR_CONTEXT  (-202)
 
-#define ERR_NUMA (-300)
-#define ERR_CLOCK (-301)
-#define ERR_MEMORY (-302)
+#define ERR_NUMA            (-300)
+#define ERR_CLOCK           (-301)
+#define ERR_MEMORY          (-302)
 #define ERR_NOT_IMPLEMENTED (-303)
 
-#endif  // ERROR_H
+#endif // ERROR_H

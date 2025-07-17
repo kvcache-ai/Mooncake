@@ -45,68 +45,32 @@
 extern "C" {
 #endif // __cplusplus
 struct RankInfo {
-    uint64_t rankId = 0xFFFFFFFF;
-    uint64_t serverIdx; 
-    struct in_addr hostIp;
-    uint64_t hostPort;
-    uint64_t deviceLogicId;
-    uint64_t devicePhyId;
-    DevType deviceType{DevType::DEV_TYPE_NOSOC};
-    struct in_addr deviceIp;
-    uint64_t devicePort;
-    uint64_t pid;
+	uint64_t rankId = 0xFFFFFFFF;
+	uint64_t serverIdx;
+	struct in_addr hostIp;
+	uint64_t hostPort;
+	uint64_t deviceLogicId;
+	uint64_t devicePhyId;
+	DevType deviceType {DevType::DEV_TYPE_NOSOC};
+	struct in_addr deviceIp;
+	uint64_t devicePort;
+	uint64_t pid;
 };
 
 struct RankControlInfo {
-    uint64_t deviceLogicId;
-    uint64_t devicePhyId;
-    struct in_addr hostIp;
-    struct in_addr deviceIp;
-    uint64_t pid;
+	uint64_t deviceLogicId;
+	uint64_t devicePhyId;
+	struct in_addr hostIp;
+	struct in_addr deviceIp;
+	uint64_t pid;
 };
-
-
-
-
-
-
 
 extern int initTransportMem(RankInfo *local_rank_info);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-extern int transportMemTask(RankInfo *local_rank_info, 
-                            RankInfo *remote_rank_info, int op_code, uint64_t offset,
+extern int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info, int op_code, uint64_t offset,
                             uint64_t req_len, void *local_mem, aclrtStream stream);
 
-
-
-
-
-
-
-
 extern int transportMemAccept(RankInfo *local_rank_info);
-
-
-
-
-
-
-
-
 
 extern int regLocalRmaMem(void *addr, uint64_t length);
 
@@ -115,4 +79,3 @@ extern int regLocalRmaMem(void *addr, uint64_t length);
 #endif // __cplusplus
 
 #endif // HCCL_TRANSPORT_MEM_C_H
-

@@ -16,10 +16,10 @@ def main():
     # Get the path to the transfer_engine_bench binary
     package_dir = os.path.dirname(os.path.abspath(__file__))
     bin_path = os.path.join(package_dir, "transfer_engine_bench")
-    
+
     # Make sure the binary is executable
     os.chmod(bin_path, 0o755)
-    
+
     # Run the binary with all arguments passed through
     return subprocess.call([bin_path] + sys.argv[1:])
 

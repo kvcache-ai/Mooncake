@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import unittest
 
+
 class TestImportStructure(unittest.TestCase):
 
     def test_new_import_structure(self):
@@ -30,6 +31,7 @@ class TestImportStructure(unittest.TestCase):
         # Verify direct imports work
         self.assertIsNotNone(TransferEngine)
         self.assertIsNotNone(TransferOpcode)
+
 
 if __name__ == '__main__':
     unittest.main()

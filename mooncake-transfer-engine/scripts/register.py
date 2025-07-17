@@ -40,15 +40,14 @@ if __name__ == "__main__":
     value['protocol'] = "nvmeof"
     value['buffers'] = []
     for file in files:
-      # TODO: check file path existence
-      buffer = {}
-      buffer['length'] = os.path.getsize(file)
-      buffer['file_path'] = file
-      local_path_map = {}
-      local_path_map[server_name] = file
-      buffer['local_path_map'] = local_path_map
-      value['buffers'].append(buffer)
-    
+        # TODO: check file path existence
+        buffer = {}
+        buffer['length'] = os.path.getsize(file)
+        buffer['file_path'] = file
+        local_path_map = {}
+        local_path_map[server_name] = file
+        buffer['local_path_map'] = local_path_map
+        value['buffers'].append(buffer)
+
     print(json.dumps(value))
     etcd.put(segment_name, json.dumps(value))
-

@@ -59,13 +59,13 @@ SlabAllocator::SlabAllocator(void* headerMemoryStart,
 
   if (slabMemorySize_ % sizeof(Slab)) {
     throw std::invalid_argument(
-        fmt::format("Invalid slabMemorySize_ {}, sizeof(Slab) {}", slabMemorySize_, sizeof(Slab)));
+        fmt::format("Invalid slabMemorySize_ {}, sizeof(Slab) {}",
+                    slabMemorySize_,
+                    sizeof(Slab)));
   }
 }
 
-SlabAllocator::~SlabAllocator() {
-  stopMemoryLocker();
-}
+SlabAllocator::~SlabAllocator() { stopMemoryLocker(); }
 
 void SlabAllocator::stopMemoryLocker() {
   if (memoryLocker_.joinable()) {
@@ -131,7 +131,7 @@ void SlabAllocator::freeSlab(Slab* slab) {
   auto* header = getSlabHeader(slab);
   XDCHECK(header != nullptr);
   if (header == nullptr) {
-    throw std::runtime_error(fmt::format("Invalid Slab {}", (void*) slab));
+    throw std::runtime_error(fmt::format("Invalid Slab {}", (void*)slab));
   }
 
   memoryPoolSize_[header->poolId] -= sizeof(Slab);

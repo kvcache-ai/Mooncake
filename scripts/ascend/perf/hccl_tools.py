@@ -34,25 +34,34 @@ def parse_args():
     Examples:
         >>> parse_args()
     """
-    parser = ArgumentParser(description="mindspore distributed training launch "
-                                        "helper utility that will generate hccl"
-                                        " config file")
-    parser.add_argument("--device_num", type=str, default="[0,16)",
-                        help="The number of the Ascend accelerators used. please note that the Ascend accelerators"
-                             "used must be continuous, such [0,4) means using four chips "
-                             "0，1，2，3; [0,1) means using chip 0; In the most Ascend system, "
-                             "the first four chips belong to one group, and the last four chips belong to another one."
-                             "Only full chips are allowed to cross-group such as [0,8), other cross-group such as [3,6)"
-                             "are prohibited.")
-    parser.add_argument("--visible_devices", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
-                        help="The visible devices according to the software system. "
-                             "Usually used in the virtual system or docker container "
-                             "that makes the device_id dismatch logic_id. --device_num uses logic_id. "
-                             "For example \"4,5,6,7\" means the system has 4 logic chips "
-                             "which are actually the last 4 chips in hardware "
-                             "while `--device_num` could only be set to \"[0, 8)\" instead of \"[8, 16)\"")
-    parser.add_argument("--server_ip", type=str, default="",
-                        help="Set the server_ip manually, to avoid errors in auto detection.")
+    parser = ArgumentParser(
+        description="mindspore distributed training launch " "helper utility that will generate hccl" " config file"
+    )
+    parser.add_argument(
+        "--device_num",
+        type=str,
+        default="[0,16)",
+        help="The number of the Ascend accelerators used. please note that the Ascend accelerators"
+        "used must be continuous, such [0,4) means using four chips "
+        "0，1，2，3; [0,1) means using chip 0; In the most Ascend system, "
+        "the first four chips belong to one group, and the last four chips belong to another one."
+        "Only full chips are allowed to cross-group such as [0,8), other cross-group such as [3,6)"
+        "are prohibited.",
+    )
+    parser.add_argument(
+        "--visible_devices",
+        type=str,
+        default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+        help="The visible devices according to the software system. "
+        "Usually used in the virtual system or docker container "
+        "that makes the device_id dismatch logic_id. --device_num uses logic_id. "
+        "For example \"4,5,6,7\" means the system has 4 logic chips "
+        "which are actually the last 4 chips in hardware "
+        "while `--device_num` could only be set to \"[0, 8)\" instead of \"[8, 16)\"",
+    )
+    parser.add_argument(
+        "--server_ip", type=str, default="", help="Set the server_ip manually, to avoid errors in auto detection."
+    )
     args = parser.parse_args()
     return args
 
@@ -96,8 +105,9 @@ def main():
     if first_num < 0 or last_num > 16:
         raise ValueError("device num {} must be in range [0,8] !".format(args.device_num))
     if first_num > last_num:
-        raise ValueError("First num {} of device num {} must less than last num {} !".format(first_num, args.device_num,
-                                                                                             last_num))
+        raise ValueError(
+            "First num {} of device num {} must less than last num {} !".format(first_num, args.device_num, last_num)
+        )
     if first_num < 8 < last_num:
         if first_num == 0 and last_num == 16:
             pass
@@ -128,31 +138,22 @@ def main():
             print("Failed to read /etc/hccn.conf")
             raise SystemError("Failed to find information for hccl")
 
-    hccn_table = {'version': '1.0',
-                  'server_count': '1',
-                  'server_list': []}
+    hccn_table = {'version': '1.0', 'server_count': '1', 'server_list': []}
     device_list = []
     rank_id = 0
     for instance_id in device_num_list:
         device_id = visible_devices[instance_id]
         device_ip = device_ips[device_id]
-        device = {'device_id': device_id,
-                  'device_ip': device_ip,
-                  'rank_id': str(rank_id)}
+        device = {'device_id': device_id, 'device_ip': device_ip, 'rank_id': str(rank_id)}
         print('rank_id:{}, device_id:{}, device_ip:{}'.format(rank_id, device_id, device_ip))
         rank_id += 1
         device_list.append(device)
-    hccn_table['server_list'].append({
-        'server_id': server_id,
-        'device': device_list,
-        'host_nic_ip': 'reserve'
-    })
+    hccn_table['server_list'].append({'server_id': server_id, 'device': device_list, 'host_nic_ip': 'reserve'})
     hccn_table['status'] = 'completed'
 
     # save hccn_table to file
     table_path = "/etc"
-    table_fn = os.path.join(table_path,
-                            'hccl_16p.json')
+    table_fn = os.path.join(table_path, 'hccl_16p.json')
     with open(table_fn, 'w') as table_fp:
         json.dump(hccn_table, table_fp, indent=4)
     sys.stdout.flush()

@@ -5,6 +5,7 @@ import unittest
 
 from mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE
 
+
 class TestMooncakeConfig(unittest.TestCase):
     def setUp(self):
         # Create temporary directory
@@ -19,7 +20,7 @@ class TestMooncakeConfig(unittest.TestCase):
             "global_segment_size": 3355443200,
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
-            "device_name": "eth0"
+            "device_name": "eth0",
         }
 
     def tearDown(self):
@@ -48,7 +49,7 @@ class TestMooncakeConfig(unittest.TestCase):
         minimal_config = {
             "local_hostname": "localhost",
             "metadata_server": "localhost:8080",
-            "master_server_address": "localhost:8081"
+            "master_server_address": "localhost:8081",
         }
         self.write_config(minimal_config)
         config = MooncakeConfig.from_file(self.config_file)
@@ -89,6 +90,7 @@ class TestMooncakeConfig(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
         self.assertIn("The environment variable 'MOONCAKE_CONFIG_PATH' is not set", str(cm.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

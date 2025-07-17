@@ -30,89 +30,77 @@
 
 namespace mooncake {
 
-struct NVMeoFBatchDesc
-{
-    int desc_idx_;
-    std::vector<TransferStatus> transfer_status;
-    std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
+struct NVMeoFBatchDesc {
+	int desc_idx_;
+	std::vector<TransferStatus> transfer_status;
+	std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
 };
 
 class NVMeoFTransport : public Transport {
-   public:
-    NVMeoFTransport();
+public:
+	NVMeoFTransport();
 
-    ~NVMeoFTransport();
+	~NVMeoFTransport();
 
-    BatchID allocateBatchID(size_t batch_size) override;
+	BatchID allocateBatchID(size_t batch_size) override;
 
-    Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
-        const std::vector<TransferTask *> &task_list) override;
+	Status submitTransferTask(const std::vector<TransferRequest *> &request_list,
+	                          const std::vector<TransferTask *> &task_list) override;
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) override;
+	Status submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries) override;
 
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
+	Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status) override;
 
-    Status freeBatchID(BatchID batch_id) override;
+	Status freeBatchID(BatchID batch_id) override;
 
-    void addSliceToTask(void *source_addr, uint64_t slice_len,
-                        uint64_t target_start,
-                        TransferRequest::OpCode op,
-                        TransferTask &task,
-                        const char *file_path);
-   
-   private:
-    void startTransfer(Slice *slice);
+	void addSliceToTask(void *source_addr, uint64_t slice_len, uint64_t target_start, TransferRequest::OpCode op,
+	                    TransferTask &task, const char *file_path);
 
-   private:
-    struct pair_hash {
-        template <class T1, class T2>
-        std::size_t operator()(const std::pair<T1, T2> &pair) const {
-            auto hash1 = std::hash<T1>{}(pair.first);
-            auto hash2 = std::hash<T2>{}(pair.second);
-            return hash1 ^ hash2;
-        }
-    };
+private:
+	void startTransfer(Slice *slice);
 
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo) override;
+private:
+	struct pair_hash {
+		template <class T1, class T2>
+		std::size_t operator()(const std::pair<T1, T2> &pair) const {
+			auto hash1 = std::hash<T1> {}(pair.first);
+			auto hash2 = std::hash<T2> {}(pair.second);
+			return hash1 ^ hash2;
+		}
+	};
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata) override;
+	int install(std::string &local_server_name, std::shared_ptr<TransferMetadata> meta,
+	            std::shared_ptr<Topology> topo) override;
 
-    int unregisterLocalMemory(void *addr,
-                              bool update_metadata = false) override;
+	int registerLocalMemory(void *addr, size_t length, const std::string &location, bool remote_accessible,
+	                        bool update_metadata) override;
 
-    int registerLocalMemoryBatch(
-        const std::vector<Transport::BufferEntry> &buffer_list,
-        const std::string &location) override {
-        return 0;
-    }
+	int unregisterLocalMemory(void *addr, bool update_metadata = false) override;
 
-    int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override {
-        return 0;
-    }
+	int registerLocalMemoryBatch(const std::vector<Transport::BufferEntry> &buffer_list,
+	                             const std::string &location) override {
+		return 0;
+	}
 
-    void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
-                               uint64_t slice_len, uint64_t desc_id,
-                               TransferRequest::OpCode op, CUfileHandle_t fh);
+	int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list) override {
+		return 0;
+	}
 
-    const char *getName() const override { return "nvmeof"; }
+	void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset, uint64_t slice_len, uint64_t desc_id,
+	                           TransferRequest::OpCode op, CUfileHandle_t fh);
 
-    std::unordered_map<BatchID, int> batch_to_cufile_desc_;
-    std::unordered_map<std::pair<SegmentHandle, uint64_t>,
-                       std::shared_ptr<CuFileContext>, pair_hash>
-        segment_to_context_;
-    std::vector<std::thread> workers_;
+	const char *getName() const override {
+		return "nvmeof";
+	}
 
-    std::shared_ptr<CUFileDescPool> desc_pool_;
-    RWSpinlock context_lock_;
+	std::unordered_map<BatchID, int> batch_to_cufile_desc_;
+	std::unordered_map<std::pair<SegmentHandle, uint64_t>, std::shared_ptr<CuFileContext>, pair_hash>
+	    segment_to_context_;
+	std::vector<std::thread> workers_;
+
+	std::shared_ptr<CUFileDescPool> desc_pool_;
+	RWSpinlock context_lock_;
 };
-}  // namespace mooncake
+} // namespace mooncake
 
 #endif

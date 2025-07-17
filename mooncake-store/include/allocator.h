@@ -37,55 +37,63 @@ namespace mooncake {
  * ```
  */
 class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
-   public:
-    BufferAllocator(std::string segment_name, size_t base, size_t size);
+public:
+	BufferAllocator(std::string segment_name, size_t base, size_t size);
 
-    ~BufferAllocator();
+	~BufferAllocator();
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size);
+	std::unique_ptr<AllocatedBuffer> allocate(size_t size);
 
-    void deallocate(AllocatedBuffer* handle);
+	void deallocate(AllocatedBuffer *handle);
 
-    size_t capacity() const { return total_size_; }
-    size_t size() const { return cur_size_.load(); }
-    std::string getSegmentName() const { return segment_name_; }
+	size_t capacity() const {
+		return total_size_;
+	}
+	size_t size() const {
+		return cur_size_.load();
+	}
+	std::string getSegmentName() const {
+		return segment_name_;
+	}
 
-   private:
-    // metadata
-    const std::string segment_name_;
-    const size_t base_;
-    const size_t total_size_;
-    std::atomic_size_t cur_size_;
+private:
+	// metadata
+	const std::string segment_name_;
+	const size_t base_;
+	const size_t total_size_;
+	std::atomic_size_t cur_size_;
 
-    // metrics - removed allocated_bytes_ member
-    // ylt::metric::gauge_t* allocated_bytes_{nullptr};
-    // cachelib
-    std::unique_ptr<char[]> header_region_start_;
-    size_t header_region_size_;
-    std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
-    facebook::cachelib::PoolId pool_id_;
+	// metrics - removed allocated_bytes_ member
+	// ylt::metric::gauge_t* allocated_bytes_{nullptr};
+	// cachelib
+	std::unique_ptr<char[]> header_region_start_;
+	size_t header_region_size_;
+	std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
+	facebook::cachelib::PoolId pool_id_;
 };
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address
 class SimpleAllocator {
-   public:
-    SimpleAllocator(size_t size);
-    ~SimpleAllocator();
-    void* allocate(size_t size);
-    void deallocate(void* ptr, size_t size);
-    void* getBase() const { return base_; }
+public:
+	SimpleAllocator(size_t size);
+	~SimpleAllocator();
+	void *allocate(size_t size);
+	void deallocate(void *ptr, size_t size);
+	void *getBase() const {
+		return base_;
+	}
 
-   private:
-    void* base_{nullptr};
+private:
+	void *base_ {nullptr};
 
-    std::unique_ptr<char[]> header_region_start_;
-    size_t header_region_size_;
+	std::unique_ptr<char[]> header_region_start_;
+	size_t header_region_size_;
 
-    std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
-    facebook::cachelib::PoolId pool_id_;
+	std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
+	facebook::cachelib::PoolId pool_id_;
 };
 
-}  // namespace mooncake
+} // namespace mooncake
 
-#endif  // BUFFER_ALLOCATOR_H
+#endif // BUFFER_ALLOCATOR_H

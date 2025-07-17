@@ -36,25 +36,22 @@ concept TlExpected = is_tl_expected<std::decay_t<T>>::value;
  * @param inc_fail_metric A function to increment the failure counter metric.
  * @return The result of the RPC call, a tl::expected object.
  */
-template <typename RpcCallable, typename LogRequestCallable,
-          typename IncReqMetric, typename IncFailMetric>
-auto execute_rpc(std::string_view rpc_name, RpcCallable&& rpc_call,
-                 LogRequestCallable&& log_request,
-                 IncReqMetric&& inc_req_metric, IncFailMetric&& inc_fail_metric)
-    requires TlExpected<std::invoke_result_t<RpcCallable>>
-{
-    ScopedVLogTimer timer(1, rpc_name.data());
-    log_request(timer);
+template <typename RpcCallable, typename LogRequestCallable, typename IncReqMetric, typename IncFailMetric>
+auto execute_rpc(std::string_view rpc_name, RpcCallable &&rpc_call, LogRequestCallable &&log_request,
+                 IncReqMetric &&inc_req_metric,
+                 IncFailMetric &&inc_fail_metric) requires TlExpected<std::invoke_result_t<RpcCallable>> {
+	ScopedVLogTimer timer(1, rpc_name.data());
+	log_request(timer);
 
-    inc_req_metric();
+	inc_req_metric();
 
-    auto result = rpc_call();
-    if (!result.has_value()) {
-        inc_fail_metric();
-    }
-    timer.LogResponseExpected(result);
+	auto result = rpc_call();
+	if (!result.has_value()) {
+		inc_fail_metric();
+	}
+	timer.LogResponseExpected(result);
 
-    return result;
+	return result;
 }
 
-}  // namespace mooncake
+} // namespace mooncake

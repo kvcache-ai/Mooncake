@@ -26,16 +26,15 @@ const int pagesize = 4096;
 
 namespace mooncake {
 struct MemoryLocationEntry {
-    uint64_t start;
-    size_t len;
-    std::string location;
+	uint64_t start;
+	size_t len;
+	std::string location;
 };
 
-const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
-                                                         size_t len);
+const std::vector<MemoryLocationEntry> getMemoryLocation(void *start, size_t len);
 
 const static std::string kWildcardLocation = "*";
 
-}  // namespace mooncake
+} // namespace mooncake
 
-#endif  // MEMORY_LOCATION_H
+#endif // MEMORY_LOCATION_H

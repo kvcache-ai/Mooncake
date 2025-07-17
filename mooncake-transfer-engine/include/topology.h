@@ -17,9 +17,9 @@
 
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>  // Ubuntu
+#include <jsoncpp/json/json.h> // Ubuntu
 #else
-#include <json/json.h>  // CentOS
+#include <json/json.h> // CentOS
 #endif
 #include <netdb.h>
 
@@ -35,75 +35,77 @@
 
 namespace mooncake {
 struct TopologyEntry {
-    std::string name;
-    std::vector<std::string> preferred_hca;
-    std::vector<std::string> avail_hca;
+	std::string name;
+	std::vector<std::string> preferred_hca;
+	std::vector<std::string> avail_hca;
 
-    Json::Value toJson() const {
-        Json::Value matrix(Json::arrayValue);
-        Json::Value hca_list(Json::arrayValue);
-        for (auto &hca : preferred_hca) {
-            hca_list.append(hca);
-        }
-        matrix.append(hca_list);
-        hca_list.clear();
-        for (auto &hca : avail_hca) {
-            hca_list.append(hca);
-        }
-        matrix.append(hca_list);
-        return matrix;
-    }
+	Json::Value toJson() const {
+		Json::Value matrix(Json::arrayValue);
+		Json::Value hca_list(Json::arrayValue);
+		for (auto &hca : preferred_hca) {
+			hca_list.append(hca);
+		}
+		matrix.append(hca_list);
+		hca_list.clear();
+		for (auto &hca : avail_hca) {
+			hca_list.append(hca);
+		}
+		matrix.append(hca_list);
+		return matrix;
+	}
 };
 
-using TopologyMatrix =
-    std::unordered_map<std::string /* storage type */, TopologyEntry>;
+using TopologyMatrix = std::unordered_map<std::string /* storage type */, TopologyEntry>;
 
 class Topology {
-   public:
-    Topology();
+public:
+	Topology();
 
-    ~Topology();
+	~Topology();
 
-    bool empty() const;
+	bool empty() const;
 
-    void clear();
+	void clear();
 
-    int discover() {
-        std::vector<std::string> filter;
-        return discover(filter);
-    }
+	int discover() {
+		std::vector<std::string> filter;
+		return discover(filter);
+	}
 
-    int discover(const std::vector<std::string> &filter);
+	int discover(const std::vector<std::string> &filter);
 
-    int parse(const std::string &topology_json);
+	int parse(const std::string &topology_json);
 
-    int disableDevice(const std::string &device_name);
+	int disableDevice(const std::string &device_name);
 
-    std::string toString() const;
+	std::string toString() const;
 
-    Json::Value toJson() const;
+	Json::Value toJson() const;
 
-    int selectDevice(const std::string storage_type, int retry_count = 0);
+	int selectDevice(const std::string storage_type, int retry_count = 0);
 
-    TopologyMatrix getMatrix() const { return matrix_; }
+	TopologyMatrix getMatrix() const {
+		return matrix_;
+	}
 
-    const std::vector<std::string> &getHcaList() const { return hca_list_; }
+	const std::vector<std::string> &getHcaList() const {
+		return hca_list_;
+	}
 
-   private:
-    int resolve();
+private:
+	int resolve();
 
-   private:
-    TopologyMatrix matrix_;
-    std::vector<std::string> hca_list_;
+private:
+	TopologyMatrix matrix_;
+	std::vector<std::string> hca_list_;
 
-    struct ResolvedTopologyEntry {
-        std::vector<int> preferred_hca;
-        std::vector<int> avail_hca;
-    };
-    std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
-        resolved_matrix_;
+	struct ResolvedTopologyEntry {
+		std::vector<int> preferred_hca;
+		std::vector<int> avail_hca;
+	};
+	std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry> resolved_matrix_;
 };
 
-}  // namespace mooncake
+} // namespace mooncake
 
-#endif  // TOPOLOGY_H
+#endif // TOPOLOGY_H

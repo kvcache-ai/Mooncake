@@ -13,21 +13,22 @@ class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
         self.version = version
         self.shape = shape
-    
+
     def serialize_into(self, buffer):
         struct.pack_into("i", buffer, 0, self.version)
         struct.pack_into("3i", buffer, 4, *self.shape)
-        
+
     def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
         shape_bytes = struct.pack("3i", *self.shape)
         return (version_bytes, shape_bytes)
-        
+
     def deserialize_from(buffer):
         version = struct.unpack_from("i", buffer, 0)[0]
         shape = struct.unpack_from("3i", buffer, 4)
         return TestClass(version, shape)
-         
+
+
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -35,19 +36,19 @@ def get_client(store):
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
+        local_hostname,
+        metadata_server,
         global_segment_size,
-        local_buffer_size, 
-        protocol, 
+        local_buffer_size,
+        protocol,
         device_name,
-        master_server_address
+        master_server_address,
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -75,7 +76,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor, retrieved))
 
         # Int tensor
-        tensor_int = torch.tensor([1,2,3,4], dtype=torch.int32)
+        tensor_int = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
@@ -112,6 +113,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_int)
         self.store.remove(key_bool)
         self.store.remove(key_rand)
-             
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -24,8 +24,7 @@ MemoryPoolManager::MemoryPoolManager(SlabAllocator& slabAlloc)
     : slabAlloc_(slabAlloc) {}
 
 size_t MemoryPoolManager::getRemainingSizeLocked() const noexcept {
-  const size_t totalSize =
-      slabAlloc_.getNumUsableSlabs() * Slab::kSize;
+  const size_t totalSize = slabAlloc_.getNumUsableSlabs() * Slab::kSize;
   // check if there is enough space left.
   size_t sum = 0;
   for (PoolId id = 0; id < nextPoolId_; id++) {

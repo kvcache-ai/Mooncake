@@ -21,48 +21,44 @@
 
 namespace mooncake {
 class MultiTransport {
-   public:
-    using BatchID = Transport::BatchID;
-    using TransferRequest = Transport::TransferRequest;
-    using TransferStatus = Transport::TransferStatus;
-    using BatchDesc = Transport::BatchDesc;
+public:
+	using BatchID = Transport::BatchID;
+	using TransferRequest = Transport::TransferRequest;
+	using TransferStatus = Transport::TransferStatus;
+	using BatchDesc = Transport::BatchDesc;
 
-    const static BatchID INVALID_BATCH_ID = Transport::INVALID_BATCH_ID;
+	const static BatchID INVALID_BATCH_ID = Transport::INVALID_BATCH_ID;
 
-    MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                   std::string &local_server_name);
+	MultiTransport(std::shared_ptr<TransferMetadata> metadata, std::string &local_server_name);
 
-    ~MultiTransport();
+	~MultiTransport();
 
-    BatchID allocateBatchID(size_t batch_size);
+	BatchID allocateBatchID(size_t batch_size);
 
-    Status freeBatchID(BatchID batch_id);
+	Status freeBatchID(BatchID batch_id);
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries);
+	Status submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries);
 
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status);
+	Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+	Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
-    Transport *installTransport(const std::string &proto,
-                                std::shared_ptr<Topology> topo);
+	Transport *installTransport(const std::string &proto, std::shared_ptr<Topology> topo);
 
-    Transport *getTransport(const std::string &proto);
+	Transport *getTransport(const std::string &proto);
 
-    std::vector<Transport *> listTransports();
+	std::vector<Transport *> listTransports();
 
-   private:
-    Status selectTransport(const TransferRequest &entry, Transport *&transport);
+private:
+	Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
-   private:
-    std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::map<std::string, std::shared_ptr<Transport>> transport_map_;
-    RWSpinlock batch_desc_lock_;
-    std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+private:
+	std::shared_ptr<TransferMetadata> metadata_;
+	std::string local_server_name_;
+	std::map<std::string, std::shared_ptr<Transport>> transport_map_;
+	RWSpinlock batch_desc_lock_;
+	std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 };
-}  // namespace mooncake
+} // namespace mooncake
 
-#endif  // MULTI_TRANSPORT_H_
+#endif // MULTI_TRANSPORT_H_

@@ -35,127 +35,108 @@ using namespace mooncake;
 const static size_t kDefaultBufferCapacity = 2ull * 1024 * 1024 * 1024;
 const static size_t kSlabSizeKBTabLen = 16;
 const static size_t kMaxClassId = kSlabSizeKBTabLen - 1;
-const static size_t kSlabSizeKB[] = {
-    8,         16,        32,         64,        128,      256,
-    512,       1024,      2 * 1024,   4 * 1024,  8 * 1024, 16 * 1024,
-    32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024};
+const static size_t kSlabSizeKB[] = {8,         16,        32,         64,        128,      256,
+                                     512,       1024,      2 * 1024,   4 * 1024,  8 * 1024, 16 * 1024,
+                                     32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024};
 
 class TransferEnginePy {
-   public:
-    enum class TransferOpcode { READ = 0, WRITE = 1 };
+public:
+	enum class TransferOpcode { READ = 0, WRITE = 1 };
 
-   public:
-    using BatchDesc = Transport::BatchDesc;
+public:
+	using BatchDesc = Transport::BatchDesc;
 
-   public:
-    TransferEnginePy();
+public:
+	TransferEnginePy();
 
-    ~TransferEnginePy();
+	~TransferEnginePy();
 
-    int initialize(const char *local_hostname, const char *metadata_server,
-                   const char *protocol, const char *device_name);
+	int initialize(const char *local_hostname, const char *metadata_server, const char *protocol,
+	               const char *device_name);
 
-    int initializeExt(const char *local_hostname, const char *metadata_server,
-                      const char *protocol, const char *device_name,
-                      const char *metadata_type);
+	int initializeExt(const char *local_hostname, const char *metadata_server, const char *protocol,
+	                  const char *device_name, const char *metadata_type);
 
-    int getRpcPort();
+	int getRpcPort();
 
-    uintptr_t allocateManagedBuffer(size_t length);
+	uintptr_t allocateManagedBuffer(size_t length);
 
-    int freeManagedBuffer(uintptr_t user_tensor, size_t length);
+	int freeManagedBuffer(uintptr_t user_tensor, size_t length);
 
-    int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
-                          uintptr_t peer_buffer_address, size_t length);
+	int transferSyncWrite(const char *target_hostname, uintptr_t buffer, uintptr_t peer_buffer_address, size_t length);
 
-    batch_id_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
-                            uintptr_t peer_buffer_address, size_t length);
+	batch_id_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer, uintptr_t peer_buffer_address,
+	                               size_t length);
 
-    int transferCheckStatus(batch_id_t batch_id);
+	int transferCheckStatus(batch_id_t batch_id);
 
-    int transferSyncRead(const char *target_hostname, uintptr_t buffer,
-                         uintptr_t peer_buffer_address, size_t length);
-    
-    int batchTransferSyncWrite(const char *target_hostname,
-                               std::vector<uintptr_t> buffers,
-                               std::vector<uintptr_t> peer_buffer_addresses,
-                               std::vector<size_t> lengths);
+	int transferSyncRead(const char *target_hostname, uintptr_t buffer, uintptr_t peer_buffer_address, size_t length);
 
-    int batchTransferSyncRead(const char *target_hostname,
-                              std::vector<uintptr_t> buffers,
-                              std::vector<uintptr_t> peer_buffer_addresses,
-                              std::vector<size_t> lengths);
+	int batchTransferSyncWrite(const char *target_hostname, std::vector<uintptr_t> buffers,
+	                           std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths);
 
-    batch_id_t batchTransferAsyncWrite(const char *target_hostname,
-                                const std::vector<uintptr_t> &buffers,
-                                const std::vector<uintptr_t> &peer_buffer_addresses,
-                                const std::vector<size_t> &lengths);
+	int batchTransferSyncRead(const char *target_hostname, std::vector<uintptr_t> buffers,
+	                          std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths);
 
-    batch_id_t batchTransferAsyncRead(const char *target_hostname,
-                               const std::vector<uintptr_t> &buffers,
-                               const std::vector<uintptr_t> &peer_buffer_addresses,
-                               const std::vector<size_t> &lengths);
+	batch_id_t batchTransferAsyncWrite(const char *target_hostname, const std::vector<uintptr_t> &buffers,
+	                                   const std::vector<uintptr_t> &peer_buffer_addresses,
+	                                   const std::vector<size_t> &lengths);
 
-    int transferSync(const char *target_hostname, uintptr_t buffer,
-                     uintptr_t peer_buffer_address, size_t length,
-                     TransferOpcode opcode);
+	batch_id_t batchTransferAsyncRead(const char *target_hostname, const std::vector<uintptr_t> &buffers,
+	                                  const std::vector<uintptr_t> &peer_buffer_addresses,
+	                                  const std::vector<size_t> &lengths);
 
-    int batchTransferSync(const char *target_hostname,
-                          std::vector<uintptr_t> buffers,
-                          std::vector<uintptr_t> peer_buffer_addresses,
-                          std::vector<size_t> lengths,
-                          TransferOpcode opcode);
+	int transferSync(const char *target_hostname, uintptr_t buffer, uintptr_t peer_buffer_address, size_t length,
+	                 TransferOpcode opcode);
 
-    batch_id_t batchTransferAsync(const char *target_hostname,
-                          const std::vector<uintptr_t> &buffers,
-                          const std::vector<uintptr_t> &peer_buffer_addresses,
-                          const std::vector<size_t> &lengths,
-                          TransferOpcode opcode);
-    
-    int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
+	int batchTransferSync(const char *target_hostname, std::vector<uintptr_t> buffers,
+	                      std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+	                      TransferOpcode opcode);
 
-    uintptr_t getFirstBufferAddress(const std::string &segment_name);
+	batch_id_t batchTransferAsync(const char *target_hostname, const std::vector<uintptr_t> &buffers,
+	                              const std::vector<uintptr_t> &peer_buffer_addresses,
+	                              const std::vector<size_t> &lengths, TransferOpcode opcode);
 
-    int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
-                           size_t length) {
-        memcpy((void *)dest_address, (void *)src_ptr, length);
-        return 0;
-    }
+	int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
-    pybind11::bytes readBytesFromBuffer(uintptr_t source_address,
-                                        size_t length) {
-        return pybind11::bytes(
-            static_cast<const char *>(reinterpret_cast<void *>(source_address)),
-            length);
-    }
+	uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
-    // FOR EXPERIMENT ONLY
-    int registerMemory(uintptr_t buffer_addr, size_t capacity);
+	int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr, size_t length) {
+		memcpy((void *)dest_address, (void *)src_ptr, length);
+		return 0;
+	}
 
-    // must be called before TransferEnginePy::~TransferEnginePy()
-    int unregisterMemory(uintptr_t buffer_addr);
+	pybind11::bytes readBytesFromBuffer(uintptr_t source_address, size_t length) {
+		return pybind11::bytes(static_cast<const char *>(reinterpret_cast<void *>(source_address)), length);
+	}
 
-    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+	// FOR EXPERIMENT ONLY
+	int registerMemory(uintptr_t buffer_addr, size_t capacity);
 
-    int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
+	// must be called before TransferEnginePy::~TransferEnginePy()
+	int unregisterMemory(uintptr_t buffer_addr);
 
-   private:
-    char *allocateRawBuffer(size_t capacity);
+	int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
 
-    int findClassId(size_t size);
+	int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
-    int doBuddyAllocate(int class_id);
+private:
+	char *allocateRawBuffer(size_t capacity);
 
-   private:
-    std::shared_ptr<TransferEngine> engine_;
-    Transport *xport_;
+	int findClassId(size_t size);
 
-    std::mutex mutex_;
-    std::vector<std::stack<char *>> free_list_;
-    std::vector<char *> buffer_list_;
-    std::unordered_set<char *> large_buffer_list_;
-    std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
-    bool auto_discovery_;
+	int doBuddyAllocate(int class_id);
 
-    uint64_t transfer_timeout_nsec_;
+private:
+	std::shared_ptr<TransferEngine> engine_;
+	Transport *xport_;
+
+	std::mutex mutex_;
+	std::vector<std::stack<char *>> free_list_;
+	std::vector<char *> buffer_list_;
+	std::unordered_set<char *> large_buffer_list_;
+	std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
+	bool auto_discovery_;
+
+	uint64_t transfer_timeout_nsec_;
 };

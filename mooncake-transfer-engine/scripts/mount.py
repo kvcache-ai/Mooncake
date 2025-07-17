@@ -19,6 +19,7 @@ import os
 import socket
 import subprocess
 
+
 def discover_nvmeof_targets(nqn, transport, traddr, trsvcid):
     """Discover NVMe-oF targets."""
     cmd = f"nvme discover -t {transport} -a {traddr} -s {trsvcid}"
@@ -28,6 +29,7 @@ def discover_nvmeof_targets(nqn, transport, traddr, trsvcid):
         return None
     print(f"Discovered NVMe-oF targets:\n{result.stdout}")
     return result.stdout
+
 
 def connect_nvmeof_target(nqn, transport, traddr, trsvcid):
     """Connect to NVMe-oF target."""
@@ -39,6 +41,7 @@ def connect_nvmeof_target(nqn, transport, traddr, trsvcid):
     print(f"Connected to NVMe-oF target:\n{result.stdout}")
     return result.stdout
 
+
 def mount_nvme_device(device, mount_point):
     """Mount the NVMe device to a specific mount point."""
     os.makedirs(mount_point, exist_ok=True)
@@ -49,6 +52,7 @@ def mount_nvme_device(device, mount_point):
         return None
     print(f"Mounted {device} on {mount_point}")
     return mount_point
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 5:
@@ -82,5 +86,4 @@ if __name__ == "__main__":
     etcd.put(segment_name, json.dumps(segment))
     print(etcd.get(segment_name)[0])
 
-  # TODO: mount the buffer to local_path, currently users should mount buffers manually
-
+# TODO: mount the buffer to local_path, currently users should mount buffers manually

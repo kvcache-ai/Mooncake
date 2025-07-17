@@ -8,12 +8,7 @@ include_directories("fake_include")
 include_directories("cachelib_memory_allocator/include")
 include_directories("cachelib_memory_allocator/fake_include")
 
-add_library (cachelib_memory_allocator
-        STATIC
-        AllocationClass.cpp
-        MemoryAllocator.cpp
-        MemoryPool.cpp
-        MemoryPoolManager.cpp
-        Slab.cpp
-        SlabAllocator.cpp
-)
+add_library(
+  cachelib_memory_allocator STATIC
+  AllocationClass.cpp MemoryAllocator.cpp MemoryPool.cpp MemoryPoolManager.cpp
+  Slab.cpp SlabAllocator.cpp)

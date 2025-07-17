@@ -31,72 +31,70 @@
 #include "transport/transport.h"
 #include "hccl_transport_mem_c.h"
 
-#define THREAD_NUM 1
-#define ASCEND_DEFAULT_HOST_PORT  10000
+#define THREAD_NUM                 1
+#define ASCEND_DEFAULT_HOST_PORT   10000
 #define ASCEND_DEFAULT_DEVICE_PORT 16666
 
 namespace mooncake {
 class TransferMetadata;
 class HcclTransport : public Transport {
-   public:
-    using BufferDesc = TransferMetadata::BufferDesc;
-    using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
+public:
+	using BufferDesc = TransferMetadata::BufferDesc;
+	using SegmentDesc = TransferMetadata::SegmentDesc;
+	using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
-   public:
-    HcclTransport();
+public:
+	HcclTransport();
 
-    ~HcclTransport();
+	~HcclTransport();
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) override;
+	Status submitTransfer(BatchID batch_id, const std::vector<TransferRequest> &entries) override;
 
-    Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
-        const std::vector<TransferTask *> &task_list) override;
+	Status submitTransferTask(const std::vector<TransferRequest *> &request_list,
+	                          const std::vector<TransferTask *> &task_list) override;
 
-    Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
+	Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &status) override;
 
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta, std::shared_ptr<Topology> topo) override;
+	int install(std::string &local_server_name, std::shared_ptr<TransferMetadata> meta,
+	            std::shared_ptr<Topology> topo) override;
 
-    const char *getName() const override { return "hccl"; }
-    
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible, bool update_metadata) override;
+	const char *getName() const override {
+		return "hccl";
+	}
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = false) override;
+	int registerLocalMemory(void *addr, size_t length, const std::string &location, bool remote_accessible,
+	                        bool update_metadata) override;
 
-    int registerLocalMemoryBatch(
-        const std::vector<Transport::BufferEntry> &buffer_list,
-        const std::string &location) override;
+	int unregisterLocalMemory(void *addr, bool update_metadata = false) override;
 
-    int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override;
+	int registerLocalMemoryBatch(const std::vector<Transport::BufferEntry> &buffer_list,
+	                             const std::string &location) override;
 
-   private:
-    int allocateLocalSegmentID();
+	int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list) override;
 
-    int initPdThread();
+private:
+	int allocateLocalSegmentID();
 
-    void initiatorLoop(int deviceLogicId, int selfIdx);
+	int initPdThread();
 
-    void acceptLoop(int deviceLogicId);
+	void initiatorLoop(int deviceLogicId, int selfIdx);
 
-    int getDevIdAndIpPortFromServerName(std::string& local_server_name, std::string& ip, int &ip_port, int& devicePhyId);
+	void acceptLoop(int deviceLogicId);
 
-    int rankInfoParse(int devicePhyId, std::string hostIp);
+	int getDevIdAndIpPortFromServerName(std::string &local_server_name, std::string &ip, int &ip_port,
+	                                    int &devicePhyId);
 
-   private:
-    std::atomic_bool running_;
-    std::thread allInitiatorThreads_[THREAD_NUM];
-    std::thread allAcceptThreads_[THREAD_NUM];
-    std::queue<Slice*> allReqQueues_[THREAD_NUM];
-    std::mutex initiator_mutex_;
-    std::condition_variable initiator_cond_;
-    RankInfo local_rank_info_;
-    RankInfo remote_rank_info_;
+	int rankInfoParse(int devicePhyId, std::string hostIp);
+
+private:
+	std::atomic_bool running_;
+	std::thread allInitiatorThreads_[THREAD_NUM];
+	std::thread allAcceptThreads_[THREAD_NUM];
+	std::queue<Slice *> allReqQueues_[THREAD_NUM];
+	std::mutex initiator_mutex_;
+	std::condition_variable initiator_cond_;
+	RankInfo local_rank_info_;
+	RankInfo remote_rank_info_;
 };
-}  // namespace mooncake
+} // namespace mooncake
 #endif
