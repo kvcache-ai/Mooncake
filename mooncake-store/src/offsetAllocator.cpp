@@ -224,8 +224,9 @@ Allocation __Allocator::allocate(uint32 size) {
     uint32 nodeIndex = m_binIndices[binIndex];
     Node& node = m_nodes[nodeIndex];
     uint32 nodeTotalSize = node.dataSize;
-    // Round up to bin size. Otherwise when this node is freed, if it cannot be
-    // merged with neighbors, it will be inserted to a smaller bin.
+    // Modified in Mooncake project: Round up to bin size. Otherwise when this
+    // node is freed, if it cannot be merged with neighbors, it will be inserted
+    // to a smaller bin.
     uint32 roundupSize = SmallFloat::floatToUint(minBinIndex);
     node.dataSize = roundupSize;
     node.used = true;
