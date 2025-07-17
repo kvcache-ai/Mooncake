@@ -92,6 +92,7 @@ class SliceBuffer {
     void *buffer_;
     uint64_t size_;
     bool use_allocator_free_;  // Flag to control deallocation method
+    std::shared_ptr<mooncake::SimpleAllocator> allocator_;  // Hold allocator reference to ensure lifetime
 };
 
 class DistributedObjectStore {
@@ -279,7 +280,7 @@ class DistributedObjectStore {
 
    public:
     std::shared_ptr<mooncake::Client> client_ = nullptr;
-    std::unique_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
+    std::shared_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
         nullptr;
     struct SegmentDeleter {
         void operator()(void *ptr) {
