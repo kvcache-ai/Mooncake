@@ -5,7 +5,7 @@
 #include <mutex>
 #include <fstream>
 #include <types.h>
-#include <local_file.h>
+#include <file_interface.h>
 #include <filesystem>
 #include <thread>
 #include <chrono>
@@ -25,7 +25,18 @@ class StorageBackend  {
      * @param fsdir  subdirectory name
      * @note Directory existence is not checked in constructor
      */
-    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir): root_dir_(root_dir), fsdir_(fsdir) {}
+    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir, bool is_3fs_dir)
+        : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
+            #ifdef USE_3FS
+            resource_manager_ = std::make_unique<USRBIOResourceManager>();
+            Hf3fsConfig config;
+            config.mount_root = root_dir;
+            config.iov_size = 32 << 20; // 32MB
+            config.ior_entries = 16;
+            config.io_depth = 0;
+            resource_manager_->setDefaultParams(config);
+            #endif
+        }
 
     /**
      * @brief Factory method to create a StorageBackend instance
@@ -49,8 +60,13 @@ class StorageBackend  {
             LOG(INFO) << "FSDIR cannot be empty";
             return nullptr;
         }
+
+        fs::path root_path(root_dir);
+
+        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") && 
+                    fs::is_directory(root_path / "3fs-virt");
         std::string real_fsdir = "moon_" + fsdir;
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir);
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir, is_3fs_dir);
     }  
     
     /**
@@ -68,30 +84,32 @@ class StorageBackend  {
      * @return ErrorCode indicating operation status
      */
     ErrorCode StoreObject(const ObjectKey& key, const std::string& str) ;
+
+    /**
+     * @brief Stores an object from a span of data
+     * @param key Object identifier
+     * @param data Span containing object data
+     * @return ErrorCode indicating operation status
+     */
+    ErrorCode StoreObject(const ObjectKey& key, std::span<const char> data);
     
     /**
      * @brief Loads an object into slices
-     * @param key Object identifier
+     * @param path KVCache File path to load from
      * @param slices Output vector for loaded data slices
+     * @param length Expected length of data to read
      * @return ErrorCode indicating operation status
      */
-    ErrorCode LoadObject(const ObjectKey& key, std::vector<Slice>& slices) ;
-
-    /**
-     * @brief Loads an object into slices
-     * @param key Object identifier
-     * @param slices Output vector for loaded data slices
-     * @return ErrorCode indicating operation status
-     */
-    ErrorCode LoadObject(const ObjectKey& key, std::vector<Slice>& slices, std::string& path) ;
+    ErrorCode LoadObject(std::string& path, std::vector<Slice>& slices, size_t length) ;
     
     /**
      * @brief Loads an object as a string
-     * @param key Object identifier
+     * @param path KVCache File path to load from
      * @param str Output string for loaded data
+     * @param length Expected length of data to read
      * @return ErrorCode indicating operation status
      */
-    ErrorCode LoadObject(const ObjectKey& key, std::string& str) ;
+    ErrorCode LoadObject(std::string& path, std::string& str, size_t length) ;
 
     /**
      * @brief Queries metadata for an object by key
@@ -129,10 +147,18 @@ class StorageBackend  {
      */
     void RemoveAll() ;
 
+    enum class FileMode {
+        Read,
+        Write
+    };
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
-    
+    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS directory structure
+    #ifdef USE_3FS
+    std::unique_ptr<USRBIOResourceManager> resource_manager_;
+    #endif
+
    private:
     /**
      * @brief Sanitizes object key for filesystem safety
@@ -144,8 +170,14 @@ class StorageBackend  {
      */
     std::string ResolvePath(const ObjectKey& key) const;
 
-    ErrorCode LoadObjectInPath(const std::string& path,
-                                    std::vector<Slice>& slices);
+    /**
+     * @brief Creates a file object for the specified path and mode
+     * @param path Filesystem path for the file
+     * @param mode File access mode (read/write)
+     * @return Unique pointer to the created StorageFile, or nullptr on failure
+     */
+    std::unique_ptr<StorageFile> create_file(const std::string& path, 
+                                           FileMode mode) const;
 
 };
 

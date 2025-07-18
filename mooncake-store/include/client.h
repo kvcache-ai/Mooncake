@@ -226,12 +226,8 @@ class Client {
     void PrepareStorageBackend(const std::string& storage_root_dir,
                                const std::string& fsdir);
 
-    ErrorCode GetFromLocalFile(const std::string& object_key,
-                               std::vector<Slice>& slices,
-                               std::vector<Replica::Descriptor>& replicas);
-
     void PutToLocalFile(const std::string& object_key,
-                        std::vector<Slice>& slices);
+                        const std::vector<Slice>& slices);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -255,6 +251,7 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void BatchPuttoLocalFile(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 

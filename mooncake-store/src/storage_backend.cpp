@@ -18,27 +18,24 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    FILE* file = fopen(path.c_str(), "wb");
-    size_t slices_total_size = 0;
-    std::vector<iovec> iovs;
-
+    auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
-    }    
+    }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
-
+    std::vector<iovec> iovs;
+    size_t slices_total_size = 0;
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
         iovs.push_back(io);
         slices_total_size += slice.size;
     }
 
-    ssize_t ret = local_file.pwritev(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
+        LOG(INFO) << "vector_write failed for: " << path;
         return ErrorCode::FILE_WRITE_FAIL;
     }
 
@@ -60,81 +57,66 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
 
 ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
                                     const std::string& str) {
+    return StoreObject(key, std::span<const char>(str.data(), str.size()));                                    
+}
+
+ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+                                    std::span<const char> data) {
     std::string path = ResolvePath(key);
 
-    if(std::filesystem::exists(path) == true) {
+    if (std::filesystem::exists(path)) {
         return ErrorCode::FILE_OPEN_FAIL;
     }
     
-    FILE* file = fopen(path.c_str(), "wb");
-    size_t file_total_size=str.size();
-
+    auto file = create_file(path, FileMode::Write);
     if (!file) {
-        LOG(INFO) << "Failed to open file for reading: " << path;
+        LOG(INFO) << "Failed to open file for writing: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
-
-    ssize_t ret = local_file.write(str, file_total_size);
+    size_t file_total_size = data.size();
+    ssize_t ret = file->write(data, file_total_size);  
 
     if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
-
+        LOG(INFO) << "Write failed for: " << path;
         return ErrorCode::FILE_WRITE_FAIL;
     }
     if (ret != static_cast<ssize_t>(file_total_size)) {
         LOG(INFO) << "Write size mismatch for: " << path
-                   << ", expected: " << file_total_size
-                   << ", got: " << ret;
-
+                 << ", expected: " << file_total_size
+                 << ", got: " << ret;
         return ErrorCode::FILE_WRITE_FAIL;
     }
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
 
     return ErrorCode::OK;
 }
-      
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::vector<Slice>& slices) {
-    std::string path = ResolvePath(key);
-    return LoadObjectInPath(path,slices);
-}
 
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::vector<Slice>& slices, std::string& path) {
-    return LoadObjectInPath(path, slices);
-}
+ErrorCode StorageBackend::LoadObject(std::string& path,
+                                    std::vector<Slice>& slices, size_t length) {
 
-ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
-                                    std::vector<Slice>& slices) {
-    FILE* file = fopen(path.c_str(), "rb");
-    size_t slices_total_size=0;
-    std::vector<iovec> iovs;
-
+    auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    LocalFile local_file(path,file,ErrorCode::OK);
+    std::vector<iovec> iovs;                                    
 
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
         iovs.push_back(io);
-        slices_total_size += slice.size;
     }
 
-    ssize_t ret = local_file.preadv(iovs.data(), static_cast<int>(iovs.size()), 0);
+    ssize_t ret = file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
 
     if (ret < 0) {
-        LOG(INFO) << "preadv failed for: " << path;
+        LOG(INFO) << "vector_read failed for: " << path;
 
         return ErrorCode::FILE_READ_FAIL;
     }
-    if (ret != static_cast<ssize_t>(slices_total_size)) {
+    if (ret != static_cast<ssize_t>(length)) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << slices_total_size
+                   << ", expected: " << length
                    << ", got: " << ret;
 
         return ErrorCode::FILE_READ_FAIL;
@@ -145,31 +127,24 @@ ErrorCode StorageBackend::LoadObjectInPath(const std::string& path,
     return ErrorCode::OK;
 }
 
-ErrorCode StorageBackend::LoadObject(const ObjectKey& key,
-                                    std::string& str) {
-    std::string path = ResolvePath(key);
-    FILE* file = fopen(path.c_str(), "rb");
-    size_t file_total_size=0;
+ErrorCode StorageBackend::LoadObject(std::string& path,
+                                    std::string& str, size_t length) {
 
+    auto file = create_file(path, FileMode::Read);
     if (!file) {
+        LOG(INFO) << "Failed to open file for reading: " << path;
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    fseek(file, 0, SEEK_END);
-    file_total_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    LocalFile local_file(path,file,ErrorCode::OK);
-
-    ssize_t ret = local_file.read(str, file_total_size);
+    ssize_t ret = file->read(str, length);
 
     if (ret < 0) {
-        LOG(INFO) << "preadv failed for: " << path;
+        LOG(INFO) << "read failed for: " << path;
         return ErrorCode::FILE_READ_FAIL;
     }
-    if (ret != static_cast<ssize_t>(file_total_size)) {
+    if (ret != static_cast<ssize_t>(length)) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << file_total_size
+                   << ", expected: " << length
                    << ", got: " << ret;
 
         return ErrorCode::FILE_READ_FAIL;
@@ -308,6 +283,38 @@ std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
     fs::path full_path = dir_path / SanitizeKey(key);
     
     return full_path.lexically_normal().string();
+}
+
+std::unique_ptr<StorageFile> StorageBackend::create_file(
+    const std::string& path, FileMode mode) const {
+    int flags = O_CLOEXEC;
+    int access_mode = 0;
+    switch (mode) {
+        case FileMode::Read:
+            access_mode = O_RDONLY;
+            break;
+        case FileMode::Write:
+            access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+            break;
+    }
+    
+    int fd = open(path.c_str(), flags | access_mode, 0644);
+    if (fd < 0) {
+        return nullptr;  
+    }
+
+#ifdef USE_3FS
+    if (is_3fs_dir_) {
+        if (hf3fs_reg_fd(fd, 0) > 0) {
+            close(fd);
+            return nullptr;
+        }
+        return resource_manager_ ? 
+            std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get()) : nullptr;
+    }
+#endif
+
+    return std::make_unique<PosixFile>(path, fd);
 }
 
 }  // namespace mooncake

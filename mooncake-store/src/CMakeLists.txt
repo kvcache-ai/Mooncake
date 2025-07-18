@@ -10,7 +10,6 @@ set(MOONCAKE_STORE_SOURCES
     utils.cpp
     master_metric_manager.cpp
     storage_backend.cpp
-    local_file.cpp
     thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
@@ -20,12 +19,28 @@ set(MOONCAKE_STORE_SOURCES
     ha_helper.cpp
     rpc_service.cpp
     offset_allocator.cpp
+    posix_file.cpp
+
 )
+
+set(EXTRA_LIBS "")
+
+if(USE_3FS)
+  add_subdirectory(hf3fs)
+  list(APPEND MOONCAKE_STORE_SOURCES  ${HF3FS_SOURCES})
+  find_library(HF3FS_API_LIB hf3fs_api_shared PATHS /usr/lib NO_DEFAULT_PATH)
+  if(NOT HF3FS_API_LIB)
+    message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
+  endif()
+  set(EXTRA_LIBS ${HF3FS_API_LIB})
+endif()
 
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_link_libraries(mooncake_store PUBLIC transfer_engine ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags)
+target_link_libraries(mooncake_store PUBLIC transfer_engine ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
+    ${EXTRA_LIBS}
+)
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
