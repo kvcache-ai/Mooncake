@@ -44,6 +44,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
 struct RankInfo {
     uint64_t rankId = 0xFFFFFFFF;
     uint64_t serverIdx; 
@@ -65,54 +66,50 @@ struct RankControlInfo {
     uint64_t pid;
 };
 
+struct MergeMem {
+    void *addr = nullptr;
+    uint64_t len = 0;
+    MergeMem(void* addr_, size_t len_) : addr(addr_), len(len_) {}
+};
 
+struct ConnectionInfo {
+    int tcp_socket;
+    std::shared_ptr<hccl::HcclSocket> hccl_ctrl_socket;
+    std::shared_ptr<hccl::HcclSocket> hccl_data_socket;
+    std::shared_ptr<hccl::TransportMem> transport_mem;
+};
 
-
-
-
+// Retry mechanism for initialization function failure
+#define RETRY_CALL(funcCall, errorMsg) \
+    do { \
+        int retryCount = 0; \
+        int __ret = funcCall; \
+        while (__ret && retryCount < 3) { \
+            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount << "/3)"; \
+            __ret = funcCall; \
+        } \
+        if (__ret) { \
+            LOG(ERROR) << errorMsg << " failed after 3 retries."; \
+            return __ret; \
+        } \
+    } while (0)
 
 extern int initTransportMem(RankInfo *local_rank_info);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 extern int transportMemTask(RankInfo *local_rank_info, 
                             RankInfo *remote_rank_info, int op_code, uint64_t offset,
                             uint64_t req_len, void *local_mem, aclrtStream stream);
 
-
-
-
-
-
-
-
 extern int transportMemAccept(RankInfo *local_rank_info);
 
-
-
-
-
-
-
-
-
 extern int regLocalRmaMem(void *addr, uint64_t length);
+
+extern bool printEnabled();
+
+extern int transportMemAddOpFence(RankInfo *remote_rank_info, aclrtStream stream);
 
 #ifdef __cplusplus
 }
 #endif // __cplusplus
 
 #endif // HCCL_TRANSPORT_MEM_C_H
-
