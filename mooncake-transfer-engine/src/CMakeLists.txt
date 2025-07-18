@@ -55,3 +55,5 @@ if (USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
+
+add_subdirectory(v1)
