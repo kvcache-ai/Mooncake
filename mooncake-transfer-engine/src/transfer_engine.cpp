@@ -45,23 +45,23 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << ", Metadata: " << metadata_conn_string
               << ", ip_or_host_name: " << ip_or_host_name
               << ", rpc_port: " << rpc_port;
-    
-    std::string mutable_server_name = local_server_name;
+
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
 #ifdef USE_ASCEND
-    // The only difference in initializing  the Ascend Transport is that the `local_server_name` must include the physical NPU card ID. 
+    // The only difference in initializing  the Ascend Transport is that the `local_server_name` must include the physical NPU card ID.
     // The format changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
     // While the desc_name stored in the metadata remains in the format of ip:port.
     int devicePhyId = -1;
+    std::string mutable_server_name = local_server_name;
     auto[host_name, port] = parseHostNameWithPortAscend(local_server_name, &devicePhyId);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. Server: " << host_name << " port: "
-    << port << " devicePhyId: " << devicePhyId;
+    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: " << host_name
+              << " port: " << port << " devicePhyId: " << devicePhyId;
     local_server_name_ = host_name + ":" + std::to_string(port);
 #else
     auto[host_name, port] = parseHostNameWithPort(local_server_name);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPort. Server: " << host_name << " port: " << port;
+    LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: " << host_name << " port: " << port;
     local_server_name_ = local_server_name;
 #endif
 
@@ -116,8 +116,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << desc.rpc_port;
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+#ifdef USE_ASCEND
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, mutable_server_name);
+#else
+    multi_transports_ =
+        std::make_shared<MultiTransport>(metadata_, local_server_name_);
+#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
