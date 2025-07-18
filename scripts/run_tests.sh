@@ -26,7 +26,28 @@ mooncake_master &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_distributed_object_store.py
+sleep 1
+
+pip install torch numpy
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_put_get_tensor.py
 kill $MASTER_PID || true
+
+
+# Check if MOONCAKE_STORAGE_ROOT_DIR is set and not empty
+if [ -n "$TEST_SSD_OFFLOAD_IN_EVICT" ]; then
+    TEST_ROOT_DIR="/tmp/mooncake_test_ssd"
+    mkdir -p $TEST_ROOT_DIR
+    echo "MOONCAKE_STORAGE_ROOT_DIR is set to: $TEST_ROOT_DIR"
+    echo "Running with ssd offload in evict tests..."
+    mooncake_master &
+    MASTER_PID=$!
+    sleep 1
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MOONCAKE_STORAGE_ROOT_DIR=$TEST_ROOT_DIR python test_ssd_offload_in_evict.py
+    kill $MASTER_PID || true
+    rm -rf $TEST_ROOT_DIR
+else
+    echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
+fi
 
 echo "Running CLI entry point tests..."
 python test_cli.py

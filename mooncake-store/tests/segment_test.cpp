@@ -361,8 +361,7 @@ TEST_F(SegmentTest, QuerySegments) {
     // Create 10 different segments with different names and client IDs
     std::vector<Segment> segments;
     std::vector<UUID> client_ids;
-    std::unordered_map<UUID, UUID, boost::hash<UUID>>
-        expected_client_segments;
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> expected_client_segments;
 
     for (int i = 0; i < 10; i++) {
         // Create segment

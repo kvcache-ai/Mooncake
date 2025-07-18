@@ -76,6 +76,12 @@ class RdmaEndPoint {
     void set_active(bool flag) { 
         RWSpinlock::WriteGuard guard(lock_);
         active_ = flag; 
+        if (!flag) inactive_time_ = getCurrentTimeInNano();
+    }
+
+    double inactiveTime() {
+        if (active_) return 0.0;
+        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
    public:
@@ -129,6 +135,7 @@ class RdmaEndPoint {
 
     volatile bool active_;
     volatile int *cq_outstanding_;
+    volatile uint64_t inactive_time_;
 };
 
 }  // namespace mooncake

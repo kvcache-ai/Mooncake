@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <queue>
 #include <shared_mutex>
+#include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
 #include "types.h"
@@ -11,17 +12,23 @@
 namespace mooncake {
 
 MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
+                             uint64_t default_kv_soft_pin_ttl,
+                             bool allow_evict_soft_pinned_objects,
                              double eviction_ratio,
                              double eviction_high_watermark_ratio,
                              ViewVersionId view_version,
-                             int64_t client_live_ttl_sec, bool enable_ha)
+                             int64_t client_live_ttl_sec, bool enable_ha,
+                             const std::string& cluster_id)
     : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
+      default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
+      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
       eviction_ratio_(eviction_ratio),
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
-      enable_ha_(enable_ha) {
+      enable_ha_(enable_ha),
+      cluster_id_(cluster_id) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -66,8 +73,8 @@ MasterService::~MasterService() {
     }
 }
 
-ErrorCode MasterService::MountSegment(const Segment& segment,
-                                      const UUID& client_id) {
+auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     if (enable_ha_) {
@@ -88,24 +95,26 @@ ErrorCode MasterService::MountSegment(const Segment& segment,
         if (!client_ping_queue_.push(pod_client_id)) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=client_ping_queue_full";
-            return ErrorCode::INTERNAL_ERROR;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 
     auto err = segment_access.MountSegment(segment, client_id);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
-    } else {
-        return err;
+        return {};
+    } else if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
     }
+    return {};
 }
 
-ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
-                                        const UUID& client_id) {
+auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
+                                   const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "ReMountSegment is only available in HA mode";
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -113,7 +122,7 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
         LOG(WARNING) << "client_id=" << client_id
                      << ", warn=client_already_remounted";
         // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
+        return {};
     }
 
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -135,19 +144,19 @@ ErrorCode MasterService::ReMountSegment(const std::vector<Segment>& segments,
     if (!client_ping_queue_.push(pod_client_id)) {
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=client_ping_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     ErrorCode err = segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
-        return err;
+        return tl::make_unexpected(err);
     }
 
     // Change the client status to OK
     ok_client_.insert(client_id);
     MasterMetricManager::instance().inc_active_clients();
 
-    return ErrorCode::OK;
+    return {};
 }
 
 void MasterService::ClearInvalidHandles() {
@@ -166,7 +175,6 @@ void MasterService::ClearInvalidHandles() {
             // Remove the object if it has no valid replicas
             if (has_invalid || CleanupStaleHandles(it->second)) {
                 it = shard.metadata.erase(it);
-                MasterMetricManager::instance().dec_key_count(1);
             } else {
                 ++it;
             }
@@ -174,8 +182,9 @@ void MasterService::ClearInvalidHandles() {
     }
 }
 
-ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
-                                        const UUID& client_id) {
+auto MasterService::UnmountSegment(const UUID& segment_id,
+                                   const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     // 1. Prepare to unmount the segment by deleting its allocator
@@ -186,10 +195,10 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
-            return ErrorCode::OK;
+            return {};
         }
         if (err != ErrorCode::OK) {
-            return err;
+            return tl::make_unexpected(err);
         }
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
@@ -199,78 +208,94 @@ ErrorCode MasterService::UnmountSegment(const UUID& segment_id,
 
     // 3. Commit the unmount operation
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.CommitUnmountSegment(segment_id, client_id,
-                                               metrics_dec_capacity);
+    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                   metrics_dec_capacity);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
-ErrorCode MasterService::ExistKey(const std::string& key) {
+auto MasterService::ExistKey(const std::string& key)
+    -> tl::expected<bool, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return false;
     }
 
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(WARNING) << "key=" << key << ", status=" << *status
                      << ", error=replica_not_ready";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Grant a lease to the object as it may be further used by the client.
-    metadata.GrantLease(default_kv_lease_ttl_);
+    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
-    return ErrorCode::OK;
+    return true;
 }
 
-std::vector<ErrorCode> MasterService::BatchExistKey(
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
-    std::vector<ErrorCode> results;
+    std::vector<tl::expected<bool, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.push_back(ExistKey(key));
+        results.emplace_back(ExistKey(key));
     }
     return results;
 }
 
-ErrorCode MasterService::GetAllKeys(std::vector<std::string>& all_keys) {
-    all_keys.clear();
+auto MasterService::GetAllKeys()
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::vector<std::string> all_keys;
     for (size_t i = 0; i < kNumShards; i++) {
         MutexLocker lock(&metadata_shards_[i].mutex);
         for (const auto& item : metadata_shards_[i].metadata) {
             all_keys.push_back(item.first);
         }
     }
-    return ErrorCode::OK;
+    return all_keys;
 }
 
-ErrorCode MasterService::GetAllSegments(
-    std::vector<std::string>& all_segments) {
+auto MasterService::GetAllSegments()
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.GetAllSegments(all_segments);
+    std::vector<std::string> all_segments;
+    auto err = segment_access.GetAllSegments(all_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return all_segments;
 }
 
-ErrorCode MasterService::QuerySegments(const std::string& segment, size_t& used,
-                                       size_t& capacity) {
+auto MasterService::QuerySegments(const std::string& segment)
+    -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return segment_access.QuerySegments(segment, used, capacity);
+    size_t used, capacity;
+    auto err = segment_access.QuerySegments(segment, used, capacity);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return std::make_pair(used, capacity);
 }
 
-ErrorCode MasterService::GetReplicaList(
-    const std::string& key, std::vector<Replica::Descriptor>& replica_list) {
-    MetadataAccessor accessor(this, key);
+auto MasterService::GetReplicaList(std::string_view key)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(WARNING) << "key=" << key << ", status=" << *status
                      << ", error=replica_not_ready";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    replica_list.clear();
+    std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(metadata.replicas.size());
     for (const auto& replica : metadata.replicas) {
         replica_list.emplace_back(replica.get_descriptor());
@@ -278,38 +303,37 @@ ErrorCode MasterService::GetReplicaList(
 
     // Only mark for GC if enabled
     if (enable_gc_) {
-        MarkForGC(key, 1000);  // After 1 second, the object will be removed
+        MarkForGC(std::string(key),
+                  1000);  // After 1 second, the object will be removed
     } else {
         // Grant a lease to the object so it will not be removed
         // when the client is reading it.
-        metadata.GrantLease(default_kv_lease_ttl_);
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
     }
 
-    return ErrorCode::OK;
+    return replica_list;
 }
 
-ErrorCode MasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys,
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
-        batch_replica_list) {
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    results.reserve(keys.size());
     for (const auto& key : keys) {
-        if (GetReplicaList(key, batch_replica_list[key]) != ErrorCode::OK) {
-            LOG(ERROR) << "key=" << key << ", error=object_not_found";
-            return ErrorCode::OBJECT_NOT_FOUND;
-        };
+        results.emplace_back(GetReplicaList(key));
     }
-    return ErrorCode::OK;
+    return results;
 }
 
-ErrorCode MasterService::PutStart(
-    const std::string& key, uint64_t value_length,
-    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
-    std::vector<Replica::Descriptor>& replica_list) {
-    if (config.replica_num == 0 || value_length == 0 || key.empty()) {
+auto MasterService::PutStart(const std::string& key,
+                             const std::vector<uint64_t>& slice_lengths,
+                             const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.replica_num == 0 || key.empty() || slice_lengths.empty()) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
-                   << ", value_length=" << value_length
+                   << ", slice_count=" << slice_lengths.size()
                    << ", key_size=" << key.size() << ", error=invalid_params";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Validate slice lengths
@@ -320,19 +344,12 @@ ErrorCode MasterService::PutStart(
                        << ", slice_size=" << slice_lengths[i]
                        << ", max_size=" << kMaxSliceSize
                        << ", error=invalid_slice_size";
-            return ErrorCode::INVALID_PARAMS;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         total_length += slice_lengths[i];
     }
 
-    if (total_length != value_length) {
-        LOG(ERROR) << "key=" << key << ", total_length=" << total_length
-                   << ", expected_length=" << value_length
-                   << ", error=slice_length_mismatch";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    VLOG(1) << "key=" << key << ", value_length=" << value_length
+    VLOG(1) << "key=" << key << ", value_length=" << total_length
             << ", slice_count=" << slice_lengths.size() << ", config=" << config
             << ", action=put_start_begin";
 
@@ -344,12 +361,8 @@ ErrorCode MasterService::PutStart(
     if (it != metadata_shards_[shard_idx].metadata.end() &&
         !CleanupStaleHandles(it->second)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
-
-    // Initialize object metadata
-    ObjectMetadata metadata;
-    metadata.size = value_length;
 
     // Allocate replicas
     std::vector<Replica> replicas;
@@ -375,11 +388,10 @@ ErrorCode MasterService::PutStart(
                     LOG(ERROR)
                         << "key=" << key << ", replica_id=" << i
                         << ", slice_index=" << j << ", error=allocation_failed";
-                    replica_list.clear();
                     // If the allocation failed, we need to evict some objects
                     // to free up space for future allocations.
                     need_eviction_ = true;
-                    return ErrorCode::NO_AVAILABLE_HANDLE;
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                 }
 
                 VLOG(1) << "key=" << key << ", replica_id=" << i
@@ -393,132 +405,103 @@ ErrorCode MasterService::PutStart(
         }
     }
 
-    metadata.replicas = std::move(replicas);
-
-    replica_list.clear();
-    replica_list.reserve(metadata.replicas.size());
-    for (const auto& replica : metadata.replicas) {
+    std::vector<Replica::Descriptor> replica_list;
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
         replica_list.emplace_back(replica.get_descriptor());
     }
 
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata[key] = std::move(metadata);
-    return ErrorCode::OK;
+    metadata_shards_[shard_idx].metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(total_length, std::move(replicas),
+                              config.with_soft_pin));
+    return replica_list;
 }
 
-ErrorCode MasterService::PutEnd(const std::string& key) {
+auto MasterService::PutEnd(const std::string& key)
+    -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
     for (auto& replica : metadata.replicas) {
         replica.mark_complete();
     }
-    // Set lease timeout to now, indicating that the object has no lease
-    // at beginning
-    metadata.GrantLease(0);
-    return ErrorCode::OK;
+    // 1. Set lease timeout to now, indicating that the object has no lease
+    // at beginning. 2. If this object has soft pin enabled, set it to be soft
+    // pinned.
+    metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    return {};
 }
 
-ErrorCode MasterService::PutRevoke(const std::string& key) {
+auto MasterService::PutRevoke(const std::string& key)
+    -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::INVALID_WRITE;
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
     accessor.Erase();
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode MasterService::BatchPutStart(
-    const std::vector<std::string>& keys,
-    const std::unordered_map<std::string, uint64_t>& value_lengths,
-    const std::unordered_map<std::string, std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config,
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
-        batch_replica_list) {
-    if (config.replica_num == 0 || keys.empty()) {
-        LOG(ERROR) << "replica_num=" << config.replica_num
-                   << ", keys_size=" << keys.size() << ", error=invalid_params";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
+    const std::vector<std::string>& keys) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
     for (const auto& key : keys) {
-        auto value_length_it = value_lengths.find(key);
-        auto slice_length_it = slice_lengths.find(key);
-        if (value_length_it == value_lengths.end() ||
-            slice_length_it == slice_lengths.end()) {
-            LOG(ERROR) << "Key not found in value_lengths or slice_lengths: "
-                       << key;
-            return ErrorCode::OBJECT_NOT_FOUND;
-        }
-
-        auto result =
-            PutStart(key, value_length_it->second, slice_length_it->second,
-                     config, batch_replica_list[key]);
-        if (result != ErrorCode::OK &&
-            result != ErrorCode::OBJECT_ALREADY_EXISTS) {
-            return result;
-        }
+        results.emplace_back(PutEnd(key));
     }
-    return ErrorCode::OK;
+    return results;
 }
 
-ErrorCode MasterService::BatchPutEnd(const std::vector<std::string>& keys) {
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
+    const std::vector<std::string>& keys) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
     for (const auto& key : keys) {
-        auto result = PutEnd(key);
-        if (result != ErrorCode::OK) {
-            return result;
-        }
+        results.emplace_back(PutRevoke(key));
     }
-    return ErrorCode::OK;
+    return results;
 }
 
-ErrorCode MasterService::BatchPutRevoke(const std::vector<std::string>& keys) {
-    for (const auto& key : keys) {
-        auto result = PutRevoke(key);
-        if (result != ErrorCode::OK) {
-            return result;
-        }
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode MasterService::Remove(const std::string& key) {
+auto MasterService::Remove(const std::string& key)
+    -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
-        return ErrorCode::OBJECT_NOT_FOUND;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
 
     if (!metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
-        return ErrorCode::OBJECT_HAS_LEASE;
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
-        return ErrorCode::REPLICA_IS_NOT_READY;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Remove object metadata
     accessor.Erase();
-    return ErrorCode::OK;
+    return {};
 }
 
 long MasterService::RemoveAll() {
@@ -548,27 +531,24 @@ long MasterService::RemoveAll() {
         }
     }
 
-    if (removed_count > 0) {
-        // Update metrics only if objects were actually removed
-        MasterMetricManager::instance().dec_key_count(removed_count);
-    }
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 
-ErrorCode MasterService::MarkForGC(const std::string& key, uint64_t delay_ms) {
+auto MasterService::MarkForGC(const std::string& key, uint64_t delay_ms)
+    -> tl::expected<void, ErrorCode> {
     // Create a new GC task and add it to the queue
     GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
     if (!gc_queue_.push(task)) {
         // Queue is full, delete the task to avoid memory leak
         delete task;
         LOG(ERROR) << "key=" << key << ", error=gc_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    return ErrorCode::OK;
+    return {};
 }
 
 bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
@@ -599,30 +579,37 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-ErrorCode MasterService::Ping(const UUID& client_id,
-                              ViewVersionId& view_version,
-                              ClientStatus& client_status) {
+auto MasterService::Ping(const UUID& client_id)
+    -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "Ping is only available in HA mode";
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    ClientStatus client_status;
     auto it = ok_client_.find(client_id);
     if (it != ok_client_.end()) {
         client_status = ClientStatus::OK;
     } else {
         client_status = ClientStatus::NEED_REMOUNT;
     }
-    view_version = view_version_;
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!client_ping_queue_.push(pod_client_id)) {
         // Queue is full
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=client_ping_queue_full";
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return ErrorCode::OK;
+    return std::make_pair(view_version_, client_status);
+}
+
+tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
+    if (cluster_id_.empty()) {
+        LOG(ERROR) << "Cluster ID is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return cluster_id_;
 }
 
 void MasterService::GCThreadFunc() {
@@ -633,7 +620,6 @@ void MasterService::GCThreadFunc() {
 
     while (gc_running_) {
         GCTask* task = nullptr;
-        long gc_count = 0;
         while (gc_queue_.pop(task)) {
             if (task) {
                 local_pq.push(task);
@@ -648,30 +634,26 @@ void MasterService::GCThreadFunc() {
 
             local_pq.pop();
             VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
-            ErrorCode result = Remove(task->key);
-            if (result != ErrorCode::OK &&
-                result != ErrorCode::OBJECT_NOT_FOUND &&
-                result != ErrorCode::OBJECT_HAS_LEASE) {
-                LOG(WARNING)
-                    << "key=" << task->key
-                    << ", error=gc_remove_failed, error_code=" << result;
-            }
-            if (result == ErrorCode::OK) {
-                gc_count++;
+            auto result = Remove(task->key);
+            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                result.error() != ErrorCode::OBJECT_HAS_LEASE) {
+                LOG(WARNING) << "key=" << task->key
+                             << ", error=gc_remove_failed, error_code="
+                             << result.error();
             }
             delete task;
         }
-        if (gc_count > 0) {
-            MasterMetricManager::instance().dec_key_count(gc_count);
-        }
-
         double used_ratio =
             MasterMetricManager::instance().get_global_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
-            BatchEvict(std::max(
+            double evict_ratio_target = std::max(
                 eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_));
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_lowerbound =
+                std::max(evict_ratio_target * 0.5,
+                         used_ratio - eviction_high_watermark_ratio_);
+            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
         }
 
         std::this_thread::sleep_for(
@@ -686,15 +668,29 @@ void MasterService::GCThreadFunc() {
     VLOG(1) << "action=gc_thread_stopped";
 }
 
-void MasterService::BatchEvict(double eviction_ratio) {
+void MasterService::BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound) {
+    if (evict_ratio_target < evict_ratio_lowerbound) {
+        LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
+                   << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound
+                   << ", error=invalid_params";
+        evict_ratio_lowerbound = evict_ratio_target;
+    }
+
     auto now = std::chrono::steady_clock::now();
     long evicted_count = 0;
     long object_count = 0;
     uint64_t total_freed_size = 0;
 
+    // Candidates for second pass eviction
+    std::vector<std::chrono::steady_clock::time_point> no_pin_objects;
+    std::vector<std::chrono::steady_clock::time_point> soft_pin_objects;
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % metadata_shards_.size();
+
+    // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         auto& shard =
             metadata_shards_[(start_idx + i) % metadata_shards_.size()];
@@ -704,28 +700,37 @@ void MasterService::BatchEvict(double eviction_ratio) {
         // to compute ideal_evict_num
         object_count += shard.metadata.size();
 
-        // To achieve evicted_count / object_count = eviction_ration,
+        // To achieve evicted_count / object_count = evict_ratio_target,
         // ideally how many object should be evicted in this shard
         const long ideal_evict_num =
-            std::ceil(object_count * eviction_ratio_) - evicted_count;
-
-        if (ideal_evict_num <= 0) {
-            // No need to evict any object in this shard
-            continue;
-        }
+            std::ceil(object_count * evict_ratio_target) - evicted_count;
 
         std::vector<std::chrono::steady_clock::time_point>
             candidates;  // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end();
              it++) {
-            // Only evict objects that have not expired and are complete
-            if (it->second.IsLeaseExpired(now) &&
-                !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                candidates.push_back(it->second.lease_timeout);
+            // Skip objects that are not expired or have incomplete replicas
+            if (!it->second.IsLeaseExpired(now) ||
+                it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                continue;
+            }
+            if (!it->second.IsSoftPinned(now)) {
+                if (ideal_evict_num > 0) {
+                    // first pass candidates
+                    candidates.push_back(it->second.lease_timeout);
+                } else {
+                    // No need to evict any object in this shard, put to
+                    // second pass candidates
+                    no_pin_objects.push_back(it->second.lease_timeout);
+                }
+            } else if (allow_evict_soft_pinned_objects_) {
+                // second pass candidates, only if
+                // allow_evict_soft_pinned_objects_ is true
+                soft_pin_objects.push_back(it->second.lease_timeout);
             }
         }
 
-        if (!candidates.empty()) {
+        if (ideal_evict_num > 0 && !candidates.empty()) {
             long evict_num = std::min(ideal_evict_num, (long)candidates.size());
             long shard_evicted_count =
                 0;  // number of objects evicted from this shard
@@ -735,15 +740,24 @@ void MasterService::BatchEvict(double eviction_ratio) {
             auto target_timeout = candidates[evict_num - 1];
             // Evict objects with lease timeout less than or equal to target.
             auto it = shard.metadata.begin();
-            while (it != shard.metadata.end() &&
-                   shard_evicted_count < evict_num) {
-                if (it->second.lease_timeout <= target_timeout &&
-                    !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+            while (it != shard.metadata.end()) {
+                // Skip objects that are not allowed to be evicted in the first
+                // pass
+                if (!it->second.IsLeaseExpired(now) ||
+                    it->second.IsSoftPinned(now) ||
+                    it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.lease_timeout <= target_timeout) {
+                    // Evict this object
                     total_freed_size +=
                         it->second.size * it->second.replicas.size();
                     it = shard.metadata.erase(it);
                     shard_evicted_count++;
                 } else {
+                    // second pass candidates
+                    no_pin_objects.push_back(it->second.lease_timeout);
                     ++it;
                 }
             }
@@ -751,9 +765,115 @@ void MasterService::BatchEvict(double eviction_ratio) {
         }
     }
 
+    // The ideal number of objects to evict in the second pass
+    long target_evict_num =
+        std::ceil(object_count * evict_ratio_lowerbound) - evicted_count;
+    // The actual number of objects we can evict in the second pass
+    target_evict_num =
+        std::min(target_evict_num,
+                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
+
+    // Do second pass eviction only if 1). there are candidates that can be
+    // evicted AND 2). The evicted number in the first pass is less than
+    // evict_ratio_lowerbound.
+    if (target_evict_num > 0) {
+        // If 1). there are enough candidates without soft pin OR 2). soft pin
+        // candidates are empty, then do second pass A. Otherwise, do second
+        // pass B. Note that the second condition is ensured implicitly by the
+        // calculation of target_evict_num.
+        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
+            // Second pass A: only evict objects without soft pin. The following
+            // code is error-prone if target_evict_num > no_pin_objects.size().
+
+            std::nth_element(no_pin_objects.begin(),
+                             no_pin_objects.begin() + (target_evict_num - 1),
+                             no_pin_objects.end());
+            auto target_timeout = no_pin_objects[target_evict_num - 1];
+
+            // Evict objects with lease timeout less than or equal to target.
+            // Stop when the target is reached.
+            for (size_t i = 0;
+                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
+                auto& shard =
+                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+                MutexLocker lock(&shard.mutex);
+                auto it = shard.metadata.begin();
+                while (it != shard.metadata.end() && target_evict_num > 0) {
+                    if (it->second.lease_timeout <= target_timeout &&
+                        !it->second.IsSoftPinned(now) &&
+                        !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                        // Evict this object
+                        total_freed_size +=
+                            it->second.size * it->second.replicas.size();
+                        it = shard.metadata.erase(it);
+                        evicted_count++;
+                        target_evict_num--;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        } else if (!soft_pin_objects.empty()) {
+            // Second pass B: Prioritize evicting objects without soft pin, but
+            // also allow to evict soft pinned objects. The following code is
+            // error-prone if the soft pin objects are empty.
+
+            const long soft_pin_evict_num =
+                target_evict_num - static_cast<long>(no_pin_objects.size());
+            // For soft pin objects, prioritize to evict the ones with smaller
+            // lease timeout.
+            std::nth_element(
+                soft_pin_objects.begin(),
+                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
+                soft_pin_objects.end());
+            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
+
+            // Stop when the target is reached.
+            for (size_t i = 0;
+                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
+                auto& shard =
+                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+                MutexLocker lock(&shard.mutex);
+
+                auto it = shard.metadata.begin();
+                while (it != shard.metadata.end() && target_evict_num > 0) {
+                    // Skip objects that are not expired or have incomplete
+                    // replicas
+                    if (!it->second.IsLeaseExpired(now) ||
+                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                        ++it;
+                        continue;
+                    }
+                    // Evict objects with 1). no soft pin OR 2). with soft pin
+                    // and lease timeout less than or equal to target.
+                    if (!it->second.IsSoftPinned(now) ||
+                        it->second.lease_timeout <= soft_target_timeout) {
+                        total_freed_size +=
+                            it->second.size * it->second.replicas.size();
+                        it = shard.metadata.erase(it);
+                        evicted_count++;
+                        target_evict_num--;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        } else {
+            // This should not happen.
+            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
+                       << target_evict_num
+                       << ", no_pin_objects.size()=" << no_pin_objects.size()
+                       << ", soft_pin_objects.size()="
+                       << soft_pin_objects.size()
+                       << ", evicted_count=" << evicted_count
+                       << ", object_count=" << object_count
+                       << ", evict_ratio_target=" << evict_ratio_target
+                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        }
+    }
+
     if (evicted_count > 0) {
         need_eviction_ = false;
-        MasterMetricManager::instance().dec_key_count(evicted_count);
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {

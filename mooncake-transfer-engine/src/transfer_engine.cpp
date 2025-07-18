@@ -82,8 +82,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                     return -1;
                 }
             }
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" + std::to_string(desc.rpc_port);
         }
     } else {
         rpc_binding_method = "new RPC mapping";

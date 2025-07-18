@@ -22,6 +22,8 @@ MasterMetricManager::MasterMetricManager()
                       "Total capacity across all mounted segments"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
+      soft_pin_key_count_("master_soft_pin_key_count",
+                          "Total number of soft-pinned keys managed by the master"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_("master_value_size_bytes",
                                "Distribution of object value sizes",
@@ -86,6 +88,28 @@ MasterMetricManager::MasterMetricManager()
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
 
+      // Initialize Batch Request Counters
+      batch_exist_key_requests_("master_batch_exist_key_requests_total",
+                                "Total number of BatchExistKey requests received"),
+      batch_exist_key_failures_("master_batch_exist_key_failures_total",
+                                "Total number of failed BatchExistKey requests"),
+      batch_get_replica_list_requests_("master_batch_get_replica_list_requests_total",
+                                       "Total number of BatchGetReplicaList requests received"),
+      batch_get_replica_list_failures_("master_batch_get_replica_list_failures_total",
+                                       "Total number of failed BatchGetReplicaList requests"),
+      batch_put_start_requests_("master_batch_put_start_requests_total",
+                                "Total number of BatchPutStart requests received"),
+      batch_put_start_failures_("master_batch_put_start_failures_total",
+                                "Total number of failed BatchPutStart requests"),
+      batch_put_end_requests_("master_batch_put_end_requests_total",
+                              "Total number of BatchPutEnd requests received"),
+      batch_put_end_failures_("master_batch_put_end_failures_total",
+                              "Total number of failed BatchPutEnd requests"),
+      batch_put_revoke_requests_("master_batch_put_revoke_requests_total",
+                                 "Total number of BatchPutRevoke requests received"),
+      batch_put_revoke_failures_("master_batch_put_revoke_failures_total",
+                                 "Total number of failed BatchPutRevoke requests"),
+
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
                        "Total number of successful eviction operations"),
@@ -134,12 +158,19 @@ double MasterMetricManager::get_global_used_ratio(void) {
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
+void MasterMetricManager::inc_soft_pin_key_count(int64_t val) { soft_pin_key_count_.inc(val); }
+void MasterMetricManager::dec_soft_pin_key_count(int64_t val) { soft_pin_key_count_.dec(val); }
+
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
 }
 
 int64_t MasterMetricManager::get_key_count() {
     return key_count_.value();
+}
+
+int64_t MasterMetricManager::get_soft_pin_key_count() {
+    return soft_pin_key_count_.value();
 }
 
 // Cluster Metrics
@@ -221,6 +252,38 @@ void MasterMetricManager::inc_ping_requests(int64_t val) {
 }
 void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
+}
+
+// Batch Operation Statistics (Counters)
+void MasterMetricManager::inc_batch_exist_key_requests(int64_t val) {
+    batch_exist_key_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_exist_key_failures(int64_t val) {
+    batch_exist_key_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t val) {
+    batch_get_replica_list_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t val) {
+    batch_get_replica_list_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_start_requests(int64_t val) {
+    batch_put_start_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_start_failures(int64_t val) {
+    batch_put_start_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_end_requests(int64_t val) {
+    batch_put_end_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_end_failures(int64_t val) {
+    batch_put_end_failures_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_revoke_requests(int64_t val) {
+    batch_put_revoke_requests_.inc(val);
+}
+void MasterMetricManager::inc_batch_put_revoke_failures(int64_t val) {
+    batch_put_revoke_failures_.inc(val);
 }
 
 int64_t MasterMetricManager::get_put_start_requests() {
@@ -311,6 +374,46 @@ int64_t MasterMetricManager::get_ping_failures() {
     return ping_failures_.value();
 }
 
+int64_t MasterMetricManager::get_batch_exist_key_requests() {
+    return batch_exist_key_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_exist_key_failures() {
+    return batch_exist_key_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_requests() {
+    return batch_get_replica_list_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_failures() {
+    return batch_get_replica_list_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_requests() {
+    return batch_put_start_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_failures() {
+    return batch_put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_requests() {
+    return batch_put_end_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_failures() {
+    return batch_put_end_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_requests() {
+    return batch_put_revoke_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_failures() {
+    return batch_put_revoke_failures_.value();
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
     evicted_key_count_.inc(key_count);
@@ -362,6 +465,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(allocated_size_);
     serialize_metric(total_capacity_);
     serialize_metric(key_count_);
+    serialize_metric(soft_pin_key_count_);
     if (enable_ha_) {
         serialize_metric(active_clients_);
     }
@@ -394,6 +498,18 @@ std::string MasterMetricManager::serialize_metrics() {
         serialize_metric(ping_requests_);
         serialize_metric(ping_failures_);
     }
+
+    // Serialize Batch Request Counters
+    serialize_metric(batch_exist_key_requests_);
+    serialize_metric(batch_exist_key_failures_);
+    serialize_metric(batch_get_replica_list_requests_);
+    serialize_metric(batch_get_replica_list_failures_);
+    serialize_metric(batch_put_start_requests_);
+    serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_end_requests_);
+    serialize_metric(batch_put_end_failures_);
+    serialize_metric(batch_put_revoke_requests_);
+    serialize_metric(batch_put_revoke_failures_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);
@@ -428,6 +544,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t allocated = allocated_size_.value();
     int64_t capacity = total_capacity_.value();
     int64_t keys = key_count_.value();
+    int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
 
     // Request counters
@@ -461,7 +578,7 @@ std::string MasterMetricManager::get_summary_string() {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double) allocated / (double)capacity * 100.0) << "%)";
     }
-    ss << " | Keys: " << keys;
+    ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     if (enable_ha_) {
         ss << " | Clients: " << active_clients;
     }

@@ -9,12 +9,16 @@ set(MOONCAKE_STORE_SOURCES
     master_client.cpp
     utils.cpp
     master_metric_manager.cpp
+    storage_backend.cpp
+    local_file.cpp
+    thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
     segment.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
+    rpc_service.cpp
 )
 
 # The cache_allocator library
