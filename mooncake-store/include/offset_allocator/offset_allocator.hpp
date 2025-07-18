@@ -88,9 +88,10 @@ class OffsetAllocationHandle {
 // deallocation, 2) supports creating a buffer or allocating a memory region
 // that is larger than the largest bin size (3.75GB). The __allocator class is
 // also optimized to round up the allocated size to a bin size. This will
-// slightly decrease the memory utilization ratio in general cases, but will
-// largely improve the memory utilization ratio when the allocated size is
-// mostly uniform and not equal to a specific bin size.
+// a) slightly decrease the memory utilization ratio in general cases, b) makes
+// no difference when the allocated size is equal to a bin size, c) largely
+// improve the memory utilization ratio when the allocated size is mostly
+// uniform and not equal to any bin size.
 class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
    public:
     // Factory method to create shared_ptr<OffsetAllocator>
