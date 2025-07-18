@@ -174,6 +174,6 @@ void random_size_allocation_benchmark() {
 
 int main() {
     std::cout << "=== OffsetAllocator Benchmark ===" << std::endl;
-    //uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
+    uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
     random_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
 }
