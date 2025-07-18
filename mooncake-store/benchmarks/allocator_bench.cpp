@@ -2,6 +2,9 @@
 #include <random>
 #include <vector>
 #include <chrono>
+#include <algorithm>
+#include <numeric>
+#include <iomanip>
 
 #include "offset_allocator/offsetAllocator.hpp"
 
@@ -121,6 +124,7 @@ void random_size_allocation_benchmark() {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<uint32_t> dist(min_alloc_size, max_alloc_size);
 
+    // Warmup
     size_t max_allocs = pool_size / min_alloc_size + 10;
     BenchHelper bench_helper(0x1000, pool_size, max_allocs);
     for (size_t warmup_size = 0; warmup_size < pool_size;) {
@@ -129,29 +133,47 @@ void random_size_allocation_benchmark() {
         warmup_size += alloc_size;
     }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
-    double min_util_ratio = 1.0;
-    double total_util_ratio = 0.0;
     int benchmark_num = 1000000;
+    std::vector<double> util_ratios;
+    util_ratios.reserve(benchmark_num);
+
+    // Run benchmark
+    auto start_time = std::chrono::high_resolution_clock::now(); 
     for (int i = 0; i < benchmark_num; i++) {
         size_t alloc_size = dist(gen);
         bench_helper.allocate(alloc_size);
-        double util_ratio = bench_helper.get_allocated_ratio();
-        if (util_ratio < min_util_ratio) {
-            min_util_ratio = util_ratio;
-        }
-        total_util_ratio += util_ratio;
+        util_ratios.push_back(bench_helper.get_allocated_ratio());
     }
     auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
-    double avg_util_ratio = total_util_ratio / benchmark_num;
-    std::cout << "min util ratio: " << min_util_ratio
-                << ", avg util ratio: " << avg_util_ratio
-                << ", time: " << duration.count() / benchmark_num << " ns" << std::endl;
+
+    // Calculate metrics
+    const double avg_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end_time -
+                                                             start_time)
+            .count() /
+        static_cast<double>(benchmark_num);
+
+    std::sort(util_ratios.begin(), util_ratios.end());
+
+    const double min_util = util_ratios.front();
+    const double max_util = util_ratios.back();
+    const double p50 = util_ratios[util_ratios.size() * 0.50];
+    const double p90 = util_ratios[util_ratios.size() * 0.10];
+    const double p99 = util_ratios[util_ratios.size() * 0.01];
+
+    const double mean_util =
+        std::accumulate(util_ratios.begin(), util_ratios.end(), 0.0) /
+        util_ratios.size();
+
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "util ratio (min / p99 / p90 / p50 / max / avg): " << min_util
+              << " / " << p99 << " / " << p90 << " / " << p50 << " / "
+              << max_util << " / " << mean_util << std::endl;
+    std::cout << "avg alloc time: " << avg_time_ns << " ns/op" << std::endl;
 }
 
 int main() {
     std::cout << "=== OffsetAllocator Benchmark ===" << std::endl;
-    uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
+    //uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
     random_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
 }
