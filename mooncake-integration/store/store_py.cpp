@@ -14,6 +14,8 @@
 namespace py = pybind11;
 
 namespace {
+        auto torch = py::module_::import("torch");
+
         enum class TensorDtype : int32_t {
             FLOAT32 = 0,
             FLOAT64 = 1,
@@ -52,37 +54,25 @@ namespace {
             create_typed_array<uint64_t>,   // UINT64 = 9
             create_typed_array<bool>        // BOOL = 10
         }};
-        TensorDtype dtypeStringToEnum(const std::string& dtype_str) {
-            if (dtype_str.find("float32") != std::string::npos) return TensorDtype::FLOAT32;
-            if (dtype_str.find("float64") != std::string::npos) return TensorDtype::FLOAT64;
-            if (dtype_str.find("int8") != std::string::npos) return TensorDtype::INT8;
-            if (dtype_str.find("uint8") != std::string::npos) return TensorDtype::UINT8;
-            if (dtype_str.find("int16") != std::string::npos) return TensorDtype::INT16;
-            if (dtype_str.find("uint16") != std::string::npos) return TensorDtype::UINT16;
-            if (dtype_str.find("int32") != std::string::npos) return TensorDtype::INT32;
-            if (dtype_str.find("uint32") != std::string::npos) return TensorDtype::UINT32;
-            if (dtype_str.find("int64") != std::string::npos) return TensorDtype::INT64;
-            if (dtype_str.find("uint64") != std::string::npos) return TensorDtype::UINT64;
-            if (dtype_str.find("bool") != std::string::npos) return TensorDtype::BOOL;
-            return TensorDtype::UNKNOWN;
-        }
-
-        std::string dtypeEnumToString(TensorDtype dtype) {
-            switch (dtype) {
-                case TensorDtype::FLOAT32: return "torch.float32";
-                case TensorDtype::FLOAT64: return "torch.float64";
-                case TensorDtype::INT8: return "torch.int8";
-                case TensorDtype::UINT8: return "torch.uint8";
-                case TensorDtype::INT16: return "torch.int16";
-                case TensorDtype::UINT16: return "torch.uint16";
-                case TensorDtype::INT32: return "torch.int32";
-                case TensorDtype::UINT32: return "torch.uint32";
-                case TensorDtype::INT64: return "torch.int64";
-                case TensorDtype::UINT64: return "torch.uint64";
-                case TensorDtype::BOOL: return "torch.bool";
-                default: return "unknown";
+        TensorDtype get_tensor_dtype(py::object dtype_obj) {
+            if (dtype_obj.is_none()) {
+                return TensorDtype::UNKNOWN;
             }
-        }
+
+            if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
+            if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
+            if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
+            if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
+            if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
+            if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
+            if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
+            if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
+            if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
+            if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
+            if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
+
+        return TensorDtype::UNKNOWN;
+}
 
         struct TensorMetadata {
             int32_t dtype;        
@@ -1401,11 +1391,10 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         }
         
         TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
-        std::string dtype_str = dtypeEnumToString(dtype_enum);
-        if (dtype_str == "unknown") {
+        if (dtype_enum == TensorDtype::UNKNOWN) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
-            LOG(ERROR) << "Unknown tensor dtype: " << metadata.dtype;
+            LOG(ERROR) << "Unknown tensor dtype!";
             return pybind11::none();
         }
 
@@ -1416,8 +1405,6 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             LOG(ERROR) << "Invalid data format: no tensor data found";
             return pybind11::none();
         }
-
-        //char *tensor_data = data + sizeof(TensorMetadata);
 
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
@@ -1466,11 +1453,11 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         
         pybind11::object shape_obj = tensor.attr("shape");
         pybind11::object dtype_obj = tensor.attr("dtype");
-        std::string dtype_str = pybind11::str(dtype_obj).cast<std::string>();
-        
-        TensorDtype dtype_enum = dtypeStringToEnum(dtype_str);
+        //std::string dtype_str = pybind11::str(dtype_obj).cast<std::string>();
+
+        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
         if (dtype_enum == TensorDtype::UNKNOWN) {
-            LOG(ERROR) << "Unsupported tensor dtype: " << dtype_str;
+            LOG(ERROR) << "Unsupported tensor dtype!";
             return -1;
         }
 
