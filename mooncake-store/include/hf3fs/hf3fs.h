@@ -89,6 +89,7 @@ public:
     ~ThreeFSFile() override;
 
     ssize_t write(const std::string &buffer, size_t length) override;  
+    ssize_t write(std::span<const char> data, size_t length) override; 
     ssize_t read(std::string &buffer, size_t length) override;
     ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
     ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;

@@ -31,6 +31,10 @@ ThreeFSFile::~ThreeFSFile() {
 }
 
 ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
+    return write(std::span<const char>(buffer.data(), length), length);
+}
+
+ssize_t ThreeFSFile::write(std::span<const char> data, size_t length) {
     // 1. Parameter validation
     if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
         error_code_ = ErrorCode::FILE_INVALID_BUFFER;
@@ -54,7 +58,7 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
     // 4. Write in chunks
     auto& threefs_iov = resource->iov_;
     auto& ior_write = resource->ior_write_;
-    const char* data_ptr = buffer.data();
+    const char* data_ptr = data.data();
     size_t total_bytes_written = 0;
     off_t current_offset = 0;
     const size_t max_chunk_size = resource->config_.iov_size;

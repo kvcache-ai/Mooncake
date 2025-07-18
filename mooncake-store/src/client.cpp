@@ -1078,15 +1078,17 @@ void Client::PutToLocalFile(const std::string& key,
         total_size += slice.size;
     }
 
-    std::string value;
-    value.reserve(total_size);
+    auto buffer = std::make_shared<std::vector<char>>(total_size);
+
+    size_t offset = 0;
     for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
+        std::memcpy(buffer->data() + offset, slice.ptr, slice.size);
+        offset += slice.size;
     }
 
     write_thread_pool_.enqueue(
-        [backend = storage_backend_, key, value = std::move(value)] {
-            backend->StoreObject(key, value);
+        [backend = storage_backend_, key, value = std::move(buffer)] {
+            backend->StoreObject(key, std::span<const char>(*value));
         });
 }
 

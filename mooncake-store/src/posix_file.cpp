@@ -35,6 +35,10 @@ PosixFile::~PosixFile() {
 }
 
 ssize_t PosixFile::write(const std::string &buffer, size_t length) {
+    return write(std::span<const char>(buffer.data(), length), length);
+}
+
+ssize_t PosixFile::write(std::span<const char> data, size_t length) {
     if (fd_ < 0) {
         error_code_ = ErrorCode::FILE_NOT_FOUND;
         return -1;
@@ -57,12 +61,12 @@ ssize_t PosixFile::write(const std::string &buffer, size_t length) {
 
     size_t remaining = length;
     size_t written_bytes = 0;
-    const char* ptr = buffer.data();
+    const char* ptr = data.data();  
 
     while (remaining > 0) {
         ssize_t written = ::write(fd_, ptr, remaining);
         if (written == -1) {
-            if (errno == EINTR) continue;  
+            if (errno == EINTR) continue;
             error_code_ = ErrorCode::FILE_WRITE_FAIL;
             return -1;
         }
@@ -74,7 +78,7 @@ ssize_t PosixFile::write(const std::string &buffer, size_t length) {
     if (remaining > 0) {
         error_code_ = ErrorCode::FILE_WRITE_FAIL;
         return -1;
-    }   
+    }
 
     return written_bytes;
 }

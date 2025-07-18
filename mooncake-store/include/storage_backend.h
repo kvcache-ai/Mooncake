@@ -84,6 +84,14 @@ class StorageBackend  {
      * @return ErrorCode indicating operation status
      */
     ErrorCode StoreObject(const ObjectKey& key, const std::string& str) ;
+
+    /**
+     * @brief Stores an object from a span of data
+     * @param key Object identifier
+     * @param data Span containing object data
+     * @return ErrorCode indicating operation status
+     */
+    ErrorCode StoreObject(const ObjectKey& key, std::span<const char> data);
     
     /**
      * @brief Loads an object into slices

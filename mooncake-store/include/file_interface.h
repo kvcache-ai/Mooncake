@@ -72,6 +72,15 @@ public:
     virtual ssize_t write(const std::string &buffer, size_t length) = 0;
 
     /**
+     * @brief Writes data from buffer to file
+     * @param data Input span containing data to write
+     * @param length Number of bytes to write
+     * @return Number of bytes written on success, -1 on error
+     * @note Thread-safe operation with write locking
+     */
+    virtual ssize_t write(std::span<const char> data, size_t length) = 0;
+
+    /**
      * @brief Reads data from file into buffer
      * @param buffer Output buffer for read data
      * @param length Maximum number of bytes to read
@@ -132,6 +141,7 @@ public:
     ~PosixFile() override;
 
     ssize_t write(const std::string &buffer, size_t length) override;
+    ssize_t write(std::span<const char> data, size_t length) override; 
     ssize_t read(std::string &buffer, size_t length) override;
     ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
     ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;

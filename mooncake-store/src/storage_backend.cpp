@@ -57,9 +57,14 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
 
 ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
                                     const std::string& str) {
+    return StoreObject(key, std::span<const char>(str.data(), str.size()));                                    
+}
+
+ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+                                    std::span<const char> data) {
     std::string path = ResolvePath(key);
 
-    if(std::filesystem::exists(path) == true) {
+    if (std::filesystem::exists(path)) {
         return ErrorCode::FILE_OPEN_FAIL;
     }
     
@@ -69,22 +74,19 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         return ErrorCode::FILE_OPEN_FAIL;
     }
 
-    size_t file_total_size = str.size();
-    ssize_t ret = file->write(str, file_total_size);
+    size_t file_total_size = data.size();
+    ssize_t ret = file->write(data, file_total_size);  
 
     if (ret < 0) {
-        LOG(INFO) << "pwritev failed for: " << path;
-
+        LOG(INFO) << "Write failed for: " << path;
         return ErrorCode::FILE_WRITE_FAIL;
     }
     if (ret != static_cast<ssize_t>(file_total_size)) {
         LOG(INFO) << "Write size mismatch for: " << path
-                   << ", expected: " << file_total_size
-                   << ", got: " << ret;
-
+                 << ", expected: " << file_total_size
+                 << ", got: " << ret;
         return ErrorCode::FILE_WRITE_FAIL;
     }
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
 
     return ErrorCode::OK;
 }
