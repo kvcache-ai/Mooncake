@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <unordered_map>
 #include <yaml-cpp/node/node.h>
+#include <jsoncpp/json/json.h>
 
 namespace mooncake {
 class DefaultConfig {
 public:
     struct Node {
         YAML::Node yaml_node_;
+        Json::Value json_value_;
     };
 
     enum ConfigType {
@@ -96,7 +98,11 @@ public:
 private:
     void processNode(const YAML::Node& node, std::string key);
 
+    void processNode(const Json::Value& node, std::string key);
+
     void loadFromYAML();
+
+    void loadFromJSON();
 
     bool getValue(const std::string& key, Node* node) {
         auto it = data_.find(key);
