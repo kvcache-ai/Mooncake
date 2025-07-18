@@ -77,55 +77,20 @@ class OffsetAllocationHandle {
 
    private:
     std::weak_ptr<OffsetAllocator> m_allocator;
+    // The offset in m_allocation may not be equal to the real offset.
     OffsetAllocation m_allocation;
+    // The real offset and size of the allocated memory.
     uint64_t real_base;
     uint64_t real_size;
 };
 
-class __Allocator {
-   public:
-    __Allocator(uint32 size, uint32 maxAllocs = 128 * 1024);
-    __Allocator(__Allocator&& other);
-    ~__Allocator();
-    void reset();
-
-    OffsetAllocation allocate(uint32 size);
-    void free(OffsetAllocation allocation);
-
-    uint32 allocationSize(OffsetAllocation allocation) const;
-    OffsetAllocStorageReport storageReport() const;
-    OffsetAllocStorageReportFull storageReportFull() const;
-
-   private:
-    uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
-    void removeNodeFromBin(uint32 nodeIndex);
-
-    struct Node {
-        static constexpr NodeIndex unused = 0xffffffff;
-
-        uint32 dataOffset = 0;
-        uint32 dataSize = 0;
-        NodeIndex binListPrev = unused;
-        NodeIndex binListNext = unused;
-        NodeIndex neighborPrev = unused;
-        NodeIndex neighborNext = unused;
-        bool used = false;  // TODO: Merge as bit flag
-    };
-
-    uint32 m_size;
-    uint32 m_maxAllocs;
-    uint32 m_freeStorage;
-
-    uint32 m_usedBinsTop;
-    uint8 m_usedBins[NUM_TOP_BINS];
-    NodeIndex m_binIndices[NUM_LEAF_BINS];
-
-    Node* m_nodes;
-    NodeIndex* m_freeNodes;
-    uint32 m_freeOffset;
-};
-
-// Thread-safe wrapper class for __Allocator
+// Wrapper class for __Allocator, it 1) supports thread-safe allocation and
+// deallocation, 2) supports creating a buffer or allocating a memory region
+// that is larger than the largest bin size (3.75GB). The __allocator class is
+// also optimized to round up the allocated size to a bin size. This will
+// slightly decrease the memory utilization ratio in general cases, but will
+// largely improve the memory utilization ratio when the allocated size is
+// mostly uniform and not equal to a specific bin size.
 class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
    public:
     // Factory method to create shared_ptr<OffsetAllocator>
@@ -171,4 +136,48 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024);
 };
+
+class __Allocator {
+    public:
+     __Allocator(uint32 size, uint32 maxAllocs = 128 * 1024);
+     __Allocator(__Allocator&& other);
+     ~__Allocator();
+     void reset();
+ 
+     OffsetAllocation allocate(uint32 size);
+     void free(OffsetAllocation allocation);
+ 
+     uint32 allocationSize(OffsetAllocation allocation) const;
+     OffsetAllocStorageReport storageReport() const;
+     OffsetAllocStorageReportFull storageReportFull() const;
+ 
+    private:
+     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
+     void removeNodeFromBin(uint32 nodeIndex);
+ 
+     struct Node {
+         static constexpr NodeIndex unused = 0xffffffff;
+ 
+         uint32 dataOffset = 0;
+         uint32 dataSize = 0;
+         NodeIndex binListPrev = unused;
+         NodeIndex binListNext = unused;
+         NodeIndex neighborPrev = unused;
+         NodeIndex neighborNext = unused;
+         bool used = false;  // TODO: Merge as bit flag
+     };
+ 
+     uint32 m_size;
+     uint32 m_maxAllocs;
+     uint32 m_freeStorage;
+ 
+     uint32 m_usedBinsTop;
+     uint8 m_usedBins[NUM_TOP_BINS];
+     NodeIndex m_binIndices[NUM_LEAF_BINS];
+ 
+     Node* m_nodes;
+     NodeIndex* m_freeNodes;
+     uint32 m_freeOffset;
+ };
+
 }  // namespace mooncake::offset_allocator
