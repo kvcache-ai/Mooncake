@@ -1,7 +1,7 @@
 // (C) Sebastian Aaltonen 2023
 // MIT License (see file: LICENSE)
 
-#include "offset_allocator/offsetAllocator.hpp"
+#include "offset_allocator/offset_allocator.hpp"
 
 #include "mutex.h"
 #include <iostream>

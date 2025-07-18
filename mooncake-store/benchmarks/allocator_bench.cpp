@@ -6,7 +6,7 @@
 #include <numeric>
 #include <iomanip>
 
-#include "offset_allocator/offsetAllocator.hpp"
+#include "offset_allocator/offset_allocator.hpp"
 
 using namespace mooncake::offset_allocator;
 

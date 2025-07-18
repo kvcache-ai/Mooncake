@@ -19,7 +19,7 @@ set(MOONCAKE_STORE_SOURCES
     etcd_helper.cpp
     ha_helper.cpp
     rpc_service.cpp
-    offsetAllocator.cpp
+    offset_allocator.cpp
 )
 
 # The cache_allocator library
