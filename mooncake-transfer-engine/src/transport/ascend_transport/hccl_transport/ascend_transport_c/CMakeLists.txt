@@ -9,8 +9,7 @@ file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
 set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
 set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
 
-file(GLOB MPI_INCLUDE_DIR "/usr/include/mpich-*")
-file(GLOB MPI_LOCAL_INCLUDE_DIR "/usr/local/mpich-*/include")
+find_package(MPI REQUIRED)
 
 link_directories(${ASCEND_LIB_DIR})
 include_directories(/usr/local/include
@@ -23,8 +22,7 @@ include_directories(/usr/local/include
                     ${ASCEND_INCLUDE_DIR}/experiment/metadef/common/util/error_manager
                     ${ASCEND_INCLUDE_DIR}/experiment/runtime
                     ${ASCEND_INCLUDE_DIR}/experiment/msprof
-                    ${MPI_INCLUDE_DIR}
-                    ${MPI_LOCAL_INCLUDE_DIR}
+                    ${MPI_CXX_INCLUDE_DIRS}
                     /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/
                     )
 add_library(ascend_transport_mem SHARED  ${ASCEND_TRANSPORT_MEM_SOURCES})
