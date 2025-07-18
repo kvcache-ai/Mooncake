@@ -4,6 +4,7 @@
 #include "offset_allocator/offsetAllocator.hpp"
 
 #include "mutex.h"
+#include <iostream>
 
 #ifdef DEBUG
 #include <assert.h>
@@ -48,6 +49,7 @@ namespace SmallFloat {
 static constexpr uint32 MANTISSA_BITS = 3;
 static constexpr uint32 MANTISSA_VALUE = 1 << MANTISSA_BITS;
 static constexpr uint32 MANTISSA_MASK = MANTISSA_VALUE - 1;
+static constexpr uint64_t MAX_BIN_SIZE = 4026531840ull;  // 3.75GB
 
 // Bin sizes follow floating point (exponent + mantissa) distribution (piecewise
 // linear log approx) This ensures that for each size class, the average
@@ -465,7 +467,7 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
                                    OffsetAllocation allocation, uint64_t base,
-                                   uint32_t size)
+                                   uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
@@ -520,8 +522,9 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t s
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
     : m_base(base) {
-    const uint64_t max_bin_size = 4026531840ull;  // 3.75GB
-    for (m_multiplier = 1; max_bin_size * m_multiplier < size; m_multiplier *= 2) {}
+    for (m_multiplier = 1; SmallFloat::MAX_BIN_SIZE < size / m_multiplier;
+         m_multiplier *= 2) {
+    }
     m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
 }
 
@@ -537,6 +540,10 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 
     size_t fake_size =
         m_multiplier > 1 ? (size + m_multiplier - 1) / m_multiplier : size;
+
+    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+        return std::nullopt;
+    }
 
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.offset == OffsetAllocation::NO_SPACE) {

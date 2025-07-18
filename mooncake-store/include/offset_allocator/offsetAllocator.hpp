@@ -49,7 +49,7 @@ class OffsetAllocationHandle {
    public:
     // Constructor for valid allocation
     OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
-                     OffsetAllocation allocation, uint64_t base, uint32_t size);
+                     OffsetAllocation allocation, uint64_t base, uint64_t size);
 
     // Move constructor
     OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept;
