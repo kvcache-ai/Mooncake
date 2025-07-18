@@ -1,8 +1,8 @@
-set(THREEFS_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/threefs_file.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/threefs_resource_manager.cpp
+set(HF3FS_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/hf3fs_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hf3fs_resource_manager.cpp
 )
 
 include_directories("include")
 
-set(THREEFS_SOURCES ${THREEFS_SOURCES} PARENT_SCOPE)
+set(HF3FS_SOURCES ${HF3FS_SOURCES} PARENT_SCOPE)

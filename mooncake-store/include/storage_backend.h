@@ -29,12 +29,12 @@ class StorageBackend  {
         : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
             #ifdef USE_3FS
             resource_manager_ = std::make_unique<USRBIOResourceManager>();
-            ThreeFSParams params;
-            params.mount_root = root_dir;
-            params.iov_size = 32 << 20; // 32MB
-            params.ior_entries = 16;
-            params.io_depth = 0;
-            resource_manager_->setDefaultParams(params);
+            Hf3fsConfig config;
+            config.mount_root = root_dir;
+            config.iov_size = 32 << 20; // 32MB
+            config.ior_entries = 16;
+            config.io_depth = 0;
+            resource_manager_->setDefaultParams(config);
             #endif
         }
 

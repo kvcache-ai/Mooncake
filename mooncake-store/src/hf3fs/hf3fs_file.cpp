@@ -57,7 +57,7 @@ ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
     const char* data_ptr = buffer.data();
     size_t total_bytes_written = 0;
     off_t current_offset = 0;
-    const size_t max_chunk_size = resource->params.iov_size;
+    const size_t max_chunk_size = resource->config_.iov_size;
 
     while (total_bytes_written < length) {
         // Calculate current chunk size
@@ -136,7 +136,7 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
         // Calculate current chunk size
         size_t chunk_size = std::min<size_t>(
             length - total_bytes_read,
-            resource->params.iov_size
+            resource->config_.iov_size
         );
 
         // Prepare IO request
@@ -212,7 +212,7 @@ ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
         // 2. Determine current write chunk size (not exceeding shared buffer size)
         size_t current_chunk_size = std::min<size_t>(
             bytes_remaining,
-            resource->params.iov_size
+            resource->config_.iov_size
         );
 
         // 3. Copy data from user IOV to shared buffer
@@ -307,7 +307,7 @@ ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
     while(bytes_remaining > 0) {
         // Determine current block size
         size_t current_chunk_size =
-            std::min<size_t>(bytes_remaining, resource->params.iov_size);
+            std::min<size_t>(bytes_remaining, resource->config_.iov_size);
 
         // Prepare IO request
         int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, 

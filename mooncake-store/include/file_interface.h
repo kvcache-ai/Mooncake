@@ -9,86 +9,7 @@
 #include <thread>
 #include <sys/file.h>
 
-#ifdef USE_3FS
-#include <hf3fs_usrbio.h>
-#endif
-
 namespace mooncake {
-#ifdef USE_3FS
-// Forward declaration of USRBIOResourceManager
-struct ThreeFSParams {
-    // 3FS cluster related parameters
-    
-    // USRBIO related parameters
-    std::string mount_root = "/";    // Mount point root directory
-    size_t iov_size = 1024 * 1024;         // Shared memory size (1MB)
-    size_t ior_entries = 1024;             // Maximum number of requests in IO ring
-    //`0` for no control with I/O depth.
-    // If greater than 0, then only when `io_depth` I/O requests are in queue, they will be issued to server as a batch.
-    // If smaller than 0, then USRBIO will wait for at most `-io_depth` I/O requests are in queue and issue them in one batch. 
-    // If io_depth is 0, then USRBIO will issue all the prepared I/O requests to server ASAP.
-    size_t io_depth = 0;                  // IO batch processing depth
-    int ior_timeout = 0;                   // IO timeout (milliseconds)
-    
-};
-
-class USRBIOResourceManager {
-public:
-
-    USRBIOResourceManager() {}
-
-    void setDefaultParams(const ThreeFSParams& params) {
-        default_params_ = params;
-    }
-
-    struct ThreadUSRBIOResource* getThreadResource(
-        const ThreeFSParams &params);
-
-    struct ThreadUSRBIOResource* getThreadResource() {
-        return getThreadResource(default_params_);
-    }
-
-    ~USRBIOResourceManager();
-
-
-private:
-    USRBIOResourceManager(const USRBIOResourceManager &) = delete;
-    USRBIOResourceManager &operator=(const USRBIOResourceManager &) = delete;
-    ThreeFSParams default_params_;
-
-    // Thread resources map protection lock
-    std::mutex resource_map_mutex;
-
-    // ThreadID to resource mapping
-    std::unordered_map<std::thread::id, struct ThreadUSRBIOResource *>
-        thread_resources;
-};
-
-// Thread level USRBIO resource structure
-struct ThreadUSRBIOResource {
-  // USRBIO resources
-  struct hf3fs_iov iov_;
-  struct hf3fs_ior ior_read_;
-  struct hf3fs_ior ior_write_;
-
-  // Resource initialization status
-  bool initialized;
-
-  // Resource belongs to parameters
-  ThreeFSParams params;
-
-  ThreadUSRBIOResource() : initialized(false) {}
-
-  // Initialize resource
-  bool Initialize(const ThreeFSParams &params);
-
-  // Cleanup resource
-  void Cleanup();
-
-  ~ThreadUSRBIOResource() { Cleanup(); }
-};
-#endif // USE_3FS
-
 class FileLockRAII {
 public:
     enum class LockType { READ, WRITE };
@@ -216,21 +137,10 @@ public:
     ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
 };
 
-#ifdef USE_3FS
-class ThreeFSFile : public StorageFile {
-public:
-    ThreeFSFile(const std::string &filename, int fd, USRBIOResourceManager* resource_manager);
-    ~ThreeFSFile() override;
-
-    ssize_t write(const std::string &buffer, size_t length) override;  
-    ssize_t read(std::string &buffer, size_t length) override;
-    ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
-    ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
-
-private:
-    USRBIOResourceManager* resource_manager_;
-};
-#endif // USE_3FS
 } // namespace mooncake
+
+#ifdef USE_3FS
+#include <hf3fs/hf3fs.h>
+#endif
 
 
