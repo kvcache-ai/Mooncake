@@ -56,11 +56,11 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
-    int n = (uintptr_t(start) - aligned_start + len + pagesize - 1) / pagesize;
+    long long n = (uintptr_t(start) - aligned_start + len + pagesize - 1) / pagesize;
     void **pages = (void **)malloc(sizeof(void *) * n);
     int *status = (int *)malloc(sizeof(int) * n);
 
-    for (int i = 0; i < n; i++) {
+    for (long long i = 0; i < n; i++) {
         pages[i] = (void *)((char *)aligned_start + i * pagesize);
     }
 
@@ -77,7 +77,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     int node = status[0];
     uint64_t start_addr = (uint64_t)start;
     uint64_t new_start_addr;
-    for (int i = 1; i < n; i++) {
+    for (long long i = 1; i < n; i++) {
         if (status[i] != node) {
             new_start_addr = alignPage((uint64_t)start) + i * pagesize;
             entries.push_back({start_addr, size_t(new_start_addr - start_addr),

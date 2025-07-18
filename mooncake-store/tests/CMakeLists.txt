@@ -90,4 +90,15 @@ target_link_libraries(segment_test PUBLIC
 )
 add_test(NAME segment_test COMMAND segment_test)
 
+add_executable(offset_allocator_test offset_allocator_test.cpp)
+target_link_libraries(offset_allocator_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME offset_allocator_test COMMAND offset_allocator_test)
+
 add_subdirectory(e2e)
