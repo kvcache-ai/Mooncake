@@ -79,7 +79,6 @@ namespace {
             int32_t ndim;       
             int32_t shape[4];     
         };
-        static_assert(sizeof(TensorMetadata) == 24, "TensorMetadata size should be 24 bytes");
 }
 
 namespace mooncake {
@@ -1328,6 +1327,52 @@ int DistributedObjectStore::put_from(const std::string &key, void *buffer,
     return 0;
 }
 
+int DistributedObjectStore::put_from_with_metadata(const std::string &key, void *buffer, void *metadata_buffer,
+                                     size_t size, size_t metadata_size,
+                                     const ReplicateConfig &config) {
+    // NOTE: The buffer address must be previously registered with
+    // register_buffer() for zero-copy RDMA operations to work correctly
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
+
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to put empty data for key: " << key;
+        return 0;
+    }
+
+    // Create slices directly from the user buffer
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    // Add metadata slice
+    uint64_t metadata_offset = 0;
+    while (metadata_offset < metadata_size) {
+        auto metadata_chunk_size = std::min(metadata_size - metadata_offset, kMaxSliceSize);
+        void *metadata_chunk_ptr = static_cast<char *>(metadata_buffer) + metadata_offset;
+        slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
+        metadata_offset += metadata_chunk_size;
+    }
+
+    auto put_result = client_->Put(key, slices, config);
+    if (!put_result) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(put_result.error());
+        return -toInt(put_result.error());
+    }
+
+    return 0;
+}
+
+
 pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1335,9 +1380,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     }
 
     try {
-        SliceGuard guard(*this);
-        uint64_t total_length = 0;
-
+        
         auto query_result = client_->Query(key);
         if (!query_result) {
             py::gil_scoped_acquire acquire_gil;
@@ -1352,6 +1395,8 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
+        SliceGuard guard(*this);
+        uint64_t total_length = 0;
         int ret = allocateSlices(guard.slices(), replica_list, total_length);
         if (ret) {
             py::gil_scoped_acquire acquire_gil;
@@ -1453,7 +1498,6 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         
         pybind11::object shape_obj = tensor.attr("shape");
         pybind11::object dtype_obj = tensor.attr("dtype");
-        //std::string dtype_str = pybind11::str(dtype_obj).cast<std::string>();
 
         TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
         if (dtype_enum == TensorDtype::UNKNOWN) {
@@ -1481,20 +1525,14 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
             }
         }
         
-        size_t total_size = sizeof(TensorMetadata) + tensor_size;
-        char* combined_buffer = new char[total_size];
-        
-        std::memcpy(combined_buffer, &metadata, sizeof(TensorMetadata));
-        std::memcpy(combined_buffer + sizeof(TensorMetadata), 
-                reinterpret_cast<void*>(data_ptr), tensor_size);
-        
 
-        this->register_buffer(combined_buffer, total_size);
-        int result = this->put_from(key, combined_buffer, total_size);
-        this->unregister_buffer(combined_buffer);
-        
-        delete[] combined_buffer;
-
+        char* buffer = reinterpret_cast<char*>(data_ptr);
+        char* metadata_buffer = reinterpret_cast<char*>(&metadata);
+        this->register_buffer(buffer, tensor_size);
+        this->register_buffer(metadata_buffer, sizeof(TensorMetadata));
+        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMetadata));
+        this->unregister_buffer(buffer);
+        this->unregister_buffer(metadata_buffer);
         return result;
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
@@ -1644,6 +1682,25 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
             "Put object data directly from a pre-allocated buffer")
+        .def(
+            "put_from_with_metadata",
+            [](DistributedObjectStore &self, const std::string &key,
+               uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr,
+               size_t size, size_t metadata_size,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                // Put data directly from user-provided buffer with metadata
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void *metadata_buffer =
+                    reinterpret_cast<void *>(metadata_buffer_ptr);
+                py::gil_scoped_release release;
+                return self.put_from_with_metadata(
+                    key, buffer, metadata_buffer, size, metadata_size, config);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("metadata_buffer_ptr"),
+            py::arg("size"), py::arg("metadata_size"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from a pre-allocated buffer with metadata"
+        )
         .def(
             "batch_put_from",
             [](DistributedObjectStore &self,

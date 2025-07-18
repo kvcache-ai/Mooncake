@@ -160,6 +160,25 @@ class DistributedObjectStore {
 
     /**
      * @brief Put object data directly from pre-allocated buffers for multiple
+     * keys(metadata version, better not be directly used in Python)
+     * @param keys Vector of keys of the objects to put
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param metadata_buffers Vector of pointers to the pre-allocated metadata buffers
+     * @param size Number of sizes of the buffers
+     * @param metadata_size Number of sizes of the metadata buffers
+     * @param config Replication configuration
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    int put_from_with_metadata(const std::string &key, void *buffer,
+                                     void *metadata_buffer, size_t size,
+                                     size_t metadata_size,
+                                     const ReplicateConfig &config = ReplicateConfig{});
+
+    /**
+     * @brief Put object data directly from pre-allocated buffers for multiple
      * keys (batch version)
      * @param keys Vector of keys of the objects to put
      * @param buffers Vector of pointers to the pre-allocated buffers
@@ -170,6 +189,8 @@ class DistributedObjectStore {
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
+
+    
     std::vector<int> batch_put_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
