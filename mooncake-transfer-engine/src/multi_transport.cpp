@@ -82,11 +82,9 @@ Status MultiTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    struct SubmitTasks {
-        std::vector<TransferRequest *> request_list;
-        std::vector<Transport::TransferTask *> task_list;
-    };
-    std::unordered_map<Transport *, SubmitTasks> submit_tasks;
+
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+        submit_tasks;
     for (auto &request : entries) {
         Transport *transport = nullptr;
         auto status = selectTransport(request, transport);
@@ -94,15 +92,13 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.request = &request;
         ++task_id;
-        submit_tasks[transport].request_list.push_back(
-            (TransferRequest *)&request);
-        submit_tasks[transport].task_list.push_back(&task);
+        submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second.request_list,
-                                                      entry.second.task_list);
+        auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
