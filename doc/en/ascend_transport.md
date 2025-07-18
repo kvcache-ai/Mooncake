@@ -70,6 +70,9 @@ Alternatively, you can copy the `.so` file to another path referenced by `$LD_LI
    sudo apt install mpich libmpich-dev
 ```
 
+6. **IPV6 is not support**:
+   IPv6 is not supported in this release; an IPv6-compatibility patch will be delivered shortly.
+
 ## One-Step Installation Script (Without Compiling Mooncake)
 
 If you have already compiled Mooncake on one machine, you can skip the compilation step on other machines with the same system and only install the dependencies. You can directly use the output artifacts of Mooncake, `libascend_transport_mem.so` and `mooncake-wheel/dist/mooncake_transfer_engine*.whl`.

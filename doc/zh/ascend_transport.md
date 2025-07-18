@@ -41,6 +41,8 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packa
 sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
 sudo apt install mpich libmpich-dev        # 安装 MPICH
 
+6.当前版本不支持IPV6，我们会很快完成针对IPV6的适配。
+
 ### 一键式安装脚本(不编译Mooncake)
 用户如果在一台机器上编译过Mooncake，在其它相同系统的机器上可以不编译Mooncake只安装依赖项，直接使用Mooncake的输出件libascend_transport_mem.so和mooncake whl包。
 用户将whl包、so包和scripts/ascend/dependencies_ascend_installation.sh都放置到同一目录下，执行脚本即可，命令如下：

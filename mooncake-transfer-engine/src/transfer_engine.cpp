@@ -50,11 +50,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     std::string rpc_binding_method;
 
 #ifdef USE_ASCEND
-    // The only difference in initializing  the Ascend Transport is that the `local_server_name` must include the physical NPU card ID.
+    // The only difference in initializing the Ascend Transport is that the `local_server_name` must include the physical NPU card ID.
     // The format changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
     // While the desc_name stored in the metadata remains in the format of ip:port.
     int devicePhyId = -1;
-    std::string mutable_server_name = local_server_name;
     auto[host_name, port] = parseHostNameWithPortAscend(local_server_name, &devicePhyId);
     LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: " << host_name
               << " port: " << port << " devicePhyId: " << devicePhyId;
@@ -82,7 +81,12 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                     return -1;
                 }
             }
+#ifdef USE_ASCEND
+            // The current version of Ascend Transport does not support IPv6, but it will be added in a future release.
+            local_server_name_ = desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+#else
             local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" + std::to_string(desc.rpc_port);
+#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -116,6 +120,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
+    std::string mutable_server_name = local_server_name_ + ":npu_" + std::to_string(devicePhyId);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, mutable_server_name);
 #else
