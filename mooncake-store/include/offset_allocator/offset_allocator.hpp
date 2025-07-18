@@ -73,15 +73,15 @@ class OffsetAllocationHandle {
     void* ptr() const { return reinterpret_cast<void*>(address()); }
 
     // Get size
-    uint64_t size() const { return real_size; }
+    uint64_t size() const { return requested_size; }
 
    private:
     std::weak_ptr<OffsetAllocator> m_allocator;
     // The offset in m_allocation may not be equal to the real offset.
     OffsetAllocation m_allocation;
-    // The real offset and size of the allocated memory.
+    // The real base and requested size of the allocated memory.
     uint64_t real_base;
-    uint64_t real_size;
+    uint64_t requested_size;
 };
 
 // Wrapper class for __Allocator, it 1) supports thread-safe allocation and
@@ -110,15 +110,15 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     ~OffsetAllocator() = default;
 
     // Allocate memory and return a Handle (thread-safe)
+    [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
 
-    // Get allocation size (thread-safe)
-    uint32 allocationSize(const OffsetAllocation& allocation) const;
-
     // Get storage report (thread-safe)
+    [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;
 
     // Get full storage report (thread-safe)
+    [[nodiscard]]
     OffsetAllocStorageReportFull storageReportFull() const;
 
    private:
@@ -131,7 +131,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     const uint64_t m_base;
     // The real offset and size of the allocated memory need to be multiplied by
     // m_multiplier
-    uint64_t m_multiplier;
+    const uint64_t m_multiplier;
     mutable Mutex m_mutex;
 
     // Private constructor - use create() factory method instead

@@ -229,7 +229,12 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     // Modified in Mooncake project: Round up to bin size. Otherwise when this
     // node is freed, if it cannot be merged with neighbors, it will be inserted
     // to a smaller bin.
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    uint32 roundupSize = size;
+#else
+    // In default, round up to bin size.
     uint32 roundupSize = SmallFloat::floatToUint(minBinIndex);
+#endif
     node.dataSize = roundupSize;
     node.used = true;
     m_binIndices[binIndex] = node.binListNext;
@@ -471,16 +476,16 @@ OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> 
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
-      real_size(size) {}
+      requested_size(size) {}
 
 OffsetAllocationHandle::OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
-      real_size(other.real_size) {
+      requested_size(other.requested_size) {
     other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
     other.real_base = 0;
-    other.real_size = 0;
+    other.requested_size = 0;
 }
 
 OffsetAllocationHandle& OffsetAllocationHandle::operator=(
@@ -496,12 +501,12 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         m_allocator = std::move(other.m_allocator);
         m_allocation = other.m_allocation;
         real_base = other.real_base;
-        real_size = other.real_size;
+        requested_size = other.requested_size;
 
         // Reset other
         other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
         other.real_base = 0;
-        other.real_size = 0;
+        other.requested_size = 0;
     }
     return *this;
 }
@@ -513,6 +518,14 @@ OffsetAllocationHandle::~OffsetAllocationHandle() {
     }
 }
 
+// Helper function to calculate the multiplier
+static uint64_t calculateMultiplier(size_t size) {
+    uint64_t multiplier = 1;
+    for (; SmallFloat::MAX_BIN_SIZE < size / multiplier; multiplier *= 2) {
+    }
+    return multiplier;
+}
+
 // Thread-safe OffsetAllocator implementation
 std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t size,
                                              uint32 maxAllocs) {
@@ -521,10 +534,7 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t s
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
-    : m_base(base) {
-    for (m_multiplier = 1; SmallFloat::MAX_BIN_SIZE < size / m_multiplier;
-         m_multiplier *= 2) {
-    }
+    : m_base(base), m_multiplier(calculateMultiplier(size)) {
     m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
 }
 
@@ -554,14 +564,6 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     return OffsetAllocationHandle(shared_from_this(), allocation,
                             m_base + allocation.offset * m_multiplier,
                             size);
-}
-
-uint32 OffsetAllocator::allocationSize(const OffsetAllocation& allocation) const {
-    MutexLocker guard(&m_mutex);
-    if (!m_allocator) {
-        return 0;
-    }
-    return m_allocator->allocationSize(allocation);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
