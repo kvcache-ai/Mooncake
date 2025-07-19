@@ -19,7 +19,7 @@ def get_client(store):
     device_name = os.getenv("DEVICE_NAME", "eth0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
-    global_segment_size = 512 * 1024 * 1024  # 3200 MB
+    global_segment_size = 512 * 1024 * 1024   # 512 MB
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
@@ -60,6 +60,30 @@ class TestStats:
         
     def get_duration(self):
         return self.end_time - self.start_time if self.end_time > self.start_time else 0
+
+    def combine(self, other):
+        """Merge data from another TestStats object into the current one"""
+        # Merge operation counts
+        self.operation_count += other.operation_count
+        self.success_count += other.success_count
+        self.failure_count += other.failure_count
+        
+        # Merge latency data
+        self.latencies.extend(other.latencies)
+        
+        # Merge error codes
+        for code, count in other.error_codes.items():
+            self.error_codes[code] += count
+        
+        # Merge data volume
+        self.data_transferred += other.data_transferred
+        
+        # Merge thread duration (used for computing concurrency efficiency)
+        if hasattr(other, 'thread_duration'):
+            if not hasattr(self, 'thread_duration'):
+                self.thread_duration = 0
+            self.thread_duration = max(self.thread_duration, other.thread_duration)
+
         
     def record_operation(self, success, latency, data_size=0, error_code=None):
         self.operation_count += 1
@@ -73,6 +97,62 @@ class TestStats:
             self.latencies.append(latency)
         if data_size > 0:
             self.data_transferred += data_size
+
+    def record_throughput(self, total_ops, total_data, duration):
+        """Record overall throughput metrics"""
+        self.total_ops = total_ops
+        self.total_data = total_data
+        self.duration = duration
+        self.ops_per_sec = total_ops / duration if duration > 0 else 0
+        self.mb_per_sec = total_data / duration / (1024 * 1024) if duration > 0 else 0
+        
+    def print_throughput(self, thread_put_stats, thread_get_stats):
+        """Print throughput statistics"""
+        # Calculate PUT concurrency efficiency
+        if thread_put_stats:
+            # Calculate average thread time
+            total_put_time = sum(s.thread_duration for s in thread_put_stats)
+            avg_put_time = total_put_time / len(thread_put_stats)
+            
+            # Calculate slowest thread time
+            max_put_time = max(s.thread_duration for s in thread_put_stats)
+            
+            # Calculate concurrency efficiency (using average time)
+            put_efficiency = total_put_time / avg_put_time if avg_put_time > 0 else 0
+        else:
+            avg_put_time = 0
+            max_put_time = 0
+            put_efficiency = 0
+
+        # Calculate GET concurrency efficiency
+        if thread_get_stats:
+            # Calculate average thread time
+            total_get_time = sum(s.thread_duration for s in thread_get_stats)
+            avg_get_time = total_get_time / len(thread_get_stats)
+            
+            # Calculate slowest thread time
+            max_get_time = max(s.thread_duration for s in thread_get_stats)
+            
+            # Calculate concurrency efficiency (using average time)
+            get_efficiency = total_get_time / avg_get_time if avg_get_time > 0 else 0
+        else:
+            avg_get_time = 0
+            max_get_time = 0
+            get_efficiency = 0
+            
+        print(f"\n=== {self.test_name} STATISTICS ===")
+        print(f"Concurrent Throughput: {self.ops_per_sec:.2f} ops/sec, {self.mb_per_sec:.2f} MB/s")
+        print(f"Total Operations: {self.total_ops}, Duration: {self.duration:.2f} seconds")
+
+        print(f"Put Concurrency Efficiency: {put_efficiency*100:.2f}%")
+        print(f"  • Average Thread Time: {avg_put_time:.4f}s")
+        print(f"  • Slowest Thread Time: {max_put_time:.4f}s")
+        print(f"  • Efficiency Ratio: {avg_put_time/max_put_time:.2f}")
+
+        print(f"Get Concurrency Efficiency: {get_efficiency*100:.2f}%")
+        print(f"  • Average Thread Time: {avg_get_time:.4f}s")
+        print(f"  • Slowest Thread Time: {max_get_time:.4f}s")
+        print(f"  • Efficiency Ratio: {avg_get_time/max_get_time:.2f}")
             
     def print_stats(self):
         """Print comprehensive statistics for the test."""
@@ -207,7 +287,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Phase 3: Cleanup
         # --------------------------
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-        index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
             self.store.remove(key)
@@ -224,15 +303,19 @@ class TestDistributedObjectStore(unittest.TestCase):
         2. Thread safety
         """
         NUM_THREADS = 4
-        VALUE_SIZE = 1024*1024
+        VALUE_SIZE = 1024 * 1024
         OPERATIONS_PER_THREAD = 1000
 
         thread_exceptions = []
         references = {}
         
-        # Create shared statistics objects
+        # Create independent PUT and GET statistics objects
         put_stats = TestStats("Concurrent Put Operations")
         get_stats = TestStats("Concurrent Get Operations")
+        
+        # Create thread-level statistics objects
+        thread_put_stats = [TestStats(f"Thread-{i}-Put") for i in range(NUM_THREADS)]
+        thread_get_stats = [TestStats(f"Thread-{i}-Get") for i in range(NUM_THREADS)]
         
         index = 0
         while index < OPERATIONS_PER_THREAD:
@@ -241,11 +324,12 @@ class TestDistributedObjectStore(unittest.TestCase):
             references[key] = value
             index = index + 1
         
-        def worker(thread_id, stats):
+        def worker(thread_id, put_stats, get_stats):
             try:
                 print(f"Thread {thread_id} started") 
                 
-                # Put operations
+                # PUT operation phase
+                put_start = time.perf_counter()
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = "k_" + str(index)
@@ -255,15 +339,14 @@ class TestDistributedObjectStore(unittest.TestCase):
                     result = self.store.put(key, test_data)
                     op_end = time.perf_counter()
                     latency = op_end - op_start
-                    
                     success = (result == 0)
-                    stats.record_operation(success, latency, VALUE_SIZE, result if not success else None)
-                    
+                    put_stats.record_operation(success, latency, VALUE_SIZE, result if not success else None)
                     index = index + 1
-                    if index % 500 == 0:
-                        print(f"Thread {thread_id}: put completed {index} entries")
-            
-                # Get operations
+                put_end = time.perf_counter()
+                put_stats.thread_duration = put_end - put_start  # Record thread PUT duration
+                
+                # GET operation phase
+                get_start = time.perf_counter()
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = "k_" + str(index)
@@ -272,67 +355,71 @@ class TestDistributedObjectStore(unittest.TestCase):
                     retrieved_data = self.store.get(key)
                     op_end = time.perf_counter()
                     latency = op_end - op_start
-                    
                     if len(retrieved_data) != 0:
                         expected_value = references[key]
                         success = (retrieved_data == expected_value)
-                        stats.record_operation(success, latency, VALUE_SIZE)
+                        get_stats.record_operation(success, latency, VALUE_SIZE)
                         if not success:
                             print(f"Thread {thread_id}: Data mismatch for key {key}")
                     else:
-                        stats.record_operation(False, latency, VALUE_SIZE, -1)
+                        get_stats.record_operation(False, latency, VALUE_SIZE, -1)
                     
                     index = index + 1
-                    if index % 500 == 0:
-                        print(f"Thread {thread_id}: get completed {index} entries")
-
-                print(f"Thread {thread_id} completed")  
+                get_end = time.perf_counter()
+                get_stats.thread_duration = get_end - get_start  # Record thread GET duration
                 
+                print(f"Thread {thread_id} completed")  
             except Exception as e:
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
                 print("Exception in thread:", str(e))
         
+        # Record overall start time
+        overall_start = time.perf_counter()
         
         # Create and start threads
         threads = []
-        thread_stats = [TestStats(f"Thread-{i}") for i in range(NUM_THREADS)]
-        put_stats.start_timer()
-        
         for i in range(NUM_THREADS):
-            t = threading.Thread(target=worker, args=(i, thread_stats[i]), name=f"Worker-{i}")
+            t = threading.Thread(target=worker, 
+                                args=(i, thread_put_stats[i], thread_get_stats[i]))
             threads.append(t)
             t.start()
 
-        # Join all threads
+        # Wait for all threads to complete
         for t in threads:
             t.join()
-            
-        put_stats.stop_timer()
         
-        # Combine thread stats
-        for stats in thread_stats:
-            put_stats.operation_count += stats.operation_count
-            put_stats.success_count += stats.success_count
-            put_stats.failure_count += stats.failure_count
-            put_stats.latencies.extend(stats.latencies)
-            put_stats.data_transferred += stats.data_transferred
-            for code, count in stats.error_codes.items():
-                put_stats.error_codes[code] += count
-
-        # Check for any exceptions
+        # Record overall end time
+        overall_end = time.perf_counter()
+        
+        # Check for exceptions
         self.assertEqual(len(thread_exceptions), 0, "\n".join(thread_exceptions))
 
-        # Print combined statistics
+        # Merge thread statistics into main statistics objects
+        for i in range(NUM_THREADS):
+            put_stats.combine(thread_put_stats[i])
+            get_stats.combine(thread_get_stats[i])
+        
+        # Calculate overall throughput statistics
+        total_duration = overall_end - overall_start
+        total_put_ops = OPERATIONS_PER_THREAD * NUM_THREADS
+        total_get_ops = OPERATIONS_PER_THREAD * NUM_THREADS
+        total_ops = total_put_ops + total_get_ops
+        total_data = total_ops * VALUE_SIZE
+        
+        # Create throughput statistics object
+        throughput_stats = TestStats("Concurrent overall ")
+        throughput_stats.record_throughput(total_ops, total_data, total_duration)
+        
+        # Print detailed statistics
         put_stats.print_stats()
+        get_stats.print_stats()
+        throughput_stats.print_throughput(thread_put_stats, thread_get_stats)
 
-        # Remove all keys
+        # Cleanup
         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
-        index = 0
-        while index < OPERATIONS_PER_THREAD:
-            key = "k_" + str(index)
+        for key in references.keys():
             self.store.remove(key)
-            index += 1
-        print("Cleanup completed")  
+        print("Cleanup completed")
 
     def test_batch_get_in_evict_operations(self):
         """Test batch Put/Get operations with eviction scenario
@@ -347,7 +434,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         reference = {}
         
         # Initialize statistics
-        put_stats = TestStats("Batch Put Operations")
+        put_stats = TestStats("Put Operations")
         get_stats = TestStats("Batch Get Operations")
 
         # --------------------------
@@ -454,10 +541,6 @@ class TestDistributedObjectStore(unittest.TestCase):
                         get_stats.record_operation(False, latency, VALUE_SIZE, result)
                 else:
                     get_stats.record_operation(False, latency, VALUE_SIZE, -2)
-            
-            # Record batch latency
-            get_stats.record_operation(batch_success == len(batch_keys), latency, 
-                                      len(batch_keys) * VALUE_SIZE)
             
             if index % 500 == 0:
                 print("completed", index, "entries")
