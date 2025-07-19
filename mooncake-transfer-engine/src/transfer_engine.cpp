@@ -73,13 +73,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            if (port == getDefaultHandshakePort()) {
-                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-                if (desc.rpc_port == 0) {
-                    LOG(ERROR)
-                        << "P2P: No valid port found for local TCP service.";
-                    return -1;
-                }
+            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            if (desc.rpc_port == 0) {
+                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                return -1;
             }
 #ifdef USE_ASCEND
             // The current version of Ascend Transport does not support IPv6, but it will be added in a future release.
@@ -153,7 +150,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                   << local_topology_->getHcaList().size() << " HCAs.";
 
 #ifdef USE_MNNVL
-        if (local_topology_->getHcaList().size() > 0 && !getenv("MC_FORCE_MNNVL")) {
+        if (local_topology_->getHcaList().size() > 0 &&
+            !getenv("MC_FORCE_MNNVL")) {
             multi_transports_->installTransport("rdma", local_topology_);
         } else {
             multi_transports_->installTransport("nvlink", nullptr);
@@ -229,11 +227,18 @@ int TransferEngine::getNotifies(
     return metadata_->getNotifies(notifies);
 }
 
-int TransferEngine::sendNotify(SegmentID target_id,
-                               TransferMetadata::NotifyDesc notify_msg) {
+int TransferEngine::sendNotifyByID(SegmentID target_id,
+                                   TransferMetadata::NotifyDesc notify_msg) {
     auto desc = metadata_->getSegmentDescByID(target_id);
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+    return ret;
+}
+
+int TransferEngine::sendNotifyByName(std::string remote_agent,
+                                     TransferMetadata::NotifyDesc notify_msg) {
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
     return ret;
 }
 
