@@ -40,6 +40,7 @@ endif()
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
+include_directories(mooncake-common/include)
 
 add_subdirectory(mooncake-transfer-engine)
 include_directories(mooncake-transfer-engine/include)

@@ -1,0 +1,10 @@
+{
+    "testInteger": 43,
+    "testFloat": 4.15,
+    "testString": "Hello, World",
+    "testBoolean": false,
+    "testObject": {
+        "nestedInteger": 1000,
+        "nestedString": "Nested Hello, World"
+    }
+}

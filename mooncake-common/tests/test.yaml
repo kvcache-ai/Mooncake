@@ -1,0 +1,7 @@
+testInteger: 42
+testFloat: 3.14
+testString: "Hello, World!"
+testBoolean: true
+testObject:
+  nestedInteger: 100
+  nestedString: "Nested Hello"
