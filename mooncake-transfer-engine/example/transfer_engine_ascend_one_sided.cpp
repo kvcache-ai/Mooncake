@@ -42,7 +42,9 @@ DEFINE_string(segment_id, "10.20.130.154:12346", "Segment ID to access data");
 DEFINE_int32(batch_size, 20, "Batch size");
 DEFINE_uint64(block_size, 8388608, "Block size for each transfer request");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
-DEFINE_uint64(device_id, 0, "The device ID of this machine");
+DEFINE_uint64(device_id, 65536, "The device logic and phy ID of this machine");
+DEFINE_uint64(device_logicid, 0, "The device logic ID of this machine");
+DEFINE_uint64(device_phyid, 0, "The device phy ID of this machine");
 DEFINE_string(segment_id_1, "NA", "A segment ID that a sender wants to another receiver");
 DEFINE_uint64(recv_num, 1, "Num of coonections received by the receiver");
 DEFINE_uint64(send_index, 0, "which one is sent to the same receiver");
@@ -51,7 +53,8 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 using namespace mooncake;
 
-int g_deviceId = 0;
+int g_deviceLogicId = 0;
+int g_devicePhyId = 0;
 uint64_t g_TotalSize = 0;
 
 const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
@@ -121,7 +124,7 @@ int allocateDevMem(void* &devAddr, size_t size) {
 
 int initiator() {
     aclrtContext context = nullptr;
-    aclError ret = aclrtCreateContext(&context, g_deviceId);
+    aclError ret = aclrtCreateContext(&context, g_deviceLogicId);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to create context, ret: " << ret;
         return ret;
@@ -130,7 +133,7 @@ int initiator() {
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    std::string FLAGS_local_server_name_npu = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_deviceId);
+    std::string FLAGS_local_server_name_npu = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_devicePhyId);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_npu.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
     
@@ -144,7 +147,7 @@ int initiator() {
     LOG(INFO) << "devAddr_initiator: " << devAddr;
 
     ret = engine->registerLocalMemory(devAddr, g_TotalSize,
-                                        "npu:" + std::to_string(g_deviceId));
+                                        "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;
@@ -160,7 +163,7 @@ int initiator() {
     LOG(INFO) << "devAddr_initiator2: " << devAddr2;
 
     ret = engine->registerLocalMemory(devAddr2, g_TotalSize,
-                                        "npu:" + std::to_string(g_deviceId));
+                                        "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;
@@ -204,21 +207,25 @@ int initiator() {
 
     s = engine->submitTransfer(batch_id, requests);
     LOG_ASSERT(s.ok());
-    for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
-        bool completed = false;
-        TransferStatus status;
-        while (!completed) {
-            Status s = engine->getTransferStatus(batch_id, task_id, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED)
-                completed = true;
-            else if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "getTransferStatus FAILED";
-                completed = true;
-                return -1;
-            }
+    bool completed = false;
+    TransferStatus status;
+    while (!completed) {
+        Status s = engine->getBatchTransferStatus(batch_id, status);
+        LOG_ASSERT(s.ok());
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            completed = true;
+        } else if (status.s == TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "getTransferStatus FAILED";
+            completed = true;
+        } else if (status.s == TransferStatusEnum::TIMEOUT) {
+            LOG(INFO) << "Sync data transfer timeout";
+            completed = true;
         }
     }
+
+    s = engine->freeBatchID(batch_id);
+    LOG_ASSERT(s.ok());
+
     LOG(INFO) << "The First Time Send OK";
 
     uint64_t remote_base2 =
@@ -235,24 +242,26 @@ int initiator() {
         entry.target_offset = remote_base2 + FLAGS_block_size * i + g_TotalSize * FLAGS_send_index; 
         requests2.emplace_back(entry);
     }
-
+    completed = false;
     s = engine->submitTransfer(batch_id_2, requests2);
     LOG_ASSERT(s.ok());
-    for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
-        bool completed = false;
-        TransferStatus status;
-        while (!completed) {
-            s = engine->getTransferStatus(batch_id_2, task_id, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED)
-                completed = true;
-            else if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "getTransferStatus FAILED";
-                completed = true;
-                return -1;
-            }
+    while (!completed) {
+        Status s = engine->getBatchTransferStatus(batch_id_2, status);
+        LOG_ASSERT(s.ok());
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            completed = true;
+        } else if (status.s == TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "getTransferStatus FAILED";
+            completed = true;
+        } else if (status.s == TransferStatusEnum::TIMEOUT) {
+            LOG(INFO) << "Sync data transfer timeout";
+            completed = true;
         }
     }
+
+    s = engine->freeBatchID(batch_id_2);
+    LOG_ASSERT(s.ok());
+
     LOG(INFO) << "The Second Time Send OK";
 
     gettimeofday(&stop_tv, nullptr);
@@ -264,8 +273,6 @@ int initiator() {
               << calculateRate(
                      FLAGS_batch_size * FLAGS_block_size,
                      duration);
-    s = engine->freeBatchID(batch_id);
-    LOG_ASSERT(s.ok());
     
     // When testing 1-to-2 transmission (1 initiator to 2 targets), fill in the segment_id of the second receiver.  
     // If not filled, it defaults to "NA" and 1-to-2 transmission is not enabled, only 1-to-1 transmission is performed.
@@ -305,19 +312,19 @@ int initiator() {
 
         s = engine->submitTransfer(batch_id, requests);
         LOG_ASSERT(s.ok());
-        for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
-            bool completed = false;
-            TransferStatus status;
-            while (!completed) {
-                Status s = engine->getTransferStatus(batch_id, task_id, status);
-                LOG_ASSERT(s.ok());
-                if (status.s == TransferStatusEnum::COMPLETED)
-                    completed = true;
-                else if (status.s == TransferStatusEnum::FAILED) {
-                    LOG(ERROR) << "getTransferStatus FAILED";
-                    completed = true;
-                    return -1;
-                }
+        bool completed = false;
+        TransferStatus status;
+        while (!completed) {
+            Status s = engine->getBatchTransferStatus(batch_id, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                completed = true;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "getTransferStatus FAILED";
+                completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                completed = true;
             }
         }
 
@@ -337,7 +344,7 @@ volatile bool target_running = true;
 
 int target() {
     aclrtContext context = nullptr;
-    aclError ret = aclrtCreateContext(&context, g_deviceId);
+    aclError ret = aclrtCreateContext(&context, g_deviceLogicId);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) <<"Failed to create context, ret: " << ret;
         return -1;
@@ -346,7 +353,7 @@ int target() {
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    std::string FLAGS_local_server_name_npu = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_deviceId);
+    std::string FLAGS_local_server_name_npu = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_devicePhyId);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_npu.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
     
@@ -361,7 +368,7 @@ int target() {
     LOG(INFO) << "devAddr_target: " << devAddr;
 
     ret = engine->registerLocalMemory(devAddr, g_TotalSize * FLAGS_recv_num,
-                                        "npu:" + std::to_string(g_deviceId));
+                                        "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;
@@ -377,7 +384,7 @@ int target() {
     LOG(INFO) << "devAddr_target_2: " << devAddr2;
 
     ret = engine->registerLocalMemory(devAddr2, g_TotalSize * FLAGS_recv_num,
-                                        "npu:" + std::to_string(g_deviceId));
+                                        "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;
@@ -395,8 +402,15 @@ int target() {
 int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     g_TotalSize = (uint64_t)(FLAGS_batch_size * FLAGS_block_size);
+    
+    if (FLAGS_device_id != 65536) {
+        g_deviceLogicId = FLAGS_device_id;
+        g_devicePhyId = FLAGS_device_id;
+    } else {
+        g_deviceLogicId = FLAGS_device_logicid;
+        g_devicePhyId = FLAGS_device_phyid;
+    }
 
-    g_deviceId = FLAGS_device_id;
     const char *aclConfigPath = nullptr;
     aclError ret = aclInit(aclConfigPath);
     if (ret != ACL_ERROR_NONE) {
@@ -404,7 +418,7 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    ret = aclrtSetDevice(g_deviceId);
+    ret = aclrtSetDevice(g_deviceLogicId);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to set device, ret: " << ret;
         return -1;
