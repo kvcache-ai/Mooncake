@@ -407,7 +407,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         total_data = total_ops * VALUE_SIZE
         
         # Create throughput statistics object
-        throughput_stats = TestStats("Concurrent overall ")
+        throughput_stats = TestStats("Concurrent overall")
         throughput_stats.record_throughput(total_ops, total_data, total_duration)
         
         # Print detailed statistics
