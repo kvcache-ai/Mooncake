@@ -9,4 +9,5 @@ add_library(mooncake_common
 
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
+    jsoncpp
 )

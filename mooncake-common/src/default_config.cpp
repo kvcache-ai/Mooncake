@@ -1,9 +1,11 @@
 #include "default_config.h"
 
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <fstream>
 #include <jsoncpp/json/reader.h>
+#include <jsoncpp/json/value.h>
 #include <yaml-cpp/node/node.h>
 #include <yaml-cpp/yaml.h>
 
@@ -14,7 +16,7 @@ void DefaultConfig::Load() {
     if (path_.empty()) {
         throw std::runtime_error("Default config path is not set");
     }
-
+    std::cout << "Loading config from: " << path_ << std::endl;
     auto check_extension = [](const std::string &path, const std::string &ext) {
         return path.size() >= ext.size() &&
                path.compare(path.size() - ext.size(), ext.size(), ext) == 0;
@@ -43,6 +45,7 @@ void DefaultConfig::loadFromJSON() {
     file.open(path_);
 
     if (!reader.parse(file, root, false)) {
+        file.close();
         throw std::runtime_error("Failed to parse JSON file: " + reader.getFormattedErrorMessages());
     }
     processNode(root, "");
@@ -51,7 +54,7 @@ void DefaultConfig::loadFromJSON() {
 
 void DefaultConfig::processNode(const YAML::Node& node, std::string key) {
     if (node.IsScalar()) {
-        data_[key] = Node{.yaml_node_ = node, .json_value_= Json::Value()};
+        data_[key] = Node{.yaml_node_ = node, .json_value_ = Json::nullValue};
     } else if (node.IsMap()) {
         for (const auto& iter : node) {
             std::string new_key = key.empty() ? iter.first.as<std::string>()
@@ -65,7 +68,7 @@ void DefaultConfig::processNode(const YAML::Node& node, std::string key) {
 
 void DefaultConfig::processNode(const Json::Value& node, std::string key) {
     if (!node.isObject() && !node.isArray()) {
-        data_[key] = Node{.yaml_node_ = YAML::Node(), .json_value_ = node};
+        data_[key] = Node{.yaml_node_ = YAML::Node(), .json_value_ = node };
     } else if (node.isObject()) {
         for (const auto& member : node.getMemberNames()) {
             std::string new_key = key.empty() ? member : key + "." + member;
