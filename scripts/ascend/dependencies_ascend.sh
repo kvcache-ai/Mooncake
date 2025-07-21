@@ -46,7 +46,6 @@ set +e
 if command -v apt-get &> /dev/null; then
     echo "Detected apt-get. Using Debian-based package manager."
     apt-get update
-    apt purge -y openmpi-bin libopenmpi-dev || true
     apt-get install -y build-essential \
             cmake \
             git \
@@ -63,6 +62,7 @@ if command -v apt-get &> /dev/null; then
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
+            libyaml-cpp-dev \
             protobuf-compiler-grpc \
             libcurl4-openssl-dev \
             libhiredis-dev \
@@ -70,6 +70,7 @@ if command -v apt-get &> /dev/null; then
             patchelf \
             mpich \
             libmpich-dev
+    apt purge -y openmpi-bin libopenmpi-dev || true
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
@@ -87,6 +88,16 @@ elif command -v yum &> /dev/null; then
             jsoncpp-devel \
             mpich \
             mpich-devel
+    # Install yaml-cpp
+    cd "$TARGET_DIR"
+    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
+    cd yaml-cpp || exit
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j$(nproc)
+    make install
+    cd ../..
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
@@ -118,8 +129,12 @@ cd Mooncake || exit
 if ! git submodule update --init --recursive; then
     if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
         echo "git submodule update failed, try to cp pybind11..."
-        cp -r ../pybind11 extern/
-        check_success "Failed to update submodule pybind11"
+        if [ -d "../pybind11" ]; then
+            cp -r ../pybind11 extern/
+        else
+            echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
+            exit 1
+        fi
     else
         echo "Detected that extern/pybind11 already exists, continuing execution...."
     fi
@@ -136,7 +151,8 @@ echo -e "Mooncake installed successfully."
 
 # Add the so package to the environment variables
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
-cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
+cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so build/
+cp build/libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
 cp /usr/local/lib/python*/site-packages/mooncake/*.so  /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
 
 # Copy the so package to a shared path for others to use

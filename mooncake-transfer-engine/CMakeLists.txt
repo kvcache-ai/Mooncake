@@ -11,7 +11,7 @@ if (NOT GLOBAL_CONFIG)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
-  find_package(MPI REQUIRED)
+  include(../mooncake-common/FindMpi.cmake)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
 
@@ -25,7 +25,7 @@ if (USE_ASCEND)
                       ${ASCEND_INCLUDE_DIR}/experiment/metadef/common/util/error_manager
                       ${ASCEND_INCLUDE_DIR}/experiment/runtime
                       ${ASCEND_INCLUDE_DIR}/experiment/msprof
-                      ${MPI_CXX_INCLUDE_DIRS}
+                      ${MPI_INCLUDE_DIR}
                       /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/
                       )
 endif()

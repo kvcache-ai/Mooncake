@@ -97,7 +97,7 @@ Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_e
 
 性能用例执行命令如：
 ```启动发起节点：```
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384
 ```启动目标节点：```
 ./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target
 
@@ -112,11 +112,13 @@ Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_e
 export ASCEND_TRANSPORT_PRINT=1
 
 ### 超时时间配置
-Ascend Transport基于TCP的带外通信，在主机侧接收超时设置为 120 秒。
+Ascend Transport基于TCP的带外通信，连接的超时时间通过环境变量Ascend_TCP_TIMEOUT配置，默认为30秒，在主机侧recv接收超时设置为30秒，即recv阻塞超过30s未收到对端的消息会报错。
 
-在hccl_socket中，连接超时时间由环境变量HCCL_CONNECT_TIMEOUT配置，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+hccl_socket的连接超时时间通过环境变量Ascend_HCCL_SOCKET_TIMEOUT配置，默认为30秒，超时则本次传输会报错并返回。
 
-在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间为 120 秒。
+hccl_socket有保活要求，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+
+在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间通过Ascend_TRANSPORT_MEM_TIMEOUT配置，默认为120秒。
 
 ### 错误码
 Ascend传输错误码沿用HCCL集合通信传输错误码。
