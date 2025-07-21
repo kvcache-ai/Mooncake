@@ -1344,15 +1344,6 @@ int DistributedObjectStore::put_from_with_metadata(const std::string &key, void 
 
     // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
-
     // Add metadata slice
     uint64_t metadata_offset = 0;
     while (metadata_offset < metadata_size) {
@@ -1362,13 +1353,19 @@ int DistributedObjectStore::put_from_with_metadata(const std::string &key, void 
         metadata_offset += metadata_chunk_size;
     }
 
+    uint64_t offset = 0;
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
         return -toInt(put_result.error());
     }
-
     return 0;
 }
 
@@ -1528,11 +1525,11 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
 
         char* buffer = reinterpret_cast<char*>(data_ptr);
         char* metadata_buffer = reinterpret_cast<char*>(&metadata);
-        this->register_buffer(buffer, tensor_size);
         this->register_buffer(metadata_buffer, sizeof(TensorMetadata));
+        this->register_buffer(buffer, tensor_size);
         int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMetadata));
-        this->unregister_buffer(buffer);
         this->unregister_buffer(metadata_buffer);
+        this->unregister_buffer(buffer);
         return result;
     } catch (const pybind11::error_already_set &e) {
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
