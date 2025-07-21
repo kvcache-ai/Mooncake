@@ -25,18 +25,18 @@ class StorageBackend  {
      * @param fsdir  subdirectory name
      * @note Directory existence is not checked in constructor
      */
+    #ifdef USE_3FS
     explicit StorageBackend(const std::string& root_dir, const std::string& fsdir, bool is_3fs_dir)
         : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
-            #ifdef USE_3FS
             resource_manager_ = std::make_unique<USRBIOResourceManager>();
             Hf3fsConfig config;
             config.mount_root = root_dir;
-            config.iov_size = 32 << 20; // 32MB
-            config.ior_entries = 16;
-            config.io_depth = 0;
             resource_manager_->setDefaultParams(config);
-            #endif
-        }
+    }
+    #else
+    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir)
+        : root_dir_(root_dir), fsdir_(fsdir) {}
+    #endif
 
     /**
      * @brief Factory method to create a StorageBackend instance
@@ -63,53 +63,64 @@ class StorageBackend  {
 
         fs::path root_path(root_dir);
 
-        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") && 
-                    fs::is_directory(root_path / "3fs-virt");
         std::string real_fsdir = "moon_" + fsdir;
+    #ifdef USE_3FS
+        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") && 
+                fs::is_directory(root_path / "3fs-virt");
         return std::make_shared<StorageBackend>(root_dir, real_fsdir, is_3fs_dir);
+    #else
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir);
+    #endif
     }  
     
     /**
      * @brief Stores an object composed of multiple slices
      * @param key Object identifier
      * @param slices Vector of data slices to store
-     * @return ErrorCode indicating operation status
+     * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    ErrorCode StoreObject(const ObjectKey& key, const std::vector<Slice>& slices) ;
-    
+    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, const std::vector<Slice>& slices) ;
+
     /**
      * @brief Stores an object from a string
      * @param key Object identifier
      * @param str String containing object data
-     * @return ErrorCode indicating operation status
+     * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    ErrorCode StoreObject(const ObjectKey& key, const std::string& str) ;
+    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, const std::string& str) ;
 
     /**
      * @brief Stores an object from a span of data
      * @param key Object identifier
      * @param data Span containing object data
-     * @return ErrorCode indicating operation status
+     * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    ErrorCode StoreObject(const ObjectKey& key, std::span<const char> data);
+    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, std::span<const char> data);
     
     /**
      * @brief Loads an object into slices
      * @param path KVCache File path to load from
      * @param slices Output vector for loaded data slices
      * @param length Expected length of data to read
-     * @return ErrorCode indicating operation status
+     * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    ErrorCode LoadObject(std::string& path, std::vector<Slice>& slices, size_t length) ;
+    tl::expected<void, ErrorCode> LoadObject(std::string& path, std::vector<Slice>& slices, size_t length) ;
     
     /**
      * @brief Loads an object as a string
      * @param path KVCache File path to load from
      * @param str Output string for loaded data
      * @param length Expected length of data to read
-     * @return ErrorCode indicating operation status
+     * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    ErrorCode LoadObject(std::string& path, std::string& str, size_t length) ;
+    tl::expected<void, ErrorCode> LoadObject(std::string& path, std::string& str, size_t length) ;
+
+    /**
+     * @brief Checks if an object with the given key exists
+     * @param key Object identifier
+     * @return bool indicating whether the object exists
+     */
+    bool Existkey(const ObjectKey& key) ;
 
     /**
      * @brief Queries metadata for an object by key
@@ -126,13 +137,6 @@ class StorageBackend  {
      * @return unordered_map mapping ObjectKey to Replica::Descriptor
      */
     std::unordered_map<ObjectKey, Replica::Descriptor> BatchQueryKey(const std::vector<ObjectKey>& keys);
-
-    /**
-     * @brief Checks if an object with the given key exists
-     * @param key Object identifier
-     * @return ErrorCode::OK if exists, ErrorCode::FILE_NOT_FOUND if not exists, other ErrorCode for errors
-     */
-    ErrorCode Existkey(const ObjectKey& key) ;
 
     /**
      * @brief Deletes the physical file associated with the given object key
@@ -154,8 +158,9 @@ class StorageBackend  {
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
-    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS directory structure
+
     #ifdef USE_3FS
+    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS directory structure
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
     #endif
 

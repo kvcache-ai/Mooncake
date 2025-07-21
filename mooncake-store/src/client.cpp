@@ -1033,6 +1033,12 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
     if (!result) {
+        if(storage_backend_) {
+            // If master query fails, check storage backend
+            if (storage_backend_->Existkey(key)) {
+                return true;  // Key exists in storage backend
+            }
+        }
         return tl::unexpected(result.error());
     }
     return result.value();

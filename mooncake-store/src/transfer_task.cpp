@@ -88,18 +88,18 @@ void FilereadWorkerPool::workerThread() {
                 if (!backend_) {
                     LOG(ERROR) << "Backend is not initialized, cannot load object";
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
-                    continue; 
+                    continue;
                 }
 
-                auto error_code = backend_->LoadObject(task.file_path, task.slices, task.file_size);
-                if(error_code == ErrorCode::OK){
-                    VLOG(2) << "Fileread task completed successfully with "
-                            << task.file_path;
+                auto load_result = backend_->LoadObject(task.file_path, task.slices, task.file_size);
+                if (load_result) {
+                    VLOG(2) << "Fileread task completed successfully with " 
+                            << task.file_path ;
                     task.state->set_completed(ErrorCode::OK);
-                }else{
-                    LOG(ERROR) << "Fileread task failed for file: "
-                               << task.file_path
-                               << " with error code: " << toString(error_code);
+                } else {
+                    LOG(ERROR) << "Fileread task failed for file: " 
+                            << task.file_path
+                            << " with error: " << toString(load_result.error());
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                 }
             } catch (const std::exception& e) {

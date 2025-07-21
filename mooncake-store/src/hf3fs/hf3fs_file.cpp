@@ -30,29 +30,26 @@ ThreeFSFile::~ThreeFSFile() {
     }
 }
 
-ssize_t ThreeFSFile::write(const std::string& buffer, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::write(const std::string& buffer, size_t length) {
     return write(std::span<const char>(buffer.data(), length), length);
 }
 
-ssize_t ThreeFSFile::write(std::span<const char> data, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, size_t length) {
     // 1. Parameter validation
     if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
-        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
     // 2. Get thread resources
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
-        error_code_ = ErrorCode::FILE_OPEN_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
     // 3. Acquire write lock
     auto lock = acquire_write_lock();
     if (!lock.is_locked()) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
 
     // 4. Write in chunks
@@ -74,23 +71,20 @@ ssize_t ThreeFSFile::write(std::span<const char> data, size_t length) {
         int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
                                threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         // Submit IO request
         ret = hf3fs_submit_ios(&ior_write);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         // Wait for IO completion
         struct hf3fs_cqe cqe;
         ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         size_t bytes_written = cqe.result;
@@ -102,29 +96,25 @@ ssize_t ThreeFSFile::write(std::span<const char> data, size_t length) {
         }
     }
 
-    // 5. Return result
-    return total_bytes_written > 0 ? static_cast<ssize_t>(total_bytes_written) : -1;
+    return total_bytes_written;
 }
 
-ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t length) {
     // 1. Parameter validation
     if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
-        error_code_ = ErrorCode::FILE_INVALID_BUFFER;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
     // 2. Get thread resources
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
-        error_code_ = ErrorCode::FILE_OPEN_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
     // 3. Acquire read lock
     auto lock = acquire_read_lock();
     if (!lock.is_locked()) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
 
     // 4. Prepare buffer
@@ -147,23 +137,20 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
         int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true,
                                threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         // Submit IO request
         ret = hf3fs_submit_ios(&ior_read);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         // Wait for IO completion
         struct hf3fs_cqe cqe;
         ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         size_t bytes_read = cqe.result;
@@ -180,16 +167,14 @@ ssize_t ThreeFSFile::read(std::string& buffer, size_t length) {
             break;
         }
     }
-
-    // 6. Return result
-    return total_bytes_read > 0 ? static_cast<ssize_t>(total_bytes_read) : -1;
+    
+    return total_bytes_read;
 }
 
-ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
-        error_code_ = ErrorCode::FILE_OPEN_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
     auto& threefs_iov = resource->iov_;
@@ -197,9 +182,9 @@ ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
 
     auto lock = acquire_write_lock();
     if (!lock.is_locked()) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
+
     // 1. Calculate total length
     size_t total_length = 0;
     for (int i = 0; i < iovcnt; ++i) {
@@ -249,22 +234,19 @@ ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
         int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
                                threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         ret = hf3fs_submit_ios(&ior_write);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         // 5. Wait for IO completion
         struct hf3fs_cqe cqe;
         ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
         if (ret < 0 || cqe.result < 0) {
-            error_code_ = ErrorCode::FILE_WRITE_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
 
         size_t bytes_written = cqe.result;
@@ -277,14 +259,13 @@ ssize_t ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
         }
     }
 
-    return total_bytes_written > 0 ? total_bytes_written : -1;
+    return total_bytes_written;
 }
 
-ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
-        error_code_ = ErrorCode::FILE_OPEN_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
     auto& threefs_iov = resource->iov_;
@@ -292,8 +273,7 @@ ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
 
     auto lock = acquire_read_lock();
     if (!lock.is_locked()) {
-        error_code_ = ErrorCode::FILE_LOCK_FAIL;
-        return -1;
+        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
 
     // Calculate total length
@@ -317,15 +297,13 @@ ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
         int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, 
                             threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         // Submit IO request
         ret = hf3fs_submit_ios(&ior_read);
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         // Wait for IO completion
@@ -333,8 +311,7 @@ ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
         ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
         size_t bytes_read = cqe.result;
         if (ret < 0) {
-            error_code_ = ErrorCode::FILE_READ_FAIL;
-            return -1;
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
 
         // Copy data from shared buffer to user IOV
@@ -372,7 +349,7 @@ ssize_t ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
         }
     }
 
-    return total_bytes_read > 0 ? total_bytes_read : -1;
+    return total_bytes_read;
 }
 
 } // namespace mooncake

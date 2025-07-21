@@ -43,9 +43,10 @@ TEST_F(PosixFileTest, BasicWrite) {
     PosixFile posix_file(test_filename, test_fd);
     
     std::string test_data = "Test write data";
-    ssize_t result = posix_file.write(test_data, test_data.size());
+    auto result = posix_file.write(test_data, test_data.size());
     
-    EXPECT_EQ(result, static_cast<ssize_t>(test_data.size()));
+    ASSERT_TRUE(result) << "Write failed with error: " << toString(result.error());
+    EXPECT_EQ(*result, test_data.size());
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
 
@@ -64,9 +65,10 @@ TEST_F(PosixFileTest, BasicRead) {
     PosixFile posix_file(test_filename, test_fd);
     
     std::string buffer;
-    ssize_t result = posix_file.read(buffer, 100); // Read up to 100 bytes
+    auto result = posix_file.read(buffer, 100); // Read up to 100 bytes
     
-    EXPECT_EQ(result, static_cast<ssize_t>(strlen(test_data)));
+    ASSERT_TRUE(result) << "Read failed with error: " << toString(result.error());
+    EXPECT_EQ(*result, strlen(test_data));
     EXPECT_EQ(buffer, test_data);
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
@@ -84,9 +86,10 @@ TEST_F(PosixFileTest, VectorizedWrite) {
     iov[1].iov_base = const_cast<char*>(data2.data());
     iov[1].iov_len = data2.size();
     
-    ssize_t result = posix_file.vector_write(iov, 2, 0);
+    auto result = posix_file.vector_write(iov, 2, 0);
     
-    EXPECT_EQ(result, static_cast<ssize_t>(data1.size() + data2.size()));
+    ASSERT_TRUE(result) << "Vector write failed with error: " << toString(result.error());
+    EXPECT_EQ(*result, data1.size() + data2.size());
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
 
@@ -113,9 +116,10 @@ TEST_F(PosixFileTest, VectorizedRead) {
     iov[1].iov_base = buf2;
     iov[1].iov_len = 15;  // Exact length of " read test data"
     
-    ssize_t result = posix_file.vector_read(iov, 2, 0);
+    auto result = posix_file.vector_read(iov, 2, 0);
     
-    EXPECT_EQ(result, static_cast<ssize_t>(strlen(test_data)));
+    ASSERT_TRUE(result) << "Vector read failed with error: " << toString(result.error());
+    EXPECT_EQ(*result, strlen(test_data));
     EXPECT_STREQ(buf1, "Vectorized");
     EXPECT_STREQ(buf2, " read test data");
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
@@ -129,13 +133,15 @@ TEST_F(PosixFileTest, ErrorCases) {
     
     // Test write to invalid file
     std::string test_data = "test";
-    ssize_t result = posix_file.write(test_data, test_data.size());
-    EXPECT_EQ(result, -1);
+    auto write_result = posix_file.write(test_data, test_data.size());
+    EXPECT_FALSE(write_result);
+    EXPECT_EQ(write_result.error(), ErrorCode::FILE_WRITE_FAIL);
     
     // Test read from invalid file
     std::string buffer;
-    result = posix_file.read(buffer, 10);
-    EXPECT_EQ(result, -1);
+    auto read_result = posix_file.read(buffer, 10);
+    EXPECT_FALSE(read_result);
+    EXPECT_EQ(read_result.error(), ErrorCode::FILE_READ_FAIL);
 }
 
 // Test file locking
@@ -149,8 +155,8 @@ TEST_F(PosixFileTest, FileLocking) {
         
         // Try to read while locked
         std::string buffer;
-        ssize_t result = posix_file.read(buffer, 10);
-        EXPECT_GE(result, 0); // Should succeed since it's the same process
+        auto result = posix_file.read(buffer, 10);
+        EXPECT_TRUE(result) << "Read failed with error: " << toString(result.error());
     }
     
     {

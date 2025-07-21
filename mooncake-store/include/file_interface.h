@@ -66,48 +66,54 @@ public:
      * @brief Writes data from buffer to file
      * @param buffer Input buffer containing data to write
      * @param length Number of bytes to write
-     * @return Number of bytes written on success, -1 on error
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual ssize_t write(const std::string &buffer, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> write(const std::string &buffer, size_t length) = 0;
 
     /**
      * @brief Writes data from buffer to file
      * @param data Input span containing data to write
      * @param length Number of bytes to write
-     * @return Number of bytes written on success, -1 on error
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual ssize_t write(std::span<const char> data, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> write(std::span<const char> data, size_t length) = 0;
 
     /**
      * @brief Reads data from file into buffer
      * @param buffer Output buffer for read data
      * @param length Maximum number of bytes to read
-     * @return Number of bytes read on success, -1 on error
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes read on success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual ssize_t read(std::string &buffer, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> read(std::string &buffer, size_t length) = 0;
 
     /**
      * @brief Scattered write at specified file offset
      * @param iov Array of I/O vectors
      * @param iovcnt Number of elements in iov array
      * @param offset File offset to write at
-     * @return Total bytes written on success, -1 on error
+     * @return tl::expected<size_t, ErrorCode> containing total bytes written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt, off_t offset) = 0;
 
     /**
      * @brief Scattered read from specified file offset
      * @param iov Array of I/O vectors
      * @param iovcnt Number of elements in iov array
      * @param offset File offset to read from
-     * @return Total bytes read on success, -1 on error
+     * @return tl::expected<size_t, ErrorCode> containing total bytes read on success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt, off_t offset) = 0;
+
+    template<typename T>
+    tl::expected<T, ErrorCode> make_error(ErrorCode code) {
+        error_code_ = code;
+        return tl::make_unexpected(code);
+    }
 
     /**
      * @brief file locking mechanism
@@ -131,7 +137,7 @@ public:
 protected:
     std::string filename_;
     int fd_;
-    ErrorCode error_code_;
+    ErrorCode error_code_{ErrorCode::OK};
     std::atomic<bool> is_locked_{false};
 };
 
@@ -140,11 +146,11 @@ public:
     PosixFile(const std::string &filename, int fd);
     ~PosixFile() override;
 
-    ssize_t write(const std::string &buffer, size_t length) override;
-    ssize_t write(std::span<const char> data, size_t length) override; 
-    ssize_t read(std::string &buffer, size_t length) override;
-    ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
-    ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
+    tl::expected<size_t, ErrorCode> write(const std::string &buffer, size_t length) override;
+    tl::expected<size_t, ErrorCode> write(std::span<const char> data, size_t length) override; 
+    tl::expected<size_t, ErrorCode> read(std::string &buffer, size_t length) override;
+    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt, off_t offset) override;
+    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt, off_t offset) override;
 };
 
 } // namespace mooncake

@@ -10,18 +10,18 @@
 
 namespace mooncake {
   
-ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const ObjectKey& key,
                                      const std::vector<Slice>& slices) {
     std::string path = ResolvePath(key);
 
-    if(std::filesystem::exists(path) == true) {
-        return ErrorCode::FILE_OPEN_FAIL;
+    if(std::filesystem::exists(path)) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     std::vector<iovec> iovs;
@@ -32,127 +32,120 @@ ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
         slices_total_size += slice.size;
     }
 
-    ssize_t ret = file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
-
-    if (ret < 0) {
-        LOG(INFO) << "vector_write failed for: " << path;
-        return ErrorCode::FILE_WRITE_FAIL;
+    auto write_result = file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
+    if (!write_result) {
+        LOG(INFO) << "vector_write failed for: " << path << ", error: " << write_result.error();
+        return tl::make_unexpected(write_result.error());
     }
 
-    if (ret != static_cast<ssize_t>(slices_total_size)) {
+    if (*write_result != slices_total_size) {
         LOG(INFO) << "Write size mismatch for: " << path
-                   << ", expected: " << slices_total_size
-                   << ", got: " << ret;
-        return ErrorCode::FILE_WRITE_FAIL;
+                 << ", expected: " << slices_total_size
+                 << ", got: " << *write_result;
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    // TODO: Determine whether the data has been completely and correctly written.
-    // If the write operation fails, the corresponding file should be deleted 
-    // to prevent incomplete data from being found in subsequent get operations. 
-    // Alternatively, a marking method can be used to record that the file is not a valid file.
 
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
-
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const ObjectKey& key,
                                     const std::string& str) {
     return StoreObject(key, std::span<const char>(str.data(), str.size()));                                    
 }
 
-ErrorCode StorageBackend::StoreObject(const ObjectKey& key,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const ObjectKey& key,
                                     std::span<const char> data) {
     std::string path = ResolvePath(key);
 
     if (std::filesystem::exists(path)) {
-        return ErrorCode::FILE_OPEN_FAIL;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     size_t file_total_size = data.size();
-    ssize_t ret = file->write(data, file_total_size);  
+    auto write_result = file->write(data, file_total_size);  
 
-    if (ret < 0) {
-        LOG(INFO) << "Write failed for: " << path;
-        return ErrorCode::FILE_WRITE_FAIL;
+    if (!write_result) {
+        LOG(INFO) << "Write failed for: " << path << ", error: " << write_result.error();
+        return tl::make_unexpected(write_result.error());
     }
-    if (ret != static_cast<ssize_t>(file_total_size)) {
+    if (*write_result != file_total_size) {
         LOG(INFO) << "Write size mismatch for: " << path
                  << ", expected: " << file_total_size
-                 << ", got: " << ret;
-        return ErrorCode::FILE_WRITE_FAIL;
+                 << ", got: " << *write_result;
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode StorageBackend::LoadObject(std::string& path,
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(std::string& path,
                                     std::vector<Slice>& slices, size_t length) {
-
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     std::vector<iovec> iovs;                                    
-
     for (const auto& slice : slices) {
         iovec io{ slice.ptr, slice.size };
         iovs.push_back(io);
     }
 
-    ssize_t ret = file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
-
-    if (ret < 0) {
-        LOG(INFO) << "vector_read failed for: " << path;
-
-        return ErrorCode::FILE_READ_FAIL;
+    auto read_result = file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
+    if (!read_result) {
+        LOG(INFO) << "vector_read failed for: " << path << ", error: " << read_result.error();
+        return tl::make_unexpected(read_result.error());
     }
-    if (ret != static_cast<ssize_t>(length)) {
+    if (*read_result != length) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << length
-                   << ", got: " << ret;
-
-        return ErrorCode::FILE_READ_FAIL;
+                 << ", expected: " << length
+                 << ", got: " << *read_result;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
-
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode StorageBackend::LoadObject(std::string& path,
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(std::string& path,
                                     std::string& str, size_t length) {
-
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
-        return ErrorCode::FILE_OPEN_FAIL;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    ssize_t ret = file->read(str, length);
-
-    if (ret < 0) {
-        LOG(INFO) << "read failed for: " << path;
-        return ErrorCode::FILE_READ_FAIL;
+    auto read_result = file->read(str, length);
+    if (!read_result) {
+        LOG(INFO) << "read failed for: " << path << ", error: " << read_result.error();
+        return tl::make_unexpected(read_result.error());
     }
-    if (ret != static_cast<ssize_t>(length)) {
+    if (*read_result != length) {
         LOG(INFO) << "Read size mismatch for: " << path
-                   << ", expected: " << length
-                   << ", got: " << ret;
-
-        return ErrorCode::FILE_READ_FAIL;
+                 << ", expected: " << length
+                 << ", got: " << *read_result;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    // Note: fclose is not necessary here as LocalFile destructor will handle it
+    return {};
+}
 
-    return ErrorCode::OK;
+bool StorageBackend::Existkey(const ObjectKey& key) {
+    std::string path = ResolvePath(key);
+    namespace fs = std::filesystem;
+
+    // Check if the file exists
+    if (fs::exists(path)) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 std::optional<Replica::Descriptor> StorageBackend::Querykey(const ObjectKey& key) {
@@ -197,18 +190,6 @@ StorageBackend::BatchQueryKey(const std::vector<ObjectKey>& keys) {
     }
 
     return result;
-}
-
-ErrorCode StorageBackend::Existkey(const ObjectKey& key) {
-    std::string path = ResolvePath(key);
-    namespace fs = std::filesystem;
-
-    // Check if the file exists
-    if (fs::exists(path)) {
-        return ErrorCode::OK;
-    } else {
-        return ErrorCode::FILE_NOT_FOUND;
-    }
 }
 
 void StorageBackend::RemoveFile(const ObjectKey& key) {

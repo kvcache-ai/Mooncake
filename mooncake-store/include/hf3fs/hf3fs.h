@@ -5,6 +5,7 @@
 #include <mutex>
 #include <thread>
 #include <hf3fs_usrbio.h>
+#include "types.h"
 
 namespace mooncake {
 
@@ -16,15 +17,14 @@ struct Hf3fsConfig {
     
     // USRBIO related parameters
     std::string mount_root = "/";    // Mount point root directory
-    size_t iov_size = 1024 * 1024;         // Shared memory size (1MB)
-    size_t ior_entries = 1024;             // Maximum number of requests in IO ring
+    size_t iov_size = 32 << 20;         // Shared memory size (32MB)
+    size_t ior_entries = 16;             // Maximum number of requests in IO ring
     //`0` for no control with I/O depth.
     // If greater than 0, then only when `io_depth` I/O requests are in queue, they will be issued to server as a batch.
     // If smaller than 0, then USRBIO will wait for at most `-io_depth` I/O requests are in queue and issue them in one batch. 
     // If io_depth is 0, then USRBIO will issue all the prepared I/O requests to server ASAP.
     size_t io_depth = 0;                  // IO batch processing depth
     int ior_timeout = 0;                   // IO timeout (milliseconds)
-    
 };
 
 class USRBIOResourceManager {
@@ -88,11 +88,11 @@ public:
     ThreeFSFile(const std::string &filename, int fd, USRBIOResourceManager* resource_manager);
     ~ThreeFSFile() override;
 
-    ssize_t write(const std::string &buffer, size_t length) override;  
-    ssize_t write(std::span<const char> data, size_t length) override; 
-    ssize_t read(std::string &buffer, size_t length) override;
-    ssize_t vector_write(const iovec *iov, int iovcnt, off_t offset) override;
-    ssize_t vector_read(const iovec *iov, int iovcnt, off_t offset) override;
+    tl::expected<size_t, ErrorCode> write(const std::string &buffer, size_t length) override;  
+    tl::expected<size_t, ErrorCode> write(std::span<const char> data, size_t length) override; 
+    tl::expected<size_t, ErrorCode> read(std::string &buffer, size_t length) override;
+    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt, off_t offset) override;
+    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt, off_t offset) override;
 
 private:
     USRBIOResourceManager* resource_manager_;
