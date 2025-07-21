@@ -438,6 +438,8 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 ## Mooncake Store Python API
 
+**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
+
 ### setup
 ```python
 def setup(

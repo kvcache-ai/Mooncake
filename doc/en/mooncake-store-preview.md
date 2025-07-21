@@ -425,6 +425,8 @@ When persistence is enabled, every successful `Put`or`BatchPut` operation in mem
 
 ## Mooncake Store Python API
 
+**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
+
 ### setup
 ```python
 def setup(
