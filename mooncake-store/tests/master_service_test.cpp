@@ -9,7 +9,10 @@
 #include <thread>
 #include <vector>
 
+#include "cachelib_memory_allocator/AllocationClass.h"
 #include "types.h"
+
+using namespace facebook::cachelib;
 
 namespace mooncake::test {
 
@@ -32,7 +35,6 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
     while (true) {
         std::string key = "key_" + std::to_string(counter.fetch_add(1));
         std::vector<Replica::Descriptor> replica_list;
-
         // Check if the key already exists.
         auto exist_result = service->ExistKey(key);
         if (exist_result.has_value() && exist_result.value()) {
@@ -284,6 +286,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     replica_list = final_get_result.value();
     EXPECT_EQ(1, replica_list.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
+    // service_->RemoveAll();
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
@@ -309,6 +312,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     int random_number = dis(gen);
     config.replica_num = random_number;
     auto put_start_result = service_->PutStart(key, slice_lengths, config);
+    LOG(ERROR) << "try to allocate ";
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
@@ -952,7 +956,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t size = 1024 * 1024 * 32;
 
     Segment segment1(generate_uuid(), "segment1", buffer1, size);
     Segment segment2(generate_uuid(), "segment2", buffer2, size);
@@ -964,7 +968,9 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 
     // Create two objects in the two segments
     std::string key1 = GenerateKeyForSegment(service_, segment1.name);
+    LOG(ERROR) << "key1 generated " << key1;
     std::string key2 = GenerateKeyForSegment(service_, segment2.name);
+    LOG(ERROR) << "key2 generated " << key2;
     std::vector<uint64_t> slice_lengths = {1024};
     ReplicateConfig config;
     config.replica_num = 1;
@@ -984,7 +990,9 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ASSERT_TRUE(get_result2.has_value());
 
     // Verify put key1 will put into segment2 rather than segment1
+    LOG(ERROR) << "key1 = " << key1;
     auto put_start_result = service_->PutStart(key1, slice_lengths, config);
+
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     auto put_end_result = service_->PutEnd(key1);
@@ -1575,9 +1583,90 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+TEST_F(MasterServiceTest, ReleaseSlabTest) {
+    // set a large kv_lease_ttl so the granted lease will not quickly expire
+    // const uint64_t kv_lease_ttl = 2000;
+    std::unique_ptr<MasterService> service_(new MasterService(false));
+    // Mount a segment that can hold about 1024 * 16 objects.
+    // As the eviction is processed separately for each shard,
+    // we need to fill each shard with enough objects to thoroughly
+    // test the eviction process.
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, size);
+    UUID client_id = generate_uuid();
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    // Verify if we can put objects more than the segment can hold
+    int success_puts = 0;
+    for (int i = 0; i < 13; ++i) {
+        std::string key = "test_key" + std::to_string(i);
+        std::vector<uint64_t> slice_lengths = {object_size};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
+        if (put_start_result.has_value()) {
+            auto put_end_result = service_->PutEnd(key);
+            ASSERT_TRUE(put_end_result.has_value());
+            success_puts++;
+        } else {
+            // wait for gc thread to work
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // put a larger kv
+    {
+        std::string key = "large_test_key";
+        std::vector<uint64_t> slice_lengths = {object_size * 2};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        while (1) {
+            auto put_start_result =
+                service_->PutStart(key, slice_lengths, config);
+            if (put_start_result.has_value()) {
+                auto put_end_result = service_->PutEnd(key);
+                ASSERT_TRUE(put_end_result.has_value());
+                success_puts++;
+                LOG(INFO) << "large key put success";
+                break;
+            } else {
+                // wait for gc thread to work
+                // LOG(ERROR) << "large key put fail";
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, FreeListTest) {
+    MemoryFreeList freelist;
+    std::vector<MemoryAllocInfo_> infos;
+    uint64_t size = 100000;
+    for (uint64_t i = 0; i < size; i++) {
+        infos.push_back(MemoryAllocInfo_{(void*)i, false, NULL, NULL});
+    }
+    for (int i = 0; i < size; i++) {
+        freelist.push_front(&infos[i]);
+    }
+    for (uint64_t i = 0; i < size; i++) {
+        auto x = freelist.front();
+        ASSERT_EQ((uint64_t)x->memory, i);
+        ASSERT_NE((uint64_t)freelist.head, 0);
+        freelist.pop_front();
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    // ::testing::GTEST_FLAG(filter) = "*UnmountSegmentImmediateCleanup*";
+    // "*FreeListTest*";
     return RUN_ALL_TESTS();
 }
