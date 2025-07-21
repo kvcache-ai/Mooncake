@@ -46,7 +46,7 @@ store.setup(
     "localhost:12345",           # Your node's address
     "http://localhost:8080/metadata",    # HTTP metadata server
     512*1024*1024,          # 512MB segment size
-    128*1024*1024,          # 16MB local buffer
+    128*1024*1024,          # 128MB local buffer
     "tcp",                             # Use TCP (RDMA for high performance)
     "",                            # Empty for TCP, specify device for RDMA
     "localhost:50051"        # Master service
