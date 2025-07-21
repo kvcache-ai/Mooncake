@@ -13,7 +13,7 @@ Mooncake Store 的主要特性包括：
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
 *   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
 *   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
-*   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
+*   **零拷贝、高带宽利用**：由 Transfer Engine 提供支持, 数据链路零拷贝，对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
 *   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
 *   **分级缓存**: 支持将 RAM 中缓存数据卸载到 SSD 中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
@@ -97,20 +97,10 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
-enum class MediaType {
-    VRAM,
-    RAM,
-    SSD
-};
-
-struct Location {
-    std::string segment_name;   // Transfer Engine 内的 Segment Name，通常是目标 Server 启动时填写的 local_hostname 字段内容
-};
-
 struct ReplicateConfig {
-    uint64_t replica_num;       // 指定对象的总副本数量
-    std::map<MediaType, int> media_replica_num; // 指定某个介质上分配的副本数量，累加超过 replica_num 时取高值
-    std::vector<Location> locations;// 指定某个副本的具体存放位置 (机器和介质)
+    size_t replica_num{1};                    // 对象的总副本数
+    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    std::string preferred_segment{};         // 首选的分配段
 };
 ```
 
@@ -423,6 +413,33 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 被软固定的对象仍然可以通过 `Remove`、`RemoveAll` 等 API 主动删除。
 
+### 首选段分配
+
+Mooncake Store 提供了**首选段分配**功能，允许用户为对象分配指定首选的存储段（节点）。此功能特别适用于优化数据局部性和减少分布式场景中的网络开销。
+
+#### 工作原理
+
+首选段分配功能通过 `AllocationStrategy` 系统实现，并通过 `ReplicateConfig` 结构中的 `preferred_segment` 字段进行控制：
+
+```cpp
+struct ReplicateConfig {
+    size_t replica_num{1};                    // 对象的总副本数
+    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    std::string preferred_segment{};         // 首选的分配段
+};
+```
+
+当使用非空的 `preferred_segment` 值启动 `Put` 操作时，分配策略遵循以下流程：
+
+1. **首选分配尝试**：系统首先尝试从指定的首选段分配空间。如果首选段有足够的可用空间，分配立即成功。
+
+2. **回退到随机分配**：如果首选段不可用、已满或不存在，系统会自动回退到所有可用段之间的标准随机分配策略。
+
+3. **重试逻辑**：分配策略包含内置的重试机制，最多尝试 10 次在不同段中寻找合适的存储空间。
+
+- **数据局部性**：通过首选本地段，应用程序可以减少网络流量并提高频繁使用数据的访问性能。
+- **负载均衡**：应用程序可以将数据分布到特定节点，实现更好的负载分布。
+
 ### 分级缓存支持
 
 本系统提供了分级缓存架构的支持，通过内存缓存与持久化存储相结合的方式实现高效数据访问。数据首先存储在内存缓存中，并会异步写入分布式文件系统（DFS，Distributed File System）作为备份，形成"内存-SSD持久化存储"的分级缓存结构。
@@ -440,149 +457,6 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 **完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
 
-### setup
-```python
-def setup(
-    self,
-    local_hostname: str,
-    metadata_server: str,
-    global_segment_size: int = 16777216,  # 默认 16MB
-    local_buffer_size: int = 16777216,    # 默认 16MB
-    protocol: str = "tcp",
-    rdma_devices: str = "",
-    master_server_addr: str = "127.0.0.1:50051"
-) -> int
-```
-初始化存储配置和网络参数。
-
-**参数**  
-- `local_hostname`: 本地节点的主机名/IP
-- `metadata_server`: 元数据协调服务器地址
-- `global_segment_size`: 共享内存段大小（默认 16MB）
-- `local_buffer_size`: 本地缓冲区分配大小（默认 16MB）
-- `protocol`: 通信协议 ("tcp" 或 "rdma")
-- `rdma_devices`: RDMA 设备规格（格式取决于具体实现）
-- `master_server_addr`: 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### init_all
-```python
-def init_all(
-    self,
-    protocol: str,
-    device_name: str,
-    mount_segment_size: int = 16777216  # 默认 16MB
-) -> int
-```
-初始化分布式资源并建立连接。
-
-**参数**  
-- `protocol`: 使用的网络协议 ("tcp"/"rdma")
-- `device_name`: 硬件设备标识符
-- `mount_segment_size`: 挂载内存段大小（默认 16MB）
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### put
-```python
-def put(self, key: str, value: bytes) -> int
-```
-存储二进制对象到分布式存储。
-
-**参数**  
-- `key`: 唯一对象标识符 (字符串)
-- `value`: 要存储的二进制数据 (bytes 类型对象)
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### get
-```python
-def get(self, key: str) -> bytes
-```
-从分布式存储检索对象。
-
-**参数**  
-- `key`: 要检索的对象标识符
-
-**返回值**  
-- `bytes`: 检索到的二进制数据
-
-**异常**  
-- `KeyError`: 当指定键不存在时抛出
-
----
-
-### remove
-```python
-def remove(self, key: str) -> int
-```
-从存储系统中删除对象。
-
-**参数**  
-- `key`: 要删除的对象标识符
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### isExist
-```python
-def isExist(self, key: str) -> int
-```
-检查对象是否存在。
-
-**参数**  
-- `key`: 要检查的对象标识符
-
-**返回值**  
-- `int`: 
-  - `1`: 对象存在
-  - `0`: 对象不存在
-  - `-1`: 发生错误
-
----
-
-### close
-```python
-def close(self) -> int
-```
-清理所有资源并终止连接。对应 `tearDownAll()` 方法。
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
-### 代码使用样例
-```python
-
-from mooncake.store import MooncakeDistributedStore
-store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="IP:port",
-    metadata_server="etcd://metadata server IP:port",
-    protocol="rdma",
-    ...
-)
-store.initAll(protocol="rdma", device_name="mlx5_0")
-
-# Store configuration
-store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
-
-# Retrieve data
-value = store.get("kvcache1")
-
-store.close()
-```
 
 ## 编译及使用方法
 Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
