@@ -16,7 +16,7 @@ def get_client(store):
     device_name = os.getenv("DEVICE_NAME", "eth0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
-    global_segment_size = 512 * 1024 * 1024  # 3200 MB
+    global_segment_size = 2048 * 1024 * 1024  # 2048 MB
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
