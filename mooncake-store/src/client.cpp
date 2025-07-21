@@ -1078,6 +1078,11 @@ void Client::PutToLocalFile(const std::string& key,
         total_size += slice.size;
     }
 
+    // Currently, persistence is achieved through asynchronous writes, but before asynchronous
+    // writing in 3FS, significant performance degradation may occur due to data copying. 
+    // Profiling reveals that the number of page faults triggered in this scenario is nearly double the normal count. 
+    // Future plans include introducing a reuse buffer list to address this performance degradation issue.
+
     std::string value;
     value.reserve(total_size);
     for (const auto& slice : slices) {
