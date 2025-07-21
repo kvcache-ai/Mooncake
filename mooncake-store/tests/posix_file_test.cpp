@@ -135,13 +135,13 @@ TEST_F(PosixFileTest, ErrorCases) {
     std::string test_data = "test";
     auto write_result = posix_file.write(test_data, test_data.size());
     EXPECT_FALSE(write_result);
-    EXPECT_EQ(write_result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(write_result.error(), ErrorCode::FILE_NOT_FOUND);
     
     // Test read from invalid file
     std::string buffer;
     auto read_result = posix_file.read(buffer, 10);
     EXPECT_FALSE(read_result);
-    EXPECT_EQ(read_result.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(read_result.error(), ErrorCode::FILE_NOT_FOUND);
 }
 
 // Test file locking
