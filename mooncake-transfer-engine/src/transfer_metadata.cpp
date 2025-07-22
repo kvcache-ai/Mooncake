@@ -112,8 +112,7 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     return 0;
 }
 
-int TransferMetadata::getNotifies(
-    std::vector<NotifyDesc> &notifies) {
+int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
         std::move(notifys.begin(), notifys.end(), std::back_inserter(notifies));
@@ -186,14 +185,20 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         segmentJSON["buffers"] = buffersJSON;
 
         Json::Value rankInfoJSON;
-        rankInfoJSON["rankId"] = static_cast<Json::UInt64>(desc.rank_info.rankId);
+        rankInfoJSON["rankId"] =
+            static_cast<Json::UInt64>(desc.rank_info.rankId);
         rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
-        rankInfoJSON["hostPort"] = static_cast<Json::UInt64>(desc.rank_info.hostPort);
-        rankInfoJSON["deviceLogicId"] = static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
-        rankInfoJSON["devicePhyId"] = static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
-        rankInfoJSON["deviceType"] = static_cast<Json::UInt64>(desc.rank_info.deviceType);
+        rankInfoJSON["hostPort"] =
+            static_cast<Json::UInt64>(desc.rank_info.hostPort);
+        rankInfoJSON["deviceLogicId"] =
+            static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
+        rankInfoJSON["devicePhyId"] =
+            static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
+        rankInfoJSON["deviceType"] =
+            static_cast<Json::UInt64>(desc.rank_info.deviceType);
         rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
-        rankInfoJSON["devicePort"] = static_cast<Json::UInt64>(desc.rank_info.devicePort);
+        rankInfoJSON["devicePort"] =
+            static_cast<Json::UInt64>(desc.rank_info.devicePort);
         rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
 
         segmentJSON["rank_info"] = rankInfoJSON;
@@ -370,7 +375,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
         desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
         desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
-        desc->rank_info.deviceLogicId = rankInfoJSON["deviceLogicId"].asUInt64();
+        desc->rank_info.deviceLogicId =
+            rankInfoJSON["deviceLogicId"].asUInt64();
         desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt64();
         desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
@@ -643,8 +649,10 @@ int TransferMetadata::startHandshakeDaemon(
                                Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
             TransferHandshakeUtil::decode(peer, peer_desc);
-            int ret = on_receive_handshake(peer_desc, local_desc);
-            if (ret) return ret;
+            if (on_receive_handshake) {
+                int ret = on_receive_handshake(peer_desc, local_desc);
+                if (ret) return ret;
+            }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });
