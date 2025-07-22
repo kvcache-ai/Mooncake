@@ -6,13 +6,16 @@
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "master_metric_manager.h"
+#include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
 using facebook::cachelib::PoolId;
 
 namespace mooncake {
+
+// forward declare AllocatedBuffer
+class AllocatedBuffer;
 
 /**
  * Virtual base class for buffer allocators.
@@ -83,8 +86,56 @@ class CachelibBufferAllocator
     facebook::cachelib::PoolId pool_id_;
 };
 
+/**
+ * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
+ * strategy, which provides efficient memory allocation with bin-based optimization.
+ *
+ * This allocator uses the OffsetAllocator implementation which:
+ * 1. Supports thread-safe allocation and deallocation
+ * 2. Optimizes memory utilization through bin-based allocation
+ * 3. Provides automatic memory management through RAII handles
+ * 4. Supports allocation of memory regions larger than the largest bin size
+ *
+ * Example usage:
+ * ```cpp
+ * // Create an offset buffer allocator
+ * auto allocator = std::make_shared<OffsetBufferAllocator>("segment_name", base_addr, size);
+ * 
+ * // Allocate memory
+ * auto buffer = allocator->allocate(1024);
+ * 
+ * // Memory is automatically deallocated when buffer goes out of scope
+ * ```
+ */
+class OffsetBufferAllocator
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<OffsetBufferAllocator> {
+   public:
+    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size);
+
+    ~OffsetBufferAllocator() override;
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+
+    void deallocate(AllocatedBuffer* handle) override;
+
+    size_t capacity() const override { return total_size_; }
+    size_t size() const override { return cur_size_.load(); }
+    std::string getSegmentName() const override { return segment_name_; }
+
+   private:
+    // metadata
+    const std::string segment_name_;
+    const size_t base_;
+    const size_t total_size_;
+    std::atomic_size_t cur_size_;
+
+    // offset allocator implementation
+    std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+};
+
 // The main difference is that it allocates real memory and returns it, while
-// BufferAllocator allocates an address
+// BufferAllocatorBase allocates an address
 class SimpleAllocator {
    public:
     SimpleAllocator(size_t size);

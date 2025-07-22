@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "Slab.h"
+#include "allocator.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -37,6 +38,8 @@ static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 
 // Forward declarations
 class BufferAllocatorBase;
+class CachelibBufferAllocator;
+class OffsetBufferAllocator;
 class AllocatedBuffer;
 class Replica;
 
@@ -224,16 +227,20 @@ struct ReplicateConfig {
 class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
+    friend class OffsetBufferAllocator;
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     std::string segment_name, void* buffer_ptr,
-                    std::size_t size)
+                    std::size_t size,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
           segment_name_(std::move(segment_name)),
           buffer_ptr_(buffer_ptr),
-          size_(size) {}
+          size_(size),
+          offset_handle_(std::move(offset_handle)) {}
 
     ~AllocatedBuffer();
 
@@ -274,6 +281,7 @@ class AllocatedBuffer {
     BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{std::nullopt};
 };
 
 // Implementation of get_descriptor
