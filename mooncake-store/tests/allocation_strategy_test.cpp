@@ -31,9 +31,9 @@ class AllocationStrategyTest : public ::testing::Test {
 
 // Test basic functionality with empty allocators map
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
-    std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>
+    std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>
         empty_allocators_by_name;
-    std::vector<std::shared_ptr<BufferAllocator>> empty_allocators;
+    std::vector<std::shared_ptr<BufferAllocatorBase>> empty_allocators;
     ReplicateConfig config{1, false, "local"};
 
     auto result = strategy_->Allocate(empty_allocators, empty_allocators_by_name, 100, config);
@@ -42,9 +42,9 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
 
 // Test preferred segment behavior with empty allocators
 TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
-    std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>
+    std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>
         empty_allocators_by_name;
-    std::vector<std::shared_ptr<BufferAllocator>> empty_allocators;
+    std::vector<std::shared_ptr<BufferAllocatorBase>> empty_allocators;
     ReplicateConfig config{1, false, "preferred_segment"};
 
     auto result = strategy_->Allocate(empty_allocators, empty_allocators_by_name, 100, config);

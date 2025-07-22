@@ -15,6 +15,21 @@ using facebook::cachelib::PoolId;
 namespace mooncake {
 
 /**
+ * Virtual base class for buffer allocators.
+ * Defines the interface that all buffer allocators must implement.
+ */
+class BufferAllocatorBase {
+   public:
+    virtual ~BufferAllocatorBase() = default;
+    
+    virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
+    virtual void deallocate(AllocatedBuffer* handle) = 0;
+    virtual size_t capacity() const = 0;
+    virtual size_t size() const = 0;
+    virtual std::string getSegmentName() const = 0;
+};
+
+/**
  * BufferAllocator manages memory allocation using CacheLib's slab allocation
  * strategy.
  *
@@ -36,19 +51,19 @@ namespace mooncake {
  * const size_t base = 0x100000001;  // Not 4MB aligned
  * ```
  */
-class BufferAllocator : public std::enable_shared_from_this<BufferAllocator> {
+class BufferAllocator : public BufferAllocatorBase, public std::enable_shared_from_this<BufferAllocator> {
    public:
     BufferAllocator(std::string segment_name, size_t base, size_t size);
 
-    ~BufferAllocator();
+    ~BufferAllocator() override;
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size);
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
-    void deallocate(AllocatedBuffer* handle);
+    void deallocate(AllocatedBuffer* handle) override;
 
-    size_t capacity() const { return total_size_; }
-    size_t size() const { return cur_size_.load(); }
-    std::string getSegmentName() const { return segment_name_; }
+    size_t capacity() const override { return total_size_; }
+    size_t size() const override { return cur_size_.load(); }
+    std::string getSegmentName() const override { return segment_name_; }
 
    private:
     // metadata

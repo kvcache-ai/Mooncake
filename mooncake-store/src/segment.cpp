@@ -34,7 +34,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocator> allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator;
     try {
         // SlabAllocator may throw an exception if the size or base is invalid
         // for the slab allocator.
@@ -110,7 +110,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     metrics_dec_capacity = segment.size;
 
     // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocator> allocator = mounted_segment.buf_allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator = mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
     auto alloc_it = std::find(segment_manager_->allocators_.begin(),
