@@ -1250,7 +1250,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         auto replica_list = query_result.value();
         if (replica_list.empty()) {
             py::gil_scoped_acquire acquire_gil;
-            LOG(ERROR) << "No replicas found for key: " << key;
+            LOG(INFO) << "No replicas found for key: " << key;
             return pybind11::none();
         }
 
