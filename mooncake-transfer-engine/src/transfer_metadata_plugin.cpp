@@ -644,7 +644,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK)
+                    if (errno != EWOULDBLOCK && errno != EINTR)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
                     continue;
                 }
@@ -743,7 +743,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];
@@ -778,7 +778,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];
@@ -886,7 +886,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];

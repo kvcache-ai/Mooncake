@@ -286,6 +286,25 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
+int Topology::selectDevice(const std::string storage_type,
+                           std::string_view hint, int retry_count) {
+    const auto it = resolved_matrix_.find(std::string(storage_type));
+    if (it == resolved_matrix_.end()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    const auto &entry = it->second;
+
+    if (!hint.empty()) {
+        auto hca_idx = entry.getHcaIndex(std::string(hint));
+        if (hca_idx != -1) {
+            return hca_idx;
+        }
+    }
+
+    return selectDevice(storage_type, retry_count);
+}
+
 int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
@@ -318,25 +337,31 @@ int Topology::resolve() {
         for (auto &hca : entry.second.preferred_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
-                hca_id_map[hca] = next_hca_map_index;
-                next_hca_map_index++;
+                hca_id_map[hca] = next_hca_map_index++;
 
                 resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
                     hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation]
+                    .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
             resolved_matrix_[entry.first].preferred_hca.push_back(
                 hca_id_map[hca]);
+            resolved_matrix_[entry.first]
+                .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
         }
         for (auto &hca : entry.second.avail_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
-                hca_id_map[hca] = next_hca_map_index;
-                next_hca_map_index++;
+                hca_id_map[hca] = next_hca_map_index++;
 
                 resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
                     hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation]
+                    .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
             resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
+            resolved_matrix_[entry.first].avail_hca_name_to_index_map_[hca] =
+                hca_id_map[hca];
         }
     }
     return 0;
