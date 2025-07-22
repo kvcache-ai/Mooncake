@@ -84,27 +84,6 @@ struct TensorMetadata {
     int32_t shape[4];     
 };
 
-// RAII container that automatically frees slices on destruction
-class SliceGuard {
-   public:
-    explicit SliceGuard(DistributedObjectStore &store) : store_(store) {}
-
-    ~SliceGuard() { store_.freeSlices(slices_); }
-
-    // Prevent copying
-    SliceGuard(const SliceGuard &) = delete;
-    SliceGuard &operator=(const SliceGuard &) = delete;
-
-    // Access the underlying slices
-    std::vector<Slice> &slices() { return slices_; }
-    const std::vector<Slice> &slices() const { return slices_; }
-
-   private:
-    DistributedObjectStore &store_;
-    std::vector<Slice> slices_;
-};
-
-
 // ResourceTracker implementation using singleton pattern
 ResourceTracker &ResourceTracker::getInstance() {
     static ResourceTracker instance;
@@ -1315,33 +1294,47 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
-        char *data = exportSlices(guard.slices(), total_length);
-        if (!data) {
-            py::gil_scoped_acquire acquire_gil;
-            LOG(ERROR) << "Failed to export slices";
-            return pybind11::none();
-        }
-
-
         // Create contiguous buffer and copy data
         char *exported_data = new char[total_length];
         if (!exported_data) {
-
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
+        TensorMetadata metadata;
 
         // Copy data from buffer to contiguous memory
         memcpy(exported_data, buffer_handle.ptr(), total_length);
+        memcpy(&metadata, exported_data, sizeof(TensorMetadata));
+
+        if(metadata.ndim < 0 || metadata.ndim > 4) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+            return pybind11::none();
+        }
+
+        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Unknown tensor dtype!";
+            return pybind11::none();
+        }
+
+        size_t tensor_size = total_length - sizeof(TensorMetadata);
+        if (tensor_size == 0) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Invalid data format: no tensor data found";
+            return pybind11::none();
+        }
 
         // Convert bytes to tensor using torch.from_numpy
-        py::gil_scoped_acquire acquire_gil;
-
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
-            np_array = array_creators[dtype_index](data, sizeof(TensorMetadata), tensor_size);
+            np_array = array_creators[dtype_index](exported_data, sizeof(TensorMetadata), tensor_size);
         } else {
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
