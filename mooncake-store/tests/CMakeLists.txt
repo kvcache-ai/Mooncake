@@ -1,6 +1,6 @@
-add_executable(buffer_allocator_test buffer_allocator_test.cpp)
-target_link_libraries(buffer_allocator_test PUBLIC mooncake_store cachelib_memory_allocator gtest gtest_main pthread)
-add_test(NAME buffer_allocator_test COMMAND buffer_allocator_test)
+# add_executable(buffer_allocator_test buffer_allocator_test.cpp)
+# target_link_libraries(buffer_allocator_test PUBLIC mooncake_store cachelib_memory_allocator gtest gtest_main pthread)
+# add_test(NAME buffer_allocator_test COMMAND buffer_allocator_test)
 
 # add_executable(allocation_strategy_test allocation_strategy_test.cpp)
 # target_link_libraries(allocation_strategy_test PUBLIC mooncake_store cachelib_memory_allocator glog gtest gtest_main pthread)

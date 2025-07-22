@@ -36,7 +36,7 @@ static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 
 // Forward declarations
-class BufferAllocator;
+class BufferAllocatorBase;
 class AllocatedBuffer;
 class Replica;
 
@@ -49,7 +49,7 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 // using ReplicaList = std::vector<ReplicaInfo>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
-    std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
+    std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
 // Mapping between c++ and go types
 #ifdef STORE_USE_ETCD
 using EtcdRevisionId = GoInt64;
@@ -223,11 +223,11 @@ struct ReplicateConfig {
 
 class AllocatedBuffer {
    public:
-    friend class BufferAllocator;
+    friend class CachelibBufferAllocator;
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
-    AllocatedBuffer(std::shared_ptr<BufferAllocator> allocator,
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     std::string segment_name, void* buffer_ptr,
                     std::size_t size)
         : allocator_(std::move(allocator)),
@@ -269,7 +269,7 @@ class AllocatedBuffer {
     void mark_complete() { status = BufStatus::COMPLETE; }
 
    private:
-    std::weak_ptr<BufferAllocator> allocator_;
+    std::weak_ptr<BufferAllocatorBase> allocator_;
     std::string segment_name_;
     BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};

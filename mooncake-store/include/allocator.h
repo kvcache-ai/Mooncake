@@ -30,7 +30,7 @@ class BufferAllocatorBase {
 };
 
 /**
- * BufferAllocator manages memory allocation using CacheLib's slab allocation
+ * CachelibBufferAllocator manages memory allocation using CacheLib's slab allocation
  * strategy.
  *
  * Important alignment requirements:
@@ -51,11 +51,13 @@ class BufferAllocatorBase {
  * const size_t base = 0x100000001;  // Not 4MB aligned
  * ```
  */
-class BufferAllocator : public BufferAllocatorBase, public std::enable_shared_from_this<BufferAllocator> {
+class CachelibBufferAllocator
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    BufferAllocator(std::string segment_name, size_t base, size_t size);
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size);
 
-    ~BufferAllocator() override;
+    ~CachelibBufferAllocator() override;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 

@@ -22,7 +22,7 @@ AllocatedBuffer::~AllocatedBuffer() {
 }
 
 // Removed allocated_bytes parameter and member initialization
-BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
+CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name, size_t base,
                                  size_t size)
     : segment_name_(segment_name),
       base_(base),
@@ -58,9 +58,9 @@ BufferAllocator::BufferAllocator(std::string segment_name, size_t base,
             << static_cast<int>(pool_id_);
 }
 
-BufferAllocator::~BufferAllocator() = default;
+CachelibBufferAllocator::~CachelibBufferAllocator() = default;
 
-std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
+std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(size_t size) {
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
@@ -87,7 +87,7 @@ std::unique_ptr<AllocatedBuffer> BufferAllocator::allocate(size_t size) {
                                              buffer, size);
 }
 
-void BufferAllocator::deallocate(AllocatedBuffer* handle) {
+void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // Deallocate memory using CacheLib.
         memory_allocator_->free(handle->buffer_ptr_);

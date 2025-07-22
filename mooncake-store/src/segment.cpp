@@ -39,7 +39,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         // SlabAllocator may throw an exception if the size or base is invalid
         // for the slab allocator.
         allocator =
-            std::make_shared<BufferAllocator>(segment.name, buffer, size);
+            std::make_shared<CachelibBufferAllocator>(segment.name, buffer, size);
         if (!allocator) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=failed_to_create_allocator";
