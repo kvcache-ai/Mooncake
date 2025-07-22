@@ -1,7 +1,7 @@
 #pragma once
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
-#include <pybind11/numpy.h> 
 
 #include <csignal>
 #include <mutex>
@@ -10,13 +10,13 @@
 
 #include "allocator.h"
 #include "client.h"
+#include "client_buffer.hpp"
 
 namespace mooncake {
 
 class DistributedObjectStore;
 
 // Forward declarations
-class SliceGuard;
 class SliceBuffer;
 
 // Global resource tracker to handle cleanup on abnormal termination
@@ -58,45 +58,17 @@ class ResourceTracker {
  */
 class SliceBuffer {
    public:
-    /**
-     * @brief Construct a new SliceBuffer object with contiguous memory
-     * @param store Reference to the DistributedObjectStore that owns the
-     * allocator
-     * @param buffer Pointer to the contiguous buffer
-     * @param size Size of the buffer in bytes
-     * @param use_allocator_free If true, use SimpleAllocator to free the
-     * buffer, otherwise use delete[]
-     */
-    SliceBuffer(DistributedObjectStore &store, void *buffer, uint64_t size,
-                bool use_allocator_free = true);
+    SliceBuffer(BufferHandle handle);
 
-    /**
-     * @brief Destructor that frees the buffer
-     */
-    ~SliceBuffer();
-
-    /**
-     * @brief Get a pointer to the data
-     * @return void* Pointer to the dat
-     */
     void *ptr() const;
-
-    /**
-     * @brief Get the size of the data
-     * @return uint64_t Size of the data in bytes
-     */
     uint64_t size() const;
 
    private:
-    DistributedObjectStore &store_;
-    void *buffer_;
-    uint64_t size_;
-    bool use_allocator_free_;  // Flag to control deallocation method
+    BufferHandle handle_;
 };
 
 class DistributedObjectStore {
    public:
-    friend class SliceGuard;   // Allow SliceGuard to access private members
     friend class SliceBuffer;  // Allow SliceBuffer to access private members
     DistributedObjectStore();
     ~DistributedObjectStore();
@@ -234,7 +206,8 @@ class DistributedObjectStore {
      * @param dtype Data type of the tensor
      * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
      */
-    pybind11::object get_tensor(const std::string &key, const std::string dtype);
+    pybind11::object get_tensor(const std::string &key,
+                                const std::string dtype);
 
     /**
      * @brief Put a PyTorch tensor into the store
@@ -248,39 +221,10 @@ class DistributedObjectStore {
     pybind11::module numpy = pybind11::module::import("numpy");
     pybind11::module torch = pybind11::module::import("torch");
 
-    int allocateSlices(std::vector<mooncake::Slice> &slices,
-                                           size_t length);
-
-    int allocateSlices(std::vector<mooncake::Slice> &slices,
-                       const std::string &value);
-
-    int allocateSlices(std::vector<mooncake::Slice> &slices,
-                       const std::vector<Replica::Descriptor> &handles,
-                       uint64_t &length);
-
-    int allocateSlices(std::vector<mooncake::Slice> &slices,
-                       std::span<const char> value);
-
-    int allocateSlicesPacked(std::vector<mooncake::Slice> &slices,
-                             const std::vector<std::span<const char>> &parts);
-
-    int allocateBatchedSlices(
-        const std::vector<std::string> &keys,
-        std::unordered_map<std::string, std::vector<mooncake::Slice>>
-            &batched_slices,
-        const std::vector<std::vector<mooncake::Replica::Descriptor>>
-            &replica_lists,
-        std::unordered_map<std::string, uint64_t> &str_length_map);
-
-    char *exportSlices(const std::vector<mooncake::Slice> &slices,
-                       uint64_t length);
-
-    int freeSlices(const std::vector<mooncake::Slice> &slices);
-
    public:
     std::shared_ptr<mooncake::Client> client_ = nullptr;
-    std::unique_ptr<mooncake::SimpleAllocator> client_buffer_allocator_ =
-        nullptr;
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
+
     struct SegmentDeleter {
         void operator()(void *ptr) {
             if (ptr) {
@@ -289,7 +233,7 @@ class DistributedObjectStore {
         }
     };
 
-    std::unique_ptr<void, SegmentDeleter> segment_ptr_;
+    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

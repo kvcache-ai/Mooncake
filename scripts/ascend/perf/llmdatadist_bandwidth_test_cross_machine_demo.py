@@ -5,17 +5,23 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     http:#www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# llmdatadist跨机带宽测速demo，要求两机使用的deviceId相同，PROMPT_IP_LIST和DECODER_IP_LIST改为当前机器NPU deviceIp信息，
-# block_size代表pull_blocks一次的数据块大小，预热后拉取20次统计时延和带宽。
-# e.g. Prefill侧：python datadist.py --device_id 2 --cluster_id 1 --block_size=64
-#      Decode侧: python datadist.py --device_id 2 --cluster_id 2 --block_size=64
+
+# Instructions:
+# llmdatadist cross-machine bandwidth measurement demo. Change PROMPT_IP_LIST and DECODER_IP_LIST to the NPU deviceIp information of your machines. 
+# device_id is the physical card number of the current NPU. 
+# target_device_id is the physical card number of the peer NPU.
+# block_size is the size of a single data block. block_num is the number of data blocks to be transmitted. 
+# block_pattern indicates the continuity of the data blocks. 1 means all transmitted data blocks are continuous. 
+#                                                            2 means all transmitted data blocks are discontinuous, sending one block every other block.
+# e.g. Prefill：python llmdatadist_bandwidth_test_cross_machine_demo.py --device_id 2 --target_device_id 2 --cluster_id 1 --block_size 64 --block_num 20 --block_pattern 2
+#      Decode: python llmdatadist_bandwidth_test_cross_machine_demo.py --device_id 2 --target_device_id 2 --cluster_id 2 --block_size 64 --block_num 20 --block_pattern 2
 
 import argparse
 import json
@@ -29,9 +35,12 @@ import torchair
 
 PROMPT_IP_LIST = ['192.168.1.1', '192.168.1.2', '192.168.1.3', '192.168.1.4',
                   '192.168.1.5', '192.168.1.6', '192.168.1.7', '192.168.1.8']
-DECODER_IP_LIST = ['192.168.1.1', '192.168.1.2', '192.168.1.3', '192.168.1.4',
-                  '192.168.1.5', '192.168.1.6', '192.168.1.7', '192.168.1.8']
+DECODER_IP_LIST = ['192.168.2.1', '192.168.2.2', '192.168.2.3', '192.168.2.4',
+                  '192.168.2.5', '192.168.2.6', '192.168.2.7', '192.168.2.8']
 BLOCK_SIZE = 64 * 1024
+TARGRT_DEVICE_ID = 1
+BLOCK_NUM = 20
+BLOCK_PATTERN = 2
 
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 
@@ -45,7 +54,8 @@ def init_llm_datadist(role: LLMRole, cluster_id, device_id: int) -> LLMDataDist:
     datadist.init(llm_options)
     return datadist
 
-def link(datadist, device_id):
+
+def link(datadist, prefill_device_id, decode_device_id):
     rank_table_dict = {
         "server_count": "2",
         "status": "completed",
@@ -54,8 +64,8 @@ def link(datadist, device_id):
             {
                 "device": [
                     {
-                        "device_id": str(device_id),
-                        "device_ip": PROMPT_IP_LIST[device_id],
+                        "device_id": str(prefill_device_id),
+                        "device_ip": PROMPT_IP_LIST[prefill_device_id],
                         "rank_id": "0"
                     }
                 ],
@@ -64,8 +74,8 @@ def link(datadist, device_id):
             {
                 "device": [
                     {
-                        "device_id": str(device_id),
-                        "device_ip": DECODER_IP_LIST[device_id],
+                        "device_id": str(decode_device_id),
+                        "device_ip": DECODER_IP_LIST[decode_device_id],
                         "rank_id": "1"
                     }
                 ],
@@ -104,57 +114,66 @@ def _allocate_cpu_cache(block_size, num_block, num_tensors):
 
 def run_decoder_sample(datadist, device_id: int):
     cache_manager = datadist.cache_manager
-    cache_desc = CacheDesc(num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
+    cache_desc = CacheDesc(num_tensors=1, shape=[BLOCK_NUM, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
                            placement=Placement.DEVICE)
-    tensor = torch.ones(20, BLOCK_SIZE // 4, dtype=torch.float).npu()
+    tensor = torch.ones(BLOCK_NUM, BLOCK_SIZE // 4, dtype=torch.float).npu()
     addr = int(tensor.data_ptr())
     cache = cache_manager.register_blocks_cache(cache_desc, [addr])
     logging.info('[register_blocks_cache] success')
 
-    comm_id = link(datadist, device_id)
+    comm_id = link(datadist, TARGRT_DEVICE_ID, device_id)
 
     # Define src_blocks and dst_blocks here or pass them as arguments to the function.
-    src_blocks = list(range(1))
-    dst_blocks = list(range(1))
+    if BLOCK_PATTERN == 1:
+        src_blocks = list(range(BLOCK_NUM))
+        dst_blocks = list(range(BLOCK_NUM))
+    else:
+        src_blocks = list(range(0, BLOCK_NUM, BLOCK_PATTERN))
+        dst_blocks = list(range(0, BLOCK_NUM, BLOCK_PATTERN))
 
     cache_manager.pull_blocks(BlocksCacheKey(1, 0), cache, src_blocks=src_blocks, dst_blocks=dst_blocks)
 
     # Start timing
     start_time = time.time()
-    for i in range(20):
-        cache_manager.pull_blocks(BlocksCacheKey(1, 0), cache, src_blocks=src_blocks, dst_blocks=dst_blocks)
+    cache_manager.pull_blocks(BlocksCacheKey(1, 0), cache, src_blocks=src_blocks, dst_blocks=dst_blocks)
 
     # End timing
     end_time = time.time()
 
     # Calculate bandwidth
-    # Each block is of size 20 * 1024*1024 elements of float32 (4 bytes each)
+    # Each block is of size BLOCK_NUM * 1024*1024 elements of float32 (4 bytes each)
     num_blocks = len(src_blocks)  # Assuming src_blocks and dst_blocks have the same length
     element_size = 4  # Size of float32 in bytes
-    total_data_transferred = tensor.numel() * element_size  # in bytes
+    total_data_transferred = tensor.numel() * element_size / BLOCK_PATTERN  # in bytes
     print(num_blocks, tensor.numel())
     duration = end_time - start_time  # in seconds
-    bandwidth = total_data_transferred / duration / (1024 ** 3)  # in GB/s
+    bandwidth = total_data_transferred / duration / (1000** 3)  # in GB/s
     print(total_data_transferred)
     logging.info(f"after pull, tensor={tensor}")
     logging.info(f"[pull_blocks] duration: {duration * 1000:.4f} ms, bandwidth: {bandwidth:.2f} GB/s")
 
+    # # swap blocks
+    # cpu_cache, cpu_tensors = _allocate_cpu_cache(BLOCK_SIZE, BLOCK_NUM, 1)
+    # # swap out
+    # cache_manager.swap_blocks(cache, cpu_cache, {0: 0, 1: 1})
+    # # swap in
+    # cache_manager.swap_blocks(cpu_cache, cache, {0: 0, 1: 1})
     datadist.unlink(comm_id)
     datadist.finalize()
 
 
 def run_prompt_sample(datadist, device_id: int):
     cache_manager = datadist.cache_manager
-    cache_desc = CacheDesc(num_tensors=1, shape=[20, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
+    cache_desc = CacheDesc(num_tensors=1, shape=[BLOCK_NUM, BLOCK_SIZE // 4], data_type=DataType.DT_FLOAT,
                            placement=Placement.DEVICE)
-    tensor = torch.ones(20, BLOCK_SIZE // 4, dtype=torch.float).npu()
+    tensor = torch.ones(BLOCK_NUM, BLOCK_SIZE // 4, dtype=torch.float).npu()
     addr = int(tensor.data_ptr())
     cache = cache_manager.register_blocks_cache(cache_desc, [addr], BlocksCacheKey(1, 0))
     logging.info('[register_blocks_cache] success')
 
-    comm_id = link(datadist, device_id)
-    logging.info('wait for 10 seconds')
-    time.sleep(10)
+    comm_id = link(datadist, device_id, TARGRT_DEVICE_ID)
+    logging.info('wait for 5 seconds')
+    time.sleep(5)
     logging.info('wait ended')
     datadist.unlink(comm_id)
     datadist.finalize()
@@ -164,11 +183,16 @@ def run_prompt_sample(datadist, device_id: int):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--device_id", type=int, default=0, help='device id')
+    parser.add_argument("--target_device_id", type=int, default=1, help='target device id')
     parser.add_argument("--cluster_id", type=int, default=1, help='cluster id')
     parser.add_argument("--block_size", type=int, default=64, help='block')
-
+    parser.add_argument("--block_num", type=int, default=20, help='block')
+    parser.add_argument("--block_pattern", type=int, default=2, help='block')
     args = parser.parse_args()
+    TARGRT_DEVICE_ID = args.target_device_id
     BLOCK_SIZE = args.block_size * 1024
+    BLOCK_NUM = args.block_num * args.block_pattern
+    BLOCK_PATTERN = args.block_pattern
     if args.cluster_id not in [1, 2]:
         raise RuntimeError("Not supported cluster id")
     logging.info(f'Sample start, device_id = {args.device_id}, cluster_id = {args.cluster_id}')
@@ -180,4 +204,4 @@ if __name__ == '__main__':
     else:
         run_decoder_sample(datadist, args.device_id)
     logging.info('Sample end')
-                                                         
+

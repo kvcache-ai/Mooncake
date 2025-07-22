@@ -72,7 +72,7 @@ jobs:
         run: |
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+          bash build.sh --use-nvcc ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
 
       - name: Generate Python version tag
