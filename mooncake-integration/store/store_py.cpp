@@ -13,7 +13,7 @@
 
 namespace py = pybind11;
 
-namespace {
+namespace TensorMap {
         auto torch = py::module_::import("torch");
 
         enum class TensorDtype : int32_t {
@@ -1415,32 +1415,32 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
-        if (total_length < sizeof(TensorMetadata)) {
+        if (total_length < sizeof(TensorMap::TensorMetadata)) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
 
-        TensorMetadata metadata;
-        std::memcpy(&metadata, data, sizeof(TensorMetadata));
-        
+        TensorMap::TensorMetadata metadata;
+        std::memcpy(&metadata, data, sizeof(TensorMap::TensorMetadata));
+
         if (metadata.ndim < 0 || metadata.ndim > 4) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid tensor dimensions: " << metadata.ndim;
             return pybind11::none();
         }
-        
-        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
-        if (dtype_enum == TensorDtype::UNKNOWN) {
+
+        TensorMap::TensorDtype dtype_enum = static_cast<TensorMap::TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorMap::TensorDtype::UNKNOWN) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unknown tensor dtype!";
             return pybind11::none();
         }
 
-        size_t tensor_size = total_length - sizeof(TensorMetadata);
+        size_t tensor_size = total_length - sizeof(TensorMap::TensorMetadata);
         if (tensor_size == 0) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
@@ -1451,7 +1451,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
-            np_array = array_creators[dtype_index](data, sizeof(TensorMetadata), tensor_size);   
+            np_array = array_creators[dtype_index](data, sizeof(TensorMap::TensorMetadata), tensor_size);
         } else {
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
@@ -1496,8 +1496,8 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         pybind11::object shape_obj = tensor.attr("shape");
         pybind11::object dtype_obj = tensor.attr("dtype");
 
-        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-        if (dtype_enum == TensorDtype::UNKNOWN) {
+        TensorMap::TensorDtype dtype_enum = TensorMap::get_tensor_dtype(dtype_obj);
+        if (dtype_enum == TensorMap::TensorDtype::UNKNOWN) {
             LOG(ERROR) << "Unsupported tensor dtype!";
             return -1;
         }
@@ -1510,7 +1510,7 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
             return -1;
         }
 
-        TensorMetadata metadata;
+        TensorMap::TensorMetadata metadata;
         metadata.dtype = static_cast<int32_t>(dtype_enum);
         metadata.ndim = ndim;
         
@@ -1525,9 +1525,9 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
 
         char* buffer = reinterpret_cast<char*>(data_ptr);
         char* metadata_buffer = reinterpret_cast<char*>(&metadata);
-        this->register_buffer(metadata_buffer, sizeof(TensorMetadata));
+        this->register_buffer(metadata_buffer, sizeof(TensorMap::TensorMetadata));
         this->register_buffer(buffer, tensor_size);
-        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMetadata));
+        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMap::TensorMetadata));
         this->unregister_buffer(metadata_buffer);
         this->unregister_buffer(buffer);
         return result;
