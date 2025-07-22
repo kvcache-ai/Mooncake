@@ -13,75 +13,72 @@
 
 namespace py = pybind11;
 
-namespace TensorMap {
-        auto torch = py::module_::import("torch");
-
-        enum class TensorDtype : int32_t {
-            FLOAT32 = 0,
-            FLOAT64 = 1,
-            INT8 = 2,
-            UINT8 = 3,
-            INT16 = 4,
-            UINT16 = 5,
-            INT32 = 6,
-            UINT32 = 7,
-            INT64 = 8,
-            UINT64 = 9,
-            BOOL = 10,
-            UNKNOWN = -1
-        };
-
-        template <typename T>
-        py::array create_typed_array(char *exported_data, size_t offset, size_t total_length) {
-            py::capsule free_when_done(exported_data,
-                                       [](void *p) { delete[] static_cast<char *>(p); });
-            return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                                  (T *)(exported_data + offset), free_when_done);
-        }
-
-        using ArrayCreatorFunc = std::function<py::array(char*, size_t, size_t)>;
-
-        static const std::array<ArrayCreatorFunc, 11> array_creators = {{
-            create_typed_array<float>,      // FLOAT32 = 0
-            create_typed_array<double>,     // FLOAT64 = 1
-            create_typed_array<int8_t>,     // INT8 = 2
-            create_typed_array<uint8_t>,    // UINT8 = 3
-            create_typed_array<int16_t>,    // INT16 = 4
-            create_typed_array<uint16_t>,   // UINT16 = 5
-            create_typed_array<int32_t>,    // INT32 = 6
-            create_typed_array<uint32_t>,   // UINT32 = 7
-            create_typed_array<int64_t>,    // INT64 = 8
-            create_typed_array<uint64_t>,   // UINT64 = 9
-            create_typed_array<bool>        // BOOL = 10
-        }};
-        TensorDtype get_tensor_dtype(py::object dtype_obj) {
-            if (dtype_obj.is_none()) {
-                return TensorDtype::UNKNOWN;
-            }
-
-            if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
-            if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
-            if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
-            if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
-            if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
-            if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
-            if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
-            if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
-            if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
-            if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
-            if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
-
-        return TensorDtype::UNKNOWN;
-}
-
-        struct TensorMetadata {
-            int32_t dtype;        
-            int32_t ndim;       
-            int32_t shape[4];     
-        };
-}
-
 namespace mooncake {
+
+auto torch = py::module_::import("torch");
+
+enum class TensorDtype : int32_t {
+        FLOAT32 = 0,
+        FLOAT64 = 1,
+        INT8 = 2,
+        UINT8 = 3,
+        INT16 = 4,
+        UINT16 = 5,
+        INT32 = 6,
+        UINT32 = 7,
+        INT64 = 8,
+        UINT64 = 9,
+        BOOL = 10,
+        UNKNOWN = -1
+    };
+
+template <typename T>
+py::array create_typed_array(char *exported_data, size_t offset, size_t total_length) {
+    py::capsule free_when_done(exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+        (T *)(exported_data + offset), free_when_done);
+}
+
+using ArrayCreatorFunc = std::function<py::array(char*, size_t, size_t)>;
+
+static const std::array<ArrayCreatorFunc, 11> array_creators = {{
+        create_typed_array<float>,      // FLOAT32 = 0
+        create_typed_array<double>,     // FLOAT64 = 1
+        create_typed_array<int8_t>,     // INT8 = 2
+        create_typed_array<uint8_t>,    // UINT8 = 3
+        create_typed_array<int16_t>,    // INT16 = 4
+        create_typed_array<uint16_t>,   // UINT16 = 5
+        create_typed_array<int32_t>,    // INT32 = 6
+        create_typed_array<uint32_t>,   // UINT32 = 7
+        create_typed_array<int64_t>,    // INT64 = 8
+        create_typed_array<uint64_t>,   // UINT64 = 9
+        create_typed_array<bool>        // BOOL = 10
+    }};
+TensorDtype get_tensor_dtype(py::object dtype_obj) {
+    if (dtype_obj.is_none()) {
+        return TensorDtype::UNKNOWN;
+    }
+
+    if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
+    if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
+    if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
+    if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
+    if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
+    if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
+    if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
+    if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
+    if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
+    if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
+    if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
+
+    return TensorDtype::UNKNOWN;
+}
+
+struct TensorMetadata {
+    int32_t dtype;        
+    int32_t ndim;       
+    int32_t shape[4];     
+};
 
 // RAII container that automatically frees slices on destruction
 class SliceGuard {
@@ -1415,15 +1412,15 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
-        if (total_length < sizeof(TensorMap::TensorMetadata)) {
+        if (total_length < sizeof(TensorMetadata)) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
 
-        TensorMap::TensorMetadata metadata;
-        std::memcpy(&metadata, data, sizeof(TensorMap::TensorMetadata));
+        TensorMetadata metadata;
+        std::memcpy(&metadata, data, sizeof(TensorMetadata));
 
         if (metadata.ndim < 0 || metadata.ndim > 4) {
             delete[] data;
@@ -1432,15 +1429,15 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
             return pybind11::none();
         }
 
-        TensorMap::TensorDtype dtype_enum = static_cast<TensorMap::TensorDtype>(metadata.dtype);
-        if (dtype_enum == TensorMap::TensorDtype::UNKNOWN) {
+        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unknown tensor dtype!";
             return pybind11::none();
         }
 
-        size_t tensor_size = total_length - sizeof(TensorMap::TensorMetadata);
+        size_t tensor_size = total_length - sizeof(TensorMetadata);
         if (tensor_size == 0) {
             delete[] data;
             py::gil_scoped_acquire acquire_gil;
@@ -1451,7 +1448,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
-            np_array = array_creators[dtype_index](data, sizeof(TensorMap::TensorMetadata), tensor_size);
+            np_array = array_creators[dtype_index](data, sizeof(TensorMetadata), tensor_size);
         } else {
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
@@ -1483,7 +1480,10 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         return -1;
     }
     try{
-        if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
+        if (!(tensor.attr("__class__")
+        .attr("__name__")
+        .cast<std::string>()
+        .find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
             return -1;
         }
@@ -1496,8 +1496,8 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
         pybind11::object shape_obj = tensor.attr("shape");
         pybind11::object dtype_obj = tensor.attr("dtype");
 
-        TensorMap::TensorDtype dtype_enum = TensorMap::get_tensor_dtype(dtype_obj);
-        if (dtype_enum == TensorMap::TensorDtype::UNKNOWN) {
+        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
             LOG(ERROR) << "Unsupported tensor dtype!";
             return -1;
         }
@@ -1510,7 +1510,7 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
             return -1;
         }
 
-        TensorMap::TensorMetadata metadata;
+        TensorMetadata metadata;
         metadata.dtype = static_cast<int32_t>(dtype_enum);
         metadata.ndim = ndim;
         
@@ -1525,9 +1525,9 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
 
         char* buffer = reinterpret_cast<char*>(data_ptr);
         char* metadata_buffer = reinterpret_cast<char*>(&metadata);
-        this->register_buffer(metadata_buffer, sizeof(TensorMap::TensorMetadata));
+        this->register_buffer(metadata_buffer, sizeof(TensorMetadata));
         this->register_buffer(buffer, tensor_size);
-        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMap::TensorMetadata));
+        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMetadata));
         this->unregister_buffer(metadata_buffer);
         this->unregister_buffer(buffer);
         return result;
