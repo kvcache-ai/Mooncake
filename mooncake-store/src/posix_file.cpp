@@ -68,6 +68,9 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data, siz
         written_bytes += written;
     }
 
+    if(written_bytes != length) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
     return written_bytes;
 }
 
@@ -103,6 +106,9 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer, size_t leng
     }
 
     buffer.resize(read_bytes);
+    if(read_bytes != length) {
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    }
     return read_bytes;
 }
 

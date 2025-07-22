@@ -36,7 +36,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(const std::string& buffer, si
 
 tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, size_t length) {
     // 1. Parameter validation
-    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    if (length == 0) {
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
@@ -96,12 +96,16 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, s
         }
     }
 
+    if(total_bytes_written != length) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     return total_bytes_written;
 }
 
 tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t length) {
     // 1. Parameter validation
-    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    if (length == 0) {
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
@@ -166,6 +170,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t le
         if (bytes_read < chunk_size) { // Short read
             break;
         }
+    }
+
+    if(total_bytes_read != length) {
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
     
     return total_bytes_read;
