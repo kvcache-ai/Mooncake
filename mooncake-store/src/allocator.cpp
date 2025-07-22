@@ -106,25 +106,31 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 }
 
 // OffsetBufferAllocator implementation
-OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name, size_t base,
-                                 size_t size)
+OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
+                                             size_t base, size_t size)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0) {
-    VLOG(1) << "initializing_offset_buffer_allocator segment_name=" << segment_name
-            << " base_address=" << reinterpret_cast<void*>(base)
+    VLOG(1) << "initializing_offset_buffer_allocator segment_name="
+            << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
 
     try {
+        uint32_t max_allocs = size < (1ull << 32)
+                                  ? size / 4096
+                                  : 1024 * 1024;  // min(1M, size / 4K)
+        max_allocs = std::max(max_allocs, 1024u * 64u);  // at least 64K allocations
         // Create the offset allocator
-        offset_allocator_ = offset_allocator::OffsetAllocator::create(base, size);
+        offset_allocator_ =
+            offset_allocator::OffsetAllocator::create(base, size, max_allocs);
         if (!offset_allocator_) {
             LOG(ERROR) << "status=failed_to_create_offset_allocator";
             throw std::runtime_error("Failed to create offset allocator");
         }
-        
-        VLOG(1) << "offset_buffer_allocator_initialized segment_name=" << segment_name;
+
+        VLOG(1) << "offset_buffer_allocator_initialized segment_name="
+                << segment_name;
     } catch (const std::exception& e) {
         LOG(ERROR) << "offset_allocator_init_exception error=" << e.what();
         throw;
@@ -174,9 +180,9 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // The OffsetAllocator handles deallocation automatically through RAII
         // when the OffsetAllocationHandle goes out of scope
+        size_t freed_size = handle->size();
         handle->offset_handle_.reset();
         handle->status = BufStatus::UNREGISTERED;
-        size_t freed_size = handle->size();
         cur_size_.fetch_sub(freed_size);
         MasterMetricManager::instance().dec_allocated_size(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->data()

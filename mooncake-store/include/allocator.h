@@ -89,23 +89,6 @@ class CachelibBufferAllocator
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based optimization.
- *
- * This allocator uses the OffsetAllocator implementation which:
- * 1. Supports thread-safe allocation and deallocation
- * 2. Optimizes memory utilization through bin-based allocation
- * 3. Provides automatic memory management through RAII handles
- * 4. Supports allocation of memory regions larger than the largest bin size
- *
- * Example usage:
- * ```cpp
- * // Create an offset buffer allocator
- * auto allocator = std::make_shared<OffsetBufferAllocator>("segment_name", base_addr, size);
- * 
- * // Allocate memory
- * auto buffer = allocator->allocate(1024);
- * 
- * // Memory is automatically deallocated when buffer goes out of scope
- * ```
  */
 class OffsetBufferAllocator
     : public BufferAllocatorBase,
