@@ -481,4 +481,9 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+enum class BufferAllocatorType {
+    CACHELIB = 0,  // CachelibBufferAllocator
+    OFFSET = 1,    // OffsetBufferAllocator
+};
+
 }  // namespace mooncake

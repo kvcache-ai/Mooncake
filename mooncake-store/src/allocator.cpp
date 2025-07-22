@@ -151,17 +151,16 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
         // Create AllocatedBuffer with the allocated memory
         void* buffer_ptr = allocation_handle->ptr();
-        size_t allocated_size = allocation_handle->size();
         
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
         
-        cur_size_.fetch_add(allocated_size);
-        MasterMetricManager::instance().inc_allocated_size(allocated_size);
+        cur_size_.fetch_add(size);
+        MasterMetricManager::instance().inc_allocated_size(size);
         
         // Create a custom AllocatedBuffer that manages the OffsetAllocationHandle
         return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                                 buffer_ptr, allocated_size, std::move(allocation_handle));
+                                                 buffer_ptr, size, std::move(allocation_handle));
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;

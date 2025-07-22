@@ -145,6 +145,13 @@ class ScopedAllocatorAccess {
 class SegmentManager {
    public:
     /**
+     * @brief Constructor for SegmentManager
+     * @param memory_allocator Type of buffer allocator to use for new segments
+     */
+    explicit SegmentManager(BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
+        : memory_allocator_(memory_allocator) {}
+
+    /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
      */
@@ -164,6 +171,7 @@ class SegmentManager {
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    BufferAllocatorType memory_allocator_;  // Type of buffer allocator to use
     // Each allocator is put into both of allocators_by_name_ and allocators_.
     // These two containers only contain allocators whose segment status is OK.
     std::unordered_map<std::string,
