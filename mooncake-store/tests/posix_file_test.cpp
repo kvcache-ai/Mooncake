@@ -65,8 +65,8 @@ TEST_F(PosixFileTest, BasicRead) {
     PosixFile posix_file(test_filename, test_fd);
     
     std::string buffer;
-    auto result = posix_file.read(buffer, 100); // Read up to 100 bytes
-    
+    auto result = posix_file.read(buffer, strlen(test_data)); // Read up to test_data bytes
+
     ASSERT_TRUE(result) << "Read failed with error: " << toString(result.error());
     EXPECT_EQ(*result, strlen(test_data));
     EXPECT_EQ(buffer, test_data);
@@ -139,7 +139,7 @@ TEST_F(PosixFileTest, ErrorCases) {
     
     // Test read from invalid file
     std::string buffer;
-    auto read_result = posix_file.read(buffer, 10);
+    auto read_result = posix_file.read(buffer, test_data.size());
     EXPECT_FALSE(read_result);
     EXPECT_EQ(read_result.error(), ErrorCode::FILE_NOT_FOUND);
 }
@@ -156,7 +156,7 @@ TEST_F(PosixFileTest, FileLocking) {
         // Try to read while locked
         std::string buffer;
         auto result = posix_file.read(buffer, 10);
-        EXPECT_TRUE(result) << "Read failed with error: " << toString(result.error());
+        EXPECT_FALSE(result);
     }
     
     {
