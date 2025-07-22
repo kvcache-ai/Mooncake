@@ -254,6 +254,10 @@ void loadGlobalConfig(GlobalConfig &config) {
             config.fragment_limit = config.slice_size / 4;
         }
     }
+
+    if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
+        config.enable_dest_device_affinity = true;
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
