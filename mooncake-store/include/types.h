@@ -486,4 +486,17 @@ enum class BufferAllocatorType {
     OFFSET = 1,    // OffsetBufferAllocator
 };
 
+/**
+ * @brief Stream operator for BufferAllocatorType
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const BufferAllocatorType& type) noexcept {
+    static const std::unordered_map<BufferAllocatorType, std::string_view>
+        type_strings{{BufferAllocatorType::CACHELIB, "CACHELIB"},
+                     {BufferAllocatorType::OFFSET, "OFFSET"}};
+
+    os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
+    return os;
+}
+
 }  // namespace mooncake
