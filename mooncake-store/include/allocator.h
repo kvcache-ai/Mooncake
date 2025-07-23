@@ -118,7 +118,7 @@ class OffsetBufferAllocator
 };
 
 // The main difference is that it allocates real memory and returns it, while
-// BufferAllocatorBase allocates an address
+// BufferAllocator allocates an address
 class SimpleAllocator {
    public:
     SimpleAllocator(size_t size);

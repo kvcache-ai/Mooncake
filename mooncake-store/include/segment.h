@@ -171,7 +171,7 @@ class SegmentManager {
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    BufferAllocatorType memory_allocator_;  // Type of buffer allocator to use
+    const BufferAllocatorType memory_allocator_;  // Type of buffer allocator to use
     // Each allocator is put into both of allocators_by_name_ and allocators_.
     // These two containers only contain allocators whose segment status is OK.
     std::unordered_map<std::string,

@@ -119,7 +119,7 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     try {
         uint32_t max_allocs = size < (1ull << 32)
                                   ? size / 4096
-                                  : 1024 * 1024;  // min(1M, size / 4K)
+                                  : 1024 * 1024;  // min(size / 4K, 1M)
         max_allocs = std::max(max_allocs, 1024u * 64u);  // at least 64K allocations
         // Create the offset allocator
         offset_allocator_ =
@@ -145,6 +145,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         return nullptr;
     }
 
+    std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
         // Allocate memory using OffsetAllocator
         auto allocation_handle = offset_allocator_->allocate(size);
@@ -157,16 +158,14 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
         // Create AllocatedBuffer with the allocated memory
         void* buffer_ptr = allocation_handle->ptr();
-        
+
+        // Create a custom AllocatedBuffer that manages the
+        // OffsetAllocationHandle
+        allocated_buffer = std::make_unique<AllocatedBuffer>(
+            shared_from_this(), segment_name_, buffer_ptr, size,
+            std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
-        
-        cur_size_.fetch_add(size);
-        MasterMetricManager::instance().inc_allocated_size(size);
-        
-        // Create a custom AllocatedBuffer that manages the OffsetAllocationHandle
-        return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                                 buffer_ptr, size, std::move(allocation_handle));
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;
@@ -174,6 +173,10 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         LOG(ERROR) << "allocation_unknown_exception";
         return nullptr;
     }
+
+    cur_size_.fetch_add(size);
+    MasterMetricManager::instance().inc_allocated_size(size);
+    return allocated_buffer;
 }
 
 void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {

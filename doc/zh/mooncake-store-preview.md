@@ -379,11 +379,11 @@ virtual std::unique_ptr<AllocatedBuffer> Allocate(
 ```
 
 * **输入参数**：
-
   * `allocators`：所有已挂载的 buffer allocator 的列表
   * `allocators_by_name`：按 segment 名称组织的 allocator 映射，用于优先分配到指定 segment
   * `objectSize`：待分配对象的大小
   * `config`：副本配置，包含首选 segment 及其他分配偏好
+
 * **输出结果**：如果分配成功，返回一个指向 `AllocatedBuffer` 的智能指针；若找不到合适的 allocator，则返回 `nullptr`
 
 #### 实现策略
