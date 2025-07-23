@@ -1452,7 +1452,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
         if (dtype_enum == TensorDtype::UNKNOWN) {
             LOG(ERROR) << "Unsupported tensor dtype!";
-            return -1;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
 
@@ -1460,7 +1460,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         int32_t ndim = static_cast<int32_t>(shape_tuple.size());
         if (ndim > 4) {
             LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
-            return -1;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         TensorMetadata metadata;
@@ -1482,13 +1482,13 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         values.emplace_back(std::span<const char>(buffer, tensor_size));
         
         auto register_result = register_buffer_internal(
-            reinterpret_cast<void *>(data_ptr), buffer_size);
+            reinterpret_cast<void *>(data_ptr), tensor_size);
         if (!register_result) {
             return tl::unexpected(register_result.error());
         }
 
         // Use put_parts to put metadata and tensor together
-        auto result = this->put_parts(key, values);
+        auto put_result = this->put_parts_internal(key, values);
 
         auto unregister_result =
             unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
