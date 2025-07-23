@@ -19,16 +19,20 @@ class DistributedObjectStore;
 class SliceBuffer;
 
 template <class T>
-int to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
-    // If the expected object is not valid, return the error code
+constexpr bool is_supported_return_type_v =
+    std::is_void_v<T> || std::is_integral_v<T>;
+
+template <class T>
+    requires is_supported_return_type_v<T>
+int64_t to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
     if (!exp) {
-        return toInt(exp.error());
+        return static_cast<int64_t>(toInt(exp.error()));
     }
 
     if constexpr (std::is_void_v<T>) {
         return 0;
     } else if constexpr (std::is_integral_v<T>) {
-        return static_cast<int>(*exp);  // ssize_t / int64_t
+        return static_cast<int64_t>(exp.value());
     } else {
         static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
     }
