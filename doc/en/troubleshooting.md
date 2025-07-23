@@ -58,3 +58,41 @@ If the network state is unstable, some requests may not be delivered, displaying
 Note: In most cases, the errors output, except for the first occurrence, are `work request flushed error`. This is because when the first error occurs, the RDMA driver sets the connection to an unavailable state, so tasks in the submission queue are blocked from execution and subsequent errors are reported. Therefore, it is recommended to locate the first occurrence of the error and check it.
 
 In addition, if the error `Failed to get description of XXX` is displayed, it indicates that the Segment name input by the user when calling the `openSegment` interface cannot be found in the etcd database. For memory read/write scenarios, the Segment name needs to strictly match the `local_hostname` field filled in by the other node during initialization.
+
+## SGLang Common Questions
+
+### How to make sure GPUDirect RDMA (GDR) is supported
+
+1. Verify the presence of an RDMA-capable NIC (e.g., Mellanox, ERDMA) and drivers.
+```
+ibv_devices
+lspci | grep rdma
+lsmod | grep -E 'ib_core|mlx4_core|mlx5_core|nvidia_peer_mem'
+```
+If no RDMA devices appear: (1) Confirm physical NIC presence via lspci
+(2) Install vendor-specific drivers (e.g., Mellanox MLNX_OFED)
+
+2. check GDR driver is ready, and peer_memory module (part of MLNX_OFED) should be installed
+```
+# Check peer_memory module (from MLNX_OFED)
+lsmod | grep peer_mem
+
+# Verify NVIDIA peer memory module
+lsmod | grep nvidia_peer_mem
+```
+
+3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in previledge mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
+
+4. Check the connectivity
+Benchmark end-to-end performance using ib_write_bw.
+```
+apt install perftest
+# server side
+ib_write_bw -d [rdma_device] -R -x gdr
+# client side
+# server side
+ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
+```
+Expected Output:
+Successful bidirectional transfer with "BW peak" reported
+Errors with -x gdr indicate GDR setup failures
