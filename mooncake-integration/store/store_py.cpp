@@ -263,6 +263,46 @@ std::vector<Slice> split_into_slices(BufferHandle &handle) {
     return slices;
 }
 
+uint64_t calculate_total_size(const Replica::Descriptor &replica) {
+    uint64_t total_length = 0;
+    if (replica.is_memory_replica() == false) {
+        auto &disk_descriptor = replica.get_disk_descriptor();
+        total_length = disk_descriptor.file_size;
+    } else {
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
+            total_length += handle.size_;
+        }
+    }
+    return total_length;
+}
+
+int allocateSlices(std::vector<Slice> &slices,
+                   const Replica::Descriptor &replica,
+                   BufferHandle &buffer_handle) {
+    uint64_t offset = 0;
+    if (replica.is_memory_replica() == false) {
+        // For disk-based replica, split into slices based on file size
+        uint64_t total_length = replica.get_disk_descriptor().file_size;
+        while (offset < total_length) {
+            auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+    } else {
+        // For memory-based replica, split into slices based on buffer
+        // descriptors
+        for (auto &handle :
+             replica.get_memory_descriptor().buffer_descriptors) {
+            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
+            slices.emplace_back(Slice{chunk_ptr, handle.size_});
+            offset += handle.size_;
+        }
+    }
+    return 0;
+}
+
 tl::expected<void, ErrorCode> DistributedObjectStore::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config) {
@@ -444,13 +484,9 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
             return kNullString;
         }
 
-        // Calculate total size from memory descriptors (assuming memory
-        // replica)
-        uint64_t total_size = 0;
-        auto &memory_descriptors = replica_list[0].get_memory_descriptor();
-        for (auto &handle : memory_descriptors.buffer_descriptors) {
-            total_size += handle.size_;
-        }
+        // Calculate total size
+        const auto &replica = replica_list[0];
+        uint64_t total_size = calculate_total_size(replica);
 
         if (total_size == 0) {
             py::gil_scoped_acquire acquire_gil;
@@ -470,13 +506,7 @@ pybind11::bytes DistributedObjectStore::get(const std::string &key) {
 
         // Create slices for the allocated buffer based on memory descriptors
         std::vector<Slice> slices;
-        uint64_t offset = 0;
-
-        for (auto &handle : memory_descriptors.buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
+        allocateSlices(slices, replica, buffer_handle);
 
         // Get the object data
         auto get_result = client_->Get(key, replica_list, slices);
@@ -549,12 +579,10 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
                 return {kNullString};
             }
 
-            // Calculate total size (memory replica assumption)
-            uint64_t total_size = 0;
-            auto &memory_descriptors = replica_list[0].get_memory_descriptor();
-            for (auto &handle : memory_descriptors.buffer_descriptors) {
-                total_size += handle.size_;
-            }
+            // Calculate total size
+            const auto &replica = replica_list[0];
+            uint64_t total_size = calculate_total_size(replica);
+            ;
 
             // Allocate buffer
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
@@ -568,13 +596,7 @@ std::vector<pybind11::bytes> DistributedObjectStore::get_batch(
 
             // Create slices
             std::vector<Slice> slices;
-            uint64_t offset = 0;
-            for (auto &handle : memory_descriptors.buffer_descriptors) {
-                void *chunk_ptr =
-                    static_cast<char *>(buffer_handle.ptr()) + offset;
-                slices.emplace_back(Slice{chunk_ptr, handle.size_});
-                offset += handle.size_;
-            }
+            allocateSlices(slices, replica, buffer_handle);
 
             buffer_handles.emplace_back(
                 std::make_unique<BufferHandle>(std::move(buffer_handle)));
@@ -698,15 +720,7 @@ tl::expected<int64_t, ErrorCode> DistributedObjectStore::getSize_internal(
     int64_t total_size = 0;
     if (!replica_list.empty()) {
         auto &replica = replica_list[0];
-        if (replica.is_memory_replica() == false) {
-            auto &disk_descriptor = replica.get_disk_descriptor();
-            total_size = disk_descriptor.file_size;
-        } else {
-            auto &memory_descriptors = replica.get_memory_descriptor();
-            for (auto &handle : memory_descriptors.buffer_descriptors) {
-                total_size += handle.size_;
-            }
-        }
+        total_size = calculate_total_size(replica);
     } else {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);  // Internal error
@@ -751,12 +765,8 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
         return nullptr;
     }
 
-    // Calculate total size (memory replica assumption)
-    uint64_t total_length = 0;
-    auto &memory_descriptors = replica_list[0].get_memory_descriptor();
-    for (auto &handle : memory_descriptors.buffer_descriptors) {
-        total_length += handle.size_;
-    }
+    const auto &replica = replica_list[0];
+    uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
         return nullptr;
@@ -773,12 +783,7 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
 
     // Create slices for the allocated buffer
     std::vector<Slice> slices;
-    uint64_t offset = 0;
-    for (auto &handle : memory_descriptors.buffer_descriptors) {
-        void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-        slices.emplace_back(Slice{chunk_ptr, handle.size_});
-        offset += handle.size_;
-    }
+    allocateSlices(slices, replica, buffer_handle);
 
     // Get the object data
     auto get_result = client_->Get(key, replica_list, slices);
@@ -850,22 +855,13 @@ tl::expected<int64_t, ErrorCode> DistributedObjectStore::get_into_internal(
     auto replica_list = query_result.value();
 
     // Calculate total size from replica list
-    uint64_t total_size = 0;
     if (replica_list.empty()) {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto &replica = replica_list[0];
-    if (replica.is_memory_replica() == false) {
-        auto &disk_descriptor = replica.get_disk_descriptor();
-        total_size = disk_descriptor.file_size;
-    } else {
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            total_size += handle.size_;
-        }
-    }
+    uint64_t total_size = calculate_total_size(replica);
 
     // Check if user buffer is large enough
     if (size < total_size) {
@@ -1051,16 +1047,7 @@ DistributedObjectStore::batch_get_into_internal(
 
         // Calculate required buffer size
         const auto &replica = replica_list[0];
-        uint64_t total_size = 0;
-        if (replica.is_memory_replica() == false) {
-            auto &disk_descriptor = replica.get_disk_descriptor();
-            total_size = disk_descriptor.file_size;
-        } else {
-            for (auto &handle :
-                 replica.get_memory_descriptor().buffer_descriptors) {
-                total_size += handle.size_;
-            }
-        }
+        uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -1241,12 +1228,8 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
             return pybind11::none();
         }
 
-        // Calculate total size (memory replica assumption)
-        uint64_t total_length = 0;
-        auto &memory_descriptors = replica_list[0].get_memory_descriptor();
-        for (auto &handle : memory_descriptors.buffer_descriptors) {
-            total_length += handle.size_;
-        }
+        const auto &replica = replica_list[0];
+        uint64_t total_length = calculate_total_size(replica);
 
         if (total_length == 0) {
             py::gil_scoped_acquire acquire_gil;
@@ -1264,12 +1247,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
 
         // Create slices for the allocated buffer
         std::vector<Slice> slices;
-        uint64_t offset = 0;
-        for (auto &handle : memory_descriptors.buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
+        allocateSlices(slices, replica, buffer_handle);
 
         // Get the object data
         auto get_result = client_->Get(key, replica_list, slices);

@@ -18,7 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -99,13 +98,12 @@ typedef void *transport_t;
  * This means that the caller can free the memory pointed to by "char *"
  * parameters, after the call is completed.
  * All the C functions here follow this convention.
-*/
+ */
 
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port,
-                                       int auto_discover);
+                                       uint64_t rpc_port, int auto_discover);
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len);
 
@@ -116,7 +114,8 @@ int uninstallTransport(transfer_engine_t engine, const char *proto);
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name);
 
-segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_name);
+segment_id_t openSegmentNoCache(transfer_engine_t engine,
+                                const char *segment_name);
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
 
@@ -145,12 +144,13 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg);
 
-notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
-              int* size);
+notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size);
 
-int getTransferStatus(transfer_engine_t engine,
-                      batch_id_t batch_id, size_t task_id,
-                      struct transfer_status *status);
+int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
+                      notify_msg_t notify_msg);
+
+int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                      size_t task_id, struct transfer_status *status);
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 

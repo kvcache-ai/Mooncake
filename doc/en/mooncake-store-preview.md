@@ -12,6 +12,7 @@ Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
 - **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
+- **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
 - **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
@@ -91,20 +92,10 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, after a successful in-memory put request, an asynchronous persistence operation to SSD will be initiated.)​ The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
-enum class MediaType {
-    VRAM,
-    RAM,
-    SSD
-};
-
-struct Location {
-    std::string segment_name;   // Segment Name within the Transfer Engine, usually the local_hostname field filled when the target server starts
-};
-
 struct ReplicateConfig {
-    uint64_t replica_num;       // Total number of replicas for the object
-    std::map<MediaType, int> media_replica_num; // Number of replicas allocated on a specific medium, with the higher value taken if the sum exceeds replica_num
-    std::vector<Location> locations; // Specific storage locations (machine and medium) for a replica
+    size_t replica_num{1};                    // Total number of replicas for the object
+    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
 
@@ -409,6 +400,33 @@ There are two startup parameters in `master_service` related to the soft pin mec
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Preferred Segment Allocation
+
+Mooncake Store provides a **preferred segment allocation** feature that allows users to specify a preferred storage segment (node) for object allocation. This feature is particularly useful for optimizing data locality and reducing network overhead in distributed scenarios.
+
+#### How It Works
+
+The preferred segment allocation feature is implemented through the `AllocationStrategy` system and is controlled via the `preferred_segment` field in the `ReplicateConfig` structure:
+
+```cpp
+struct ReplicateConfig {
+    size_t replica_num{1};                    // Total number of replicas for the object
+    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    std::string preferred_segment{};         // Preferred segment for allocation
+};
+```
+
+When a `Put` operation is initiated with a non-empty `preferred_segment` value, the allocation strategy follows this process:
+
+1. **Preferred Allocation Attempt**: The system first attempts to allocate space from the specified preferred segment. If the preferred segment has sufficient available space, the allocation succeeds immediately.
+
+2. **Fallback to Random Allocation**: If the preferred segment is unavailable, full, or doesn't exist, the system automatically falls back to the standard random allocation strategy among all available segments.
+
+3. **Retry Logic**: The allocation strategy includes built-in retry mechanisms with up to 10 attempts to find suitable storage space across different segments.
+
+- **Data Locality**: By preferring local segments, applications can reduce network traffic and improve access performance for frequently used data.
+- **Load Balancing**: Applications can distribute data across specific nodes to achieve better load distribution.
+
 ### Multi-layer Storage Support
 
 This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
@@ -425,149 +443,7 @@ When persistence is enabled, every successful `Put`or`BatchPut` operation in mem
 
 ## Mooncake Store Python API
 
-### setup
-```python
-def setup(
-    self,
-    local_hostname: str,
-    metadata_server: str,
-    global_segment_size: int = 16777216,  # 16MB
-    local_buffer_size: int = 16777216,    # 16MB
-    protocol: str = "tcp",
-    rdma_devices: str = "",
-    master_server_addr: str = "127.0.0.1:50051"
-) -> int
-```
-Initializes storage configuration and network parameters.
-
-**Parameters**  
-- `local_hostname`: Hostname/IP of local node
-- `metadata_server`: Address of metadata coordination server
-- `global_segment_size`: Shared memory segment size (default 16MB)
-- `local_buffer_size`: Local buffer allocation size (default 16MB)
-- `protocol`: Communication protocol ("tcp" or "rdma")
-- `rdma_devices`: RDMA device spec (format depends on implementation)
-- `master_server_addr`: The address information of the Master (format: `IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### initAll
-```python
-def initAll(
-    self,
-    protocol: str,
-    device_name: str,
-    mount_segment_size: int = 16777216  # 16MB
-) -> int
-```
-Initializes distributed resources and establishes connections.
-
-**Parameters**  
-- `protocol`: Network protocol to use ("tcp"/"rdma")
-- `device_name`: Hardware device identifier
-- `mount_segment_size`: Memory segment size for mounting (default 16MB)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### put
-```python
-def put(self, key: str, value: bytes) -> int
-```
-Stores a binary object in the distributed storage.
-
-**Parameters**  
-- `key`: Unique object identifier (string)
-- `value`: Binary data to store (bytes-like object)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### get
-```python
-def get(self, key: str) -> bytes
-```
-Retrieves an object from distributed storage.
-
-**Parameters**  
-- `key`: Object identifier to retrieve
-
-**Returns**  
-- `bytes`: Retrieved binary data
-
-**Raises**  
-- `KeyError`: If specified key doesn't exist
-
----
-
-### remove
-```python
-def remove(self, key: str) -> int
-```
-Deletes an object from the storage system.
-
-**Parameters**  
-- `key`: Object identifier to remove
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### isExist
-```python
-def isExist(self, key: str) -> int
-```
-Checks object existence in the storage system.
-
-**Parameters**  
-- `key`: Object identifier to check
-
-**Returns**  
-- `int`: 
-  - `1`: Object exists
-  - `0`: Object doesn't exist
-  - `-1`: Error occurred
-
----
-
-### close
-```python
-def close(self) -> int
-```
-Cleans up all resources and terminates connections. Corresponds to `tearDownAll()`.
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
-### Usage Example
-```python
-
-from mooncake.store import MooncakeDistributedStore
-store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="IP:port",
-    metadata_server="etcd://metadata server IP:port",
-    protocol="rdma",
-    ...
-)
-store.initAll(protocol="rdma", device_name="mlx5_0")
-
-# Store configuration
-store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
-
-# Retrieve data
-value = store.get("kvcache1")
-
-store.close()
-```
+**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
 
 ## Compilation and Usage
 Mooncake Store is compiled together with other related components (such as the Transfer Engine).
