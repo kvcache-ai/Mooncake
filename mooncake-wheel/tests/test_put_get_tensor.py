@@ -7,6 +7,11 @@ import threading
 import random
 from mooncake.store import MooncakeDistributedStore
 
+# The lease time of the kv object, should be set equal to
+# the master's value.
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+# Use environment variable if set, otherwise use default
+default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 
 # Define a test class for serialization
 class TestClass:
@@ -108,6 +113,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.equal(tensor_rand, retrieved_rand))
 
         # Clean up
+        time.sleep(default_kv_lease_ttl / 1000)
         self.store.remove(key)
         self.store.remove(key_int)
         self.store.remove(key_bool)

@@ -10,7 +10,9 @@ from collections import defaultdict
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_KV_LEASE_TTL = 200 # 200 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+# Use environment variable if set, otherwise use default
+default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 ADD_OPERATION_COUNT_ONE = 1 
 ADD_OPERATION_COUNT_ZERO = 0   
 NO_ADD_LATENCY = 0              
@@ -286,7 +288,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # --------------------------
         # Phase 3: Cleanup
         # --------------------------
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
@@ -417,7 +419,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         throughput_stats.print_throughput(thread_put_stats, thread_get_stats)
 
         # Cleanup
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         index = 0
         while index < OPERATIONS_PER_THREAD:
             key = "k_" + str(index)
@@ -563,7 +565,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # --------------------------
         # Phase 3: Cleanup (still using single remove for simplicity)
         # --------------------------
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         index = 0
         while index < MAX_REQUESTS:
