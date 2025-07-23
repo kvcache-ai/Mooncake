@@ -1382,13 +1382,14 @@ int DistributedObjectStore::put_tensor(const std::string &key, pybind11::object 
             }
         }
         
-
         char* buffer = reinterpret_cast<char*>(data_ptr);
         char* metadata_buffer = reinterpret_cast<char*>(&metadata);
-        this->register_buffer(metadata_buffer, sizeof(TensorMetadata));
+        std::vector<std::span<const char>> values;
+        values.emplace_back(std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
+        values.emplace_back(std::span<const char>(buffer, tensor_size));
+        
         this->register_buffer(buffer, tensor_size);
-        int result = this->put_from_with_metadata(key, buffer, metadata_buffer, tensor_size, sizeof(TensorMetadata));
-        this->unregister_buffer(metadata_buffer);
+        int result = this->put_parts(key, values);
         this->unregister_buffer(buffer);
         return result;
     } catch (const pybind11::error_already_set &e) {
