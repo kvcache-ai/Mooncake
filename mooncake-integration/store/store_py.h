@@ -218,6 +218,14 @@ class DistributedObjectStore {
     int put_tensor(const std::string &key, pybind11::object tensor);
 
    private:
+    std::vector<Slice> split_into_slices(BufferHandle &handle); 
+
+    uint64_t calculate_total_size(const Replica::Descriptor &replica);
+
+    int allocateSlices(std::vector<Slice> &slices, 
+                       const Replica::Descriptor &replica, 
+                       BufferHandle &buffer_handle); 
+
     pybind11::module numpy = pybind11::module::import("numpy");
     pybind11::module torch = pybind11::module::import("torch");
 
