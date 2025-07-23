@@ -146,5 +146,6 @@ if(USE_3FS)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
+find_package(yaml-cpp REQUIRED)
 find_package(gflags REQUIRED)
 find_package(yalantinglibs CONFIG REQUIRED)
