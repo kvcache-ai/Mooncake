@@ -128,7 +128,11 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     if (ret) return ret;
 
 #ifdef USE_ASCEND
-    multi_transports_->installTransport("ascend", local_topology_);
+    Transport* ascend_transport = multi_transports_->installTransport("ascend", local_topology_);
+    if (!ascend_transport) {
+        LOG(ERROR) << "Failed to install Ascend transport";
+        return -1;
+    }
 #else
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
@@ -152,16 +156,32 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #ifdef USE_MNNVL
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_MNNVL")) {
-            multi_transports_->installTransport("rdma", local_topology_);
+            Transport* rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+            if (!rdma_transport) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
         } else {
-            multi_transports_->installTransport("nvlink", nullptr);
+            Transport* nvlink_transport = multi_transports_->installTransport("nvlink", nullptr);
+            if (!nvlink_transport) {
+                LOG(ERROR) << "Failed to install NVLink transport";
+                return -1;
+            }
         }
 #else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
-            multi_transports_->installTransport("rdma", local_topology_);
+            Transport* rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+            if (!rdma_transport) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
         } else {
-            multi_transports_->installTransport("tcp", nullptr);
+            Transport* tcp_transport = multi_transports_->installTransport("tcp", nullptr);
+            if (!tcp_transport) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
         }
 #endif
         // TODO: install other transports automatically
