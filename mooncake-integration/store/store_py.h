@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
-#include "allocator.h"
+
 #include "client.h"
 #include "client_buffer.hpp"
 
@@ -17,6 +17,26 @@ class DistributedObjectStore;
 
 // Forward declarations
 class SliceBuffer;
+
+template <class T>
+constexpr bool is_supported_return_type_v =
+    std::is_void_v<T> || std::is_integral_v<T>;
+
+template <class T>
+    requires is_supported_return_type_v<T>
+int64_t to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
+    if (!exp) {
+        return static_cast<int64_t>(toInt(exp.error()));
+    }
+
+    if constexpr (std::is_void_v<T>) {
+        return 0;
+    } else if constexpr (std::is_integral_v<T>) {
+        return static_cast<int64_t>(exp.value());
+    } else {
+        static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
+    }
+}
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -234,7 +254,70 @@ class DistributedObjectStore {
      */
     int put_tensor(const std::string &key, pybind11::object tensor);
 
-   public:
+    // Internal versions that return tl::expected
+    tl::expected<void, ErrorCode> setup_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "tcp",
+        const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051");
+
+    tl::expected<void, ErrorCode> initAll_internal(
+        const std::string &protocol, const std::string &device_name,
+        size_t mount_segment_size = 1024 * 1024 * 16);
+
+    tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
+
+    tl::expected<void, ErrorCode> put_internal(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
+                                                           size_t size);
+
+    tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
+                                                       void *buffer,
+                                                       size_t size);
+
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
+    tl::expected<void, ErrorCode> put_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> put_parts_internal(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> put_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> remove_internal(const std::string &key);
+
+    tl::expected<int64_t, ErrorCode> removeAll_internal();
+
+    tl::expected<void, ErrorCode> tearDownAll_internal();
+
+    tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
+        const std::vector<std::string> &keys);
+
+    tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
+
+    tl::expected<void, ErrorCode> put_tensor_internal(const std::string &key,
+                                                      pybind11::object tensor);
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 
