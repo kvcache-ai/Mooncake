@@ -281,7 +281,9 @@ class AllocatedBuffer {
     BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{std::nullopt};
+    // RAII handle for buffer allocated by offset allocator
+    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
+        std::nullopt};
 };
 
 // Implementation of get_descriptor

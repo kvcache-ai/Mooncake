@@ -24,7 +24,7 @@ Key features of Mooncake Store include:
 
 As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
 
-**Master Service**: The `Master Service` manages the logical storage space pool for the entire cluster and handles node join and leave events. It is responsible for allocating space for objects and maintaining their metadata. The actual allocation logic is implemented by the `BufferAllocator` class and coordinated through the `AllocationStrategy` class.
+**Master Service**: The `Master Service` orchestrates the logical storage space pool across the entire cluster, managing node join and leave events. It is responsible for object space allocation and metadata maintenance. Its memory allocation and eviction strategies are specifically designed and optimized to meet the demands of LLM inference workloads.
 
 The `Master Service` runs as an independent process and exposes RPC services to external components. Note that the `metadata service` required by the `Transfer Engine` (via etcd, Redis, or HTTP, etc.) is not included in the `Master Service` and needs to be deployed separately.
 
@@ -267,7 +267,8 @@ message UnMountSegmentResponse {
 When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
 
 #### Object Information Maintenance
-The Master Service needs to maintain mappings related to `BufferAllocator` and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
+
+The Master Service needs to maintain mappings related to buffer allocators and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
 
 - MountSegment
 
@@ -322,23 +323,33 @@ The Client requests the Master Service to delete all replicas corresponding to t
 
 ### Buffer Allocator
 
-The BufferAllocator is a low-level space management class in the Mooncake Store system, primarily responsible for efficiently allocating and releasing memory. It leverages Facebook's CacheLib `MemoryAllocator` to manage underlying memory. When the Master Service receives a `MountSegment` request to register underlying space, it creates a `BufferAllocator` object via `AddSegment`. The main interfaces in the `BufferAllocator` class are as follows:
+The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
+
+Importantly, the memory managed by the buffer allocator does not reside within the `Master Service` itself. Instead, it operates on memory segments registered by `Clients`. When the `Master Service` receives a `MountSegment` request to register a contiguous memory region, it creates a corresponding buffer allocator via the `AddSegment` interface.
+
+Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
+
+**CachelibBufferAllocator**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios.
+
+**OffsetBufferAllocator**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation.
+
+Mooncake Store optimizes both allocators based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios. The allocators can be used interchangeably based on specific performance requirements and memory usage patterns. This is configurable via the startup parameter `--memory-allocator` of `master_service`.
+
+Both allocators implement the same interface as `BufferAllocatorBase`. The main interfaces of the `BufferAllocatorBase` class are as follows:
 
 ```C++
-class BufferAllocator {
-    BufferAllocator(SegmentName segment_name,
-                    size_t base,
-                    size_t size);
-    ~BufferAllocator();
-
-    std::shared_ptr<BufHandle> allocate(size_t size);
-    void deallocate(BufHandle* handle);
- };
+class BufferAllocatorBase {
+    virtual ~BufferAllocatorBase() = default;
+    virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
+    virtual void deallocate(AllocatedBuffer* handle) = 0;
+};
 ```
 
-1. Constructor: When creating a `BufferAllocator` instance, the upstream needs to pass the address and size of the instance space. Based on this information, the internal cachelib interface is called for unified management.
-2. `allocate` function: When the upstream has read/write requests, it needs to specify a region for the upstream to use. The `allocate` function calls the internal cachelib allocator to allocate memory and provides information such as the address and size of the space.
-3. `deallocate` function: Automatically called by the `BufHandle` destructor, which internally calls the cachelib allocator to release memory and sets the handle state to `BufStatus::UNREGISTERED`.
+1. **Constructor**: When a `BufferAllocator` instance is created, the upstream component must provide the base address and size of the memory region to be managed. This information is used to initialize the internal allocator, enabling unified memory management.
+
+2. **`allocate` Function**: When the upstream issues read or write requests, it needs a memory region to operate on. The `allocate` function invokes the internal allocator to reserve a memory block and returns metadata such as the starting address and size. The status of the newly allocated memory is initialized as `BufStatus::INIT`.
+
+3. **`deallocate` Function**: This function is automatically triggered by the `BufHandle` destructor. It calls the internal allocator to release the associated memory and updates the handle’s status to `BufStatus::UNREGISTERED`.
 
 ### AllocationStrategy
 AllocationStrategy is a strategy class for efficiently managing memory resource allocation and replica storage location selection in a distributed environment. It is mainly used in the following scenarios:
@@ -346,28 +357,39 @@ AllocationStrategy is a strategy class for efficiently managing memory resource 
 - Selecting suitable read/write paths among multiple replicas.
 - Providing decision support for resource load balancing between nodes in distributed storage.
 
-AllocationStrategy is used in conjunction with the Master Service and the underlying module BufferAllocator:
+AllocationStrategy is used in conjunction with the Master Service and the underlying buffer allocator:
 - Master Service: Determines the target locations for replica allocation via `AllocationStrategy`.
-- `BufferAllocator`: Executes the actual memory allocation and release tasks.
+- Buffer Allocator: Executes the actual memory allocation and release tasks.
 
 #### APIs
 
-1. `Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
+`Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
 
 ```C++
-virtual std::shared_ptr<BufHandle> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>& allocators,
-        size_t objectSize) = 0;
+virtual std::unique_ptr<AllocatedBuffer> Allocate(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
+        size_t objectSize, const ReplicateConfig& config) = 0;
 ```
 
-- Input: The list of available storage segments and the size of the space to be allocated.
-- Output: Returns a successful allocation handle BufHandle.
+- **Input Parameters**:
+  - `allocators`: A vector of all mounted buffer allocators
+  - `allocators_by_name`: A map of allocators organized by segment name for preferred segment allocation
+  - `objectSize`: The size of the object to be allocated
+  - `config`: Replica configuration including preferred segment and other allocation preferences
+- **Output**: Returns a unique pointer to an `AllocatedBuffer` if allocation succeeds, or `nullptr` if no suitable allocator is found
 
 #### Implementation Strategies
 
-`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy`, using a randomized approach to select a target from available storage segments. It supports setting a random seed to ensure deterministic allocation. In addition to random allocation, strategies can be defined based on actual needs, such as:
-- Load-based allocation strategy: Prioritizes low-load segments based on current load information of storage segments.
-- Topology-aware strategy: Prioritizes data segments that are physically closer to reduce network overhead.
+`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy` that provides intelligent allocation with the following features:
+
+1. **Preferred Segment Support**: If a preferred segment is specified in the `ReplicateConfig`, the strategy first attempts to allocate from that segment before falling back to random allocation.
+
+2. **Random Allocation with Retry Logic**: When multiple allocators are available, it uses a randomized approach with up to 10 retry attempts to find a suitable allocator.
+
+3. **Deterministic Randomization**: Uses a Mersenne Twister random number generator with proper seeding for consistent behavior.
+
+The strategy automatically handles cases where the preferred segment is unavailable, full, or doesn't exist by gracefully falling back to random allocation among all available segments.
 
 ### Eviction Policy
 
