@@ -228,7 +228,7 @@ int DistributedObjectStore::tearDownAll() {
     return 0;
 }
 
-std::vector<Slice> DistributedObjectStore::split_into_slices(BufferHandle &handle) {
+std::vector<Slice> split_into_slices(BufferHandle &handle) {
     std::vector<Slice> slices;
     auto base = static_cast<uint8_t *>(handle.ptr());
     size_t offset = 0;
@@ -241,7 +241,7 @@ std::vector<Slice> DistributedObjectStore::split_into_slices(BufferHandle &handl
     return slices;
 }
 
-uint64_t DistributedObjectStore::calculate_total_size(const Replica::Descriptor &replica){
+uint64_t calculate_total_size(const Replica::Descriptor &replica){
     uint64_t total_length = 0;
     if (replica.is_memory_replica() == false) {
         auto &disk_descriptor = replica.get_disk_descriptor();
@@ -255,7 +255,7 @@ uint64_t DistributedObjectStore::calculate_total_size(const Replica::Descriptor 
     return total_length;
 }
 
-int DistributedObjectStore::allocateSlices(std::vector<Slice> &slices, 
+int allocateSlices(std::vector<Slice> &slices, 
                                            const Replica::Descriptor &replica, 
                                            BufferHandle &buffer_handle) {
     uint64_t offset = 0;
