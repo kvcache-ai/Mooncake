@@ -292,7 +292,12 @@ static int connectToTarget(std::string target_ip, int target_port) {
     }
     
     int connected = 0;
-    for (int i = 0; i < RETRY_TIMES; ++i) {
+
+    const char* tcp_timeout_str = std::getenv("Ascend_TCP_TIMEOUT");
+    int ascend_tcp_timeout = tcp_timeout_str ? std::atoi(tcp_timeout_str) : 30;
+    int connect_retry_times = ascend_tcp_timeout * 100;
+
+    for (int i = 0; i < connect_retry_times; ++i) {
         if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
             LOG(INFO) << "Connect to host server " << target_ip << ":" << ntohs(server_addr.sin_port) << " successful";
             connected = 1;
@@ -301,13 +306,13 @@ static int connectToTarget(std::string target_ip, int target_port) {
 
         LOG(INFO) << "Connect attempt " << i << " failed: " << strerror(errno) << ", retry once";
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     if (!connected) {
-        LOG(ERROR) << "Failed to connect to server after " << RETRY_TIMES << " retries";
+        LOG(ERROR) << "Failed to connect to server after " << connect_retry_times << " retries";
         close(client_socket);
-        return -1;
+        return HCCL_E_TIMEOUT;
     }
 
     return client_socket;
@@ -424,10 +429,23 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
         return ret;
     }
     LOG(INFO) << "hccl_socket begin to connect, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
+
     hccl::HcclSocketStatus status;
+    struct timespec start, end;
+    const char* hccl_socket_timeout_str = std::getenv("Ascend_HCCL_SOCKET_TIMEOUT");
+    int hccl_socket_timeout = hccl_socket_timeout_str ? std::atoi(hccl_socket_timeout_str) : 30;
+    long long hccl_socket_timeout_ns = static_cast<long long>(hccl_socket_timeout) * 1000000000LL;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     do {
         status = hccl_socket->GetStatus();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        long long elapsed_time = (end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec);
+        if (elapsed_time > hccl_socket_timeout_ns) {  // Exceeds 20 seconds,TimeOut
+            LOG(ERROR) << "hccl_socket connect timeout, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
+            return HCCL_E_TIMEOUT;
+        }
     } while (status != hccl::HcclSocketStatus::SOCKET_OK);
+
     LOG(INFO) << "hccl_socket connect success, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
 
     return 0;
@@ -495,7 +513,9 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
                     << ", ret: " << ret;
         return ret;
     }
-    ret = transport_mem->Connect(120);
+    const char* transport_mem_timeout_str = std::getenv("Ascend_TRANSPORT_MEM_TIMEOUT");
+    int transport_mem_timeout = transport_mem_timeout_str ? std::atoi(transport_mem_timeout_str) : 120;
+    ret = transport_mem->Connect(transport_mem_timeout);
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp, sizeof(deviceIp));
@@ -821,7 +841,9 @@ int transportMemAccept(RankInfo *local_rank_info) {
                     << ", ret: " << ret;
         return ret;
     }
-    ret = transport_mem->Connect(120);
+    const char* transport_mem_timeout_str = std::getenv("Ascend_TRANSPORT_MEM_TIMEOUT");
+    int transport_mem_timeout = transport_mem_timeout_str ? std::atoi(transport_mem_timeout_str) : 120;
+    ret = transport_mem->Connect(transport_mem_timeout);
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
@@ -906,8 +928,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
     return 0;
 }
 
-int regLocalRmaMem(void *addr, uint64_t length)
-{
+int regLocalRmaMem(void *addr, uint64_t length) {
     g_localMergeMem.push_back(MergeMem{addr, length});
     return 0;
 }

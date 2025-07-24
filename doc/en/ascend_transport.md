@@ -157,7 +157,7 @@ You can configure various scenarios (e.g., 1-to-1, 1-to-2, 2-to-1) and performan
 
 **Start Initiator Node:**
 ```bash
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384
 ```
 
 **Start Target Node:**
@@ -187,13 +187,13 @@ export ASCEND_TRANSPORT_PRINT=1
 ```
 
 ### Timeout Configuration
-Ascend Transport uses TCP-based out-of-band communication on the host side, with a receive timeout set to 120 seconds.
+Ascend Transport based on TCP for out-of-band communication, has a connection timeout configured via the environment variable `Ascend_TCP_TIMEOUT`, with a default value of 30 seconds. On the host side, the `recv` timeout is set to 30 seconds, meaning that if no message is received from the peer within 30 seconds, an error will be reported.
 
-Connection timeout is controlled by the environment variable HCCL_CONNECT_TIMEOUT.
-Execution timeout is configured via HCCL_EXEC_TIMEOUT.
-If no communication occurs within this timeout, the hccl_socket connection will be terminated.
+The connection timeout for `hccl_socket` is configured through the environment variable `Ascend_HCCL_SOCKET_TIMEOUT`, with a default value of 30 seconds. If this timeout is exceeded, the current transmission will report an error and return.
 
-Point-to-point communication between endpoints involves a connection handshake with a timeout of 120 seconds.
+`hccl_socket` has a keep-alive requirement, and the execution timeout is configured via the environment variable `HCCL_EXEC_TIMEOUT`. If no communication occurs within the `HCCL_EXEC_TIMEOUT` period, the `hccl_socket` connection will be disconnected.
+
+In `transport_mem`, the point-to-point communication between endpoints involves a connection handshake process, and its timeout is configured via `Ascend_TRANSPORT_MEM_TIMEOUT`, with a default value of 120 seconds.
 
 ### Error Code
 Ascend transport error codes reuse the HCCL collective communication transport error codes.
