@@ -99,7 +99,10 @@ class TransferEnginePy {
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode);
-
+    
+    // Known issue: in a few inference engines and benchmarks, accuracy 
+    // may be affected when using the batchTransferSync API. We currently 
+    // found this issue only in multi-node NVLink transfers.
     int batchTransferSync(const char *target_hostname,
                           std::vector<uintptr_t> buffers,
                           std::vector<uintptr_t> peer_buffer_addresses,
