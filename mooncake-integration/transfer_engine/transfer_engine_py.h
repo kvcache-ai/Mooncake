@@ -146,6 +146,10 @@ class TransferEnginePy {
 
     int doBuddyAllocate(int class_id);
 
+    int doSingleTransferSync(const char *target_hostname, uintptr_t buffer,
+                             uintptr_t peer_buffer_address, size_t length,
+                             TransferOpcode opcode);
+
    private:
     std::shared_ptr<TransferEngine> engine_;
     Transport *xport_;
