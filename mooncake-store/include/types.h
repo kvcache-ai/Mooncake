@@ -25,7 +25,7 @@ static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    200;  // in milliseconds
+    5000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;

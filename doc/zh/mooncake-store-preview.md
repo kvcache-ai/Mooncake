@@ -397,7 +397,7 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。
 
-默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
+默认的租约时间为 5 秒，并可通过 `master_service` 的启动参数进行配置。
 
 ### 软固定机制
 
