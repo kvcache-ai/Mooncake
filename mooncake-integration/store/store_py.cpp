@@ -18,6 +18,72 @@ namespace py = pybind11;
 
 namespace mooncake {
 
+
+auto torch = py::module_::import("torch");
+
+enum class TensorDtype : int32_t {
+        FLOAT32 = 0,
+        FLOAT64 = 1,
+        INT8 = 2,
+        UINT8 = 3,
+        INT16 = 4,
+        UINT16 = 5,
+        INT32 = 6,
+        UINT32 = 7,
+        INT64 = 8,
+        UINT64 = 9,
+        BOOL = 10,
+        UNKNOWN = -1
+    };
+
+template <typename T>
+py::array create_typed_array(char *exported_data, size_t offset, size_t total_length) {
+    py::capsule free_when_done(exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+        (T *)(exported_data + offset), free_when_done);
+}
+
+using ArrayCreatorFunc = std::function<py::array(char*, size_t, size_t)>;
+
+static const std::array<ArrayCreatorFunc, 11> array_creators = {{
+        create_typed_array<float>,      // FLOAT32 = 0
+        create_typed_array<double>,     // FLOAT64 = 1
+        create_typed_array<int8_t>,     // INT8 = 2
+        create_typed_array<uint8_t>,    // UINT8 = 3
+        create_typed_array<int16_t>,    // INT16 = 4
+        create_typed_array<uint16_t>,   // UINT16 = 5
+        create_typed_array<int32_t>,    // INT32 = 6
+        create_typed_array<uint32_t>,   // UINT32 = 7
+        create_typed_array<int64_t>,    // INT64 = 8
+        create_typed_array<uint64_t>,   // UINT64 = 9
+        create_typed_array<bool>        // BOOL = 10
+    }};
+TensorDtype get_tensor_dtype(py::object dtype_obj) {
+    if (dtype_obj.is_none()) {
+        return TensorDtype::UNKNOWN;
+    }
+
+    if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
+    if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
+    if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
+    if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
+    if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
+    if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
+    if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
+    if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
+    if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
+    if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
+    if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
+
+    return TensorDtype::UNKNOWN;
+}
+
+struct TensorMetadata {
+    int32_t dtype;        
+    int32_t ndim;       
+    int32_t shape[4];     
+};
+
 // ResourceTracker implementation using singleton pattern
 ResourceTracker &ResourceTracker::getInstance() {
     static ResourceTracker instance;
@@ -1198,17 +1264,50 @@ DistributedObjectStore::batchIsExist_internal(
     return client_->BatchIsExist(keys);
 }
 
-template <typename T>
-py::array create_typed_array(char *exported_data, size_t total_length) {
-    py::capsule free_when_done(exported_data,
-                               [](void *p) { delete[] static_cast<T *>(p); });
+int DistributedObjectStore::put_from_with_metadata(const std::string &key, void *buffer, void *metadata_buffer,
+                                     size_t size, size_t metadata_size,
+                                     const ReplicateConfig &config) {
+    // NOTE: The buffer address must be previously registered with
+    // register_buffer() for zero-copy RDMA operations to work correctly
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return -1;
+    }
 
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)exported_data, free_when_done);
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to put empty data for key: " << key;
+        return 0;
+    }
+
+    // Create slices directly from the user buffer
+    std::vector<mooncake::Slice> slices;
+    // Add metadata slice
+    uint64_t metadata_offset = 0;
+    while (metadata_offset < metadata_size) {
+        auto metadata_chunk_size = std::min(metadata_size - metadata_offset, kMaxSliceSize);
+        void *metadata_chunk_ptr = static_cast<char *>(metadata_buffer) + metadata_offset;
+        slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
+        metadata_offset += metadata_chunk_size;
+    }
+
+    uint64_t offset = 0;
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+    auto put_result = client_->Put(key, slices, config);
+    if (!put_result) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(put_result.error());
+        return -toInt(put_result.error());
+    }
+    return 0;
 }
 
-pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
-                                                    const std::string dtype) {
+
+pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return pybind11::none();
@@ -1219,12 +1318,14 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
         auto query_result = client_->Query(key);
         if (!query_result) {
             py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Query failed: " << query_result.error();
             return pybind11::none();
         }
 
         auto replica_list = query_result.value();
         if (replica_list.empty()) {
             py::gil_scoped_acquire acquire_gil;
+            LOG(INFO) << "No replicas found for key: " << key;
             return pybind11::none();
         }
 
@@ -1233,6 +1334,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
 
         if (total_length == 0) {
             py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Failed to allocate slices for key: " << key;
             return pybind11::none();
         }
 
@@ -1253,8 +1355,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
         auto get_result = client_->Get(key, replica_list, slices);
         if (!get_result) {
             py::gil_scoped_acquire acquire_gil;
-            LOG(ERROR) << "Get failed for key: " << key
-                       << " with error: " << toString(get_result.error());
+            LOG(ERROR) << "Get failed for key: " << key;
             return pybind11::none();
         }
 
@@ -1262,53 +1363,68 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key,
         char *exported_data = new char[total_length];
         if (!exported_data) {
             py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
+        TensorMetadata metadata;
 
         // Copy data from buffer to contiguous memory
         memcpy(exported_data, buffer_handle.ptr(), total_length);
+        memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
-        // Convert bytes to tensor using torch.from_numpy
-        py::gil_scoped_acquire acquire_gil;
-
-        py::object py_buffer =
-            py::memoryview::from_memory(exported_data, total_length);
-        pybind11::object np_array;
-        if (dtype == "float32") {
-            np_array = create_typed_array<float>(exported_data, total_length);
-        } else if (dtype == "float64") {
-            np_array = create_typed_array<double>(exported_data, total_length);
-        } else if (dtype == "int8") {
-            np_array = create_typed_array<int8_t>(exported_data, total_length);
-        } else if (dtype == "uint8") {
-            np_array = create_typed_array<uint8_t>(exported_data, total_length);
-        } else if (dtype == "int16") {
-            np_array = create_typed_array<int16_t>(exported_data, total_length);
-        } else if (dtype == "uint16") {
-            np_array =
-                create_typed_array<uint16_t>(exported_data, total_length);
-        } else if (dtype == "int32") {
-            np_array = create_typed_array<int32_t>(exported_data, total_length);
-        } else if (dtype == "uint32") {
-            np_array =
-                create_typed_array<uint32_t>(exported_data, total_length);
-        } else if (dtype == "int64") {
-            np_array = create_typed_array<int64_t>(exported_data, total_length);
-        } else if (dtype == "uint64") {
-            np_array =
-                create_typed_array<uint64_t>(exported_data, total_length);
-        } else if (dtype == "bool") {
-            np_array = create_typed_array<bool>(exported_data, total_length);
+        if(metadata.ndim < 0 || metadata.ndim > 4) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+            return pybind11::none();
         }
 
-        // Create tensor from numpy array
+        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Unknown tensor dtype!";
+            return pybind11::none();
+        }
+
+        size_t tensor_size = total_length - sizeof(TensorMetadata);
+        if (tensor_size == 0) {
+            delete[] exported_data;
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Invalid data format: no tensor data found";
+            return pybind11::none();
+        }
+
+        // Convert bytes to tensor using torch.from_numpy
+        pybind11::object np_array;
+        int dtype_index = static_cast<int>(dtype_enum);
+        if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
+            np_array = array_creators[dtype_index](exported_data, sizeof(TensorMetadata), tensor_size);
+        } else {
+            py::gil_scoped_acquire acquire_gil;
+            LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
+            return pybind11::none();
+        }
+
+        if (metadata.ndim > 0) {
+            std::vector<int> shape_vec;
+            for (int i = 0; i < metadata.ndim; i++) {
+                shape_vec.push_back(metadata.shape[i]);
+            }
+            py::tuple shape_tuple = py::cast(shape_vec);
+            np_array = np_array.attr("reshape")(shape_tuple);
+        }
+        py::gil_scoped_acquire acquire_gil;
         pybind11::object tensor = torch.attr("from_numpy")(np_array);
         return tensor;
+
     } catch (const pybind11::error_already_set &e) {
-        LOG(ERROR) << "Failed to convert bytes to tensor: " << e.what();
+        py::gil_scoped_acquire acquire_gil;
+        LOG(ERROR) << "Failed to get tensor data: " << e.what();
         return pybind11::none();
     }
 }
+
 
 tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
     const std::string &key, pybind11::object tensor) {
@@ -1316,32 +1432,63 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-
-    try {
-        // Import torch module
-        // Check if the object is a tensor
+    try{
         if (!(tensor.attr("__class__")
-                  .attr("__name__")
-                  .cast<std::string>()
-                  .find("Tensor") != std::string::npos)) {
+        .attr("__name__")
+        .cast<std::string>()
+        .find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        // Get the data pointer and size directly from the tensor
+
         uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = tensor.attr("numel")().cast<size_t>();
         size_t element_size = tensor.attr("element_size")().cast<size_t>();
-        size_t buffer_size = numel * element_size;
+        size_t tensor_size = numel * element_size;
+        
+        pybind11::object shape_obj = tensor.attr("shape");
+        pybind11::object dtype_obj = tensor.attr("dtype");
 
+        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            LOG(ERROR) << "Unsupported tensor dtype!";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+
+        pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+        int32_t ndim = static_cast<int32_t>(shape_tuple.size());
+        if (ndim > 4) {
+            LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        TensorMetadata metadata;
+        metadata.dtype = static_cast<int32_t>(dtype_enum);
+        metadata.ndim = ndim;
+        
+        for (int i = 0; i < 4; i++) {
+            if (i < ndim) {
+                metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+            } else {
+                metadata.shape[i] = -1;
+            }
+        }
+        
+        char* buffer = reinterpret_cast<char*>(data_ptr);
+        char* metadata_buffer = reinterpret_cast<char*>(&metadata);
+        std::vector<std::span<const char>> values;
+        values.emplace_back(std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
+        values.emplace_back(std::span<const char>(buffer, tensor_size));
+        
         auto register_result = register_buffer_internal(
-            reinterpret_cast<void *>(data_ptr), buffer_size);
+            reinterpret_cast<void *>(data_ptr), tensor_size);
         if (!register_result) {
             return tl::unexpected(register_result.error());
         }
 
-        // Use put_from_internal for direct memory access (zero-copy)
-        auto put_result = put_from_internal(
-            key, reinterpret_cast<void *>(data_ptr), buffer_size);
+        // Use put_parts to put metadata and tensor together
+        auto put_result = this->put_parts_internal(key, values);
 
         auto unregister_result =
             unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
@@ -1358,6 +1505,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    
 }
 
 int DistributedObjectStore::put_tensor(const std::string &key,
@@ -1440,7 +1588,7 @@ PYBIND11_MODULE(store, m) {
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
         .def("get_tensor", &DistributedObjectStore::get_tensor, py::arg("key"),
-             py::arg("dtype"), "Get a PyTorch tensor from the store")
+         "Get a PyTorch tensor from the store")
         .def("put_tensor", &DistributedObjectStore::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
@@ -1506,6 +1654,25 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
             "Put object data directly from a pre-allocated buffer")
+        .def(
+            "put_from_with_metadata",
+            [](DistributedObjectStore &self, const std::string &key,
+               uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr,
+               size_t size, size_t metadata_size,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                // Put data directly from user-provided buffer with metadata
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void *metadata_buffer =
+                    reinterpret_cast<void *>(metadata_buffer_ptr);
+                py::gil_scoped_release release;
+                return self.put_from_with_metadata(
+                    key, buffer, metadata_buffer, size, metadata_size, config);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("metadata_buffer_ptr"),
+            py::arg("size"), py::arg("metadata_size"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from a pre-allocated buffer with metadata"
+        )
         .def(
             "batch_put_from",
             [](DistributedObjectStore &self,
