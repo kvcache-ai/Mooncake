@@ -89,7 +89,8 @@ class MasterServiceSupervisor {
             std::chrono::seconds(
                 0),  // Client connection timeout. 0 = no timeout (infinite)
         bool rpc_enable_tcp_no_delay = true,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
     int Start();
     ~MasterServiceSupervisor();
 
@@ -122,6 +123,7 @@ class MasterServiceSupervisor {
     std::string local_hostname_;
 
     std::string cluster_id_;
+    BufferAllocatorType memory_allocator_;
 };
 
 }  // namespace mooncake
