@@ -62,7 +62,8 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
-    rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2, "cuda:0");
+    rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
+                                            "cuda:" + std::to_string(gpu_id));
     ASSERT_EQ(rc, 0);
 
     // Write: client -> server

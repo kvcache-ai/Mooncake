@@ -313,8 +313,10 @@ int initiator() {
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
+        int name_postfix = FLAGS_use_vram ? FLAGS_gpu_id : i;
+        int rc = engine->registerLocalMemory(
+            addr[i], FLAGS_buffer_size,
+            name_prefix + std::to_string(name_postfix));
         LOG_ASSERT(!rc);
     }
 #else
@@ -406,8 +408,10 @@ int target() {
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
+        int name_postfix = FLAGS_use_vram ? FLAGS_gpu_id : i;
+        int rc = engine->registerLocalMemory(
+            addr[i], FLAGS_buffer_size,
+            name_prefix + std::to_string(name_postfix));
         LOG_ASSERT(!rc);
     }
 #else
