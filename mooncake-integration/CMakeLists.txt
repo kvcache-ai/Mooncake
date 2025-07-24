@@ -45,6 +45,7 @@ if(USE_MNNVL)
         "${ALLOCATOR_SO_PATH}"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
+    add_definitions(-DUSE_MNNVL)
 endif()
 
 if (WITH_STORE)
