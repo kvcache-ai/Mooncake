@@ -67,7 +67,7 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence in HA mode");
 
-DEFINE_string(memory_allocator, "cachelib",
+DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 
 int main(int argc, char* argv[]) {
