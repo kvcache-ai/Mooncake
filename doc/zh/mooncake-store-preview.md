@@ -24,7 +24,8 @@ Mooncake Store 的主要特性包括：
 
 如上图所示，Mooncake Store 中有两个关键组件：**Master Service** 和 **Client**。
 
-**Master Service**：`Master Service` 负责管理整个集群的逻辑存储空间池，并处理节点的加入与退出事件。它负责为对象分配存储空间，并维护对象的元数据。具体的分配逻辑由 `BufferAllocator` 类实现，并通过 `AllocationStrategy` 类进行协调。
+**Master Service**：`Master Service` 负责管理整个集群的逻辑存储空间池，并处理节点的加入与退出事件。它负责对象空间的分配以及元数据的维护。其内存分配与替换策略经过专门设计和优化，以满足大语言模型推理任务的需求。
+
 
 `Master Service` 作为一个独立进程运行，并向外部组件提供 RPC 服务。需要注意的是，`Transfer Engine` 所依赖的 `metadata service`（可通过 etcd、Redis 或 HTTP 等方式实现）不包含在 `Master Service` 中，需要单独部署。
 
@@ -274,7 +275,7 @@ message UnMountSegmentResponse {
 空间需要释放时，通过该接口在`Master Service` 中把之前挂载的资源移除。
 
 #### 对象信息维护
-`Master Service` 需要维护与 `BufferAllocator` 相关的映射关系和对象元数据等信息，在多副本场景下实现对内存资源的高效管理和副本状态的精确控制。此外，`Master Service` 使用读写锁保护关键数据结构，从而在多线程环境下保证数据的一致性与安全性。
+`Master Service` 需要维护与 buffer allocator 相关的映射关系和对象元数据等信息，在多副本场景下实现对内存资源的高效管理和副本状态的精确控制。此外，`Master Service` 使用读写锁保护关键数据结构，从而在多线程环境下保证数据的一致性与安全性。
 以下为`Master Service` 维护存储空间信息的接口：
 
 - MountSegment
@@ -331,56 +332,71 @@ tl::expected<void, ErrorCode> Remove(const std::string& key);
 
 ### Buffer Allocator
 
-BufferAllocator是Mooncake Store 体系中处于底层的空间管理类，主要的职责是高效分配和释放内存，借助 Facebook 的 CacheLib MemoryAllocator 来管理底层内存。
-在`Master Service`接收 `MountSegment`请求注册底层空间时，会通过 `AddSegment` 创建一个 BufferAllocator 对象。
-在 BufferAllocator类中，主要接口如下：
+在 Mooncake Store 系统中，Buffer Allocator 是一个底层的内存管理组件，主要负责高效的内存分配与释放。它基于底层内存分配器实现其功能。
+
+需要注意的是，Buffer Allocator 管理的内存并不属于 `Master Service` 本身。它实际操作的是由 `Clients` 注册的内存段。当 `Master Service` 收到一个 `MountSegment` 请求来注册一段连续的内存区域时，会通过 `AddSegment` 接口创建一个对应的 Buffer Allocator。
+
+Mooncake Store 提供了 `BufferAllocatorBase` 的两个具体实现：
+
+**CachelibBufferAllocator**：该分配器基于 Facebook 的 [CacheLib](https://github.com/facebook/CacheLib)，采用基于 slab 的分配策略进行内存管理，具有良好的碎片控制能力，适用于高性能场景。
+
+**OffsetBufferAllocator**：该分配器源自 [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator)，采用自定义的基于 bin 的分配策略，支持实时性要求较高的 `O(1)` 级偏移分配，并能最大限度地减少内存碎片。
+
+Mooncake Store 针对 LLM 推理任务的内存使用特性对这两种分配器进行了优化，从而提升了在大模型场景下的内存利用率。用户可以根据具体的性能需求和内存使用模式选择不同的分配器，具体通过 `master_service` 的启动参数 `--memory-allocator` 进行配置。
+
+这两种分配器都实现了 `BufferAllocatorBase` 接口。`BufferAllocatorBase` 类的主要接口如下：
 
 ```C++
-class BufferAllocator {
-    BufferAllocator(SegmentName segment_name,
-                    size_t base,
-                    size_t size);
-    ~BufferAllocator();
-
-    std::shared_ptr<BufHandle> allocate(size_t size);
-    void deallocate(BufHandle* handle);
- };
+class BufferAllocatorBase {
+    virtual ~BufferAllocatorBase() = default;
+    virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
+    virtual void deallocate(AllocatedBuffer* handle) = 0;
+};
 ```
 
-1. 构造函数，上游创建BufferAllocator 实例时，需要传入实例空间的地址和大小，根据这些信息，内部会调用底层的cachelib接口进行统一管理；
-2. `allocate`函数： 上游发生读写请求时，需要指定一片区域供上游使用, allocate会调用内部的cachelib的allocator分配内存，然后提供这片空间的地址、大小等信息；
-3. `deallocate`函数： 由BufHandle的析构函数自动调用，内部会调用cachelib的allocator释放内存，然后设置handle状态为`BufStatus::UNREGISTERED`。
+1. **构造函数**：创建 `BufferAllocator` 实例时，上层组件必须提供要管理的内存区域的基地址和大小。该信息用于初始化内部分配器，实现统一的内存管理。
+
+2. **`allocate` 函数**：当上层组件发起读写请求时，需要一段可操作的内存区域。`allocate` 函数调用内部分配器分配内存块，并返回内存起始地址和大小等元信息。新分配的内存状态被初始化为 `BufStatus::INIT`。
+
+3. **`deallocate` 函数**：该函数由 `BufHandle` 析构函数自动触发，内部调用分配器释放对应内存，并将句柄状态更新为 `BufStatus::UNREGISTERED`。
 
 ### AllocationStrategy
 
-AllocationStrategy 是一个分配策略类，用于高效地在分布式环境中管理内存资源的分配和副本的存储位置选择。主要用于以下场景：
-1. 确定对象存储副本的分配位置。
-2. 在多个副本间选择适合的读/写路径。
-3. 为分布式存储中各节点之间的资源负载均衡提供决策支持。
+`AllocationStrategy` 与 Master Service 和底层 Buffer Allocator 协同工作：
 
-AllocationStrategy 与`Master Service`和底层模块 `BufferAllocator` 配合使用：
-* `Master Service`：通过 `AllocationStrategy` 决定副本分配的目标位置。
-* `BufferAllocator`：实际执行分配和释放内存的任务。
+* **Master Service**：通过 `AllocationStrategy` 决定副本分配的目标位置。
+* **Buffer Allocator**：执行实际的内存分配与释放操作。
 
-#### 接口
+#### 接口定义
 
-1. Allocate：从可用的存储资源中，寻找适合的存储段来分配指定大小的空间。
+`Allocate`：从可用的存储资源中查找合适的存储段，以分配指定大小的空间。
 
 ```C++
-virtual std::shared_ptr<BufHandle> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>& allocators,
-        size_t objectSize) = 0;
+virtual std::unique_ptr<AllocatedBuffer> Allocate(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
+        size_t objectSize, const ReplicateConfig& config) = 0;
 ```
 
-输入：当前可用的存储段列表，以及所需分配的空间大小。
-输出：返回分配成功的存储空间句柄`BufHandle`。
+* **输入参数**：
+  * `allocators`：所有已挂载的 buffer allocator 的列表
+  * `allocators_by_name`：按 segment 名称组织的 allocator 映射，用于优先分配到指定 segment
+  * `objectSize`：待分配对象的大小
+  * `config`：副本配置，包含首选 segment 及其他分配偏好
 
-#### 具体实现策略
+* **输出结果**：如果分配成功，返回一个指向 `AllocatedBuffer` 的智能指针；若找不到合适的 allocator，则返回 `nullptr`
 
-`RandomAllocationStrategy` 是 `AllocationStrategy` 的一个实现子类，使用随机化的方式从可用存储段中选择一个目标, 支持设定随机种子来保证分配的确定性。
-除了随机分配，还可以根据实际需求定义策略。例如：
-* 基于负载的分配策略：根据存储段的当前负载信息优先选择低负载段。
-* 拓扑感知策略：优先选择物理上更接近的数据段以减少网络开销。
+#### 实现策略
+
+`RandomAllocationStrategy` 是 `AllocationStrategy` 的一个子类，提供如下智能分配特性：
+
+1. **支持首选 Segment**：若 `ReplicateConfig` 中指定了首选 segment，策略将优先尝试从该 segment 分配；如果失败，再退回到随机分配。
+
+2. **带重试逻辑的随机分配**：当存在多个可用 allocator 时，采用带最多 10 次重试机制的随机选择策略以寻找合适的 allocator。
+
+3. **确定性随机性**：使用 Mersenne Twister 随机数生成器，并通过合理种子确保分配行为的一致性。
+
+该策略能够自动处理首选 segment 不存在、空间不足或不可用等情况，并优雅地回退到所有可用 segment 中进行随机分配。
 
 ### 替换策略
 

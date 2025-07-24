@@ -30,8 +30,8 @@ class AllocationStrategy {
      *         or no suitable allocator is found
      */
     virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t objectSize, const ReplicateConfig& config) = 0;
 };
@@ -48,8 +48,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t objectSize, const ReplicateConfig& config) override {
         // Fast path: single allocator case
@@ -77,7 +77,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
      * eligible
      */
     std::unique_ptr<AllocatedBuffer> TryPreferredAllocate(
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocator>>>&
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators,
         size_t objectSize, const ReplicateConfig& config) {
         if (config.preferred_segment.empty()) {
@@ -104,7 +104,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
      * @brief Attempts allocation with random selection and retry logic
      */
     std::unique_ptr<AllocatedBuffer> TryRandomAllocate(
-        const std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         size_t objectSize) {
         const size_t max_tries = std::min(kMaxRetryLimit, allocators.size());
 

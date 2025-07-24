@@ -10,10 +10,18 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     const size_t size = segment.size;
 
     // Check if parameters are valid before allocating memory.
-    if (buffer == 0 || size == 0 || buffer % facebook::cachelib::Slab::kSize ||
-        size % facebook::cachelib::Slab::kSize) {
+    if (buffer == 0 || size == 0) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is not aligned to " << facebook::cachelib::Slab::kSize;
+                   << " is invalid";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
+        (buffer % facebook::cachelib::Slab::kSize ||
+         size % facebook::cachelib::Slab::kSize)) {
+        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
+                   << " is not aligned to " << facebook::cachelib::Slab::kSize
+                   << " as required by Cachelib";
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -34,12 +42,27 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocator> allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    // CachelibBufferAllocator may throw an exception if the size or base is
+    // invalid for the slab allocator.
     try {
-        // SlabAllocator may throw an exception if the size or base is invalid
-        // for the slab allocator.
-        allocator =
-            std::make_shared<BufferAllocator>(segment.name, buffer, size);
+        // Create allocator based on the configured type
+        switch (segment_manager_->memory_allocator_) {
+            case BufferAllocatorType::CACHELIB:
+                allocator = std::make_shared<CachelibBufferAllocator>(
+                    segment.name, buffer, size);
+                break;
+            case BufferAllocatorType::OFFSET:
+                allocator = std::make_shared<OffsetBufferAllocator>(
+                    segment.name, buffer, size);
+                break;
+            default:
+                LOG(ERROR) << "segment_name=" << segment.name
+                           << ", error=unknown_memory_allocator="
+                           << static_cast<int>(segment_manager_->memory_allocator_);
+                return ErrorCode::INVALID_PARAMS;
+        }
+
         if (!allocator) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=failed_to_create_allocator";
@@ -47,7 +70,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
     } catch (...) {
         LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=unknown_exception_during_allocator_creation";
+                   << ", error=exception_during_allocator_creation";
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -110,7 +133,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     metrics_dec_capacity = segment.size;
 
     // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocator> allocator = mounted_segment.buf_allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator = mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
     auto alloc_it = std::find(segment_manager_->allocators_.begin(),

@@ -70,7 +70,9 @@ class MasterService {
                   ViewVersionId view_version = 0,
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
                   bool enable_ha = false,
-                  const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+                  const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+                  BufferAllocatorType memory_allocator =
+                      BufferAllocatorType::CACHELIB);
     ~MasterService();
 
     /**
@@ -349,10 +351,6 @@ class MasterService {
         }
     };
 
-    // Segment management
-    SegmentManager segment_manager_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
-
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -459,6 +457,10 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+
+    // Segment management
+    SegmentManager segment_manager_;
+    std::shared_ptr<AllocationStrategy> allocation_strategy_;
 };
 
 }  // namespace mooncake
