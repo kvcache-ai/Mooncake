@@ -7,7 +7,9 @@ from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_KV_LEASE_TTL = 200 # 200 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+# Use environment variable if set, otherwise use default
+default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 
 def get_client(store):
     """Initialize and setup the distributed store client."""
@@ -89,7 +91,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(key, test_data), 0)
 
         # Remove the key
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
     def test_batch_is_exist_operations(self):
@@ -134,7 +136,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(non_existent_result[0], 0)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         for key in existing_keys:
             self.assertEqual(self.store.remove(key), 0)
         
@@ -194,7 +196,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertLess(bytes_read, 0, "get_into should fail with small buffer")
 
         # Cleanup
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0, "Buffer unregistration should succeed")
         self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
@@ -270,7 +272,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
 
         # Cleanup
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
@@ -343,7 +345,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
 
         # Cleanup
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
@@ -398,7 +400,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 get_barrier.wait()
                 
                 # Remove all keys
-                time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+                time.sleep(default_kv_lease_ttl / 1000)
                 for key in thread_keys:
                     self.assertEqual(self.store.remove(key), 0)
                 
@@ -517,7 +519,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                  print(record)
              raise e
          # Cleanup: ensure all remaining keys are removed
-         time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+         time.sleep(default_kv_lease_ttl / 1000)
          for key in list(reference.keys()):
              self.store.remove(key)
 
@@ -561,7 +563,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_data, test_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
         
         # Test with custom config
@@ -577,7 +579,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_data, test_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key2), 0)
         
         with self.assertRaises(TypeError):
@@ -607,7 +609,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertEqual(retrieved_data, expected_value)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
         
@@ -625,7 +627,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertEqual(retrieved_data, expected_value)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         for key in keys2:
             self.assertEqual(self.store.remove(key), 0)
 
@@ -657,7 +659,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_data, test_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
         
         # Test with custom config
@@ -674,7 +676,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(retrieved_data, test_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
         self.assertEqual(self.store.remove(key2), 0)
 
@@ -727,7 +729,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertEqual(retrieved_data, expected_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
         
@@ -748,7 +750,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertEqual(retrieved_data, expected_data)
         
         # Clean up
-        time.sleep(DEFAULT_KV_LEASE_TTL / 1000)
+        time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0)
         for key in keys2:
             self.assertEqual(self.store.remove(key), 0)

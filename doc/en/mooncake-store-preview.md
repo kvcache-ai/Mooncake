@@ -384,7 +384,7 @@ it initiates evict operations. The eviction target is to clean an additional `-e
 
 To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
 
-The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
+The default lease TTL is 5 seconds and is configurable via a startup parameter of `master_service`.
 
 ### Soft Pin
 
