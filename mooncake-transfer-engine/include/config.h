@@ -47,6 +47,7 @@ struct GlobalConfig {
     int64_t slice_timeout = -1;
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
+    bool enable_dest_device_affinity = false;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

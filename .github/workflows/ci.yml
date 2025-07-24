@@ -81,7 +81,7 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+        bash build.sh --use-nvcc ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Start Metadata Server
@@ -102,18 +102,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_STORE_MEMCPY=false make test -j ARGS="-V"
-      shell: bash
-
-    - name: Test (in build env with ssd)
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        mkdir -p /tmp/mooncake_test_ssd
-        export MOONCAKE_STORAGE_ROOT_DIR=/tmp/mooncake_test_ssd
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
-        rm -rf /tmp/mooncake_test_ssd
       shell: bash
 
     - name: Stop Mooncake Master Service
@@ -183,27 +172,9 @@ jobs:
     - name: Run tests with ssd
       run: |
         source test_env/bin/activate
-        mkdir -p /tmp/mooncake_test_ssd
-        export MOONCAKE_STORAGE_ROOT_DIR=/tmp/mooncake_test_ssd
-        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
-        deactivate
-        rm -rf /tmp/mooncake_test_ssd
-      shell: bash
-
-    - name: Restart metadata server
-      run: |
-        PID=$(pgrep -f "mooncake_http_metadata_server"); kill -9 $PID
-        source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
-      shell: bash
-
-    - name: Run tests
-      run: |
-        source test_env/bin/activate
-        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
         deactivate
       shell: bash
-
 
   build-flags:
     runs-on: ubuntu-22.04
@@ -313,7 +284,7 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+        bash build.sh --use-nvcc ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Generate Python version tag

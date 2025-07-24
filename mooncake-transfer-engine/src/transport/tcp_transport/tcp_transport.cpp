@@ -22,10 +22,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <random>
 
 #include "common.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 #ifdef USE_CUDA
@@ -253,8 +255,15 @@ int TcpTransport::install(std::string &local_server_name,
                           std::shared_ptr<Topology> topo) {
     metadata_ = meta;
     local_server_name_ = local_server_name;
+    int sockfd = -1;
+    int tcp_port = findAvailableTcpPort(sockfd);
+    if (tcp_port == 0) {
+        LOG(ERROR) << "TcpTransport: unable to find available tcp port for "
+                      "data transmission";
+        return -1;
+    }
 
-    int ret = allocateLocalSegmentID();
+    int ret = allocateLocalSegmentID(tcp_port);
     if (ret) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
         return -1;
@@ -267,7 +276,7 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    int tcp_port = meta->localRpcMeta().rpc_port + 1;
+    close(sockfd); // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
     running_ = true;
@@ -275,11 +284,12 @@ int TcpTransport::install(std::string &local_server_name,
     return 0;
 }
 
-int TcpTransport::allocateLocalSegmentID() {
+int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
     desc->protocol = "tcp";
+    desc->tcp_data_port = tcp_data_port;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -435,7 +445,7 @@ void TcpTransport::startTransfer(Slice *slice) {
         }
         auto endpoint_iterator =
             resolver.resolve(asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
-                             std::to_string(meta_entry.rpc_port + 1));
+                             std::to_string(desc->tcp_data_port));
         asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {

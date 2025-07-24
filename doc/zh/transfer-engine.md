@@ -410,3 +410,4 @@ int init(const std::string &metadata_conn_string,
 - `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
 - `MC_FRAGMENT_RATIO` 在将RdmaTransport::submitTransferTask中切割传输任务为传输块时，当切割完成后最后一块数据大小小于等于切割块大小的1/MC_FRAGMENT_RATIO，最后一块数据将合并进前一块的切割块进行传输以减少开销，默认值为4。
+- `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 false

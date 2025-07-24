@@ -259,8 +259,10 @@ int initiator() {
     void *addr = nullptr;
 #ifdef USE_CUDA
     addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size,
-                                         FLAGS_use_vram ? "cuda:0" : "cpu:0");
+    std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+    int name_postfix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
+    int rc = engine->registerLocalMemory(
+        addr, ram_buffer_size, name_prefix + std::to_string(name_postfix));
     LOG_ASSERT(!rc);
 #else
     addr = allocateMemoryPool(ram_buffer_size, 0, false);

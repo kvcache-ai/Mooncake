@@ -597,16 +597,67 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
     }
 }
 
+// Test batch put with duplicate keys
+TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
+    const std::string test_data = "test_data_duplicate";
+    const std::string key = "duplicate_key";
+
+    // Create two identical keys
+    std::vector<std::string> keys = {key, key};
+    std::vector<std::vector<Slice>> batched_slices;
+
+    // Prepare data for both keys
+    for (int i = 0; i < 2; i++) {
+        std::vector<Slice> slices;
+        void* buffer = client_buffer_allocator_->allocate(test_data.size());
+        memcpy(buffer, test_data.data(), test_data.size());
+        slices.emplace_back(Slice{buffer, test_data.size()});
+        batched_slices.push_back(std::move(slices));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Test batch put with duplicate keys
+    auto batch_put_results =
+        test_client_->BatchPut(keys, batched_slices, config);
+
+    // Check that we got results for both operations
+    ASSERT_EQ(batch_put_results.size(), 2);
+
+    // Both of them should success
+    // Because we currently consider `OBJECT_ALREADY_EXISTS` as success
+
+    for (const auto& result : batch_put_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchPut operation failed: " << toString(result.error());
+    }
+
+    // Clean up allocated memory
+    for (const auto& slices : batched_slices) {
+        for (const auto& slice : slices) {
+            client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+        }
+    }
+
+    // Clean up the key that was successfully put
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+    auto remove_result = test_client_->Remove(key);
+    // Remove might fail if the key wasn't actually put, which is fine
+    ASSERT_TRUE(remove_result);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
-    // Initialize Google's flags library
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
-
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);
+
+    // Initialize Google's flags library
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
 
     // Run all tests
     return RUN_ALL_TESTS();

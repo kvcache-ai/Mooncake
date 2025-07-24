@@ -6,32 +6,46 @@ Mooncake Store 是一款专为LLM推理场景设计的高性能**分布式键值
 
 与 Redis 或 Memcached 等传统缓存系统不同，Mooncake Store 的核心定位是**KV Cache 的存储引擎而非完整的缓存系统**。它们之间的最大区别是，对于后者，key 是由 value 通过哈希计算得到的，因此不再需要 `update()` 操作，也没有版本管理方面的需求。
 
-Mooncake Store 提供了底层对象存储和管理功能，而具体的缓存策略（如淘汰策略）则交由上层框架（比如vLLM）或用户实现，从而提供更高的灵活性和可定制性。
+Mooncake Store 提供了底层的对象存储和管理能力，包括可配置的缓存与淘汰策略，具有高内存利用率，专为加速LLM推理性能而设计。
 
 Mooncake Store 的主要特性包括：
 
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
 *   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
 *   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
-*   **高带宽利用**：支持对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
+*   **零拷贝、高带宽利用**：由 Transfer Engine 提供支持, 数据链路零拷贝，对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
 *   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
 *   **分级缓存**: 支持将 RAM 中缓存数据卸载到 SSD 中，以进一步实现成本与性能间的平衡，提升存储系统的效率。
 
 ## 架构
 
-Mooncake Store 由一个全局的`Master Service` 进行分配存储空间池职责。
-具体的分配细节由 `BufferAllocator` 类实现，结合 `AllocationStrategy` 策略类协调分配行为。
-
 ![architecture](../../image/mooncake-store-preview.png)
 
-如上图所示，在 Mooncake Store 中，有两个关键组件：
-1. Master Service，用于管理整个集群的逻辑存储空间池（Logical Memory Pool），并维护节点的进入与退出。这是一个独立运行的进程，会对外提供 RPC 服务。需要注意的是，Transfer Engine所需的元数据服务（通过etcd、redis或HTTP等）不包含在Master Service内，需要另行部署。
-2. Client 与 vLLM 实例共享一个进程（至少目前版本是这样）。每个 Client 分配了一定大小的 DRAM 空间，作为逻辑存储空间池（Logical Memory Pool）的一个部分。因此，数据传输实际上是从一个 Client 到另一个 Client，不经过 Master。
+如上图所示，Mooncake Store 中有两个关键组件：**Master Service** 和 **Client**。
+
+**Master Service**：`Master Service` 负责管理整个集群的逻辑存储空间池，并处理节点的加入与退出事件。它负责为对象分配存储空间，并维护对象的元数据。具体的分配逻辑由 `BufferAllocator` 类实现，并通过 `AllocationStrategy` 类进行协调。
+
+`Master Service` 作为一个独立进程运行，并向外部组件提供 RPC 服务。需要注意的是，`Transfer Engine` 所依赖的 `metadata service`（可通过 etcd、Redis 或 HTTP 等方式实现）不包含在 `Master Service` 中，需要单独部署。
+
+**Client**：在 Mooncake Store 中，`Client` 类是唯一用于表示客户端逻辑的类，但它承担着**两种不同的角色**：
+
+1. 作为 **客户端**，由上层应用调用，用于发起 `Put`、`Get` 等请求。
+2. 作为 **存储服务器**，它托管一段连续的内存区域，作为分布式 KV 缓存的一部分，使其内存可以被其他 `Client` 实例访问。数据传输实际上是发生在不同 `Client` 实例之间，绕过了 `Master Service`。
+
+可以通过配置使 `Client` 实例仅执行上述两种角色中的一种：
+
+* 如果将 `global_segment_size` 设置为 0，则该实例作为 **纯客户端**，只发起请求，但不贡献内存给系统。
+* 如果将 `local_buffer_size` 设置为 0，则该实例作为 **纯服务器**，仅提供内存用于存储。在这种情况下，该实例不允许发起 `Get` 或 `Put` 等请求操作。
+
+`Client` 有两种运行模式：
+
+1. **嵌入式模式**：作为共享库被导入，与 LLM 推理程序（例如 vLLM 实例）运行在同一进程中。
+2. **独立模式**：作为一个独立进程运行。
 
 Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
-**默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
-**高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
+1. **默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
+2. **高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
 如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
 leader 通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
 
@@ -58,8 +72,8 @@ ErrorCode Init(const std::string& local_hostname,
 ### Get 接口
 
 ```C++
-ErrorCode Get(const std::string& object_key, 
-              std::vector<Slice>& slices);
+tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+                                  std::vector<Slice>& slices);
 ```
 
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
@@ -72,9 +86,9 @@ ErrorCode Get(const std::string& object_key,
 ### Put 接口
 
 ```C++
-ErrorCode Put(const ObjectKey& key,
-              std::vector<Slice>& slices,
-              const ReplicateConfig& config);
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
 ```
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
@@ -83,27 +97,17 @@ ErrorCode Put(const ObjectKey& key,
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
-enum class MediaType {
-    VRAM,
-    RAM,
-    SSD
-};
-
-struct Location {
-    std::string segment_name;   // Transfer Engine 内的 Segment Name，通常是目标 Server 启动时填写的 local_hostname 字段内容
-};
-
 struct ReplicateConfig {
-    uint64_t replica_num;       // 指定对象的总副本数量
-    std::map<MediaType, int> media_replica_num; // 指定某个介质上分配的副本数量，累加超过 replica_num 时取高值
-    std::vector<Location> locations;// 指定某个副本的具体存放位置 (机器和介质)
+    size_t replica_num{1};                    // 对象的总副本数
+    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    std::string preferred_segment{};         // 首选的分配段
 };
 ```
 
 ### Remove 接口
 
 ```C++
-ErrorCode Remove(const ObjectKey& key);
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
@@ -276,9 +280,9 @@ message UnMountSegmentResponse {
 - MountSegment
 
 ```C++
-ErrorCode MountSegment(uint64_t buffer,
-                       uint64_t size,
-                       const std::string& segment_name);
+tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
+                                          uint64_t size,
+                                          const std::string& segment_name);
 ```
 
 存储节点(Client)向`Master Service`注册存储段空间。
@@ -286,7 +290,7 @@ ErrorCode MountSegment(uint64_t buffer,
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
 ```
 
 存储节点(Client)向`Master Service`注销存储段空间。
@@ -320,7 +324,7 @@ ErrorCode GetReplicaList(const std::string& key,
 - Remove
 
 ```C++
-ErrorCode Remove(const std::string& key);
+tl::expected<void, ErrorCode> Remove(const std::string& key);
 ```
 
 `Client`向`Master Service`请求删除指定key的所有副本。
@@ -395,6 +399,47 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 默认的租约时间为 200 毫秒，并可通过 `master_service` 的启动参数进行配置。
 
+### 软固定机制
+
+对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
+
+如果某个软固定的对象长时间未被访问，其软固定状态将被解除。而后当该对象再次被访问时，它将自动重新进入软固定状态。
+
+`master_service` 中有两个与软固定机制相关的启动参数：
+
+* `default_kv_soft_pin_ttl`：表示一个被软固定的对象在多长时间（毫秒）未被访问后会自动解除软固定状态。默认值为`30 分钟`。
+
+* `allow_evict_soft_pinned_objects`：是否允许替换已被软固定的对象。默认值为 `true`。
+
+被软固定的对象仍然可以通过 `Remove`、`RemoveAll` 等 API 主动删除。
+
+### 首选段分配
+
+Mooncake Store 提供了**首选段分配**功能，允许用户为对象分配指定首选的存储段（节点）。此功能特别适用于优化数据局部性和减少分布式场景中的网络开销。
+
+#### 工作原理
+
+首选段分配功能通过 `AllocationStrategy` 系统实现，并通过 `ReplicateConfig` 结构中的 `preferred_segment` 字段进行控制：
+
+```cpp
+struct ReplicateConfig {
+    size_t replica_num{1};                    // 对象的总副本数
+    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    std::string preferred_segment{};         // 首选的分配段
+};
+```
+
+当使用非空的 `preferred_segment` 值启动 `Put` 操作时，分配策略遵循以下流程：
+
+1. **首选分配尝试**：系统首先尝试从指定的首选段分配空间。如果首选段有足够的可用空间，分配立即成功。
+
+2. **回退到随机分配**：如果首选段不可用、已满或不存在，系统会自动回退到所有可用段之间的标准随机分配策略。
+
+3. **重试逻辑**：分配策略包含内置的重试机制，最多尝试 10 次在不同段中寻找合适的存储空间。
+
+- **数据局部性**：通过首选本地段，应用程序可以减少网络流量并提高频繁使用数据的访问性能。
+- **负载均衡**：应用程序可以将数据分布到特定节点，实现更好的负载分布。
+
 ### 分级缓存支持
 
 本系统提供了分级缓存架构的支持，通过内存缓存与持久化存储相结合的方式实现高效数据访问。数据首先存储在内存缓存中，并会异步写入分布式文件系统（DFS，Distributed File System）作为备份，形成"内存-SSD持久化存储"的分级缓存结构。
@@ -410,149 +455,8 @@ virtual std::shared_ptr<BufHandle> Allocate(
 
 ## Mooncake Store Python API
 
-### setup
-```python
-def setup(
-    self,
-    local_hostname: str,
-    metadata_server: str,
-    global_segment_size: int = 16777216,  # 默认 16MB
-    local_buffer_size: int = 16777216,    # 默认 16MB
-    protocol: str = "tcp",
-    rdma_devices: str = "",
-    master_server_addr: str = "127.0.0.1:50051"
-) -> int
-```
-初始化存储配置和网络参数。
+**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
 
-**参数**  
-- `local_hostname`: 本地节点的主机名/IP
-- `metadata_server`: 元数据协调服务器地址
-- `global_segment_size`: 共享内存段大小（默认 16MB）
-- `local_buffer_size`: 本地缓冲区分配大小（默认 16MB）
-- `protocol`: 通信协议 ("tcp" 或 "rdma")
-- `rdma_devices`: RDMA 设备规格（格式取决于具体实现）
-- `master_server_addr`: 表示 Master 的地址信息（默认模式为 `IP:Port`，高可用模式为 `etcd://IP:Port;IP:Port;...;IP:Port`）
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### init_all
-```python
-def init_all(
-    self,
-    protocol: str,
-    device_name: str,
-    mount_segment_size: int = 16777216  # 默认 16MB
-) -> int
-```
-初始化分布式资源并建立连接。
-
-**参数**  
-- `protocol`: 使用的网络协议 ("tcp"/"rdma")
-- `device_name`: 硬件设备标识符
-- `mount_segment_size`: 挂载内存段大小（默认 16MB）
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### put
-```python
-def put(self, key: str, value: bytes) -> int
-```
-存储二进制对象到分布式存储。
-
-**参数**  
-- `key`: 唯一对象标识符 (字符串)
-- `value`: 要存储的二进制数据 (bytes 类型对象)
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### get
-```python
-def get(self, key: str) -> bytes
-```
-从分布式存储检索对象。
-
-**参数**  
-- `key`: 要检索的对象标识符
-
-**返回值**  
-- `bytes`: 检索到的二进制数据
-
-**异常**  
-- `KeyError`: 当指定键不存在时抛出
-
----
-
-### remove
-```python
-def remove(self, key: str) -> int
-```
-从存储系统中删除对象。
-
-**参数**  
-- `key`: 要删除的对象标识符
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
----
-
-### isExist
-```python
-def isExist(self, key: str) -> int
-```
-检查对象是否存在。
-
-**参数**  
-- `key`: 要检查的对象标识符
-
-**返回值**  
-- `int`: 
-  - `1`: 对象存在
-  - `0`: 对象不存在
-  - `-1`: 发生错误
-
----
-
-### close
-```python
-def close(self) -> int
-```
-清理所有资源并终止连接。对应 `tearDownAll()` 方法。
-
-**返回值**  
-- `int`: 状态码 (0 = 成功，非零 = 错误)
-
-### 代码使用样例
-```python
-
-from mooncake.store import MooncakeDistributedStore
-store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="IP:port",
-    metadata_server="etcd://metadata server IP:port",
-    protocol="rdma",
-    ...
-)
-store.initAll(protocol="rdma", device_name="mlx5_0")
-
-# Store configuration
-store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
-
-# Retrieve data
-value = store.get("kvcache1")
-
-store.close()
-```
 
 ## 编译及使用方法
 Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
@@ -661,6 +565,36 @@ retcode = store.setup(
    对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
 
 无报错信息表示数据传输成功。
+
+### 以独立进程方式启动 Client
+
+使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 `Client`。
+
+首先，创建并保存一个 JSON 格式的配置文件。例如：
+
+```
+{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "global_segment_size": 268435456,
+    "local_buffer_size": 268435456,
+    "protocol": "tcp",
+    "device_name": "",
+    "master_server_address": "localhost:50051"
+}
+```
+
+然后运行 `mooncake_store_service.py`。该程序在启动 `Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
+
+程序的主要启动参数包括：
+
+* `config`：配置文件路径
+* `port`：HTTP 服务的端口号
+
+假设 `mooncake_transfer_engine` 的 wheel 包已经安装，通过下列命令可以启动程序：
+```bash
+python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
+```
 
 ## 范例代码
 

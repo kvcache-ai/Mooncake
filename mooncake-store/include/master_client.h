@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,7 +80,7 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
-             size_t value_length, const ReplicateConfig& config);
+             const ReplicateConfig& config);
 
     /**
      * @brief Starts a batch of put operations for N objects
@@ -94,7 +93,6 @@ class MasterClient {
     [[nodiscard]] std::vector<
         tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& value_lengths,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config);
 
