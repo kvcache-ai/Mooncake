@@ -592,7 +592,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return ERR_SOCKET;
             }
 
-            if (!getenv("MC_DISABLE_REUSEADDR")) {
+            if (getenv("MC_ENABLE_REUSEADDR")) {
                 if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
                                sizeof(on))) {
                     PLOG(ERROR)
@@ -1069,7 +1069,7 @@ uint16_t findAvailableTcpPort(int &sockfd) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     const int min_port = 15000;
-    const int max_port = 25000;
+    const int max_port = 17000;
     const int max_attempts = 500;
     bool use_ipv6 = globalConfig().use_ipv6;
 
@@ -1090,7 +1090,7 @@ uint16_t findAvailableTcpPort(int &sockfd) {
             continue;
         }
 
-        if (!getenv("MC_DISABLE_REUSEADDR")) {
+        if (getenv("MC_ENABLE_REUSEADDR")) {
             int on = 1;
             if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
                 close(sockfd);
