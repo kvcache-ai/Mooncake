@@ -592,20 +592,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return ERR_SOCKET;
             }
 
-            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
-                           sizeof(on))) {
-                PLOG(ERROR)
-                    << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-                closeListen();
-                return ERR_SOCKET;
-            }
-
-            int one = 1;
-            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
-                PLOG(ERROR)
-                    << "SocketHandShakePlugin: setsockopt(SO_REUSEPORT)";
-                closeListen();
-                return ERR_SOCKET;
+            if (!getenv("MC_DISABLE_REUSEADDR")) {
+                if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
+                               sizeof(on))) {
+                    PLOG(ERROR)
+                        << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+                    closeListen();
+                    return ERR_SOCKET;
+                }
             }
 
             if (globalConfig().use_ipv6) {
@@ -696,9 +690,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 // old protocol equals Connection type
                 if (type == HandShakeRequestType::Connection ||
                     type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_) on_connection_callback_(peer, local);
+                    if (on_connection_callback_)
+                        on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_) on_metadata_callback_(peer, local);
+                    if (on_metadata_callback_)
+                        on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
                 } else {
@@ -1094,19 +1090,13 @@ uint16_t findAvailableTcpPort(int &sockfd) {
             continue;
         }
 
-        int on = 1;
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-
-        int one = 1;
-
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
+        if (!getenv("MC_DISABLE_REUSEADDR")) {
+            int on = 1;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+                close(sockfd);
+                sockfd = -1;
+                continue;
+            }
         }
 
         if (use_ipv6) {
