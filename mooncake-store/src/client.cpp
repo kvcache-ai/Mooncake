@@ -237,6 +237,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                      "disabled.";
     } else {
         LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+        LOG(INFO) << "Fs subdir is: " << response.value();
         // Initialize storage backend
         client->PrepareStorageBackend(storage_root_dir, response.value());
     }
@@ -868,6 +869,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
+void Client::BatchPuttoLocalFile(std::vector<PutOperation>& ops) {
+    if (!storage_backend_) {
+        return;  // No storage backend initialized
+    }
+
+    for (const auto& op : ops) {
+        if (op.IsSuccessful()) {
+            // Store to local file if operation was successful
+            PutToLocalFile(op.key, op.slices);
+        } else {
+            LOG(ERROR) << "Skipping local file storage for key " << op.key
+                       << " due to failure: "
+                       << toString(op.result.error());
+        }
+    }
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -877,6 +895,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     SubmitTransfers(ops);
     WaitForTransfers(ops);
     FinalizeBatchPut(ops);
+    BatchPuttoLocalFile(ops);
     return CollectResults(ops);
 }
 
@@ -1014,6 +1033,12 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
     if (!result) {
+        if(storage_backend_) {
+            // If master query fails, check storage backend
+            if (storage_backend_->Existkey(key)) {
+                return true;  // Key exists in storage backend
+            }
+        }
         return tl::unexpected(result.error());
     }
     return result.value();
@@ -1050,29 +1075,19 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
     }
 }
 
-ErrorCode Client::GetFromLocalFile(const std::string& object_key,
-                                   std::vector<Slice>& slices,
-                                   std::vector<Replica::Descriptor>& replicas) {
-    if (!storage_backend_) {
-        return ErrorCode::FILE_READ_FAIL;
-    }
-
-    ErrorCode err = storage_backend_->LoadObject(object_key, slices);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    return ErrorCode::OK;
-}
-
 void Client::PutToLocalFile(const std::string& key,
-                            std::vector<Slice>& slices) {
+                            const std::vector<Slice>& slices) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;
     for (const auto& slice : slices) {
         total_size += slice.size;
     }
+
+    // Currently, persistence is achieved through asynchronous writes, but before asynchronous
+    // writing in 3FS, significant performance degradation may occur due to data copying. 
+    // Profiling reveals that the number of page faults triggered in this scenario is nearly double the normal count. 
+    // Future plans include introducing a reuse buffer list to address this performance degradation issue.
 
     std::string value;
     value.reserve(total_size);
