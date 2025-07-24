@@ -141,6 +141,23 @@ Ascend Transport provides two test files:
 
 You can configure various scenarios (e.g., 1-to-1, 1-to-2, 2-to-1) and performance tests by passing valid parameters to these programs.
 
+When `metadata_server` is set to `P2PHANDSHAKE`, Mooncake randomly selects a port in the new RPC port-mapping to avoid conflicts.  
+Therefore, in testing:
+
+1. **Start the target node first**.  
+   Watch the log produced by `mooncake-transfer-engine/src/transfer_engine.cpp`; you should see a line similar to  
+   ```
+   Transfer Engine RPC using <protocol> listening on <IP>:<actual-port>
+   ```  
+   Note the **actual port** the target node is listening on.
+
+2. **Edit the initiator’s launch command**:  
+   Change the value of `--segment_id` to `<IP>:<actual-port>` (i.e., the target node’s IP plus the port you just captured).
+
+3. **Launch the initiator node** to complete the test.
+
+Refer to the command format shown below:
+
 #### Example Commands for Scenario Testing
 
 **Start Initiator Node:**

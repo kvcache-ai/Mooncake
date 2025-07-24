@@ -381,23 +381,24 @@ Status HcclTransport::submitTransfer(
 }
 
 Status HcclTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     std::vector<Slice *> slice_list;
-    slice_list.reserve(request_list.size());
-    int task_id = 0;
-    for (auto &request : request_list) {
-        TransferTask &task = *task_list[task_id];
-        ++task_id;
-        task.total_bytes = request->length;
+    slice_list.reserve(task_list.size());
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
+        auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
+        task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request->source;
-        slice->length = request->length;
-        slice->opcode = request->opcode;
-        slice->hccl.dest_addr = request->target_offset;
+        slice->source_addr = (char *)request.source;
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->hccl.dest_addr = request.target_offset;
         slice->task = &task;
-        slice->target_id = request->target_id;
+        slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        slice->ts = 0;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
