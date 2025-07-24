@@ -42,7 +42,6 @@ set +e
 if command -v apt-get &> /dev/null; then
     echo "Detected apt-get. Using Debian-based package manager."
     apt-get update
-    apt purge -y openmpi-bin libopenmpi-dev || true
     apt-get install -y build-essential \
             cmake \
             git \
@@ -59,6 +58,7 @@ if command -v apt-get &> /dev/null; then
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
+            libyaml-cpp-dev \
             protobuf-compiler-grpc \
             libcurl4-openssl-dev \
             libhiredis-dev \
@@ -66,6 +66,7 @@ if command -v apt-get &> /dev/null; then
             patchelf \
             mpich \
             libmpich-dev
+    apt purge -y openmpi-bin libopenmpi-dev || true
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
@@ -83,6 +84,16 @@ elif command -v yum &> /dev/null; then
             jsoncpp-devel \
             mpich \
             mpich-devel
+    # Install yaml-cpp
+    cd "$TARGET_DIR"
+    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
+    cd yaml-cpp || exit
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j$(nproc)
+    make install
+    cd ../..
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
