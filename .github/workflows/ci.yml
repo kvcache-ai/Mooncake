@@ -319,6 +319,88 @@ jobs:
     - name: Build Docker image
       run: docker build -t mooncake-app .
 
+  build-release:
+    name: Test Release Build
+    runs-on: ubuntu-22.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc"]'
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project (Release build)
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
+        shell: bash
+
+      - name: Build project (Release)
+        run: |
+          cd build
+          make -j
+          sudo make install
+        shell: bash
+
+      - name: Build nvlink_allocator.so
+        run: |
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh --use-nvcc ../../build/mooncake-transfer-engine/nvlink-allocator/
+        shell: bash
+
+      - name: Build Python wheel (Release)
+        run: |
+          # Set LD_LIBRARY_PATH for wheel building
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=3.12 OUTPUT_DIR=dist-release ./scripts/build_wheel.sh
+        shell: bash
+
+      - name: Verify wheel build
+        run: |
+          ls -la mooncake-wheel/dist-release/
+          if [ ! -f mooncake-wheel/dist-release/*.whl ]; then
+            echo "ERROR: No wheel file found in release build"
+            exit 1
+          fi
+          echo "Release wheel build successful"
+        shell: bash
+
   spell-check:
     name: Spell Check with Typos
     runs-on: ubuntu-22.04
