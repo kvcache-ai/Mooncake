@@ -255,10 +255,11 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(const char *target_hostname,
                              TransferOpcode::READ);
 }
 
-
-int TransferEnginePy::doSingleTransferSync(const char *target_hostname, uintptr_t buffer,
-                                           uintptr_t peer_buffer_address, size_t length,
-                                           TransferOpcode opcode) {
+int TransferEnginePy::transferSync(const char *target_hostname,
+                                   uintptr_t buffer,
+                                   uintptr_t peer_buffer_address, size_t length,
+                                   TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -327,38 +328,11 @@ int TransferEnginePy::doSingleTransferSync(const char *target_hostname, uintptr_
     return -1;
 }
 
-int TransferEnginePy::transferSync(const char *target_hostname,
-                                   uintptr_t buffer,
-                                   uintptr_t peer_buffer_address, size_t length,
-                                   TransferOpcode opcode) {
-    pybind11::gil_scoped_release release;
-    return doSingleTransferSync(target_hostname, buffer, peer_buffer_address, 
-                                length, opcode);
-}
-
 int TransferEnginePy::batchTransferSync(const char *target_hostname,
                                    std::vector<uintptr_t> buffers,
                                    std::vector<uintptr_t> peer_buffer_addresses,
                                    std::vector<size_t> lengths,
                                    TransferOpcode opcode) {
-#ifdef USE_MNNVL
-    // TODO We have found that the accuracy of a very small number of benchmarks 
-    // may be affected when MNNVL is enabled. Thus we fallback to the series of regular
-    // transferSync calls
-    // Remind that the GIL lock still exists between call of each transferSync
-    if (buffers.size() != peer_buffer_addresses.size() || buffers.size() != lengths.size()) {
-        LOG(ERROR) << "buffers, peer_buffer_addresses and lengths have different size";
-        return -1;
-    }
-
-    auto batch_size = buffers.size();
-    for (size_t i = 0; i < batch_size; ++i) {
-        int rc = transferSync(target_hostname, buffers[i], peer_buffer_addresses[i], 
-                              lengths[i], opcode);
-        if (rc) return rc;
-    }
-    return 0;
-#else
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -437,7 +411,6 @@ int TransferEnginePy::batchTransferSync(const char *target_hostname,
         }
     }
     return -1;
-#endif
 }
 
 batch_id_t TransferEnginePy::batchTransferAsync(const char *target_hostname,
