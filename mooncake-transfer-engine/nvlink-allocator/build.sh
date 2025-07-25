@@ -20,7 +20,7 @@ CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path,
 
 # Use nvcc or g++ based on flag
 if [ "$USE_NVCC" = true ]; then
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include
 else
     g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include
 fi
