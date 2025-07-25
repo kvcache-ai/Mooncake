@@ -15,7 +15,6 @@
 #ifndef CXL_TRANSPORT_H_
 #define CXL_TRANSPORT_H_
 
-#include <infiniband/verbs.h>
 
 #include <atomic>
 #include <cstddef>
@@ -37,47 +36,56 @@ class CxlTransport : public Transport {
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
-    using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
    public:
     CxlTransport();
 
     ~CxlTransport();
 
-    BatchID allocateBatchID(size_t batch_size) override;
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) override;
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
+    Status submitTransferTask(
+        const std::vector<TransferRequest *> &request_list,
+        const std::vector<TransferTask *> &task_list) override;
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
-    Status freeBatchID(BatchID batch_id) override;
+    void* getCxlBaseAddr() { return cxl_base_addr; }
 
    private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
-                std::shared_ptr<Topology> topo) override;
+                std::shared_ptr<Topology> topo);
+
+    int allocateLocalSegmentID();
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
-                            bool update_metadata) override;
+                            bool update_metadata);
 
-    int unregisterLocalMemory(void *addr,
-                              bool update_metadata = false) override;
+    int unregisterLocalMemory(void *addr, bool update_metadata = false);
 
     int registerLocalMemoryBatch(
         const std::vector<Transport::BufferEntry> &buffer_list,
-        const std::string &location) override {
-        return 0;
-    }
+        const std::string &location);
 
     int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override {
-        return 0;
-    }
+        const std::vector<void *> &addr_list) override;
 
     const char *getName() const override { return "cxl"; }
+
+    int cxlDevInit();
+
+    size_t cxlGetDeviceSize(char* _cxl_dev_path);
+
+    int cxlMemcpy(void *dest_addr, void *source_addr, size_t size);
+
+   private:
+    void* cxl_base_addr;
+    size_t cxl_dev_size;
+    char* cxl_dev_path;
 };
 }  // namespace mooncake
 

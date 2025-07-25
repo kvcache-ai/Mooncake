@@ -55,6 +55,7 @@ class TransferMetadata {
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink
+        uint64_t offset;             // for cxl
     };
 
     struct NVMeoFBufferDesc {
@@ -86,6 +87,9 @@ class TransferMetadata {
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        // this is for cxl.
+        std::string cxl_name;
+        uint64_t cxl_base_addr;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
         // this is for ascend
