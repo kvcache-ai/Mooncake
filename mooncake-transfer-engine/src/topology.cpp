@@ -203,8 +203,11 @@ static std::vector<TopologyEntry> discoverCudaTopology(
                 avail_hca.push_back(hca.name);
             }
         }
+        topology.push_back(TopologyEntry{.name = "cuda:" + std::to_string(i),
+                                         .preferred_hca = preferred_hca,
+                                         .avail_hca = avail_hca});
         topology.push_back(
-            TopologyEntry{.name = "cuda:" + std::to_string(i),
+            TopologyEntry{.name = "gpu:" + std::to_string(i),
                           .preferred_hca = std::move(preferred_hca),
                           .avail_hca = std::move(avail_hca)});
     }
