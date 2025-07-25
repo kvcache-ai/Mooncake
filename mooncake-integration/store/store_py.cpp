@@ -6,7 +6,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>   // for timing
 #include <cstdlib>  // for atexit
+#include <iomanip>  // for std::setprecision
+#include <numeric>  // for std::accumulate
+#include <optional>
 #include <random>
 
 #include "client_buffer.hpp"
@@ -18,46 +22,47 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-
 auto torch = py::module_::import("torch");
 
 enum class TensorDtype : int32_t {
-        FLOAT32 = 0,
-        FLOAT64 = 1,
-        INT8 = 2,
-        UINT8 = 3,
-        INT16 = 4,
-        UINT16 = 5,
-        INT32 = 6,
-        UINT32 = 7,
-        INT64 = 8,
-        UINT64 = 9,
-        BOOL = 10,
-        UNKNOWN = -1
-    };
+    FLOAT32 = 0,
+    FLOAT64 = 1,
+    INT8 = 2,
+    UINT8 = 3,
+    INT16 = 4,
+    UINT16 = 5,
+    INT32 = 6,
+    UINT32 = 7,
+    INT64 = 8,
+    UINT64 = 9,
+    BOOL = 10,
+    UNKNOWN = -1
+};
 
 template <typename T>
-py::array create_typed_array(char *exported_data, size_t offset, size_t total_length) {
-    py::capsule free_when_done(exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+py::array create_typed_array(char *exported_data, size_t offset,
+                             size_t total_length) {
+    py::capsule free_when_done(
+        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
     return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-        (T *)(exported_data + offset), free_when_done);
+                          (T *)(exported_data + offset), free_when_done);
 }
 
-using ArrayCreatorFunc = std::function<py::array(char*, size_t, size_t)>;
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
 
 static const std::array<ArrayCreatorFunc, 11> array_creators = {{
-        create_typed_array<float>,      // FLOAT32 = 0
-        create_typed_array<double>,     // FLOAT64 = 1
-        create_typed_array<int8_t>,     // INT8 = 2
-        create_typed_array<uint8_t>,    // UINT8 = 3
-        create_typed_array<int16_t>,    // INT16 = 4
-        create_typed_array<uint16_t>,   // UINT16 = 5
-        create_typed_array<int32_t>,    // INT32 = 6
-        create_typed_array<uint32_t>,   // UINT32 = 7
-        create_typed_array<int64_t>,    // INT64 = 8
-        create_typed_array<uint64_t>,   // UINT64 = 9
-        create_typed_array<bool>        // BOOL = 10
-    }};
+    create_typed_array<float>,     // FLOAT32 = 0
+    create_typed_array<double>,    // FLOAT64 = 1
+    create_typed_array<int8_t>,    // INT8 = 2
+    create_typed_array<uint8_t>,   // UINT8 = 3
+    create_typed_array<int16_t>,   // INT16 = 4
+    create_typed_array<uint16_t>,  // UINT16 = 5
+    create_typed_array<int32_t>,   // INT32 = 6
+    create_typed_array<uint32_t>,  // UINT32 = 7
+    create_typed_array<int64_t>,   // INT64 = 8
+    create_typed_array<uint64_t>,  // UINT64 = 9
+    create_typed_array<bool>       // BOOL = 10
+}};
 TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;
@@ -79,9 +84,9 @@ TensorDtype get_tensor_dtype(py::object dtype_obj) {
 }
 
 struct TensorMetadata {
-    int32_t dtype;        
-    int32_t ndim;       
-    int32_t shape[4];     
+    int32_t dtype;
+    int32_t ndim;
+    int32_t shape[4];
 };
 
 // ResourceTracker implementation using singleton pattern
@@ -864,6 +869,118 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
     return std::make_shared<SliceBuffer>(std::move(buffer_handle));
 }
 
+// Implementation of batch_get_buffer_internal method
+std::vector<std::shared_ptr<SliceBuffer>>
+DistributedObjectStore::batch_get_buffer_internal(
+    const std::vector<std::string> &keys) {
+    std::vector<std::shared_ptr<SliceBuffer>> final_results(keys.size(),
+                                                            nullptr);
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return final_results;
+    }
+
+    if (keys.empty()) {
+        return final_results;
+    }
+
+    // 1. Query metadata for all keys
+    auto query_results = client_->BatchQuery(keys);
+
+    // 2. Prepare for batch get: filter valid keys and prepare buffers
+    struct KeyOp {
+        size_t original_index;
+        std::string key;
+        std::vector<Replica::Descriptor> replica_list;
+        std::unique_ptr<BufferHandle> buffer_handle;
+        std::vector<Slice> slices;
+    };
+    std::vector<KeyOp> valid_ops;
+    valid_ops.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &key = keys[i];
+
+        if (!query_results[i]) {
+            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "Query failed for key '" << key
+                           << "': " << toString(query_results[i].error());
+            }
+            continue;
+        }
+
+        auto replica_list = query_results[i].value();
+        if (replica_list.empty()) {
+            LOG(ERROR) << "Empty replica list for key: " << key;
+            continue;
+        }
+
+        const auto &replica = replica_list[0];
+        uint64_t total_size = calculate_total_size(replica);
+        if (total_size == 0) {
+            continue;
+        }
+
+        auto alloc_result = client_buffer_allocator_->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate buffer for key: " << key;
+            continue;
+        }
+
+        auto buffer_handle =
+            std::make_unique<BufferHandle>(std::move(*alloc_result));
+        std::vector<Slice> slices;
+        allocateSlices(slices, replica, *buffer_handle);
+
+        valid_ops.emplace_back(KeyOp{.original_index = i,
+                                     .key = key,
+                                     .replica_list = std::move(replica_list),
+                                     .buffer_handle = std::move(buffer_handle),
+                                     .slices = std::move(slices)});
+    }
+
+    if (valid_ops.empty()) {
+        return final_results;
+    }
+
+    // 3. Execute batch get
+    std::vector<std::string> batch_keys;
+    std::vector<std::vector<Replica::Descriptor>> batch_replica_lists;
+    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    batch_keys.reserve(valid_ops.size());
+    batch_replica_lists.reserve(valid_ops.size());
+
+    for (auto &op : valid_ops) {
+        batch_keys.push_back(op.key);
+        batch_replica_lists.push_back(op.replica_list);
+        batch_slices[op.key] = op.slices;
+    }
+
+    auto batch_get_results =
+        client_->BatchGet(batch_keys, batch_replica_lists, batch_slices);
+
+    // 4. Process results and create SliceBuffers
+    for (size_t i = 0; i < valid_ops.size(); ++i) {
+        if (batch_get_results[i]) {
+            auto &op = valid_ops[i];
+            final_results[op.original_index] =
+                std::make_shared<SliceBuffer>(std::move(*op.buffer_handle));
+        } else {
+            LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
+                       << "': " << toString(batch_get_results[i].error());
+        }
+    }
+
+    return final_results;
+}
+
+// Implementation of batch_get_buffer method
+std::vector<std::shared_ptr<SliceBuffer>>
+DistributedObjectStore::batch_get_buffer(const std::vector<std::string> &keys) {
+    return batch_get_buffer_internal(keys);
+}
+
 tl::expected<void, ErrorCode> DistributedObjectStore::register_buffer_internal(
     void *buffer, size_t size) {
     if (!client_) {
@@ -936,7 +1053,8 @@ tl::expected<int64_t, ErrorCode> DistributedObjectStore::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 2: Split user buffer according to object info and create slices
+    // Step 2: Split user buffer according to object info and create
+    // slices
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
 
@@ -1264,9 +1382,9 @@ DistributedObjectStore::batchIsExist_internal(
     return client_->BatchIsExist(keys);
 }
 
-int DistributedObjectStore::put_from_with_metadata(const std::string &key, void *buffer, void *metadata_buffer,
-                                     size_t size, size_t metadata_size,
-                                     const ReplicateConfig &config) {
+int DistributedObjectStore::put_from_with_metadata(
+    const std::string &key, void *buffer, void *metadata_buffer, size_t size,
+    size_t metadata_size, const ReplicateConfig &config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (!client_) {
@@ -1284,8 +1402,10 @@ int DistributedObjectStore::put_from_with_metadata(const std::string &key, void 
     // Add metadata slice
     uint64_t metadata_offset = 0;
     while (metadata_offset < metadata_size) {
-        auto metadata_chunk_size = std::min(metadata_size - metadata_offset, kMaxSliceSize);
-        void *metadata_chunk_ptr = static_cast<char *>(metadata_buffer) + metadata_offset;
+        auto metadata_chunk_size =
+            std::min(metadata_size - metadata_offset, kMaxSliceSize);
+        void *metadata_chunk_ptr =
+            static_cast<char *>(metadata_buffer) + metadata_offset;
         slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
         metadata_offset += metadata_chunk_size;
     }
@@ -1305,7 +1425,6 @@ int DistributedObjectStore::put_from_with_metadata(const std::string &key, void 
     }
     return 0;
 }
-
 
 pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     if (!client_) {
@@ -1363,7 +1482,8 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         char *exported_data = new char[total_length];
         if (!exported_data) {
             py::gil_scoped_acquire acquire_gil;
-            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+            LOG(ERROR) << "Invalid data format: insufficient data for "
+                          "metadata";
             return pybind11::none();
         }
         TensorMetadata metadata;
@@ -1372,7 +1492,7 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         memcpy(exported_data, buffer_handle.ptr(), total_length);
         memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
-        if(metadata.ndim < 0 || metadata.ndim > 4) {
+        if (metadata.ndim < 0 || metadata.ndim > 4) {
             delete[] exported_data;
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
@@ -1398,8 +1518,10 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
         // Convert bytes to tensor using torch.from_numpy
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
-        if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
-            np_array = array_creators[dtype_index](exported_data, sizeof(TensorMetadata), tensor_size);
+        if (dtype_index >= 0 &&
+            dtype_index < static_cast<int>(array_creators.size())) {
+            np_array = array_creators[dtype_index](
+                exported_data, sizeof(TensorMetadata), tensor_size);
         } else {
             py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
@@ -1425,18 +1547,17 @@ pybind11::object DistributedObjectStore::get_tensor(const std::string &key) {
     }
 }
 
-
 tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
     const std::string &key, pybind11::object tensor) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    try{
+    try {
         if (!(tensor.attr("__class__")
-        .attr("__name__")
-        .cast<std::string>()
-        .find("Tensor") != std::string::npos)) {
+                  .attr("__name__")
+                  .cast<std::string>()
+                  .find("Tensor") != std::string::npos)) {
             LOG(ERROR) << "Input is not a PyTorch tensor";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -1445,7 +1566,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         size_t numel = tensor.attr("numel")().cast<size_t>();
         size_t element_size = tensor.attr("element_size")().cast<size_t>();
         size_t tensor_size = numel * element_size;
-        
+
         pybind11::object shape_obj = tensor.attr("shape");
         pybind11::object dtype_obj = tensor.attr("dtype");
 
@@ -1455,8 +1576,8 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-
-        pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+        pybind11::tuple shape_tuple =
+            pybind11::cast<pybind11::tuple>(shape_obj);
         int32_t ndim = static_cast<int32_t>(shape_tuple.size());
         if (ndim > 4) {
             LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
@@ -1466,7 +1587,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         TensorMetadata metadata;
         metadata.dtype = static_cast<int32_t>(dtype_enum);
         metadata.ndim = ndim;
-        
+
         for (int i = 0; i < 4; i++) {
             if (i < ndim) {
                 metadata.shape[i] = shape_tuple[i].cast<int32_t>();
@@ -1474,13 +1595,14 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
                 metadata.shape[i] = -1;
             }
         }
-        
-        char* buffer = reinterpret_cast<char*>(data_ptr);
-        char* metadata_buffer = reinterpret_cast<char*>(&metadata);
+
+        char *buffer = reinterpret_cast<char *>(data_ptr);
+        char *metadata_buffer = reinterpret_cast<char *>(&metadata);
         std::vector<std::span<const char>> values;
-        values.emplace_back(std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
+        values.emplace_back(
+            std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
         values.emplace_back(std::span<const char>(buffer, tensor_size));
-        
+
         auto register_result = register_buffer_internal(
             reinterpret_cast<void *>(data_ptr), tensor_size);
         if (!register_result) {
@@ -1505,7 +1627,6 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
         LOG(ERROR) << "Failed to access tensor data: " << e.what();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    
 }
 
 int DistributedObjectStore::put_tensor(const std::string &key,
@@ -1574,6 +1695,9 @@ PYBIND11_MODULE(store, m) {
         .def("get_buffer", &DistributedObjectStore::get_buffer,
              py::call_guard<py::gil_scoped_release>(),
              py::return_value_policy::take_ownership)
+        .def("batch_get_buffer", &DistributedObjectStore::batch_get_buffer,
+             py::call_guard<py::gil_scoped_release>(),
+             py::return_value_policy::take_ownership)
         .def("remove", &DistributedObjectStore::remove,
              py::call_guard<py::gil_scoped_release>())
         .def("remove_all", &DistributedObjectStore::removeAll,
@@ -1582,13 +1706,14 @@ PYBIND11_MODULE(store, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("batch_is_exist", &DistributedObjectStore::batchIsExist,
              py::call_guard<py::gil_scoped_release>(), py::arg("keys"),
-             "Check if multiple objects exist. Returns list of results: 1 if "
+             "Check if multiple objects exist. Returns list of "
+             "results: 1 if "
              "exists, 0 if not exists, -1 if error")
         .def("close", &DistributedObjectStore::tearDownAll)
         .def("get_size", &DistributedObjectStore::getSize,
              py::call_guard<py::gil_scoped_release>())
         .def("get_tensor", &DistributedObjectStore::get_tensor, py::arg("key"),
-         "Get a PyTorch tensor from the store")
+             "Get a PyTorch tensor from the store")
         .def("put_tensor", &DistributedObjectStore::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
@@ -1639,7 +1764,8 @@ PYBIND11_MODULE(store, m) {
                 return self.batch_get_into(keys, buffers, sizes);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-            "Get object data directly into pre-allocated buffers for multiple "
+            "Get object data directly into pre-allocated buffers for "
+            "multiple "
             "keys")
         .def(
             "put_from",
@@ -1657,22 +1783,23 @@ PYBIND11_MODULE(store, m) {
         .def(
             "put_from_with_metadata",
             [](DistributedObjectStore &self, const std::string &key,
-               uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr,
-               size_t size, size_t metadata_size,
+               uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr, size_t size,
+               size_t metadata_size,
                const ReplicateConfig &config = ReplicateConfig{}) {
-                // Put data directly from user-provided buffer with metadata
+                // Put data directly from user-provided buffer with
+                // metadata
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 void *metadata_buffer =
                     reinterpret_cast<void *>(metadata_buffer_ptr);
                 py::gil_scoped_release release;
-                return self.put_from_with_metadata(
-                    key, buffer, metadata_buffer, size, metadata_size, config);
+                return self.put_from_with_metadata(key, buffer, metadata_buffer,
+                                                   size, metadata_size, config);
             },
-            py::arg("key"), py::arg("buffer_ptr"), py::arg("metadata_buffer_ptr"),
-            py::arg("size"), py::arg("metadata_size"),
-            py::arg("config") = ReplicateConfig{},
-            "Put object data directly from a pre-allocated buffer with metadata"
-        )
+            py::arg("key"), py::arg("buffer_ptr"),
+            py::arg("metadata_buffer_ptr"), py::arg("size"),
+            py::arg("metadata_size"), py::arg("config") = ReplicateConfig{},
+            "Put object data directly from a pre-allocated buffer with "
+            "metadata")
         .def(
             "batch_put_from",
             [](DistributedObjectStore &self,
@@ -1690,7 +1817,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             py::arg("config") = ReplicateConfig{},
-            "Put object data directly from pre-allocated buffers for multiple "
+            "Put object data directly from pre-allocated buffers for "
+            "multiple "
             "keys")
         .def(
             "put",
@@ -1739,20 +1867,22 @@ PYBIND11_MODULE(store, m) {
             "put_batch",
             [](DistributedObjectStore &self,
                const std::vector<std::string> &keys,
-               const std::vector<py::bytes> &py_values,
+               const std::vector<py::buffer> &buffers,
                const ReplicateConfig &config = ReplicateConfig{}) {
-                std::vector<std::string> temp_values;
-                temp_values.reserve(py_values.size());
-                for (const auto &value : py_values) {
-                    temp_values.emplace_back(value.cast<std::string>());
-                }
-
+                // Convert pybuffers to spans without copying
+                std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
-                spans.reserve(temp_values.size());
-                for (const auto &s : temp_values) {
-                    spans.emplace_back(s.data(), s.size());
+                infos.reserve(buffers.size());
+                spans.reserve(buffers.size());
+
+                for (const auto &buf : buffers) {
+                    infos.emplace_back(buf.request(/*writable=*/false));
+                    const auto &info = infos.back();
+                    spans.emplace_back(static_cast<const char *>(info.ptr),
+                                       static_cast<size_t>(info.size));
                 }
 
+                py::gil_scoped_release release;
                 return self.put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),

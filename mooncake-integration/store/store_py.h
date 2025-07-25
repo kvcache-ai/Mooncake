@@ -155,7 +155,8 @@ class DistributedObjectStore {
      * keys(metadata version, better not be directly used in Python)
      * @param keys Vector of keys of the objects to put
      * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param metadata_buffers Vector of pointers to the pre-allocated metadata buffers
+     * @param metadata_buffers Vector of pointers to the pre-allocated metadata
+     * buffers
      * @param size Number of sizes of the buffers
      * @param metadata_size Number of sizes of the metadata buffers
      * @param config Replication configuration
@@ -164,10 +165,10 @@ class DistributedObjectStore {
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int put_from_with_metadata(const std::string &key, void *buffer,
-                                     void *metadata_buffer, size_t size,
-                                     size_t metadata_size,
-                                     const ReplicateConfig &config = ReplicateConfig{});
+    int put_from_with_metadata(
+        const std::string &key, void *buffer, void *metadata_buffer,
+        size_t size, size_t metadata_size,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put object data directly from pre-allocated buffers for multiple
@@ -182,7 +183,6 @@ class DistributedObjectStore {
      * register_buffer() for zero-copy operations
      */
 
-    
     std::vector<int> batch_put_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
@@ -210,6 +210,15 @@ class DistributedObjectStore {
      * nullptr if error
      */
     std::shared_ptr<SliceBuffer> get_buffer(const std::string &key);
+
+    /**
+     * @brief Get buffers containing the data for multiple keys (batch version)
+     * @param keys Vector of keys to get data for
+     * @return Vector of std::shared_ptr<SliceBuffer> buffers containing the
+     * data, or nullptr for each key if error
+     */
+    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer(
+        const std::vector<std::string> &keys);
 
     int remove(const std::string &key);
 
@@ -302,6 +311,11 @@ class DistributedObjectStore {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    tl::expected<void, ErrorCode> put_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<pybind11::buffer> &buffers,
+        const ReplicateConfig &config = ReplicateConfig{});
+
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal();
@@ -317,6 +331,9 @@ class DistributedObjectStore {
 
     tl::expected<void, ErrorCode> put_tensor_internal(const std::string &key,
                                                       pybind11::object tensor);
+
+    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer_internal(
+        const std::vector<std::string> &keys);
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
