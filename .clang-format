@@ -33,14 +33,6 @@ AlignConsecutiveDeclarations:
   AlignFunctionDeclarations: true
   AlignFunctionPointers: false
   PadOperators:    false
-AlignConsecutiveMacros:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    false
 AlignConsecutiveShortCaseStatements:
   Enabled:         false
   AcrossEmptyLines: false
