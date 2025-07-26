@@ -355,7 +355,7 @@ int initiator() {
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
-    std::thread workers[FLAGS_threads];
+    std::vector<std::thread> workers(FLAGS_threads);
 
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
