@@ -246,7 +246,7 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    close(sockfd); // the above function has opened a socket
+    close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
     running_ = true;

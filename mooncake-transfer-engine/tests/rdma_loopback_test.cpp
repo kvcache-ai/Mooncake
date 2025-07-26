@@ -87,7 +87,7 @@ TEST_F(RDMALoopbackTest, MultiWrite) {
         }
         s = engine->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
-        ASSERT_EQ(0, memcmp(addr, (char *) addr + kDataLength, kDataLength));
+        ASSERT_EQ(0, memcmp(addr, (char *)addr + kDataLength, kDataLength));
     }
 }
 }  // namespace mooncake

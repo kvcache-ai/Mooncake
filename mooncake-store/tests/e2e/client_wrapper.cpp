@@ -44,7 +44,8 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
 
     auto register_result = client_opt.value()->RegisterLocalMemory(
         allocator->getBase(), local_buffer_size, "cpu:0", false, false);
-    ErrorCode error_code = register_result.has_value() ? ErrorCode::OK : register_result.error();
+    ErrorCode error_code =
+        register_result.has_value() ? ErrorCode::OK : register_result.error();
     if (error_code != ErrorCode::OK) {
         LOG(ERROR) << "register_local_memory_failed base="
                    << allocator->getBase() << " size=" << local_buffer_size
@@ -62,7 +63,8 @@ ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
     }
 
     auto mount_result = client_->MountSegment(buffer, size);
-    ErrorCode error_code = mount_result.has_value() ? ErrorCode::OK : mount_result.error();
+    ErrorCode error_code =
+        mount_result.has_value() ? ErrorCode::OK : mount_result.error();
     if (error_code != ErrorCode::OK) {
         free(buffer);
         return error_code;
@@ -80,7 +82,8 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
     }
     SegmentInfo& segment = it->second;
     auto unmount_result = client_->UnmountSegment(segment.base, segment.size);
-    ErrorCode error_code = unmount_result.has_value() ? ErrorCode::OK : unmount_result.error();
+    ErrorCode error_code =
+        unmount_result.has_value() ? ErrorCode::OK : unmount_result.error();
     if (error_code != ErrorCode::OK) {
         return error_code;
     } else {
@@ -97,7 +100,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     if (!query_result.has_value()) {
         return query_result.error();
     }
-    
+
     auto replica_list = query_result.value();
     if (replica_list.empty()) {
         return ErrorCode::OBJECT_NOT_FOUND;
@@ -110,7 +113,8 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
 
     // Perform get operation
     auto get_result = client_->Get(key, replica_list, slice_guard.slices_);
-    ErrorCode error_code = get_result.has_value() ? ErrorCode::OK : get_result.error();
+    ErrorCode error_code =
+        get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {
         return error_code;
     }

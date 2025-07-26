@@ -73,9 +73,9 @@ class RdmaEndPoint {
 
     bool active() const { return active_; }
 
-    void set_active(bool flag) { 
+    void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag; 
+        active_ = flag;
         if (!flag) inactive_time_ = getCurrentTimeInNano();
     }
 

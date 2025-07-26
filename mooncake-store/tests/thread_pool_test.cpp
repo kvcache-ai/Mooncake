@@ -9,15 +9,13 @@
 namespace mooncake {
 
 class ThreadPoolTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         google::InitGoogleLogging("ThreadPoolTest");
         FLAGS_logtostderr = 1;
     }
 
-    void TearDown() override {
-        google::ShutdownGoogleLogging();
-    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
 // Test basic task execution
@@ -59,8 +57,9 @@ TEST_F(ThreadPoolTest, ParallelExecution) {
         pool.enqueue([&]() {
             int current = ++running_threads;
             int old_max = max_concurrent_threads.load();
-            while (old_max < current && 
-                  !max_concurrent_threads.compare_exchange_weak(old_max, current)) {
+            while (old_max < current &&
+                   !max_concurrent_threads.compare_exchange_weak(old_max,
+                                                                 current)) {
                 // Keep trying to update max
             }
 
@@ -107,9 +106,7 @@ TEST_F(ThreadPoolTest, ProperStop) {
     pool.stop();
 
     EXPECT_EQ(counter.load(), total_tasks);
-    EXPECT_THROW({
-        pool.enqueue([](){});
-    }, std::runtime_error);
+    EXPECT_THROW({ pool.enqueue([]() {}); }, std::runtime_error);
 }
 
 // Test stress with many tasks
@@ -136,8 +133,7 @@ TEST_F(ThreadPoolTest, StressTest) {
     EXPECT_EQ(counter.load(), num_tasks);
 }
 
-
-} // namespace mooncake
+}  // namespace mooncake
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

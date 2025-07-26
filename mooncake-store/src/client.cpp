@@ -880,8 +880,7 @@ void Client::BatchPuttoLocalFile(std::vector<PutOperation>& ops) {
             PutToLocalFile(op.key, op.slices);
         } else {
             LOG(ERROR) << "Skipping local file storage for key " << op.key
-                       << " due to failure: "
-                       << toString(op.result.error());
+                       << " due to failure: " << toString(op.result.error());
         }
     }
 }
@@ -1033,7 +1032,7 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
     if (!result) {
-        if(storage_backend_) {
+        if (storage_backend_) {
             // If master query fails, check storage backend
             if (storage_backend_->Existkey(key)) {
                 return true;  // Key exists in storage backend
@@ -1084,10 +1083,12 @@ void Client::PutToLocalFile(const std::string& key,
         total_size += slice.size;
     }
 
-    // Currently, persistence is achieved through asynchronous writes, but before asynchronous
-    // writing in 3FS, significant performance degradation may occur due to data copying. 
-    // Profiling reveals that the number of page faults triggered in this scenario is nearly double the normal count. 
-    // Future plans include introducing a reuse buffer list to address this performance degradation issue.
+    // Currently, persistence is achieved through asynchronous writes, but
+    // before asynchronous writing in 3FS, significant performance degradation
+    // may occur due to data copying. Profiling reveals that the number of page
+    // faults triggered in this scenario is nearly double the normal count.
+    // Future plans include introducing a reuse buffer list to address this
+    // performance degradation issue.
 
     std::string value;
     value.reserve(total_size);

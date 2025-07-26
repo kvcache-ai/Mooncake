@@ -152,8 +152,8 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
-                    void *addr) {
+Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
+                       int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
@@ -192,14 +192,15 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_
         }
 
         s = engine->submitTransfer(batch_id, requests);
-        if (!s.ok()) 
+        if (!s.ok())
             LOG(INFO) << "Found Failed Requests";
         else {
             for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
                 bool completed = false;
                 TransferStatus status;
                 while (!completed) {
-                    Status s = engine->getTransferStatus(batch_id, task_id, status);
+                    Status s =
+                        engine->getTransferStatus(batch_id, task_id, status);
                     LOG_ASSERT(s.ok());
                     if (status.s == TransferStatusEnum::COMPLETED)
                         completed = true;
@@ -319,8 +320,8 @@ int initiator() {
         auto segment_id = engine->openSegment(segment_name.c_str());
         running = true;
         for (int i = 0; i < FLAGS_threads; ++i)
-            workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
-                                    addr[i % buffer_num]);
+            workers[i] = std::thread(initiatorWorker, engine.get(), segment_id,
+                                     i, addr[i % buffer_num]);
 
         sleep(FLAGS_duration);
         running = false;
@@ -354,7 +355,7 @@ volatile bool target_running = true;
 
 void signalHandler(int signum) {
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    target_running = false;  
+    target_running = false;
 }
 
 int target() {

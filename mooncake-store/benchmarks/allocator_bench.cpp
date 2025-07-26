@@ -12,7 +12,8 @@ using namespace mooncake::offset_allocator;
 
 class OffsetAllocatorBenchHelper {
    public:
-    OffsetAllocatorBenchHelper(uint64_t baseAddress, uint32_t poolSize, uint32_t maxAllocs)
+    OffsetAllocatorBenchHelper(uint64_t baseAddress, uint32_t poolSize,
+                               uint32_t maxAllocs)
         : pool_size_(poolSize),
           allocated_size_(0),
           allocator_(OffsetAllocator::create(baseAddress, poolSize, maxAllocs)),
@@ -58,7 +59,8 @@ class OffsetAllocatorBenchHelper {
 
 template <typename BenchHelper>
 void uniform_size_allocation_benchmark() {
-    std::cout << std::endl << "=== Uniform Size Allocation Benchmark ===" << std::endl;
+    std::cout << std::endl
+              << "=== Uniform Size Allocation Benchmark ===" << std::endl;
     const size_t max_pool_size = 2ull * 1024 * 1024 * 1024;
     std::vector<uint32_t> allocation_sizes;
     for (uint32_t i = 32; i < (1 << 26); i *= 4) {
@@ -103,26 +105,30 @@ void uniform_size_allocation_benchmark() {
             total_util_ratio += util_ratio;
         }
         auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end_time - start_time);
         // END
         double avg_util_ratio = total_util_ratio / benchmark_num;
         std::cout << "Alloc size: " << alloc_size
                   << ", min util ratio: " << min_util_ratio
                   << ", avg util ratio: " << avg_util_ratio
-                  << ", time: " << duration.count() / benchmark_num << " ns" << std::endl;
+                  << ", time: " << duration.count() / benchmark_num << " ns"
+                  << std::endl;
     }
 }
 
 template <typename BenchHelper>
 void random_size_allocation_benchmark() {
-    std::cout << std::endl << "=== Random Size Allocation Benchmark ===" << std::endl;
+    std::cout << std::endl
+              << "=== Random Size Allocation Benchmark ===" << std::endl;
     const size_t pool_size = 2ull * 1024 * 1024 * 1024;
     const size_t max_alloc_size = 1ull << 26;
     const size_t min_alloc_size = 1024;
 
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint32_t> dist(min_alloc_size, max_alloc_size);
+    std::uniform_int_distribution<uint32_t> dist(min_alloc_size,
+                                                 max_alloc_size);
 
     // Warmup
     size_t max_allocs = pool_size / min_alloc_size + 10;
@@ -138,7 +144,7 @@ void random_size_allocation_benchmark() {
     util_ratios.reserve(benchmark_num);
 
     // Run benchmark
-    auto start_time = std::chrono::high_resolution_clock::now(); 
+    auto start_time = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < benchmark_num; i++) {
         size_t alloc_size = dist(gen);
         bench_helper.allocate(alloc_size);
