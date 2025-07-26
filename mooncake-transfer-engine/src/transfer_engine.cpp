@@ -150,8 +150,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         } else {
             local_topology_->discover(filter_);
         }
-        LOG(INFO) << "Topology discovery complete. Found "
+        LOG(INFO) << "Auto-discovering topology complete: Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+        LOG(INFO) << "Topology:\n" << local_topology_->toString();
 
 #ifdef USE_MNNVL
         if (local_topology_->getHcaList().size() > 0 &&
@@ -215,6 +216,7 @@ Transport *TransferEngine::installTransport(const std::string &proto,
             LOG(ERROR) << "Failed to parse NIC priority matrix";
             return nullptr;
         }
+        LOG(INFO) << "Install transport " << proto << " with custom topology:\n" << local_topology_->toString();
     }
 
     transport = multi_transports_->installTransport(proto, local_topology_);
