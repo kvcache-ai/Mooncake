@@ -19,22 +19,22 @@
 
 #define PT_GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(pt_guarded_by(x))
 
-#define ACQUIRED_BEFORE(...) \
+#define ACQUIRED_BEFORE(...)                                                   \
     THREAD_ANNOTATION_ATTRIBUTE__(acquired_before(__VA_ARGS__))
 
-#define ACQUIRED_AFTER(...) \
+#define ACQUIRED_AFTER(...)                                                    \
     THREAD_ANNOTATION_ATTRIBUTE__(acquired_after(__VA_ARGS__))
 
-#define REQUIRES(...) \
+#define REQUIRES(...)                                                          \
     THREAD_ANNOTATION_ATTRIBUTE__(requires_capability(__VA_ARGS__))
 
-#define ACQUIRE(...) \
+#define ACQUIRE(...)                                                           \
     THREAD_ANNOTATION_ATTRIBUTE__(acquire_capability(__VA_ARGS__))
 
-#define RELEASE(...) \
+#define RELEASE(...)                                                           \
     THREAD_ANNOTATION_ATTRIBUTE__(release_capability(__VA_ARGS__))
 
-#define TRY_ACQUIRE(...) \
+#define TRY_ACQUIRE(...)                                                       \
     THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_capability(__VA_ARGS__))
 
 #define EXCLUDES(...) THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(__VA_ARGS__))
@@ -43,7 +43,7 @@
 
 #define RETURN_CAPABILITY(x) THREAD_ANNOTATION_ATTRIBUTE__(lock_returned(x))
 
-#define NO_THREAD_SAFETY_ANALYSIS \
+#define NO_THREAD_SAFETY_ANALYSIS                                              \
     THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
 
 // Simple mutex implementation using std::mutex for exclusive locking only.

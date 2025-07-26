@@ -80,19 +80,19 @@ struct ConnectionInfo {
 };
 
 // Retry mechanism for initialization function failure
-#define RETRY_CALL(funcCall, errorMsg)                                  \
-    do {                                                                \
-        int retryCount = 0;                                             \
-        int __ret = funcCall;                                           \
-        while (__ret && retryCount < 3) {                               \
-            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount \
-                       << "/3)";                                        \
-            __ret = funcCall;                                           \
-        }                                                               \
-        if (__ret) {                                                    \
-            LOG(ERROR) << errorMsg << " failed after 3 retries.";       \
-            return __ret;                                               \
-        }                                                               \
+#define RETRY_CALL(funcCall, errorMsg)                                         \
+    do {                                                                       \
+        int retryCount = 0;                                                    \
+        int __ret = funcCall;                                                  \
+        while (__ret && retryCount < 3) {                                      \
+            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount        \
+                       << "/3)";                                               \
+            __ret = funcCall;                                                  \
+        }                                                                      \
+        if (__ret) {                                                           \
+            LOG(ERROR) << errorMsg << " failed after 3 retries.";              \
+            return __ret;                                                      \
+        }                                                                      \
     } while (0)
 
 extern int initTransportMem(RankInfo *local_rank_info);

@@ -9,65 +9,6 @@ SortIncludes: false
 AccessModifierOffset: -1
 AlignAfterOpenBracket: Align
 AlignArrayOfStructures: None
-AlignConsecutiveAssignments:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    true
-AlignConsecutiveBitFields:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    false
-AlignConsecutiveDeclarations:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: true
-  AlignFunctionPointers: false
-  PadOperators:    false
-AlignConsecutiveShortCaseStatements:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCaseArrows: false
-  AlignCaseColons: false
-AlignConsecutiveTableGenBreakingDAGArgColons:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    false
-AlignConsecutiveTableGenCondOperatorColons:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    false
-AlignConsecutiveTableGenDefinitionColons:
-  Enabled:         false
-  AcrossEmptyLines: false
-  AcrossComments:  false
-  AlignCompound:   false
-  AlignFunctionDeclarations: false
-  AlignFunctionPointers: false
-  PadOperators:    false
-AlignEscapedNewlines: Left
-AlignOperands:   Align
-AlignTrailingComments:
-  Kind:            Always
-  OverEmptyLines:  0
 AllowAllArgumentsOnNextLine: true
 AllowAllParametersOfDeclarationOnNextLine: true
 AllowBreakBeforeNoexceptSpecifier: Never
@@ -83,30 +24,9 @@ AllowShortLoopsOnASingleLine: true
 AllowShortNamespacesOnASingleLine: false
 AlwaysBreakAfterDefinitionReturnType: None
 AlwaysBreakBeforeMultilineStrings: true
-AttributeMacros:
-  - __capability
 BinPackArguments: true
 BinPackParameters: BinPack
 BitFieldColonSpacing: Both
-BraceWrapping:
-  AfterCaseLabel:  false
-  AfterClass:      false
-  AfterControlStatement: Never
-  AfterEnum:       false
-  AfterExternBlock: false
-  AfterFunction:   false
-  AfterNamespace:  false
-  AfterObjCDeclaration: false
-  AfterStruct:     false
-  AfterUnion:      false
-  BeforeCatch:     false
-  BeforeElse:      false
-  BeforeLambdaBody: false
-  BeforeWhile:     false
-  IndentBraces:    false
-  SplitEmptyFunction: true
-  SplitEmptyRecord: true
-  SplitEmptyNamespace: true
 BreakAdjacentStringLiterals: true
 BreakAfterAttributes: Leave
 BreakAfterJavaFieldAnnotations: false
@@ -135,30 +55,7 @@ EmptyLineAfterAccessModifier: Never
 EmptyLineBeforeAccessModifier: LogicalBlock
 ExperimentalAutoDetectBinPacking: false
 FixNamespaceComments: true
-ForEachMacros:
-  - foreach
-  - Q_FOREACH
-  - BOOST_FOREACH
-IfMacros:
-  - KJ_IF_MAYBE
 IncludeBlocks:   Regroup
-IncludeCategories:
-  - Regex:           '^<ext/.*\.h>'
-    Priority:        2
-    SortPriority:    0
-    CaseSensitive:   false
-  - Regex:           '^<.*\.h>'
-    Priority:        1
-    SortPriority:    0
-    CaseSensitive:   false
-  - Regex:           '^<.*'
-    Priority:        2
-    SortPriority:    0
-    CaseSensitive:   false
-  - Regex:           '.*'
-    Priority:        3
-    SortPriority:    0
-    CaseSensitive:   false
 IncludeIsMainRegex: '([-_](test|unittest))?$'
 IncludeIsMainSourceRegex: ''
 IndentAccessModifiers: false
@@ -173,19 +70,8 @@ IndentWrappedFunctionNames: false
 InsertBraces:    false
 InsertNewlineAtEOF: false
 InsertTrailingCommas: None
-IntegerLiteralSeparator:
-  Binary:          0
-  BinaryMinDigits: 0
-  Decimal:         0
-  DecimalMinDigits: 0
-  Hex:             0
-  HexMinDigits:    0
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
-KeepEmptyLines:
-  AtEndOfFile:     false
-  AtStartOfBlock:  false
-  AtStartOfFile:   true
 KeepFormFeed:    false
 LambdaBodyIndentation: Signature
 LineEnding:      DeriveLF
@@ -215,36 +101,6 @@ PenaltyReturnTypeOnItsOwnLine: 200
 PointerAlignment: Left
 PPIndentWidth:   -1
 QualifierAlignment: Leave
-RawStringFormats:
-  - Language:        Cpp
-    Delimiters:
-      - cc
-      - CC
-      - cpp
-      - Cpp
-      - CPP
-      - 'c++'
-      - 'C++'
-    CanonicalDelimiter: ''
-    BasedOnStyle:    google
-  - Language:        TextProto
-    Delimiters:
-      - pb
-      - PB
-      - proto
-      - PROTO
-    EnclosingFunctions:
-      - EqualsProto
-      - EquivToProto
-      - PARSE_PARTIAL_TEXT_PROTO
-      - PARSE_TEST_PROTO
-      - PARSE_TEXT_PROTO
-      - ParseTextOrDie
-      - ParseTextProtoOrDie
-      - ParseTestProto
-      - ParsePartialTestProto
-    CanonicalDelimiter: pb
-    BasedOnStyle:    google
 ReferenceAlignment: Pointer
 ReflowComments:  Always
 RemoveBracesLLVM: false

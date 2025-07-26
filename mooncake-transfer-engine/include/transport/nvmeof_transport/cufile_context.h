@@ -46,15 +46,15 @@ static std::string cuFileGetErrorString(CUfileError_t status) {
     return errStr;
 }
 
-#define CUFILE_CHECK(e)                                                       \
-    do {                                                                      \
-        if (e.err != CU_FILE_SUCCESS) {                                       \
-            throw std::runtime_error("Error Code: " + std::to_string(e.err) + \
-                                     " " + cuFileGetErrorString(e) + " @ " +  \
-                                     __FILE__ + ":" +                         \
-                                     std::to_string(__LINE__));               \
-            assert(false);                                                    \
-        }                                                                     \
+#define CUFILE_CHECK(e)                                                        \
+    do {                                                                       \
+        if (e.err != CU_FILE_SUCCESS) {                                        \
+            throw std::runtime_error("Error Code: " + std::to_string(e.err) +  \
+                                     " " + cuFileGetErrorString(e) + " @ " +   \
+                                     __FILE__ + ":" +                          \
+                                     std::to_string(__LINE__));                \
+            assert(false);                                                     \
+        }                                                                      \
     } while (0)
 
 class CuFileContext {
