@@ -321,6 +321,8 @@ int initiator() {
             LOG(INFO) << "GPU ID is specified or failed to get GPU count, use " << FLAGS_gpu_id << " GPU";
             buffer_num = 1;
         }
+    } else {
+        LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     }
     addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
@@ -344,6 +346,7 @@ int initiator() {
         LOG_ASSERT(!rc);
     }
 #else
+    LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
@@ -374,9 +377,6 @@ int initiator() {
                     (stop_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
     auto batch_count = total_batch_count.load();
 
-    if (!FLAGS_use_vram) {
-        LOG(INFO) << "numa node num: " << NR_SOCKETS;
-    }
 
     LOG(INFO) << "Test completed: duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "
@@ -441,6 +441,8 @@ int target() {
                       << FLAGS_gpu_id << " GPU";
             buffer_num = 1;
         }
+    } else {
+        LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     }
     addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
@@ -464,6 +466,7 @@ int target() {
         LOG_ASSERT(!rc);
     }
 #else
+    LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
@@ -472,10 +475,6 @@ int target() {
         LOG_ASSERT(!rc);
     }
 #endif
-
-    if (!FLAGS_use_vram) {
-        LOG(INFO) << "numa node num: " << NR_SOCKETS;
-    }
 
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
