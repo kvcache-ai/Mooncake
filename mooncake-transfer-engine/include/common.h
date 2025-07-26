@@ -508,7 +508,9 @@ class SimpleRandom {
     // 生成下一个伪随机数
     uint32_t next() {
         current = (a * current + c) % m;
-        return current;
+        // We find that the LSB are usually lack of randomness, so it's
+        // better to shift 12 bits.
+        return current >> 12;
     }
 
     uint32_t next(uint32_t max) { return next() % max; }
@@ -519,6 +521,9 @@ class SimpleRandom {
     static const uint32_t c = 1013904223;
     static const uint32_t m = 0xFFFFFFFF;
 };
+
+void setup_signal_handlers();
+
 }  // namespace mooncake
 
 #endif  // COMMON_H
