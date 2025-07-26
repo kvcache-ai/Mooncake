@@ -12,7 +12,7 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif // __cplusplus
+#endif  // __cplusplus
 
 /* 网络设备句柄 */
 typedef void *HcclNetDev;
@@ -37,7 +37,8 @@ typedef struct {
  * @param[out] buf 返回的缓冲区描述符
  * @return 执行状态码 HcclResult
  */
-extern HcclResult HcclMemReg(HcclNetDev netDev, const HcclMem *mem, HcclBuf *buf);
+extern HcclResult HcclMemReg(HcclNetDev netDev, const HcclMem *mem,
+                             HcclBuf *buf);
 
 /**
  * @brief 注销已注册的内存区域
@@ -53,7 +54,8 @@ extern HcclResult HcclMemDereg(const HcclBuf *buf);
  * @param[out] outDescLen 返回描述信息长度
  * @return 执行状态码 HcclResult
  */
-extern HcclResult HcclMemExport(HcclBuf *buf, char **outDesc, uint64_t *outDescLen);
+extern HcclResult HcclMemExport(HcclBuf *buf, char **outDesc,
+                                uint64_t *outDescLen);
 
 /**
  * @brief 通过描述信息重建内存缓冲区
@@ -63,7 +65,8 @@ extern HcclResult HcclMemExport(HcclBuf *buf, char **outDesc, uint64_t *outDescL
  * @param[out] outBuf 返回的缓冲区描述符
  * @return 执行状态码 HcclResult
  */
-extern HcclResult HcclMemImport(const char *description, uint32_t descLen, bool isRemote, HcclBuf *outBuf);
+extern HcclResult HcclMemImport(const char *description, uint32_t descLen,
+                                bool isRemote, HcclBuf *outBuf);
 
 /**
  * @brief 关闭已打开的内存缓冲区
@@ -89,7 +92,8 @@ typedef struct {
  * @param[in] remoteGrantInfo 远端授权目标信息
  * @return 执行状态码 HcclResult
  */
-extern HcclResult HcclMemGrant(HcclBuf *localBuf, const HcclMemGrantInfo *remoteGrantInfo);
+extern HcclResult HcclMemGrant(HcclBuf *localBuf,
+                               const HcclMemGrantInfo *remoteGrantInfo);
 
 /**
  * @brief 内存重映射接口
@@ -99,9 +103,10 @@ extern HcclResult HcclMemGrant(HcclBuf *localBuf, const HcclMemGrantInfo *remote
  * @return 执行状态码 HcclResult
  * @attention 需确保内存段已经在目标网络设备注册
  */
-extern HcclResult HcclMemRemap(HcclNetDev netDev, const HcclMem *memArray, uint64_t arraySize);
+extern HcclResult HcclMemRemap(HcclNetDev netDev, const HcclMem *memArray,
+                               uint64_t arraySize);
 
 #ifdef __cplusplus
 }
-#endif // __cplusplus
+#endif  // __cplusplus
 #endif

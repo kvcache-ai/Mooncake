@@ -13,7 +13,7 @@ namespace mooncake {
  * @brief Abstract interface for eviction strategy, responsible for choosing
  *        which kvcache object to be evicted before pool overflow.
  */
-class EvictionStrategy : public std::enable_shared_from_this<EvictionStrategy>{
+class EvictionStrategy : public std::enable_shared_from_this<EvictionStrategy> {
    public:
     virtual ~EvictionStrategy() = default;
     virtual ErrorCode AddKey(const std::string& key) = 0;
@@ -28,23 +28,23 @@ class EvictionStrategy : public std::enable_shared_from_this<EvictionStrategy>{
         return ErrorCode::OK;
     }
     virtual std::string EvictKey(void) = 0;
-    virtual size_t GetSize(void) {
-        return all_key_list_.size();
-    }
+    virtual size_t GetSize(void) { return all_key_list_.size(); }
     void CleanUp(void) {
         all_key_list_.clear();
         all_key_idx_map_.clear();
     }
+
    protected:
     std::list<std::string> all_key_list_;
-    std::unordered_map<std::string, std::list<std::string>::iterator> all_key_idx_map_;
+    std::unordered_map<std::string, std::list<std::string>::iterator>
+        all_key_idx_map_;
 };
 
 class LRUEvictionStrategy : public EvictionStrategy {
    public:
     virtual ErrorCode AddKey(const std::string& key) override {
         // Add key to the front of the list
-        if(all_key_idx_map_.find(key) != all_key_idx_map_.end()) {
+        if (all_key_idx_map_.find(key) != all_key_idx_map_.end()) {
             all_key_list_.erase(all_key_idx_map_[key]);
             all_key_idx_map_.erase(key);
         }
@@ -93,7 +93,7 @@ class FIFOEvictionStrategy : public EvictionStrategy {
         std::string evicted_key = all_key_list_.back();
         all_key_list_.pop_back();
         return evicted_key;
-    }  
+    }
 };
 
-}
+}  // namespace mooncake

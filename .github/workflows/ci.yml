@@ -338,12 +338,12 @@ jobs:
     - name: Install clang-format
       run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format
+          sudo apt-get install -y clang-format-18
 
     - name: run clang-format
       run: |
         # skip cachelib_memory_allocator
-        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format -i
+        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format -style=file -i
         if ! git diff --exit-code; then
           echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
           exit 1

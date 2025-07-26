@@ -249,8 +249,8 @@ void loadGlobalConfig(GlobalConfig &config) {
         if (val > 0 && val < config.slice_size)
             config.fragment_limit = config.slice_size / val;
         else {
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_FRAGMENT_RATIO and set it to 4 as default";
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_FRAGMENT_RATIO and set it to 4 as default";
             config.fragment_limit = config.slice_size / 4;
         }
     }

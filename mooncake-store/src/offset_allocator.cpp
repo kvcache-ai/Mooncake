@@ -470,20 +470,22 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 }
 
 // OffsetAllocationHandle implementation
-OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
-                                   OffsetAllocation allocation, uint64_t base,
-                                   uint64_t size)
+OffsetAllocationHandle::OffsetAllocationHandle(
+    std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
+    uint64_t base, uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
       requested_size(size) {}
 
-OffsetAllocationHandle::OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept
+OffsetAllocationHandle::OffsetAllocationHandle(
+    OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
       requested_size(other.requested_size) {
-    other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    other.m_allocation = {OffsetAllocation::NO_SPACE,
+                          OffsetAllocation::NO_SPACE};
     other.real_base = 0;
     other.requested_size = 0;
 }
@@ -504,7 +506,8 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         requested_size = other.requested_size;
 
         // Reset other
-        other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+        other.m_allocation = {OffsetAllocation::NO_SPACE,
+                              OffsetAllocation::NO_SPACE};
         other.real_base = 0;
         other.requested_size = 0;
     }
@@ -527,10 +530,12 @@ static uint64_t calculateMultiplier(size_t size) {
 }
 
 // Thread-safe OffsetAllocator implementation
-std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t size,
-                                             uint32 maxAllocs) {
+std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
+                                                         size_t size,
+                                                         uint32 maxAllocs) {
     // Use a custom deleter to allow private constructor
-    return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(base, size, maxAllocs));
+    return std::shared_ptr<OffsetAllocator>(
+        new OffsetAllocator(base, size, maxAllocs));
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
@@ -562,8 +567,8 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 
     // Use shared_from_this to get a shared_ptr to this OffsetAllocator
     return OffsetAllocationHandle(shared_from_this(), allocation,
-                            m_base + allocation.offset * m_multiplier,
-                            size);
+                                  m_base + allocation.offset * m_multiplier,
+                                  size);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
@@ -584,8 +589,9 @@ OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
     }
     OffsetAllocStorageReportFull report = m_allocator->storageReportFull();
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
-        report.freeRegions[i] = {.size = report.freeRegions[i].size * m_multiplier,
-                                 .count = report.freeRegions[i].count};
+        report.freeRegions[i] = {
+            .size = report.freeRegions[i].size * m_multiplier,
+            .count = report.freeRegions[i].count};
     }
     return report;
 }

@@ -12,15 +12,12 @@
 
 namespace mooncake {
 
-MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                             uint64_t default_kv_soft_pin_ttl,
-                             bool allow_evict_soft_pinned_objects,
-                             double eviction_ratio,
-                             double eviction_high_watermark_ratio,
-                             ViewVersionId view_version,
-                             int64_t client_live_ttl_sec, bool enable_ha,
-                             const std::string& cluster_id,
-                             BufferAllocatorType memory_allocator)
+MasterService::MasterService(
+    bool enable_gc, uint64_t default_kv_lease_ttl,
+    uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
+    double eviction_ratio, double eviction_high_watermark_ratio,
+    ViewVersionId view_version, int64_t client_live_ttl_sec, bool enable_ha,
+    const std::string& cluster_id, BufferAllocatorType memory_allocator)
     : enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),

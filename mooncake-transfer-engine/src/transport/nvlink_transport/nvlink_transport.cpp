@@ -318,7 +318,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
         desc.length = real_size;          // length;
         desc.name = location;
-        desc.shm_name = serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+        desc.shm_name =
+            serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -337,7 +338,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             dest_addr + length <= entry.addr + entry.length) {
             remap_lock_.lockShared();
             if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
-                auto shm_addr = remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
+                auto shm_addr =
+                    remap_entries_[std::make_pair(target_id, entry.addr)]
+                        .shm_addr;
                 remap_lock_.unlockShared();
                 dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
@@ -363,7 +366,8 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
-                    remap_entries_[std::make_pair(target_id, entry.addr)] = shm_entry;
+                    remap_entries_[std::make_pair(target_id, entry.addr)] =
+                        shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
                            use_fabric_mem_) {
                     CUmemFabricHandle export_handle;
@@ -394,14 +398,17 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                             << "NvlinkTransport: cuMemMap failed: " << result;
                         return -1;
                     }
-                    
+
                     int device_count;
                     cudaGetDeviceCount(&device_count);
                     CUmemAccessDesc accessDesc[device_count];
-                    for (int device_id = 0; device_id < device_count; ++device_id) {
-                        accessDesc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                    for (int device_id = 0; device_id < device_count;
+                         ++device_id) {
+                        accessDesc[device_id].location.type =
+                            CU_MEM_LOCATION_TYPE_DEVICE;
                         accessDesc[device_id].location.id = device_id;
-                        accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                        accessDesc[device_id].flags =
+                            CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     }
                     result = cuMemSetAccess((CUdeviceptr)shm_addr, entry.length,
                                             accessDesc, device_count);
@@ -413,13 +420,15 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = length;
-                    remap_entries_[std::make_pair(target_id, entry.addr)] = shm_entry;
+                    remap_entries_[std::make_pair(target_id, entry.addr)] =
+                        shm_entry;
                 } else {
                     LOG(ERROR) << "Mismatched NVLink data transfer method";
                     return -1;
                 }
             }
-            auto shm_addr = remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
+            auto shm_addr =
+                remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
             return 0;
         }

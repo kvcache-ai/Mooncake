@@ -11,7 +11,7 @@
 
 namespace mooncake {
 class FileLockRAII {
-public:
+   public:
     enum class LockType { READ, WRITE };
 
     FileLockRAII(int fd, LockType type) : fd_(fd), locked_(false) {
@@ -28,18 +28,17 @@ public:
         }
     }
 
+    FileLockRAII(const FileLockRAII &) = delete;
+    FileLockRAII &operator=(const FileLockRAII &) = delete;
 
-    FileLockRAII(const FileLockRAII&) = delete;
-    FileLockRAII& operator=(const FileLockRAII&) = delete;
-
-    FileLockRAII(FileLockRAII&& other) noexcept 
+    FileLockRAII(FileLockRAII &&other) noexcept
         : fd_(other.fd_), locked_(other.locked_) {
         other.locked_ = false;
     }
 
     bool is_locked() const { return locked_; }
 
-private:
+   private:
     int fd_;
     bool locked_;
 };
@@ -47,15 +46,17 @@ private:
 /**
  * @class LocalFile
  * @brief RAII wrapper for file operations with thread-safe locking support
- * 
- * Provides thread-safe file I/O operations including read/write and vectorized I/O.
- * Implements proper resource management through RAII pattern.
+ *
+ * Provides thread-safe file I/O operations including read/write and vectorized
+ * I/O. Implements proper resource management through RAII pattern.
  */
 class StorageFile {
-public:    
-
+   public:
     StorageFile(const std::string &filename, int fd)
-        : filename_(filename), fd_(fd), error_code_(ErrorCode::OK), is_locked_(false) {}
+        : filename_(filename),
+          fd_(fd),
+          error_code_(ErrorCode::OK),
+          is_locked_(false) {}
     /**
      * @brief Destructor
      * @note Automatically closes the file and releases resources
@@ -66,50 +67,62 @@ public:
      * @brief Writes data from buffer to file
      * @param buffer Input buffer containing data to write
      * @param length Number of bytes to write
-     * @return tl::expected<size_t, ErrorCode> containing number of bytes written on success, or ErrorCode on failure
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes
+     * written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual tl::expected<size_t, ErrorCode> write(const std::string &buffer, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+                                                  size_t length) = 0;
 
     /**
      * @brief Writes data from buffer to file
      * @param data Input span containing data to write
      * @param length Number of bytes to write
-     * @return tl::expected<size_t, ErrorCode> containing number of bytes written on success, or ErrorCode on failure
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes
+     * written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual tl::expected<size_t, ErrorCode> write(std::span<const char> data, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> write(std::span<const char> data,
+                                                  size_t length) = 0;
 
     /**
      * @brief Reads data from file into buffer
      * @param buffer Output buffer for read data
      * @param length Maximum number of bytes to read
-     * @return tl::expected<size_t, ErrorCode> containing number of bytes read on success, or ErrorCode on failure
+     * @return tl::expected<size_t, ErrorCode> containing number of bytes read
+     * on success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual tl::expected<size_t, ErrorCode> read(std::string &buffer, size_t length) = 0;
+    virtual tl::expected<size_t, ErrorCode> read(std::string &buffer,
+                                                 size_t length) = 0;
 
     /**
      * @brief Scattered write at specified file offset
      * @param iov Array of I/O vectors
      * @param iovcnt Number of elements in iov array
      * @param offset File offset to write at
-     * @return tl::expected<size_t, ErrorCode> containing total bytes written on success, or ErrorCode on failure
+     * @return tl::expected<size_t, ErrorCode> containing total bytes written on
+     * success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual tl::expected<size_t, ErrorCode> vector_write(const iovec *iov,
+                                                         int iovcnt,
+                                                         off_t offset) = 0;
 
     /**
      * @brief Scattered read from specified file offset
      * @param iov Array of I/O vectors
      * @param iovcnt Number of elements in iov array
      * @param offset File offset to read from
-     * @return tl::expected<size_t, ErrorCode> containing total bytes read on success, or ErrorCode on failure
+     * @return tl::expected<size_t, ErrorCode> containing total bytes read on
+     * success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt, off_t offset) = 0;
+    virtual tl::expected<size_t, ErrorCode> vector_read(const iovec *iov,
+                                                        int iovcnt,
+                                                        off_t offset) = 0;
 
-    template<typename T>
+    template <typename T>
     tl::expected<T, ErrorCode> make_error(ErrorCode code) {
         error_code_ = code;
         return tl::make_unexpected(code);
@@ -130,11 +143,9 @@ public:
      * @brief Gets the current error code
      * @return Current error code
      */
-    ErrorCode get_error_code(){
-        return error_code_;
-    }
+    ErrorCode get_error_code() { return error_code_; }
 
-protected:
+   protected:
     std::string filename_;
     int fd_;
     ErrorCode error_code_{ErrorCode::OK};
@@ -142,21 +153,24 @@ protected:
 };
 
 class PosixFile : public StorageFile {
-public:
+   public:
     PosixFile(const std::string &filename, int fd);
     ~PosixFile() override;
 
-    tl::expected<size_t, ErrorCode> write(const std::string &buffer, size_t length) override;
-    tl::expected<size_t, ErrorCode> write(std::span<const char> data, size_t length) override; 
-    tl::expected<size_t, ErrorCode> read(std::string &buffer, size_t length) override;
-    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt, off_t offset) override;
-    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt, off_t offset) override;
+    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> write(std::span<const char> data,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> read(std::string &buffer,
+                                         size_t length) override;
+    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
+                                                 off_t offset) override;
+    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
+                                                off_t offset) override;
 };
 
-} // namespace mooncake
+}  // namespace mooncake
 
 #ifdef USE_3FS
 #include <hf3fs/hf3fs.h>
 #endif
-
-

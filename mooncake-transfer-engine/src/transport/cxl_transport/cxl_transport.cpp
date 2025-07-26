@@ -42,12 +42,12 @@ CxlTransport::BatchID CxlTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                    TransferStatus &status) {
+                                       TransferStatus &status) {
     return 0;
 }
 
-Status CxlTransport::submitTransfer(BatchID batch_id,
-                                 const std::vector<TransferRequest> &entries) {
+Status CxlTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
     return 0;
 }
 

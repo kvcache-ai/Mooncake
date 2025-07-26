@@ -10,16 +10,16 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif // __cplusplus
+#endif  // __cplusplus
 
 /**
  * @enum HcclMemType
  * @brief 内存类型枚举定义
  */
 typedef enum {
-    HCCL_MEM_TYPE_DEVICE, ///< 设备侧内存（如NPU等）
-    HCCL_MEM_TYPE_HOST,   ///< 主机侧内存
-    HCCL_MEM_TYPE_NUM     ///< 内存类型数量
+    HCCL_MEM_TYPE_DEVICE,  ///< 设备侧内存（如NPU等）
+    HCCL_MEM_TYPE_HOST,    ///< 主机侧内存
+    HCCL_MEM_TYPE_NUM      ///< 内存类型数量
 } HcclMemType;
 
 /**
@@ -37,5 +37,5 @@ typedef struct {
 
 #ifdef __cplusplus
 }
-#endif // __cplusplus
+#endif  // __cplusplus
 #endif
