@@ -16,15 +16,15 @@
 
 #include "AllocationClass.h"
 
-#include "SlabAllocator.h"
-#include "common/Exceptions.h"
-#include "common/Throttler.h"
-
 #include <algorithm>
 #include <chrono>
 #include <random>
 #include <stdexcept>
 #include <thread>
+
+#include "SlabAllocator.h"
+#include "common/Exceptions.h"
+#include "common/Throttler.h"
 
 using namespace facebook::cachelib;
 
@@ -46,8 +46,7 @@ AllocationClass::AllocationClass(ClassId classId,
 void AllocationClass::checkState() const {
   // classId_ and allocationSize_ must be valid.
   if (classId_ < 0) {
-    throw std::invalid_argument(
-        fmt::format("Invalid Class Id {}", classId_));
+    throw std::invalid_argument(fmt::format("Invalid Class Id {}", classId_));
   }
 
   if (allocationSize_ > Slab::kSize) {
@@ -58,21 +57,21 @@ void AllocationClass::checkState() const {
   const auto header = slabAlloc_.getSlabHeader(currSlab_);
   if (currSlab_ != nullptr && header == nullptr) {
     throw std::invalid_argument(fmt::format(
-        "Could not locate header for our current slab {}", (void*) currSlab_));
+        "Could not locate header for our current slab {}", (void*)currSlab_));
   }
 
   if (header != nullptr && header->classId != classId_) {
-    throw std::invalid_argument(fmt::format(
-        "ClassId of currSlab {} is not the same as our classId {}",
-        header->classId, classId_));
+    throw std::invalid_argument(
+        fmt::format("ClassId of currSlab {} is not the same as our classId {}",
+                    header->classId, classId_));
   }
 
   if (currSlab_ != nullptr &&
       std::find(allocatedSlabs_.begin(), allocatedSlabs_.end(), currSlab_) ==
           allocatedSlabs_.end()) {
-    throw std::invalid_argument(fmt::format(
-        "Current allocation slab {} is not in allocated slabs list",
-        (void*) currSlab_));
+    throw std::invalid_argument(
+        fmt::format("Current allocation slab {} is not in allocated slabs list",
+                    (void*)currSlab_));
   }
 }
 
@@ -81,6 +80,8 @@ void AllocationClass::addSlabLocked(Slab* slab) {
   auto header = slabAlloc_.getSlabHeader(slab);
   header->classId = classId_;
   header->allocSize = allocationSize_;
+  // insert alloc state
+  createSlabReleaseAllocMapLocked(slab);
   freeSlabs_.push_back(slab);
 }
 
@@ -121,33 +122,28 @@ void* AllocationClass::allocate() {
 
 void* AllocationClass::allocateLocked() {
   // fast path for case when the cache is mostly full.
-  if (freedAllocations_.empty() && freeSlabs_.empty() &&
-      !canAllocateFromCurrentSlabLocked()) {
+  if (freedAllocations_.empty() && freeSlabs_.empty()) {
     canAllocate_ = false;
     return nullptr;
   }
 
   XDCHECK(canAllocate_);
 
-  // grab from the free list if possible.
-  if (!freedAllocations_.empty()) {
-    void* ret = freedAllocations_.front();
-    XDCHECK(ret != nullptr);
-    freedAllocations_.pop_front();
-    return reinterpret_cast<void*>(ret);
-  }
-
-  // see if we have an active slab that is being used to carve the
-  // allocations.
-  if (canAllocateFromCurrentSlabLocked()) {
-    return allocateFromCurrentSlabLocked();
-  }
-
-  XDCHECK(canAllocate_);
   XDCHECK(!freeSlabs_.empty());
-  setupCurrentSlabLocked();
+  if (freedAllocations_.empty()) {
+    setupCurrentSlabLocked();
+  }
   // grab a free slab and make it current.
-  return allocateFromCurrentSlabLocked();
+  // grab from the freelist if possible.
+  if (!freedAllocations_.empty()) {
+    MemoryAllocInfo_* memoryInfo = freedAllocations_.front();
+    XDCHECK(memoryInfo != nullptr);
+    freedAllocations_.pop_front();
+    memoryInfo->allocated = false;
+    return reinterpret_cast<void*>(memoryInfo->memory);
+  } else {
+    return NULL;
+  }
 }
 
 void AllocationClass::setupCurrentSlabLocked() {
@@ -157,6 +153,23 @@ void AllocationClass::setupCurrentSlabLocked() {
   currSlab_ = slab;
   currOffset_ = 0;
   allocatedSlabs_.push_back(slab);
+  // add memory into free list
+  auto slabPtrVal = getSlabPtrValue(slab);
+  auto it = slabAllocMap_.find(slabPtrVal);
+
+  // this should not happen.
+  if (it == slabAllocMap_.end()) {
+    throw std::runtime_error(
+        "Invalid slabReleaseAllocMap state when attempting to setup a slab.");
+  }
+
+  auto& allocState = it->second;
+  int size = allocState.size();
+  for (int i = 0; i < size; i++) {
+    freedAllocations_.push_front(&allocState[i]);
+  }
+  // freedAllocations_.list();
+  canAllocate_ = true;
 }
 
 const Slab* AllocationClass::getSlabForReleaseLocked() const noexcept {
@@ -165,8 +178,8 @@ const Slab* AllocationClass::getSlabForReleaseLocked() const noexcept {
   } else if (!allocatedSlabs_.empty()) {
     std::random_device rd;
     std::mt19937 gen(rd());
-    auto idx =
-        std::uniform_int_distribution<uint32_t>(0, static_cast<uint32_t>(allocatedSlabs_.size() - 1))(gen);
+    auto idx = std::uniform_int_distribution<uint32_t>(
+        0, static_cast<uint32_t>(allocatedSlabs_.size() - 1))(gen);
     return allocatedSlabs_[idx];
   }
   return nullptr;
@@ -178,8 +191,8 @@ SlabReleaseContext AllocationClass::startSlabRelease(
   LockHolder startSlabReleaseLockHolder(startSlabReleaseLock_);
   const auto* hintSlab = slabAlloc_.getSlabForMemory(hint);
   if (hint != nullptr && !slabAlloc_.isValidSlab(hintSlab)) {
-    throw std::invalid_argument(
-        fmt::format("Invalid hint {} for slab release {}", hint, (void*) hintSlab));
+    throw std::invalid_argument(fmt::format(
+        "Invalid hint {} for slab release {}", hint, (void*)hintSlab));
   }
 
   const Slab* slab;
@@ -191,16 +204,41 @@ SlabReleaseContext AllocationClass::startSlabRelease(
     if (slab == nullptr) {
       throw std::invalid_argument("Can not figure out a slab for release");
     }
-
     header = slabAlloc_.getSlabHeader(slab);
+  }
+  auto results = pruneFreeAllocs(slab, shouldAbortFn);
+  if (results.first) {
+    {
+      std::unique_lock l(lock_);
+      ([&]() {
+        header->setMarkedForRelease(false);
+        slabAllocMap_.erase(getSlabPtrValue(slab));
+      })();
+    }
+    throw exception::SlabReleaseAborted(
+        fmt::format("Slab Release aborted "
+                    "during pruning free allocs. Slab address: {}",
+                    (void*)slab));
+  }
+  std::vector<void*> activeAllocations = results.second;
+
+  {
+    std::unique_lock l(lock_);
+
     // slab header must be valid and NOT marked for release
     if (header == nullptr || header->classId != getId() ||
-        header->poolId != getPoolId() || header->isMarkedForRelease()) {
+        header->poolId != getPoolId()) {
       throw std::invalid_argument(fmt::format(
           "Slab Header {} is in invalid state for release. id = {}, "
           "markedForRelease = {}, classId = {}",
-          (void*) header, header == nullptr ? Slab::kInvalidClassId : header->classId,
+          (void*)header,
+          header == nullptr ? Slab::kInvalidClassId : header->classId,
           header == nullptr ? false : header->isMarkedForRelease(), getId()));
+    }
+
+    if (header->isMarkedForRelease()) {
+      return SlabReleaseContext{slab, header->poolId, header->classId,
+                                std::move(activeAllocations), mode};
     }
 
     // if its is a free slab, get it off the freeSlabs_ and return context
@@ -217,7 +255,6 @@ SlabReleaseContext AllocationClass::startSlabRelease(
     // and mark the slab for release
     header->setMarkedForRelease(true);
     createSlabReleaseAllocMapLocked(slab);
-
     // remove this slab from the allocatedSlab_ if it exists.
     auto allocIt =
         std::find(allocatedSlabs_.begin(), allocatedSlabs_.end(), slab);
@@ -229,7 +266,7 @@ SlabReleaseContext AllocationClass::startSlabRelease(
           fmt::format("Slab {} belongs to class {}. But its not present in "
                       "the free list or "
                       "allocated list.",
-                      (void*) slab, getId()));
+                      (void*)slab, getId()));
     }
     *allocIt = allocatedSlabs_.back();
     allocatedSlabs_.pop_back();
@@ -237,12 +274,12 @@ SlabReleaseContext AllocationClass::startSlabRelease(
     // if slab is being carved currently, then update slabReleaseAllocMap
     // allocState with free Allocs info, and then reset it
     if (currSlab_ == slab) {
-      const auto it = slabReleaseAllocMap_.find(getSlabPtrValue(slab));
+      const auto it = slabAllocMap_.find(getSlabPtrValue(slab));
       auto& allocState = it->second;
       XDCHECK_EQ(allocState.size(), getAllocsPerSlab());
       for (size_t i = currOffset_ / allocationSize_; i < allocState.size();
            i++) {
-        allocState[i] = true;
+        allocState[i].allocated = true;
       }
 
       currSlab_ = nullptr;
@@ -250,21 +287,6 @@ SlabReleaseContext AllocationClass::startSlabRelease(
     }
   } // alloc lock scope
 
-  auto results = pruneFreeAllocs(slab, shouldAbortFn);
-  if (results.first) {
-    {
-      std::unique_lock l(lock_);
-      ([&]() {
-        header->setMarkedForRelease(false);
-        slabReleaseAllocMap_.erase(getSlabPtrValue(slab));
-      })();
-    }
-    throw exception::SlabReleaseAborted(
-        fmt::format("Slab Release aborted "
-                    "during pruning free allocs. Slab address: {}",
-                    (void*) slab));
-  }
-  std::vector<void*> activeAllocations = std::move(results.second);
   std::unique_lock l(lock_);
   return ([&]() {
     if (activeAllocations.empty()) {
@@ -274,7 +296,7 @@ SlabReleaseContext AllocationClass::startSlabRelease(
       // no active allocations to be freed back. We can consider this slab as
       // released from this AllocationClass. This means we also do not need
       // to keep the slabFreeState
-      slabReleaseAllocMap_.erase(getSlabPtrValue(slab));
+      slabAllocMap_.erase(getSlabPtrValue(slab));
       return SlabReleaseContext{slab, header->poolId, header->classId, mode};
     } else {
       ++activeReleases_;
@@ -332,7 +354,7 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
       // Take the allocation class free list offline
       // This is because we need to process this free list in batches
       // in order not to stall threads that need to allocate memory
-      std::swap(freeAllocs, freedAllocations_);
+      // std::swap(freeAllocs, freedAllocations_);
 
       // Check up to kFreeAllocsPruneLimit while holding the lock. This limits
       // the amount of time we hold the lock while also having a good chance
@@ -352,7 +374,8 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
       ([&]() {
         // Put back allocs we checked while not holding the lock.
         if (!notInSlab.empty()) {
-          freedAllocations_.splice(freedAllocations_.begin(), std::move(notInSlab));
+          // freedAllocations_.splice(freedAllocations_.begin(),
+          //                          std::move(notInSlab));
           canAllocate_ = true;
         }
 
@@ -365,7 +388,7 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
               slabAlloc_.isMemoryInSlab(reinterpret_cast<void*>(alloc), slab));
           const auto idx = getAllocIdx(slab, reinterpret_cast<void*>(alloc));
           XDCHECK_LT(idx, allocState.size());
-          allocState[idx] = true;
+          allocState[idx].allocated = true;
         }
       })(); // alloc lock scope
     }
@@ -401,7 +424,8 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
       if (!inSlab.empty()) {
         freeAllocs.splice(freeAllocs.begin(), std::move(inSlab));
       }
-      freedAllocations_.splice(freedAllocations_.begin(), std::move(freeAllocs));
+      // freedAllocations_.splice(freedAllocations_.begin(),
+      //                          std::move(freeAllocs));
     })();
     return {shouldAbort, activeAllocations};
   }
@@ -418,7 +442,7 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
     // done fast enough since we're iterating a vector.
     size_t offset = 0;
     for (const auto freed : allocState) {
-      if (!freed) {
+      if (!freed.allocated) {
         activeAllocations.push_back(slab->memoryAtOffset(offset));
       }
       offset += allocationSize_;
@@ -429,17 +453,18 @@ std::pair<bool, std::vector<void*>> AllocationClass::pruneFreeAllocs(
 }
 
 bool AllocationClass::allFreed(const Slab* slab) const {
-  std::unique_lock l(lock_);
+  // std::unique_lock l(lock_);
   return ([this, slab]() {
-    const auto it = slabReleaseAllocMap_.find(getSlabPtrValue(slab));
-    if (it == slabReleaseAllocMap_.end()) {
+    const auto it = slabAllocMap_.find(getSlabPtrValue(slab));
+    if (it == slabAllocMap_.end()) {
       throw std::runtime_error(fmt::format(
-          "Slab {} is not in the active slab release allocation map.", (void*) slab));
+          "Slab {} is not in the active slab release allocation map.",
+          (void*)slab));
     }
 
     const auto& allocState = it->second;
     for (const auto freed : allocState) {
-      if (!freed) {
+      if (!freed.allocated) {
         return false;
       }
     }
@@ -448,15 +473,15 @@ bool AllocationClass::allFreed(const Slab* slab) const {
 }
 
 void AllocationClass::waitUntilAllFreed(const Slab* slab) {
-  util::Throttler t{util::Throttler::Config{
-      1000, /* sleepTime. milliseconds */
-      10,   /* sleepInterval. milliseconds */
-  }};
-  while (!allFreed(slab)) {
-    if (t.throttle() && t.numThrottles() % 128) {
-      XLOG(WARN, "still waiting for all slabs released");
-    }
-  }
+  // util::Throttler t{util::Throttler::Config{
+  //     1000, /* sleepTime. milliseconds */
+  //     10,   /* sleepInterval. milliseconds */
+  // }};
+  // while (!allFreed(slab)) {
+  //   if (t.throttle() && t.numThrottles() % 128) {
+  //     XLOG(WARN, "still waiting for all slabs released");
+  //   }
+  // }
 }
 
 void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
@@ -469,14 +494,14 @@ void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
 
   std::unique_lock l(lock_);
   ([&]() {
-    const auto it = slabReleaseAllocMap_.find(getSlabPtrValue(slab));
+    const auto it = slabAllocMap_.find(getSlabPtrValue(slab));
     bool inserted = false;
-    if (it != slabReleaseAllocMap_.end()) {
+    if (it != slabAllocMap_.end()) {
       const auto& allocState = it->second;
       for (size_t idx = 0; idx < allocState.size(); idx++) {
-        if (allocState[idx]) {
+        if (allocState[idx].allocated) {
           auto alloc = getAllocForIdx(slab, idx);
-          freedAllocations_.push_front(alloc);
+          // freedAllocations_.push_front(alloc);
           inserted = true;
         }
       }
@@ -484,7 +509,7 @@ void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
     if (inserted) {
       canAllocate_ = true;
     }
-    slabReleaseAllocMap_.erase(slabPtrVal);
+    slabAllocMap_.erase(slabPtrVal);
     allocatedSlabs_.push_back(const_cast<Slab*>(slab));
     // restore the classId and allocSize
     header->classId = classId_;
@@ -494,12 +519,11 @@ void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
   })();
 }
 
-void AllocationClass::completeSlabRelease(const SlabReleaseContext& context) {
+bool AllocationClass::completeSlabRelease(const SlabReleaseContext& context) {
   if (context.isReleased()) {
     // nothing to be done here since the slab is already released
-    return;
+    return false;
   }
-
   auto slab = context.getSlab();
   auto header = slabAlloc_.getSlabHeader(slab);
 
@@ -514,6 +538,19 @@ void AllocationClass::completeSlabRelease(const SlabReleaseContext& context) {
                         (void*)slab, (void*)header));
       }
     })();
+    if (allFreed(slab)) {
+      const auto slabPtrVal = getSlabPtrValue(slab);
+      slabAllocMap_.erase(slabPtrVal);
+
+      header->classId = Slab::kInvalidClassId;
+      header->allocSize = 0;
+      header->setMarkedForRelease(false);
+      --activeReleases_;
+      XDCHECK_GE(activeReleases_.load(), 0);
+      return true;
+    } else {
+      return false;
+    }
   }
 
   // release the lock and check that all the allocs are freed back to the
@@ -521,19 +558,19 @@ void AllocationClass::completeSlabRelease(const SlabReleaseContext& context) {
   // TODO consider completeSlabRelease not sleep forever and provide the
   // context back to the caller for the list of non-free allocations after
   // waiting for a while.
-  waitUntilAllFreed(slab);
+  // waitUntilAllFreed(slab);
 
-  const auto slabPtrVal = getSlabPtrValue(slab);
-  std::unique_lock l(lock_);
-  ([&]() {
-    slabReleaseAllocMap_.erase(slabPtrVal);
+  // const auto slabPtrVal = getSlabPtrValue(slab);
+  // std::unique_lock l(lock_);
+  // ([&]() {
+  //   slabAllocMap_.erase(slabPtrVal);
 
-    header->classId = Slab::kInvalidClassId;
-    header->allocSize = 0;
-    header->setMarkedForRelease(false);
-    --activeReleases_;
-    XDCHECK_GE(activeReleases_.load(), 0);
-  })();
+  //   header->classId = Slab::kInvalidClassId;
+  //   header->allocSize = 0;
+  //   header->setMarkedForRelease(false);
+  //   --activeReleases_;
+  //   XDCHECK_GE(activeReleases_.load(), 0);
+  // })();
 }
 
 void AllocationClass::checkSlabInRelease(const SlabReleaseContext& ctx,
@@ -569,27 +606,26 @@ bool AllocationClass::isAllocFreedLocked(const SlabReleaseContext& /*ctx*/,
                                          void* memory) const {
   const auto* slab = slabAlloc_.getSlabForMemory(memory);
   const auto slabPtrVal = getSlabPtrValue(slab);
-  const auto it = slabReleaseAllocMap_.find(slabPtrVal);
+  const auto it = slabAllocMap_.find(slabPtrVal);
 
   // this should not happen
-  if (it == slabReleaseAllocMap_.end()) {
+  if (it == slabAllocMap_.end()) {
     throw std::runtime_error(
         fmt::format("Invalid slabReleaseAllocMap "
-                       "state when checking if memory is freed. Memory: {}",
-                       memory));
+                    "state when checking if memory is freed. Memory: {}",
+                    memory));
   }
 
   const auto& allocState = it->second;
   const auto idx = getAllocIdx(slab, memory);
-  return allocState[idx];
+  return allocState[idx].allocated;
 }
 
 bool AllocationClass::isAllocFreed(const SlabReleaseContext& ctx,
                                    void* memory) const {
   checkSlabInRelease(ctx, memory);
   std::unique_lock l(lock_);
-  return (
-      [this, &ctx, memory]() { return isAllocFreedLocked(ctx, memory); })();
+  return ([this, &ctx, memory]() { return isAllocFreedLocked(ctx, memory); })();
 }
 
 void AllocationClass::processAllocForRelease(
@@ -605,8 +641,8 @@ void AllocationClass::processAllocForRelease(
   })();
 }
 
-void AllocationClass::free(void* memory) {
-  const auto* header = slabAlloc_.getSlabHeader(memory);
+bool AllocationClass::free(void* memory) {
+  auto* header = slabAlloc_.getSlabHeader(memory);
   auto* slab = slabAlloc_.getSlabForMemory(memory);
   if (header == nullptr || header->classId != classId_) {
     throw std::invalid_argument(fmt::format(
@@ -617,51 +653,90 @@ void AllocationClass::free(void* memory) {
 
   const auto slabPtrVal = getSlabPtrValue(slab);
   std::unique_lock l(lock_);
-  ([this, header, slab, memory, slabPtrVal]() {
-    // check under the lock we actually add the allocation back to the free list
-    if (header->isMarkedForRelease()) {
-      auto it = slabReleaseAllocMap_.find(slabPtrVal);
+  // ([this, header, slab, memory, slabPtrVal]() {
+  //   // check under the lock we actually add the allocation back to the free
+  //   list
+  //   // if (header->isMarkedForRelease()) {
+  auto it = slabAllocMap_.find(slabPtrVal);
 
-      // this should not happen.
-      if (it == slabReleaseAllocMap_.end()) {
-        throw std::runtime_error(fmt::format(
-            "Invalid slabReleaseAllocMap "
-            "state when attempting to free an allocation. Memory: {}",
-            memory));
-      }
+  // this should not happen.
+  if (it == slabAllocMap_.end()) {
+    throw std::runtime_error(
+        fmt::format("Invalid slabReleaseAllocMap "
+                    "state when attempting to free an allocation. Memory: {}",
+                    memory));
+  }
 
-      auto& allocState = it->second;
-      const auto idx = getAllocIdx(slab, memory);
-      if (allocState[idx]) {
-        throw std::invalid_argument(
-            fmt::format("Allocation {} is already marked as free", memory));
-      }
-      allocState[idx] = true;
-      return;
+  auto& allocState = it->second;
+  const auto idx = getAllocIdx(slab, memory);
+  if (allocState[idx].allocated) {
+    throw std::invalid_argument(
+        fmt::format("Allocation {} is already marked as free", memory));
+  }
+  allocState[idx].allocated = true;
+
+  int size = allocState.size();
+  for (int i = 0; i < size; i++) {
+    if (!allocState[i].allocated) {
+      freedAllocations_.push_front(&allocState[i]);
+      canAllocate_ = true;
+      return false;
     }
+  }
+  // free slab memory from freeAllocation_
+  for (int i = 0; i < size; i++) {
+    freedAllocations_.release(&allocState[i]);
+  }
+  // release slab
+  auto allocIt =
+      std::find(allocatedSlabs_.begin(), allocatedSlabs_.end(), slab);
+  if (allocIt == allocatedSlabs_.end()) {
+    // not a part of free slabs and not part of allocated slab. This is an
+    // error, return to caller. This should not happen. throw a run time
+    // error.
+    throw std::runtime_error(
+        fmt::format("Slab {} belongs to class {}. But its not present in "
+                    "the free list or "
+                    "allocated list.",
+                    (void*)slab, getId()));
+  }
+  *allocIt = allocatedSlabs_.back();
+  allocatedSlabs_.pop_back();
+  // remove all from free list
 
-    // TODO add checks here to ensure that we dont double free in debug mode.
-    freedAllocations_.push_front(memory);
-    canAllocate_ = true;
-  })();
+  if (currSlab_ == slab) {
+    currSlab_ = nullptr;
+    currOffset_ = 0;
+  }
+  slabAllocMap_.erase(slabPtrVal);
+  header->classId = Slab::kInvalidClassId;
+  header->allocSize = 0;
+  header->setMarkedForRelease(false);
+  --activeReleases_;
+  return true;
+  // })();
 }
 
 void AllocationClass::createSlabReleaseAllocMapLocked(const Slab* slab) {
   // Initialize slab free state
   // Each bit represents whether or not an alloc has already been freed
   const auto slabPtrVal = getSlabPtrValue(slab);
-  std::vector<bool> allocState(getAllocsPerSlab(), false);
-  const auto res =
-      slabReleaseAllocMap_.insert({slabPtrVal, std::move(allocState)});
+  auto size = getAllocsPerSlab();
+  std::vector<MemoryAllocInfo_> allocState;
+  for (int i = 0; i < size; i++) {
+    allocState.push_back(
+        MemoryAllocInfo_{getAllocForIdx(slab, i), false, NULL, NULL});
+  }
+  const auto res = slabAllocMap_.insert({slabPtrVal, std::move(allocState)});
   if (!res.second) {
     // this should never happen. we must always be able to insert.
-    throw std::runtime_error(
-        fmt::format("failed to insert allocState map for slab {}", (void*) slab));
+    throw std::runtime_error(fmt::format(
+        "failed to insert allocState map for slab {}", (void*)slab));
   }
 }
 
-std::vector<bool>& AllocationClass::getSlabReleaseAllocMapLocked(
+std::vector<MemoryAllocInfo_>& AllocationClass::getSlabReleaseAllocMapLocked(
     const Slab* slab) {
   const auto slabPtrVal = getSlabPtrValue(slab);
-  return slabReleaseAllocMap_.at(slabPtrVal);
+  return slabAllocMap_.at(slabPtrVal);
 }
