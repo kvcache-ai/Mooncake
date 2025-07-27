@@ -15,7 +15,6 @@
 #ifndef CXL_TRANSPORT_H_
 #define CXL_TRANSPORT_H_
 
-
 #include <atomic>
 #include <cstddef>
 #include <map>
@@ -51,7 +50,7 @@ class CxlTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
-    void* getCxlBaseAddr() { return cxl_base_addr; }
+    void *getCxlBaseAddr() { return cxl_base_addr; }
 
    private:
     int install(std::string &local_server_name,
@@ -86,9 +85,9 @@ class CxlTransport : public Transport {
     bool validateMemoryBounds(void *dest, void *src, size_t size);
 
    private:
-    void* cxl_base_addr;
+    void *cxl_base_addr;
     size_t cxl_dev_size;
-    char* cxl_dev_path;
+    char *cxl_dev_path;
 };
 }  // namespace mooncake
 

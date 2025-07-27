@@ -23,7 +23,6 @@ class EvictionStrategyTest : public ::testing::Test {
     }
 };
 
-
 // Test LRUEvictionStrategy AddKey and RemoveKey functionality
 TEST_F(EvictionStrategyTest, AddAndRemoveKey) {
     LRUEvictionStrategy eviction_strategy;
@@ -87,7 +86,9 @@ TEST_F(EvictionStrategyTest, FIFOAddAndRemoveKey) {
     EXPECT_EQ(eviction_strategy.GetSize(), 2);
 
     // Remove a key
-    EXPECT_EQ(eviction_strategy.RemoveKey("key1"), ErrorCode::OK); // FIFO not support remove a randomly accessed key
+    EXPECT_EQ(
+        eviction_strategy.RemoveKey("key1"),
+        ErrorCode::OK);  // FIFO not support remove a randomly accessed key
     EXPECT_EQ(eviction_strategy.GetSize(), 2);
 
     // Clean up

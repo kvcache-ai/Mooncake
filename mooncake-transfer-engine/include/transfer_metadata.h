@@ -65,12 +65,12 @@ class TransferMetadata {
     };
 
     struct RankInfoDesc {
-        uint64_t rankId = 0xFFFFFFFF; // rank id, user rank
+        uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
         std::string hostIp;
         uint64_t hostPort;
         uint64_t deviceLogicId;
         uint64_t devicePhyId;
-        uint64_t deviceType = 5; // default
+        uint64_t deviceType = 5;  // default
         std::string deviceIp;
         uint64_t devicePort;
         uint64_t pid;
