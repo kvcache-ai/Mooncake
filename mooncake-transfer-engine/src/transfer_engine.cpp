@@ -20,6 +20,7 @@
 #include <fstream>
 #include <string>
 
+#include "config.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
@@ -150,8 +151,11 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         } else {
             local_topology_->discover(filter_);
         }
-        LOG(INFO) << "Topology discovery complete. Found "
+        LOG(INFO) << "Auto-discovering topology complete: Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+        if (globalConfig().trace) {
+            LOG(INFO) << "Topology:\n" << local_topology_->toString();
+        }
 
 #ifdef USE_MNNVL
         if (local_topology_->getHcaList().size() > 0 &&
@@ -214,6 +218,9 @@ Transport *TransferEngine::installTransport(const std::string &proto,
         if (ret) {
             LOG(ERROR) << "Failed to parse NIC priority matrix";
             return nullptr;
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "Install transport " << proto << " with custom topology:\n" << local_topology_->toString();
         }
     }
 
