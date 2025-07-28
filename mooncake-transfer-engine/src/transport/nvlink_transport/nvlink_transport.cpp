@@ -32,16 +32,20 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
+static void checkCudaError(cudaError_t result, const char *message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << " (Error code: " << result << " - "
+                   << cudaGetErrorString(result) << ")" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
 namespace mooncake {
 static int getNumDevices() {
     static int cached_num_devices = -1;
     if (cached_num_devices == -1) {
-        cudaError_t err = cudaGetDeviceCount(&cached_num_devices);
-        if (err != cudaSuccess) {
-            LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
-                       << cudaGetErrorString(err);
-            cached_num_devices = 0;
-        }
+        checkCudaError(cudaGetDeviceCount(&cached_num_devices), 
+                      "NvlinkTransport: cudaGetDeviceCount failed");
     }
     return cached_num_devices;
 }
@@ -67,7 +71,57 @@ static bool supportFabricMem() {
     return true;
 }
 
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
+static bool enableP2PAccess(int src_device_id, int dst_device_id) {
+    int canAccessPeer = 0;
+    checkCudaError(
+        cudaDeviceCanAccessPeer(&canAccessPeer, src_device_id, dst_device_id),
+        "NvlinkTransport: failed to query peer access");
+
+    if (!canAccessPeer) {
+        LOG(ERROR) << "NvlinkTransport: device " << src_device_id
+                   << " cannot p2p access device " << dst_device_id;
+        return false;
+    }
+
+    // enable src->dst p2p access
+    checkCudaError(cudaSetDevice(src_device_id),
+                   "NvlinkTransport: failed to set device");
+    checkCudaError(cudaDeviceEnablePeerAccess(dst_device_id, 0),
+                   "NvlinkTransport: failed to enable p2p access");
+
+    // enable dst->src p2p access
+    checkCudaError(cudaSetDevice(dst_device_id),
+                   "NvlinkTransport: failed to set device");
+    checkCudaError(cudaDeviceEnablePeerAccess(src_device_id, 0),
+                   "NvlinkTransport: failed to enable p2p access");
+
+    return true;
+}
+
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {
+    int num_devices = getNumDevices();
+    if (globalConfig().trace) {
+        LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
+                  << ", num_devices: " << num_devices;
+    }
+
+    for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
+        for (int dst_device_id = src_device_id + 1; dst_device_id < num_devices;
+             ++dst_device_id) {
+            if (enableP2PAccess(src_device_id, dst_device_id)) {
+                if (globalConfig().trace) {
+                    LOG(INFO)
+                        << "NvlinkTransport: enabled p2p access between device "
+                        << src_device_id << " and " << dst_device_id;
+                }
+            } else {
+                LOG(ERROR) << "NvlinkTransport: failed to enable p2p access "
+                              "between device "
+                           << src_device_id << " and " << dst_device_id;
+            }
+        }
+    }
+}
 
 NvlinkTransport::~NvlinkTransport() {
     if (use_fabric_mem_) {
