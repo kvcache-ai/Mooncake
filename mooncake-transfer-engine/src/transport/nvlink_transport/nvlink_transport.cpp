@@ -33,19 +33,28 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+static int getNumDevices() {
+    static int cached_num_devices = -1;
+    if (cached_num_devices == -1) {
+        cudaError_t err = cudaGetDeviceCount(&cached_num_devices);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
+                       << cudaGetErrorString(err);
+            cached_num_devices = 0;
+        }
+    }
+    return cached_num_devices;
+}
+
 static bool supportFabricMem() {
     if (getenv("MC_USE_NVLINK_IPC")) return false;
-    int num_devices = 0;
-    cudaError_t err = cudaGetDeviceCount(&num_devices);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
-                   << cudaGetErrorString(err);
-        return false;
-    }
+    
+    int num_devices = getNumDevices();
     if (num_devices == 0) {
         LOG(ERROR) << "NvlinkTransport: not device found";
         return false;
     }
+    
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttribute(&device_support_fabric_mem,
