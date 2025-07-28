@@ -40,6 +40,15 @@ static void checkCudaError(cudaError_t result, const char *message) {
     }
 }
 
+static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << " (Error code: " << result << " - "
+                   << cudaGetErrorString(result) << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 namespace mooncake {
 static int getNumDevices() {
     static int cached_num_devices = -1;
@@ -73,9 +82,11 @@ static bool supportFabricMem() {
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     int canAccessPeer = 0;
-    checkCudaError(
-        cudaDeviceCanAccessPeer(&canAccessPeer, src_device_id, dst_device_id),
-        "NvlinkTransport: failed to query peer access");
+    if (!checkCudaErrorReturn(
+            cudaDeviceCanAccessPeer(&canAccessPeer, src_device_id, dst_device_id),
+            "NvlinkTransport: failed to query peer access")) {
+        return false;
+    }
 
     if (!canAccessPeer) {
         LOG(ERROR) << "NvlinkTransport: device " << src_device_id
@@ -84,16 +95,24 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     }
 
     // enable src->dst p2p access
-    checkCudaError(cudaSetDevice(src_device_id),
-                   "NvlinkTransport: failed to set device");
-    checkCudaError(cudaDeviceEnablePeerAccess(dst_device_id, 0),
-                   "NvlinkTransport: failed to enable p2p access");
+    if (!checkCudaErrorReturn(cudaSetDevice(src_device_id),
+                             "NvlinkTransport: failed to set device")) {
+        return false;
+    }
+    if (!checkCudaErrorReturn(cudaDeviceEnablePeerAccess(dst_device_id, 0),
+                             "NvlinkTransport: failed to enable p2p access")) {
+        return false;
+    }
 
     // enable dst->src p2p access
-    checkCudaError(cudaSetDevice(dst_device_id),
-                   "NvlinkTransport: failed to set device");
-    checkCudaError(cudaDeviceEnablePeerAccess(src_device_id, 0),
-                   "NvlinkTransport: failed to enable p2p access");
+    if (!checkCudaErrorReturn(cudaSetDevice(dst_device_id),
+                             "NvlinkTransport: failed to set device")) {
+        return false;
+    }
+    if (!checkCudaErrorReturn(cudaDeviceEnablePeerAccess(src_device_id, 0),
+                             "NvlinkTransport: failed to enable p2p access")) {
+        return false;
+    }
 
     return true;
 }
