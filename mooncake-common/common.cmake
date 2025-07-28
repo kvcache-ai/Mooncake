@@ -149,6 +149,3 @@ set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(yaml-cpp REQUIRED)
 find_package(gflags REQUIRED)
 find_package(yalantinglibs CONFIG REQUIRED)
-
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_package(Threads REQUIRED)
