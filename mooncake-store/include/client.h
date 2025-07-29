@@ -15,6 +15,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -116,6 +117,13 @@ class Client {
                                       const ReplicateConfig& config);
 
     /**
+     * Same as Put, but the destination is VRAM
+     */
+    tl::expected<void, ErrorCode> PutToVRAM(const ObjectKey& key,
+                                            std::vector<Slice>& slices,
+                                            const ReplicateConfig& config);
+
+    /**
      * @brief Batch put data with replication
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices to store (indexed
@@ -146,7 +154,7 @@ class Client {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer, size_t size);
+    tl::expected<void, ErrorCode> MountSegment(const void* buffer, size_t size, bool is_vram);
 
     /**
      * @brief Unregisters a memory segment from master

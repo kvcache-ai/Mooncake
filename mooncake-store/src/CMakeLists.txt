@@ -35,10 +35,13 @@ if(USE_3FS)
   set(EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
+find_package(CUDAToolkit REQUIRED)
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_link_libraries(mooncake_store PUBLIC transfer_engine ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
+    CUDA::cudart
     ${EXTRA_LIBS}
 )
 if (STORE_USE_ETCD)

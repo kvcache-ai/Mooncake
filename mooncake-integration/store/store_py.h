@@ -100,6 +100,8 @@ class DistributedObjectStore {
               const std::string &rdma_devices = "",
               const std::string &master_server_addr = "127.0.0.1:50051");
 
+    int setup_vram(size_t vram_buffer_size);
+
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
@@ -196,6 +198,14 @@ class DistributedObjectStore {
                   const std::vector<std::span<const char>> &values,
                   const ReplicateConfig &config = ReplicateConfig{});
 
+    /**
+     * Now these two function only supports user buffer
+     */
+    int put_to_vram(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    int get_from_vram(const std::string &key, void *buffer, size_t size);
+
     [[nodiscard]] std::string get_hostname() const;
 
     pybind11::bytes get(const std::string &key);
@@ -225,6 +235,8 @@ class DistributedObjectStore {
     long removeAll();
 
     int tearDownAll();
+
+    void evict_key(std::string);
 
     /**
      * @brief Check if an object exists
@@ -272,6 +284,8 @@ class DistributedObjectStore {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051");
 
+    tl::expected<void, ErrorCode> setup_vram_internal(size_t vram_size);
+
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);
@@ -289,11 +303,19 @@ class DistributedObjectStore {
                                                        void *buffer,
                                                        size_t size);
 
+    tl::expected<int64_t, ErrorCode> get_from_vram_internal(const std::string &key,
+                                                       void *buffer,
+                                                       size_t size);
+
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
     tl::expected<void, ErrorCode> put_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> put_to_vram_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
 
@@ -346,10 +368,22 @@ class DistributedObjectStore {
         }
     };
 
+    struct VRAMSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                cudaAlignedFree(ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> local_vram_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+
+    // For VRAM eviction
+    std::queue<std::string> evict_queue;
 };
 
 }  // namespace mooncake

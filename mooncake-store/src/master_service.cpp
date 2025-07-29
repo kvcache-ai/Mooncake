@@ -331,6 +331,7 @@ auto MasterService::PutStart(const std::string& key,
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     if (config.replica_num == 0 || key.empty() || slice_lengths.empty()) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", vram_only= " << config.local_vram_only
                    << ", slice_count=" << slice_lengths.size()
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -372,6 +373,7 @@ auto MasterService::PutStart(const std::string& key,
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
+        auto& vram_allocators_by_name = allocator_access.getVRAMAllocatorsByName();
         for (size_t i = 0; i < config.replica_num; ++i) {
             std::vector<std::unique_ptr<AllocatedBuffer>> handles;
             handles.reserve(slice_lengths.size());
@@ -382,7 +384,9 @@ auto MasterService::PutStart(const std::string& key,
 
                 // Use the unified allocation strategy with replica config
                 auto handle = allocation_strategy_->Allocate(
-                    allocators, allocators_by_name, chunk_size, config);
+                    allocators,
+                    config.local_vram_only ? vram_allocators_by_name : allocators_by_name,
+                    chunk_size, config);
 
                 if (!handle) {
                     // If the allocation failed, we need to evict some objects

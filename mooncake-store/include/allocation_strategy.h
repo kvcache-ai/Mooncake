@@ -43,6 +43,8 @@ class AllocationStrategy {
  * This strategy first attempts to allocate from a preferred segment if
  * specified, then falls back to random allocation among all available
  * allocators.
+ * 
+ * But there is a limitation for VRAM: only allocate in local segment
  */
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
@@ -64,6 +66,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 TryPreferredAllocate(allocators_by_name, objectSize, config)) {
             return preferred_buffer;
         }
+
+        // For now, vram is only for local use
+        if (config.local_vram_only)
+            return nullptr;
 
         // Fall back to random allocation among all eligible allocators
         return TryRandomAllocate(allocators, objectSize);

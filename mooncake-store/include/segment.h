@@ -118,9 +118,13 @@ class ScopedAllocatorAccess {
         std::unordered_map<std::string,
                            std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
+        std::unordered_map<std::string,
+                           std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+            vram_allocators_by_name,
         std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         std::shared_mutex& mutex)
         : allocators_by_name_(allocators_by_name),
+          vram_allocators_by_name_(vram_allocators_by_name),
           allocators_(allocators),
           lock_(mutex) {}
 
@@ -128,6 +132,12 @@ class ScopedAllocatorAccess {
                              std::vector<std::shared_ptr<BufferAllocatorBase>>>&
     getAllocatorsByName() {
         return allocators_by_name_;
+    }
+
+    const std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+    getVRAMAllocatorsByName() {
+        return vram_allocators_by_name_;
     }
 
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& getAllocators() {
@@ -138,6 +148,9 @@ class ScopedAllocatorAccess {
     const std::unordered_map<std::string,
                              std::vector<std::shared_ptr<BufferAllocatorBase>>>&
         allocators_by_name_;  // segment name -> allocators
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
+        vram_allocators_by_name_;
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;
 };
@@ -165,7 +178,9 @@ class SegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocators_by_name_, allocators_,
+        return ScopedAllocatorAccess(allocators_by_name_,
+                                     vram_allocators_by_name_,
+                                     allocators_,
                                      segment_mutex_);
     }
 
@@ -181,6 +196,9 @@ class SegmentManager {
         allocators_by_name_;  // segment name -> allocators
     std::vector<std::shared_ptr<BufferAllocatorBase>>
         allocators_;  // allocators
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
+        vram_allocators_by_name_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>

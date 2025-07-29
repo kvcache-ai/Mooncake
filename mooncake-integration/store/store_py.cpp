@@ -200,7 +200,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         segment_ptrs_.emplace_back(ptr);
-        auto mount_result = client_->MountSegment(ptr, segment_size);
+        auto mount_result = client_->MountSegment(ptr, segment_size, false);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -224,6 +224,37 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr));
+}
+
+tl::expected<void, ErrorCode> DistributedObjectStore::setup_vram_internal(size_t vram_buffer_size) {
+    auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
+    uint64_t total_glbseg_size = vram_buffer_size;  // For logging
+    uint64_t current_glbseg_size = 0;                  // For logging
+    // Normally, The vram buffer is smaller than max_mr_size.
+    while (vram_buffer_size > 0) {
+        size_t segment_size = std::min(vram_buffer_size, max_mr_size);
+        vram_buffer_size -= segment_size;
+        current_glbseg_size += segment_size;
+        LOG(INFO) << "Mounting VRAM segment: " << segment_size << " bytes, "
+                  << current_glbseg_size << " of " << total_glbseg_size;
+        void *ptr = allocate_vram_buffer_allocator_memory(segment_size);
+        if (!ptr) {
+            LOG(ERROR) << "Failed to allocate vram segment memory";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        local_vram_segment_ptrs_.emplace_back(ptr);
+        auto mount_result = client_->MountSegment(ptr, segment_size, true);
+        if (!mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount vram segment: "
+                       << toString(mount_result.error());
+            return tl::unexpected(mount_result.error());
+        }
+    }
+    return {};
+}
+
+int DistributedObjectStore::setup_vram(size_t vram_buffer_size) {
+    return to_py_ret(setup_vram_internal(vram_buffer_size));
 }
 
 tl::expected<void, ErrorCode> DistributedObjectStore::initAll_internal(
@@ -255,6 +286,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::tearDownAll_internal() {
     client_.reset();
     client_buffer_allocator_.reset();
     segment_ptrs_.clear();
+    local_vram_segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
     protocol = "";
@@ -1523,6 +1555,108 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_tensor_internal(
 int DistributedObjectStore::put_tensor(const std::string &key,
                                        pybind11::object tensor) {
     return to_py_ret(put_tensor_internal(key, tensor));
+}
+
+void DistributedObjectStore::evict_key(std::string key) {
+    auto query_result = client_->Query(key);
+
+    auto replica_list = query_result.value();
+
+    // Calculate total size
+    const auto &replica = replica_list[0];
+    uint64_t total_size = calculate_total_size(replica);
+
+    // Allocate buffer using the new allocator
+    auto alloc_result = client_buffer_allocator_->allocate(total_size);
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for evict operation, key: "
+                    << key << ", size: " << total_size;
+        return;
+    }
+
+    auto &buffer_handle = *alloc_result;
+
+    // Create slices for the allocated buffer based on memory descriptors
+    std::vector<Slice> slices;
+    allocateSlices(slices, replica, buffer_handle);
+
+    // Get the object data
+    auto get_result = client_->Get(key, replica_list, slices);
+    if (!get_result) {
+        LOG(ERROR) << "Evict Get operation failed with error: "
+                    << toString(get_result.error());
+        return;
+    }
+
+    remove_internal(key);
+    ReplicateConfig config;
+    auto put_result = client_->Put(key, slices, config);
+    if (!put_result)
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(put_result.error());
+}
+
+tl::expected<void, ErrorCode> DistributedObjectStore::put_to_vram_internal(
+    const std::string &key, void *buffer, size_t size,
+    const ReplicateConfig &config) {
+    // NOTE: The buffer address must be previously registered with
+    // register_buffer() for zero-copy RDMA operations to work correctly
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to put empty data for key: " << key;
+        return {};
+    }
+
+    // Create slices directly from the user buffer
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    tl::expected<void, ErrorCode> put_result;
+    do {
+        put_result = client_->PutToVRAM(key, slices, config);
+        if (!put_result && put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+            evict_key(evict_queue.front());
+            evict_queue.pop();
+        }
+    } while (!put_result && put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE);
+
+    if (!put_result && put_result.error() != ErrorCode::NO_AVAILABLE_HANDLE) {
+        LOG(ERROR) << "Put operation failed with error: "
+                   << toString(put_result.error());
+        return tl::unexpected(put_result.error());
+    }
+
+    evict_queue.push(key);
+
+    return {};
+}
+
+int DistributedObjectStore::put_to_vram(const std::string &key,
+                                        void *buffer, size_t size,
+                                        const ReplicateConfig &config) {
+    return to_py_ret(put_to_vram_internal(key, buffer, size, config));
+}
+
+tl::expected<int64_t, ErrorCode> DistributedObjectStore::get_from_vram_internal(
+                                                        const std::string &key,
+                                                       void *buffer,
+                                                       size_t size) {
+    return get_into_internal(key, buffer, size);
+}
+
+int DistributedObjectStore::get_from_vram(const std::string &key, void *buffer, size_t size) {
+    return to_py_ret(get_from_vram_internal(key, buffer, size));
 }
 
 PYBIND11_MODULE(store, m) {

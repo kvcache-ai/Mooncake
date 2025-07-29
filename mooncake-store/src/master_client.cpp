@@ -249,7 +249,7 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("base=", segment.base, ", size=", segment.size,
                      ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id);
+                     ", is_vram=", segment.is_vram, ", client_id=", client_id);
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
         segment, client_id);

@@ -215,12 +215,14 @@ struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
     std::string preferred_segment{};  // Preferred segment for allocation
+    bool local_vram_only{false};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         return os << "ReplicateConfig: { replica_num: " << config.replica_num
                   << ", with_soft_pin: " << config.with_soft_pin
                   << ", preferred_segment: " << config.preferred_segment
+                  << ", Local VRAM only: " << config.local_vram_only
                   << " }";
     }
 };
@@ -451,10 +453,11 @@ struct Segment {
                          // of the server that owns the segment
     uintptr_t base{0};
     size_t size{0};
+    bool is_vram{false};
     Segment() = default;
     Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size)
-        : id(id), name(name), base(base), size(size) {}
+            size_t size, bool is_vram)
+        : id(id), name(name), base(base), size(size), is_vram(is_vram) {}
 };
 YLT_REFL(Segment, id, name, base, size);
 
