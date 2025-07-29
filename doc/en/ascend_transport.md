@@ -26,7 +26,9 @@ apt-get install -y mpich libmpich-dev
 **Ascend Compute Architecture for Neural Networks**
 Ascend Compute Architecture for Neural Networks 8.1.RC1 Version + pkg Dependency Package
 
-The pkg package contains header files and shared libraries (.so), located at scripts/ascend/pkg. Please navigate to the pkg directory and execute the commands specified in the ReadMe.txt file according to your system architecture (ARM/x86).
+To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.Download pkg.zip from the comment in this PR:
+https://github.com/kvcache-ai/Mooncake/pull/684
+Follow the instructions in ReadMe.txt for your architecture
 
 ## One-Step Compilation Script
 
@@ -72,6 +74,11 @@ Alternatively, you can copy the `.so` file to another path referenced by `$LD_LI
 
 6. **IPV6 is not support**:
    IPv6 is not supported in this release; an IPv6-compatibility patch will be delivered shortly.
+
+7. **pkg need to download**:
+   To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.
+   Download pkg.zip from the comment in this PR:
+   https://github.com/kvcache-ai/Mooncake/pull/684
 
 ## One-Step Installation Script (Without Compiling Mooncake)
 

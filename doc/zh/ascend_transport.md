@@ -16,7 +16,8 @@ apt-get install -y mpich libmpich-dev
 
 **昇腾Compute Architecture for Neural Networks**
 昇腾Compute Architecture for Neural Networks 8.1.RC1版本 + pkg依赖包
-pkg包含一些头文件和so包，路径在scripts/ascend/pkg,请进入pkg文件夹，根据arm/x86系统执行ReadMe.txt的命令。
+为了不增加Mooncake项目的整体大小，完整的pkg依赖包请在https://github.com/kvcache-ai/Mooncake/pull/684 下载，我在comment中上传了pkg.zip文件，
+根据arm/x86系统执行ReadMe.txt的命令。
 
 ### 一键式编译脚本
 Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh,执行命令如下：
@@ -42,6 +43,8 @@ sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
 sudo apt install mpich libmpich-dev        # 安装 MPICH
 
 6.当前版本不支持IPV6，我们会很快完成针对IPV6的适配。
+
+7.请在https://github.com/kvcache-ai/Mooncake/pull/684 comment中下载pkg.zip文件，根据arm/x86系统执行ReadMe.txt的命令。
 
 ### 一键式安装脚本(不编译Mooncake)
 用户如果在一台机器上编译过Mooncake，在其它相同系统的机器上可以不编译Mooncake只安装依赖项，直接使用Mooncake的输出件libascend_transport_mem.so和mooncake whl包。
