@@ -227,7 +227,8 @@ class Client {
                                const std::string& fsdir);
 
     void PutToLocalFile(const std::string& object_key,
-                        const std::vector<Slice>& slices);
+                        const std::vector<Slice>& slices,
+                        const std::string& sub_path);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -251,7 +252,6 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
-    void BatchPuttoLocalFile(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 

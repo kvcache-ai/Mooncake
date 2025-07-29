@@ -277,7 +277,8 @@ MasterClient::BatchPutStart(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key, 
+                                                   ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
@@ -289,7 +290,7 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key) {
     }
 
     auto request_result =
-        client->send_request<&WrappedMasterService::PutEnd>(key);
+        client->send_request<&WrappedMasterService::PutEnd>(key, replica_type);
     auto result =
         coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;
@@ -344,7 +345,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key, 
+                                                       ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
@@ -356,7 +358,7 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key) {
     }
 
     auto request_result =
-        client->send_request<&WrappedMasterService::PutRevoke>(key);
+        client->send_request<&WrappedMasterService::PutRevoke>(key, replica_type);
     auto result =
         coro::syncAwait([&]() -> coro::Lazy<tl::expected<void, ErrorCode>> {
             auto result = co_await co_await request_result;

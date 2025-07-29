@@ -272,19 +272,21 @@ WrappedMasterService::PutStart(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const std::string& key) {
+    const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutEnd", [&] { return master_service_.PutEnd(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "PutEnd", [&] { return master_service_.PutEnd(key, replica_type); },
+        [&](auto& timer) { timer.LogRequest("key=", key,
+                                            ", replica_type=", replica_type); },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
-    const std::string& key) {
+    const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutRevoke", [&] { return master_service_.PutRevoke(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "PutRevoke", [&] { return master_service_.PutRevoke(key, replica_type); },
+        [&](auto& timer) { timer.LogRequest("key=", key,
+                                            ", replica_type=", replica_type); },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }

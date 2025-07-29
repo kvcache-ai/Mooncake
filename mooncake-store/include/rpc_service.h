@@ -50,9 +50,9 @@ class WrappedMasterService {
         const std::string& key, const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    tl::expected<void, ErrorCode> PutEnd(const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY);
 
-    tl::expected<void, ErrorCode> PutRevoke(const std::string& key);
+    tl::expected<void, ErrorCode> PutRevoke(const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,

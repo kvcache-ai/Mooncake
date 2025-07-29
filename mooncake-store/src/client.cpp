@@ -313,15 +313,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
     const std::string& object_key) {
     auto result = master_client_.GetReplicaList(object_key);
-    if (!result) {
-        // Check storage backend if master query fails
-        if (storage_backend_) {
-            if (auto desc_opt = storage_backend_->Querykey(object_key)) {
-                return std::vector<Replica::Descriptor>{std::move(*desc_opt)};
-            }
-        }
-        return tl::unexpected(result.error());
-    }
     return result.value();
 }
 
@@ -342,20 +333,6 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
         }
         return results;
     }
-
-    // For failed queries, check storage backend if available
-    if (storage_backend_) {
-        for (size_t i = 0; i < response.size(); ++i) {
-            if (!response[i]) {
-                if (auto desc_opt =
-                        storage_backend_->Querykey(object_keys[i])) {
-                    response[i] =
-                        std::vector<Replica::Descriptor>{std::move(*desc_opt)};
-                }
-            }
-        }
-    }
-
     return response;
 }
 
@@ -470,8 +447,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
+    ReplicateConfig effective_config = config;
+    if (storage_backend_) {
+        effective_config.use_disk_replica = true;
+    }
+
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, effective_config);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -481,18 +463,33 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         LOG(ERROR) << "Failed to start put operation: " << err;
         return tl::unexpected(err);
     }
-
-    // Transfer data using allocated handles from all replicas
-    for (const auto& replica : start_result.value()) {
-        ErrorCode transfer_err = TransferWrite(replica, slices);
-        if (transfer_err != ErrorCode::OK) {
-            // Revoke put operation
-            auto revoke_result = master_client_.PutRevoke(key);
-            if (!revoke_result) {
-                LOG(ERROR) << "Failed to revoke put operation";
-                return tl::unexpected(revoke_result.error());
+    
+    // We must deal with disk replica first, then the disk putrevoke/putend can be called surely
+    if(storage_backend_){
+       for (auto it = start_result.value().rbegin(); it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if(replica.is_disk_replica()){
+                // Store to local file if storage backend is available
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor.file_path);
+                break; // Only one disk replica is needed
             }
-            return tl::unexpected(transfer_err);
+        } 
+    }
+
+    for (const auto& replica : start_result.value()) {
+        if(replica.is_memory_replica()){
+            // Transfer data using allocated handles from all replicas
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                // Revoke put operation
+                auto revoke_result = master_client_.PutRevoke(key);
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return tl::unexpected(revoke_result.error());
+                }
+                return tl::unexpected(transfer_err);
+            }
         }
     }
 
@@ -503,9 +500,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         LOG(ERROR) << "Failed to end put operation: " << err;
         return tl::unexpected(err);
     }
-
-    // Store to local file if storage backend is available
-    PutToLocalFile(key, slices);
 
     return {};
 }
@@ -590,6 +584,11 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
 
+    ReplicateConfig effective_config = config;
+    if (storage_backend_) {
+        effective_config.use_disk_replica = true;
+    }
+
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
@@ -605,7 +604,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+        master_client_.BatchPutStart(keys, slice_lengths, effective_config);
 
     // Ensure response size matches request size
     if (start_responses.size() != ops.size()) {
@@ -652,21 +651,35 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         bool all_transfers_submitted = true;
         std::string failure_context;
 
+        // We must deal with disk replica first, then the disk putrevoke/putend can be called surely
+        if(storage_backend_){
+            for (auto it = op.replicas.rbegin();
+                 it != op.replicas.rend(); ++it) {
+                const auto& replica = *it;
+                if (replica.is_disk_replica()) {
+                    auto disk_descriptor = replica.get_disk_descriptor();
+                    PutToLocalFile(op.key, op.slices, disk_descriptor.file_path);
+                    break; // Only one disk replica is needed
+                }
+            }
+        }
+
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
+            if(replica.is_memory_replica()){
+                auto submit_result = transfer_submitter_->submit(
+                    replica, op.slices, TransferRequest::WRITE);
 
-            auto submit_result = transfer_submitter_->submit(
-                replica, op.slices, TransferRequest::WRITE);
+                if (!submit_result) {
+                    failure_context = "Failed to submit transfer for replica " +
+                                    std::to_string(replica_idx);
+                    all_transfers_submitted = false;
+                    break;
+                }
 
-            if (!submit_result) {
-                failure_context = "Failed to submit transfer for replica " +
-                                  std::to_string(replica_idx);
-                all_transfers_submitted = false;
-                break;
+                op.pending_transfers.emplace_back(std::move(submit_result.value()));
             }
-
-            op.pending_transfers.emplace_back(std::move(submit_result.value()));
         }
 
         if (!all_transfers_submitted) {
@@ -869,23 +882,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
-void Client::BatchPuttoLocalFile(std::vector<PutOperation>& ops) {
-    if (!storage_backend_) {
-        return;  // No storage backend initialized
-    }
-
-    for (const auto& op : ops) {
-        if (op.IsSuccessful()) {
-            // Store to local file if operation was successful
-            PutToLocalFile(op.key, op.slices);
-        } else {
-            LOG(ERROR) << "Skipping local file storage for key " << op.key
-                       << " due to failure: "
-                       << toString(op.result.error());
-        }
-    }
-}
-
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -895,15 +891,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     SubmitTransfers(ops);
     WaitForTransfers(ops);
     FinalizeBatchPut(ops);
-    BatchPuttoLocalFile(ops);
     return CollectResults(ops);
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     auto result = master_client_.Remove(key);
-    if (storage_backend_) {
-        storage_backend_->RemoveFile(key);
-    }
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveFile(key);
+    // }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -911,9 +906,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
-    if (storage_backend_) {
-        storage_backend_->RemoveAll();
-    }
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveAll();
+    // }
     return master_client_.RemoveAll();
 }
 
@@ -1032,15 +1027,6 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
-    if (!result) {
-        if(storage_backend_) {
-            // If master query fails, check storage backend
-            if (storage_backend_->Existkey(key)) {
-                return true;  // Key exists in storage backend
-            }
-        }
-        return tl::unexpected(result.error());
-    }
     return result.value();
 }
 
@@ -1076,7 +1062,8 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
 }
 
 void Client::PutToLocalFile(const std::string& key,
-                            const std::vector<Slice>& slices) {
+                            const std::vector<Slice>& slices,
+                            const std::string& sub_path) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;
@@ -1096,8 +1083,26 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     write_thread_pool_.enqueue(
-        [backend = storage_backend_, key, value = std::move(value)] {
-            backend->StoreObject(key, value);
+        [this, backend = storage_backend_, key, value = std::move(value), sub_path] {
+            // Store the object
+            auto store_result = backend->StoreObject(sub_path, value);
+            ReplicaType replica_type = ReplicaType::DISK;
+            
+            if (!store_result) {
+                // If storage failed, revoke the put operation
+                LOG(ERROR) << "Failed to store object for key: " << key;
+                auto revoke_result = master_client_.PutRevoke(key, replica_type);
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke put operation for key: " << key;
+                }
+                return;
+            }
+            
+            // If storage succeeded, end the put operation
+            auto end_result = master_client_.PutEnd(key, replica_type);
+            if (!end_result) {
+                LOG(ERROR) << "Failed to end put operation for key: " << key;
+            }
         });
 }
 
