@@ -466,7 +466,6 @@ enum class ClientStatus {
     NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
                     // need to remount
 };
-YLT_REFL(ClientStatus);
 
 /**
  * @brief Stream operator for ClientStatus
