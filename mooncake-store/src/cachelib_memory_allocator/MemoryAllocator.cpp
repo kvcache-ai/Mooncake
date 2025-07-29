@@ -33,10 +33,8 @@ MemoryAllocator::MemoryAllocator(Config config,
                                  void* slabMemoryStart,
                                  size_t slabMemorySize)
     : config_(std::move(config)),
-      slabAllocator_(headerMemoryStart,
-                     headerMemorySize,
-                     slabMemoryStart,
-                     slabMemorySize),
+      slabAllocator_(
+          headerMemoryStart, headerMemorySize, slabMemoryStart, slabMemorySize),
       memoryPoolManager_(slabAllocator_) {
   checkConfig(config_);
 }
@@ -151,7 +149,7 @@ std::set<uint32_t> MemoryAllocator::generateAllocSizes(
   if (maxSize > Slab::kSize) {
     throw std::invalid_argument(
         fmt::format("maximum alloc size {} is more than the slab size {}",
-                       maxSize, Slab::kSize));
+                    maxSize, Slab::kSize));
   }
 
   if (factor <= 1.0) {
