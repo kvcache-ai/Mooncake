@@ -586,8 +586,8 @@ std::string MasterMetricManager::get_summary_string() {
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
     ss << "Put="
-       << put_starts - put_start_fails + put_ends - put_end_fails
-       << "/" << put_starts + put_ends << ", ";
+       << ( put_starts - put_start_fails + put_ends - put_end_fails ) / 2
+       << "/" << ( put_starts + put_ends ) / 2 << ", ";
     ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
