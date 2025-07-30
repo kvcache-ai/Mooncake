@@ -466,7 +466,6 @@ enum class ClientStatus {
     NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
                     // need to remount
 };
-YLT_REFL(ClientStatus);
 
 /**
  * @brief Stream operator for ClientStatus
@@ -482,6 +481,25 @@ inline std::ostream& operator<<(std::ostream& os,
                                         : "UNKNOWN");
     return os;
 }
+
+/**
+ * @brief Response structure for Ping operation
+ */
+struct PingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
+    
+    PingResponse() = default;
+    PingResponse(ViewVersionId view_version, ClientStatus status)
+        : view_version_id(view_version), client_status(status) {}
+    
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const PingResponse& response) noexcept {
+        return os << "PingResponse: { view_version_id: " << response.view_version_id
+                  << ", client_status: " << response.client_status << " }";
+    }
+};
+YLT_REFL(PingResponse, view_version_id, client_status);
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator

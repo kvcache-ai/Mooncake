@@ -583,7 +583,7 @@ size_t MasterService::GetKeyCount() const {
 }
 
 auto MasterService::Ping(const UUID& client_id)
-    -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> {
+    -> tl::expected<PingResponse, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "Ping is only available in HA mode";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -604,7 +604,7 @@ auto MasterService::Ping(const UUID& client_id)
                    << ", error=client_ping_queue_full";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return std::make_pair(view_version_, client_status);
+    return PingResponse(view_version_, client_status);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {

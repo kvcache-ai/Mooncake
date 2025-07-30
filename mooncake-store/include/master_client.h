@@ -180,11 +180,10 @@ class MasterClient {
     /**
      * @brief Pings master to check its availability
      * @param client_id The uuid of the client
-     * @return tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
+     * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<std::pair<ViewVersionId, ClientStatus>,
-                               ErrorCode>
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode>
     Ping(const UUID& client_id);
 
    private:

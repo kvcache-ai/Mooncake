@@ -1191,8 +1191,8 @@ void Client::PingThreadFunc() {
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
-            auto [view_version, client_status] = ping_result.value();
-            if (client_status == ClientStatus::NEED_REMOUNT &&
+            auto& ping_response = ping_result.value();
+            if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =

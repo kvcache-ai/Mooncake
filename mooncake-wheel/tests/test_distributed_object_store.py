@@ -684,75 +684,139 @@ class TestDistributedObjectStore(unittest.TestCase):
         """Test batch_put_from method with config parameter."""
         import ctypes
         from mooncake.store import ReplicateConfig
-        
+
         # Test data
         test_data = [
             b"Batch Config Data 1",
-            b"Batch Config Data 2", 
+            b"Batch Config Data 2",
             b"Batch Config Data 3"
         ]
         keys = ["test_batch_put_from_config_key1", "test_batch_put_from_config_key2", "test_batch_put_from_config_key3"]
-        
+
         # Use large spacing between buffers
         buffer_spacing = 1024 * 1024  # 1MB spacing
         total_buffer_size = buffer_spacing * len(test_data)
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-        
+
         # Register buffer
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(result, 0)
-        
+
         # Prepare individual buffers
         buffer_ptrs = []
         buffer_sizes = []
-        
+
         for i, data in enumerate(test_data):
             offset = i * buffer_spacing
             buffer_ptr = large_buffer_ptr + offset
-            
+
             # Copy test data to buffer
             ctypes.memmove(ctypes.c_void_p(buffer_ptr), data, len(data))
-            
+
             buffer_ptrs.append(buffer_ptr)
             buffer_sizes.append(len(data))
-        
+
         # Test with default config (backward compatibility)
         results = self.store.batch_put_from(keys=keys, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes)
         self.assertEqual(len(results), len(keys))
         for result in results:
             self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_data in zip(keys, test_data):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_data)
-        
+
         # Clean up
         time.sleep(default_kv_lease_ttl / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
-        
+
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = 2
         config.with_soft_pin = False
-        
+
         keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]
         results = self.store.batch_put_from(keys=keys2, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes, config=config)
         self.assertEqual(len(results), len(keys2))
         for result in results:
             self.assertEqual(result, 0)
-        
+
         # Verify data
         for key, expected_data in zip(keys2, test_data):
             retrieved_data = self.store.get(key)
             self.assertEqual(retrieved_data, expected_data)
-        
+
         # Clean up
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0)
         for key in keys2:
+            self.assertEqual(self.store.remove(key), 0)
+
+    def test_batch_get_buffer_operations(self):
+        """Test batch_get_buffer operations for multiple keys."""
+        # Test data
+        test_data = [
+            b"Batch Buffer Data 1! " * 100,  # ~2.1KB
+            b"Batch Buffer Data 2! " * 200,  # ~4.2KB
+        ]
+        keys = ["test_batch_get_buffer_key1", "test_batch_get_buffer_key2"]
+
+        # First, put the test data using regular put operations
+        for key, data in zip(keys, test_data):
+            result = self.store.put(key, data)
+            self.assertEqual(result, 0, f"Failed to put data for key {key}")
+
+        # Test 1: Batch get two successful keys
+        results = self.store.batch_get_buffer(keys)
+
+        # Verify results
+        self.assertEqual(len(results), len(keys), "Should return result for each key")
+
+        for i, (expected_data, buffer) in enumerate(zip(test_data, results)):
+            self.assertIsNotNone(buffer, f"batch_get_buffer should succeed for key {keys[i]}")
+            self.assertEqual(buffer.size(), len(expected_data), f"Buffer size should match for key {keys[i]}")
+
+            # Verify data integrity using buffer protocol
+            buffer_data = bytes(buffer)
+            self.assertEqual(buffer_data, expected_data, f"Data should match for key {keys[i]}")
+
+        # Test 2: Batch get one successful key and one non-existent key
+        mixed_keys = [keys[0], "non_existent_key"]
+        mixed_results = self.store.batch_get_buffer(mixed_keys)
+
+        # Verify mixed results
+        self.assertEqual(len(mixed_results), len(mixed_keys), "Should return result for each key")
+
+        # First key should succeed
+        self.assertIsNotNone(mixed_results[0], "First key should exist")
+        self.assertEqual(mixed_results[0].size(), len(test_data[0]), "First buffer size should match")
+        buffer_data = bytes(mixed_results[0])
+        self.assertEqual(buffer_data, test_data[0], "First buffer data should match")
+
+        # Second key should fail (return None)
+        self.assertIsNone(mixed_results[1], "Second key should not exist")
+
+        # Test edge cases
+        # Test with empty keys list
+        empty_results = self.store.batch_get_buffer([])
+        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+
+        # Test with single existing key
+        single_result = self.store.batch_get_buffer([keys[0]])
+        self.assertEqual(len(single_result), 1, "Should return one result")
+        self.assertIsNotNone(single_result[0], "Single key should exist")
+
+        # Test with single non-existent key
+        non_existent_result = self.store.batch_get_buffer(["definitely_non_existent_key"])
+        self.assertEqual(len(non_existent_result), 1, "Should return one result")
+        self.assertIsNone(non_existent_result[0], "Non-existent key should return None")
+
+        # Cleanup
+        time.sleep(default_kv_lease_ttl / 1000)
+        for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
 
