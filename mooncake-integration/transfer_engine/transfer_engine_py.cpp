@@ -546,7 +546,7 @@ int TransferEnginePy::transferTensorSyncWrite(const char* target_hostname,
                                              pybind11::object tensor,
                                              uintptr_t peer_buffer_address) {
     try {
-        // Check whether ot is pytorch tensor
+        // Check whether it is pytorch tensor
         if (!(tensor.attr("__class__")
                   .attr("__name__")
                   .cast<std::string>()
@@ -571,7 +571,7 @@ int TransferEnginePy::transferTensorSyncWrite(const char* target_hostname,
             return -1;
         }
 
-        // Currently support tensors with no more than 4 dimetions
+        // Currently support tensors with no more than 4 dimensions
         pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
         int32_t ndim = static_cast<int32_t>(shape_tuple.size());
         if (ndim > 4) {
@@ -591,37 +591,29 @@ int TransferEnginePy::transferTensorSyncWrite(const char* target_hostname,
             }
         }
 
-        // Register memory
-        int ret = registerMemory(data_ptr, tensor_size);
-        if (ret != 0) {
-            LOG(ERROR) << "Failed to register tensor memory";
+        // Calculate total size
+        size_t total_size = sizeof(TensorMetadata) + tensor_size;
+        
+        // Allocate single buffer for metadata + tensor data
+        uintptr_t local_buffer = allocateManagedBuffer(total_size);
+        if (local_buffer == 0) {
+            LOG(ERROR) << "Failed to allocate combined buffer";
             return -1;
         }
 
-        // Allocate temporary buffer to store metadata
-        uintptr_t metadata_buffer = allocateManagedBuffer(sizeof(TensorMetadata));
-        if (metadata_buffer == 0) {
-            unregisterMemory(data_ptr);
-            LOG(ERROR) << "Failed to allocate metadata buffer";
-            return -1;
-        }
+        // Copy metadata to buffer
+        memcpy(reinterpret_cast<void*>(local_buffer), &metadata, sizeof(TensorMetadata));
+        
+        // Copy tensor data to buffer
+        memcpy(reinterpret_cast<void*>(local_buffer + sizeof(TensorMetadata)), 
+               reinterpret_cast<void*>(data_ptr), tensor_size);
 
-        memcpy(reinterpret_cast<void*>(metadata_buffer), &metadata, sizeof(TensorMetadata));
+        // Single transfer for the entire data
+        int ret = transferSync(target_hostname, local_buffer, peer_buffer_address, 
+                              total_size, TransferOpcode::WRITE);
 
-        // Batch transfer for tensor
-        std::vector<uintptr_t> local_buffers = {metadata_buffer, data_ptr};
-        std::vector<uintptr_t> peer_addresses = {
-            peer_buffer_address, 
-            peer_buffer_address + sizeof(TensorMetadata)
-        };
-        std::vector<size_t> lengths = {sizeof(TensorMetadata), tensor_size};
-
-        ret = batchTransferSync(target_hostname, local_buffers, peer_addresses, lengths,
-                               TransferOpcode::WRITE);
-
-        // Clear and release
-        freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-        unregisterMemory(data_ptr);
+        // Clean up
+        freeManagedBuffer(local_buffer, total_size);
 
         return ret;
 
@@ -635,72 +627,61 @@ pybind11::object TransferEnginePy::transferTensorSyncRead(const char* target_hos
                                                          uintptr_t peer_buffer_address,
                                                          size_t total_size) {
     try {
-        // Allocate buffer for metadata and tensor
-        uintptr_t metadata_buffer = allocateManagedBuffer(sizeof(TensorMetadata));
-        if (metadata_buffer == 0) {
-            LOG(ERROR) << "Failed to allocate metadata buffer";
+        // Allocate single buffer for the entire data
+        uintptr_t local_buffer = allocateManagedBuffer(total_size);
+        if (local_buffer == 0) {
+            LOG(ERROR) << "Failed to allocate receive buffer, size: " << total_size;
             py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
-        size_t tensor_size = total_size - sizeof(TensorMetadata);
-        uintptr_t tensor_buffer = allocateManagedBuffer(tensor_size);
-        if (tensor_buffer == 0) {
-            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-            LOG(ERROR) << "Failed to allocate tensor buffer";
-            py::gil_scoped_acquire acquire_gil;
-            return pybind11::none();
-        }
-
-        // Batch transfer to get meatadata and tensor respectively
-        std::vector<uintptr_t> local_buffers = {metadata_buffer, tensor_buffer};
-        std::vector<uintptr_t> peer_addresses = {
-            peer_buffer_address,
-            peer_buffer_address + sizeof(TensorMetadata)
-        };
-        std::vector<size_t> lengths = {sizeof(TensorMetadata), tensor_size};
-
-        int ret = batchTransferSync(target_hostname, local_buffers, peer_addresses, lengths,
-                                   TransferOpcode::READ);
+        // Single transfer to read the entire data
+        int ret = transferSync(target_hostname, local_buffer, peer_buffer_address, 
+                              total_size, TransferOpcode::READ);
         if (ret != 0) {
-            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-            freeManagedBuffer(tensor_buffer, tensor_size);
-            LOG(ERROR) << "Failed to transfer tensor data";
+            freeManagedBuffer(local_buffer, total_size);
+            LOG(ERROR) << "Failed to transfer data, ret: " << ret;
             py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
-        // Parse the metadata
+        // Parse the metadata from the beginning of buffer
         TensorMetadata metadata;
-        memcpy(&metadata, reinterpret_cast<void*>(metadata_buffer), sizeof(TensorMetadata));
+        memcpy(&metadata, reinterpret_cast<void*>(local_buffer), sizeof(TensorMetadata));
+
+        // Add debug logging
+        LOG(INFO) << "Read metadata: dtype=" << metadata.dtype << ", ndim=" << metadata.ndim;
+        LOG(INFO) << "Shape: [" << metadata.shape[0] << "," << metadata.shape[1] 
+                  << "," << metadata.shape[2] << "," << metadata.shape[3] << "]";
 
         if (metadata.ndim < 0 || metadata.ndim > 4) {
-            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-            freeManagedBuffer(tensor_buffer, tensor_size);
+            freeManagedBuffer(local_buffer, total_size);
             LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
             py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
         TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
-        if (dtype_enum == TensorDtype::UNKNOWN) {
-            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-            freeManagedBuffer(tensor_buffer, tensor_size);
-            LOG(ERROR) << "Unknown tensor dtype!";
+        if (metadata.dtype < 0 || metadata.dtype > 10 || dtype_enum == TensorDtype::UNKNOWN) {
+            freeManagedBuffer(local_buffer, total_size);
+            LOG(ERROR) << "Unknown tensor dtype: " << metadata.dtype;
             py::gil_scoped_acquire acquire_gil;
             return pybind11::none();
         }
 
-        // Copy data from buffer to contiguous memory
+        // Calculate actual tensor size
+        size_t tensor_size = total_size - sizeof(TensorMetadata);
+        LOG(INFO) << "Total size: " << total_size << ", metadata size: " << sizeof(TensorMetadata) 
+                  << ", tensor size: " << tensor_size;
+
+        // Create contiguous memory copy
         char* exported_data = new char[total_size];
-        memcpy(exported_data, reinterpret_cast<void*>(metadata_buffer), sizeof(TensorMetadata));
-        memcpy(exported_data + sizeof(TensorMetadata), reinterpret_cast<void*>(tensor_buffer), tensor_size);
+        memcpy(exported_data, reinterpret_cast<void*>(local_buffer), total_size);
 
-        // Release buffer space
-        freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
-        freeManagedBuffer(tensor_buffer, tensor_size);
+        // Release managed buffer
+        freeManagedBuffer(local_buffer, total_size);
 
-        // Set up numpy array
+        // Create numpy array
         pybind11::object np_array;
         int dtype_index = static_cast<int>(dtype_enum);
         if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
@@ -712,14 +693,20 @@ pybind11::object TransferEnginePy::transferTensorSyncRead(const char* target_hos
             return pybind11::none();
         }
 
-        // Reshape tensor data
+        // Reshape tensor data (only for ndim > 0)
         if (metadata.ndim > 0) {
             std::vector<int> shape_vec;
             for (int i = 0; i < metadata.ndim; i++) {
-                shape_vec.push_back(metadata.shape[i]);
+                if (metadata.shape[i] > 0) {  // Only add valid dimensions
+                    shape_vec.push_back(metadata.shape[i]);
+                }
             }
-            py::tuple shape_tuple = py::cast(shape_vec);
-            np_array = np_array.attr("reshape")(shape_tuple);
+            
+            if (!shape_vec.empty()) {
+                py::tuple shape_tuple = py::cast(shape_vec);
+                LOG(INFO) << "Reshaping to " << shape_vec.size() << " dimensions";
+                np_array = np_array.attr("reshape")(shape_tuple);
+            }
         }
 
         py::gil_scoped_acquire acquire_gil;

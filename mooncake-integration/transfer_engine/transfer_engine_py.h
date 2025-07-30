@@ -51,7 +51,7 @@ struct TensorMetadata {
     int32_t dtype;
     int32_t ndim;
     int32_t shape[4];
-};
+} __attribute__((packed));
 
 class TransferEnginePy {
    public:
@@ -163,6 +163,9 @@ class TransferEnginePy {
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
+    template<typename T>
+    py::array create_typed_array(char* data, size_t offset, size_t total_length);
+
    private:
     char *allocateRawBuffer(size_t capacity);
 
@@ -171,9 +174,6 @@ class TransferEnginePy {
     int doBuddyAllocate(int class_id);
 
     TensorDtype get_tensor_dtype(py::object dtype_obj);
-
-    template<typename T>
-    py::array create_typed_array(char* data, size_t offset, size_t total_length);
 
    private:
     std::shared_ptr<TransferEngine> engine_;
