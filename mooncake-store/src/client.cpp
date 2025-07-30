@@ -313,7 +313,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
     const std::string& object_key) {
     auto result = master_client_.GetReplicaList(object_key);
-    return result.value();
+    return result;
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>

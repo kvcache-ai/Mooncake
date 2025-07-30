@@ -246,6 +246,11 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
 
+    // Verify that the data is removed
+    auto query_result = test_client_->Query(key);
+    ASSERT_FALSE(query_result.has_value())
+        << "Query should not find the removed key: " << key;
+
     // Try to get the removed data - should fail
     buffer = client_buffer_allocator_->allocate(test_data.size());
     slices.clear();
