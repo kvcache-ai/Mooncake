@@ -469,6 +469,9 @@ struct ReplicateConfig {
 
 启用持久化功能后，对于每次成功写入memory的 `Put`或`BatchPut` 操作，都会异步地发起一次持久化操作，写入DFS当中。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
+#### 3FS USRBIO 插件
+如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/READMD.md)。
+
 ## Mooncake Store Python API
 
 **完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)

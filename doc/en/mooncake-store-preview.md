@@ -463,6 +463,9 @@ In the current implementation, all operations on kvcache objects (e.g., read/wri
 
 When persistence is enabled, every successful `Put`or`BatchPut` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `Get`or `BatchGet` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
 
+#### 3FS USRBIO Plugin
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](/mooncake-store/src/hf3fs/READMD.md).
+
 ## Mooncake Store Python API
 
 **Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
