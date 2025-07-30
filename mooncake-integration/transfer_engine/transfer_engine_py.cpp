@@ -20,6 +20,8 @@
 
 #include <pybind11/stl.h>
 
+auto torch = py::module_::import("torch");
+
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
@@ -51,6 +53,72 @@ TransferEnginePy::~TransferEnginePy() {
     buffer_list_.clear();
     for (auto &buffer : large_buffer_list_) freeMemory(buffer);
     large_buffer_list_.clear();
+}
+
+template <typename T>
+py::array TransferEnginePy::create_typed_array(char *exported_data, size_t offset, size_t total_length) {
+    py::capsule free_when_done(
+        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                          (T *)(exported_data + offset), free_when_done);
+}
+
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
+
+static const std::array<ArrayCreatorFunc, 11> array_creators = {{
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<float>(data, offset, total_length); 
+    },     // FLOAT32 = 0
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<double>(data, offset, total_length); 
+    },    // FLOAT64 = 1
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<int8_t>(data, offset, total_length); 
+    },    // INT8 = 2
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<uint8_t>(data, offset, total_length); 
+    },   // UINT8 = 3
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<int16_t>(data, offset, total_length); 
+    },   // INT16 = 4
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<uint16_t>(data, offset, total_length); 
+    },  // UINT16 = 5
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<int32_t>(data, offset, total_length); 
+    },   // INT32 = 6
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<uint32_t>(data, offset, total_length); 
+    },  // UINT32 = 7
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<int64_t>(data, offset, total_length); 
+    },   // INT64 = 8
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<uint64_t>(data, offset, total_length); 
+    },  // UINT64 = 9
+    [](char* data, size_t offset, size_t total_length) { 
+        return TransferEnginePy{}.create_typed_array<bool>(data, offset, total_length); 
+    }       // BOOL = 10
+}};
+
+TensorDtype TransferEnginePy::get_tensor_dtype(py::object dtype_obj) {
+    if (dtype_obj.is_none()) {
+        return TensorDtype::UNKNOWN;
+    }
+
+    if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
+    if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
+    if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
+    if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
+    if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
+    if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
+    if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
+    if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
+    if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
+    if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
+    if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
+
+    return TensorDtype::UNKNOWN;
 }
 
 std::vector<std::string> buildDeviceFilter(const std::string &device_names) {
@@ -474,6 +542,197 @@ batch_id_t TransferEnginePy::batchTransferAsync(const char *target_hostname,
     return batch_id;
 }
 
+int TransferEnginePy::transferTensorSyncWrite(const char* target_hostname,
+                                             pybind11::object tensor,
+                                             uintptr_t peer_buffer_address) {
+    try {
+        // Check whether ot is pytorch tensor
+        if (!(tensor.attr("__class__")
+                  .attr("__name__")
+                  .cast<std::string>()
+                  .find("Tensor") != std::string::npos)) {
+            LOG(ERROR) << "Input is not a PyTorch tensor";
+            return -1;
+        }
+
+        // Get tensor metadata
+        uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        size_t tensor_size = numel * element_size;
+
+        pybind11::object shape_obj = tensor.attr("shape");
+        pybind11::object dtype_obj = tensor.attr("dtype");
+
+        // Build tensor metadata
+        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            LOG(ERROR) << "Unsupported tensor dtype!";
+            return -1;
+        }
+
+        // Currently support tensors with no more than 4 dimetions
+        pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+        int32_t ndim = static_cast<int32_t>(shape_tuple.size());
+        if (ndim > 4) {
+            LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
+            return -1;
+        }
+
+        TensorMetadata metadata;
+        metadata.dtype = static_cast<int32_t>(dtype_enum);
+        metadata.ndim = ndim;
+
+        for (int i = 0; i < 4; i++) {
+            if (i < ndim) {
+                metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+            } else {
+                metadata.shape[i] = -1;
+            }
+        }
+
+        // Register memory
+        int ret = registerMemory(data_ptr, tensor_size);
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to register tensor memory";
+            return -1;
+        }
+
+        // Allocate temporary buffer to store metadata
+        uintptr_t metadata_buffer = allocateManagedBuffer(sizeof(TensorMetadata));
+        if (metadata_buffer == 0) {
+            unregisterMemory(data_ptr);
+            LOG(ERROR) << "Failed to allocate metadata buffer";
+            return -1;
+        }
+
+        memcpy(reinterpret_cast<void*>(metadata_buffer), &metadata, sizeof(TensorMetadata));
+
+        // Batch transfer for tensor
+        std::vector<uintptr_t> local_buffers = {metadata_buffer, data_ptr};
+        std::vector<uintptr_t> peer_addresses = {
+            peer_buffer_address, 
+            peer_buffer_address + sizeof(TensorMetadata)
+        };
+        std::vector<size_t> lengths = {sizeof(TensorMetadata), tensor_size};
+
+        ret = batchTransferSync(target_hostname, local_buffers, peer_addresses, lengths,
+                               TransferOpcode::WRITE);
+
+        // Clear and release
+        freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+        unregisterMemory(data_ptr);
+
+        return ret;
+
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to access tensor data: " << e.what();
+        return -1;
+    }
+}
+
+pybind11::object TransferEnginePy::transferTensorSyncRead(const char* target_hostname,
+                                                         uintptr_t peer_buffer_address,
+                                                         size_t total_size) {
+    try {
+        // Allocate buffer for metadata and tensor
+        uintptr_t metadata_buffer = allocateManagedBuffer(sizeof(TensorMetadata));
+        if (metadata_buffer == 0) {
+            LOG(ERROR) << "Failed to allocate metadata buffer";
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        size_t tensor_size = total_size - sizeof(TensorMetadata);
+        uintptr_t tensor_buffer = allocateManagedBuffer(tensor_size);
+        if (tensor_buffer == 0) {
+            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+            LOG(ERROR) << "Failed to allocate tensor buffer";
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Batch transfer to get meatadata and tensor respectively
+        std::vector<uintptr_t> local_buffers = {metadata_buffer, tensor_buffer};
+        std::vector<uintptr_t> peer_addresses = {
+            peer_buffer_address,
+            peer_buffer_address + sizeof(TensorMetadata)
+        };
+        std::vector<size_t> lengths = {sizeof(TensorMetadata), tensor_size};
+
+        int ret = batchTransferSync(target_hostname, local_buffers, peer_addresses, lengths,
+                                   TransferOpcode::READ);
+        if (ret != 0) {
+            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+            freeManagedBuffer(tensor_buffer, tensor_size);
+            LOG(ERROR) << "Failed to transfer tensor data";
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Parse the metadata
+        TensorMetadata metadata;
+        memcpy(&metadata, reinterpret_cast<void*>(metadata_buffer), sizeof(TensorMetadata));
+
+        if (metadata.ndim < 0 || metadata.ndim > 4) {
+            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+            freeManagedBuffer(tensor_buffer, tensor_size);
+            LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+            freeManagedBuffer(tensor_buffer, tensor_size);
+            LOG(ERROR) << "Unknown tensor dtype!";
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Copy data from buffer to contiguous memory
+        char* exported_data = new char[total_size];
+        memcpy(exported_data, reinterpret_cast<void*>(metadata_buffer), sizeof(TensorMetadata));
+        memcpy(exported_data + sizeof(TensorMetadata), reinterpret_cast<void*>(tensor_buffer), tensor_size);
+
+        // Release buffer space
+        freeManagedBuffer(metadata_buffer, sizeof(TensorMetadata));
+        freeManagedBuffer(tensor_buffer, tensor_size);
+
+        // Set up numpy array
+        pybind11::object np_array;
+        int dtype_index = static_cast<int>(dtype_enum);
+        if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
+            np_array = array_creators[dtype_index](exported_data, sizeof(TensorMetadata), tensor_size);
+        } else {
+            delete[] exported_data;
+            LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::none();
+        }
+
+        // Reshape tensor data
+        if (metadata.ndim > 0) {
+            std::vector<int> shape_vec;
+            for (int i = 0; i < metadata.ndim; i++) {
+                shape_vec.push_back(metadata.shape[i]);
+            }
+            py::tuple shape_tuple = py::cast(shape_vec);
+            np_array = np_array.attr("reshape")(shape_tuple);
+        }
+
+        py::gil_scoped_acquire acquire_gil;
+        pybind11::object tensor = torch.attr("from_numpy")(np_array);
+        return tensor;
+
+    } catch (const pybind11::error_already_set &e) {
+        LOG(ERROR) << "Failed to get tensor data: " << e.what();
+        py::gil_scoped_acquire acquire_gil;
+        return pybind11::none();
+    }
+}
+
 int TransferEnginePy::getBatchTransferStatus(const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
     TransferStatus status;
@@ -624,6 +883,20 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 namespace py = pybind11;
 
 PYBIND11_MODULE(engine, m) {
+    py::enum_<TensorDtype>(m, "TensorDtype", py::arithmetic())
+        .value("FLOAT32", TensorDtype::FLOAT32)
+        .value("FLOAT64", TensorDtype::FLOAT64)
+        .value("INT8", TensorDtype::INT8)
+        .value("UINT8", TensorDtype::UINT8)
+        .value("INT16", TensorDtype::INT16)
+        .value("UINT16", TensorDtype::UINT16)
+        .value("INT32", TensorDtype::INT32)
+        .value("UINT32", TensorDtype::UINT32)
+        .value("INT64", TensorDtype::INT64)
+        .value("UINT64", TensorDtype::UINT64)
+        .value("BOOL", TensorDtype::BOOL)
+        .value("UNKNOWN", TensorDtype::UNKNOWN)
+        .export_values();
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
@@ -648,6 +921,8 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync", &TransferEnginePy::transferSync)
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
+            .def("transfer_tensor_sync_write", &TransferEnginePy::transferTensorSyncWrite)
+            .def("transfer_tensor_sync_read", &TransferEnginePy::transferTensorSyncRead)
             .def("get_batch_transfer_status", &TransferEnginePy::getBatchTransferStatus)
             .def("transfer_submit_write",
                  &TransferEnginePy::transferSubmitWrite)

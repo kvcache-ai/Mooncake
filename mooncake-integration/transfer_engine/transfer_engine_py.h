@@ -15,6 +15,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <sys/time.h>
 
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include "transport/transport.h"
 
 using namespace mooncake;
+namespace py = pybind11;
 
 const static size_t kDefaultBufferCapacity = 2ull * 1024 * 1024 * 1024;
 const static size_t kSlabSizeKBTabLen = 16;
@@ -39,6 +41,17 @@ const static size_t kSlabSizeKB[] = {
     8,         16,        32,         64,        128,      256,
     512,       1024,      2 * 1024,   4 * 1024,  8 * 1024, 16 * 1024,
     32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024};
+
+enum class TensorDtype : int32_t {
+    FLOAT32 = 0, FLOAT64 = 1, INT8 = 2, UINT8 = 3, INT16 = 4, UINT16 = 5,
+    INT32 = 6, UINT32 = 7, INT64 = 8, UINT64 = 9, BOOL = 10, UNKNOWN = -1
+};
+
+struct TensorMetadata {
+    int32_t dtype;
+    int32_t ndim;
+    int32_t shape[4];
+};
 
 class TransferEnginePy {
    public:
@@ -114,6 +127,14 @@ class TransferEnginePy {
                           const std::vector<uintptr_t> &peer_buffer_addresses,
                           const std::vector<size_t> &lengths,
                           TransferOpcode opcode);
+
+    int transferTensorSyncWrite(const char* target_hostname,
+                               pybind11::object tensor,
+                               uintptr_t peer_buffer_address);
+                               
+    pybind11::object transferTensorSyncRead(const char* target_hostname,
+                                           uintptr_t peer_buffer_address,
+                                           size_t length);
     
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
@@ -148,6 +169,11 @@ class TransferEnginePy {
     int findClassId(size_t size);
 
     int doBuddyAllocate(int class_id);
+
+    TensorDtype get_tensor_dtype(py::object dtype_obj);
+
+    template<typename T>
+    py::array create_typed_array(char* data, size_t offset, size_t total_length);
 
    private:
     std::shared_ptr<TransferEngine> engine_;
