@@ -305,13 +305,15 @@ Status CxlTransport::submitTransfer(
 }
 
 Status CxlTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
         uint64_t dest_cxl_offset = request.target_offset;
         task.total_bytes = request.length;
+        
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->cxl.dest_addr = (char *)cxl_base_addr + dest_cxl_offset;
