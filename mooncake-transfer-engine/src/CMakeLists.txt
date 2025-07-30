@@ -53,3 +53,5 @@ if (USE_ASCEND)
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
+
+add_subdirectory(v1)
