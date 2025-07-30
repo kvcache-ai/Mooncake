@@ -554,7 +554,7 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
-tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
+tl::expected<PingResponse, ErrorCode>
 MasterClient::Ping(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id);
@@ -569,8 +569,7 @@ MasterClient::Ping(const UUID& client_id) {
     auto request_result =
         client->send_request<&WrappedMasterService::Ping>(client_id);
     auto result = coro::syncAwait(
-        [&]() -> coro::Lazy<tl::expected<std::pair<ViewVersionId, ClientStatus>,
-                                         ErrorCode>> {
+        [&]() -> coro::Lazy<tl::expected<PingResponse, ErrorCode>> {
             auto result = co_await co_await request_result;
             if (!result) {
                 LOG(ERROR) << "Failed to ping master: " << result.error().msg;
