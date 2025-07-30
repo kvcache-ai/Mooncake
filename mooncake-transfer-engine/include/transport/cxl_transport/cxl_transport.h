@@ -82,6 +82,10 @@ class CxlTransport : public Transport {
 
     int cxlMemcpy(void *dest_addr, void *source_addr, size_t size);
 
+    bool isAddressInCxlRange(void *addr);
+
+    bool validateMemoryBounds(void *dest, void *src, size_t size);
+
    private:
     void* cxl_base_addr;
     size_t cxl_dev_size;

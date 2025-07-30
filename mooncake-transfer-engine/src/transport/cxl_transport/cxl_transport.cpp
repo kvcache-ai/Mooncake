@@ -31,6 +31,7 @@
 #include <cstring>
 #include <fcntl.h>    // For O_RDWR, O_CREAT, etc.
 #include <unistd.h>   // For open(), close(), read(), write()
+#include <sys/mman.h> // For mmap, munmap
 
 namespace mooncake {
 
@@ -38,7 +39,10 @@ CxlTransport::CxlTransport() {
     // cxl_dev_path = "/dev/dax0.0";
     // cxl_dev_size = 1024 * 1024 * 1024;
     // get from env
-    const char* env_cxl_dev_path = std::getenv("CXL_DEV_PATH");
+    const char* env_cxl_dev_path = std::getenv("MC_CXL_DEV_PATH");
+
+    LOG(INFO) << "MC_CXL_DEV_PATH: " << env_cxl_dev_path;
+
     if (env_cxl_dev_path) {
         cxl_dev_path = (char *) env_cxl_dev_path;
         cxl_dev_size = cxlGetDeviceSize();
@@ -52,7 +56,10 @@ CxlTransport::~CxlTransport() {
 
 size_t CxlTransport::cxlGetDeviceSize() {
     // for now, get cxl_shm size from env
-    const char* env_cxl_dev_size = std::getenv("CXL_DEV_SIZE");
+    const char* env_cxl_dev_size = std::getenv("MC_CXL_DEV_SIZE");
+
+    LOG(INFO) << "MC_CXL_DEV_SIZE: " << env_cxl_dev_size;
+
     if (env_cxl_dev_size) {
         char* end = nullptr;
         unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
@@ -63,20 +70,69 @@ size_t CxlTransport::cxlGetDeviceSize() {
 }
 
 int CxlTransport::cxlMemcpy(void *dest, void *src, size_t size) {
+    // Input validation
     if (!src || !dest) {
         LOG(ERROR) << "CxlTransport::cxlMemcpy invalid arguments: null pointer provided.";
         return -1; // null pointer
     }
+    
+    // Validate memory bounds using the helper function
+    if (!validateMemoryBounds(dest, src, size)) {
+        return -1; // validation failed
+    }
+    
+    // Perform the memory copy
     std::memcpy(dest, src, size);
-    //Todo: memcpy accelrate
-    //Todo: cpu cache flush if needed
+    
+    // Memory barriers and cache operations
+    if (isAddressInCxlRange(dest) || isAddressInCxlRange(src)) {
+        // Ensure memory ordering for CXL operations
+        __sync_synchronize();
+    }
+    
     return 0; // success
+}
+
+bool CxlTransport::validateMemoryBounds(void *dest, void *src, size_t size) {
+    uintptr_t base = reinterpret_cast<uintptr_t>(cxl_base_addr);
+    uintptr_t end = base + cxl_dev_size;
+    uintptr_t dest_ptr = reinterpret_cast<uintptr_t>(dest);
+    uintptr_t src_ptr = reinterpret_cast<uintptr_t>(src);
+    
+    if (isAddressInCxlRange(dest)) {
+        uintptr_t dest_end = dest_ptr + size;
+        if (dest_end > end || dest_end < dest_ptr) {
+            LOG(ERROR) << "CxlTransport::cxlMemcpy destination out of bounds.";
+            return false;
+        }
+    }
+    
+    if (isAddressInCxlRange(src)) {
+        uintptr_t src_end = src_ptr + size;
+        if (src_end > end || src_end < src_ptr) {
+            LOG(ERROR) << "CxlTransport::cxlMemcpy source out of bounds.";
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+bool CxlTransport::isAddressInCxlRange(void *addr) {
+    if (!addr || !cxl_base_addr) return false;
+    
+    uintptr_t base = reinterpret_cast<uintptr_t>(cxl_base_addr);
+    uintptr_t end = base + cxl_dev_size;
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
+    
+    return (ptr >= base && ptr < end);
 }
 
 int CxlTransport::cxlDevInit()
 {
     int fd = open(cxl_dev_path, O_RDWR);
     if (fd == -1) {
+        LOG(ERROR) << "CxlTransport: Cannot open cxl device." << strerror(errno);
         return -1;
     }
 

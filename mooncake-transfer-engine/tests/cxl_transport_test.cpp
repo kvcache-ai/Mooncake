@@ -44,6 +44,7 @@ DEFINE_string(protocol, "cxl", "Transfer protocol: rdma|tcp|cxl");
 
 DEFINE_string(device_name, "/dev/dax0.0", "Device name for cxl");
 
+DEFINE_int64(device_size, 1073741824, "Device Size for cxl");
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
@@ -75,6 +76,11 @@ class CXLTransportTest : public ::testing::Test {
         static int offset = 0;
         google::InitGoogleLogging("CXLTransportTest");
         FLAGS_logtostderr = 1;
+
+        // Set device name from gflags parameter
+        setenv("MC_CXL_DEV_PATH", FLAGS_device_name.c_str(), 1);
+
+        setenv("MC_CXL_DEV_SIZE", std::to_string(FLAGS_device_size).c_str(), 1);
 
         // cxl setup
         engine = std::make_unique<TransferEngine>(false);
