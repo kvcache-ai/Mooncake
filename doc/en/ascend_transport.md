@@ -26,7 +26,9 @@ apt-get install -y mpich libmpich-dev
 **Ascend Compute Architecture for Neural Networks**
 Ascend Compute Architecture for Neural Networks 8.1.RC1 Version + pkg Dependency Package
 
-The pkg package contains header files and shared libraries (.so), located at scripts/ascend/pkg. Please navigate to the pkg directory and execute the commands specified in the ReadMe.txt file according to your system architecture (ARM/x86).
+To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.Download pkg.zip from the comment in this PR:
+https://github.com/kvcache-ai/Mooncake/pull/684
+Follow the instructions in ReadMe.txt for your architecture
 
 ## One-Step Compilation Script
 
@@ -72,6 +74,11 @@ Alternatively, you can copy the `.so` file to another path referenced by `$LD_LI
 
 6. **IPV6 is not support**:
    IPv6 is not supported in this release; an IPv6-compatibility patch will be delivered shortly.
+
+7. **pkg need to download**:
+   To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.
+   Download pkg.zip from the comment in this PR:
+   https://github.com/kvcache-ai/Mooncake/pull/684
 
 ## One-Step Installation Script (Without Compiling Mooncake)
 
@@ -140,6 +147,23 @@ Ascend Transport provides two test files:
 - Performance test: `mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp`
 
 You can configure various scenarios (e.g., 1-to-1, 1-to-2, 2-to-1) and performance tests by passing valid parameters to these programs.
+
+When `metadata_server` is set to `P2PHANDSHAKE`, Mooncake randomly selects a port in the new RPC port-mapping to avoid conflicts.  
+Therefore, in testing:
+
+1. **Start the target node first**.  
+   Watch the log produced by `mooncake-transfer-engine/src/transfer_engine.cpp`; you should see a line similar to  
+   ```
+   Transfer Engine RPC using <protocol> listening on <IP>:<actual-port>
+   ```  
+   Note the **actual port** the target node is listening on.
+
+2. **Edit the initiator’s launch command**:  
+   Change the value of `--segment_id` to `<IP>:<actual-port>` (i.e., the target node’s IP plus the port you just captured).
+
+3. **Launch the initiator node** to complete the test.
+
+Refer to the command format shown below:
 
 #### Example Commands for Scenario Testing
 
