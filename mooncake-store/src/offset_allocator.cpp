@@ -657,7 +657,7 @@ std::ostream& operator<<(std::ostream& os,
        << ", free_space="
        << mooncake::byte_size_to_string(metrics.total_free_space_)
        << ", largest_free="
-       << mooncake::byte_size_to_string(metrics.largest_free_region_);
+       << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";
     return os;
 }
 
