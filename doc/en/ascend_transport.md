@@ -24,11 +24,7 @@ apt-get install -y mpich libmpich-dev
 ```
 
 **Ascend Compute Architecture for Neural Networks**
-Ascend Compute Architecture for Neural Networks 8.1.RC1 Version + pkg Dependency Package
-
-To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.Download pkg.zip from the comment in this PR:
-https://github.com/kvcache-ai/Mooncake/pull/684
-Follow the instructions in ReadMe.txt for your architecture
+Updated to Ascend Compute Architecture for Neural Networks 8.2.RC1. pkg packages are no longer required.
 
 ## One-Step Compilation Script
 
@@ -68,17 +64,12 @@ Alternatively, you can copy the `.so` file to another path referenced by `$LD_LI
 5. **potential MPI Conflicts**:
    Concurrently installing MPI (typically MPICH) and OpenMPI may cause conflicts. If you encounter MPI-related issues, try running the following commands:
 ```bash
-   sudo apt purge openmpi-bin libopenmpi-dev
    sudo apt install mpich libmpich-dev
+   sudo apt purge openmpi-bin libopenmpi-dev
 ```
 
 6. **IPV6 is not support**:
    IPv6 is not supported in this release; an IPv6-compatibility patch will be delivered shortly.
-
-7. **pkg need to download**:
-   To avoid increasing the overall size of the Mooncake repository, the complete package dependencies are provided separately.
-   Download pkg.zip from the comment in this PR:
-   https://github.com/kvcache-ai/Mooncake/pull/684
 
 ## One-Step Installation Script (Without Compiling Mooncake)
 
@@ -138,15 +129,11 @@ Ascend Transport supports write/read semantics and automatically determines whet
 
 ### Fault Handling
 
-Building upon HCCL’s built-in fault handling mechanisms, Ascend Transport implements comprehensive error recovery strategies across multiple stages, including initialization, connection setup, and data transfer. It incorporates retry logic and returns precise error codes based on HCCL collective communication standards when retries fail. For detailed logs, refer to `/root/Ascend/log/plog`.
+Building upon HCCL’s built-in fault handling mechanisms, Ascend Transport implements comprehensive error recovery strategies across multiple stages, including initialization, connection setup, and data transfer. It incorporates retry logic and returns precise error codes based on HCCL collective communication standards when retries fail. For detailed logs, refer to `/root/Ascend/log/debug/plog`.
 
 ### Test Cases
 
-Ascend Transport provides two test files:
-- Multi-scenario test: `mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp`
-- Performance test: `mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp`
-
-You can configure various scenarios (e.g., 1-to-1, 1-to-2, 2-to-1) and performance tests by passing valid parameters to these programs.
+Ascend Transport provides multi-scenario test files: `mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp`, which supports one-to-one, one-to-two, and two-to-one transfer tests, as well as a performance benchmark file `mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp`. After successfully compiling the Transfer Engine, the corresponding test programs can be found in the `build/mooncake-transfer-engine/example` directory.The test programs accept configuration parameters via command-line arguments. For the full list of configurable options, refer to the DEFINE_string definitions at the beginning of each test file.
 
 When `metadata_server` is set to `P2PHANDSHAKE`, Mooncake randomly selects a port in the new RPC port-mapping to avoid conflicts.  
 Therefore, in testing:
@@ -169,24 +156,24 @@ Refer to the command format shown below:
 
 **Start Initiator Node:**
 ```bash
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608 --batch_size=32 
 ```
 
 **Start Target Node:**
 ```bash
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608 --batch_size=32 
 ```
 
 #### Example Commands for Performance Testing
 
 **Start Initiator Node:**
 ```bash
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384 --batch_size=32 --block_iteration=10
 ```
 
 **Start Target Node:**
 ```bash
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --batch_size=32 --block_iteration=10
 ```
 
 **Note:** The `device_id` parameter mentioned above represents both the NPU logical ID and physical ID. If not all devices are mounted in your container, please specify the logical ID and physical ID separately when using the demo above. Replace `--device_id` with `--device_logicid` and `--device_phyid`.

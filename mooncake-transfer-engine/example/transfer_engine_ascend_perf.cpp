@@ -39,7 +39,7 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "write", "Operation type: read or write");
 DEFINE_string(protocol, "hccl", "Transfer protocol: rdma|tcp|hccl");
 DEFINE_string(segment_id, "10.20.130.154:12346", "Segment ID to access data");
-DEFINE_int32(batch_size, 20, "Batch size");
+DEFINE_int32(batch_size, 32, "Batch size");
 DEFINE_uint64(block_size, 32768, "Block size for each transfer request");
 DEFINE_uint64(block_iteration, 10, "number of iterations of the block");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
