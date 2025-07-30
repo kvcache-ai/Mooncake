@@ -588,7 +588,7 @@ int TransferEnginePy::batchRegisterMemory(std::vector<uintptr_t> buffer_addresse
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
-    for (int i = 0; i < batch_size; i ++ ) {
+    for (size_t i = 0; i < batch_size; i ++ ) {
         buffers.push_back(BufferEntry{(void *)buffer_addresses[i], capacities[i]});
     }
     return engine_->registerLocalMemoryBatch(buffers, location);
@@ -598,7 +598,7 @@ int TransferEnginePy::batchUnregisterMemory(std::vector<uintptr_t> buffer_addres
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<void *> buffers;
-    for (int i = 0; i < batch_size; i ++ ) {
+    for (size_t i = 0; i < batch_size; i ++ ) {
         buffers.push_back(reinterpret_cast<char *>(buffer_addresses[i]));
     }
     return engine_->unregisterLocalMemoryBatch(buffers);

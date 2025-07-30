@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-# 默认的git clone的依赖目录，如果git clone失败，可以把依赖和Mooncake源码放到该目录下进行编译安装
-# 如果提供了第一个参数（$1），则使用它作为TARGET_DIR；否则，默认使用当前目录。
-TARGET_DIR=${1:-$(pwd)}
+# If git clone fails, you can place dependencies and the script in a directory for compilation and installation.
+# Define a function to handle the git clone operation
 
-# 定义一个函数来处理git clone操作
+#!/bin/bash
+
 clone_repo_if_not_exists() {
     local repo_dir=$1
     local repo_url=$2
@@ -30,36 +29,96 @@ clone_repo_if_not_exists() {
     fi
 }
 
-set +e  # 允许脚本在某条命令失败后继续执行
+# Function to check command success
+check_success() {
+    if [ $? -ne 0 ]; then
+        print_error "$1"
+    fi
+}
 
-# 安装基础依赖库
-yum install -y cmake \
-gflags-devel \
-glog-devel \
-libibverbs-devel \
-numactl-devel \
-gtest \
-gtest-devel \
-boost-devel \
-openssl-devel --allowerasing \
-hiredis-devel \
-libcurl-devel \
-jsoncpp-devel
+set +e
 
-# 安装 MPI 相关依赖，ASCEND依赖
-yum install -y mpich mpich-devel
+# System detection and dependency installation
+if command -v apt-get &> /dev/null; then
+    echo "Detected apt-get. Using Debian-based package manager."
+    apt-get update
+    apt-get install -y build-essential \
+            cmake \
+            git \
+            wget \
+            libibverbs-dev \
+            libgoogle-glog-dev \
+            libgtest-dev \
+            libjsoncpp-dev \
+            libunwind-dev \
+            libnuma-dev \
+            libpython3-dev \
+            libboost-all-dev \
+            libssl-dev \
+            libgrpc-dev \
+            libgrpc++-dev \
+            libprotobuf-dev \
+            libyaml-cpp-dev \
+            protobuf-compiler-grpc \
+            libcurl4-openssl-dev \
+            libhiredis-dev \
+            pkg-config \
+            patchelf \
+            mpich \
+            libmpich-dev
+    apt purge -y openmpi-bin libopenmpi-dev || true
+elif command -v yum &> /dev/null; then
+    echo "Detected yum. Using Red Hat-based package manager."
+    yum makecache
+    yum install -y cmake \
+            gflags-devel \
+            glog-devel \
+            libibverbs-devel \
+            numactl-devel \
+            gtest \
+            gtest-devel \
+            boost-devel \
+            openssl-devel \
+            hiredis-devel \
+            libcurl-devel \
+            jsoncpp-devel \
+            mpich \
+            mpich-devel
+    # Install yaml-cpp
+    cd "$TARGET_DIR"
+    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
+    cd yaml-cpp || exit
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j$(nproc)
+    make install
+    cd ../..
+else
+    echo "Unsupported package manager. Please install the dependencies manually."
+    exit 1
+fi
 
-# 进入目标目录
-cd "$TARGET_DIR" || { echo "Failed to enter directory"; exit 1; }
+check_success "Failed to install system packages"
+echo -e "system packages installed successfully."
 
-# 处理 yalantinglibs
+export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -)
+
+# Install yalantinglibs
 clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
 cd yalantinglibs || exit
+git checkout 0.5.1
+rm -rf build
 mkdir -p build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
 make -j$(nproc)
 make install
 cd ../..
 
+echo -e "yalantinglibs installed successfully."
+
+# Add the so package to the environment variables
 cp libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
-pip install *.whl --force-reinstall
+
+# Pip install whl
+pip install mooncake_transfer_engine*.whl --force

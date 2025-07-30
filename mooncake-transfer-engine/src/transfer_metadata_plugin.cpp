@@ -644,7 +644,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK)
+                    if (errno != EWOULDBLOCK && errno != EINTR)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
                     continue;
                 }
@@ -688,11 +688,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 // old protocol equals Connection type
                 if (type == HandShakeRequestType::Connection ||
                     type == HandShakeRequestType::OldProtocol) {
-                    on_connection_callback_(peer, local);
+                    if (on_connection_callback_) on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
-                    on_metadata_callback_(peer, local);
+                    if (on_metadata_callback_) on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
-                    on_notify_callback_(peer, local);
+                    if (on_notify_callback_) on_notify_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -743,7 +743,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];
@@ -778,7 +778,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];
@@ -886,7 +886,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         char service[16];

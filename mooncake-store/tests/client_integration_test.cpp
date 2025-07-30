@@ -61,6 +61,13 @@ class ClientIntegrationTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
 
+        if (getenv("DEFAULT_KV_LEASE_TTL")) {
+            default_kv_lease_ttl_ = std::stoul(getenv("DEFAULT_KV_LEASE_TTL"));
+        } else {
+            default_kv_lease_ttl_ = FLAGS_default_kv_lease_ttl;
+        }
+        LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
+
         InitializeClients();
         InitializeSegment();
     }
@@ -154,6 +161,7 @@ class ClientIntegrationTest : public ::testing::Test {
     static size_t ram_buffer_size_;
     static void* test_client_segment_ptr_;
     static size_t test_client_ram_buffer_size_;
+    static uint64_t default_kv_lease_ttl_;
 };
 
 // Static members initialization
@@ -166,6 +174,7 @@ std::unique_ptr<SimpleAllocator>
     ClientIntegrationTest::client_buffer_allocator_ = nullptr;
 size_t ClientIntegrationTest::ram_buffer_size_ = 0;
 size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
+uint64_t ClientIntegrationTest::default_kv_lease_ttl_ = 0;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
@@ -208,7 +217,7 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ASSERT_TRUE(put_result2.has_value())
         << "Second Put operation failed: " << toString(put_result2.error());
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+        std::chrono::milliseconds(default_kv_lease_ttl_));
     auto remove_result = test_client_->Remove(key);
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
@@ -297,7 +306,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
 
     // Clean up
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+        std::chrono::milliseconds(default_kv_lease_ttl_));
     auto remove_result2 = test_client_->Remove(key);
     ASSERT_TRUE(remove_result2.has_value())
         << "Remove operation failed: " << toString(remove_result2.error());
@@ -424,7 +433,7 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
 
     // Remove the key
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+        std::chrono::milliseconds(default_kv_lease_ttl_));
     auto remove_result = test_client_->Remove(key);
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
@@ -589,7 +598,7 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
                                              test_data_list[i].size());
     }
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+        std::chrono::milliseconds(default_kv_lease_ttl_));
     for (int i = 0; i < batch_size / 2; i++) {
         auto remove_result = test_client_->Remove(keys[i]);
         ASSERT_TRUE(remove_result.has_value())
@@ -642,7 +651,7 @@ TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
 
     // Clean up the key that was successfully put
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(FLAGS_default_kv_lease_ttl));
+        std::chrono::milliseconds(default_kv_lease_ttl_));
     auto remove_result = test_client_->Remove(key);
     // Remove might fail if the key wasn't actually put, which is fine
     ASSERT_TRUE(remove_result);

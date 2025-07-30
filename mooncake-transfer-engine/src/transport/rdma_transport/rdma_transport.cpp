@@ -263,7 +263,6 @@ Status RdmaTransport::submitTransfer(
 }
 
 Status RdmaTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
@@ -274,11 +273,12 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark = globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        assert(request_list[index] && task_list[index]);
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
         nr_slices = 0;
+        assert(task.request);
+        auto &request = *task.request;
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
@@ -467,21 +467,33 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 // According to the request desc, offset and length information, find proper
 // buffer_id and device_id as output.
 // Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
-int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                                size_t length, int &buffer_id, int &device_id,
-                                int retry_count) {
-    if (!desc) return ERR_ADDRESS_NOT_REGISTERED;
-    for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
-        auto &buffer_desc = desc->buffers[buffer_id];
-        if (buffer_desc.addr > offset ||
-            offset + length > buffer_desc.addr + buffer_desc.length)
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
+                                std::string_view hint, int &buffer_id, int &device_id, int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size()); ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+        // Check if offset is within buffer range
+        if (offset < buffer.addr || length > buffer.length || offset - buffer.addr > buffer.length - length) {
             continue;
-        device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+        }
+
+        device_id = hint.empty()
+            ? desc->topology.selectDevice(buffer.name, retry_count)
+            : desc->topology.selectDevice(buffer.name, hint, retry_count);
         if (device_id >= 0) return 0;
-        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count);
+        device_id = hint.empty()
+            ? desc->topology.selectDevice(kWildcardLocation, retry_count)
+            : desc->topology.selectDevice(kWildcardLocation, hint, retry_count);
         if (device_id >= 0) return 0;
     }
-
     return ERR_ADDRESS_NOT_REGISTERED;
 }
+
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
+                                int &buffer_id, int &device_id, int retry_count) {
+    return selectDevice(desc, offset, length, "", buffer_id, device_id, retry_count);
+}
 }  // namespace mooncake
+

@@ -132,9 +132,11 @@ class TransferEngine {
         if (!s.ok()) {
             return s;
         }
+
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+
         return s;
     }
 
@@ -143,7 +145,8 @@ class TransferEngine {
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
-    int sendNotifyByName(std::string remote_agent,TransferMetadata::NotifyDesc notify_msg);
+    int sendNotifyByName(std::string remote_agent,
+                         TransferMetadata::NotifyDesc notify_msg);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
@@ -157,8 +160,8 @@ class TransferEngine {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // send notify
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            if (!notifies_to_send_.count(batch_id)) return result;
             auto value = notifies_to_send_[batch_id];
             sendNotifyByID(value.first, value.second);
             notifies_to_send_.erase(batch_id);
@@ -167,7 +170,8 @@ class TransferEngine {
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
-        Status result = multi_transports_->getBatchTransferStatus(batch_id, status);
+        Status result =
+            multi_transports_->getBatchTransferStatus(batch_id, status);
 #ifdef WITH_METRICS
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
@@ -175,6 +179,14 @@ class TransferEngine {
             }
         }
 #endif
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            // send notify
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            if (!notifies_to_send_.count(batch_id)) return result;
+            auto value = notifies_to_send_[batch_id];
+            sendNotifyByID(value.first, value.second);
+            notifies_to_send_.erase(batch_id);
+        }
         return result;
     }
 
@@ -210,10 +222,12 @@ class TransferEngine {
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
+    
     RWSpinlock send_notifies_lock_;
     std::unordered_map<BatchID,
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
+
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;

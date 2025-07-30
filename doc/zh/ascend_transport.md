@@ -5,28 +5,52 @@ Ascend Transport是一个单边语义的高性能零拷贝NPU数据传输库，�
 
 Ascend Transport支持使用单边语义进行NPU间数据传输（当前版本只支持DEVICE TO DEVICE，其它进行中），用户只需通过Mooncake Transfer Engine接口指定两端传输的节点及内存信息，即可完成点对点高性能传输。Ascend Transport为用户隐去繁琐的内部实现，自动完成一系列如建链、注册和交换内存、检查传输状态等操作。
 
+Ascend Transport支持Mooncake在transfer_engine_py.cpp中提供的批量传输接口batch_transfer_sync，支持批量传输一组目标端为同一张卡且不连续的内存块，经过测试，在传输小块不连续内存时(如128KB)，使用批量传输接口带宽较使用transferSync接口，带宽提升达到了100%+。
+
 ### 新增依赖
 Ascend Transport在Mooncake本身依赖的基础上，新增了一部分HCCL的依赖：
 **MPI**
 yum install -y mpich mpich-devel
+或者
+apt-get install -y mpich libmpich-dev
 
 **昇腾Compute Architecture for Neural Networks**
-昇腾Compute Architecture for Neural Networks 8.1.RC1版本
+昇腾Compute Architecture for Neural Networks 8.1.RC1版本 + pkg依赖包
+pkg包含一些头文件和so包，路径在scripts/ascend/pkg,请进入pkg文件夹，根据arm/x86系统执行ReadMe.txt的命令。
 
 ### 一键式编译脚本
-Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh，将脚本复制到想要安装依赖和Mooncake的目录下执行脚本即可，也支持传入参数指定安装路径，不传入时默认为脚本所在目录，命令如下：
-./dependencies_ascend.sh /path/to/install_directory
-一键式编译脚本同样考虑到用户无法直接在环境上git clone的情况，用户可以把给依赖和Mooncake的源码放在安装目录下并指定，脚本会自动编译依赖和Mooncake。
+Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh,执行命令如下：
+sh scripts/ascend/dependencies_ascend.sh
+一键式编译脚本同样考虑到用户无法直接在环境上git clone的情况，用户可以把需要git clone的依赖项源码和Mooncake的源码放在同一目录中，然后执行脚本，脚本会自动编译依赖项和Mooncake。Mooncake的输出件是libascend_transport_mem.so和mooncake-wheel/dist/mooncake_transfer_engine*.whl包。
+
+使用ascend_transport前，记得设置环境变量，命令如下：
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+或者把so包复制到$LD_LIBRARY_PATH指向的其它路径下。
+
+### 注意事项（必看）
+1.调用TransferEngine initialize时需要在传入的local_server_name参数中包含运行的NPU物理Id，local_server_name参数从ip:port改为ip:port:npu_x，例如"0.0.0.0:12345:npu_2"，Ascend Transport会在内部解析获取本卡的NPU物理Id。存储在metadata的segment_name以及传输时传入的target_hostname格式不变，仍为ip:port，例如："0.0.0.0:12345“。
+
+2.ascend_transport会建立一个host侧的tcp连接，占用端口为10000加上npu的物理Id,若该端口已被占用会自动寻找一个可用端口；
+
+3.由于内部接口限制，ascend_transport要求注册的内存是NPU内存，且必须2M对齐；
+
+4.请确保/etc路径下存在文件hccn.conf，特别是在容器内，请挂载/etc/hccn.conf或者把宿主机的文件复制到容器的/etc路径下。
+
+5.潜在的 MPI 冲突,同时安装 MPI 和 OpenMPI 可能导致冲突。如果遇到与 MPI 相关的问题，请尝试按顺序执行以下命令进行解决：
+
+sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
+sudo apt install mpich libmpich-dev        # 安装 MPICH
+
+6.当前版本不支持IPV6，我们会很快完成针对IPV6的适配。
 
 ### 一键式安装脚本(不编译Mooncake)
-为了避免用户出现在编译Mooncake的环境上，执行其它进程有冲突的可能问题，Ascend Transport给出编译和执行Mooncake分离的一种方案。
-在执行dependencies_ascend.sh完成Mooncake编译后，用户可执行scripts/ascend/dependencies_ascend_installation.sh，仅安装依赖。将一键式编译脚本生成的mooncake whl包和libascend_transport_mem.so放在安装目录下
+用户如果在一台机器上编译过Mooncake，在其它相同系统的机器上可以不编译Mooncake只安装依赖项，直接使用Mooncake的输出件libascend_transport_mem.so和mooncake whl包。
+用户将whl包、so包和scripts/ascend/dependencies_ascend_installation.sh都放置到同一目录下，执行脚本即可，命令如下：
+./dependencies_ascend_installation.sh
 
-将脚本复制到安装目录下执行脚本即可，命令如下：
-./dependencies_ascend_installation.sh /path/to/install_directory
-
-在使用前，确保编译生成的libascend_transport_mem.so文件已经复制到/usr/local/Ascend/ascend-toolkit/latest/python/site-packages下，然后执行命令：
+使用ascend_transport前，记得执行环境变量，命令如下：
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+或者把so包复制到$LD_LIBRARY_PATH指向的其它路径下。
 
 ### 编译说明
 在成功安装所有依赖后，正常编译Mooncake即可，如果报错，可尝试设置环境变量：
@@ -73,22 +97,55 @@ Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_e
 
 性能用例执行命令如：
 ```启动发起节点：```
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384
 ```启动目标节点：```
 ./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target
+
+需要注意的是，上面传入的device_id既代表NPU逻辑id也代表物理id，如果您在容器里没有挂载所有的卡，使用上面的demo时请分别传入逻辑id和物理id，即--device_id改为--device_logicid和--device_phyid，如容器内只挂载了5卡和7卡，5卡为发起端，7卡为接收端，多场景用例执行命令改为：
+```启动发起节点：```
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_logicid=0 --device_phyid=5 --mode=initiator --block_size=8388608
+```启动目标节点：```
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_logicid=1 --device_phyid=7 --mode=target --block_size=8388608
 
 ### 打印说明
 如果需要得到每个传输request请求是否跨hccs和耗时情况，可以通过设置环境变量打开相关打印，命令如下：
 export ASCEND_TRANSPORT_PRINT=1
 
-### 注意事项
-1.ascend_transport会建立一个host侧的tcp连接，占用端口为10000+deviceId,请注意避开此端口，勿重复占用
-2.ascend_transport 在一次传输结束后，若对端（remote end）发生掉线并重启，系统已设计有自动重试建链机制，无需手动重启本端服务。
-注意：若目标端发生掉线并重启，发起端在下次发起请求时会尝试重新建立连接。目标端需确保在发起端发起请求后的 5 秒内完成重启并进入就绪状态。若超过该时间窗口仍未恢复，连接将失败并返回错误。
-
 ### 超时时间配置
-Ascend Transport基于TCP的带外通信，在主机侧接收超时设置为 120 秒。
+Ascend Transport基于TCP的带外通信，连接的超时时间通过环境变量Ascend_TCP_TIMEOUT配置，默认为30秒，在主机侧recv接收超时设置为30秒，即recv阻塞超过30s未收到对端的消息会报错。
 
-在hccl_socket中，连接超时时间由环境变量HCCL_CONNECT_TIMEOUT配置，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+hccl_socket的连接超时时间通过环境变量Ascend_HCCL_SOCKET_TIMEOUT配置，默认为30秒，超时则本次传输会报错并返回。
 
-在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间为 120 秒。
+hccl_socket有保活要求，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+
+在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间通过Ascend_TRANSPORT_MEM_TIMEOUT配置，默认为120秒。
+
+### 错误码
+Ascend传输错误码沿用HCCL集合通信传输错误码。
+typedef enum {
+    HCCL_SUCCESS = 0,       /* 成功 */
+    HCCL_E_PARA = 1,        /* 参数错误 */
+    HCCL_E_PTR = 2,         /* 空指针，检查是否多次执行了如 notifypool->reset 之类的操作，导致指针被清除 */
+    HCCL_E_MEMORY = 3,      /* 内存错误 */
+    HCCL_E_INTERNAL = 4,    /* 内部错误，常见原因：内存未注册、内存注册错误、内存注册首地址未2M对齐、内存未成功交换。检查传输的内存是否在已注册内存范围内。
+                            在多机场景下，检查启动脚本是否混用 */
+    HCCL_E_NOT_SUPPORT = 5, /* 不支持该特性 */
+    HCCL_E_NOT_FOUND = 6,   /* 特定资源未找到 */
+    HCCL_E_UNAVAIL = 7,     /* 资源不可用 */
+    HCCL_E_SYSCALL = 8,     /* 调用系统接口出错，优先检查初始化参数是否正确传递 */
+    HCCL_E_TIMEOUT = 9,     /* 超时 */
+    HCCL_E_OPEN_FILE_FAILURE = 10, /* 打开文件失败 */
+    HCCL_E_TCP_CONNECT = 11, /* tcp 连接失败，连接失败，仅限于检查两端的端口以及连通性 */
+    HCCL_E_ROCE_CONNECT = 12, /* roce 连接失败，连接失败，仅限于检查两端的端口以及连通性 */
+    HCCL_E_TCP_TRANSFER = 13, /* tcp 传输失败，检查端口是否正确以及 SOCKET 是否混用 */
+    HCCL_E_ROCE_TRANSFER = 14, /* roce 传输失败 */
+    HCCL_E_RUNTIME = 15,      /* 调用运行时 api 失败，检查传输时传入的 transportmem 相关参数 */
+    HCCL_E_DRV = 16,          /* 调用驱动 api 失败 */
+    HCCL_E_PROFILING = 17,    /* 调用 profiling api 失败 */
+    HCCL_E_CCE = 18,          /* 调用 cce api 失败 */
+    HCCL_E_NETWORK = 19,      /* 调用网络 api 失败 */
+    HCCL_E_AGAIN = 20,        /* 操作重复，在某些情况下不是错误。例如，多次注册同一内存时，会直接返回第一次注册的句柄。如果不影响功能，则视为成功 */
+    HCCL_E_REMOTE = 21,       /* 错误的 cqe */
+    HCCL_E_SUSPENDING = 22,   /* 错误的通信挂起 */
+    HCCL_E_RESERVED           /* 保留 */
+} HcclResult;

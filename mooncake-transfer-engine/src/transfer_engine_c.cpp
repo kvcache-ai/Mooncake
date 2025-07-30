@@ -25,8 +25,7 @@ using namespace mooncake;
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port,
-                                       int auto_discover) {
+                                       uint64_t rpc_port, int auto_discover) {
     TransferEngine *native = new TransferEngine(auto_discover);
     int ret = native->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
@@ -65,7 +64,8 @@ segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     return native->openSegment(segment_name);
 }
 
-segment_id_t openSegmentNoCache(transfer_engine_t engine, const char *segment_name) {
+segment_id_t openSegmentNoCache(transfer_engine_t engine,
+                                const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
     int rc = native->syncSegmentCache(segment_name);
     if (rc) return rc;
@@ -123,8 +123,7 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
 }
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries,
-                   size_t count) {
+                   struct transfer_request *entries, size_t count) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -146,6 +145,9 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              notify_msg_t notify_msg) {
     uint64_t target_id = entries[0].target_id;
     int rc = submitTransfer(engine, batch_id, entries, count);
+    if (rc) {
+        return rc;
+    }
     // notify
     TransferEngine *native = (TransferEngine *)engine;
     TransferMetadata::NotifyDesc notify;
@@ -154,13 +156,12 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
     return native->sendNotifyByID((SegmentID)target_id, notify);
 }
 
-int getTransferStatus(transfer_engine_t engine,
-                      batch_id_t batch_id, size_t task_id,
-                      struct transfer_status *status) {
+int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                      size_t task_id, struct transfer_status *status) {
     TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
-    Status s = native->getTransferStatus((Transport::BatchID)batch_id,
-                                                    task_id, native_status);
+    Status s = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
+                                         native_status);
     if (s.ok()) {
         status->status = (int)native_status.s;
         status->transferred_bytes = native_status.transferred_bytes;
@@ -168,22 +169,23 @@ int getTransferStatus(transfer_engine_t engine,
     return (int)s.code();
 }
 
-notify_msg_t* getNotifsFromEngine(transfer_engine_t engine,
-              int *size) {
+notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<TransferMetadata::NotifyDesc> notifies_desc;
     native->getNotifies(notifies_desc);
     *size = notifies_desc.size();
-    notify_msg_t* notifies = (notify_msg_t*)malloc(*size * sizeof(notify_msg_t));
-    for (int i = 0 ;i < *size;i++) {
-        notifies[i].name = const_cast<char*>(notifies_desc[i].name.c_str());
-        notifies[i].msg = const_cast<char*>(notifies_desc[i].notify_msg.c_str());
+    notify_msg_t *notifies =
+        (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
+    for (int i = 0; i < *size; i++) {
+        notifies[i].name = const_cast<char *>(notifies_desc[i].name.c_str());
+        notifies[i].msg =
+            const_cast<char *>(notifies_desc[i].notify_msg.c_str());
     }
     return notifies;
 }
 
 int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
-              notify_msg_t notify_msg) {
+                      notify_msg_t notify_msg) {
     TransferEngine *native = (TransferEngine *)engine;
     TransferMetadata::NotifyDesc notify;
     notify.name.assign(notify_msg.name);

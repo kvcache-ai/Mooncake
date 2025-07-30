@@ -67,6 +67,9 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence in HA mode");
 
+DEFINE_string(memory_allocator, "offset",
+              "Memory allocator for global segments, cachelib | offset");
+
 int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
@@ -92,7 +95,8 @@ int main(int argc, char* argv[]) {
               << ", rpc_address=" << FLAGS_rpc_address
               << ", rpc_conn_timeout_seconds=" << FLAGS_rpc_conn_timeout_seconds
               << ", rpc_enable_tcp_no_delay=" << FLAGS_rpc_enable_tcp_no_delay
-              << ", cluster_id=" << FLAGS_cluster_id;
+              << ", cluster_id=" << FLAGS_cluster_id
+              << ", memory_allocator=" << FLAGS_memory_allocator;
 
     int server_thread_num =
         std::min(FLAGS_max_threads,
@@ -147,6 +151,16 @@ int main(int argc, char* argv[]) {
             << "Etcd endpoints are set but will not be used in non-HA mode";
     }
 
+    mooncake::BufferAllocatorType allocator_type;
+    if (FLAGS_memory_allocator == "cachelib") {
+        allocator_type = mooncake::BufferAllocatorType::CACHELIB;
+    } else if (FLAGS_memory_allocator == "offset") {
+        allocator_type = mooncake::BufferAllocatorType::OFFSET;
+    } else {
+        LOG(FATAL) << "Invalid memory allocator type: " << FLAGS_memory_allocator;
+        return 1;
+    }
+
     if (FLAGS_enable_ha) {
         // Construct local hostname from rpc_address and rpc_port
         std::string local_hostname =
@@ -159,7 +173,8 @@ int main(int argc, char* argv[]) {
             FLAGS_allow_evict_soft_pinned_objects, FLAGS_eviction_ratio,
             FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
             FLAGS_etcd_endpoints, local_hostname, FLAGS_rpc_address,
-            rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay, FLAGS_cluster_id);
+            rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay, FLAGS_cluster_id,
+            allocator_type);
 
         return supervisor.Start();
     } else {
@@ -174,7 +189,8 @@ int main(int argc, char* argv[]) {
             FLAGS_allow_evict_soft_pinned_objects,
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio, version,
-            FLAGS_client_ttl, FLAGS_enable_ha, FLAGS_cluster_id);
+            FLAGS_client_ttl, FLAGS_enable_ha, FLAGS_cluster_id,
+            allocator_type);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

@@ -84,6 +84,8 @@ class Topology {
     Json::Value toJson() const;
 
     int selectDevice(const std::string storage_type, int retry_count = 0);
+    int selectDevice(const std::string storage_type, std::string_view hint,
+                     int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
@@ -99,6 +101,22 @@ class Topology {
     struct ResolvedTopologyEntry {
         std::vector<int> preferred_hca;
         std::vector<int> avail_hca;
+        // Maps for efficient name-to-index lookup
+        std::unordered_map<std::string, int> preferred_hca_name_to_index_map_;
+        std::unordered_map<std::string, int> avail_hca_name_to_index_map_;
+
+        // Helper method for efficient name-to-index lookup
+        int getHcaIndex(const std::string &hca_name) const {
+            // First try to find in preferred HCA map
+            auto it = preferred_hca_name_to_index_map_.find(hca_name);
+            if (it != preferred_hca_name_to_index_map_.end()) {
+                return it->second;
+            }
+
+            // Then try to find in available HCA map
+            it = avail_hca_name_to_index_map_.find(hca_name);
+            return (it != avail_hca_name_to_index_map_.end()) ? it->second : -1;
+        }
     };
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
         resolved_matrix_;

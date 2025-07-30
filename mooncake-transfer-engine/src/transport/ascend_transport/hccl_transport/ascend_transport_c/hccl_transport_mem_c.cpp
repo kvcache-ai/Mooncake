@@ -23,6 +23,11 @@
 #include <sys/time.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <random>
+#include <ifaddrs.h>
+#include "mpi.h"
 #include "transport/ascend_transport/hccl_transport/hccl_transport_mem_c.h"
 
 #ifdef __cplusplus
@@ -31,54 +36,62 @@ extern "C" {
 
 #define READ 0
 #define WRITE 1
+#define MAX_EVENTS 32
 #define CONNECT_MAX 1000
 #define RETRY_TIMES 3
-#define MAX_EVENTS 32
-#define VECTOR_RESERVE_SIZE 100
+#define VECTOR_RESERVE_SIZE 200
 
 HcclNetDevCtx vnicNetDevCtx_{nullptr};
 HcclNetDevCtx nicNetDevCtx_{nullptr};
-
 std::shared_ptr<hccl::HcclSocket> vnicServerSocket_{nullptr};
 std::shared_ptr<hccl::HcclSocket> nicServerSocket_{nullptr};
-
 std::unique_ptr<hccl::NotifyPool> notifyPool_;
 HcclDispatcher dispatcher_{nullptr};
-
-std::unordered_map<std::string, int>  target_key_to_control_socket_map_;
-std::unordered_map<std::string, std::shared_ptr<hccl::HcclSocket>> target_key_to_hccl_ctrl_socket_map_;
-std::unordered_map<std::string, std::shared_ptr<hccl::HcclSocket>> target_key_to_hccl_data_socket_map_;
-std::unordered_map<std::string, std::shared_ptr<hccl::TransportMem>> target_key_to_transport_mem_map_;
-std::vector<hccl::TransportMem::RmaMem *> localRmaMem_;
-
-std::vector<void *> g_localMemAddr;
-std::vector<uint64_t> g_localMemLen;
-
+std::unordered_map<std::string, ConnectionInfo> target_key_to_connection_map_;
+std::vector<MergeMem> g_localMergeMem;
 int g_server_socket_ = 0;
-struct sockaddr_in g_server_addr_;
-
 int g_epoll_fd = 0;
 struct epoll_event g_ev;
 struct epoll_event g_events[MAX_EVENTS];
 
-// Retry mechanism for initialization function failure
-#define RETRY_CALL(funcCall, errorMsg) \
-    do { \
-        int retryCount = 0; \
-        int __ret = funcCall; \
-        while (__ret && retryCount < 3) { \
-            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount << "/3)"; \
-            __ret = funcCall; \
-        } \
-        if (__ret) { \
-            LOG(ERROR) << errorMsg << " failed after 3 retries."; \
-            return __ret; \
-        } \
-    } while (0)
-
 bool printEnabled() {
     char* env = getenv("ASCEND_TRANSPORT_PRINT");
     return env != nullptr && std::string(env) == "1";
+}
+
+uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
+    static std::random_device rand_gen;
+    std::mt19937 gen(rand_gen());
+    const int min_port = 15000;
+    const int max_port = 17000;
+    const int max_attempts = 500;
+    std::uniform_int_distribution<> rand_dist(min_port, max_port);
+
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        int port = rand_dist(rand_gen);
+        if (use_ipv6) {
+            sockaddr_in6 bind_address;
+            memset(&bind_address, 0, sizeof(sockaddr_in6));
+            bind_address.sin6_family = AF_INET6;
+            bind_address.sin6_port = htons(port);
+            bind_address.sin6_addr = IN6ADDR_ANY_INIT;
+            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in6)) < 0) {
+                continue;
+            }
+        } else {
+            sockaddr_in bind_address;
+            memset(&bind_address, 0, sizeof(sockaddr_in));
+            bind_address.sin_family = AF_INET;
+            bind_address.sin_port = htons(port);
+            bind_address.sin_addr.s_addr = INADDR_ANY;
+            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+                continue;
+            }
+        }
+
+        return port;
+    }
+    return 0;
 }
 
 static int initServerNetSocket(RankInfo *local_rank_info) {
@@ -126,7 +139,7 @@ static int initServerNetSocket(RankInfo *local_rank_info) {
     
     notifyPool_.reset(new (std::nothrow) hccl::NotifyPool());
     if (notifyPool_ == nullptr) {
-        LOG(ERROR) << "create notifyPool error";
+        LOG(ERROR) << "reset notifyPool error";
         return -1;
     }
 
@@ -140,7 +153,7 @@ static int initControlSocket(RankInfo *local_rank_info) {
     int ret = 0;
     g_server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (g_server_socket_ < 0) {
-        LOG(ERROR) << "Socket create failed";
+        LOG(ERROR) << "ascend transport out-of-band socket create failed";
         return g_server_socket_;
     }
 
@@ -152,16 +165,22 @@ static int initControlSocket(RankInfo *local_rank_info) {
         return ret;
     }
 
-    memset(&g_server_addr_, 0, sizeof(g_server_addr_));
-    g_server_addr_.sin_family = AF_INET;
-    g_server_addr_.sin_addr.s_addr = INADDR_ANY;
-    g_server_addr_.sin_port = htons(local_rank_info->hostPort);
+    struct sockaddr_in bind_address;
+    memset(&bind_address, 0, sizeof(sockaddr_in));
+    bind_address.sin_family = AF_INET;
+    bind_address.sin_addr.s_addr = INADDR_ANY;
+    bind_address.sin_port = htons(local_rank_info->hostPort);
 
-    ret = bind(g_server_socket_, (struct sockaddr*)&g_server_addr_, sizeof(g_server_addr_));
+    ret = bind(g_server_socket_, (struct sockaddr*)&bind_address, sizeof(bind_address));
     if (ret < 0) {
-        LOG(ERROR) << "Bind Failed, ret: " << ret;
-        close(g_server_socket_);
-        return ret;
+        LOG(INFO) << "bind failed on the default port, default port: " << local_rank_info->hostPort << ", will find available port";
+        uint16_t port = findAvailableTcpPort(g_server_socket_, false);
+        if (port == 0) {
+            LOG(ERROR) << "findAvailableTcpPort failed";
+            close(g_server_socket_);
+            return -1;
+        }
+        local_rank_info->hostPort = (uint64_t)port;
     }
 
     struct timeval timeout;
@@ -180,17 +199,17 @@ static int initControlSocket(RankInfo *local_rank_info) {
         close(g_server_socket_);
         return ret;
     }
-    LOG(INFO) << "initControlSocket successful, Server listening on host port" << ntohs(g_server_addr_.sin_port) << "..." << "g_server_socket_" << g_server_socket_;
+    LOG(INFO) << "initControlSocket successful, Server listening on host port: " << local_rank_info->hostPort << "..." << " g_server_socket_" << g_server_socket_;
     g_epoll_fd = epoll_create1(0);
     if (g_epoll_fd == -1) {
-        LOG(ERROR) << "epoll create Failed, ret: " << ret;
+        LOG(ERROR) << "epoll create Failed, ret: " << g_epoll_fd;
         close(g_server_socket_);
-        return ret;
+        return g_epoll_fd;
     }
     g_ev.events = EPOLLIN;
     g_ev.data.fd = g_server_socket_;
     ret = epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_server_socket_, &g_ev);
-    if (ret == -1) {
+    if (ret < 0) {
         LOG(ERROR) << "epoll epoll_ctl Failed, ret: " << ret;
         close(g_server_socket_);
         return ret;
@@ -208,7 +227,7 @@ int initTransportMem(RankInfo *local_rank_info) {
     uint32_t devPid;
     ret = SalGetBareTgid(reinterpret_cast<uint32_t*>(&devPid));
     if (ret) {
-        LOG(ERROR) << "HcclTransport: SalGetBareTgid failed: " << ret;
+        LOG(ERROR) << "SalGetBareTgid failed: " << ret;
         return ret;
     }
 
@@ -223,23 +242,22 @@ int initTransportMem(RankInfo *local_rank_info) {
               << ", devicePort: " << local_rank_info->devicePort
               << ", hostIp: " << inet_ntoa(local_rank_info->hostIp)
               << ", hostPort: " << local_rank_info->hostPort
-              << ", pid: " << local_rank_info->pid;
+              << ", device pid: " << local_rank_info->pid;
 
     // Initialize the virtual network card and socket for the data channel, exchange RmaMem, and create the QP connection
     ret = initServerNetSocket(local_rank_info);
     if (ret) {
-        LOG(ERROR) << "initServerNetSocket failed";
+        LOG(ERROR) << "initServerNetSocket failed, ret: " << ret;
         return ret;
     }
     
     ret = initControlSocket(local_rank_info);
     if (ret) {
-        LOG(ERROR) << "initControlSocket failed";
+        LOG(ERROR) << "initControlSocket failed, ret: " << ret;
         return ret;
     }
 
-    g_localMemAddr.reserve(VECTOR_RESERVE_SIZE);
-    g_localMemLen.reserve(VECTOR_RESERVE_SIZE);
+    g_localMergeMem.reserve(VECTOR_RESERVE_SIZE);
 
     return 0;
 }
@@ -273,25 +291,28 @@ static int connectToTarget(std::string target_ip, int target_port) {
         return -1;
     }
     
-    const int max_retries = 5;
     int connected = 0;
 
-    for (int i = 0; i < max_retries; ++i) {
+    const char* tcp_timeout_str = std::getenv("Ascend_TCP_TIMEOUT");
+    int ascend_tcp_timeout = tcp_timeout_str ? std::atoi(tcp_timeout_str) : 30;
+    int connect_retry_times = ascend_tcp_timeout * 100;
+
+    for (int i = 0; i < connect_retry_times; ++i) {
         if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
-            LOG(INFO) << "Connect to host server successful" << target_ip << ":" << ntohs(server_addr.sin_port);
+            LOG(INFO) << "Connect to host server " << target_ip << ":" << ntohs(server_addr.sin_port) << " successful";
             connected = 1;
             break;
         }
 
-        LOG(ERROR) << "Connect attempt " << i << " failed: " << strerror(errno);
+        LOG(INFO) << "Connect attempt " << i << " failed: " << strerror(errno) << ", retry once";
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     if (!connected) {
-        LOG(ERROR) << "Failed to connect to server after " << max_retries << " retries.";
+        LOG(ERROR) << "Failed to connect to server after " << connect_retry_times << " retries";
         close(client_socket);
-        return -1;
+        return HCCL_E_TIMEOUT;
     }
 
     return client_socket;
@@ -309,7 +330,8 @@ int controlInfoSend(RankInfo *local_rank_info, RankInfo *remote_rank_info) {
               << ", devicePort: " << local_rank_info->devicePort
               << ", hostIp: " << inet_ntoa(local_rank_info->hostIp)
               << ", hostPort: " << local_rank_info->hostPort
-              << ", pid: " << local_rank_info->pid;
+              << ", device pid: " << local_rank_info->pid;
+    
     LOG(INFO) << "transportMemTask remote_rank_info rankId: "
             << remote_rank_info->rankId
             << ", serverIdx: " << remote_rank_info->serverIdx
@@ -319,7 +341,7 @@ int controlInfoSend(RankInfo *local_rank_info, RankInfo *remote_rank_info) {
             << ", devicePort: " << remote_rank_info->devicePort
             << ", hostIp: " << inet_ntoa(remote_rank_info->hostIp)
             << ", hostPort: " << remote_rank_info->hostPort
-            << ", pid: " << remote_rank_info->pid;
+            << ", device pid: " << remote_rank_info->pid;
 
     // Encapsulate control information
     RankControlInfo control_info;
@@ -341,7 +363,7 @@ int controlInfoSend(RankInfo *local_rank_info, RankInfo *remote_rank_info) {
         close(client_socket);
         return ret;
     }
-    target_key_to_control_socket_map_[key_str] = client_socket;
+    target_key_to_connection_map_[key_str].tcp_socket = client_socket;
     return 0;
 }
 
@@ -355,12 +377,12 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
         remoteDevPhyId.push_back(remote_rank_info->devicePhyId);
         ret = hccl::P2PMgmtPub::EnableP2P(remoteDevPhyId);
         if (ret) {
-            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret:" << ret;
+            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret: " << ret;
             return ret;
         }
         ret = hccl::P2PMgmtPub::WaitP2PEnabled(remoteDevPhyId);
         if (ret) {
-            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret:" << ret;
+            LOG(ERROR) << "P2PMgmtPub WaitP2PEnabled failed, ret: " << ret;
             return ret;
         }
         rempoteDevIp = hccl::HcclIpAddress(remote_rank_info->devicePhyId);
@@ -368,7 +390,7 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
                                             DeviceIdType::DEVICE_ID_TYPE_PHY_ID,
                                             remote_rank_info->devicePhyId, rempoteDevIp);
         if (ret) {
-            LOG(ERROR) << "hrtRaGetSingleSocketVnicIpInfo, ret:" << ret;
+            LOG(ERROR) << "hrtRaGetSingleSocketVnicIpInfo, ret: " << ret;
             return ret;
         }                                    
         hccl_socket = std::make_shared<hccl::HcclSocket>(
@@ -386,11 +408,11 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client hccl_socket init failed, target rank_id:" 
+        LOG(ERROR) << "client hccl_socket init failed, target devicePhyId: " 
                     << remote_rank_info->devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
-                    << ", remote port:" << remote_rank_info->devicePort
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
+                    << ", remote port: " << remote_rank_info->devicePort
                     << ", ret: " << ret;
         return ret;
     }
@@ -398,20 +420,33 @@ int createClientSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo 
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client hccl_socket Connect failed, target rank_id:" 
+        LOG(ERROR) << "client hccl_socket Connect failed, target devicePhyId: " 
                     << remote_rank_info->devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
-                    << ", remote port:" << remote_rank_info->devicePort
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
+                    << ", remote port: " << remote_rank_info->devicePort
                     << ", ret: " << ret;
         return ret;
     }
-    LOG(INFO) << "hccl_socket begin to connect";
+    LOG(INFO) << "hccl_socket begin to connect, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
+
     hccl::HcclSocketStatus status;
+    struct timespec start, end;
+    const char* hccl_socket_timeout_str = std::getenv("Ascend_HCCL_SOCKET_TIMEOUT");
+    int hccl_socket_timeout = hccl_socket_timeout_str ? std::atoi(hccl_socket_timeout_str) : 30;
+    long long hccl_socket_timeout_ns = static_cast<long long>(hccl_socket_timeout) * 1000000000LL;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     do {
         status = hccl_socket->GetStatus();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        long long elapsed_time = (end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec);
+        if (elapsed_time > hccl_socket_timeout_ns) {  // Exceeds 20 seconds,TimeOut
+            LOG(ERROR) << "hccl_socket connect timeout, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
+            return HCCL_E_TIMEOUT;
+        }
     } while (status != hccl::HcclSocketStatus::SOCKET_OK);
-    LOG(INFO) << "hccl_socket connect success";
+
+    LOG(INFO) << "hccl_socket connect success, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
 
     return 0;
 }
@@ -424,7 +459,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
     bool is_cross_hccs = !(same_host && same_group);
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
     if (printEnabled()) {
-        LOG(INFO) << "transport is cross_hccs: " << (is_cross_hccs ? "true (cross-hccs)" : "false (same-hccs)");
+        LOG(INFO) << "hccl transport is cross_hccs: " << (is_cross_hccs ? "true (cross-hccs)" : "false (same-hccs)");
     }
     std::shared_ptr<hccl::HcclSocket> hccl_ctrl_socket;
     std::shared_ptr<hccl::HcclSocket> hccl_data_socket;
@@ -433,13 +468,13 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
         LOG(ERROR) << "createClientSocket hccl_ctrl_socket failed, ret: " << ret;
         return ret;
     }
-    target_key_to_hccl_ctrl_socket_map_[key_str] = hccl_ctrl_socket;
+    target_key_to_connection_map_[key_str].hccl_ctrl_socket = hccl_ctrl_socket;
     ret = createClientSocket(hccl_data_socket, local_rank_info, remote_rank_info, is_cross_hccs, "data");
     if (ret) {
         LOG(ERROR) << "createClientSocket hccl_data_socket failed, ret: " << ret;
         return ret;
     }
-    target_key_to_hccl_data_socket_map_[key_str] = hccl_data_socket;
+    target_key_to_connection_map_[key_str].hccl_data_socket = hccl_data_socket;
     hccl::TransportMem::AttrInfo attrInfo;
     attrInfo.localRankId = local_rank_info->deviceLogicId;
     attrInfo.remoteRankId = remote_rank_info->deviceLogicId;
@@ -458,11 +493,11 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client SetDataSocket failed, target rank_id:" 
+        LOG(ERROR) << "client SetDataSocket failed, target devicePhyId: " 
                     << remote_rank_info->devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
-                    << ", remote port:" << remote_rank_info->devicePort
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
+                    << ", remote port: " << remote_rank_info->devicePort
                     << ", ret: " << ret;
         return ret;
     }
@@ -470,36 +505,38 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client SetSocket failed, target rank_id:" 
+        LOG(ERROR) << "client SetSocket failed, target devicePhyId: " 
                     << remote_rank_info->devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
-                    << ", remote port:" << remote_rank_info->devicePort
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
+                    << ", remote port: " << remote_rank_info->devicePort
                     << ", ret: " << ret;
         return ret;
     }
-    ret = transport_mem->Connect(120);
+    const char* transport_mem_timeout_str = std::getenv("Ascend_TRANSPORT_MEM_TIMEOUT");
+    int transport_mem_timeout = transport_mem_timeout_str ? std::atoi(transport_mem_timeout_str) : 120;
+    ret = transport_mem->Connect(transport_mem_timeout);
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target rank_id:" 
+        LOG(ERROR) << "client Connect failed, target devicePhyId: " 
                     << remote_rank_info->devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
-                    << ", remote port:" << remote_rank_info->devicePort
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
+                    << ", remote port: " << remote_rank_info->devicePort
                     << ", ret: " << ret;
         return ret;
     }
     LOG(INFO) << "transport_mem connect success";
-    target_key_to_transport_mem_map_[key_str] = transport_mem;
-    size_t m_num = g_localMemAddr.size();
+    target_key_to_connection_map_[key_str].transport_mem = transport_mem;
+    size_t m_num = g_localMergeMem.size();
     std::vector<hccl::TransportMem::RmaMemDesc> rmaMemDescs(m_num);
 
     for (size_t i = 0; i < m_num; ++i) {
         HcclMem mem;
         HcclBuf buf;
-        mem.addr = g_localMemAddr[i];
-        mem.size = (uint64_t)g_localMemLen[i];
+        mem.addr = g_localMergeMem[i].addr;
+        mem.size = g_localMergeMem[i].len;
         mem.type = HCCL_MEM_TYPE_DEVICE;
         if (!is_cross_hccs) {
             ret = HcclMemReg(vnicNetDevCtx_, &mem, &buf);
@@ -507,14 +544,14 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
             ret = HcclMemReg(nicNetDevCtx_, &mem, &buf);
         }
         if (ret != 0 && ret != 20) {
-            LOG(ERROR) << "HcclMemReg failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemReg failed, ret: " << ret << " addr: " << g_localMergeMem[i].addr << " len: " << g_localMergeMem[i].len;
             return ret;
         }
         char *desc = nullptr;
         uint64_t desc_len = 0;
         ret = HcclMemExport(&buf, &desc, &desc_len);
         if (ret) {
-            LOG(ERROR) << "HcclMemExport failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemExport failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
             return ret;
         }
         
@@ -522,7 +559,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
         rmaMemDescs[i].remoteRankId = remote_rank_info->deviceLogicId;
         memset_s(rmaMemDescs[i].memDesc, hccl::TRANSPORT_EMD_ESC_SIZE, 0, hccl::TRANSPORT_EMD_ESC_SIZE);
         if (memcpy_s(rmaMemDescs[i].memDesc, hccl::TRANSPORT_EMD_ESC_SIZE, desc, desc_len + 1) != EOK) {
-            LOG(ERROR) << "memcpy_s failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "memcpy_s failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
             return -1;
         }
 
@@ -530,11 +567,10 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
         if (!is_cross_hccs) {
             HcclMemGrantInfo grant_info;
             grant_info.remotePid = (int32_t)remote_rank_info->pid;
-            LOG(INFO) << "HcclMemGrant begin, remote pid:" << grant_info.remotePid;
             grant_info.remoteSdid = 0xFFFFFFFF;
             ret = HcclMemGrant(&buf, &grant_info);
             if (ret) {
-                LOG(ERROR) << "HcclMemGrant failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];;
+                LOG(ERROR) << "HcclMemGrant failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
                 return ret;
             }
         }
@@ -549,69 +585,68 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info, st
     remoteRmaMemDescs.arrayLength = m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs, actualNumOfRemote);
     if (ret) {
-        LOG(ERROR) << "transport_mem->ExchangeMemDesc failed, ret:" << ret << "local_rank: " << local_rank_info->devicePhyId << "remote_rank: " << remote_rank_info->devicePhyId;
+        LOG(ERROR) << "transport_mem->ExchangeMemDesc failed, ret: " << ret << ", local_rank: " << local_rank_info->devicePhyId << ", remote_rank: " << remote_rank_info->devicePhyId;
         return ret;
     }
     std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
     for (uint32_t i = 0; i < m_num; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i], remoteRmaMemArray[i]);
         if (ret) {
-            LOG(ERROR) << "transport_mem->EnableMemAccess failed, ret:" << ret << " i:" << i << "local_rank: " << local_rank_info->devicePhyId << "remote_rank: " << remote_rank_info->devicePhyId;
+            LOG(ERROR) << "transport_mem->EnableMemAccess failed, ret: " << ret << ", i: " << i << ", local_rank: " << local_rank_info->devicePhyId << ", remote_rank: " << remote_rank_info->devicePhyId;
             return ret;
         }
     }
+    LOG(INFO) << "ExchangeMem and EnableMemAccess Success, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_rank_info->devicePhyId;
+    return 0;
+}
 
-    LOG(INFO) << "ExchangeMem and EnableMemAccess Success!";
+int transportMemAddOpFence(RankInfo *remote_rank_info, aclrtStream stream) {
+    std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
+    int ret = target_key_to_connection_map_[key_str].transport_mem->AddOpFence(stream);
+    if (ret) {
+        LOG(ERROR) << "transport_mem AddOpFence failed, ret: " << ret;
+        return ret; 
+    }
+
     return 0;
 }
 
 int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info, 
                     int op_code, uint64_t offset,
-                    uint64_t req_len, void *local_mem, aclrtStream stream)
-{
+                    uint64_t req_len, void *local_mem, aclrtStream stream) {
     int ret = 0;
-    // 1. Check if a connection has been established with the peer, and send local information to the peer
+    std::shared_ptr<hccl::TransportMem> transport_mem{};
+    // Check if a connection has been established with the peer, and send local information to the peer
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) + std::to_string(remote_rank_info->devicePhyId);
-    auto iter = target_key_to_control_socket_map_.find(key_str);
-    if (iter == target_key_to_control_socket_map_.end()) {
+    auto iter = target_key_to_connection_map_.find(key_str);
+    if (iter == target_key_to_connection_map_.end()) {
         ret = controlInfoSend(local_rank_info, remote_rank_info);
         if (ret) {
             LOG(ERROR) << "controlInfoSend failed, ret: " << ret;
             return ret;
         }
-    }
-
-    // 2. Check if transport_mem has been established with the peer, and send local information to the peer.
-    std::shared_ptr<hccl::TransportMem> transport_mem{};
-    auto iter_mem = target_key_to_transport_mem_map_.find(key_str);
-    if (iter_mem == target_key_to_transport_mem_map_.end()) {
         ret = createTransportMem(local_rank_info, remote_rank_info, transport_mem);
         if (ret) {
             LOG(ERROR) << "createTransportMem failed, ret: " << ret;
             return ret;
         }
     } else {
-        transport_mem = target_key_to_transport_mem_map_[key_str];
+        transport_mem = target_key_to_connection_map_[key_str].transport_mem;
     }
-    
-    auto start = std::chrono::high_resolution_clock::now();
-    pid_t pid = getpid();
-
     hccl::TransportMem::RmaOpMem localMem;
     localMem.addr = local_mem;
     localMem.size = req_len;
     hccl::TransportMem::RmaOpMem remoteMem;
     remoteMem.addr = (void *)offset;
     remoteMem.size = req_len;
-    if (op_code == WRITE) {
+    if (op_code == WRITE){
         ret = transport_mem->Write(remoteMem, localMem, stream);
         if (ret) {
-            LOG(ERROR) << "transport_mem Read failed, localMem.addr: " 
+            LOG(ERROR) << "transport_mem Write failed, localMem.addr: " 
                     << local_mem << "local_mem.size: " << req_len
                     << ", remoteMem.addr: "  << remoteMem.addr 
                     << ", remoteMem.size: " << req_len
-                    << ", ret: " << ret
-                    << "retry failed..";
+                    << ", ret: " << ret;
             return ret;
         }
     } else {
@@ -621,40 +656,9 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
                 << local_mem << "local_mem.size: " << req_len
                 << ", remoteMem.addr: "  << remoteMem.addr 
                 << ", remoteMem.size: " << req_len
-                << ", ret: " << ret
-                << "retry failed..";
+                << ", ret: " << ret;
             return ret;
         }
-    }
-    auto mid = std::chrono::high_resolution_clock::now();
-    ret = transport_mem->AddOpFence(stream);
-    if (ret) {
-        LOG(ERROR) << "transport_mem AddOpFence failed, ret: " << ret;
-        return ret; 
-    }
-
-    ret = aclrtSynchronizeStream(stream);
-    if (ret) {
-        LOG(ERROR) << "aclrtSynchronizeStream failed, localMem.addr: " 
-                        << local_mem << "local_mem.size: " << req_len
-                        << ", remoteMem.addr: "  << remoteMem.addr 
-                        << ", remoteMem.size: " << req_len
-                        << ", ret: " << ret;
-        return ret;
-    }
-
-    auto stop = std::chrono::high_resolution_clock::now();
-    if (printEnabled()) {
-        auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(mid - start);
-        auto duration_sync = std::chrono::duration_cast<std::chrono::microseconds>(stop - mid);
-        LOG(INFO) << "pid: " << pid << "; " << "thread submit one block size: "<< req_len;
-        LOG(INFO) << "pid: " << pid << "; " << "thread call write/read spent: "<< duration_call.count() << "us";
-        LOG(INFO) << "pid: " << pid << "; " << "thread sync stream spent: "<< duration_sync.count() << "us";
-    } else {
-        (void)start;
-        (void)mid;
-        (void)stop;
-        (void)pid;
     }
 
     return 0;
@@ -694,7 +698,7 @@ int acceptSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket, RankInfo *local
 
     ret = serverSocket->Accept(baseTag_, hccl_socket);
     if (ret) {
-        LOG(ERROR) << "serverSocket transportMemAccept ctrl socket failed ret:" << ret;
+        LOG(ERROR) << "serverSocket transportMemAccept ctrl socket failed ret: " << ret;
         return ret;
     }
     return 0;
@@ -711,7 +715,6 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (client_socket < 0) {
         return client_socket;
     }
-
     RankControlInfo remote_control_info;
     ret = recv(client_socket, &remote_control_info, sizeof(RankControlInfo), 0);
     if (ret <= 0) {
@@ -721,19 +724,20 @@ int transportMemAccept(RankInfo *local_rank_info) {
             LOG(ERROR) << "Peer close the connection, ret: " << ret;
         }
         close(client_socket);
-        return ret;
+        return -1;
     }
 
     LOG(INFO) << "Received remote_control_info, deviceLogicId: "
               << remote_control_info.deviceLogicId
               << ", devicePhyId: " << remote_control_info.devicePhyId
               << ", hostIp: " << inet_ntoa(remote_control_info.hostIp)
-              << ", deviceIp: " << inet_ntoa(remote_control_info.deviceIp);
+              << ", deviceIp: " << inet_ntoa(remote_control_info.deviceIp)
+              << ", device pid: "    << remote_control_info.pid;
 
     // Check if TransportMem has been established with the peer
     std::string key_str = inet_ntoa(remote_control_info.hostIp) + std::to_string(remote_control_info.devicePhyId);
-    auto iter = target_key_to_transport_mem_map_.find(key_str);
-    if (iter != target_key_to_transport_mem_map_.end()) {
+    auto iter = target_key_to_connection_map_.find(key_str);
+    if (iter != target_key_to_connection_map_.end()) {
         LOG(WARNING) << "A duplicate connection request from the same remote endpoint has been detected, the remote side may have restarted.";
     }
 
@@ -757,47 +761,47 @@ int transportMemAccept(RankInfo *local_rank_info) {
                                             remote_control_info.devicePhyId,
                                             rempoteDevIp);
         if (ret) {
-            LOG(ERROR) << "hrtRaGetSingleSocketVnicIpInfo failed, ret:" << ret;
+            LOG(ERROR) << "hrtRaGetSingleSocketVnicIpInfo failed, ret: " << ret;
             return ret;
         }
         ret = hccl::P2PMgmtPub::EnableP2P(remoteDevPhyId);
         if (ret) {
-            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret:" << ret;
+            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret: " << ret;
             return ret;
         }
         ret = hccl::P2PMgmtPub::WaitP2PEnabled(remoteDevPhyId);
         if (ret) {
-            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret:" << ret;
+            LOG(ERROR) << "P2PMgmtPub EnableP2P failed, ret: " << ret;
             return ret;
         }
         ret = acceptSocket(hccl_ctrl_socket, local_rank_info, remote_control_info, baseTag_ + "ctrl", rempoteDevIp, is_cross_hccs);
         if (ret) {
-            LOG(ERROR) << "acceptSocket ctrl failed, ret:" << ret;
+            LOG(ERROR) << "acceptSocket ctrl failed, ret: " << ret;
             return ret;
         }
 
         ret = acceptSocket(hccl_data_socket, local_rank_info, remote_control_info, baseTag_ + "data", rempoteDevIp, is_cross_hccs);
         if (ret) {
-            LOG(ERROR) << "acceptSocket data failed, ret:" << ret;
+            LOG(ERROR) << "acceptSocket data failed, ret: " << ret;
             return ret;
         }
     } else {
         rempoteDevIp = hccl::HcclIpAddress(remote_control_info.deviceIp);
         ret = acceptSocket(hccl_ctrl_socket, local_rank_info, remote_control_info, baseTag_ + "ctrl", rempoteDevIp, is_cross_hccs);
         if (ret) {
-            LOG(ERROR) << "acceptSocket ctrl failed, ret:" << ret;
+            LOG(ERROR) << "acceptSocket ctrl failed, ret: " << ret;
             return ret;
         }
 
         ret = acceptSocket(hccl_data_socket, local_rank_info, remote_control_info, baseTag_ + "data", rempoteDevIp, is_cross_hccs);
         if (ret) {
-            LOG(ERROR) << "acceptSocket data failed, ret:" << ret;
+            LOG(ERROR) << "acceptSocket data failed, ret: " << ret;
             return ret;
         }
     }
 
-    target_key_to_hccl_ctrl_socket_map_[key_str] = hccl_ctrl_socket;
-    target_key_to_hccl_data_socket_map_[key_str] = hccl_data_socket;
+    target_key_to_connection_map_[key_str].hccl_ctrl_socket = hccl_ctrl_socket;
+    target_key_to_connection_map_[key_str].hccl_data_socket = hccl_data_socket;
     LOG(INFO) << "Creating transfer_mem on the accept side";
     std::shared_ptr<hccl::TransportMem> transport_mem{};
     hccl::TransportMem::AttrInfo attrInfo;
@@ -818,10 +822,10 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client SetDataSocket failed, target rank_id:" 
+        LOG(ERROR) << "client SetDataSocket failed, target devicePhyId: " 
                     << remote_control_info.devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
                     << ", ret: " << ret;
         return ret;
     }
@@ -830,34 +834,36 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target rank_id:" 
+        LOG(ERROR) << "client Connect failed, target devicePhyId: " 
                     << remote_control_info.devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
                     << ", ret: " << ret;
         return ret;
     }
-    ret = transport_mem->Connect(120);
+    const char* transport_mem_timeout_str = std::getenv("Ascend_TRANSPORT_MEM_TIMEOUT");
+    int transport_mem_timeout = transport_mem_timeout_str ? std::atoi(transport_mem_timeout_str) : 120;
+    ret = transport_mem->Connect(transport_mem_timeout);
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target rank_id:" 
+        LOG(ERROR) << "client Connect failed, target devicePhyId: " 
                     << remote_control_info.devicePhyId
-                    << ",local rank_id:" << local_rank_info->devicePhyId
-                    << ", rempoteDevIp:" << deviceIp 
+                    << ", local devicePhyId: " << local_rank_info->devicePhyId
+                    << ", rempoteDevIp: " << deviceIp 
                     << ", ret: " << ret;
         return ret;
     }
 
-    target_key_to_transport_mem_map_[key_str] = transport_mem;    
+    target_key_to_connection_map_[key_str].transport_mem = transport_mem;    
 
-    size_t m_num = g_localMemAddr.size();
+    size_t m_num = g_localMergeMem.size();
     std::vector<hccl::TransportMem::RmaMemDesc> rmaMemDescs(m_num);
     for (size_t i = 0; i < m_num; ++i) {
         HcclBuf buf;
         HcclMem mem;
-        mem.addr = g_localMemAddr[i];
-        mem.size = g_localMemLen[i];
+        mem.addr = g_localMergeMem[i].addr;
+        mem.size = g_localMergeMem[i].len;
         mem.type = HCCL_MEM_TYPE_DEVICE;
         if (!is_cross_hccs) {
             ret = HcclMemReg(vnicNetDevCtx_, &mem, &buf);
@@ -865,14 +871,14 @@ int transportMemAccept(RankInfo *local_rank_info) {
             ret = HcclMemReg(nicNetDevCtx_, &mem, &buf);
         }
         if (ret != 0 && ret != 20) {
-            LOG(ERROR) << "HcclMemReg failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemReg failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
             return ret;
         }
         char *desc = nullptr;
         uint64_t desc_len = 0;
         ret = HcclMemExport(&buf, &desc, &desc_len);
         if (ret) {
-            LOG(ERROR) << "HcclMemExport failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "HcclMemExport failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
             return ret;
         }
         
@@ -880,7 +886,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
         rmaMemDescs[i].remoteRankId = remote_control_info.deviceLogicId;
         memset_s(rmaMemDescs[i].memDesc, hccl::TRANSPORT_EMD_ESC_SIZE, 0, hccl::TRANSPORT_EMD_ESC_SIZE);
         if (memcpy_s(rmaMemDescs[i].memDesc, hccl::TRANSPORT_EMD_ESC_SIZE, desc, desc_len + 1) != EOK) {
-            LOG(ERROR) << "memcpy_s failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+            LOG(ERROR) << "memcpy_s failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
             return -1;
         }
 
@@ -889,10 +895,9 @@ int transportMemAccept(RankInfo *local_rank_info) {
             HcclMemGrantInfo grant_info;
             grant_info.remotePid = (int32_t)remote_control_info.pid;
             grant_info.remoteSdid = 0xFFFFFFFF;
-            LOG(INFO) << "device pid:" << grant_info.remotePid;
             ret = HcclMemGrant(&buf, &grant_info);
             if (ret) {
-                LOG(ERROR) << "HcclMemGrant failed, ret:" << ret << " addr: " << g_localMemAddr[i] << " len: " << g_localMemLen[i];
+                LOG(ERROR) << "HcclMemGrant failed, ret: " << ret << ", addr: " << g_localMergeMem[i].addr << ", len: " << g_localMergeMem[i].len;
                 return ret;
             }
         }
@@ -907,26 +912,24 @@ int transportMemAccept(RankInfo *local_rank_info) {
     remoteRmaMemDescs.arrayLength = m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs, actualNumOfRemote);
     if (ret) {
-        LOG(ERROR) << "transport_mem->ExchangeMemDesc failed, ret:" << ret << "local_rank: " << local_rank_info->devicePhyId << "remote_rank: " << remote_control_info.devicePhyId;
+        LOG(ERROR) << "transport_mem->ExchangeMemDesc failed, ret: " << ret << ", local_rank: " << local_rank_info->devicePhyId << ", remote_rank: " << remote_control_info.devicePhyId;
         return ret;
     }
     std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
     for (uint32_t i = 0; i < m_num; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i], remoteRmaMemArray[i]);
         if (ret) {
-            LOG(ERROR) << "transport_mem->EnableMemAccess failed, ret:" << ret << " i:" << i << "local_rank: " << local_rank_info->devicePhyId << "remote_rank: " << remote_control_info.devicePhyId;
+            LOG(ERROR) << "transport_mem->EnableMemAccess failed, ret: " << ret << ", i: " << i << ", local_rank: " << local_rank_info->devicePhyId << ", remote_rank: " << remote_control_info.devicePhyId;
             return ret;
         }
     }
 
-    LOG(INFO) << "ExchangeMem and EnableMemAccess Success, with remote";
+    LOG(INFO) << "ExchangeMem and EnableMemAccess Success, local devicePhyId: " << local_rank_info->devicePhyId << ", target devicePhyId: " << remote_control_info.devicePhyId;
     return 0;
 }
 
-int regLocalRmaMem(void *addr, uint64_t length)
-{
-    g_localMemAddr.push_back(addr);
-    g_localMemLen.push_back(length);
+int regLocalRmaMem(void *addr, uint64_t length) {
+    g_localMergeMem.push_back(MergeMem{addr, length});
     return 0;
 }
 

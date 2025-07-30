@@ -54,12 +54,10 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
-#ifdef USE_CUDA
-const static int NR_SOCKETS = 4;
-#else
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
-#endif
+
+static int buffer_num = NR_SOCKETS;
 
 DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
@@ -88,17 +86,23 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 #ifdef USE_CUDA
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
-DEFINE_int32(gpu_id, 0, "GPU ID to use");
+DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
 #endif
 
 using namespace mooncake;
 
-static void *allocateMemoryPool(size_t size, int socket_id,
+static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #ifdef USE_CUDA
     if (from_vram) {
-        int gpu_id = FLAGS_gpu_id;
+        int gpu_id;
+        if (FLAGS_gpu_id == -1) {
+            gpu_id = buffer_id;
+        } else {
+            gpu_id = FLAGS_gpu_id;
+        }
         void *d_buf;
+        LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
@@ -109,7 +113,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         return d_buf;
     }
 #endif
-    return numa_alloc_onnode(size, socket_id);
+    return numa_alloc_onnode(size, buffer_id);
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
@@ -192,7 +196,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         exit(EXIT_FAILURE);
     }
     uint64_t remote_base =
-        (uint64_t)segment_desc->buffers[thread_id % NR_SOCKETS].addr;
+        (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
     size_t batch_count = 0;
     while (running) {
@@ -305,19 +309,45 @@ int initiator() {
         LOG_ASSERT(xport);
     }
 
-    std::vector<void *> addr(NR_SOCKETS, nullptr);
-    int buffer_num = NR_SOCKETS;
-
+    std::vector<void *> addr;
 #ifdef USE_CUDA
-    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
+    if (FLAGS_use_vram) {
+        int gpu_num;
+        LOG(INFO) << "VRAM is used";
+        if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
+            LOG(INFO) << "GPU ID is not specified, found " << gpu_num << " GPUs to use";
+            buffer_num = gpu_num;
+        } else {
+            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use " << FLAGS_gpu_id << " GPU";
+            buffer_num = 1;
+        }
+    } else {
+        LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
+    }
+    addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
+        std::string name_prefix;
+        int name_suffix;
+        if (FLAGS_use_vram) {
+            name_prefix = "cuda:";
+            if (FLAGS_gpu_id == -1) {
+                name_suffix = i;
+            } else {
+                name_suffix = FLAGS_gpu_id;
+            }
+        } else {
+            name_prefix = "cpu:";
+            name_suffix = i;
+        }
+        int rc = engine->registerLocalMemory(
+            addr[i], FLAGS_buffer_size,
+            name_prefix + std::to_string(name_suffix));
         LOG_ASSERT(!rc);
     }
 #else
+    LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
+    addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
@@ -328,7 +358,7 @@ int initiator() {
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
-    std::thread workers[FLAGS_threads];
+    std::vector<std::thread> workers(FLAGS_threads);
 
     struct timeval start_tv, stop_tv;
     gettimeofday(&start_tv, nullptr);
@@ -347,7 +377,6 @@ int initiator() {
                     (stop_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
     auto batch_count = total_batch_count.load();
 
-    LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     LOG(INFO) << "Test completed: duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "
@@ -398,19 +427,47 @@ int target() {
         }
     }
 
-    std::vector<void *> addr(NR_SOCKETS, nullptr);
-    int buffer_num = NR_SOCKETS;
-
+    std::vector<void *> addr;
 #ifdef USE_CUDA
-    if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
+    if (FLAGS_use_vram) {
+        int gpu_num;
+        LOG(INFO) << "VRAM is used";
+        if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
+            LOG(INFO) << "GPU ID is not specified, found " << gpu_num
+                      << " GPUs to use";
+            buffer_num = gpu_num;
+        } else {
+            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use "
+                      << FLAGS_gpu_id << " GPU";
+            buffer_num = 1;
+        }
+    } else {
+        LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
+    }
+    addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
+        std::string name_prefix;
+        int name_suffix;
+        if (FLAGS_use_vram) {
+            name_prefix = "cuda:";
+            if (FLAGS_gpu_id == -1) {
+                name_suffix = i;
+            } else {
+                name_suffix = FLAGS_gpu_id;
+            }
+        } else {
+            name_prefix = "cpu:";
+            name_suffix = i;
+        }
+        int rc = engine->registerLocalMemory(
+            addr[i], FLAGS_buffer_size,
+            name_prefix + std::to_string(name_suffix));
         LOG_ASSERT(!rc);
     }
 #else
+    LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
+    addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
@@ -418,8 +475,6 @@ int target() {
         LOG_ASSERT(!rc);
     }
 #endif
-
-    LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {

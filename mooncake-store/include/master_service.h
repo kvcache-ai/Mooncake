@@ -70,7 +70,9 @@ class MasterService {
                   ViewVersionId view_version = 0,
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
                   bool enable_ha = false,
-                  const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+                  const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+                  BufferAllocatorType memory_allocator =
+                      BufferAllocatorType::CACHELIB);
     ~MasterService();
 
     /**
@@ -229,13 +231,12 @@ class MasterService {
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
-     * @param[out] view_version The view version of the master
-     * @param[out] client_status The status of the client from the master
+     * @return PingResponse containing view version and client status
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
     auto Ping(const UUID& client_id)
-        -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>;
+        -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
@@ -349,10 +350,6 @@ class MasterService {
         }
     };
 
-    // Segment management
-    SegmentManager segment_manager_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
-
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -459,6 +456,10 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+
+    // Segment management
+    SegmentManager segment_manager_;
+    std::shared_ptr<AllocationStrategy> allocation_strategy_;
 };
 
 }  // namespace mooncake

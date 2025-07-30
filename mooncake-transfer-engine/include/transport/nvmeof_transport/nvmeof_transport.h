@@ -46,7 +46,6 @@ class NVMeoFTransport : public Transport {
     BatchID allocateBatchID(size_t batch_size) override;
 
     Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
     Status submitTransfer(BatchID batch_id,

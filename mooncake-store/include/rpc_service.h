@@ -28,7 +28,8 @@ class WrappedMasterService {
         ViewVersionId view_version = 0,
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
         bool enable_ha = false,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
 
     ~WrappedMasterService();
 
@@ -79,7 +80,7 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
-    tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(
+    tl::expected<PingResponse, ErrorCode> Ping(
         const UUID& client_id);
 
    private:
