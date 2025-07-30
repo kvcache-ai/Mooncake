@@ -78,7 +78,7 @@ class CxlTransport : public Transport {
 
     int cxlDevInit();
 
-    size_t cxlGetDeviceSize(char* _cxl_dev_path);
+    size_t cxlGetDeviceSize();
 
     int cxlMemcpy(void *dest_addr, void *source_addr, size_t size);
 

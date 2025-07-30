@@ -136,7 +136,11 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
 
 #ifdef USE_CXL
-    multi_transports_->installTransport("cxl", local_topology_);
+    Transport* cxl_transport = multi_transports_->installTransport("cxl", local_topology_);
+    if (!cxl_transport) {
+        LOG(ERROR) << "Failed to install Ascend transport";
+        return -1;
+    }
 #endif
 
     if (auto_discover_) {

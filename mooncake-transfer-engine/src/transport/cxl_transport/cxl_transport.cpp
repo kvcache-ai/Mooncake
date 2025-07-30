@@ -40,11 +40,8 @@ CxlTransport::CxlTransport() {
     // get from env
     const char* env_cxl_dev_path = std::getenv("CXL_DEV_PATH");
     if (env_cxl_dev_path) {
-        cxl_dev_path = std::string(env_cxl_dev_path);
-        cxl_dev_size = cxlGetDeviceSize(cxl_dev_path);
-    } else {
-        cxl_dev_path = "/dev/dax0.0";
-        cxl_dev_size = cxlGetDeviceSize(cxl_dev_path);
+        cxl_dev_path = (char *) env_cxl_dev_path;
+        cxl_dev_size = cxlGetDeviceSize();
     }
 }
 
@@ -53,40 +50,16 @@ CxlTransport::~CxlTransport() {
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
-size_t CxlTransport::cxlGetDeviceSize(char* _cxl_dev_path) {
-    size_t size = 0;
-    char command[256];
-    FILE *fp;
-    char line[256];
-
-    char* dax_name = basename(_cxl_dev_path);
-    snprintf(command, sizeof(command), "daxctl list -d %s | grep size", dax_name);
-
-    fp = popen(command, "r");
-    if (fp == NULL) {
-        perror("Failed to get daxctl command");
-        return 0;
+size_t CxlTransport::cxlGetDeviceSize() {
+    // for now, get cxl_shm size from env
+    const char* env_cxl_dev_size = std::getenv("CXL_DEV_SIZE");
+    if (env_cxl_dev_size) {
+        char* end = nullptr;
+        unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
+        if (end != env_cxl_dev_size && *end == '\0')
+            return static_cast<size_t>(val);
     }
-
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char *size_str = strstr(line, "\"size\":");
-        if (size_str) {
-            size_str += 7; // skip over "\"size\":"
-
-            while (*size_str && (*size_str < '0' || *size_str > '9')) {
-                size_str++;
-            }
-
-            char *endptr;
-            unsigned long long value = strtoull(size_str, &endptr, 10);
-            if (endptr != size_str) {
-                size = (size_t)value;
-            }
-            break;
-        }
-    }
-    pclose(fp);
-    return size;
+    return 0;
 }
 
 int CxlTransport::cxlMemcpy(void *dest, void *src, size_t size) {
