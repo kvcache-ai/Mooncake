@@ -253,7 +253,8 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
 
     // Check if the key exists using IsExist
     auto exist_result = test_client_->IsExist(key);
-    ASSERT_FALSE(exist_result.has_value())
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_FALSE(exist_result.value())
         << "IsExist should return false for removed key: " << key;
 
     // Try to get the removed data - should fail
