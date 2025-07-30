@@ -1027,7 +1027,7 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
-    return result.value();
+    return result;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
