@@ -136,10 +136,12 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
 
 #if defined(USE_CXL) && !defined(USE_ASCEND)
-    Transport* cxl_transport = multi_transports_->installTransport("cxl", local_topology_);
-    if (!cxl_transport) {
-        LOG(ERROR) << "Failed to install CXL transport";
-        return -1;
+    if (std::getenv("MC_CXL_DEV_PATH") != nullptr && std::getenv("MC_CXL_DEV_SIZE") != nullptr) {
+        Transport* cxl_transport = multi_transports_->installTransport("cxl", local_topology_);
+        if (!cxl_transport) {
+            LOG(ERROR) << "Failed to install CXL transport";
+            return -1;
+        }
     }
 #endif
 

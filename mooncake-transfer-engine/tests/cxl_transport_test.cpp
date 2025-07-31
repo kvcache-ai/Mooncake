@@ -119,6 +119,7 @@ class CXLTransportTest : public ::testing::Test {
             close(tmp_fd); 
             unlink(FLAGS_device_name.c_str()); 
         }
+        free(args);
         google::ShutdownGoogleLogging();
         freeMemoryPool(addr, kDataLength);
     }
