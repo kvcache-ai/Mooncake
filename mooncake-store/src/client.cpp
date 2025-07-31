@@ -135,7 +135,7 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     return whitelst_filters;
 }
 
-tl::expected<void, ErrorCode> CheckRegisterMemoryParms(const void* addr,
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
                                                        size_t length) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
@@ -957,7 +957,7 @@ tl::expected<long, ErrorCode> Client::RemoveAll() {
 
 tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
                                                    size_t size) {
-    auto check_result = CheckRegisterMemoryParms(buffer, size);
+    auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -1049,7 +1049,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    auto check_result = CheckRegisterMemoryParms(addr, length);
+    auto check_result = CheckRegisterMemoryParams(addr, length);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
