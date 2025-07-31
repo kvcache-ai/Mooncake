@@ -12,6 +12,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
+#include "config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -132,6 +133,26 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
         }
     }
     return whitelst_filters;
+}
+
+tl::expected<void, ErrorCode> CheckRegisterMemoryParms(const void* addr,
+                                                       size_t length) {
+    if (addr == nullptr) {
+        LOG(ERROR) << "addr is nullptr";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (length == 0) {
+        LOG(ERROR) << "length is 0";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Tcp is not limited by max_mr_size, but we ignore it for now.
+    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
+    if (length > max_mr_size) {
+        LOG(ERROR) << "length " << length
+                   << " is larger than max_mr_size: " << max_mr_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
@@ -919,12 +940,9 @@ tl::expected<long, ErrorCode> Client::RemoveAll() {
 
 tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
                                                    size_t size) {
-    if (buffer == nullptr || size == 0 ||
-        reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
-        size % facebook::cachelib::Slab::kSize) {
-        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is not aligned to " << facebook::cachelib::Slab::kSize;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto check_result = CheckRegisterMemoryParms(buffer, size);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
     }
 
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -1014,6 +1032,10 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
+    auto check_result = CheckRegisterMemoryParms(addr, length);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
+    }
     if (this->transfer_engine_.registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
