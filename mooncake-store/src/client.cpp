@@ -414,7 +414,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<tl::expected<void, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         return results;
     }
@@ -669,7 +669,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
-            op.SetError(ErrorCode::INTERNAL_ERROR, "TransferSubmitter not initialized");
+            op.SetError(ErrorCode::INVALID_PARAMS, "TransferSubmitter not initialized");
         }
         return;
     }
@@ -1145,7 +1145,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                TransferRequest::OpCode op_code) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INTERNAL_ERROR;
+        return ErrorCode::INVALID_PARAMS;
     }
 
     auto future =
