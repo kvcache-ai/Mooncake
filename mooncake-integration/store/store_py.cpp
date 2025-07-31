@@ -231,14 +231,21 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
     }
     client_ = *client_opt;
 
+    // Local_buffer_size is allowed to be 0, but we only register memory when
+    // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
+    // fail in some rdma implementations.
     client_buffer_allocator_ = ClientBufferAllocator::create(local_buffer_size);
-    auto result = client_->RegisterLocalMemory(
-        client_buffer_allocator_->getBase(), local_buffer_size,
-        kWildcardLocation, false, true);
-    if (!result.has_value()) {
-        LOG(ERROR) << "Failed to register local memory: "
-                   << toString(result.error());
-        return tl::unexpected(result.error());
+    if (local_buffer_size > 0) {
+        auto result = client_->RegisterLocalMemory(
+            client_buffer_allocator_->getBase(), local_buffer_size,
+            kWildcardLocation, false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to register local memory: "
+                    << toString(result.error());
+            return tl::unexpected(result.error());
+        }
+    } else {
+        LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
     // If global_segment_size is 0, skip mount segment;
@@ -265,6 +272,9 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
+    }
+    if (total_glbseg_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
     }
 
     return {};

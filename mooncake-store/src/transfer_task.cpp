@@ -325,7 +325,10 @@ void TransferEngineOperationState::wait_for_completion() {
 
 TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
     : state_(std::move(state)) {
-    CHECK(state_) << "TransferFuture requires valid state";
+    if (!state_) {
+        LOG(ERROR) << "TransferFuture requires valid state";
+        throw std::invalid_argument("TransferFuture requires valid state");
+    }
 }
 
 bool TransferFuture::isReady() const { return state_->is_completed(); }
@@ -354,7 +357,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)) {
-    CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
+    if (local_hostname_.empty()) {
+        LOG(ERROR) << "Local hostname cannot be empty";
+        throw std::invalid_argument("Local hostname cannot be empty");
+    }
 
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
