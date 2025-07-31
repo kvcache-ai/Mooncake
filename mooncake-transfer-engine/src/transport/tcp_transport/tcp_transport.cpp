@@ -138,6 +138,7 @@ struct Session : public std::enable_shared_from_this<Session> {
         char *dram_buffer = addr + total_transferred_bytes_;
 
 #ifdef USE_CUDA
+        LOG(INFO) << "Use CUDA!";
         dram_buffer = new char[buffer_size];
         cudaMemcpy(dram_buffer, addr + total_transferred_bytes_, buffer_size,
                    cudaMemcpyDefault);
@@ -145,12 +146,13 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         asio::async_write(
             socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, dram_buffer, self](const asio::error_code &ec,
+            [this, addr, dram_buffer, self](const asio::error_code &ec,
                                       std::size_t transferred_bytes) {
 #ifdef USE_CUDA
                 delete[] dram_buffer;
 #endif
                 if (ec) {
+                    LOG(INFO) << "Write address: " << addr << " -> " << dram_buffer << " failed";
                     LOG(ERROR)
                         << "Session::writeBody failed. Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
