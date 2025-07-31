@@ -138,7 +138,6 @@ struct Session : public std::enable_shared_from_this<Session> {
         char *dram_buffer = addr + total_transferred_bytes_;
 
 #ifdef USE_CUDA
-        LOG(INFO) << "Use CUDA!";
         dram_buffer = new char[buffer_size];
         cudaMemcpy(dram_buffer, addr + total_transferred_bytes_, buffer_size,
                    cudaMemcpyDefault);
