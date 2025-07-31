@@ -50,6 +50,19 @@ Errors in this part usually indicate that the error occurred within the `mooncak
     1. After starting, the log output usually includes several lines of log information like `RDMA device: XXX, LID: XXX, GID: (X) XX:XX:XX:...`. If the displayed GID address is all 0 (the bracket indicates GID Index), you need to choose the correct GID Index according to the network environment and specify it at startup using the `MC_GID_INDEX` environment variable.
     2. If the error `Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num` is displayed, first determine which party the error occurred on. If there is no prefix `Handshake request rejected by peer endpoint: `, it indicates that the problem comes from the party displaying the error. According to the error message, you need to check the MTU length configuration (adjust using the `MC_MTU` environment variable), whether your own and the other party's GID addresses are valid, etc. At the same time, if the two nodes cannot achieve physical connection, it may also be hang/interrupted at this step, please pay attention.
 
+4. If you encounter an error like `Failed to register memory 0x7efb94000000: Input/output error [5]`, this may indicate that RDMA memory registration has failed. This is usually caused by device limitations where some machines can only register a maximum of 64GB of memory. When the registration exceeds this limit, it will fail.
+
+   **Diagnostic Commands:**
+   - Use `ulimit -a` to check system limits, particularly the `max locked memory` value
+   - Use `ibv_devinfo -v` to check RDMA device capabilities, especially the `max_mr_size` field
+   - Use `dmesg -T` to view detailed failure logs, which may show messages like:
+     ```
+     [Wed Jul 30 11:49:18 2025] infiniband erdma_0: ERROR: Out of mr size: 0, max 68719476736
+     ```
+
+   **Solution:**
+   Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
+
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
 
