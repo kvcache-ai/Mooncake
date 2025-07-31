@@ -183,10 +183,35 @@ class MasterClient {
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<PingResponse, ErrorCode>
-    Ping(const UUID& client_id);
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping(
+        const UUID& client_id);
 
    private:
+    /**
+     * @brief Generic RPC invocation helper for single-result operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ReturnType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param args Arguments to pass to the RPC call
+     * @return The result of the RPC call
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        Args&&... args);
+
+    /**
+     * @brief Generic RPC invocation helper for batch operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ResultType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param input_size Size of input batch for error handling
+     * @param args Arguments to pass to the RPC call
+     * @return Vector of results from the batch RPC call
+     */
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc(size_t input_size, Args&&... args);
+
     /**
      * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
      * reconnect to a different address, a new coro_rpc_client is created if
