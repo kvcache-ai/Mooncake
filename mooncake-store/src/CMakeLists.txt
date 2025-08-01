@@ -51,6 +51,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    mooncake_common
     ${ETCD_WRAPPER_LIB}
 )
 if (STORE_USE_ETCD)

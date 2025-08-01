@@ -41,6 +41,7 @@ target_link_libraries(stress_workload_test PUBLIC
     mooncake_store
     cachelib_memory_allocator
     ${ETCD_WRAPPER_LIB}
+    mooncake_common
     glog
     gflags
     pthread
