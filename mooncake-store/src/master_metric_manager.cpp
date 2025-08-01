@@ -547,6 +547,8 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t put_start_fails = put_start_failures_.value();
     int64_t put_ends = put_end_requests_.value();
     int64_t put_end_fails = put_end_failures_.value();
+    int64_t put_revoke_requests = put_revoke_requests_.value();
+    int64_t put_revoke_fails = put_revoke_failures_.value();
     int64_t get_replicas = get_replica_list_requests_.value();
     int64_t get_replica_fails = get_replica_list_failures_.value();
     int64_t removes = remove_requests_.value();
@@ -578,8 +580,9 @@ std::string MasterMetricManager::get_summary_string() {
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
-    ss << "Put=" << put_starts - put_start_fails + put_ends - put_end_fails
-       << "/" << put_starts + put_ends << ", ";
+    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts << ", ";
+    ss << "PutEnd=" << put_ends - put_end_fails << "/" << put_ends << ", ";
+    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/" << put_revoke_requests << ", ";
     ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
        << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
