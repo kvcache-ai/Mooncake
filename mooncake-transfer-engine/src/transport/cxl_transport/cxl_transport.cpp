@@ -41,16 +41,18 @@ CxlTransport::CxlTransport() {
     // get from env
     const char* env_cxl_dev_path = std::getenv("MC_CXL_DEV_PATH");
 
-    LOG(INFO) << "MC_CXL_DEV_PATH: " << env_cxl_dev_path;
-
     if (env_cxl_dev_path) {
+        LOG(INFO) << "MC_CXL_DEV_PATH: " << env_cxl_dev_path;
         cxl_dev_path = (char *) env_cxl_dev_path;
         cxl_dev_size = cxlGetDeviceSize();
     }
 }
 
 CxlTransport::~CxlTransport() {
-    munmap(cxl_base_addr, cxl_dev_size);
+    if (cxl_base_addr != nullptr && cxl_base_addr != MAP_FAILED && 
+        cxl_dev_size != 0) {
+        munmap(cxl_base_addr, cxl_dev_size);
+    }
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
@@ -58,9 +60,8 @@ size_t CxlTransport::cxlGetDeviceSize() {
     // for now, get cxl_shm size from env
     const char* env_cxl_dev_size = std::getenv("MC_CXL_DEV_SIZE");
 
-    LOG(INFO) << "MC_CXL_DEV_SIZE: " << env_cxl_dev_size;
-
     if (env_cxl_dev_size) {
+        LOG(INFO) << "MC_CXL_DEV_SIZE: " << env_cxl_dev_size;
         char* end = nullptr;
         unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
         if (end != env_cxl_dev_size && *end == '\0')
@@ -128,8 +129,11 @@ bool CxlTransport::isAddressInCxlRange(void *addr) {
     return (ptr >= base && ptr < end);
 }
 
-int CxlTransport::cxlDevInit()
-{
+int CxlTransport::cxlDevInit() {
+    if (!cxl_dev_path || !cxl_dev_size) {
+        LOG(ERROR) << "CxlTransport: cxl_dev_path or cxl_dev_size is null.";
+        return -1;
+    }
     int fd = open(cxl_dev_path, O_RDWR);
     if (fd == -1) {
         LOG(ERROR) << "CxlTransport: Cannot open cxl device." << strerror(errno);
