@@ -7,7 +7,7 @@ rpc_address: "0.0.0.0"
 rpc_conn_timeout_seconds: 0
 rpc_enable_tcp_no_delay: true
 
-default_kv_lease_ttl: 200
+default_kv_lease_ttl: 5000
 default_kv_soft_pin_ttl: 1800000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1

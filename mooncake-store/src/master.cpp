@@ -72,47 +72,56 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
-    default_config.GetBool("enable_gc", &master_config.enable_gc, false);
+    default_config.GetBool("enable_gc", &master_config.enable_gc,
+                           FLAGS_enable_gc);
     default_config.GetBool("enable_metric_reporting",
-                           &master_config.enable_metric_reporting, true);
-    default_config.GetUInt32("metrics_port", &master_config.metrics_port, 9003);
-    default_config.GetUInt32("rpc_port", &master_config.rpc_port, 50051);
+                           &master_config.enable_metric_reporting,
+                           FLAGS_enable_metric_reporting);
+    default_config.GetUInt32("metrics_port", &master_config.metrics_port,
+                             FLAGS_metrics_port);
+    default_config.GetUInt32("rpc_port", &master_config.rpc_port,
+                             FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
-                             4);
+                             FLAGS_rpc_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
-                             "0.0.0.0");
+                             FLAGS_rpc_address);
     default_config.GetInt32("rpc_conn_timeout_seconds",
-                            &master_config.rpc_conn_timeout_seconds, 0);
+                            &master_config.rpc_conn_timeout_seconds,
+                            FLAGS_rpc_conn_timeout_seconds);
     default_config.GetBool("rpc_enable_tcp_no_delay",
-                           &master_config.rpc_enable_tcp_no_delay, true);
+                           &master_config.rpc_enable_tcp_no_delay,
+                           FLAGS_rpc_enable_tcp_no_delay);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
-                             mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
+                             FLAGS_default_kv_lease_ttl);
     default_config.GetUInt64("default_kv_soft_pin_ttl",
                              &master_config.default_kv_soft_pin_ttl,
-                             mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS);
+                             FLAGS_default_kv_soft_pin_ttl);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
-                           mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS);
+                           FLAGS_allow_evict_soft_pinned_objects);
     default_config.GetDouble("eviction_ratio", &master_config.eviction_ratio,
-                             mooncake::DEFAULT_EVICTION_RATIO);
+                             FLAGS_eviction_ratio);
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
-                             mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
+                             FLAGS_eviction_high_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
-                            mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC);
+                            FLAGS_client_ttl);
 
-    default_config.GetBool("enable_ha", &master_config.enable_ha, false);
+    default_config.GetBool("enable_ha", &master_config.enable_ha,
+                           FLAGS_enable_ha);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
-                             "");
+                             FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
-                             mooncake::DEFAULT_CLUSTER_ID);
+                             FLAGS_cluster_id);
     default_config.GetString("memory_allocator",
-                             &master_config.memory_allocator, "offset");
+                             &master_config.memory_allocator,
+                             FLAGS_memory_allocator);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
