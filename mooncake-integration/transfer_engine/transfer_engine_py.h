@@ -133,12 +133,12 @@ class TransferEnginePy {
     }
 
     // FOR EXPERIMENT ONLY
-    int registerMemory(uintptr_t buffer_addr, size_t capacity);
+    int registerMemory(uintptr_t buffer_addr, size_t capacity, const std::string &location = kWildcardLocation);
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
-    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities, const std::string &location = kWildcardLocation);
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 

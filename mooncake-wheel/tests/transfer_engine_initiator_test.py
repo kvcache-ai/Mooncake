@@ -1,6 +1,14 @@
 import unittest
+import ctypes
 import os
+import random
+import string
 from mooncake.engine import TransferEngine
+
+
+def generate_random_string(length):
+    chars = string.ascii_letters + string.digits + string.punctuation
+    return ''.join(random.choices(chars, k=length))
 
 
 class TestVLLMAdaptorTransfer(unittest.TestCase):
@@ -24,11 +32,6 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
 
     def test_random_write_circle_times(self):
         """Test circle times of random string write/read via buffer transfer."""
-        import random, string
-
-        def generate_random_string(length):
-            chars = string.ascii_letters + string.digits + string.punctuation
-            return ''.join(random.choices(chars, k=length))
 
         adaptor = self.adaptor
         circles = self.circle
@@ -70,11 +73,6 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
 
     def test_batch_write_read(self):
         """Test batch_transfer_sync_write and batch_transfer_sync_read for batch write/read consistency."""
-        import random, string
-
-        def generate_random_string(length):
-            chars = string.ascii_letters + string.digits + string.punctuation
-            return ''.join(random.choices(chars, k=length))
 
         adaptor = self.adaptor
         batch_size = 100  # Adjust batch size if needed
@@ -133,11 +131,6 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
 
     def test_async_batch_write_read(self):
         """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
-        import random, string
-
-        def generate_random_string(length):
-            chars = string.ascii_letters + string.digits + string.punctuation
-            return ''.join(random.choices(chars, k=length))
 
         adaptor = self.adaptor
         batch_size = 100  # Adjust batch size if needed
@@ -199,6 +192,64 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
                 self.assertEqual(read_back, data_list[j], f"[{i}-{j}] Data mismatch in batch read")
 
         print(f"[✓] {circles} rounds of batch_write_async_read passed, batch size {batch_size}.")
+
+    def run_test_register_memory(self, dst_addr, with_location):
+        adaptor = self.adaptor
+        circles = self.circle
+        buffer_size = 10 * 1024
+        buffer = ctypes.create_string_buffer(buffer_size)
+        buffer_addr = ctypes.addressof(buffer)
+
+        if with_location:
+            adaptor.register_memory(buffer_addr, buffer_size, "cpu")
+        else:
+            adaptor.register_memory(buffer_addr, buffer_size)
+
+        try:
+            for i in range(circles):
+                str_len = random.randint(16, 256)
+                src_data = generate_random_string(str_len).encode('utf-8')
+                data_len = len(src_data)
+                offset = random.randint(0, 1024)
+                assert offset + data_len <= buffer_size
+                buffer[offset:offset + data_len] = src_data
+
+                #Write to the remote end
+                result = adaptor.transfer_sync_write(
+                    self.target_server_name, buffer_addr + offset, dst_addr, data_len
+                )
+                self.assertEqual(result, 0, f"[{i}] WRITE transferSyncExt failed")
+
+                #Clear the local buffer
+                clear_data = bytes([0] * data_len)
+                buffer[offset:offset + data_len] = clear_data
+
+                #Read it back from the remote end
+                dst_offset = random.randint(0, 1024)
+                assert dst_offset + data_len <= buffer_size
+
+                result = adaptor.transfer_sync_read(
+                    self.target_server_name, buffer_addr + dst_offset, dst_addr, data_len
+                )
+                self.assertEqual(result, 0, f"[{i}] READ transferSyncExt failed")
+
+                #Verify data consistency
+                read_back = bytes(buffer[dst_offset:dst_offset + data_len])
+                self.assertEqual(read_back, src_data, f"[{i}] Data mismatch")
+
+                #Clear the local buffer
+                buffer[dst_offset:dst_offset + data_len] = clear_data
+            print(f"[✓] {circles} iterations of random write-read with custom buffer passed successfully ({with_location=}).")
+        finally:
+            adaptor.unregister_memory(buffer_addr)
+
+    def test_register_memory(self):
+        adaptor = self.adaptor
+        dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+
+        for with_location in [False, True]:
+            self.run_test_register_memory(dst_addr, with_location)
+
 
 if __name__ == '__main__':
     unittest.main()
