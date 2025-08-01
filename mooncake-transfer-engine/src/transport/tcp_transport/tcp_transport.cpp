@@ -45,6 +45,16 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
+#ifdef USE_CUDA
+static bool isCudaMemory(void *addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return false;
+    if (attributes.type == cudaMemoryTypeDevice) return true;
+    return false;
+}
+#endif
+
 struct Session : public std::enable_shared_from_this<Session> {
     explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
 
@@ -138,9 +148,11 @@ struct Session : public std::enable_shared_from_this<Session> {
         char *dram_buffer = addr + total_transferred_bytes_;
 
 #ifdef USE_CUDA
-        dram_buffer = new char[buffer_size];
-        cudaMemcpy(dram_buffer, addr + total_transferred_bytes_, buffer_size,
-                   cudaMemcpyDefault);
+        if (isCudaMemory(addr)) {
+            dram_buffer = new char[buffer_size];
+            cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                       buffer_size, cudaMemcpyDefault);
+        }
 #endif
 
         asio::async_write(
@@ -185,13 +197,18 @@ struct Session : public std::enable_shared_from_this<Session> {
         char *dram_buffer = addr + total_transferred_bytes_;
 
 #ifdef USE_CUDA
-        dram_buffer = new char[buffer_size];
+        bool is_cuda_memory = isCudaMemory(addr);
+        if (is_cuda_memory) {
+            dram_buffer = new char[buffer_size];
+        }
+#else
+        bool is_cuda_memory = false;
 #endif
 
         asio::async_read(
             socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code &ec,
-                                            std::size_t transferred_bytes) {
+            [this, addr, dram_buffer, is_cuda_memory, self](
+                const asio::error_code &ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
                         << "Session::readBody failed. "
@@ -203,7 +220,7 @@ struct Session : public std::enable_shared_from_this<Session> {
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
 #ifdef USE_CUDA
-                    delete[] dram_buffer;
+                    if (is_cuda_memory) delete[] dram_buffer;
 #endif
                     session_mutex_.unlock();
                     return;
@@ -211,7 +228,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 #ifdef USE_CUDA
                 cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                            transferred_bytes, cudaMemcpyDefault);
-                delete[] dram_buffer;
+                if (is_cuda_memory) delete[] dram_buffer;
 #endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
