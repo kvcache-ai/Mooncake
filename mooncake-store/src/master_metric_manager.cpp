@@ -95,28 +95,73 @@ MasterMetricManager::MasterMetricManager()
       batch_exist_key_failures_(
           "master_batch_exist_key_failures_total",
           "Total number of failed BatchExistKey requests"),
+      batch_exist_key_partial_successes_(
+          "master_batch_exist_key_partial_successes_total",
+          "Total number of partially successful BatchExistKey requests"),
+      batch_exist_key_items_(
+          "master_batch_exist_key_items_total",
+          "Total number of items processed in BatchExistKey requests"),
+      batch_exist_key_failed_items_(
+          "master_batch_exist_key_failed_items_total",
+          "Total number of failed items in BatchExistKey requests"),
       batch_get_replica_list_requests_(
           "master_batch_get_replica_list_requests_total",
           "Total number of BatchGetReplicaList requests received"),
       batch_get_replica_list_failures_(
           "master_batch_get_replica_list_failures_total",
           "Total number of failed BatchGetReplicaList requests"),
+      batch_get_replica_list_partial_successes_(
+          "master_batch_get_replica_list_partial_successes_total",
+          "Total number of partially successful BatchGetReplicaList requests"),
+      batch_get_replica_list_items_(
+          "master_batch_get_replica_list_items_total",
+          "Total number of items processed in BatchGetReplicaList requests"),
+      batch_get_replica_list_failed_items_(
+          "master_batch_get_replica_list_failed_items_total",
+          "Total number of failed items in BatchGetReplicaList requests"),
       batch_put_start_requests_(
           "master_batch_put_start_requests_total",
           "Total number of BatchPutStart requests received"),
       batch_put_start_failures_(
           "master_batch_put_start_failures_total",
           "Total number of failed BatchPutStart requests"),
+      batch_put_start_partial_successes_(
+          "master_batch_put_start_partial_successes_total",
+          "Total number of partially successful BatchPutStart requests"),
+      batch_put_start_items_(
+          "master_batch_put_start_items_total",
+          "Total number of items processed in BatchPutStart requests"),
+      batch_put_start_failed_items_(
+          "master_batch_put_start_failed_items_total",
+          "Total number of failed items in BatchPutStart requests"),
       batch_put_end_requests_("master_batch_put_end_requests_total",
                               "Total number of BatchPutEnd requests received"),
       batch_put_end_failures_("master_batch_put_end_failures_total",
                               "Total number of failed BatchPutEnd requests"),
+      batch_put_end_partial_successes_(
+          "master_batch_put_end_partial_successes_total",
+          "Total number of partially successful BatchPutEnd requests"),
+      batch_put_end_items_(
+          "master_batch_put_end_items_total",
+          "Total number of items processed in BatchPutEnd requests"),
+      batch_put_end_failed_items_(
+          "master_batch_put_end_failed_items_total",
+          "Total number of failed items in BatchPutEnd requests"),
       batch_put_revoke_requests_(
           "master_batch_put_revoke_requests_total",
           "Total number of BatchPutRevoke requests received"),
       batch_put_revoke_failures_(
           "master_batch_put_revoke_failures_total",
           "Total number of failed BatchPutRevoke requests"),
+      batch_put_revoke_partial_successes_(
+          "master_batch_put_revoke_partial_successes_total",
+          "Total number of partially successful BatchPutRevoke requests"),
+      batch_put_revoke_items_(
+          "master_batch_put_revoke_items_total",
+          "Total number of items processed in BatchPutRevoke requests"),
+      batch_put_revoke_failed_items_(
+          "master_batch_put_revoke_failed_items_total",
+          "Total number of failed items in BatchPutRevoke requests"),
 
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
@@ -265,35 +310,80 @@ void MasterMetricManager::inc_ping_failures(int64_t val) {
 }
 
 // Batch Operation Statistics (Counters)
-void MasterMetricManager::inc_batch_exist_key_requests(int64_t val) {
+void MasterMetricManager::inc_batch_exist_key_requests(int64_t items,
+                                                       int64_t val) {
     batch_exist_key_requests_.inc(val);
+    batch_exist_key_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_exist_key_failures(int64_t val) {
+void MasterMetricManager::inc_batch_exist_key_failures(int64_t failed_items,
+                                                        int64_t val) {
     batch_exist_key_failures_.inc(val);
+    batch_exist_key_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t val) {
+void MasterMetricManager::inc_batch_exist_key_partial_success(
+    int64_t failed_items, int64_t val) {
+    batch_exist_key_partial_successes_.inc(val);
+    batch_exist_key_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items,
+                                                              int64_t val) {
     batch_get_replica_list_requests_.inc(val);
+    batch_get_replica_list_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t val) {
+void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t failed_items,
+                                                               int64_t val) {
     batch_get_replica_list_failures_.inc(val);
+    batch_get_replica_list_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_start_requests(int64_t val) {
+void MasterMetricManager::inc_batch_get_replica_list_partial_success(
+    int64_t failed_items, int64_t val) {
+    batch_get_replica_list_partial_successes_.inc(val);
+    batch_get_replica_list_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_put_start_requests(int64_t items,
+                                                       int64_t val) {
     batch_put_start_requests_.inc(val);
+    batch_put_start_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_start_failures(int64_t val) {
+void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items,
+                                                        int64_t val) {
     batch_put_start_failures_.inc(val);
+    batch_put_start_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_end_requests(int64_t val) {
+void MasterMetricManager::inc_batch_put_start_partial_success(
+    int64_t failed_items, int64_t val) {
+    batch_put_start_partial_successes_.inc(val);
+    batch_put_start_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_put_end_requests(int64_t items,
+                                                     int64_t val) {
     batch_put_end_requests_.inc(val);
+    batch_put_end_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_end_failures(int64_t val) {
+void MasterMetricManager::inc_batch_put_end_failures(int64_t failed_items,
+                                                      int64_t val) {
     batch_put_end_failures_.inc(val);
+    batch_put_end_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_revoke_requests(int64_t val) {
+void MasterMetricManager::inc_batch_put_end_partial_success(
+    int64_t failed_items, int64_t val) {
+    batch_put_end_partial_successes_.inc(val);
+    batch_put_end_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_put_revoke_requests(int64_t items,
+                                                        int64_t val) {
     batch_put_revoke_requests_.inc(val);
+    batch_put_revoke_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_revoke_failures(int64_t val) {
+void MasterMetricManager::inc_batch_put_revoke_failures(int64_t failed_items,
+                                                         int64_t val) {
     batch_put_revoke_failures_.inc(val);
+    batch_put_revoke_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_put_revoke_partial_success(
+    int64_t failed_items, int64_t val) {
+    batch_put_revoke_partial_successes_.inc(val);
+    batch_put_revoke_failed_items_.inc(failed_items);
 }
 
 int64_t MasterMetricManager::get_put_start_requests() {
@@ -392,12 +482,36 @@ int64_t MasterMetricManager::get_batch_exist_key_failures() {
     return batch_exist_key_failures_.value();
 }
 
+int64_t MasterMetricManager::get_batch_exist_key_partial_successes() {
+    return batch_exist_key_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_exist_key_items() {
+    return batch_exist_key_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_exist_key_failed_items() {
+    return batch_exist_key_failed_items_.value();
+}
+
 int64_t MasterMetricManager::get_batch_get_replica_list_requests() {
     return batch_get_replica_list_requests_.value();
 }
 
 int64_t MasterMetricManager::get_batch_get_replica_list_failures() {
     return batch_get_replica_list_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_partial_successes() {
+    return batch_get_replica_list_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_items() {
+    return batch_get_replica_list_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_replica_list_failed_items() {
+    return batch_get_replica_list_failed_items_.value();
 }
 
 int64_t MasterMetricManager::get_batch_put_start_requests() {
@@ -408,6 +522,18 @@ int64_t MasterMetricManager::get_batch_put_start_failures() {
     return batch_put_start_failures_.value();
 }
 
+int64_t MasterMetricManager::get_batch_put_start_partial_successes() {
+    return batch_put_start_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_items() {
+    return batch_put_start_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_failed_items() {
+    return batch_put_start_failed_items_.value();
+}
+
 int64_t MasterMetricManager::get_batch_put_end_requests() {
     return batch_put_end_requests_.value();
 }
@@ -416,12 +542,36 @@ int64_t MasterMetricManager::get_batch_put_end_failures() {
     return batch_put_end_failures_.value();
 }
 
+int64_t MasterMetricManager::get_batch_put_end_partial_successes() {
+    return batch_put_end_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_items() {
+    return batch_put_end_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_end_failed_items() {
+    return batch_put_end_failed_items_.value();
+}
+
 int64_t MasterMetricManager::get_batch_put_revoke_requests() {
     return batch_put_revoke_requests_.value();
 }
 
 int64_t MasterMetricManager::get_batch_put_revoke_failures() {
     return batch_put_revoke_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_partial_successes() {
+    return batch_put_revoke_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_items() {
+    return batch_put_revoke_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_revoke_failed_items() {
+    return batch_put_revoke_failed_items_.value();
 }
 
 // Eviction Metrics
@@ -556,6 +706,33 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
 
+    // Batch request counters
+    int64_t batch_put_start_requests = batch_put_start_requests_.value();
+    int64_t batch_put_start_fails = batch_put_start_failures_.value();
+    int64_t batch_put_start_partial_successes = batch_put_start_partial_successes_.value();
+    int64_t batch_put_start_items = batch_put_start_items_.value();
+    int64_t batch_put_start_failed_items = batch_put_start_failed_items_.value();
+    int64_t batch_put_end_requests = batch_put_end_requests_.value();
+    int64_t batch_put_end_fails = batch_put_end_failures_.value();
+    int64_t batch_put_end_partial_successes = batch_put_end_partial_successes_.value();
+    int64_t batch_put_end_items = batch_put_end_items_.value();
+    int64_t batch_put_end_failed_items = batch_put_end_failed_items_.value();
+    int64_t batch_put_revoke_requests = batch_put_revoke_requests_.value();
+    int64_t batch_put_revoke_fails = batch_put_revoke_failures_.value();
+    int64_t batch_put_revoke_partial_successes = batch_put_revoke_partial_successes_.value();
+    int64_t batch_put_revoke_items = batch_put_revoke_items_.value();
+    int64_t batch_put_revoke_failed_items = batch_put_revoke_failed_items_.value();
+    int64_t batch_get_replica_list_requests = batch_get_replica_list_requests_.value();
+    int64_t batch_get_replica_list_fails = batch_get_replica_list_failures_.value();
+    int64_t batch_get_replica_list_partial_successes = batch_get_replica_list_partial_successes_.value();
+    int64_t batch_get_replica_list_items = batch_get_replica_list_items_.value();
+    int64_t batch_get_replica_list_failed_items = batch_get_replica_list_failed_items_.value();
+    int64_t batch_exist_key_requests = batch_exist_key_requests_.value();
+    int64_t batch_exist_key_fails = batch_exist_key_failures_.value();
+    int64_t batch_exist_key_partial_successes = batch_exist_key_partial_successes_.value();
+    int64_t batch_exist_key_items = batch_exist_key_items_.value();
+    int64_t batch_exist_key_failed_items = batch_exist_key_failed_items_.value();
+
     // Eviction counters
     int64_t eviction_success = eviction_success_.value();
     int64_t eviction_attempts = eviction_attempts_.value();
@@ -592,6 +769,45 @@ std::string MasterMetricManager::get_summary_string() {
     if (enable_ha_) {
         ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
     }
+
+    // Batch request summary
+    ss << " | Batch Requests "
+          "(Success/PartialSuccess/Total/SuccessItems/TotalItems): ";
+    ss << "PutStart="
+       << batch_put_start_requests - batch_put_start_fails -
+              batch_put_start_partial_successes
+       << "/" << batch_put_start_partial_successes << "/"
+       << batch_put_start_requests << "/"
+       << batch_put_start_items - batch_put_start_failed_items << "/"
+       << batch_put_start_items << ", ";
+    ss << "PutEnd="
+       << batch_put_end_requests - batch_put_end_fails -
+              batch_put_end_partial_successes
+       << "/" << batch_put_end_partial_successes << "/"
+       << batch_put_end_requests << "/"
+       << batch_put_end_items - batch_put_end_failed_items << "/"
+       << batch_put_end_items << ", ";
+    ss << "PutRevoke="
+       << batch_put_revoke_requests - batch_put_revoke_fails -
+              batch_put_revoke_partial_successes
+       << "/" << batch_put_revoke_partial_successes << "/"
+       << batch_put_revoke_requests << "/"
+       << batch_put_revoke_items - batch_put_revoke_failed_items << "/"
+       << batch_put_revoke_items << ", ";
+    ss << "Get="
+       << batch_get_replica_list_requests - batch_get_replica_list_fails -
+              batch_get_replica_list_partial_successes
+       << "/" << batch_get_replica_list_partial_successes << "/"
+       << batch_get_replica_list_requests << "/"
+       << batch_get_replica_list_items - batch_get_replica_list_failed_items
+       << "/" << batch_get_replica_list_items << ", ";
+    ss << "ExistKey="
+       << batch_exist_key_requests - batch_exist_key_fails -
+              batch_exist_key_partial_successes
+       << "/" << batch_exist_key_partial_successes << "/"
+       << batch_exist_key_requests << "/"
+       << batch_exist_key_items - batch_exist_key_failed_items << "/"
+       << batch_exist_key_items << ", ";
 
     // Eviction summary
     ss << " | Eviction: "
