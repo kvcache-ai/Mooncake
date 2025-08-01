@@ -126,20 +126,23 @@ uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
 }
 
 // __Allocator...
-__Allocator::__Allocator(uint32 size, uint32 maxAllocs)
+__Allocator::__Allocator(uint32 size, uint32 init_capacity,
+                         uint32 max_capacity)
     : m_size(size),
-      m_maxAllocs(maxAllocs),
+      m_current_capacity(init_capacity),
+      m_max_capacity(std::max(init_capacity, max_capacity)),
       m_nodes(nullptr),
       m_freeNodes(nullptr) {
     if (sizeof(NodeIndex) == 2) {
-        ASSERT(maxAllocs <= 65536);
+        ASSERT(m_max_capacity <= 65536);
     }
     reset();
 }
 
 __Allocator::__Allocator(__Allocator&& other)
     : m_size(other.m_size),
-      m_maxAllocs(other.m_maxAllocs),
+      m_current_capacity(other.m_current_capacity),
+      m_max_capacity(other.m_max_capacity),
       m_freeStorage(other.m_freeStorage),
       m_usedBinsTop(other.m_usedBinsTop),
       m_nodes(other.m_nodes),
@@ -151,14 +154,15 @@ __Allocator::__Allocator(__Allocator&& other)
     other.m_nodes = nullptr;
     other.m_freeNodes = nullptr;
     other.m_freeOffset = 0;
-    other.m_maxAllocs = 0;
+    other.m_current_capacity = 0;
+    other.m_max_capacity = 0;
     other.m_usedBinsTop = 0;
 }
 
 void __Allocator::reset() {
     m_freeStorage = 0;
     m_usedBinsTop = 0;
-    m_freeOffset = m_maxAllocs - 1;
+    m_freeOffset = 0;
 
     for (uint32 i = 0; i < NUM_TOP_BINS; i++) m_usedBins[i] = 0;
 
@@ -167,12 +171,12 @@ void __Allocator::reset() {
     if (m_nodes) delete[] m_nodes;
     if (m_freeNodes) delete[] m_freeNodes;
 
-    m_nodes = new Node[m_maxAllocs];
-    m_freeNodes = new NodeIndex[m_maxAllocs];
+    m_nodes = new Node[m_max_capacity];
+    m_freeNodes = new NodeIndex[m_max_capacity];
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
-    for (uint32 i = 0; i < m_maxAllocs; i++) {
-        m_freeNodes[i] = m_maxAllocs - i - 1;
+    for (uint32 i = 0; i < m_current_capacity; i++) {
+        m_freeNodes[i] = i;
     }
 
     // Start state: Whole storage as one big node
@@ -187,9 +191,13 @@ __Allocator::~__Allocator() {
 
 OffsetAllocation __Allocator::allocate(uint32 size) {
     // Out of allocations?
-    if (m_freeOffset == 0) {
+    if (m_freeOffset == m_max_capacity) {
         return {.offset = OffsetAllocation::NO_SPACE,
                 .metadata = OffsetAllocation::NO_SPACE};
+    }
+    if (m_freeOffset == m_current_capacity) {
+        m_freeNodes[m_current_capacity] = m_current_capacity;
+        m_current_capacity++;
     }
 
     // Round up to bin index to ensure that alloc >= bin
@@ -328,9 +336,9 @@ void __Allocator::free(OffsetAllocation allocation) {
     // Insert the removed node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (free)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     // Insert the (combined) free node to bin
     uint32 combinedNodeIndex = insertNodeIntoBin(size, offset);
@@ -363,9 +371,9 @@ uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
     // Take a freelist node and insert on top of the bin linked list (next = old
     // top)
     uint32 topNodeIndex = m_binIndices[binIndex];
-    uint32 nodeIndex = m_freeNodes[m_freeOffset--];
+    uint32 nodeIndex = m_freeNodes[m_freeOffset++];
 #ifdef DEBUG_VERBOSE
-    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset + 1);
+    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset - 1);
 #endif
     m_nodes[nodeIndex] = {.dataOffset = dataOffset,
                           .dataSize = size,
@@ -420,9 +428,9 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
     // Insert the node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (removeNodeFromBin)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     m_freeStorage -= node.dataSize;
 #ifdef DEBUG_VERBOSE
@@ -443,7 +451,7 @@ OffsetAllocStorageReport __Allocator::storageReport() const {
     uint32 freeStorage = 0;
 
     // Out of allocations? -> Zero free space
-    if (m_freeOffset > 0) {
+    if (m_freeOffset < m_current_capacity) {
         freeStorage = m_freeStorage;
         if (m_usedBinsTop) {
             uint32 topBinIndex = 31 - lzcnt_nonzero(m_usedBinsTop);
@@ -536,15 +544,18 @@ static uint64_t calculateMultiplier(size_t size) {
 // Thread-safe OffsetAllocator implementation
 std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
                                                          size_t size,
-                                                         uint32 maxAllocs) {
+                                                         uint32 init_capacity,
+                                                         uint32 max_capacity) {
     // Use a custom deleter to allow private constructor
     return std::shared_ptr<OffsetAllocator>(
-        new OffsetAllocator(base, size, maxAllocs));
+        new OffsetAllocator(base, size, init_capacity, max_capacity));
 }
 
-OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
+OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
+                                 uint32 init_capacity, uint32 max_capacity)
     : m_base(base), m_multiplier(calculateMultiplier(size)), m_capacity(size) {
-    m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
+    m_allocator = std::make_unique<__Allocator>(size / m_multiplier,
+                                                init_capacity, max_capacity);
 }
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {

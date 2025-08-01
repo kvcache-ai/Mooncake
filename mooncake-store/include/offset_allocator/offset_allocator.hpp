@@ -100,17 +100,22 @@ std::ostream& operator<<(std::ostream& os,
 // Wrapper class for __Allocator, it 1) supports thread-safe allocation and
 // deallocation, 2) supports creating a buffer or allocating a memory region
 // that is larger than the largest bin size (3.75GB). The __allocator class is
-// also optimized to round up the allocated size to a bin size. This will
-// a) slightly decrease the memory utilization ratio in general cases, b) makes
-// no difference when the allocated size is equal to a bin size, c) largely
-// improve the memory utilization ratio when the allocated size is mostly
-// uniform and not equal to any bin size.
+// also optimized to:
+// 1) round up the allocated size to a bin size. This will a) slightly decrease
+// the memory utilization ratio in general cases, b) makes no difference when
+// the allocated size is equal to a bin size, c) largely improve the memory
+// utilization ratio when the allocated size is mostly uniform and not equal to
+// any bin size.
+// 2) dynamically adjust the capacity of the allocator to the allocated size.
+// This will a) reduce the memory consumption in general cases, b) auto
+// increase the capacity in case there are a lot of small regions to be
+// allocated.
 class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
    public:
     // Factory method to create shared_ptr<OffsetAllocator>
-    static std::shared_ptr<OffsetAllocator> create(uint64_t base, size_t size,
-                                                   uint32 maxAllocs = 128 *
-                                                                      1024);
+    static std::shared_ptr<OffsetAllocator> create(
+        uint64_t base, size_t size, uint32 init_capacity = 128 * 1024,
+        uint32 max_capacity = (1 << 20));
 
     // Disable copy constructor and copy assignment
     OffsetAllocator(const OffsetAllocator&) = delete;
@@ -162,12 +167,13 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
 
     // Private constructor - use create() factory method instead
-    OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024);
+    OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
+        uint32 max_capacity);
 };
 
 class __Allocator {
    public:
-    __Allocator(uint32 size, uint32 maxAllocs = 128 * 1024);
+    __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
     __Allocator(__Allocator&& other);
     ~__Allocator();
     void reset();
@@ -196,7 +202,8 @@ class __Allocator {
     };
 
     uint32 m_size;
-    uint32 m_maxAllocs;
+    uint32 m_current_capacity;
+    uint32 m_max_capacity;
     uint32 m_freeStorage;
 
     uint32 m_usedBinsTop;
