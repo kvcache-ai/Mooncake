@@ -158,7 +158,7 @@ __Allocator::__Allocator(__Allocator&& other)
 void __Allocator::reset() {
     m_freeStorage = 0;
     m_usedBinsTop = 0;
-    m_freeOffset = m_maxAllocs - 1;
+    m_freeOffset = 0;
 
     for (uint32 i = 0; i < NUM_TOP_BINS; i++) m_usedBins[i] = 0;
 
@@ -172,7 +172,7 @@ void __Allocator::reset() {
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
     for (uint32 i = 0; i < m_maxAllocs; i++) {
-        m_freeNodes[i] = m_maxAllocs - i - 1;
+        m_freeNodes[i] = i;
     }
 
     // Start state: Whole storage as one big node
@@ -187,7 +187,7 @@ __Allocator::~__Allocator() {
 
 OffsetAllocation __Allocator::allocate(uint32 size) {
     // Out of allocations?
-    if (m_freeOffset == 0) {
+    if (m_freeOffset == m_maxAllocs) {
         return {.offset = OffsetAllocation::NO_SPACE,
                 .metadata = OffsetAllocation::NO_SPACE};
     }
@@ -328,9 +328,9 @@ void __Allocator::free(OffsetAllocation allocation) {
     // Insert the removed node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (free)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     // Insert the (combined) free node to bin
     uint32 combinedNodeIndex = insertNodeIntoBin(size, offset);
@@ -363,9 +363,9 @@ uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
     // Take a freelist node and insert on top of the bin linked list (next = old
     // top)
     uint32 topNodeIndex = m_binIndices[binIndex];
-    uint32 nodeIndex = m_freeNodes[m_freeOffset--];
+    uint32 nodeIndex = m_freeNodes[m_freeOffset++];
 #ifdef DEBUG_VERBOSE
-    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset + 1);
+    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset - 1);
 #endif
     m_nodes[nodeIndex] = {.dataOffset = dataOffset,
                           .dataSize = size,
@@ -420,9 +420,9 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
     // Insert the node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (removeNodeFromBin)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     m_freeStorage -= node.dataSize;
 #ifdef DEBUG_VERBOSE
@@ -443,7 +443,7 @@ OffsetAllocStorageReport __Allocator::storageReport() const {
     uint32 freeStorage = 0;
 
     // Out of allocations? -> Zero free space
-    if (m_freeOffset > 0) {
+    if (m_freeOffset < m_maxAllocs) {
         freeStorage = m_freeStorage;
         if (m_usedBinsTop) {
             uint32 topBinIndex = 31 - lzcnt_nonzero(m_usedBinsTop);
