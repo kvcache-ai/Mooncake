@@ -54,7 +54,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 
 option(BUILD_EXAMPLES "Build examples" ON)
 
-option(BUILD_UNIT_TESTS "Build uint tests" ON)
+option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
@@ -68,7 +68,7 @@ option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
-
+option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -143,6 +143,10 @@ endif()
 if(USE_3FS)
   add_compile_definitions(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
+endif()
+
+if(WITH_NVIDIA_PEERMEM)
+  add_compile_definitions(WITH_NVIDIA_PEERMEM)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
