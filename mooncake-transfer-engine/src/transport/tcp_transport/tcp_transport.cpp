@@ -146,14 +146,15 @@ struct Session : public std::enable_shared_from_this<Session> {
         asio::async_write(
             socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code &ec,
-                                      std::size_t transferred_bytes) {
+                                            std::size_t transferred_bytes) {
 #ifdef USE_CUDA
                 delete[] dram_buffer;
 #endif
                 if (ec) {
-                    LOG(INFO) << "Write address: " << addr << " -> " << dram_buffer << " failed";
                     LOG(ERROR)
-                        << "Session::writeBody failed. Error: " << ec.message()
+                        << "Session::writeBody failed. "
+                        << "Attempt to write data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -193,7 +194,9 @@ struct Session : public std::enable_shared_from_this<Session> {
                                             std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::readBody failed. Error: " << ec.message()
+                        << "Session::readBody failed. "
+                        << "Attempt to read data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -277,7 +280,7 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    close(sockfd); // the above function has opened a socket
+    close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
     running_ = true;
