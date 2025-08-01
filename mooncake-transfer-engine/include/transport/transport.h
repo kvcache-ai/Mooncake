@@ -116,9 +116,7 @@ class Transport {
                 const char *file_path;
             } nvmeof;
             struct {
-                void *remote_filename;
-                void *remote_addr;
-                size_t remote_offset;
+                void *dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
