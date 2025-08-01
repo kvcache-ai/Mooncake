@@ -12,6 +12,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
+#include "config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -132,6 +133,26 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
     return whitelst_filters;
 }
 
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
+                                                       size_t length) {
+    if (addr == nullptr) {
+        LOG(ERROR) << "addr is nullptr";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (length == 0) {
+        LOG(ERROR) << "length is 0";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Tcp is not limited by max_mr_size, but we ignore it for now.
+    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
+    if (length > max_mr_size) {
+        LOG(ERROR) << "length " << length
+                   << " is larger than max_mr_size: " << max_mr_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
     if (master_server_entry.find("etcd://") == 0) {
         std::string etcd_entry = master_server_entry.substr(strlen("etcd://"));
@@ -199,7 +220,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
         LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
         return ErrorCode::INVALID_PARAMS;
     }
-    CHECK(transport) << "Failed to install transport";
+    if (!transport) {
+        LOG(ERROR) << "Failed to install transport";
+        return ErrorCode::INTERNAL_ERROR;
+    }
 
     // Initialize TransferSubmitter after transfer engine is ready
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
@@ -363,7 +387,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
 
     // Validate input size consistency
     if (replica_lists.size() != object_keys.size()) {
@@ -624,7 +656,13 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
-    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        for (auto& op : ops) {
+            op.SetError(ErrorCode::INVALID_PARAMS, "TransferSubmitter not initialized");
+        }
+        return;
+    }
 
     for (auto& op : ops) {
         // Skip operations that already failed in previous stages
@@ -905,12 +943,9 @@ tl::expected<long, ErrorCode> Client::RemoveAll() {
 
 tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
                                                    size_t size) {
-    if (buffer == nullptr || size == 0 ||
-        reinterpret_cast<uintptr_t>(buffer) % facebook::cachelib::Slab::kSize ||
-        size % facebook::cachelib::Slab::kSize) {
-        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is not aligned to " << facebook::cachelib::Slab::kSize;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
     }
 
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -1000,6 +1035,10 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
+    auto check_result = CheckRegisterMemoryParams(addr, length);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
+    }
     if (this->transfer_engine_.registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1101,7 +1140,10 @@ void Client::PutToLocalFile(const std::string& key,
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
-    CHECK(transfer_submitter_) << "TransferSubmitter not initialized";
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     auto future =
         transfer_submitter_->submit(replica_descriptor, slices, op_code);
@@ -1188,8 +1230,8 @@ void Client::PingThreadFunc() {
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
-            auto [view_version, client_status] = ping_result.value();
-            if (client_status == ClientStatus::NEED_REMOUNT &&
+            auto& ping_response = ping_result.value();
+            if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =

@@ -235,13 +235,12 @@ class MasterService {
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
-     * @param[out] view_version The view version of the master
-     * @param[out] client_status The status of the client from the master
+     * @return PingResponse containing view version and client status
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
     auto Ping(const UUID& client_id)
-        -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>;
+        -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name

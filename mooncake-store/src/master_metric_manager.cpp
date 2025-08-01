@@ -4,6 +4,8 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 
+#include "utils.h"
+
 namespace mooncake {
 
 // --- Singleton Instance ---
@@ -22,13 +24,13 @@ MasterMetricManager::MasterMetricManager()
                       "Total capacity across all mounted segments"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
-      soft_pin_key_count_("master_soft_pin_key_count",
-                          "Total number of soft-pinned keys managed by the master"),
+      soft_pin_key_count_(
+          "master_soft_pin_key_count",
+          "Total number of soft-pinned keys managed by the master"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
-      value_size_distribution_("master_value_size_bytes",
-                               "Distribution of object value sizes",
-                               {4096, 65536, 262144, 1048576, 4194304,
-                                16777216, 67108864}),
+      value_size_distribution_(
+          "master_value_size_bytes", "Distribution of object value sizes",
+          {4096, 65536, 262144, 1048576, 4194304, 16777216, 67108864}),
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
@@ -52,20 +54,18 @@ MasterMetricManager::MasterMetricManager()
       get_replica_list_failures_(
           "master_get_replica_list_failures_total",
           "Total number of failed GetReplicaList requests"),
-      exist_key_requests_(
-          "master_exist_key_requests_total",
-          "Total number of ExistKey requests received"),
-      exist_key_failures_(
-          "master_exist_key_failures_total",
-          "Total number of failed ExistKey requests"),
+      exist_key_requests_("master_exist_key_requests_total",
+                          "Total number of ExistKey requests received"),
+      exist_key_failures_("master_exist_key_failures_total",
+                          "Total number of failed ExistKey requests"),
       remove_requests_("master_remove_requests_total",
                        "Total number of Remove requests received"),
       remove_failures_("master_remove_failures_total",
                        "Total number of failed Remove requests"),
       remove_all_requests_("master_remove_all_requests_total",
-                       "Total number of Remove all requests received"),
+                           "Total number of Remove all requests received"),
       remove_all_failures_("master_remove_all_failures_total",
-                       "Total number of failed Remove all requests"),
+                           "Total number of failed Remove all requests"),
 
       mount_segment_requests_("master_mount_segment_requests_total",
                               "Total number of MountSegment requests received"),
@@ -89,34 +89,42 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of failed ping requests"),
 
       // Initialize Batch Request Counters
-      batch_exist_key_requests_("master_batch_exist_key_requests_total",
-                                "Total number of BatchExistKey requests received"),
-      batch_exist_key_failures_("master_batch_exist_key_failures_total",
-                                "Total number of failed BatchExistKey requests"),
-      batch_get_replica_list_requests_("master_batch_get_replica_list_requests_total",
-                                       "Total number of BatchGetReplicaList requests received"),
-      batch_get_replica_list_failures_("master_batch_get_replica_list_failures_total",
-                                       "Total number of failed BatchGetReplicaList requests"),
-      batch_put_start_requests_("master_batch_put_start_requests_total",
-                                "Total number of BatchPutStart requests received"),
-      batch_put_start_failures_("master_batch_put_start_failures_total",
-                                "Total number of failed BatchPutStart requests"),
+      batch_exist_key_requests_(
+          "master_batch_exist_key_requests_total",
+          "Total number of BatchExistKey requests received"),
+      batch_exist_key_failures_(
+          "master_batch_exist_key_failures_total",
+          "Total number of failed BatchExistKey requests"),
+      batch_get_replica_list_requests_(
+          "master_batch_get_replica_list_requests_total",
+          "Total number of BatchGetReplicaList requests received"),
+      batch_get_replica_list_failures_(
+          "master_batch_get_replica_list_failures_total",
+          "Total number of failed BatchGetReplicaList requests"),
+      batch_put_start_requests_(
+          "master_batch_put_start_requests_total",
+          "Total number of BatchPutStart requests received"),
+      batch_put_start_failures_(
+          "master_batch_put_start_failures_total",
+          "Total number of failed BatchPutStart requests"),
       batch_put_end_requests_("master_batch_put_end_requests_total",
                               "Total number of BatchPutEnd requests received"),
       batch_put_end_failures_("master_batch_put_end_failures_total",
                               "Total number of failed BatchPutEnd requests"),
-      batch_put_revoke_requests_("master_batch_put_revoke_requests_total",
-                                 "Total number of BatchPutRevoke requests received"),
-      batch_put_revoke_failures_("master_batch_put_revoke_failures_total",
-                                 "Total number of failed BatchPutRevoke requests"),
+      batch_put_revoke_requests_(
+          "master_batch_put_revoke_requests_total",
+          "Total number of BatchPutRevoke requests received"),
+      batch_put_revoke_failures_(
+          "master_batch_put_revoke_failures_total",
+          "Total number of failed BatchPutRevoke requests"),
 
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
-                       "Total number of successful eviction operations"),
+                        "Total number of successful eviction operations"),
       eviction_attempts_("master_attempted_evictions_total",
                          "Total number of attempted eviction operations"),
       evicted_key_count_("master_evicted_key_count",
-                        "Total number of keys evicted"),
+                         "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects") {}
 
@@ -158,16 +166,18 @@ double MasterMetricManager::get_global_used_ratio(void) {
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
-void MasterMetricManager::inc_soft_pin_key_count(int64_t val) { soft_pin_key_count_.inc(val); }
-void MasterMetricManager::dec_soft_pin_key_count(int64_t val) { soft_pin_key_count_.dec(val); }
+void MasterMetricManager::inc_soft_pin_key_count(int64_t val) {
+    soft_pin_key_count_.inc(val);
+}
+void MasterMetricManager::dec_soft_pin_key_count(int64_t val) {
+    soft_pin_key_count_.dec(val);
+}
 
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
 }
 
-int64_t MasterMetricManager::get_key_count() {
-    return key_count_.value();
-}
+int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
 
 int64_t MasterMetricManager::get_soft_pin_key_count() {
     return soft_pin_key_count_.value();
@@ -415,16 +425,15 @@ int64_t MasterMetricManager::get_batch_put_revoke_failures() {
 }
 
 // Eviction Metrics
-void MasterMetricManager::inc_eviction_success(int64_t key_count, int64_t size) {
+void MasterMetricManager::inc_eviction_success(int64_t key_count,
+                                               int64_t size) {
     evicted_key_count_.inc(key_count);
     evicted_size_.inc(size);
     eviction_success_.inc();
     eviction_attempts_.inc();
 }
 
-void MasterMetricManager::inc_eviction_fail() {
-    eviction_attempts_.inc();
-}
+void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
 
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
@@ -524,22 +533,6 @@ std::string MasterMetricManager::serialize_metrics() {
 std::string MasterMetricManager::get_summary_string() {
     std::stringstream ss;
 
-    // --- Helper lambda for formatting bytes ---
-    auto format_bytes = [](double bytes) -> std::string {
-        std::stringstream byte_ss;
-        byte_ss << std::fixed << std::setprecision(2);
-        if (bytes >= 1024.0 * 1024.0 * 1024.0) {  // GB
-            byte_ss << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB";
-        } else if (bytes >= 1024.0 * 1024.0) {  // MB
-            byte_ss << (bytes / (1024.0 * 1024.0)) << " MB";
-        } else if (bytes >= 1024.0) {  // KB
-            byte_ss << (bytes / 1024.0) << " KB";
-        } else {
-            byte_ss << bytes << " B";
-        }
-        return byte_ss.str();
-    };
-
     // --- Get current values ---
     int64_t allocated = allocated_size_.value();
     int64_t capacity = total_capacity_.value();
@@ -572,11 +565,11 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t ping_fails = ping_failures_.value();
 
     // --- Format the summary string ---
-    ss << "Storage: " << format_bytes(allocated) << " / "
-       << format_bytes(capacity);
+    ss << "Storage: " << byte_size_to_string(allocated) << " / "
+       << byte_size_to_string(capacity);
     if (capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
-           << ((double) allocated / (double)capacity * 100.0) << "%)";
+           << ((double)allocated / (double)capacity * 100.0) << "%)";
     }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     if (enable_ha_) {
@@ -585,22 +578,24 @@ std::string MasterMetricManager::get_summary_string() {
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
-    ss << "Put="
-       << put_starts - put_start_fails + put_ends - put_end_fails
+    ss << "Put=" << put_starts - put_start_fails + put_ends - put_end_fails
        << "/" << put_starts + put_ends << ", ";
-    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas << ", ";
+    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
+       << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
-    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all << ", ";
+    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
+       << ", ";
     if (enable_ha_) {
         ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
     }
 
     // Eviction summary
     ss << " | Eviction: "
-        << "Success/Attempts=" << eviction_success << "/" << eviction_attempts << ", "
-        << "keys=" << evicted_key_count << ", "
-        << "size=" << format_bytes(evicted_size);
+       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
+       << ", "
+       << "keys=" << evicted_key_count << ", "
+       << "size=" << byte_size_to_string(evicted_size);
 
     return ss.str();
 }

@@ -101,4 +101,26 @@ target_link_libraries(offset_allocator_test PUBLIC
 )
 add_test(NAME offset_allocator_test COMMAND offset_allocator_test)
 
+add_executable(utils_test utils_test.cpp)
+target_link_libraries(utils_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME utils_test COMMAND utils_test)
+
+add_executable(client_buffer_test client_buffer_test.cpp)
+target_link_libraries(client_buffer_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME client_buffer_test COMMAND client_buffer_test)
+
 add_subdirectory(e2e)

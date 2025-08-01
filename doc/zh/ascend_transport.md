@@ -16,7 +16,8 @@ apt-get install -y mpich libmpich-dev
 
 **昇腾Compute Architecture for Neural Networks**
 昇腾Compute Architecture for Neural Networks 8.1.RC1版本 + pkg依赖包
-pkg包含一些头文件和so包，路径在scripts/ascend/pkg,请进入pkg文件夹，根据arm/x86系统执行ReadMe.txt的命令。
+为了不增加Mooncake项目的整体大小，完整的pkg依赖包请在https://github.com/kvcache-ai/Mooncake/pull/684 下载，我在comment中上传了pkg.zip文件，
+根据arm/x86系统执行ReadMe.txt的命令。
 
 ### 一键式编译脚本
 Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh,执行命令如下：
@@ -42,6 +43,8 @@ sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
 sudo apt install mpich libmpich-dev        # 安装 MPICH
 
 6.当前版本不支持IPV6，我们会很快完成针对IPV6的适配。
+
+7.请在https://github.com/kvcache-ai/Mooncake/pull/684 comment中下载pkg.zip文件，根据arm/x86系统执行ReadMe.txt的命令。
 
 ### 一键式安装脚本(不编译Mooncake)
 用户如果在一台机器上编译过Mooncake，在其它相同系统的机器上可以不编译Mooncake只安装依赖项，直接使用Mooncake的输出件libascend_transport_mem.so和mooncake whl包。
@@ -86,8 +89,15 @@ Ascend Transport支持write/read语义，且会自动判断是否跨HCCS通信�
 Ascend Transport在HCCL本身的故障处理基础上，设计了完善的故障处理机制。针对初始化、建链、数据传输等多个阶段可能出现的故障，新增或沿用了失败重试机制。在重试仍然失败后，沿用了HCCL集合通信相关操作错误码，给出精准的报错信息。为获取更详细的错误信息，也可以查询/root/Ascend/log目录下的plog日志。
 
 ### 测试用例
-Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp和性能测试mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp两个测试文件，根据测试头部设置的可传入参数传入合法参数，
-可以完成一对一、一对二、二对一多种场景和性能测试。
+Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp和性能测试mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp两个测试文件，根据测试头部设置的可传入参数传入合法参数，可以完成一对一、一对二、二对一多种场景和性能测试。
+
+当 metadata_server 配置为 P2PHANDSHAKE 时，Mooncake 会在新的 RPC 端口映射中随机选择监听端口，以避免端口冲突。因此，测试时需要按以下步骤操作：
+1.先启动目标节点，观察其在 mooncake-transfer-engine/src/transfer_engine.cpp 中打印的日志，找到如下格式的语句：
+Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目标节点实际监听的端口号。
+2.修改发起节点的启动命令：
+将 --segment_id 参数的值改为目标节点的 IP + 实际监听的端口号（格式为 <IP>:<端口>）。
+3.启动发起节点，完成连接测试。
+完整命令格式见下文：
 
 多场景用例执行命令如：
 ```启动发起节点：```
