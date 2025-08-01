@@ -295,7 +295,7 @@ class MemcpyWorkerPool {
  */
 struct FilereadTask {
     std::string file_path;
-    size_t file_size;
+    size_t object_size;
     std::vector<Slice> slices;
     std::shared_ptr<FilereadOperationState> state;
 
@@ -304,7 +304,7 @@ struct FilereadTask {
             const std::vector<Slice>& slices_ref,
             std::shared_ptr<FilereadOperationState> s)
     : file_path(path),
-        file_size(size),
+        object_size(size),
         slices(slices_ref),
         state(std::move(s)) {}
 };

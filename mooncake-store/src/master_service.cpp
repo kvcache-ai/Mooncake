@@ -20,6 +20,7 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
                              ViewVersionId view_version,
                              int64_t client_live_ttl_sec, bool enable_ha,
                              const std::string& cluster_id,
+                             const std::string& root_fs_dir,
                              BufferAllocatorType memory_allocator)
     : enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
@@ -30,6 +31,7 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
       client_live_ttl_sec_(client_live_ttl_sec),
       enable_ha_(enable_ha),
       cluster_id_(cluster_id),
+      root_fs_dir_(root_fs_dir),
       segment_manager_(memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
@@ -53,6 +55,10 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
         client_monitor_thread_ =
             std::thread(&MasterService::ClientMonitorFunc, this);
         VLOG(1) << "action=start_client_monitor_thread";
+    }
+
+    if(!root_fs_dir_.empty()) {
+        use_disk_replica_ = true;
     }
 }
 
@@ -220,25 +226,15 @@ auto MasterService::ExistKey(const std::string& key)
     }
 
     auto& metadata = accessor.Get();
-    if(metadata.HasMemReplica()){
-        if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE, ReplicaType::MEMORY)) {
-            LOG(WARNING) << "key=" << key << ", status=" << *status
-                        << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-        }
-    }else{
-        if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE, ReplicaType::DISK)) {
-            LOG(WARNING) << "key=" << key << ", status=" << *status
-                         << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    for (const auto& replica : metadata.replicas) {
+        if(replica.status() == ReplicaStatus::COMPLETE){
+            // Grant a lease to the object as it may be further used by the client.
+            metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+            return true;
         }
     }
 
-
-    // Grant a lease to the object as it may be further used by the client.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-
-    return true;
+    return false;  // If no complete replica is found, return false
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
@@ -293,19 +289,6 @@ auto MasterService::GetReplicaList(std::string_view key)
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    if(metadata.HasMemReplica()){
-        if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE, ReplicaType::MEMORY)) {
-            LOG(WARNING) << "key=" << key << ", status=" << *status
-                        << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-        }
-    }else{
-        if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE, ReplicaType::DISK)) {
-            LOG(WARNING) << "key=" << key << ", status=" << *status
-                         << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-        }
-    }
 
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(metadata.replicas.size());
@@ -313,6 +296,11 @@ auto MasterService::GetReplicaList(std::string_view key)
         if(replica.status() == ReplicaStatus::COMPLETE){
             replica_list.emplace_back(replica.get_descriptor());
         }
+    }
+
+    if(replica_list.empty()) {
+        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Only mark for GC if enabled
@@ -380,7 +368,7 @@ auto MasterService::PutStart(const std::string& key,
 
     // Allocate replicas
     std::vector<Replica> replicas;
-    replicas.reserve(config.replica_num + config.use_disk_replica);
+    replicas.reserve(config.replica_num + use_disk_replica_);
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
@@ -420,7 +408,7 @@ auto MasterService::PutStart(const std::string& key,
     }
 
     // If disk replica is enabled, allocate a disk replica
-    if (config.use_disk_replica) {
+    if (use_disk_replica_) {
         // Allocate a file path for the disk replica
         std::string file_path = ResolvePath(key);
         replicas.emplace_back(
@@ -631,11 +619,11 @@ auto MasterService::Ping(const UUID& client_id)
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
-    if (cluster_id_.empty()) {
-        LOG(ERROR) << "Cluster ID is not initialized";
+    if (root_fs_dir_.empty() || cluster_id_.empty()) {
+        LOG(ERROR) << "root_fs_dir or cluster_id is not set";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return cluster_id_;
+    return root_fs_dir_ + "/" + cluster_id_;
 }
 
 void MasterService::GCThreadFunc() {
@@ -1053,7 +1041,7 @@ std::string MasterService::ResolvePath(const std::string& key) const {
     fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
 
     // Combine directory path with sanitized filename
-    fs::path full_path = dir_path / SanitizeKey(key);
+    fs::path full_path = fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
     
     return full_path.lexically_normal().string();
 }

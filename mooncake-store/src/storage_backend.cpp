@@ -10,10 +10,9 @@
 
 namespace mooncake {
   
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& sub_path,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
                                      const std::vector<Slice>& slices) {
-    std::string path = ResolvePath(sub_path);
-
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
@@ -44,15 +43,14 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& sub
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& sub_path,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
                                     const std::string& str) {
-    return StoreObject(sub_path, std::span<const char>(str.data(), str.size()));
+    return StoreObject(path, std::span<const char>(str.data(), str.size()));
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& sub_path,
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
                                     std::span<const char> data) {
-    std::string path = ResolvePath(sub_path);
-    
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
@@ -76,9 +74,9 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& sub
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& sub_path,
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path,
                                     std::vector<Slice>& slices, size_t length) {
-    std::string path = ResolvePath(sub_path);
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
@@ -106,9 +104,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& sub_
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& sub_path,
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path,
                                     std::string& str, size_t length) {
-    std::string path = ResolvePath(sub_path);
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
@@ -130,8 +128,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& sub_
     return {};
 }
 
-void StorageBackend::RemoveFile(const ObjectKey& key) {
-    std::string path = ResolvePath(key);
+void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
     // TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
     // Check if the file exists before attempting to remove it
@@ -162,10 +159,10 @@ void StorageBackend::RemoveAll() {
 
 }
 
-std::string StorageBackend::ResolvePath(const std::string& path) const {
+void StorageBackend::ResolvePath(const std::string& path) const {
     // Safely construct path using std::filesystem
     namespace fs = std::filesystem;
-    fs::path full_path = fs::path(root_dir_) / fsdir_ / path;
+    fs::path full_path = path;
 
     // Create all parent directories if they don't exist
     std::error_code ec;
@@ -173,11 +170,8 @@ std::string StorageBackend::ResolvePath(const std::string& path) const {
     if (!parent_path.empty() && !fs::exists(parent_path)) {
         if (!fs::create_directories(parent_path, ec) && ec) {
             LOG(INFO) << "Failed to create directories: " << parent_path << ", error: " << ec.message();
-            return ""; // Empty string indicates failure
         }
     }
-    
-    return full_path.lexically_normal().string();
 }
 
 std::unique_ptr<StorageFile> StorageBackend::create_file(

@@ -29,6 +29,7 @@ class WrappedMasterService {
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
         bool enable_ha = false,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
 
     ~WrappedMasterService();

@@ -75,51 +75,51 @@ class StorageBackend  {
     
     /**
      * @brief Stores an object composed of multiple slices
-     * @param sub_path Subdirectory path for the object
+     * @param path path for the object
      * @param slices Vector of data slices to store
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& sub_path, const std::vector<Slice>& slices) ;
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path, const std::vector<Slice>& slices) ;
 
     /**
      * @brief Stores an object from a string
-     * @param sub_path Subdirectory path for the object
+     * @param path path for the object
      * @param str String containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& sub_path, const std::string& str) ;
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path, const std::string& str) ;
 
     /**
      * @brief Stores an object from a span of data
-     * @param sub_path Subdirectory path for the object
+     * @param path path for the object
      * @param data Span containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& sub_path, std::span<const char> data);
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path, std::span<const char> data);
     
     /**
      * @brief Loads an object into slices
-     * @param sub_path Subdirectory path for the object
+     * @param path path for the object
      * @param slices Output vector for loaded data slices
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(const std::string& sub_path, std::vector<Slice>& slices, size_t length) ;
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path, std::vector<Slice>& slices, size_t length) ;
     
     /**
      * @brief Loads an object as a string
-     * @param sub_path Subdirectory path for the object
+     * @param path path for the object
      * @param str Output string for loaded data
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(const std::string& sub_path, std::string& str, size_t length) ;
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path, std::string& str, size_t length) ;
 
     /**
      * @brief Deletes the physical file associated with the given object key
-     * @param key Object identifier
+     * @param path Path to the file to remove
      */
-    void RemoveFile(const ObjectKey& key) ;
+    void RemoveFile(const std::string& path) ;
 
     /**
      * @brief Deletes all objects from the storage backend
@@ -143,9 +143,9 @@ class StorageBackend  {
 
    private:
     /**
-     * @brief Resolves full filesystem path for an object
+     * @brief Make sure the path is valid and create necessary directories
      */
-    std::string ResolvePath(const std::string& path) const;
+    void ResolvePath(const std::string& path) const;
 
     /**
      * @brief Creates a file object for the specified path and mode

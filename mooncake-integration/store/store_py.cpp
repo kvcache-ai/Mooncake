@@ -338,7 +338,7 @@ uint64_t calculate_total_size(const Replica::Descriptor &replica) {
     uint64_t total_length = 0;
     if (replica.is_memory_replica() == false) {
         auto &disk_descriptor = replica.get_disk_descriptor();
-        total_length = disk_descriptor.file_size;
+        total_length = disk_descriptor.object_size;
     } else {
         for (auto &handle :
              replica.get_memory_descriptor().buffer_descriptors) {
@@ -354,7 +354,7 @@ int allocateSlices(std::vector<Slice> &slices,
     uint64_t offset = 0;
     if (replica.is_memory_replica() == false) {
         // For disk-based replica, split into slices based on file size
-        uint64_t total_length = replica.get_disk_descriptor().file_size;
+        uint64_t total_length = replica.get_disk_descriptor().object_size;
         while (offset < total_length) {
             auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
             void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;

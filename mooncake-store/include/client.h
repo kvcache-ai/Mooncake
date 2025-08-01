@@ -201,8 +201,7 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring,
-           const std::string& storage_root_dir);
+           const std::string& metadata_connstring);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -228,7 +227,7 @@ class Client {
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
-                        const std::string& sub_path);
+                        DiskDescriptor& disk_descriptor);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -267,7 +266,6 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
-    const std::string storage_root_dir_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;

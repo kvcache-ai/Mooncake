@@ -35,6 +35,7 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_ROOT_FS_DIR = "";
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -239,14 +240,12 @@ struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
     std::string preferred_segment{};  // Preferred segment for allocation
-    bool use_disk_replica{false};  // Use disk replica if true
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         return os << "ReplicateConfig: { replica_num: " << config.replica_num
                   << ", with_soft_pin: " << config.with_soft_pin
                   << ", preferred_segment: " << config.preferred_segment
-                  << ", use_disk_replica: " << config.use_disk_replica
                   << " }";
     }
 };
@@ -335,7 +334,7 @@ struct MemoryReplicaData {
 
 struct DiskReplicaData {
     std::string file_path;
-    uint64_t file_size = 0;
+    uint64_t object_size = 0;
 };
 
 struct MemoryDescriptor {
@@ -345,8 +344,8 @@ struct MemoryDescriptor {
 
 struct DiskDescriptor {
     std::string file_path{};
-    uint64_t file_size = 0;
-    YLT_REFL(DiskDescriptor, file_path, file_size);
+    uint64_t object_size = 0;
+    YLT_REFL(DiskDescriptor, file_path, object_size);
 };
 
 class Replica {
@@ -360,26 +359,16 @@ class Replica {
           status_(status) {}
     
     // disk replica constructor
-    Replica(std::string file_path, uint64_t file_size, ReplicaStatus status)
-        : data_(DiskReplicaData{std::move(file_path), file_size}),
+    Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
+        : data_(DiskReplicaData{std::move(file_path), object_size}),
           status_(status) {}
-
-    void reset() noexcept {
-        data_ = std::monostate{}; // Reset to no data state
-        status_ = ReplicaStatus::UNDEFINED;
-    }
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
 
     [[nodiscard]] ReplicaType type() const {
-        if (is_memory_replica()) {
-            return ReplicaType::MEMORY;
-        } else if (is_disk_replica()) {
-            return ReplicaType::DISK;
-        }
-        throw std::runtime_error("Unknown replica type");
+        return std::visit(ReplicaTypeVisitor{}, data_);
     }
 
     [[nodiscard]] bool is_memory_replica() const { 
@@ -418,6 +407,15 @@ class Replica {
     }
 
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
+
+    struct ReplicaTypeVisitor {
+        ReplicaType operator()(const MemoryReplicaData&) const {
+            return ReplicaType::MEMORY;
+        }
+        ReplicaType operator()(const DiskReplicaData&) const {
+            return ReplicaType::DISK;
+        }
+    };
 
     struct Descriptor {
         std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
@@ -473,7 +471,7 @@ class Replica {
     };
 
    private:
-    std::variant<std::monostate, MemoryReplicaData, DiskReplicaData> data_;
+    std::variant<MemoryReplicaData, DiskReplicaData> data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 };
 
@@ -495,7 +493,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         const auto& disk_data = std::get<DiskReplicaData>(data_);
         DiskDescriptor disk_desc;
         disk_desc.file_path = disk_data.file_path;
-        disk_desc.file_size = disk_data.file_size;
+        disk_desc.object_size = disk_data.object_size;
         desc.descriptor_variant = std::move(disk_desc);
     }
     
@@ -517,7 +515,7 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
     } else if (replica.is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path 
-           << ", file_size: " << disk_data.file_size;
+           << ", object_size: " << disk_data.object_size;
     }
     
     os << " }";

@@ -29,11 +29,12 @@ WrappedMasterService::WrappedMasterService(
     bool enable_metric_reporting, uint16_t http_port, double eviction_ratio,
     double eviction_high_watermark_ratio, ViewVersionId view_version,
     int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id,
-    BufferAllocatorType memory_allocator)
+    const std::string& root_fs_dir, BufferAllocatorType memory_allocator)
     : master_service_(enable_gc, default_kv_lease_ttl, default_kv_soft_pin_ttl,
                       allow_evict_soft_pinned_objects, eviction_ratio,
                       eviction_high_watermark_ratio, view_version,
-                      client_live_ttl_sec, enable_ha, cluster_id, memory_allocator),
+                      client_live_ttl_sec, enable_ha, cluster_id, root_fs_dir,
+                      memory_allocator),
       http_server_(4, http_port),
       metric_report_running_(enable_metric_reporting) {
     init_http_server();

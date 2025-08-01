@@ -33,11 +33,9 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring,
-               const std::string& storage_root_dir)
+               const std::string& metadata_connstring)
     : local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
-      storage_root_dir_(storage_root_dir),
       write_thread_pool_(2) {
     client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
@@ -214,32 +212,35 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
     const std::string& master_server_entry) {
-    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
-    std::string storage_root_dir =
-        std::getenv("MOONCAKE_STORAGE_ROOT_DIR")
-            ? std::getenv("MOONCAKE_STORAGE_ROOT_DIR")
-            : "";
 
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, storage_root_dir));
+        new Client(local_hostname, metadata_connstring));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
     }
 
-    // Initialize storage backend if storage_root_dir is provided
+    // Initialize storage backend if storage_root_dir is valid
     auto response = client->master_client_.GetFsdir();
     if (!response) {
         LOG(ERROR) << "Failed to get fsdir from master";
-    } else if (storage_root_dir.empty()) {
+    } else if (response.value().empty()) {
         LOG(INFO) << "Storage root directory is not set. persisting data is "
                      "disabled.";
     } else {
-        LOG(INFO) << "Storage root directory is: " << storage_root_dir;
-        LOG(INFO) << "Fs subdir is: " << response.value();
-        // Initialize storage backend
-        client->PrepareStorageBackend(storage_root_dir, response.value());
+        auto dir_string = response.value();
+        size_t pos = dir_string.find_last_of('/');
+        if (pos != std::string::npos) {
+            std::string storage_root_dir = dir_string.substr(0, pos);
+            std::string fs_subdir = dir_string.substr(pos + 1);
+            LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+            LOG(INFO) << "Fs subdir is: " << fs_subdir;
+            // Initialize storage backend
+            client->PrepareStorageBackend(storage_root_dir, fs_subdir);
+        } else {
+            LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+        }
     }
 
     // Initialize transfer engine
@@ -447,13 +448,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig effective_config = config;
-    if (storage_backend_) {
-        effective_config.use_disk_replica = true;
-    }
-
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, effective_config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, config);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -471,7 +467,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if(replica.is_disk_replica()){
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor.file_path);
+                PutToLocalFile(key, slices, disk_descriptor);
                 break; // Only one disk replica is needed
             }
         } 
@@ -584,11 +580,6 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
 
-    ReplicateConfig effective_config = config;
-    if (storage_backend_) {
-        effective_config.use_disk_replica = true;
-    }
-
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
@@ -604,7 +595,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, effective_config);
+        master_client_.BatchPutStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
     if (start_responses.size() != ops.size()) {
@@ -658,7 +649,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
                     auto disk_descriptor = replica.get_disk_descriptor();
-                    PutToLocalFile(op.key, op.slices, disk_descriptor.file_path);
+                    PutToLocalFile(op.key, op.slices, disk_descriptor);
                     break; // Only one disk replica is needed
                 }
             }
@@ -1063,7 +1054,7 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
 
 void Client::PutToLocalFile(const std::string& key,
                             const std::vector<Slice>& slices,
-                            const std::string& sub_path) {
+                            DiskDescriptor& disk_descriptor) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;
@@ -1071,6 +1062,7 @@ void Client::PutToLocalFile(const std::string& key,
         total_size += slice.size;
     }
 
+    std::string path = disk_descriptor.file_path;
     // Currently, persistence is achieved through asynchronous writes, but before asynchronous
     // writing in 3FS, significant performance degradation may occur due to data copying. 
     // Profiling reveals that the number of page faults triggered in this scenario is nearly double the normal count. 
@@ -1083,9 +1075,9 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     write_thread_pool_.enqueue(
-        [this, backend = storage_backend_, key, value = std::move(value), sub_path] {
+        [this, backend = storage_backend_, key, value = std::move(value), path] {
             // Store the object
-            auto store_result = backend->StoreObject(sub_path, value);
+            auto store_result = backend->StoreObject(path, value);
             ReplicaType replica_type = ReplicaType::DISK;
             
             if (!store_result) {
@@ -1138,7 +1130,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         }
     } else {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
-        total_size = disk_desc.file_size;
+        total_size = disk_desc.object_size;
     }
 
     size_t slices_size = CalculateSliceSize(slices);

@@ -72,6 +72,7 @@ class MasterService {
                   int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
                   bool enable_ha = false,
                   const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+                  const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR, 
                   BufferAllocatorType memory_allocator =
                       BufferAllocatorType::CACHELIB);
     ~MasterService();
@@ -506,6 +507,10 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // root filesystem directory for persistent storage
+    const std::string root_fs_dir_;
+
+    bool use_disk_replica_{false};
 
     // Segment management
     SegmentManager segment_manager_;
