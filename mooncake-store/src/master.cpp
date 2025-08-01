@@ -64,6 +64,8 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
 
+DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
+              "Root directory for storage backend, used in HA mode");             
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence in HA mode");
 
@@ -96,6 +98,7 @@ int main(int argc, char* argv[]) {
               << ", rpc_conn_timeout_seconds=" << FLAGS_rpc_conn_timeout_seconds
               << ", rpc_enable_tcp_no_delay=" << FLAGS_rpc_enable_tcp_no_delay
               << ", cluster_id=" << FLAGS_cluster_id
+              << ", root_fs_dir=" << FLAGS_root_fs_dir
               << ", memory_allocator=" << FLAGS_memory_allocator;
 
     int server_thread_num =
@@ -174,7 +177,7 @@ int main(int argc, char* argv[]) {
             FLAGS_eviction_high_watermark_ratio, FLAGS_client_ttl,
             FLAGS_etcd_endpoints, local_hostname, FLAGS_rpc_address,
             rpc_conn_timeout, FLAGS_rpc_enable_tcp_no_delay, FLAGS_cluster_id,
-            allocator_type);
+            FLAGS_root_fs_dir, allocator_type);
 
         return supervisor.Start();
     } else {
@@ -190,7 +193,7 @@ int main(int argc, char* argv[]) {
             FLAGS_enable_metric_reporting, FLAGS_metrics_port,
             FLAGS_eviction_ratio, FLAGS_eviction_high_watermark_ratio, version,
             FLAGS_client_ttl, FLAGS_enable_ha, FLAGS_cluster_id,
-            allocator_type);
+            FLAGS_root_fs_dir, allocator_type);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

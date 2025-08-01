@@ -100,6 +100,7 @@ MasterServiceSupervisor::MasterServiceSupervisor(
     std::chrono::steady_clock::duration rpc_conn_timeout,
     bool rpc_enable_tcp_no_delay,
     const std::string& cluster_id,
+    const std::string& root_fs_dir,
     BufferAllocatorType memory_allocator)
     : enable_gc_(enable_gc),
       enable_metric_reporting_(enable_metric_reporting),
@@ -119,7 +120,9 @@ MasterServiceSupervisor::MasterServiceSupervisor(
       etcd_endpoints_(etcd_endpoints),
       local_hostname_(local_hostname),
       cluster_id_(cluster_id),
-      memory_allocator_(memory_allocator) {}
+      root_fs_dir_(root_fs_dir),
+      memory_allocator_(memory_allocator)
+ {}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
@@ -159,7 +162,7 @@ int MasterServiceSupervisor::Start() {
             allow_evict_soft_pinned_objects_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
             version, client_live_ttl_sec_, enable_ha, cluster_id_,
-            memory_allocator_);
+            root_fs_dir_, memory_allocator_);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

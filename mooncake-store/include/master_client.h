@@ -99,9 +99,10 @@ class MasterClient {
     /**
      * @brief Ends a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -114,10 +115,11 @@ class MasterClient {
     /**
      * @brief Revokes a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key);
+        const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY);
 
     /**
      * @brief Revokes a put operation for a batch of objects

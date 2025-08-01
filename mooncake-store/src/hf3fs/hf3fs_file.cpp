@@ -46,13 +46,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, s
         return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    // 3. Acquire write lock
-    auto lock = acquire_write_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
-
-    // 4. Write in chunks
+    // 3. Write in chunks
     auto& threefs_iov = resource->iov_;
     auto& ior_write = resource->ior_write_;
     const char* data_ptr = data.data();
@@ -115,13 +109,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t le
         return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    // 3. Acquire read lock
-    auto lock = acquire_read_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
-
-    // 4. Prepare buffer
+    // 3. Prepare buffer
     buffer.clear();
     buffer.reserve(length);
     size_t total_bytes_read = 0;
@@ -187,11 +175,6 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int 
 
     auto& threefs_iov = resource->iov_;
     auto& ior_write = resource->ior_write_;
-
-    auto lock = acquire_write_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
 
     // 1. Calculate total length
     size_t total_length = 0;
@@ -278,11 +261,6 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int i
 
     auto& threefs_iov = resource->iov_;
     auto& ior_read = resource->ior_read_;
-
-    auto lock = acquire_read_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
 
     // Calculate total length
     size_t total_length = 0;
