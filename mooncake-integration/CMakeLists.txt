@@ -50,7 +50,6 @@ endif()
 if (WITH_STORE)
     pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
         store/store_py.cpp
-        store/client_buffer.cpp
     )
     target_link_libraries(store PUBLIC
         transfer_engine

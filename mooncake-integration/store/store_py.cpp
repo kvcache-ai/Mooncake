@@ -241,7 +241,7 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
             kWildcardLocation, false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
-                    << toString(result.error());
+                       << toString(result.error());
             return tl::unexpected(result.error());
         }
     } else {
@@ -329,59 +329,6 @@ tl::expected<void, ErrorCode> DistributedObjectStore::tearDownAll_internal() {
 
 int DistributedObjectStore::tearDownAll() {
     return to_py_ret(tearDownAll_internal());
-}
-
-std::vector<Slice> split_into_slices(BufferHandle &handle) {
-    std::vector<Slice> slices;
-    auto base = static_cast<uint8_t *>(handle.ptr());
-    size_t offset = 0;
-
-    while (offset < handle.size()) {
-        size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
-        slices.push_back({base + offset, chunk_size});
-        offset += chunk_size;
-    }
-    return slices;
-}
-
-uint64_t calculate_total_size(const Replica::Descriptor &replica) {
-    uint64_t total_length = 0;
-    if (replica.is_memory_replica() == false) {
-        auto &disk_descriptor = replica.get_disk_descriptor();
-        total_length = disk_descriptor.file_size;
-    } else {
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            total_length += handle.size_;
-        }
-    }
-    return total_length;
-}
-
-int allocateSlices(std::vector<Slice> &slices,
-                   const Replica::Descriptor &replica,
-                   BufferHandle &buffer_handle) {
-    uint64_t offset = 0;
-    if (replica.is_memory_replica() == false) {
-        // For disk-based replica, split into slices based on file size
-        uint64_t total_length = replica.get_disk_descriptor().file_size;
-        while (offset < total_length) {
-            auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-    } else {
-        // For memory-based replica, split into slices based on buffer
-        // descriptors
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
-    }
-    return 0;
 }
 
 tl::expected<void, ErrorCode> DistributedObjectStore::put_internal(
