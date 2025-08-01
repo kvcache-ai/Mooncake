@@ -217,7 +217,15 @@ Topology::Topology() {}
 
 Topology::~Topology() {}
 
-bool Topology::empty() const { return matrix_.empty(); }
+bool Topology::empty() const {
+    for (const auto& entry : resolved_matrix_) {
+        if (!entry.second.preferred_hca.empty() ||
+            !entry.second.avail_hca.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void Topology::clear() {
     matrix_.clear();
