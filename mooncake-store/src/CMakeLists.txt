@@ -20,7 +20,7 @@ set(MOONCAKE_STORE_SOURCES
     rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
-
+    client_buffer.cpp
 )
 
 set(EXTRA_LIBS "")
