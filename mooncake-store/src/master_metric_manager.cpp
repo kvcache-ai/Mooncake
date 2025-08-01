@@ -772,40 +772,40 @@ std::string MasterMetricManager::get_summary_string() {
 
     // Batch request summary
     ss << " | Batch Requests "
-          "(Success/PartialSuccess/Total/SuccessItems/TotalItems): ";
+          "(Success+PartialSuccess/Total|SuccessItems/TotalItems): ";
     ss << "PutStart="
        << batch_put_start_requests - batch_put_start_fails -
               batch_put_start_partial_successes
-       << "/" << batch_put_start_partial_successes << "/"
-       << batch_put_start_requests << "/"
+       << "+" << batch_put_start_partial_successes << "/"
+       << batch_put_start_requests << "|"
        << batch_put_start_items - batch_put_start_failed_items << "/"
        << batch_put_start_items << ", ";
     ss << "PutEnd="
        << batch_put_end_requests - batch_put_end_fails -
               batch_put_end_partial_successes
-       << "/" << batch_put_end_partial_successes << "/"
-       << batch_put_end_requests << "/"
+       << "+" << batch_put_end_partial_successes << "/"
+       << batch_put_end_requests << "|"
        << batch_put_end_items - batch_put_end_failed_items << "/"
        << batch_put_end_items << ", ";
     ss << "PutRevoke="
        << batch_put_revoke_requests - batch_put_revoke_fails -
               batch_put_revoke_partial_successes
-       << "/" << batch_put_revoke_partial_successes << "/"
-       << batch_put_revoke_requests << "/"
+       << "+" << batch_put_revoke_partial_successes << "/"
+       << batch_put_revoke_requests << "|"
        << batch_put_revoke_items - batch_put_revoke_failed_items << "/"
        << batch_put_revoke_items << ", ";
     ss << "Get="
        << batch_get_replica_list_requests - batch_get_replica_list_fails -
               batch_get_replica_list_partial_successes
-       << "/" << batch_get_replica_list_partial_successes << "/"
-       << batch_get_replica_list_requests << "/"
+       << "+" << batch_get_replica_list_partial_successes << "/"
+       << batch_get_replica_list_requests << "|"
        << batch_get_replica_list_items - batch_get_replica_list_failed_items
        << "/" << batch_get_replica_list_items << ", ";
     ss << "ExistKey="
        << batch_exist_key_requests - batch_exist_key_fails -
               batch_exist_key_partial_successes
-       << "/" << batch_exist_key_partial_successes << "/"
-       << batch_exist_key_requests << "/"
+       << "+" << batch_exist_key_partial_successes << "/"
+       << batch_exist_key_requests << "|"
        << batch_exist_key_items - batch_exist_key_failed_items << "/"
        << batch_exist_key_items << ", ";
 
