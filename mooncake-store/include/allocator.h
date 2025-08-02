@@ -24,7 +24,7 @@ class AllocatedBuffer;
 class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
-    
+
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
@@ -33,8 +33,8 @@ class BufferAllocatorBase {
 };
 
 /**
- * CachelibBufferAllocator manages memory allocation using CacheLib's slab allocation
- * strategy.
+ * CachelibBufferAllocator manages memory allocation using CacheLib's slab
+ * allocation strategy.
  *
  * Important alignment requirements:
  * 1. Base address must be at least 8-byte aligned (CacheLib requirement)
@@ -88,7 +88,8 @@ class CachelibBufferAllocator
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
- * strategy, which provides efficient memory allocation with bin-based optimization.
+ * strategy, which provides efficient memory allocation with bin-based
+ * optimization.
  */
 class OffsetBufferAllocator
     : public BufferAllocatorBase,

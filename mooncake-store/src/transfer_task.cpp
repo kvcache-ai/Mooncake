@@ -12,10 +12,12 @@ namespace mooncake {
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
-//to fully utilize the available ssd bandwidth, we use a default of 10 worker threads.
+// to fully utilize the available ssd bandwidth, we use a default of 10 worker
+// threads.
 constexpr int kDefaultFilereadWorkers = 10;
 
-FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend) : shutdown_(false) {
+FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
+    : shutdown_(false) {
     VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
             << " workers";
 
@@ -86,20 +88,22 @@ void FilereadWorkerPool::workerThread() {
         if (task.state) {
             try {
                 if (!backend_) {
-                    LOG(ERROR) << "Backend is not initialized, cannot load object";
+                    LOG(ERROR)
+                        << "Backend is not initialized, cannot load object";
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                     continue;
                 }
 
-                auto load_result = backend_->LoadObject(task.file_path, task.slices, task.file_size);
+                auto load_result = backend_->LoadObject(
+                    task.file_path, task.slices, task.file_size);
                 if (load_result) {
-                    VLOG(2) << "Fileread task completed successfully with " 
-                            << task.file_path ;
+                    VLOG(2) << "Fileread task completed successfully with "
+                            << task.file_path;
                     task.state->set_completed(ErrorCode::OK);
                 } else {
-                    LOG(ERROR) << "Fileread task failed for file: " 
-                            << task.file_path
-                            << " with error: " << toString(load_result.error());
+                    LOG(ERROR)
+                        << "Fileread task failed for file: " << task.file_path
+                        << " with error: " << toString(load_result.error());
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                 }
             } catch (const std::exception& e) {
@@ -389,10 +393,9 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
-    const Replica::Descriptor& replica,
-    std::vector<Slice>& slices,  Transport::TransferRequest::OpCode op_code) {
-
-    if(replica.is_memory_replica()) {
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    Transport::TransferRequest::OpCode op_code) {
+    if (replica.is_memory_replica()) {
         std::vector<AllocatedBuffer::Descriptor> handles;
         auto& mem_desc = replica.get_memory_descriptor();
         handles = mem_desc.buffer_descriptors;
@@ -412,7 +415,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
-    }else{
+    } else {
         return submitFileReadOperation(replica, slices, op_code);
     }
 }
@@ -515,7 +518,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
-    const Replica::Descriptor& replica, std::vector<Slice>& slices, 
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
     Transport::TransferRequest::OpCode op_code) {
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
@@ -526,8 +529,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     FilereadTask task(file_path, file_length, slices, state);
     fileread_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Fileread transfer submitted to worker pool with "
-            << file_path ;
+    VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
 
     return TransferFuture(state);
 }

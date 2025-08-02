@@ -110,10 +110,12 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        auto hint = globalConfig().enable_dest_device_affinity ? context_.deviceName() : "";
-        if (RdmaTransport::selectDevice(
-                peer_segment_desc.get(), slice->rdma.dest_addr, slice->length,
-                hint, buffer_id, device_id)) {
+        auto hint = globalConfig().enable_dest_device_affinity
+                        ? context_.deviceName()
+                        : "";
+        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
+                                        slice->rdma.dest_addr, slice->length,
+                                        hint, buffer_id, device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -230,7 +232,8 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(entry.first); // enable for re-establishation
+                context_.deleteEndpoint(
+                    entry.first);  // enable for re-establishation
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;

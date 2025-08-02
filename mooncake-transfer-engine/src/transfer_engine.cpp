@@ -50,17 +50,22 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     std::string rpc_binding_method;
 
 #ifdef USE_ASCEND
-    // The only difference in initializing the Ascend Transport is that the `local_server_name` must include the physical NPU card ID.
-    // The format changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of ip:port.
+    // The only difference in initializing the Ascend Transport is that the
+    // `local_server_name` must include the physical NPU card ID. The format
+    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
+    // While the desc_name stored in the metadata remains in the format of
+    // ip:port.
     int devicePhyId = -1;
-    auto[host_name, port] = parseHostNameWithPortAscend(local_server_name, &devicePhyId);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: " << host_name
-              << " port: " << port << " devicePhyId: " << devicePhyId;
+    auto [host_name, port] =
+        parseHostNameWithPortAscend(local_server_name, &devicePhyId);
+    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: "
+              << host_name << " port: " << port
+              << " devicePhyId: " << devicePhyId;
     local_server_name_ = host_name + ":" + std::to_string(port);
 #else
-    auto[host_name, port] = parseHostNameWithPort(local_server_name);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: " << host_name << " port: " << port;
+    auto [host_name, port] = parseHostNameWithPort(local_server_name);
+    LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: "
+              << host_name << " port: " << port;
     local_server_name_ = local_server_name;
 #endif
 
@@ -79,10 +84,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 return -1;
             }
 #ifdef USE_ASCEND
-            // The current version of Ascend Transport does not support IPv6, but it will be added in a future release.
-            local_server_name_ = desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+            // The current version of Ascend Transport does not support IPv6,
+            // but it will be added in a future release.
+            local_server_name_ =
+                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
 #else
-            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" + std::to_string(desc.rpc_port);
+            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
+                                 std::to_string(desc.rpc_port);
 #endif
         }
     } else {
@@ -117,7 +125,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
-    std::string mutable_server_name = local_server_name_ + ":npu_" + std::to_string(devicePhyId);
+    std::string mutable_server_name =
+        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, mutable_server_name);
 #else
@@ -128,7 +137,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     if (ret) return ret;
 
 #ifdef USE_ASCEND
-    Transport* ascend_transport = multi_transports_->installTransport("ascend", local_topology_);
+    Transport *ascend_transport =
+        multi_transports_->installTransport("ascend", local_topology_);
     if (!ascend_transport) {
         LOG(ERROR) << "Failed to install Ascend transport";
         return -1;
@@ -136,8 +146,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
 
 #if defined(USE_CXL) && !defined(USE_ASCEND)
-    if (std::getenv("MC_CXL_DEV_PATH") != nullptr && std::getenv("MC_CXL_DEV_SIZE") != nullptr) {
-        Transport* cxl_transport = multi_transports_->installTransport("cxl", local_topology_);
+    if (std::getenv("MC_CXL_DEV_PATH") != nullptr &&
+        std::getenv("MC_CXL_DEV_SIZE") != nullptr) {
+        Transport *cxl_transport =
+            multi_transports_->installTransport("cxl", local_topology_);
         if (!cxl_transport) {
             LOG(ERROR) << "Failed to install CXL transport";
             return -1;
@@ -167,13 +179,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #ifdef USE_MNNVL
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_MNNVL")) {
-            Transport* rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+            Transport *rdma_transport =
+                multi_transports_->installTransport("rdma", local_topology_);
             if (!rdma_transport) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
         } else {
-            Transport* nvlink_transport = multi_transports_->installTransport("nvlink", nullptr);
+            Transport *nvlink_transport =
+                multi_transports_->installTransport("nvlink", nullptr);
             if (!nvlink_transport) {
                 LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
@@ -182,13 +196,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
-            Transport* rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+            Transport *rdma_transport =
+                multi_transports_->installTransport("rdma", local_topology_);
             if (!rdma_transport) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
         } else {
-            Transport* tcp_transport = multi_transports_->installTransport("tcp", nullptr);
+            Transport *tcp_transport =
+                multi_transports_->installTransport("tcp", nullptr);
             if (!tcp_transport) {
                 LOG(ERROR) << "Failed to install TCP transport";
                 return -1;
@@ -315,7 +331,8 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
         return ERR_ADDRESS_OVERLAPPED;
     }
     if (length == 0) {
-        LOG(ERROR) << "Transfer Engine does not support zero length memory region";
+        LOG(ERROR)
+            << "Transfer Engine does not support zero length memory region";
         return ERR_INVALID_ARGUMENT;
     }
     for (auto transport : multi_transports_->listTransports()) {

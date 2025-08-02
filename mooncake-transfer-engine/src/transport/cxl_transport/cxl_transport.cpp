@@ -29,9 +29,9 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 #include <cstring>
-#include <fcntl.h>    // For O_RDWR, O_CREAT, etc.
-#include <unistd.h>   // For open(), close(), read(), write()
-#include <sys/mman.h> // For mmap, munmap
+#include <fcntl.h>     // For O_RDWR, O_CREAT, etc.
+#include <unistd.h>    // For open(), close(), read(), write()
+#include <sys/mman.h>  // For mmap, munmap
 
 namespace mooncake {
 
@@ -39,17 +39,17 @@ CxlTransport::CxlTransport() {
     // cxl_dev_path = "/dev/dax0.0";
     // cxl_dev_size = 1024 * 1024 * 1024;
     // get from env
-    const char* env_cxl_dev_path = std::getenv("MC_CXL_DEV_PATH");
+    const char *env_cxl_dev_path = std::getenv("MC_CXL_DEV_PATH");
 
     if (env_cxl_dev_path) {
         LOG(INFO) << "MC_CXL_DEV_PATH: " << env_cxl_dev_path;
-        cxl_dev_path = (char *) env_cxl_dev_path;
+        cxl_dev_path = (char *)env_cxl_dev_path;
         cxl_dev_size = cxlGetDeviceSize();
     }
 }
 
 CxlTransport::~CxlTransport() {
-    if (cxl_base_addr != nullptr && cxl_base_addr != MAP_FAILED && 
+    if (cxl_base_addr != nullptr && cxl_base_addr != MAP_FAILED &&
         cxl_dev_size != 0) {
         munmap(cxl_base_addr, cxl_dev_size);
     }
@@ -58,11 +58,11 @@ CxlTransport::~CxlTransport() {
 
 size_t CxlTransport::cxlGetDeviceSize() {
     // for now, get cxl_shm size from env
-    const char* env_cxl_dev_size = std::getenv("MC_CXL_DEV_SIZE");
+    const char *env_cxl_dev_size = std::getenv("MC_CXL_DEV_SIZE");
 
     if (env_cxl_dev_size) {
         LOG(INFO) << "MC_CXL_DEV_SIZE: " << env_cxl_dev_size;
-        char* end = nullptr;
+        char *end = nullptr;
         unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
         if (end != env_cxl_dev_size && *end == '\0')
             return static_cast<size_t>(val);
@@ -73,25 +73,26 @@ size_t CxlTransport::cxlGetDeviceSize() {
 int CxlTransport::cxlMemcpy(void *dest, void *src, size_t size) {
     // Input validation
     if (!src || !dest) {
-        LOG(ERROR) << "CxlTransport::cxlMemcpy invalid arguments: null pointer provided.";
-        return -1; // null pointer
+        LOG(ERROR) << "CxlTransport::cxlMemcpy invalid arguments: null pointer "
+                      "provided.";
+        return -1;  // null pointer
     }
-    
+
     // Validate memory bounds using the helper function
     if (!validateMemoryBounds(dest, src, size)) {
-        return -1; // validation failed
+        return -1;  // validation failed
     }
-    
+
     // Perform the memory copy
     std::memcpy(dest, src, size);
-    
+
     // Memory barriers and cache operations
     if (isAddressInCxlRange(dest) || isAddressInCxlRange(src)) {
         // Ensure memory ordering for CXL operations
         __sync_synchronize();
     }
-    
-    return 0; // success
+
+    return 0;  // success
 }
 
 bool CxlTransport::validateMemoryBounds(void *dest, void *src, size_t size) {
@@ -99,7 +100,7 @@ bool CxlTransport::validateMemoryBounds(void *dest, void *src, size_t size) {
     uintptr_t end = base + cxl_dev_size;
     uintptr_t dest_ptr = reinterpret_cast<uintptr_t>(dest);
     uintptr_t src_ptr = reinterpret_cast<uintptr_t>(src);
-    
+
     if (isAddressInCxlRange(dest)) {
         uintptr_t dest_end = dest_ptr + size;
         if (dest_end > end || dest_end < dest_ptr) {
@@ -107,7 +108,7 @@ bool CxlTransport::validateMemoryBounds(void *dest, void *src, size_t size) {
             return false;
         }
     }
-    
+
     if (isAddressInCxlRange(src)) {
         uintptr_t src_end = src_ptr + size;
         if (src_end > end || src_end < src_ptr) {
@@ -115,17 +116,17 @@ bool CxlTransport::validateMemoryBounds(void *dest, void *src, size_t size) {
             return false;
         }
     }
-    
+
     return true;
 }
 
 bool CxlTransport::isAddressInCxlRange(void *addr) {
     if (!addr || !cxl_base_addr) return false;
-    
+
     uintptr_t base = reinterpret_cast<uintptr_t>(cxl_base_addr);
     uintptr_t end = base + cxl_dev_size;
     uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
-    
+
     return (ptr >= base && ptr < end);
 }
 
@@ -136,11 +137,13 @@ int CxlTransport::cxlDevInit() {
     }
     int fd = open(cxl_dev_path, O_RDWR);
     if (fd == -1) {
-        LOG(ERROR) << "CxlTransport: Cannot open cxl device." << strerror(errno);
+        LOG(ERROR) << "CxlTransport: Cannot open cxl device."
+                   << strerror(errno);
         return -1;
     }
 
-    void* ptr = mmap(NULL, cxl_dev_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *ptr =
+        mmap(NULL, cxl_dev_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) {
         close(fd);
         return ERR_MEMORY;
@@ -292,13 +295,13 @@ Status CxlTransport::submitTransfer(
         __sync_fetch_and_add(&task.slice_count, 1);
         int err;
         if (slice->opcode == TransferRequest::READ)
-            //READ: Source is in local memory, Destination is on CXL
+            // READ: Source is in local memory, Destination is on CXL
             err = cxlMemcpy(slice->source_addr, (void *)slice->cxl.dest_addr,
-                             slice->length);
+                            slice->length);
         else
-            //WRITE: Source is in local memory, Destination is on CXL
+            // WRITE: Source is in local memory, Destination is on CXL
             err = cxlMemcpy((void *)slice->cxl.dest_addr, slice->source_addr,
-                             slice->length);
+                            slice->length);
         if (err != 0)
             slice->markFailed();
         else
@@ -317,7 +320,7 @@ Status CxlTransport::submitTransferTask(
         auto &request = *task.request;
         uint64_t dest_cxl_offset = request.target_offset;
         task.total_bytes = request.length;
-        
+
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
         slice->cxl.dest_addr = (char *)cxl_base_addr + dest_cxl_offset;
@@ -330,13 +333,13 @@ Status CxlTransport::submitTransferTask(
         __sync_fetch_and_add(&task.slice_count, 1);
         int err;
         if (slice->opcode == TransferRequest::READ)
-            //READ: Source is in local memory, Destination is on CXL
+            // READ: Source is in local memory, Destination is on CXL
             err = cxlMemcpy(slice->source_addr, (void *)slice->cxl.dest_addr,
-                             slice->length);
+                            slice->length);
         else
-            //WRITE: Source is in local memory, Destination is on CXL
+            // WRITE: Source is in local memory, Destination is on CXL
             err = cxlMemcpy((void *)slice->cxl.dest_addr, slice->source_addr,
-                             slice->length);
+                            slice->length);
         if (err != 0)
             slice->markFailed();
         else
