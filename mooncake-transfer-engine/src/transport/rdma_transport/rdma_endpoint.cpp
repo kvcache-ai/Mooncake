@@ -86,8 +86,8 @@ int RdmaEndPoint::deconstruct() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
@@ -236,8 +236,8 @@ void RdmaEndPoint::disconnectUnlocked() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);

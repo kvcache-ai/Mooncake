@@ -72,7 +72,6 @@ class CXLTransportTest : public ::testing::Test {
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     const size_t kDataLength = 4 * 1024;
-    
 
    protected:
     void SetUp() override {
@@ -102,22 +101,21 @@ class CXLTransportTest : public ::testing::Test {
         xport = engine->installTransport("cxl", args);
         ASSERT_NE(xport, nullptr);
 
-	    cxl_xport = dynamic_cast<CxlTransport*>(xport);
-        base_addr = (uint8_t*)cxl_xport->getCxlBaseAddr();
-        addr = (uint8_t*) allocateMemoryPool(kDataLength, 0, false);
+        cxl_xport = dynamic_cast<CxlTransport *>(xport);
+        base_addr = (uint8_t *)cxl_xport->getCxlBaseAddr();
+        addr = (uint8_t *)allocateMemoryPool(kDataLength, 0, false);
         int rc = engine->registerLocalMemory(base_addr + offset_1, len);
         ASSERT_EQ(rc, 0);
 
         segment_id = engine->openSegment(FLAGS_local_server_name.c_str());
         // bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-
     }
 
     void TearDown() override {
-        if (tmp_fd >= 0) { 
-            close(tmp_fd); 
-            unlink(FLAGS_device_name.c_str()); 
+        if (tmp_fd >= 0) {
+            close(tmp_fd);
+            unlink(FLAGS_device_name.c_str());
         }
         free(args);
         google::ShutdownGoogleLogging();
@@ -141,7 +139,7 @@ TEST_F(CXLTransportTest, MultiWrite) {
         // s = xport->submitTransfer(batch_id, {entry});
         s = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(s.ok());
-        
+
         bool completed = false;
         TransferStatus status;
         while (!completed) {
@@ -176,7 +174,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
         // s = xport->submitTransfer(batch_id, {entry});
         s = engine->submitTransfer(batch_id, {entry});
         LOG_ASSERT(s.ok());
-        
+
         bool completed = false;
         TransferStatus status;
         while (!completed) {
@@ -189,7 +187,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
                 completed = true;
             }
         }
-        
+
         s = xport->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
     }
@@ -233,7 +231,6 @@ TEST_F(CXLTransportTest, MultipleRead) {
         freeMemoryPool(src, kDataLength);
     }
     engine->unregisterLocalMemory(addr);
-    
 }
 
 }  // namespace mooncake

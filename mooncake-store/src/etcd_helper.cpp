@@ -166,7 +166,8 @@ ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
 }
 
 ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
-                                      const char* value, const size_t value_size,
+                                      const char* value,
+                                      const size_t value_size,
                                       EtcdLeaseId lease_id,
                                       EtcdRevisionId& revision_id) {
     LOG(FATAL) << "Etcd is not enabled in compilation";

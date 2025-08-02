@@ -5,13 +5,11 @@
 
 #include "common.h"
 
-
 namespace {
 
 using namespace mooncake;
 
 const uint16_t kDefaultPort = getDefaultHandshakePort();
-
 
 //------------------------------------------------------------------------------
 // parseFromString<T>
@@ -149,7 +147,6 @@ TEST(ParsePortAndDevice, InvalidDeviceIdSetsToZero) {
 // parseHostNameWithPortAscend
 //------------------------------------------------------------------------------
 
-
 TEST(ParseHostNameWithPortAscend, BracketedIpv6WithPort) {
     int dev = -1;
     auto [host, port] = parseHostNameWithPortAscend("[2001:db8::1]:1234", &dev);
@@ -208,7 +205,8 @@ TEST(ParseHostNameWithPortAscend, HostWithoutPort) {
 
 TEST(ParseHostNameWithPortAscend, BracketedIpv6PortDevice) {
     int dev = -1;
-    auto [host, port] = parseHostNameWithPortAscend("[2001:db8::1]:8080:npu_3", &dev);
+    auto [host, port] =
+        parseHostNameWithPortAscend("[2001:db8::1]:8080:npu_3", &dev);
     EXPECT_EQ(host, "2001:db8::1");
     EXPECT_EQ(port, 8080);
     EXPECT_EQ(dev, 3);
@@ -232,7 +230,8 @@ TEST(ParseHostNameWithPortAscend, Ipv4PortInvalidDevice) {
 
 TEST(ParseHostNameWithPortAscend, HostPortDevice) {
     int dev = -1;
-    auto [host, port] = parseHostNameWithPortAscend("example.com:8080:npu_1", &dev);
+    auto [host, port] =
+        parseHostNameWithPortAscend("example.com:8080:npu_1", &dev);
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, 8080);
     EXPECT_EQ(dev, 1);

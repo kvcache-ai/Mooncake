@@ -312,10 +312,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
-  
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
-    
+
     - name: Build Docker image
       run: docker build -t mooncake-app .
 
@@ -327,3 +327,32 @@ jobs:
       uses: actions/checkout@v4
     - name: Spell Check Repo
       uses: crate-ci/typos@v1.30.2
+
+  clang-format:
+    name: Check code format
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Actions Repository
+      uses: actions/checkout@v4
+
+    - name: Install clang-format 20
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 20
+        sudo apt-get install -y clang-format-20
+
+    - name: run clang-format-20
+      run: |
+        # the old clang-format-14 which is the defaut version in ubuntu 22.04,
+        # is inconsistent with clang-format-20.
+        ls -lh /usr/bin/clang-format*
+        clang-format --version
+        clang-format-20 --version
+        # skip cachelib_memory_allocator
+        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
+        if ! git diff --exit-code; then
+          echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
+          exit 1
+        fi
+      shell: bash

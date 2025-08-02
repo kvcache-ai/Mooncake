@@ -66,7 +66,8 @@ const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
     {"KiB", 1ull << 10},
     {"Kb", 1000ull / 8}};
 
-static inline std::string calculateRate(uint64_t data_bytes, uint64_t duration) {
+static inline std::string calculateRate(uint64_t data_bytes,
+                                        uint64_t duration) {
     if (!RATE_UNIT_MP.count(FLAGS_report_unit)) {
         LOG(WARNING) << "Invalid flag: report_unit only support "
                         "GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb, not support "
@@ -76,12 +77,13 @@ static inline std::string calculateRate(uint64_t data_bytes, uint64_t duration) 
     }
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(FLAGS_report_precision)
-        << 1.0 * data_bytes * 1000000 / duration / RATE_UNIT_MP.at(FLAGS_report_unit)
+        << 1.0 * data_bytes * 1000000 / duration /
+               RATE_UNIT_MP.at(FLAGS_report_unit)
         << " " << FLAGS_report_unit << "/s";
     return oss.str();
 }
 
-int allocateDevMem(void* &devAddr, size_t size) {
+int allocateDevMem(void *&devAddr, size_t size) {
     // malloc device mem
     aclError ret = aclrtMalloc(&devAddr, size, ACL_MEM_MALLOC_NORMAL_ONLY);
     if (ret != ACL_ERROR_NONE) {
@@ -90,7 +92,7 @@ int allocateDevMem(void* &devAddr, size_t size) {
     }
 
     // malloc host mem
-    void* host_addr = nullptr;
+    void *host_addr = nullptr;
     ret = aclrtMallocHost(&host_addr, size);
     if (ret != ACL_ERROR_NONE || host_addr == nullptr) {
         LOG(ERROR) << "Failed to allocate device memory, ret:" << ret;
@@ -98,25 +100,26 @@ int allocateDevMem(void* &devAddr, size_t size) {
     }
 
     for (size_t i = 0; i < size; i += sizeof(uint32_t)) {
-        *(uint32_t*)((char *)host_addr + i) = 0x12345678;
+        *(uint32_t *)((char *)host_addr + i) = 0x12345678;
     }
 
     // copy data from host mem to device mem
-    ret = aclrtMemcpy(devAddr, size, host_addr, size, ACL_MEMCPY_HOST_TO_DEVICE);
+    ret =
+        aclrtMemcpy(devAddr, size, host_addr, size, ACL_MEMCPY_HOST_TO_DEVICE);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to copy data from host to device, ret: " << ret;
         aclrtFreeHost(host_addr);
         aclrtFree(devAddr);
         return ret;
     }
-    
-    //release resource
+
+    // release resource
     ret = aclrtFreeHost(host_addr);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to aclrtFreeHost, ret: " << ret;
         return ret;
     }
-    
+
     return 0;
 }
 
@@ -131,10 +134,12 @@ int initiator() {
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    std::string FLAGS_local_server_name_new = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_devicePhyId);
+    std::string FLAGS_local_server_name_new =
+        hostname_port.first + ":" + std::to_string(hostname_port.second) +
+        ":npu_" + std::to_string(g_devicePhyId);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_new.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
-    
+
     // Warm-up transmission
     void *tmp_devAddr = NULL;
     ret = allocateDevMem(tmp_devAddr, FLAGS_block_size);
@@ -143,22 +148,25 @@ int initiator() {
         return ret;
     }
 
-    LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr << ", len: " << FLAGS_block_size;
+    LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
+              << ", len: " << FLAGS_block_size;
     ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
-                                        "npu:" + std::to_string(g_devicePhyId));
+                                      "npu:" + std::to_string(g_devicePhyId));
 
     void *devAddr = NULL;
     std::vector<void *> g_addr;
-    for (uint32_t i = 0; i < FLAGS_block_iteration; i++ ) {
+    for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
         uint64_t block_size = FLAGS_block_size * (1 << i);
         ret = allocateDevMem(devAddr, FLAGS_batch_size * block_size * 2);
         if (ret) {
             LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
             return -1;
         }
-        LOG(INFO) << "dev_addr_initiator: " << devAddr << " len:" << FLAGS_batch_size * block_size * 2;
-        ret = engine->registerLocalMemory(devAddr, FLAGS_batch_size * block_size * 2,
-                                            "npu:" + std::to_string(g_devicePhyId));
+        LOG(INFO) << "dev_addr_initiator: " << devAddr
+                  << " len:" << FLAGS_batch_size * block_size * 2;
+        ret = engine->registerLocalMemory(
+            devAddr, FLAGS_batch_size * block_size * 2,
+            "npu:" + std::to_string(g_devicePhyId));
         if (ret) {
             LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
             return ret;
@@ -195,7 +203,7 @@ int initiator() {
     entry.length = FLAGS_block_size;
     entry.source = (uint8_t *)tmp_devAddr;
     entry.target_id = segment_id;
-    entry.target_offset = remote_base; 
+    entry.target_offset = remote_base;
     tmp_requests.emplace_back(entry);
 
     s = engine->submitTransfer(tmp_batch_id, tmp_requests);
@@ -226,14 +234,15 @@ int initiator() {
         remote_base = (uint64_t)segment_desc->buffers[i + 1].addr;
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         std::vector<TransferRequest> requests;
-        // Send every other block to ensure that all the sent memory is non-contiguous
+        // Send every other block to ensure that all the sent memory is
+        // non-contiguous
         for (int j = 0; j < FLAGS_batch_size; ++j) {
             TransferRequest entry;
             entry.opcode = opcode;
             entry.length = block_size;
             entry.source = (uint8_t *)(g_addr[i]) + block_size * 2 * j;
             entry.target_id = segment_id;
-            entry.target_offset = remote_base + block_size * 2 * j; 
+            entry.target_offset = remote_base + block_size * 2 * j;
             requests.emplace_back(entry);
         }
         s = engine->submitTransfer(batch_id, requests);
@@ -255,14 +264,12 @@ int initiator() {
         }
         gettimeofday(&stop_tv, nullptr);
         uint64_t duration = (stop_tv.tv_sec - start_tv.tv_sec) * 1000000.0 +
-                        (stop_tv.tv_usec - start_tv.tv_usec);
+                            (stop_tv.tv_usec - start_tv.tv_usec);
 
-        LOG(INFO) << "Test completed: duration " << duration << "us, block size "
-                << block_size / 1024 << "KB, total size "
-                << FLAGS_batch_size * block_size / 1024 << "KB , throughput "
-                << calculateRate(
-                        FLAGS_batch_size * block_size,
-                        duration);
+        LOG(INFO) << "Test completed: duration " << duration
+                  << "us, block size " << block_size / 1024 << "KB, total size "
+                  << FLAGS_batch_size * block_size / 1024 << "KB , throughput "
+                  << calculateRate(FLAGS_batch_size * block_size, duration);
         s = engine->freeBatchID(batch_id);
         LOG_ASSERT(s.ok());
     }
@@ -280,14 +287,16 @@ int target() {
     aclrtContext context = nullptr;
     aclError ret = aclrtCreateContext(&context, g_deviceLogicId);
     if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) <<"Failed to create context, ret: " << ret;
+        LOG(ERROR) << "Failed to create context, ret: " << ret;
         return -1;
     }
 
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
     auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    std::string FLAGS_local_server_name_new = hostname_port.first + ":" + std::to_string(hostname_port.second) + ":npu_" + std::to_string(g_devicePhyId);
+    std::string FLAGS_local_server_name_new =
+        hostname_port.first + ":" + std::to_string(hostname_port.second) +
+        ":npu_" + std::to_string(g_devicePhyId);
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name_new.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
@@ -299,9 +308,10 @@ int target() {
         return ret;
     }
 
-    LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr << ", len: " << FLAGS_block_size;
+    LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
+              << ", len: " << FLAGS_block_size;
     ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
-                                        "npu:" + std::to_string(g_devicePhyId));
+                                      "npu:" + std::to_string(g_devicePhyId));
 
     void *devAddr = NULL;
     std::vector<void *> g_addr;
@@ -313,9 +323,11 @@ int target() {
             return ret;
         }
 
-        LOG(INFO) << "devAddr_target: " << devAddr << ", len: " << FLAGS_batch_size * block_size * 2;
-        ret = engine->registerLocalMemory(devAddr, FLAGS_batch_size * block_size * 2,
-                                            "npu:" + std::to_string(g_devicePhyId));
+        LOG(INFO) << "devAddr_target: " << devAddr
+                  << ", len: " << FLAGS_batch_size * block_size * 2;
+        ret = engine->registerLocalMemory(
+            devAddr, FLAGS_batch_size * block_size * 2,
+            "npu:" + std::to_string(g_devicePhyId));
         if (ret) {
             LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
             return ret;
@@ -331,7 +343,7 @@ int target() {
     for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
         aclrtFree(g_addr[i]);
     }
-    
+
     return 0;
 }
 

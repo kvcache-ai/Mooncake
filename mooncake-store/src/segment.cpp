@@ -59,7 +59,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
                            << ", error=unknown_memory_allocator="
-                           << static_cast<int>(segment_manager_->memory_allocator_);
+                           << static_cast<int>(
+                                  segment_manager_->memory_allocator_);
                 return ErrorCode::INVALID_PARAMS;
         }
 
@@ -133,7 +134,8 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     metrics_dec_capacity = segment.size;
 
     // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocatorBase> allocator = mounted_segment.buf_allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
     auto alloc_it = std::find(segment_manager_->allocators_.begin(),
@@ -246,7 +248,7 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
         VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
                 << ") not found!";
         return ErrorCode::SEGMENT_NOT_FOUND;
-        }
+    }
     return ErrorCode::OK;
 }
 }  // namespace mooncake

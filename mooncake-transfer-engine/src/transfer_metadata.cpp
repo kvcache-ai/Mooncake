@@ -215,7 +215,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         segmentJSON["buffers"] = buffersJSON;
     } else if (segmentJSON["protocol"] == "cxl") {
         segmentJSON["cxl_name"] = desc.cxl_name;
-        segmentJSON["cxl_base_addr"] = static_cast<Json::UInt64>(desc.cxl_base_addr);
+        segmentJSON["cxl_base_addr"] =
+            static_cast<Json::UInt64>(desc.cxl_base_addr);
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -584,10 +585,11 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         for (auto iter = segment_desc->buffers.begin();
-            iter != segment_desc->buffers.end(); ++iter) {
+             iter != segment_desc->buffers.end(); ++iter) {
             if (iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+                ||
+                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
 #endif
             ) {
                 segment_desc->buffers.erase(iter);
