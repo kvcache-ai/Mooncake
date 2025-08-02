@@ -15,10 +15,10 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#include <glog/logging.h>
-#include <numa.h>
 #include <arpa/inet.h>
+#include <glog/logging.h>
 #include <netinet/in.h>
+#include <numa.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -515,10 +515,9 @@ class SimpleRandom {
         return g_random;
     }
 
-    // 生成下一个伪随机数
     uint32_t next() {
         current = (a * current + c) % m;
-        return current;
+        return current >> 12;  // Shift right to add randomness of the LSBs
     }
 
     uint32_t next(uint32_t max) { return next() % max; }

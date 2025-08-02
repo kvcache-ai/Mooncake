@@ -63,7 +63,7 @@ uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
     static std::random_device rand_gen;
     std::mt19937 gen(rand_gen());
     const int min_port = 15000;
-    const int max_port = 17000;
+    const int max_port = 25000;
     const int max_attempts = 500;
     std::uniform_int_distribution<> rand_dist(min_port, max_port);
 
