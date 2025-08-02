@@ -45,6 +45,13 @@ struct RdmaCq {
     volatile int outstanding;
 };
 
+struct MrMeta {
+  // mr->addr is not set to starting address for iova based mr. Therefore we
+  // track it ourselves.
+  void *addr;
+  struct ibv_mr *mr;
+};
+
 // RdmaContext represents the set of resources controlled by each local NIC,
 // including Memory Region, CQ, EndPoint (QPs), etc.
 class RdmaContext {
@@ -160,7 +167,7 @@ class RdmaContext {
     ibv_gid gid_;
 
     RWSpinlock memory_regions_lock_;
-    std::vector<ibv_mr *> memory_region_list_;
+    std::vector<struct MrMeta> memory_region_list_;
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;

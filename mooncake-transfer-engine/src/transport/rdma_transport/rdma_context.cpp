@@ -14,6 +14,10 @@
 
 #include "transport/rdma_transport/rdma_context.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#endif
+
 #include <fcntl.h>
 #include <sys/epoll.h>
 
@@ -148,7 +152,7 @@ int RdmaContext::deconstruct() {
     endpoint_store_->destroyQPs();
 
     for (auto &entry : memory_region_list_) {
-        int ret = ibv_dereg_mr(entry);
+        int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister memory region";
         }
@@ -200,14 +204,50 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-    ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
-    if (!mr) {
+
+    MrMeta mrMeta;
+#ifndef WITH_NVIDIA_PEERMEM
+    // Implement register memory in a way that does not assume the presence of
+    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
+    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
+    // nvidia-peermem.
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(&memType,
+      CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    // Register memory depending on whether memory is on host or GPU.
+    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+      mrMeta.addr = addr;
+      mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (memType == CU_MEMORYTYPE_DEVICE) {
+      size_t allocSize;
+      cuPointerGetAttribute(&allocSize,
+          CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+      int dmabuf_fd;
+      result = cuMemGetHandleForAddressRange(&dmabuf_fd,
+          (CUdeviceptr)addr, allocSize, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+      if (result != CUDA_SUCCESS) {
+          const char* errStr;
+          cuGetErrorString(result, &errStr);
+          LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
+                     << " cuda error=" << errStr;
+          return ERR_CONTEXT;
+      }
+      mrMeta.addr = addr;
+      mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+        (uintptr_t)addr, dmabuf_fd, access);
+    }
+#else
+    mrMeta.addr = addr;
+    mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#endif
+    if (!mrMeta.mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;
         return ERR_CONTEXT;
     }
 
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    memory_region_list_.push_back(mr);
+    memory_region_list_.push_back(mrMeta);
     return 0;
 }
 
@@ -218,9 +258,9 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         has_removed = false;
         for (auto iter = memory_region_list_.begin();
              iter != memory_region_list_.end(); ++iter) {
-            if ((*iter)->addr <= addr &&
-                addr < (char *)((*iter)->addr) + (*iter)->length) {
-                if (ibv_dereg_mr(*iter)) {
+            if (iter->addr <= addr &&
+                addr < (char *)(iter->addr) + iter->mr->length) {
+                if (ibv_dereg_mr(iter->mr)) {
                     LOG(ERROR) << "Failed to unregister memory " << addr;
                     return ERR_CONTEXT;
                 }
@@ -237,9 +277,9 @@ uint32_t RdmaContext::rkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     for (auto iter = memory_region_list_.begin();
          iter != memory_region_list_.end(); ++iter)
-        if ((*iter)->addr <= addr &&
-            addr < (char *)((*iter)->addr) + (*iter)->length)
-            return (*iter)->rkey;
+        if (iter->addr <= addr &&
+            addr < (char *)(iter->addr) + iter->mr->length)
+            return iter->mr->rkey;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -249,9 +289,9 @@ uint32_t RdmaContext::lkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     for (auto iter = memory_region_list_.begin();
          iter != memory_region_list_.end(); ++iter)
-        if ((*iter)->addr <= addr &&
-            addr < (char *)((*iter)->addr) + (*iter)->length)
-            return (*iter)->lkey;
+        if (iter->addr <= addr &&
+            addr < (char *)(iter->addr) + iter->mr->length)
+            return iter->mr->lkey;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
@@ -403,6 +443,27 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
         }
+
+#ifndef WITH_NVIDIA_PEERMEM
+        // Assume device index matches.
+        CUdevice cuDevice;
+        CUresult result = cuDeviceGet(&cuDevice, i);
+        if (result != CUDA_SUCCESS) {
+          LOG(ERROR) << "Failed to query CUDA device";
+          return ERR_CONTEXT;
+        }
+        int dmaBufSupported;
+        result = cuDeviceGetAttribute(&dmaBufSupported,
+          CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to query CUDA device attributes";
+            return ERR_CONTEXT;
+        }
+        if (!dmaBufSupported) {
+            LOG(ERROR) << "DMA BUF supported required for GPU RDMA without nvidia-peermem";
+            return ERR_CONTEXT;
+        }
+#endif
 
         ibv_port_attr port_attr;
         ret = ibv_query_port(context, port, &port_attr);
