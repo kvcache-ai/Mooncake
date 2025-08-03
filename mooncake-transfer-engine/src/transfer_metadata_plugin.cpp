@@ -592,12 +592,14 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return ERR_SOCKET;
             }
 
-            if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
-                           sizeof(on))) {
-                PLOG(ERROR)
-                    << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-                closeListen();
-                return ERR_SOCKET;
+            if (getenv("MC_ENABLE_REUSEADDR")) {
+                if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
+                               sizeof(on))) {
+                    PLOG(ERROR)
+                        << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+                    closeListen();
+                    return ERR_SOCKET;
+                }
             }
 
             if (globalConfig().use_ipv6) {
@@ -1088,11 +1090,13 @@ uint16_t findAvailableTcpPort(int &sockfd) {
             continue;
         }
 
-        int on = 1;
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
+        if (getenv("MC_ENABLE_REUSEADDR")) {
+            int on = 1;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+                close(sockfd);
+                sockfd = -1;
+                continue;
+            }
         }
 
         if (use_ipv6) {
