@@ -1,3 +1,4 @@
+import argparse
 from enum import Enum
 from time import sleep
 from aiohttp import web
@@ -93,7 +94,10 @@ class KVBootstrapServer:
     def poll(self) -> KVPoll: ...
 
 if __name__ == '__main__':
-    server = KVBootstrapServer(port=8080)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8080)
+    args = parser.parse_args()
+    server = KVBootstrapServer(port=args.port)
     server.run()
     try:
         threading.Event().wait()
