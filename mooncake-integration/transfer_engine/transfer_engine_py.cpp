@@ -692,6 +692,7 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchRegisterMemory)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress);
 
