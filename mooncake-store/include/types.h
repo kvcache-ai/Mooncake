@@ -185,7 +185,6 @@ class BufferAllocator;
 enum class ReplicaType {
     MEMORY,  // Memory replica
     DISK,    // Disk replica
-    ALL,     // All replicas (used for operations that apply to both types)
 };
 
 /**
@@ -194,425 +193,436 @@ enum class ReplicaType {
 inline std::ostream& operator<<(std::ostream& os,
                                 const ReplicaType& replicaType) noexcept {
     static const std::unordered_map<ReplicaType, std::string_view>
-        replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
-                             {ReplicaType::DISK, "DISK"},
-                             {ReplicaType::ALL, "ALL"}};
+        replica_type_strings {
+        {ReplicaType::MEMORY, "MEMORY"}, {ReplicaType::DISK, "DISK"}};
 
-    os << (replica_type_strings.count(replicaType)
-               ? replica_type_strings.at(replicaType)
-               : "UNKNOWN");
-    return os;
-}
+        os << (replica_type_strings.count(replicaType)
+                   ? replica_type_strings.at(replicaType)
+                   : "UNKNOWN");
+        return os;
+    }
 
-/**
- * @brief Status of a replica in the system
- */
-enum class ReplicaStatus {
-    UNDEFINED = 0,  // Uninitialized
-    INITIALIZED,    // Space allocated, waiting for write
-    PROCESSING,     // Write in progress
-    COMPLETE,       // Write complete, replica is available
-    REMOVED,        // Replica has been removed
-    FAILED,         // Failed state (can be used for reassignment)
-};
+    /**
+     * @brief Status of a replica in the system
+     */
+    enum class ReplicaStatus {
+        UNDEFINED = 0,  // Uninitialized
+        INITIALIZED,    // Space allocated, waiting for write
+        PROCESSING,     // Write in progress
+        COMPLETE,       // Write complete, replica is available
+        REMOVED,        // Replica has been removed
+        FAILED,         // Failed state (can be used for reassignment)
+    };
 
-/**
- * @brief Stream operator for ReplicaStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const ReplicaStatus& status) noexcept {
-    static const std::unordered_map<ReplicaStatus, std::string_view>
-        status_strings{{ReplicaStatus::UNDEFINED, "UNDEFINED"},
-                       {ReplicaStatus::INITIALIZED, "INITIALIZED"},
-                       {ReplicaStatus::PROCESSING, "PROCESSING"},
-                       {ReplicaStatus::COMPLETE, "COMPLETE"},
-                       {ReplicaStatus::REMOVED, "REMOVED"},
-                       {ReplicaStatus::FAILED, "FAILED"}};
+    /**
+     * @brief Stream operator for ReplicaStatus
+     */
+    inline std::ostream& operator<<(std::ostream& os,
+                                    const ReplicaStatus& status) noexcept {
+        static const std::unordered_map<ReplicaStatus, std::string_view>
+            status_strings{{ReplicaStatus::UNDEFINED, "UNDEFINED"},
+                           {ReplicaStatus::INITIALIZED, "INITIALIZED"},
+                           {ReplicaStatus::PROCESSING, "PROCESSING"},
+                           {ReplicaStatus::COMPLETE, "COMPLETE"},
+                           {ReplicaStatus::REMOVED, "REMOVED"},
+                           {ReplicaStatus::FAILED, "FAILED"}};
 
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
+        os << (status_strings.count(status) ? status_strings.at(status)
+                                            : "UNKNOWN");
+        return os;
+    }
 
-/**
- * @brief Configuration for replica management
- */
-struct ReplicateConfig {
-    size_t replica_num{1};
-    bool with_soft_pin{false};
-    std::string preferred_segment{};  // Preferred segment for allocation
+    /**
+     * @brief Configuration for replica management
+     */
+    struct ReplicateConfig {
+        size_t replica_num{1};
+        bool with_soft_pin{false};
+        std::string preferred_segment{};  // Preferred segment for allocation
 
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const ReplicateConfig& config) noexcept {
-        return os << "ReplicateConfig: { replica_num: " << config.replica_num
-                  << ", with_soft_pin: " << config.with_soft_pin
-                  << ", preferred_segment: " << config.preferred_segment
+        friend std::ostream& operator<<(
+            std::ostream& os, const ReplicateConfig& config) noexcept {
+            return os << "ReplicateConfig: { replica_num: "
+                      << config.replica_num
+                      << ", with_soft_pin: " << config.with_soft_pin
+                      << ", preferred_segment: " << config.preferred_segment
+                      << " }";
+        }
+    };
+
+    class AllocatedBuffer {
+       public:
+        friend class CachelibBufferAllocator;
+        friend class OffsetBufferAllocator;
+        // Forward declaration of the descriptor struct
+        struct Descriptor;
+
+        AllocatedBuffer(
+            std::shared_ptr<BufferAllocatorBase> allocator,
+            std::string segment_name, void* buffer_ptr, std::size_t size,
+            std::optional<offset_allocator::OffsetAllocationHandle>&&
+                offset_handle = std::nullopt)
+            : allocator_(std::move(allocator)),
+              segment_name_(std::move(segment_name)),
+              buffer_ptr_(buffer_ptr),
+              size_(size),
+              offset_handle_(std::move(offset_handle)) {}
+
+        ~AllocatedBuffer();
+
+        AllocatedBuffer(const AllocatedBuffer&) = delete;
+        AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
+        AllocatedBuffer(AllocatedBuffer&&) noexcept;
+        AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
+
+        [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
+
+        [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+
+        [[nodiscard]] bool isAllocatorValid() const {
+            return !allocator_.expired();
+        }
+
+        // Serialize the buffer into a descriptor for transfer
+        [[nodiscard]] Descriptor get_descriptor() const;
+
+        // Friend declaration for operator<<
+        friend std::ostream& operator<<(std::ostream& os,
+                                        const AllocatedBuffer& buffer);
+
+        // Represents the serializable state
+        struct Descriptor {
+            std::string segment_name_;
+            uint64_t size_;
+            uintptr_t buffer_address_;
+            BufStatus status_;
+            YLT_REFL(Descriptor, segment_name_, size_, buffer_address_,
+                     status_);
+        };
+
+        void mark_complete() { status = BufStatus::COMPLETE; }
+
+       private:
+        std::weak_ptr<BufferAllocatorBase> allocator_;
+        std::string segment_name_;
+        BufStatus status{BufStatus::INIT};
+        void* buffer_ptr_{nullptr};
+        std::size_t size_{0};
+        // RAII handle for buffer allocated by offset allocator
+        std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
+            std::nullopt};
+    };
+
+    // Implementation of get_descriptor
+    inline AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+        return {segment_name_, static_cast<uint64_t>(size()),
+                reinterpret_cast<uintptr_t>(buffer_ptr_), status};
+    }
+
+    // Define operator<< using public accessors or get_descriptor if appropriate
+    inline std::ostream& operator<<(std::ostream& os,
+                                    const AllocatedBuffer& buffer) {
+        return os << "AllocatedBuffer: { "
+                  << "segment_name: " << buffer.segment_name_ << ", "
+                  << "size: " << buffer.size() << ", "
+                  << "status: " << buffer.status << ", "
+                  << "buffer_ptr: " << static_cast<void*>(buffer.data())
                   << " }";
     }
-};
 
-class AllocatedBuffer {
-   public:
-    friend class CachelibBufferAllocator;
-    friend class OffsetBufferAllocator;
-    // Forward declaration of the descriptor struct
-    struct Descriptor;
-
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, void* buffer_ptr,
-                    std::size_t size,
-                    std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
-        : allocator_(std::move(allocator)),
-          segment_name_(std::move(segment_name)),
-          buffer_ptr_(buffer_ptr),
-          size_(size),
-          offset_handle_(std::move(offset_handle)) {}
-
-    ~AllocatedBuffer();
-
-    AllocatedBuffer(const AllocatedBuffer&) = delete;
-    AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
-    AllocatedBuffer(AllocatedBuffer&&) noexcept;
-    AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
-
-    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
-
-    [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
-
-    [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
-    }
-
-    // Serialize the buffer into a descriptor for transfer
-    [[nodiscard]] Descriptor get_descriptor() const;
-
-    // Friend declaration for operator<<
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const AllocatedBuffer& buffer);
-
-    // Represents the serializable state
-    struct Descriptor {
-        std::string segment_name_;
-        uint64_t size_;
-        uintptr_t buffer_address_;
-        BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+    struct MemoryReplicaData {
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
     };
 
-    void mark_complete() { status = BufStatus::COMPLETE; }
+    struct DiskReplicaData {
+        std::string file_path;
+        uint64_t object_size = 0;
+    };
 
-   private:
-    std::weak_ptr<BufferAllocatorBase> allocator_;
-    std::string segment_name_;
-    BufStatus status{BufStatus::INIT};
-    void* buffer_ptr_{nullptr};
-    std::size_t size_{0};
-    // RAII handle for buffer allocated by offset allocator
-    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
-        std::nullopt};
-};
+    struct MemoryDescriptor {
+        std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
+        YLT_REFL(MemoryDescriptor, buffer_descriptors);
+    };
 
-// Implementation of get_descriptor
-inline AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
-}
+    struct DiskDescriptor {
+        std::string file_path{};
+        uint64_t object_size = 0;
+        YLT_REFL(DiskDescriptor, file_path, object_size);
+    };
 
-// Define operator<< using public accessors or get_descriptor if appropriate
-inline std::ostream& operator<<(std::ostream& os,
-                                const AllocatedBuffer& buffer) {
-    return os << "AllocatedBuffer: { "
-              << "segment_name: " << buffer.segment_name_ << ", "
-              << "size: " << buffer.size() << ", "
-              << "status: " << buffer.status << ", "
-              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
-}
+    class Replica {
+       public:
+        struct Descriptor;
 
-struct MemoryReplicaData {
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
-};
+        // memory replica constructor
+        Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
+                ReplicaStatus status)
+            : data_(MemoryReplicaData{std::move(buffers)}), status_(status) {}
 
-struct DiskReplicaData {
-    std::string file_path;
-    uint64_t object_size = 0;
-};
+        // disk replica constructor
+        Replica(std::string file_path, uint64_t object_size,
+                ReplicaStatus status)
+            : data_(DiskReplicaData{std::move(file_path), object_size}),
+              status_(status) {}
 
-struct MemoryDescriptor {
-    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
-    YLT_REFL(MemoryDescriptor, buffer_descriptors);
-};
+        [[nodiscard]] Descriptor get_descriptor() const;
 
-struct DiskDescriptor {
-    std::string file_path{};
-    uint64_t object_size = 0;
-    YLT_REFL(DiskDescriptor, file_path, object_size);
-};
+        [[nodiscard]] ReplicaStatus status() const { return status_; }
 
-class Replica {
-   public:
-    struct Descriptor;
+        [[nodiscard]] ReplicaType type() const {
+            return std::visit(ReplicaTypeVisitor{}, data_);
+        }
 
-    // memory replica constructor
-    Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
-            ReplicaStatus status)
-        : data_(MemoryReplicaData{std::move(buffers)}), status_(status) {}
+        [[nodiscard]] bool is_memory_replica() const {
+            return std::holds_alternative<MemoryReplicaData>(data_);
+        }
 
-    // disk replica constructor
-    Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
-        : data_(DiskReplicaData{std::move(file_path), object_size}),
-          status_(status) {}
+        [[nodiscard]] bool is_disk_replica() const {
+            return std::holds_alternative<DiskReplicaData>(data_);
+        }
 
-    [[nodiscard]] Descriptor get_descriptor() const;
+        [[nodiscard]] bool has_invalid_mem_handle() const {
+            if (is_memory_replica()) {
+                const auto& mem_data = std::get<MemoryReplicaData>(data_);
+                return std::any_of(
+                    mem_data.buffers.begin(), mem_data.buffers.end(),
+                    [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
+                        return !buf_ptr->isAllocatorValid();
+                    });
+            }
+            return false;  // DiskReplicaData does not have handles
+        }
 
-    [[nodiscard]] ReplicaStatus status() const { return status_; }
+        void mark_complete() {
+            if (status_ == ReplicaStatus::PROCESSING) {
+                status_ = ReplicaStatus::COMPLETE;
+                if (is_memory_replica()) {
+                    auto& mem_data = std::get<MemoryReplicaData>(data_);
+                    for (const auto& buf_ptr : mem_data.buffers) {
+                        buf_ptr->mark_complete();
+                    }
+                }
+            } else if (status_ == ReplicaStatus::COMPLETE) {
+                LOG(WARNING) << "Replica already marked as complete";
+            } else {
+                LOG(ERROR) << "Invalid replica status: " << status_;
+            }
+        }
 
-    [[nodiscard]] ReplicaType type() const {
-        return std::visit(ReplicaTypeVisitor{}, data_);
-    }
+        friend std::ostream& operator<<(std::ostream& os,
+                                        const Replica& replica);
 
-    [[nodiscard]] bool is_memory_replica() const {
-        return std::holds_alternative<MemoryReplicaData>(data_);
-    }
+        struct ReplicaTypeVisitor {
+            ReplicaType operator()(const MemoryReplicaData&) const {
+                return ReplicaType::MEMORY;
+            }
+            ReplicaType operator()(const DiskReplicaData&) const {
+                return ReplicaType::DISK;
+            }
+        };
 
-    [[nodiscard]] bool is_disk_replica() const {
-        return std::holds_alternative<DiskReplicaData>(data_);
-    }
+        struct Descriptor {
+            std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
+            ReplicaStatus status;
+            YLT_REFL(Descriptor, descriptor_variant, status);
 
-    [[nodiscard]] bool has_invalid_handle() const {
+            // Helper functions
+            bool is_memory_replica() noexcept {
+                return std::holds_alternative<MemoryDescriptor>(
+                    descriptor_variant);
+            }
+
+            bool is_memory_replica() const noexcept {
+                return std::holds_alternative<MemoryDescriptor>(
+                    descriptor_variant);
+            }
+
+            bool is_disk_replica() noexcept {
+                return std::holds_alternative<DiskDescriptor>(
+                    descriptor_variant);
+            }
+
+            bool is_disk_replica() const noexcept {
+                return std::holds_alternative<DiskDescriptor>(
+                    descriptor_variant);
+            }
+
+            MemoryDescriptor& get_memory_descriptor() {
+                if (auto* desc =
+                        std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                    return *desc;
+                }
+                throw std::runtime_error("Expected MemoryDescriptor");
+            }
+
+            DiskDescriptor& get_disk_descriptor() {
+                if (auto* desc =
+                        std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                    return *desc;
+                }
+                throw std::runtime_error("Expected DiskDescriptor");
+            }
+
+            const MemoryDescriptor& get_memory_descriptor() const {
+                if (auto* desc =
+                        std::get_if<MemoryDescriptor>(&descriptor_variant)) {
+                    return *desc;
+                }
+                throw std::runtime_error("Expected MemoryDescriptor");
+            }
+
+            const DiskDescriptor& get_disk_descriptor() const {
+                if (auto* desc =
+                        std::get_if<DiskDescriptor>(&descriptor_variant)) {
+                    return *desc;
+                }
+                throw std::runtime_error("Expected DiskDescriptor");
+            }
+        };
+
+       private:
+        std::variant<MemoryReplicaData, DiskReplicaData> data_;
+        ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+    };
+
+    inline Replica::Descriptor Replica::get_descriptor() const {
+        Replica::Descriptor desc;
+        desc.status = status_;
+
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            return std::any_of(
-                mem_data.buffers.begin(), mem_data.buffers.end(),
-                [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
-                    return !buf_ptr->isAllocatorValid();
-                });
-        }
-        return false;  // DiskReplicaData does not have handles
-    }
-
-    void mark_complete() {
-        if (status_ == ReplicaStatus::PROCESSING) {
-            status_ = ReplicaStatus::COMPLETE;
-            if (is_memory_replica()) {
-                auto& mem_data = std::get<MemoryReplicaData>(data_);
-                for (const auto& buf_ptr : mem_data.buffers) {
-                    buf_ptr->mark_complete();
+            MemoryDescriptor mem_desc;
+            mem_desc.buffer_descriptors.reserve(mem_data.buffers.size());
+            for (const auto& buf_ptr : mem_data.buffers) {
+                if (buf_ptr) {
+                    mem_desc.buffer_descriptors.push_back(
+                        buf_ptr->get_descriptor());
                 }
             }
-        } else if (status_ == ReplicaStatus::COMPLETE) {
-            LOG(WARNING) << "Replica already marked as complete";
-        } else {
-            LOG(ERROR) << "Invalid replica status: " << status_;
+            desc.descriptor_variant = std::move(mem_desc);
+        } else if (is_disk_replica()) {
+            const auto& disk_data = std::get<DiskReplicaData>(data_);
+            DiskDescriptor disk_desc;
+            disk_desc.file_path = disk_data.file_path;
+            disk_desc.object_size = disk_data.object_size;
+            desc.descriptor_variant = std::move(disk_desc);
         }
+
+        return desc;
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
+    inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
+        os << "Replica: { status: " << replica.status_ << ", ";
 
-    struct ReplicaTypeVisitor {
-        ReplicaType operator()(const MemoryReplicaData&) const {
-            return ReplicaType::MEMORY;
+        if (replica.is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
+            os << "type: MEMORY, buffers: [";
+            for (const auto& buf_ptr : mem_data.buffers) {
+                if (buf_ptr) {
+                    os << *buf_ptr;
+                }
+            }
+            os << "]";
+        } else if (replica.is_disk_replica()) {
+            const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
+            os << "type: DISK, file_path: " << disk_data.file_path
+               << ", object_size: " << disk_data.object_size;
         }
-        ReplicaType operator()(const DiskReplicaData&) const {
-            return ReplicaType::DISK;
-        }
+
+        os << " }";
+        return os;
+    }
+
+    /**
+     * @brief Represents a contiguous memory region
+     */
+    struct Slice {
+        void* ptr{nullptr};
+        size_t size{0};
     };
 
-    struct Descriptor {
-        std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
-        ReplicaStatus status;
-        YLT_REFL(Descriptor, descriptor_variant, status);
+    const static uint64_t kMinSliceSize =
+        facebook::cachelib::Slab::kMinAllocSize;
+    const static uint64_t kMaxSliceSize =
+        facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
-        // Helper functions
-        bool is_memory_replica() noexcept {
-            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
-        }
+    /**
+     * @brief Represents a contiguous memory region
+     */
+    struct Segment {
+        UUID id{0, 0};
+        std::string name{};  // The name of the segment, also might be the
+                             // hostname of the server that owns the segment
+        uintptr_t base{0};
+        size_t size{0};
+        Segment() = default;
+        Segment(const UUID& id, const std::string& name, uintptr_t base,
+                size_t size)
+            : id(id), name(name), base(base), size(size) {}
+    };
+    YLT_REFL(Segment, id, name, base, size);
 
-        bool is_memory_replica() const noexcept {
-            return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
-        }
-
-        bool is_disk_replica() noexcept {
-            return std::holds_alternative<DiskDescriptor>(descriptor_variant);
-        }
-
-        bool is_disk_replica() const noexcept {
-            return std::holds_alternative<DiskDescriptor>(descriptor_variant);
-        }
-
-        MemoryDescriptor& get_memory_descriptor() {
-            if (auto* desc =
-                    std::get_if<MemoryDescriptor>(&descriptor_variant)) {
-                return *desc;
-            }
-            throw std::runtime_error("Expected MemoryDescriptor");
-        }
-
-        DiskDescriptor& get_disk_descriptor() {
-            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
-                return *desc;
-            }
-            throw std::runtime_error("Expected DiskDescriptor");
-        }
-
-        const MemoryDescriptor& get_memory_descriptor() const {
-            if (auto* desc =
-                    std::get_if<MemoryDescriptor>(&descriptor_variant)) {
-                return *desc;
-            }
-            throw std::runtime_error("Expected MemoryDescriptor");
-        }
-
-        const DiskDescriptor& get_disk_descriptor() const {
-            if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
-                return *desc;
-            }
-            throw std::runtime_error("Expected DiskDescriptor");
-        }
+    /**
+     * @brief Client status from the master's perspective
+     */
+    enum class ClientStatus {
+        UNDEFINED = 0,  // Uninitialized
+        OK,             // Client is alive, no need to remount for now
+        NEED_REMOUNT,  // Ping ttl expired, or the first time connect to master,
+                       // so need to remount
     };
 
-   private:
-    std::variant<MemoryReplicaData, DiskReplicaData> data_;
-    ReplicaStatus status_{ReplicaStatus::UNDEFINED};
-};
+    /**
+     * @brief Stream operator for ClientStatus
+     */
+    inline std::ostream& operator<<(std::ostream& os,
+                                    const ClientStatus& status) noexcept {
+        static const std::unordered_map<ClientStatus, std::string_view>
+            status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
+                           {ClientStatus::OK, "OK"},
+                           {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
 
-inline Replica::Descriptor Replica::get_descriptor() const {
-    Replica::Descriptor desc;
-    desc.status = status_;
+        os << (status_strings.count(status) ? status_strings.at(status)
+                                            : "UNKNOWN");
+        return os;
+    }
 
-    if (is_memory_replica()) {
-        const auto& mem_data = std::get<MemoryReplicaData>(data_);
-        MemoryDescriptor mem_desc;
-        mem_desc.buffer_descriptors.reserve(mem_data.buffers.size());
-        for (const auto& buf_ptr : mem_data.buffers) {
-            if (buf_ptr) {
-                mem_desc.buffer_descriptors.push_back(
-                    buf_ptr->get_descriptor());
-            }
+    /**
+     * @brief Response structure for Ping operation
+     */
+    struct PingResponse {
+        ViewVersionId view_version_id;
+        ClientStatus client_status;
+
+        PingResponse() = default;
+        PingResponse(ViewVersionId view_version, ClientStatus status)
+            : view_version_id(view_version), client_status(status) {}
+
+        friend std::ostream& operator<<(std::ostream& os,
+                                        const PingResponse& response) noexcept {
+            return os << "PingResponse: { view_version_id: "
+                      << response.view_version_id
+                      << ", client_status: " << response.client_status << " }";
         }
-        desc.descriptor_variant = std::move(mem_desc);
-    } else if (is_disk_replica()) {
-        const auto& disk_data = std::get<DiskReplicaData>(data_);
-        DiskDescriptor disk_desc;
-        disk_desc.file_path = disk_data.file_path;
-        disk_desc.object_size = disk_data.object_size;
-        desc.descriptor_variant = std::move(disk_desc);
+    };
+    YLT_REFL(PingResponse, view_version_id, client_status);
+
+    enum class BufferAllocatorType {
+        CACHELIB = 0,  // CachelibBufferAllocator
+        OFFSET = 1,    // OffsetBufferAllocator
+    };
+
+    /**
+     * @brief Stream operator for BufferAllocatorType
+     */
+    inline std::ostream& operator<<(std::ostream& os,
+                                    const BufferAllocatorType& type) noexcept {
+        static const std::unordered_map<BufferAllocatorType, std::string_view>
+            type_strings{{BufferAllocatorType::CACHELIB, "CACHELIB"},
+                         {BufferAllocatorType::OFFSET, "OFFSET"}};
+
+        os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
+        return os;
     }
-
-    return desc;
-}
-
-inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
-    os << "Replica: { status: " << replica.status_ << ", ";
-
-    if (replica.is_memory_replica()) {
-        const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
-        os << "type: MEMORY, buffers: [";
-        for (const auto& buf_ptr : mem_data.buffers) {
-            if (buf_ptr) {
-                os << *buf_ptr;
-            }
-        }
-        os << "]";
-    } else if (replica.is_disk_replica()) {
-        const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
-        os << "type: DISK, file_path: " << disk_data.file_path
-           << ", object_size: " << disk_data.object_size;
-    }
-
-    os << " }";
-    return os;
-}
-
-/**
- * @brief Represents a contiguous memory region
- */
-struct Slice {
-    void* ptr{nullptr};
-    size_t size{0};
-};
-
-const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
-const static uint64_t kMaxSliceSize =
-    facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
-
-/**
- * @brief Represents a contiguous memory region
- */
-struct Segment {
-    UUID id{0, 0};
-    std::string name{};  // The name of the segment, also might be the hostname
-                         // of the server that owns the segment
-    uintptr_t base{0};
-    size_t size{0};
-    Segment() = default;
-    Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size)
-        : id(id), name(name), base(base), size(size) {}
-};
-YLT_REFL(Segment, id, name, base, size);
-
-/**
- * @brief Client status from the master's perspective
- */
-enum class ClientStatus {
-    UNDEFINED = 0,  // Uninitialized
-    OK,             // Client is alive, no need to remount for now
-    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
-                    // need to remount
-};
-
-/**
- * @brief Stream operator for ClientStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const ClientStatus& status) noexcept {
-    static const std::unordered_map<ClientStatus, std::string_view>
-        status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
-                       {ClientStatus::OK, "OK"},
-                       {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
-/**
- * @brief Response structure for Ping operation
- */
-struct PingResponse {
-    ViewVersionId view_version_id;
-    ClientStatus client_status;
-
-    PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status)
-        : view_version_id(view_version), client_status(status) {}
-
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const PingResponse& response) noexcept {
-        return os << "PingResponse: { view_version_id: "
-                  << response.view_version_id
-                  << ", client_status: " << response.client_status << " }";
-    }
-};
-YLT_REFL(PingResponse, view_version_id, client_status);
-
-enum class BufferAllocatorType {
-    CACHELIB = 0,  // CachelibBufferAllocator
-    OFFSET = 1,    // OffsetBufferAllocator
-};
-
-/**
- * @brief Stream operator for BufferAllocatorType
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const BufferAllocatorType& type) noexcept {
-    static const std::unordered_map<BufferAllocatorType, std::string_view>
-        type_strings{{BufferAllocatorType::CACHELIB, "CACHELIB"},
-                     {BufferAllocatorType::OFFSET, "OFFSET"}};
-
-    os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
-    return os;
-}
 
 }  // namespace mooncake

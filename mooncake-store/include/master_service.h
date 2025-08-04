@@ -187,8 +187,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key,
-                ReplicaType replica_type = ReplicaType::MEMORY)
+    auto PutEnd(const std::string& key, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -197,8 +196,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key,
-                   ReplicaType replica_type = ReplicaType::MEMORY)
+    auto PutRevoke(const std::string& key, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -315,22 +313,12 @@ class MasterService {
         // Check if there are some replicas with a different status than the
         // given value. If there are, return the status of the first replica
         // that is not equal to the given value. Otherwise, return false.
-        // If replica_type is ALL, check all replicas, otherwise only check
-        // replicas of the given type.
         std::optional<ReplicaStatus> HasDiffRepStatus(
             ReplicaStatus status, ReplicaType replica_type) const {
-            if (replica_type == ReplicaType::ALL) {
-                for (const auto& replica : replicas) {
-                    if (replica.status() != status) {
-                        return replica.status();
-                    }
-                }
-            } else {
-                for (const auto& replica : replicas) {
-                    if (replica.status() != status &&
-                        replica.type() == replica_type) {
-                        return replica.status();
-                    }
+            for (const auto& replica : replicas) {
+                if (replica.status() != status &&
+                    replica.type() == replica_type) {
+                    return replica.status();
                 }
             }
             return {};
@@ -400,6 +388,13 @@ class MasterService {
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
         bool IsValid() const { return !replicas.empty() && size > 0; }
+
+        bool IsAllReplicasComplete() const {
+            return std::all_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
+        }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

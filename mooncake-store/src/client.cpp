@@ -512,7 +512,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 // Revoke put operation
-                auto revoke_result = master_client_.PutRevoke(key);
+                auto revoke_result =
+                    master_client_.PutRevoke(key, ReplicaType::MEMORY);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke put operation";
                     return tl::unexpected(revoke_result.error());
@@ -523,7 +524,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // End put operation
-    auto end_result = master_client_.PutEnd(key);
+    auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end put operation: " << err;
@@ -1097,7 +1098,7 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
 
 void Client::PutToLocalFile(const std::string& key,
                             const std::vector<Slice>& slices,
-                            DiskDescriptor& disk_descriptor) {
+                            const DiskDescriptor& disk_descriptor) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;

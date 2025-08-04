@@ -227,7 +227,7 @@ class Client {
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
-                        DiskDescriptor& disk_descriptor);
+                        const DiskDescriptor& disk_descriptor);
 
     /**
      * @brief Find the first complete replica from a replica list

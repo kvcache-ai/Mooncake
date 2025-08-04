@@ -114,7 +114,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    auto put_revoke_result = service_.PutRevoke(key);
+    auto put_revoke_result = service_.PutRevoke(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_size(), 0);
@@ -128,7 +128,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    auto put_end_result = service_.PutEnd(key);
+    auto put_end_result = service_.PutEnd(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_size(), value_length);
@@ -160,7 +160,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test RemoveAll request
     auto put_start_result3 = service_.PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result3.has_value());
-    auto put_end_result2 = service_.PutEnd(key);
+    auto put_end_result2 = service_.PutEnd(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(1, service_.RemoveAll());
@@ -172,7 +172,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test UnmountSegment request
     auto put_start_result4 = service_.PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result4.has_value());
-    auto put_end_result3 = service_.PutEnd(key);
+    auto put_end_result3 = service_.PutEnd(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
     auto unmount_result = service_.UnmountSegment(segment_id, client_id);
     ASSERT_TRUE(unmount_result.has_value());

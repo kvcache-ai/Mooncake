@@ -340,7 +340,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutEnd(key));
+        results.emplace_back(master_service_.PutEnd(key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;
@@ -369,7 +369,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutRevoke(key));
+        results.emplace_back(
+            master_service_.PutRevoke(key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;

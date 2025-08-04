@@ -474,7 +474,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(key));
+        results.emplace_back(PutEnd(key, ReplicaType::MEMORY));
     }
     return results;
 }
@@ -484,7 +484,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(key));
+        results.emplace_back(PutRevoke(key, ReplicaType::MEMORY));
     }
     return results;
 }
@@ -504,10 +504,8 @@ auto MasterService::Remove(const std::string& key)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                ReplicaType::ALL)) {
-        LOG(ERROR) << "key=" << key << ", status=" << *status
-                   << ", error=invalid_replica_status";
+    if (!metadata.IsAllReplicasComplete()) {
+        LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -568,10 +566,10 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     auto replica_it = metadata.replicas.begin();
     while (replica_it != metadata.replicas.end()) {
         // Use any_of algorithm to check if any handle has an invalid allocator
-        bool has_invalid_handle = replica_it->has_invalid_handle();
+        bool has_invalid_mem_handle = replica_it->has_invalid_mem_handle();
 
         // Remove replicas with invalid handles using erase-remove idiom
-        if (has_invalid_handle) {
+        if (has_invalid_mem_handle) {
             replica_it = metadata.replicas.erase(replica_it);
         } else {
             ++replica_it;
