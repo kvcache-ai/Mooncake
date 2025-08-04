@@ -327,7 +327,8 @@ void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items) {
     batch_get_replica_list_requests_.inc(1);
     batch_get_replica_list_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t failed_items) {
+void MasterMetricManager::inc_batch_get_replica_list_failures(
+    int64_t failed_items) {
     batch_get_replica_list_failures_.inc(1);
     batch_get_replica_list_failed_items_.inc(failed_items);
 }
@@ -699,29 +700,41 @@ std::string MasterMetricManager::get_summary_string() {
     // Batch request counters
     int64_t batch_put_start_requests = batch_put_start_requests_.value();
     int64_t batch_put_start_fails = batch_put_start_failures_.value();
-    int64_t batch_put_start_partial_successes = batch_put_start_partial_successes_.value();
+    int64_t batch_put_start_partial_successes =
+        batch_put_start_partial_successes_.value();
     int64_t batch_put_start_items = batch_put_start_items_.value();
-    int64_t batch_put_start_failed_items = batch_put_start_failed_items_.value();
+    int64_t batch_put_start_failed_items =
+        batch_put_start_failed_items_.value();
     int64_t batch_put_end_requests = batch_put_end_requests_.value();
     int64_t batch_put_end_fails = batch_put_end_failures_.value();
-    int64_t batch_put_end_partial_successes = batch_put_end_partial_successes_.value();
+    int64_t batch_put_end_partial_successes =
+        batch_put_end_partial_successes_.value();
     int64_t batch_put_end_items = batch_put_end_items_.value();
     int64_t batch_put_end_failed_items = batch_put_end_failed_items_.value();
     int64_t batch_put_revoke_requests = batch_put_revoke_requests_.value();
     int64_t batch_put_revoke_fails = batch_put_revoke_failures_.value();
-    int64_t batch_put_revoke_partial_successes = batch_put_revoke_partial_successes_.value();
+    int64_t batch_put_revoke_partial_successes =
+        batch_put_revoke_partial_successes_.value();
     int64_t batch_put_revoke_items = batch_put_revoke_items_.value();
-    int64_t batch_put_revoke_failed_items = batch_put_revoke_failed_items_.value();
-    int64_t batch_get_replica_list_requests = batch_get_replica_list_requests_.value();
-    int64_t batch_get_replica_list_fails = batch_get_replica_list_failures_.value();
-    int64_t batch_get_replica_list_partial_successes = batch_get_replica_list_partial_successes_.value();
-    int64_t batch_get_replica_list_items = batch_get_replica_list_items_.value();
-    int64_t batch_get_replica_list_failed_items = batch_get_replica_list_failed_items_.value();
+    int64_t batch_put_revoke_failed_items =
+        batch_put_revoke_failed_items_.value();
+    int64_t batch_get_replica_list_requests =
+        batch_get_replica_list_requests_.value();
+    int64_t batch_get_replica_list_fails =
+        batch_get_replica_list_failures_.value();
+    int64_t batch_get_replica_list_partial_successes =
+        batch_get_replica_list_partial_successes_.value();
+    int64_t batch_get_replica_list_items =
+        batch_get_replica_list_items_.value();
+    int64_t batch_get_replica_list_failed_items =
+        batch_get_replica_list_failed_items_.value();
     int64_t batch_exist_key_requests = batch_exist_key_requests_.value();
     int64_t batch_exist_key_fails = batch_exist_key_failures_.value();
-    int64_t batch_exist_key_partial_successes = batch_exist_key_partial_successes_.value();
+    int64_t batch_exist_key_partial_successes =
+        batch_exist_key_partial_successes_.value();
     int64_t batch_exist_key_items = batch_exist_key_items_.value();
-    int64_t batch_exist_key_failed_items = batch_exist_key_failed_items_.value();
+    int64_t batch_exist_key_failed_items =
+        batch_exist_key_failed_items_.value();
 
     // Eviction counters
     int64_t eviction_success = eviction_success_.value();
@@ -747,9 +760,11 @@ std::string MasterMetricManager::get_summary_string() {
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
-    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts << ", ";
+    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts
+       << ", ";
     ss << "PutEnd=" << put_ends - put_end_fails << "/" << put_ends << ", ";
-    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/" << put_revoke_requests << ", ";
+    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/"
+       << put_revoke_requests << ", ";
     ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
        << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
@@ -800,10 +815,8 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_exist_key_items << ", ";
 
     // Eviction summary
-    ss << " | Eviction: "
-       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
-       << ", "
-       << "keys=" << evicted_key_count << ", "
+    ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
+       << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
 
     return ss.str();

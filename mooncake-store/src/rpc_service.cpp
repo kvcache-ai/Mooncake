@@ -239,7 +239,8 @@ WrappedMasterService::BatchGetReplicaList(
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
-    MasterMetricManager::instance().inc_batch_get_replica_list_requests(total_keys);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_keys);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
@@ -262,8 +263,8 @@ WrappedMasterService::BatchGetReplicaList(
         MasterMetricManager::instance().inc_batch_get_replica_list_failures(
             failure_count);
     } else if (failure_count != 0) {
-        MasterMetricManager::instance().inc_batch_get_replica_list_partial_success(
-            failure_count);
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
     }
 
     timer.LogResponse("total=", results.size(),
