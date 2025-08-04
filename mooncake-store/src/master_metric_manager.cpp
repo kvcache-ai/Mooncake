@@ -310,79 +310,69 @@ void MasterMetricManager::inc_ping_failures(int64_t val) {
 }
 
 // Batch Operation Statistics (Counters)
-void MasterMetricManager::inc_batch_exist_key_requests(int64_t items,
-                                                       int64_t val) {
-    batch_exist_key_requests_.inc(val);
+void MasterMetricManager::inc_batch_exist_key_requests(int64_t items) {
+    batch_exist_key_requests_.inc(1);
     batch_exist_key_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_exist_key_failures(int64_t failed_items,
-                                                        int64_t val) {
-    batch_exist_key_failures_.inc(val);
+void MasterMetricManager::inc_batch_exist_key_failures(int64_t failed_items) {
+    batch_exist_key_failures_.inc(1);
     batch_exist_key_failed_items_.inc(failed_items);
 }
 void MasterMetricManager::inc_batch_exist_key_partial_success(
-    int64_t failed_items, int64_t val) {
-    batch_exist_key_partial_successes_.inc(val);
+    int64_t failed_items) {
+    batch_exist_key_partial_successes_.inc(1);
     batch_exist_key_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items,
-                                                              int64_t val) {
-    batch_get_replica_list_requests_.inc(val);
+void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items) {
+    batch_get_replica_list_requests_.inc(1);
     batch_get_replica_list_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t failed_items,
-                                                               int64_t val) {
-    batch_get_replica_list_failures_.inc(val);
+void MasterMetricManager::inc_batch_get_replica_list_failures(int64_t failed_items) {
+    batch_get_replica_list_failures_.inc(1);
     batch_get_replica_list_failed_items_.inc(failed_items);
 }
 void MasterMetricManager::inc_batch_get_replica_list_partial_success(
-    int64_t failed_items, int64_t val) {
-    batch_get_replica_list_partial_successes_.inc(val);
+    int64_t failed_items) {
+    batch_get_replica_list_partial_successes_.inc(1);
     batch_get_replica_list_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_start_requests(int64_t items,
-                                                       int64_t val) {
-    batch_put_start_requests_.inc(val);
+void MasterMetricManager::inc_batch_put_start_requests(int64_t items) {
+    batch_put_start_requests_.inc(1);
     batch_put_start_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items,
-                                                        int64_t val) {
-    batch_put_start_failures_.inc(val);
+void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items) {
+    batch_put_start_failures_.inc(1);
     batch_put_start_failed_items_.inc(failed_items);
 }
 void MasterMetricManager::inc_batch_put_start_partial_success(
-    int64_t failed_items, int64_t val) {
-    batch_put_start_partial_successes_.inc(val);
+    int64_t failed_items) {
+    batch_put_start_partial_successes_.inc(1);
     batch_put_start_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_end_requests(int64_t items,
-                                                     int64_t val) {
-    batch_put_end_requests_.inc(val);
+void MasterMetricManager::inc_batch_put_end_requests(int64_t items) {
+    batch_put_end_requests_.inc(1);
     batch_put_end_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_end_failures(int64_t failed_items,
-                                                      int64_t val) {
-    batch_put_end_failures_.inc(val);
+void MasterMetricManager::inc_batch_put_end_failures(int64_t failed_items) {
+    batch_put_end_failures_.inc(1);
     batch_put_end_failed_items_.inc(failed_items);
 }
 void MasterMetricManager::inc_batch_put_end_partial_success(
-    int64_t failed_items, int64_t val) {
-    batch_put_end_partial_successes_.inc(val);
+    int64_t failed_items) {
+    batch_put_end_partial_successes_.inc(1);
     batch_put_end_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_revoke_requests(int64_t items,
-                                                        int64_t val) {
-    batch_put_revoke_requests_.inc(val);
+void MasterMetricManager::inc_batch_put_revoke_requests(int64_t items) {
+    batch_put_revoke_requests_.inc(1);
     batch_put_revoke_items_.inc(items);
 }
-void MasterMetricManager::inc_batch_put_revoke_failures(int64_t failed_items,
-                                                         int64_t val) {
-    batch_put_revoke_failures_.inc(val);
+void MasterMetricManager::inc_batch_put_revoke_failures(int64_t failed_items) {
+    batch_put_revoke_failures_.inc(1);
     batch_put_revoke_failed_items_.inc(failed_items);
 }
 void MasterMetricManager::inc_batch_put_revoke_partial_success(
-    int64_t failed_items, int64_t val) {
-    batch_put_revoke_partial_successes_.inc(val);
+    int64_t failed_items) {
+    batch_put_revoke_partial_successes_.inc(1);
     batch_put_revoke_failed_items_.inc(failed_items);
 }
 

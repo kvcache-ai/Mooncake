@@ -67,26 +67,21 @@ class MasterMetricManager {
     void inc_ping_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
-    void inc_batch_exist_key_requests(int64_t items, int64_t val = 1);
-    void inc_batch_exist_key_failures(int64_t failed_items, int64_t val = 1);
-    void inc_batch_exist_key_partial_success(int64_t failed_items,
-                                             int64_t val = 1);
-    void inc_batch_get_replica_list_requests(int64_t items, int64_t val = 1);
-    void inc_batch_get_replica_list_failures(int64_t failed_items, int64_t val = 1);
-    void inc_batch_get_replica_list_partial_success(int64_t failed_items,
-                                                    int64_t val = 1);
-    void inc_batch_put_start_requests(int64_t items, int64_t val = 1);
-    void inc_batch_put_start_failures(int64_t failed_items, int64_t val = 1);
-    void inc_batch_put_start_partial_success(int64_t failed_items,
-                                             int64_t val = 1);
-    void inc_batch_put_end_requests(int64_t items, int64_t val = 1);
-    void inc_batch_put_end_failures(int64_t failed_items, int64_t val = 1);
-    void inc_batch_put_end_partial_success(int64_t failed_items,
-                                           int64_t val = 1);
-    void inc_batch_put_revoke_requests(int64_t items, int64_t val = 1);
-    void inc_batch_put_revoke_failures(int64_t failed_items, int64_t val = 1);
-    void inc_batch_put_revoke_partial_success(int64_t failed_items,
-                                              int64_t val = 1);
+    void inc_batch_exist_key_requests(int64_t items);
+    void inc_batch_exist_key_failures(int64_t failed_items);
+    void inc_batch_exist_key_partial_success(int64_t failed_items);
+    void inc_batch_get_replica_list_requests(int64_t items);
+    void inc_batch_get_replica_list_failures(int64_t failed_items);
+    void inc_batch_get_replica_list_partial_success(int64_t failed_items);
+    void inc_batch_put_start_requests(int64_t items);
+    void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_partial_success(int64_t failed_items);
+    void inc_batch_put_end_requests(int64_t items);
+    void inc_batch_put_end_failures(int64_t failed_items);
+    void inc_batch_put_end_partial_success(int64_t failed_items);
+    void inc_batch_put_revoke_requests(int64_t items);
+    void inc_batch_put_revoke_failures(int64_t failed_items);
+    void inc_batch_put_revoke_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
