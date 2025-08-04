@@ -130,10 +130,9 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         max_capacity =
             std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
         // Create the offset allocator
-        offset_allocator_ =
-            offset_allocator::OffsetAllocator::create(
-                base, size, static_cast<uint32_t>(init_capacity),
-                static_cast<uint32_t>(max_capacity));
+        offset_allocator_ = offset_allocator::OffsetAllocator::create(
+            base, size, static_cast<uint32_t>(init_capacity),
+            static_cast<uint32_t>(max_capacity));
         if (!offset_allocator_) {
             LOG(ERROR) << "status=failed_to_create_offset_allocator";
             throw std::runtime_error("Failed to create offset allocator");

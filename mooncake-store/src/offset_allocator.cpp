@@ -126,8 +126,7 @@ uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
 }
 
 // __Allocator...
-__Allocator::__Allocator(uint32 size, uint32 init_capacity,
-                         uint32 max_capacity)
+__Allocator::__Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity)
     : m_size(size),
       m_current_capacity(init_capacity),
       m_max_capacity(std::max(init_capacity, max_capacity)),
@@ -536,7 +535,8 @@ OffsetAllocationHandle::~OffsetAllocationHandle() {
 // Helper function to calculate the multiplier
 static uint64_t calculateMultiplier(size_t size) {
     uint64_t multiplier_bits = 0;
-    for (; SmallFloat::MAX_BIN_SIZE < (size >> multiplier_bits); multiplier_bits++) {
+    for (; SmallFloat::MAX_BIN_SIZE < (size >> multiplier_bits);
+         multiplier_bits++) {
     }
     return multiplier_bits;
 }
@@ -553,7 +553,9 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
                                  uint32 init_capacity, uint32 max_capacity)
-    : m_base(base), m_multiplier_bits(calculateMultiplier(size)), m_capacity(size) {
+    : m_base(base),
+      m_multiplier_bits(calculateMultiplier(size)),
+      m_capacity(size) {
     m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
                                                 init_capacity, max_capacity);
 }
@@ -593,9 +595,9 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     m_allocated_num++;
 
     // Use shared_from_this to get a shared_ptr to this OffsetAllocator
-    return OffsetAllocationHandle(shared_from_this(), allocation,
-                                  m_base + (allocation.getOffset() << m_multiplier_bits),
-                                  size);
+    return OffsetAllocationHandle(
+        shared_from_this(), allocation,
+        m_base + (allocation.getOffset() << m_multiplier_bits), size);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
@@ -631,11 +633,12 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics_internal() const {
     // Get basic storage report
     OffsetAllocStorageReport basic_report = m_allocator->storageReport();
     return {
-        m_allocated_size,                               // allocated_size_
-        m_allocated_num,                                // allocated_num_
-        basic_report.largestFreeRegion << m_multiplier_bits,  // largest_free_region_
-        basic_report.totalFreeSpace << m_multiplier_bits,     // total_free_space_
-        m_capacity,                                     // capacity
+        m_allocated_size,  // allocated_size_
+        m_allocated_num,   // allocated_num_
+        basic_report.largestFreeRegion
+            << m_multiplier_bits,  // largest_free_region_
+        basic_report.totalFreeSpace << m_multiplier_bits,  // total_free_space_
+        m_capacity,                                        // capacity
     };
 }
 
@@ -667,8 +670,7 @@ std::ostream& operator<<(std::ostream& os,
        << ", allocs=" << metrics.allocated_num_
        << ", capacity=" << mooncake::byte_size_to_string(metrics.capacity)
        << ", utilization=" << std::fixed << std::setprecision(1) << utilization
-       << "%"
-       << ", free_space="
+       << "%" << ", free_space="
        << mooncake::byte_size_to_string(metrics.total_free_space_)
        << ", largest_free="
        << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";

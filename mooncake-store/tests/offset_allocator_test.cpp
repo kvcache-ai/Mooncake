@@ -104,8 +104,8 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    public:
     // Constructor
     AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
-        : m_allocator(OffsetAllocator::create(base, size, maxAllocs / 2,
-                                              maxAllocs)),
+        : m_allocator(
+              OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
           m_base(base),
           m_buffer_size(size) {
         // The allocator is created with the specified base and size
