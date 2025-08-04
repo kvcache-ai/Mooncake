@@ -177,11 +177,11 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
-        
+
         // Find HCAs with minimum distance in one pass
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
-        
+
         for (const auto &hca : all_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
             if (distance >= 0) {
@@ -194,10 +194,11 @@ static std::vector<TopologyEntry> discoverCudaTopology(
                 }
             }
         }
-        
+
         // Add HCAs with minimum distance to preferred_hca, others to avail_hca
         for (const auto &hca : all_hca) {
-            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(), hca.name) != min_distance_hcas.end()) {
+            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
+                          hca.name) != min_distance_hcas.end()) {
                 preferred_hca.push_back(hca.name);
             } else {
                 avail_hca.push_back(hca.name);
@@ -217,7 +218,15 @@ Topology::Topology() {}
 
 Topology::~Topology() {}
 
-bool Topology::empty() const { return matrix_.empty(); }
+bool Topology::empty() const {
+    for (const auto &entry : resolved_matrix_) {
+        if (!entry.second.preferred_hca.empty() ||
+            !entry.second.avail_hca.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void Topology::clear() {
     matrix_.clear();

@@ -27,12 +27,8 @@ enum class RmaMemType : int {
 constexpr size_t TRANSPORT_EMD_ESC_SIZE = 512U - (sizeof(u32) * 2);
 
 class TransportMem {
-public:
-    enum class TpType : int {
-        IPC = 0,
-        ROCE = 1,
-        TYPE_NUM
-    };
+   public:
+    enum class TpType : int { IPC = 0, ROCE = 1, TYPE_NUM };
 
     struct AttrInfo {
         u32 localRankId;
@@ -63,44 +59,54 @@ public:
         u64 size;         // segment的size
     };
 
-    static std::shared_ptr<TransportMem> Create(TpType tpType,
-        const std::unique_ptr<NotifyPool> &notifyPool, const HcclNetDevCtx &netDevCtx, const HcclDispatcher &dispatcher,
+    static std::shared_ptr<TransportMem> Create(
+        TpType tpType, const std::unique_ptr<NotifyPool> &notifyPool,
+        const HcclNetDevCtx &netDevCtx, const HcclDispatcher &dispatcher,
         AttrInfo &attrInfo);
 
-    explicit TransportMem(const std::unique_ptr<NotifyPool> &notifyPool, const HcclNetDevCtx &netDevCtx,
-        const HcclDispatcher &dispatcher, AttrInfo &attrInfo);
+    explicit TransportMem(const std::unique_ptr<NotifyPool> &notifyPool,
+                          const HcclNetDevCtx &netDevCtx,
+                          const HcclDispatcher &dispatcher, AttrInfo &attrInfo);
     virtual ~TransportMem();
-    virtual HcclResult ExchangeMemDesc(
-        const RmaMemDescs &localMemDescs, RmaMemDescs &remoteMemDescs, u32 &actualNumOfRemote) = 0;
-    virtual HcclResult EnableMemAccess(const RmaMemDesc &remoteMemDesc, RmaMem &remoteMem) = 0;
+    virtual HcclResult ExchangeMemDesc(const RmaMemDescs &localMemDescs,
+                                       RmaMemDescs &remoteMemDescs,
+                                       u32 &actualNumOfRemote) = 0;
+    virtual HcclResult EnableMemAccess(const RmaMemDesc &remoteMemDesc,
+                                       RmaMem &remoteMem) = 0;
     virtual HcclResult DisableMemAccess(const RmaMemDesc &remoteMemDesc) = 0;
     virtual HcclResult SetDataSocket(const std::shared_ptr<HcclSocket> &socket);
 
     virtual HcclResult SetSocket(const std::shared_ptr<HcclSocket> &socket) = 0;
     virtual HcclResult Connect(s32 timeoutSec) = 0;
-    virtual HcclResult Write(const RmaOpMem &remoteMem, const RmaOpMem &localMem, const rtStream_t &stream) = 0;
-    virtual HcclResult Read(const RmaOpMem &localMem, const RmaOpMem &remoteMem, const rtStream_t &stream) = 0;
+    virtual HcclResult Write(const RmaOpMem &remoteMem,
+                             const RmaOpMem &localMem,
+                             const rtStream_t &stream) = 0;
+    virtual HcclResult Read(const RmaOpMem &localMem, const RmaOpMem &remoteMem,
+                            const rtStream_t &stream) = 0;
     virtual HcclResult AddOpFence(const rtStream_t &stream) = 0;
 
-protected:
+   protected:
     // 从 string 拷贝到 memDesc
-    HcclResult RmaMemDescCopyFromStr(RmaMemDesc &rmaMemDesc, const std::string &memDescStr) const
-    {
-        if (memcpy_s(rmaMemDesc.memDesc, TRANSPORT_EMD_ESC_SIZE, memDescStr.c_str(), memDescStr.size() + 1) != EOK) {
+    HcclResult RmaMemDescCopyFromStr(RmaMemDesc &rmaMemDesc,
+                                     const std::string &memDescStr) const {
+        if (memcpy_s(rmaMemDesc.memDesc, TRANSPORT_EMD_ESC_SIZE,
+                     memDescStr.c_str(), memDescStr.size() + 1) != EOK) {
             return HCCL_E_INTERNAL;
         }
         return HCCL_SUCCESS;
     }
 
     // 从 memDesc 转换为 string
-    std::string RmaMemDescCopyToStr(const RmaMemDesc &rmaMemDesc) const
-    {
+    std::string RmaMemDescCopyToStr(const RmaMemDesc &rmaMemDesc) const {
         return std::string(rmaMemDesc.memDesc, TRANSPORT_EMD_ESC_SIZE);
     }
 
-    HcclResult DoExchangeMemDesc(const RmaMemDescs &localMemDescs, RmaMemDescs &remoteMemDescs, u32 &actualNumOfRemote);
+    HcclResult DoExchangeMemDesc(const RmaMemDescs &localMemDescs,
+                                 RmaMemDescs &remoteMemDescs,
+                                 u32 &actualNumOfRemote);
     HcclResult SendLocalMemDesc(const RmaMemDescs &localMemDescs);
-    HcclResult ReceiveRemoteMemDesc(RmaMemDescs &remoteMemDescs, u32 &actualNumOfRemote);
+    HcclResult ReceiveRemoteMemDesc(RmaMemDescs &remoteMemDescs,
+                                    u32 &actualNumOfRemote);
 
     const std::unique_ptr<NotifyPool> &notifyPool_;
     HcclNetDevCtx netDevCtx_{nullptr};

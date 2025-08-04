@@ -136,7 +136,7 @@ class MasterMetricManager {
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
-    void inc_eviction_fail(); // not a single object is evicted
+    void inc_eviction_fail();  // not a single object is evicted
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();

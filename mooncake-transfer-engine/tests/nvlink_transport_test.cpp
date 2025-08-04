@@ -16,7 +16,7 @@ DEFINE_string(local_server_name, "cuda_server:12345", "Local server name");
 DEFINE_string(segment_id, "cuda_server:12345", "Segment ID to access data");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 
-static void checkCudaError(cudaError_t result, const char *message) {
+static void checkCudaError(cudaError_t result, const char* message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
                    << cudaGetErrorString(result) << ")";
@@ -27,7 +27,8 @@ static void checkCudaError(cudaError_t result, const char *message) {
 static void* allocateCudaBuffer(size_t size, int gpu_id) {
     checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
     void* d_buf = nullptr;
-    checkCudaError(cudaMalloc(&d_buf, size), "Failed to allocate device memory");
+    checkCudaError(cudaMalloc(&d_buf, size),
+                   "Failed to allocate device memory");
     return d_buf;
 }
 
@@ -44,11 +45,13 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     server_engine->init(FLAGS_metadata_server, FLAGS_local_server_name);
 
     // Install NvlinkTransport on server
-    Transport* server_transport = server_engine->installTransport("nvlink", nullptr);
+    Transport* server_transport =
+        server_engine->installTransport("nvlink", nullptr);
     ASSERT_NE(server_transport, nullptr);
 
     void* server_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
-    int rc = server_engine->registerLocalMemory(server_buffer, kDataLength * 2, "cuda:0");
+    int rc = server_engine->registerLocalMemory(server_buffer, kDataLength * 2,
+                                                "cuda:0");
     ASSERT_EQ(rc, 0);
 
     auto segment_id = server_engine->openSegment(FLAGS_segment_id);
@@ -58,7 +61,8 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     client_engine->init(FLAGS_metadata_server, "cuda_client:12346");
 
     // Install NvlinkTransport on client
-    Transport* client_transport = client_engine->installTransport("nvlink", nullptr);
+    Transport* client_transport =
+        client_engine->installTransport("nvlink", nullptr);
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
@@ -70,7 +74,9 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     {
         // Fill client buffer with data
         std::vector<char> host_data(kDataLength, 'A');
-        checkCudaError(cudaMemcpy(client_buffer, host_data.data(), kDataLength, cudaMemcpyHostToDevice), "Memcpy to client_buffer");
+        checkCudaError(cudaMemcpy(client_buffer, host_data.data(), kDataLength,
+                                  cudaMemcpyHostToDevice),
+                       "Memcpy to client_buffer");
 
         auto batch_id = client_engine->allocateBatchID(1);
         TransferRequest entry;
@@ -120,7 +126,10 @@ TEST(NvlinkTransportTest, WriteAndRead) {
 
     // Check data
     std::vector<char> host_check(kDataLength);
-    checkCudaError(cudaMemcpy(host_check.data(), (char*)client_buffer + kDataLength, kDataLength, cudaMemcpyDeviceToHost), "Memcpy from client_buffer");
+    checkCudaError(
+        cudaMemcpy(host_check.data(), (char*)client_buffer + kDataLength,
+                   kDataLength, cudaMemcpyDeviceToHost),
+        "Memcpy from client_buffer");
     for (size_t i = 0; i < kDataLength; ++i) {
         ASSERT_EQ(host_check[i], 'A');
     }

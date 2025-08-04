@@ -213,6 +213,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "cxl") {
+        segmentJSON["cxl_name"] = desc.cxl_name;
+        segmentJSON["cxl_base_addr"] =
+            static_cast<Json::UInt64>(desc.cxl_base_addr);
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -382,6 +395,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
         desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+    } else if (desc->protocol == "cxl") {
+        desc->cxl_name = segmentJSON["cxl_name"].asString();
+        desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -558,7 +586,12 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         segment_desc = new_segment_desc;
         for (auto iter = segment_desc->buffers.begin();
              iter != segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr) {
+            if (iter->addr == (uint64_t)addr
+#ifdef USE_CXL
+                ||
+                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+#endif
+            ) {
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 break;

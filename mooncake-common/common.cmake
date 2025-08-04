@@ -102,6 +102,11 @@ if (USE_CUDA)
   )
 endif()
 
+if (USE_CXL)
+  add_compile_definitions(USE_CXL)
+  message(STATUS "CXL support is enabled")
+endif()
+
 if (USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
