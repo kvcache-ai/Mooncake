@@ -38,7 +38,7 @@ class TransferMetadataTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = "http://127.0.0.1:8080/metadata";
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
