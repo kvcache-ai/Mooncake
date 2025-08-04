@@ -78,7 +78,6 @@ class MasterMetricManager {
     void inc_batch_put_revoke_requests(int64_t val = 1);
     void inc_batch_put_revoke_failures(int64_t val = 1);
 
-
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
@@ -117,7 +116,7 @@ class MasterMetricManager {
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
-    void inc_eviction_fail(); // not a single object is evicted
+    void inc_eviction_fail();  // not a single object is evicted
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();

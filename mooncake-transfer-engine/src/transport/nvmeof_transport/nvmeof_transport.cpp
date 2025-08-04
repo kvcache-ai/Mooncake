@@ -75,7 +75,7 @@ NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
+                                          TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &task = batch_desc.task_list[task_id];
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
@@ -118,8 +118,9 @@ Status NVMeoFTransport::submitTransfer(
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "NVMeoFTransport: Exceed the limitation of current batch's "
-                      "capacity";
+        LOG(ERROR)
+            << "NVMeoFTransport: Exceed the limitation of current batch's "
+               "capacity";
         return Status::InvalidArgument(
             "NVMeoFTransport: Exceed the limitation of capacity, batch id: " +
             std::to_string(batch_id));

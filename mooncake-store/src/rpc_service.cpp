@@ -33,7 +33,8 @@ WrappedMasterService::WrappedMasterService(
     : master_service_(enable_gc, default_kv_lease_ttl, default_kv_soft_pin_ttl,
                       allow_evict_soft_pinned_objects, eviction_ratio,
                       eviction_high_watermark_ratio, view_version,
-                      client_live_ttl_sec, enable_ha, cluster_id, memory_allocator),
+                      client_live_ttl_sec, enable_ha, cluster_id,
+                      memory_allocator),
       http_server_(4, http_port),
       metric_report_running_(enable_metric_reporting) {
     init_http_server();
@@ -450,8 +451,8 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode>
-WrappedMasterService::Ping(const UUID& client_id) {
+tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 

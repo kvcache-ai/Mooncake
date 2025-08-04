@@ -110,13 +110,13 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
 
         // check the second memory location
         EXPECT_EQ(entries[1].start,
-            reinterpret_cast<uint64_t>(addr) + 4096 * 2);
+                  reinterpret_cast<uint64_t>(addr) + 4096 * 2);
         EXPECT_EQ(entries[1].location, locationa);
         EXPECT_EQ(entries[1].len, static_cast<size_t>(4096 * 7));
 
         // check the third memory location
         EXPECT_EQ(entries[2].start,
-            reinterpret_cast<uint64_t>(addr) + 4096 * 9);
+                  reinterpret_cast<uint64_t>(addr) + 4096 * 9);
         EXPECT_EQ(entries[2].location, locationb);
         EXPECT_EQ(entries[2].len, static_cast<size_t>(4096 - 1024 * 2));
     }

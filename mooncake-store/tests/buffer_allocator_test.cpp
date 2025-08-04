@@ -63,7 +63,8 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "1";
         size_t size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
-        auto allocator = CreateTestAllocator(segment_name, 0, size, allocator_type);
+        auto allocator =
+            CreateTestAllocator(segment_name, 0, size, allocator_type);
 
         // Allocate memory block
         size_t alloc_size = 1024;
@@ -83,14 +84,15 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "1";
         size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
-        auto allocator = CreateTestAllocator(segment_name, 0, size, allocator_type);
+        auto allocator =
+            CreateTestAllocator(segment_name, 0, size, allocator_type);
 
         // Allocate multiple memory blocks
         size_t alloc_size = 1024 * 1024;  // 1MB per block
         std::vector<std::unique_ptr<AllocatedBuffer>> handles;
 
-        // Attempt to allocate 8 blocks (should succeed as total size is less than
-        // buffer size)
+        // Attempt to allocate 8 blocks (should succeed as total size is less
+        // than buffer size)
         for (int i = 0; i < 8; ++i) {
             auto bufHandle = allocator->allocate(alloc_size);
             ASSERT_NE(bufHandle, nullptr);
@@ -110,7 +112,8 @@ TEST_F(BufferAllocatorTest, AllocateTooLarge) {
         std::string segment_name = "3";
         size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
 
-        auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size, allocator_type);
+        auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
+                                             allocator_type);
 
         // Attempt to allocate more than total buffer size
         size_t alloc_size = size + 1;
@@ -143,22 +146,26 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "test";
         size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
-        auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size, allocator_type);
+        auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
+                                             allocator_type);
 
         const int num_threads = 4;
         const auto test_duration = std::chrono::seconds(1);
         std::vector<std::thread> threads;
 
-        // Create 4 threads, each performing repeated allocation and deallocation for 1 second
+        // Create 4 threads, each performing repeated allocation and
+        // deallocation for 1 second
         for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
-            threads.emplace_back([this, &allocator, test_duration, segment_name]() {
+            threads.emplace_back([this, &allocator, test_duration,
+                                  segment_name]() {
                 auto start_time = std::chrono::steady_clock::now();
-                
-                while (std::chrono::steady_clock::now() - start_time < test_duration) {
+
+                while (std::chrono::steady_clock::now() - start_time <
+                       test_duration) {
                     // Allocate memory of varying sizes
                     size_t alloc_size = 477;
                     auto bufHandle = allocator->allocate(alloc_size);
-                    
+
                     ASSERT_NE(bufHandle, nullptr);
                     VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name);
                 }
@@ -171,7 +178,9 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
         }
 
         LOG(INFO) << "Completed parallel allocation/deallocation test for "
-                  << (allocator_type == BufferAllocatorType::CACHELIB ? "CACHELIB" : "OFFSET");
+                  << (allocator_type == BufferAllocatorType::CACHELIB
+                          ? "CACHELIB"
+                          : "OFFSET");
     }
 }
 

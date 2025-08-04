@@ -32,7 +32,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
-        {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, "UNAVAILABLE_IN_CURRENT_STATUS"},
+        {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+         "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
@@ -40,8 +41,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::FILE_WRITE_FAIL, "FILE_WRITE_FAIL"},
         {ErrorCode::FILE_INVALID_BUFFER, "FILE_INVALID_BUFFER"},
         {ErrorCode::FILE_LOCK_FAIL, "FILE_LOCK_FAIL"},
-        {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"}
-    };
+        {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";
@@ -61,7 +61,8 @@ UUID generate_uuid() {
     boost::uuids::random_generator gen;
     boost::uuids::uuid uuid = gen();
     std::memcpy(&pair_uuid.first, uuid.data, sizeof(uint64_t));
-    std::memcpy(&pair_uuid.second, uuid.data + sizeof(uint64_t), sizeof(uint64_t));
+    std::memcpy(&pair_uuid.second, uuid.data + sizeof(uint64_t),
+                sizeof(uint64_t));
     return pair_uuid;
 }
 

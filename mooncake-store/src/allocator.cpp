@@ -22,8 +22,8 @@ AllocatedBuffer::~AllocatedBuffer() {
 }
 
 // Removed allocated_bytes parameter and member initialization
-CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name, size_t base,
-                                 size_t size)
+CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
+                                                 size_t base, size_t size)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
@@ -60,7 +60,8 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name, size_
 
 CachelibBufferAllocator::~CachelibBufferAllocator() = default;
 
-std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(size_t size) {
+std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
+    size_t size) {
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.

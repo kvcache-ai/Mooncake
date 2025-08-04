@@ -67,8 +67,8 @@ class ScopedSegmentAccess {
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
      * errors that may be solved by subsequent remount tryings are considered as
-     * errors. When encounters unsolvable errors, the segment will not be mounted
-     * while the return value will be OK.
+     * errors. When encounters unsolvable errors, the segment will not be
+     * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
@@ -125,7 +125,7 @@ class ScopedAllocatorAccess {
           lock_(mutex) {}
 
     const std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
     getAllocatorsByName() {
         return allocators_by_name_;
     }
@@ -136,7 +136,7 @@ class ScopedAllocatorAccess {
 
    private:
     const std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
         allocators_by_name_;  // segment name -> allocators
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;
@@ -148,7 +148,8 @@ class SegmentManager {
      * @brief Constructor for SegmentManager
      * @param memory_allocator Type of buffer allocator to use for new segments
      */
-    explicit SegmentManager(BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
+    explicit SegmentManager(
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
         : memory_allocator_(memory_allocator) {}
 
     /**
@@ -171,20 +172,22 @@ class SegmentManager {
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    const BufferAllocatorType memory_allocator_;  // Type of buffer allocator to use
+    const BufferAllocatorType
+        memory_allocator_;  // Type of buffer allocator to use
     // Each allocator is put into both of allocators_by_name_ and allocators_.
     // These two containers only contain allocators whose segment status is OK.
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_by_name_;  // segment name -> allocators
-    std::vector<std::shared_ptr<BufferAllocatorBase>> allocators_;  // allocators
+    std::vector<std::shared_ptr<BufferAllocatorBase>>
+        allocators_;  // allocators
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
 
     friend class ScopedSegmentAccess;
-    friend class SegmentTest; // for unit tests
+    friend class SegmentTest;  // for unit tests
 };
 
 }  // namespace mooncake
