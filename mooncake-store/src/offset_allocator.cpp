@@ -451,7 +451,7 @@ OffsetAllocStorageReport __Allocator::storageReport() const {
     uint32 freeStorage = 0;
 
     // Out of allocations? -> Zero free space
-    if (m_freeOffset < m_current_capacity) {
+    if (m_freeOffset < m_max_capacity) {
         freeStorage = m_freeStorage;
         if (m_usedBinsTop) {
             uint32 topBinIndex = 31 - lzcnt_nonzero(m_usedBinsTop);
