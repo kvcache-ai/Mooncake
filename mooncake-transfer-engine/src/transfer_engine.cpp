@@ -176,24 +176,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
-#ifdef USE_MNNVL
-        if (local_topology_->getHcaList().size() > 0 &&
-            !getenv("MC_FORCE_MNNVL")) {
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
-            }
-        } else {
-            Transport *nvlink_transport =
-                multi_transports_->installTransport("nvlink", nullptr);
-            if (!nvlink_transport) {
-                LOG(ERROR) << "Failed to install NVLink transport";
-                return -1;
-            }
-        }
-#else
         if (local_topology_->getHcaList().size() > 0) {
             // only install RDMA transport when there is at least one HCA
             Transport *rdma_transport =
@@ -207,6 +189,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 multi_transports_->installTransport("tcp", nullptr);
             if (!tcp_transport) {
                 LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+        }
+#ifdef USE_MNNVL
+        if (getenv("MC_FORCE_MNNVL")) {
+            Transport *nvlink_transport =
+                multi_transports_->installTransport("nvlink", nullptr);
+            if (!nvlink_transport) {
+                LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
             }
         }
@@ -335,9 +326,22 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
             << "Transfer Engine does not support zero length memory region";
         return ERR_INVALID_ARGUMENT;
     }
+
+    auto buffer = std::make_shared<Transport::BufferDesc>();
+    buffer->name = location;
+    buffer->addr = reinterpret_cast<uint64_t>(addr);
+    buffer->length = length;
+
+    // Let each installed transport fill its own fields in the same BufferDesc
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata);
+        int ret = transport->registerLocalMemory(addr, length, location,
+                                                 remote_accessible,
+                                                 update_metadata, buffer.get());
+        if (ret < 0) return ret;
+    }
+
+    if (update_metadata) {
+        int ret = metadata_->addLocalMemoryBuffer(*buffer, update_metadata);
         if (ret < 0) return ret;
     }
 

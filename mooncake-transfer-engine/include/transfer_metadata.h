@@ -80,14 +80,15 @@ class TransferMetadata {
 
     struct SegmentDesc {
         std::string name;
-        std::string protocol;
+        // supported protocols
+        std::vector<std::string> protocols;
         // this is for rdma/shm
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
-        // this is for nvmeof.
+        // this is for nvmeof
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
-        // this is for cxl.
+        // this is for cxl
         std::string cxl_name;
         uint64_t cxl_base_addr;
         // TODO : make these two a union or a std::variant
@@ -96,6 +97,27 @@ class TransferMetadata {
         RankInfoDesc rank_info;
 
         int tcp_data_port;
+
+        std::string getFirstProtocol() const {
+            return protocols.empty() ? "" : protocols[0];
+        }
+
+        void addProtocol(const std::string &protocol) {
+            if (!hasProtocol(protocol)) {
+                protocols.push_back(protocol);
+            }
+        }
+
+        bool hasProtocol(const std::string &protocol) const {
+            return std::find(protocols.begin(), protocols.end(), protocol) !=
+                   protocols.end();
+        }
+
+        void removeProtocol(const std::string &protocol) {
+            protocols.erase(
+                std::remove(protocols.begin(), protocols.end(), protocol),
+                protocols.end());
+        }
 
         void dump() const;
     };
@@ -152,6 +174,11 @@ class TransferMetadata {
                         std::shared_ptr<SegmentDesc> &&desc);
 
     int removeLocalSegment(const std::string &segment_name);
+
+    bool hasLocalSegment(const std::string &segment_name);
+
+    std::shared_ptr<SegmentDesc> getLocalSegmentDesc(
+        const std::string &segment_name);
 
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 

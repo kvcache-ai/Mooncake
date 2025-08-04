@@ -204,8 +204,8 @@ int HcclTransport::initPdThread() {
             std::thread(&HcclTransport::acceptLoop, this, deviceLogicId);
     }
 
-    LOG(INFO) << "HcclTransport: initPdThread, pid: " << pid << ";" << "init "
-              << THREAD_NUM
+    LOG(INFO) << "HcclTransport: initPdThread, pid: " << pid << ";"
+              << "init " << THREAD_NUM
               << " initiator threads and accept threads, deviceLogicId: "
               << deviceLogicId;
     return 0;
@@ -372,6 +372,27 @@ int HcclTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    // Check if segment already exists
+    if (metadata_->hasLocalSegment(local_server_name_)) {
+        // Segment exists, just add the protocol to existing segment
+        auto existing_desc = metadata_->getLocalSegmentDesc(local_server_name_);
+        if (existing_desc && !existing_desc->hasProtocol("ascend")) {
+            existing_desc->addProtocol("ascend");
+            existing_desc->rank_info.rankId = local_rank_info_.rankId;
+            existing_desc->rank_info.hostIp =
+                inet_ntoa(local_rank_info_.hostIp);
+            existing_desc->rank_info.hostPort = local_rank_info_.hostPort;
+            existing_desc->rank_info.deviceLogicId =
+                local_rank_info_.deviceLogicId;
+            existing_desc->rank_info.devicePhyId = local_rank_info_.devicePhyId;
+            existing_desc->rank_info.deviceIp =
+                inet_ntoa(local_rank_info_.deviceIp);
+            existing_desc->rank_info.devicePort = local_rank_info_.devicePort;
+            existing_desc->rank_info.pid = local_rank_info_.pid;
+        }
+        return 0;
+    }
+
     ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "HcclTransport: cannot allocate local segment, ret: "
@@ -498,27 +519,15 @@ Status HcclTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 int HcclTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &location,
                                        bool remote_accessible,
-                                       bool update_metadata) {
+                                       bool update_metadata,
+                                       BufferDesc *buffer) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
-    buffer_desc.name = location;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = (uint64_t)length;
-
     int ret;
     ret = regLocalRmaMem(addr, (uint64_t)length);
     if (ret) {
         LOG(ERROR) << "HcclTransport: reglocalRmaMem failed, ret: " << ret;
         return ret;
     }
-
-    ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-    if (ret) {
-        LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: "
-                   << ret;
-        return ret;
-    }
-
     return 0;
 }
 
@@ -530,7 +539,7 @@ int HcclTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "ascend";
+    desc->addProtocol("ascend");
     desc->rank_info.rankId = local_rank_info_.rankId;
     desc->rank_info.hostIp = inet_ntoa(local_rank_info_.hostIp);
     desc->rank_info.hostPort = local_rank_info_.hostPort;

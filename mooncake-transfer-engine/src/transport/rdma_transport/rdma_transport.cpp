@@ -61,6 +61,24 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    // Check if segment already exists
+    if (metadata_->hasLocalSegment(local_server_name_)) {
+        // Segment exists, just add the protocol to existing segment
+        auto existing_desc = metadata_->getLocalSegmentDesc(local_server_name_);
+        if (existing_desc && !existing_desc->hasProtocol("rdma")) {
+            existing_desc->addProtocol("rdma");
+            for (auto &entry : context_list_) {
+                TransferMetadata::DeviceDesc device_desc;
+                device_desc.name = entry->deviceName();
+                device_desc.lid = entry->lid();
+                device_desc.gid = entry->gid();
+                existing_desc->devices.push_back(device_desc);
+            }
+            existing_desc->topology = *(local_topology_.get());
+        }
+        return 0;
+    }
+
     ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
@@ -86,38 +104,30 @@ int RdmaTransport::install(std::string &local_server_name,
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &name,
                                        bool remote_accessible,
-                                       bool update_metadata) {
+                                       bool update_metadata,
+                                       BufferDesc *buffer) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
     for (auto &context : context_list_) {
         int ret = context->registerMemoryRegion(addr, length, access_rights);
         if (ret) return ret;
-        buffer_desc.lkey.push_back(context->lkey(addr));
-        buffer_desc.rkey.push_back(context->rkey(addr));
+        buffer->lkey.push_back(context->lkey(addr));
+        buffer->rkey.push_back(context->rkey(addr));
     }
 
-    // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation("*").
+    // Handle automatic memory location detection for backward compatibility
     if (name == kWildcardLocation) {
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
         if (entries.empty()) return -1;
-        buffer_desc.name = entries[0].location;
-        buffer_desc.addr = (uint64_t)addr;
-        buffer_desc.length = length;
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        buffer->name = entries[0].location;
     } else {
-        buffer_desc.name = name;
-        buffer_desc.addr = (uint64_t)addr;
-        buffer_desc.length = length;
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-
-        if (rc) return rc;
+        buffer->name = name;
     }
+    buffer->addr = (uint64_t)addr;
+    buffer->length = length;
 
     return 0;
 }
@@ -135,7 +145,7 @@ int RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "rdma";
+    desc->addProtocol("rdma");
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();

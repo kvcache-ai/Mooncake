@@ -144,8 +144,7 @@ Status NVMeoFTransport::submitTransfer(
         }
 
         auto &desc = segment_desc_map.at(target_id);
-        // LOG(INFO) << "desc " << desc->name << " " << desc->protocol;
-        assert(desc->protocol == "nvmeof");
+        assert(desc->hasProtocol("nvmeof"));
         // TODO: solving iterator invalidation due to vector resize
         // Handle File Offset
         uint32_t buffer_id = 0;
@@ -226,9 +225,11 @@ int NVMeoFTransport::install(std::string &local_server_name,
 int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
                                          const std::string &location,
                                          bool remote_accessible,
-                                         bool update_metadata) {
+                                         bool update_metadata,
+                                         BufferDesc *buffer) {
     (void)remote_accessible;
     (void)update_metadata;
+    (void)buffer;
     CUFILE_CHECK(cuFileBufRegister(addr, length, 0));
     return 0;
 }

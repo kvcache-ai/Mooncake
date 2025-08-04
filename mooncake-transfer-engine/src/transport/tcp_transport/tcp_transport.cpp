@@ -233,6 +233,18 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
+    // Check if segment already exists
+    if (metadata_->hasLocalSegment(local_server_name_)) {
+        // Segment exists, just add the protocol to existing segment
+        auto existing_desc = metadata_->getLocalSegmentDesc(local_server_name_);
+        if (existing_desc && !existing_desc->hasProtocol("tcp")) {
+            existing_desc->addProtocol("tcp");
+            existing_desc->tcp_data_port = tcp_port;
+        }
+        close(sockfd);
+        return 0;
+    }
+
     int ret = allocateLocalSegmentID(tcp_port);
     if (ret) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
@@ -258,7 +270,7 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "tcp";
+    desc->addProtocol("tcp");
     desc->tcp_data_port = tcp_data_port;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -268,13 +280,11 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
 int TcpTransport::registerLocalMemory(void *addr, size_t length,
                                       const std::string &location,
                                       bool remote_accessible,
-                                      bool update_metadata) {
+                                      bool update_metadata,
+                                      BufferDesc *buffer) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
-    buffer_desc.name = local_server_name_;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
-    return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    (void)buffer;
+    return 0;
 }
 
 int TcpTransport::unregisterLocalMemory(void *addr, bool update_metadata) {

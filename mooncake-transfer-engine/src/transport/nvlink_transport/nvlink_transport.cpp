@@ -168,10 +168,20 @@ int NvlinkTransport::install(std::string &local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+    // Check if segment already exists
+    if (metadata_->hasLocalSegment(local_server_name_)) {
+        // Segment exists, just add the protocol to existing segment
+        auto existing_desc = metadata_->getLocalSegmentDesc(local_server_name_);
+        if (existing_desc && !existing_desc->hasProtocol("nvlink")) {
+            existing_desc->addProtocol("nvlink");
+        }
+        return 0;
+    }
+
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "nvlink";
+    desc->addProtocol("nvlink");
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -335,7 +345,8 @@ void deserializeBinaryData(const std::string &hexString,
 int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          const std::string &location,
                                          bool remote_accessible,
-                                         bool update_metadata) {
+                                         bool update_metadata,
+                                         BufferDesc *buffer) {
     std::lock_guard<std::mutex> lock(register_mutex_);
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
@@ -362,13 +373,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         (void)remote_accessible;
-        BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
-        desc.name = location;
-        desc.shm_name =
+        buffer->shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-        return metadata_->addLocalMemoryBuffer(desc, true);
     } else {
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
@@ -403,14 +409,13 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         (void)remote_accessible;
-        BufferDesc desc;
-        desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
-        desc.length = real_size;          // length;
-        desc.name = location;
-        desc.shm_name =
-            serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        buffer->addr = reinterpret_cast<uint64_t>(real_addr);
+        buffer->length = real_size;
+        buffer->shm_name =
+            serializeBinaryData(&handle, sizeof(CUmemGenericAllocationHandle));
     }
+
+    return 0;
 }
 
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {

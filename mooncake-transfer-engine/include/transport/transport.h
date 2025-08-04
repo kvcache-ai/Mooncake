@@ -266,7 +266,8 @@ class Transport {
     virtual int registerLocalMemory(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,
-                                    bool update_metadata = true) = 0;
+                                    bool update_metadata = true,
+                                    BufferDesc *buffer = nullptr) = 0;
 
     virtual int unregisterLocalMemory(void *addr,
                                       bool update_metadata = true) = 0;

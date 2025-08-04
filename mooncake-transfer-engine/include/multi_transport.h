@@ -51,7 +51,7 @@ class MultiTransport {
 
     Transport *getTransport(const std::string &proto);
 
-    std::vector<Transport *> listTransports();
+    std::vector<std::shared_ptr<Transport>> listTransports();
 
    private:
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
@@ -60,6 +60,7 @@ class MultiTransport {
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
+    std::vector<std::shared_ptr<Transport>> installed_transports_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 };

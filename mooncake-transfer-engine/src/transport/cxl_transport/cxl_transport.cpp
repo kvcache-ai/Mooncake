@@ -165,6 +165,18 @@ int CxlTransport::install(std::string &local_server_name,
         return -1;
     }
 
+    // Check if segment already exists
+    if (metadata_->hasLocalSegment(local_server_name_)) {
+        // Segment exists, just add the protocol to existing segment
+        auto existing_desc = metadata_->getLocalSegmentDesc(local_server_name_);
+        if (existing_desc && !existing_desc->hasProtocol("cxl")) {
+            existing_desc->addProtocol("cxl");
+            existing_desc->cxl_base_addr = (uint64_t)cxl_base_addr;
+            existing_desc->cxl_name = cxl_dev_path;
+        }
+        return 0;
+    }
+
     ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "CxlTransport: cannot allocate local segment";
@@ -185,7 +197,7 @@ int CxlTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "cxl";
+    desc->addProtocol("cxl");
     desc->cxl_base_addr = (uint64_t)cxl_base_addr;
     desc->cxl_name = cxl_dev_path;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
@@ -196,11 +208,9 @@ int CxlTransport::allocateLocalSegmentID() {
 int CxlTransport::registerLocalMemory(void *addr, size_t length,
                                       const std::string &location,
                                       bool remote_accessible,
-                                      bool update_metadata) {
+                                      bool update_metadata,
+                                      BufferDesc *buffer) {
     (void)remote_accessible;
-    BufferDesc cxl_buffer_desc;
-    cxl_buffer_desc.name = local_server_name_;
-
     uintptr_t base = reinterpret_cast<uintptr_t>(cxl_base_addr);
     uintptr_t end = base + cxl_dev_size;
     uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
@@ -216,9 +226,8 @@ int CxlTransport::registerLocalMemory(void *addr, size_t length,
         return -1;
     }
 
-    cxl_buffer_desc.offset = (uint64_t)addr - (uint64_t)cxl_base_addr;
-    cxl_buffer_desc.length = length;
-    return metadata_->addLocalMemoryBuffer(cxl_buffer_desc, update_metadata);
+    buffer->offset = (uint64_t)addr - (uint64_t)cxl_base_addr;
+    return 0;
 }
 
 int CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {

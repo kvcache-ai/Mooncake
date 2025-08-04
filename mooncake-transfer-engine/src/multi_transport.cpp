@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+#include <glog/logging.h>
 #include <string>
 
+#include "common.h"
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
@@ -86,7 +88,7 @@ Status MultiTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *>>
         submit_tasks;
     for (auto &request : entries) {
         Transport *transport = nullptr;
@@ -229,6 +231,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
+    installed_transports_.push_back(std::shared_ptr<Transport>(transport));
     return transport;
 }
 
@@ -239,7 +242,28 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
-    auto proto = target_segment_desc->protocol;
+
+    auto target_host = parseHostNameWithPort(target_segment_desc->name).first;
+    auto local_host = parseHostNameWithPort(local_server_name_).first;
+    if (target_host == local_host && transport_map_.count("nvlink")) {
+        uint64_t target_addr = entry.target_offset;
+        for (const auto &buffer : target_segment_desc->buffers) {
+            if (buffer.name.substr(0, 5) == "cuda:" &&
+                target_addr >= buffer.addr &&
+                target_addr + entry.length <= buffer.addr + buffer.length) {
+                // Prefer nvlink transport for local GPU memory access
+                transport = transport_map_["nvlink"].get();
+                return Status::OK();
+            }
+        }
+    }
+
+    auto proto = target_segment_desc->getFirstProtocol();
+    if (proto.empty()) {
+        return Status::InvalidArgument("No protocol available in segment " +
+                                       std::to_string(entry.target_id));
+    }
+
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
@@ -253,11 +277,8 @@ Transport *MultiTransport::getTransport(const std::string &proto) {
     return transport_map_[proto].get();
 }
 
-std::vector<Transport *> MultiTransport::listTransports() {
-    std::vector<Transport *> transport_list;
-    for (auto &entry : transport_map_)
-        transport_list.push_back(entry.second.get());
-    return transport_list;
+std::vector<std::shared_ptr<Transport>> MultiTransport::listTransports() {
+    return installed_transports_;
 }
 
 }  // namespace mooncake
