@@ -30,8 +30,7 @@
 
 namespace mooncake {
 
-struct NVMeoFBatchDesc
-{
+struct NVMeoFBatchDesc {
     int desc_idx_;
     std::vector<TransferStatus> transfer_status;
     std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
@@ -57,11 +56,9 @@ class NVMeoFTransport : public Transport {
     Status freeBatchID(BatchID batch_id) override;
 
     void addSliceToTask(void *source_addr, uint64_t slice_len,
-                        uint64_t target_start,
-                        TransferRequest::OpCode op,
-                        TransferTask &task,
-                        const char *file_path);
-   
+                        uint64_t target_start, TransferRequest::OpCode op,
+                        TransferTask &task, const char *file_path);
+
    private:
     void startTransfer(Slice *slice);
 

@@ -7,11 +7,10 @@
 #include <string>
 #include <vector>
 
-
 namespace mooncake {
   
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
-                                     const std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::vector<Slice>& slices) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
@@ -22,34 +21,36 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& pat
     std::vector<iovec> iovs;
     size_t slices_total_size = 0;
     for (const auto& slice : slices) {
-        iovec io{ slice.ptr, slice.size };
+        iovec io{slice.ptr, slice.size};
         iovs.push_back(io);
         slices_total_size += slice.size;
     }
 
-    auto write_result = file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
+    auto write_result =
+        file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
     if (!write_result) {
-        LOG(INFO) << "vector_write failed for: " << path << ", error: " << write_result.error();
+        LOG(INFO) << "vector_write failed for: " << path
+                  << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
 
     if (*write_result != slices_total_size) {
         LOG(INFO) << "Write size mismatch for: " << path
-                 << ", expected: " << slices_total_size
-                 << ", got: " << *write_result;
+                  << ", expected: " << slices_total_size
+                  << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
-                                    const std::string& str) {
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::string& str) {
     return StoreObject(path, std::span<const char>(str.data(), str.size()));
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& path,
-                                    std::span<const char> data) {
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, std::span<const char> data) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
@@ -58,24 +59,25 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(const std::string& pat
     }
 
     size_t file_total_size = data.size();
-    auto write_result = file->write(data, file_total_size);  
+    auto write_result = file->write(data, file_total_size);
 
     if (!write_result) {
-        LOG(INFO) << "Write failed for: " << path << ", error: " << write_result.error();
+        LOG(INFO) << "Write failed for: " << path
+                  << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != file_total_size) {
         LOG(INFO) << "Write size mismatch for: " << path
-                 << ", expected: " << file_total_size
-                 << ", got: " << *write_result;
+                  << ", expected: " << file_total_size
+                  << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path,
-                                    std::vector<Slice>& slices, size_t length) {
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(
+    const std::string& path, std::vector<Slice>& slices, size_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -83,21 +85,22 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    std::vector<iovec> iovs;                                    
+    std::vector<iovec> iovs;
     for (const auto& slice : slices) {
-        iovec io{ slice.ptr, slice.size };
+        iovec io{slice.ptr, slice.size};
         iovs.push_back(io);
     }
 
-    auto read_result = file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
+    auto read_result =
+        file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
     if (!read_result) {
-        LOG(INFO) << "vector_read failed for: " << path << ", error: " << read_result.error();
+        LOG(INFO) << "vector_read failed for: " << path
+                  << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
     if (*read_result != length) {
         LOG(INFO) << "Read size mismatch for: " << path
-                 << ", expected: " << length
-                 << ", got: " << *read_result;
+                  << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -105,7 +108,8 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path,
-                                    std::string& str, size_t length) {
+                                                         std::string& str, 
+                                                         size_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -115,13 +119,13 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path
 
     auto read_result = file->read(str, length);
     if (!read_result) {
-        LOG(INFO) << "read failed for: " << path << ", error: " << read_result.error();
+        LOG(INFO) << "read failed for: " << path
+                  << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
     if (*read_result != length) {
         LOG(INFO) << "Read size mismatch for: " << path
-                 << ", expected: " << length
-                 << ", got: " << *read_result;
+                  << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -130,18 +134,21 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if used in multi-thread environment
-    // Check if the file exists before attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the corresponding file
-    // it will be fixed in the next version
-    std::this_thread::sleep_for(std::chrono::microseconds(50));  //sleep for 50 us
+    // TODO: attention: this function is not thread-safe, need to add lock if
+    // used in multi-thread environment Check if the file exists before
+    // attempting to remove it
+    // TODO: add a sleep to ensure the write thread has time to create the
+    // corresponding file it will be fixed in the next version
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(50));  // sleep for 50 us
     if (fs::exists(path)) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
-            LOG(ERROR) << "Failed to delete file: " << path << ", error: " << ec.message();
+            LOG(ERROR) << "Failed to delete file: " << path
+                       << ", error: " << ec.message();
         }
-    } 
+    }
 }
 
 void StorageBackend::RemoveAll() {
@@ -150,13 +157,13 @@ void StorageBackend::RemoveAll() {
     for (const auto& entry : fs::directory_iterator(root_dir_)) {
         if (fs::is_regular_file(entry.status())) {
             std::error_code ec;
-            fs::remove(entry.path(),ec);
+            fs::remove(entry.path(), ec);
             if (ec) {
-                LOG(ERROR) << "Failed to delete file: " << entry.path() << ", error: " << ec.message();
+                LOG(ERROR) << "Failed to delete file: " << entry.path()
+                           << ", error: " << ec.message();
             }
         }
     }
-
 }
 
 void StorageBackend::ResolvePath(const std::string& path) const {
@@ -169,7 +176,8 @@ void StorageBackend::ResolvePath(const std::string& path) const {
     fs::path parent_path = full_path.parent_path();
     if (!parent_path.empty() && !fs::exists(parent_path)) {
         if (!fs::create_directories(parent_path, ec) && ec) {
-            LOG(INFO) << "Failed to create directories: " << parent_path << ", error: " << ec.message();
+            LOG(INFO) << "Failed to create directories: " << parent_path 
+                      << ", error: " << ec.message();
         }
     }
 }
@@ -186,10 +194,10 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
             access_mode = O_WRONLY | O_CREAT | O_TRUNC;
             break;
     }
-    
+
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
-        return nullptr;  
+        return nullptr;
     }
 
 #ifdef USE_3FS
@@ -198,8 +206,9 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
             close(fd);
             return nullptr;
         }
-        return resource_manager_ ? 
-            std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get()) : nullptr;
+        return resource_manager_ ? std::make_unique<ThreeFSFile>(
+                                       path, fd, resource_manager_.get())
+                                 : nullptr;
     }
 #endif
 

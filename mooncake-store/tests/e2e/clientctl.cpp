@@ -12,8 +12,8 @@
 #include "e2e_utils.h"
 
 // Command line flags
-USE_engine_flags
-DEFINE_string(master_server_entry, "localhost:50051", "Master server address");
+USE_engine_flags DEFINE_string(master_server_entry, "localhost:50051",
+                               "Master server address");
 
 namespace mooncake {
 namespace testing {
@@ -72,8 +72,8 @@ class ClientCtl {
         std::string hostname = "localhost:" + port;
 
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
-            hostname, FLAGS_engine_meta_url, FLAGS_protocol,
-            FLAGS_device_name, FLAGS_master_server_entry);
+            hostname, FLAGS_engine_meta_url, FLAGS_protocol, FLAGS_device_name,
+            FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
             std::cout << "Failed to create client: " << name << std::endl;
@@ -194,14 +194,14 @@ class ClientCtl {
         iss >> seconds;
 
         if (seconds <= 0) {
-            std::cout << "Invalid sleep command format. Expected: sleep [seconds]"
-                      << std::endl;
+            std::cout
+                << "Invalid sleep command format. Expected: sleep [seconds]"
+                << std::endl;
             return;
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
-        std::cout << "Slept for " << seconds << " seconds"
-                  << std::endl;
+        std::cout << "Slept for " << seconds << " seconds" << std::endl;
     }
 
     std::unordered_map<std::string, ClientInfo> clients_;

@@ -688,9 +688,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 // old protocol equals Connection type
                 if (type == HandShakeRequestType::Connection ||
                     type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_) on_connection_callback_(peer, local);
+                    if (on_connection_callback_)
+                        on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_) on_metadata_callback_(peer, local);
+                    if (on_metadata_callback_)
+                        on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
                 } else {

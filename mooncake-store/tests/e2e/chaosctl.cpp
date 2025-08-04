@@ -185,18 +185,18 @@ int main(int argc, char* argv[]) {
         std::vector<std::unique_ptr<mooncake::testing::ClientProcessHandler>>
             clients;
         for (int i = 0; i < client_num; ++i) {
-                mooncake::testing::ClientRunnerConfig client_config{
-                    .put_prob = std::nullopt,
-                    .get_prob = std::nullopt,
-                    .mount_prob = std::nullopt,
-                    .unmount_prob = std::nullopt,
-                    .port = 17812 + i,
-                    .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
-                    .engine_meta_url = FLAGS_engine_meta_url,
-                    .protocol = FLAGS_protocol,
-                    .device_name = FLAGS_device_name,
-                };
-                clients.emplace_back(
+            mooncake::testing::ClientRunnerConfig client_config{
+                .put_prob = std::nullopt,
+                .get_prob = std::nullopt,
+                .mount_prob = std::nullopt,
+                .unmount_prob = std::nullopt,
+                .port = 17812 + i,
+                .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
+                .engine_meta_url = FLAGS_engine_meta_url,
+                .protocol = FLAGS_protocol,
+                .device_name = FLAGS_device_name,
+            };
+            clients.emplace_back(
                 std::make_unique<mooncake::testing::ClientProcessHandler>(
                     FLAGS_client_path, i, FLAGS_out_dir, client_config));
             clients.back()->start();

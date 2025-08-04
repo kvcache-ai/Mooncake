@@ -134,7 +134,7 @@ static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
 }
 
 tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
-                                                       size_t length) {
+                                                        size_t length) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -659,7 +659,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
-            op.SetError(ErrorCode::INVALID_PARAMS, "TransferSubmitter not initialized");
+            op.SetError(ErrorCode::INVALID_PARAMS,
+                        "TransferSubmitter not initialized");
         }
         return;
     }
@@ -1102,10 +1103,12 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     std::string path = disk_descriptor.file_path;
-    // Currently, persistence is achieved through asynchronous writes, but before asynchronous
-    // writing in 3FS, significant performance degradation may occur due to data copying. 
-    // Profiling reveals that the number of page faults triggered in this scenario is nearly double the normal count. 
-    // Future plans include introducing a reuse buffer list to address this performance degradation issue.
+    // Currently, persistence is achieved through asynchronous writes, but
+    // before asynchronous writing in 3FS, significant performance degradation
+    // may occur due to data copying. Profiling reveals that the number of page
+    // faults triggered in this scenario is nearly double the normal count.
+    // Future plans include introducing a reuse buffer list to address this
+    // performance degradation issue.
 
     std::string value;
     value.reserve(total_size);

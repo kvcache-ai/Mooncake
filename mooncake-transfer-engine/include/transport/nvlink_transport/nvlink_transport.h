@@ -46,9 +46,9 @@ class NvlinkTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override;
 
-    static void *allocatePinnedLocalMemory(size_t length);
+    static void* allocatePinnedLocalMemory(size_t length);
 
-    static void freePinnedLocalMemory(void *addr);
+    static void freePinnedLocalMemory(void* addr);
 
    protected:
     int install(std::string& local_server_name,
@@ -80,7 +80,8 @@ class NvlinkTransport : public Transport {
         uint64_t length;
     };
 
-    std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash> remap_entries_;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
+        remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
 

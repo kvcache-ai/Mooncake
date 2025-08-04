@@ -23,9 +23,9 @@ namespace mooncake {
  * @brief Transfer strategy enumeration
  */
 enum class TransferStrategy {
-    LOCAL_MEMCPY = 0,    // Local memory copy using memcpy
+    LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
-    FILE_READ = 2      // File read operation
+    FILE_READ = 2         // File read operation
 };
 
 /**
@@ -126,7 +126,6 @@ class MemcpyOperationState : public OperationState {
 
 class FilereadOperationState : public OperationState {
    public:
-
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -303,10 +302,10 @@ struct FilereadTask {
             size_t size,
             const std::vector<Slice>& slices_ref,
             std::shared_ptr<FilereadOperationState> s)
-    : file_path(path),
-        object_size(size),
-        slices(slices_ref),
-        state(std::move(s)) {}
+        : file_path(path),
+          object_size(size),
+          slices(slices_ref),
+          state(std::move(s)) {}
 };
 
 /**
@@ -370,8 +369,8 @@ class TransferSubmitter {
      * failure
      */
     std::optional<TransferFuture> submit(
-        const Replica::Descriptor& replica,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        Transport::TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
@@ -415,8 +414,8 @@ class TransferSubmitter {
         std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
-    const Replica::Descriptor& replica, std::vector<Slice>& slices, 
-    Transport::TransferRequest::OpCode op_code);
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        Transport::TransferRequest::OpCode op_code);
 };
 
 }  // namespace mooncake
