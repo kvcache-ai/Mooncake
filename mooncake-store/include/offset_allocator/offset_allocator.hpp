@@ -26,8 +26,19 @@ static constexpr uint32 NUM_LEAF_BINS = NUM_TOP_BINS * BINS_PER_LEAF;
 struct OffsetAllocation {
     static constexpr uint32 NO_SPACE = 0xffffffff;
 
+   private:
     uint32 offset = NO_SPACE;
     NodeIndex metadata = NO_SPACE;  // internal: node index
+
+   public:
+    OffsetAllocation(uint32 offset_param, NodeIndex metadata_param)
+        : offset(offset_param), metadata(metadata_param) {}
+    // The real offset could be larger than uint32, so we need to cast it to
+    // uint64_t
+    uint64_t getOffset() const { return static_cast<uint64_t>(offset); }
+    bool isNoSpace() const { return offset == NO_SPACE; }
+
+    friend class __Allocator;
 };
 
 struct OffsetAllocStorageReport {
@@ -158,7 +169,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     const uint64_t m_base;
     // The real offset and size of the allocated memory need to be multiplied by
     // m_multiplier
-    const uint64_t m_multiplier;
+    const uint64_t m_multiplier_bits;
     const uint64_t m_capacity;
     mutable Mutex m_mutex;
 
