@@ -230,8 +230,9 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    transport_map_[proto] = std::shared_ptr<Transport>(transport);
-    installed_transports_.push_back(std::shared_ptr<Transport>(transport));
+    auto transport_ptr = std::shared_ptr<Transport>(transport);
+    transport_map_[proto] = transport_ptr;
+    installed_transports_.push_back(transport_ptr);
     return transport;
 }
 
