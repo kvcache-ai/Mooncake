@@ -640,7 +640,7 @@ std::string TransferEnginePy::getLocalTopology(bool original, const char *device
     tmp_engine->init(metadata_conn_string, local_server_name);
 
     if (original && custom_topology_path) {
-        setenv("MC_CUSTOM_TOPO_JSON", custom_topo_path, 1);
+        setenv("MC_CUSTOM_TOPO_JSON", custom_topology_path, 1);
     }
 
     return tmp_engine->getLocalTopology()->toString();
