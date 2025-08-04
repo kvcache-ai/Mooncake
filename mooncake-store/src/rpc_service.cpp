@@ -34,7 +34,7 @@ WrappedMasterService::WrappedMasterService(
                       allow_evict_soft_pinned_objects, eviction_ratio,
                       eviction_high_watermark_ratio, view_version,
                       client_live_ttl_sec, enable_ha, cluster_id, root_fs_dir,
-                     
+
                       memory_allocator),
       http_server_(4, http_port),
       metric_report_running_(enable_metric_reporting) {
@@ -277,8 +277,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
         "PutEnd", [&] { return master_service_.PutEnd(key, replica_type); },
-        [&](auto& timer) { timer.LogRequest("key=", key,
-                                            ", replica_type=", replica_type); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+        },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
 }
@@ -286,9 +287,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutRevoke", [&] { return master_service_.PutRevoke(key, replica_type); },
-        [&](auto& timer) { timer.LogRequest("key=", key,
-                                            ", replica_type=", replica_type); },
+        "PutRevoke",
+        [&] { return master_service_.PutRevoke(key, replica_type); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+        },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }

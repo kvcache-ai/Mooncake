@@ -298,10 +298,9 @@ struct FilereadTask {
     std::vector<Slice> slices;
     std::shared_ptr<FilereadOperationState> state;
 
-    FilereadTask(const std::string &path,
-            size_t size,
-            const std::vector<Slice>& slices_ref,
-            std::shared_ptr<FilereadOperationState> s)
+    FilereadTask(const std::string& path, size_t size,
+                 const std::vector<Slice>& slices_ref,
+                 std::shared_ptr<FilereadOperationState> s)
         : file_path(path),
           object_size(size),
           slices(slices_ref),

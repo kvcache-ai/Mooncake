@@ -8,7 +8,7 @@
 #include <vector>
 
 namespace mooncake {
-  
+
 tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     const std::string& path, const std::vector<Slice>& slices) {
     ResolvePath(path);
@@ -107,9 +107,8 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::LoadObject(const std::string& path,
-                                                         std::string& str, 
-                                                         size_t length) {
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(
+    const std::string& path, std::string& str, size_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -176,7 +175,7 @@ void StorageBackend::ResolvePath(const std::string& path) const {
     fs::path parent_path = full_path.parent_path();
     if (!parent_path.empty() && !fs::exists(parent_path)) {
         if (!fs::create_directories(parent_path, ec) && ec) {
-            LOG(INFO) << "Failed to create directories: " << parent_path 
+            LOG(INFO) << "Failed to create directories: " << parent_path
                       << ", error: " << ec.message();
         }
     }

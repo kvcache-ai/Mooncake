@@ -73,7 +73,7 @@ class MasterService {
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
         bool enable_ha = false,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR, 
+        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
     ~MasterService();
 
@@ -187,7 +187,9 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const std::string& key,
+                ReplicaType replica_type = ReplicaType::MEMORY)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -195,7 +197,9 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key, ReplicaType replica_type = ReplicaType::MEMORY) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const std::string& key,
+                   ReplicaType replica_type = ReplicaType::MEMORY)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -315,15 +319,16 @@ class MasterService {
         // replicas of the given type.
         std::optional<ReplicaStatus> HasDiffRepStatus(
             ReplicaStatus status, ReplicaType replica_type) const {
-            if(replica_type == ReplicaType::ALL) {
+            if (replica_type == ReplicaType::ALL) {
                 for (const auto& replica : replicas) {
                     if (replica.status() != status) {
                         return replica.status();
                     }
                 }
-            }else{
+            } else {
                 for (const auto& replica : replicas) {
-                    if (replica.status() != status && replica.type() == replica_type) {
+                    if (replica.status() != status &&
+                        replica.type() == replica_type) {
                         return replica.status();
                     }
                 }
@@ -365,10 +370,10 @@ class MasterService {
 
         // Get the count of memory replicas
         int GetMemReplicaCount() const {
-            return std::count_if(replicas.begin(), replicas.end(),
-                                 [](const Replica& replica) {
-                                     return replica.type() == ReplicaType::MEMORY;
-                                 });
+            return std::count_if(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.type() == ReplicaType::MEMORY;
+                });
         }
 
         // Check if the lease has expired
@@ -394,9 +399,7 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const {
-            return !replicas.empty() && size > 0;
-        }
+        bool IsValid() const { return !replicas.empty() && size > 0; }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

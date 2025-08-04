@@ -119,8 +119,7 @@ MasterServiceSupervisor::MasterServiceSupervisor(
       local_hostname_(local_hostname),
       cluster_id_(cluster_id),
       root_fs_dir_(root_fs_dir),
-      memory_allocator_(memory_allocator)
- {}
+      memory_allocator_(memory_allocator) {}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
@@ -159,8 +158,8 @@ int MasterServiceSupervisor::Start() {
             enable_gc_, default_kv_lease_ttl_, default_kv_soft_pin_ttl_,
             allow_evict_soft_pinned_objects_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version, client_live_ttl_sec_, enable_ha, cluster_id_,
-            root_fs_dir_, memory_allocator_);
+            version, client_live_ttl_sec_, enable_ha, cluster_id_, root_fs_dir_,
+            memory_allocator_);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

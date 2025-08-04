@@ -86,7 +86,7 @@ class StorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
     tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              const std::vector<Slice>& slices) ;
+                                              const std::vector<Slice>& slices);
 
     /**
      * @brief Stores an object from a string
@@ -94,8 +94,8 @@ class StorageBackend {
      * @param str String containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path, 
-                                              const std::string& str) ;
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
+                                              const std::string& str);
 
     /**
      * @brief Stores an object from a span of data
@@ -103,9 +103,9 @@ class StorageBackend {
      * @param data Span containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path, 
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
                                               std::span<const char> data);
-    
+
     /**
      * @brief Loads an object into slices
      * @param path path for the object
@@ -113,10 +113,10 @@ class StorageBackend {
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(const std::string& path, 
-                                             std::vector<Slice>& slices, 
-                                             size_t length) ;
-    
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path,
+                                             std::vector<Slice>& slices,
+                                             size_t length);
+
     /**
      * @brief Loads an object as a string
      * @param path path for the object
@@ -124,15 +124,14 @@ class StorageBackend {
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(const std::string& path, 
-                                             std::string& str, 
-                                             size_t length) ;
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path,
+                                             std::string& str, size_t length);
 
     /**
      * @brief Deletes the physical file associated with the given object key
      * @param path Path to the file to remove
      */
-    void RemoveFile(const std::string& path) ;
+    void RemoveFile(const std::string& path);
 
     /**
      * @brief Deletes all objects from the storage backend

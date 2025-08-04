@@ -236,7 +236,6 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
     const std::string& master_server_entry) {
-
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -491,22 +490,24 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         LOG(ERROR) << "Failed to start put operation: " << err;
         return tl::unexpected(err);
     }
-    
-    // We must deal with disk replica first, then the disk putrevoke/putend can be called surely
-    if(storage_backend_){
-       for (auto it = start_result.value().rbegin(); it != start_result.value().rend(); ++it) {
+
+    // We must deal with disk replica first, then the disk putrevoke/putend can
+    // be called surely
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
             const auto& replica = *it;
-            if(replica.is_disk_replica()){
+            if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
                 PutToLocalFile(key, slices, disk_descriptor);
-                break; // Only one disk replica is needed
+                break;  // Only one disk replica is needed
             }
-        } 
+        }
     }
 
     for (const auto& replica : start_result.value()) {
-        if(replica.is_memory_replica()){
+        if (replica.is_memory_replica()) {
             // Transfer data using allocated handles from all replicas
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
@@ -681,15 +682,16 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         bool all_transfers_submitted = true;
         std::string failure_context;
 
-        // We must deal with disk replica first, then the disk putrevoke/putend can be called surely
-        if(storage_backend_){
-            for (auto it = op.replicas.rbegin();
-                 it != op.replicas.rend(); ++it) {
+        // We must deal with disk replica first, then the disk putrevoke/putend
+        // can be called surely
+        if (storage_backend_) {
+            for (auto it = op.replicas.rbegin(); it != op.replicas.rend();
+                 ++it) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
                     auto disk_descriptor = replica.get_disk_descriptor();
                     PutToLocalFile(op.key, op.slices, disk_descriptor);
-                    break; // Only one disk replica is needed
+                    break;  // Only one disk replica is needed
                 }
             }
         }
@@ -697,18 +699,19 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if(replica.is_memory_replica()){
+            if (replica.is_memory_replica()) {
                 auto submit_result = transfer_submitter_->submit(
                     replica, op.slices, TransferRequest::WRITE);
 
                 if (!submit_result) {
                     failure_context = "Failed to submit transfer for replica " +
-                                    std::to_string(replica_idx);
+                                      std::to_string(replica_idx);
                     all_transfers_submitted = false;
                     break;
                 }
 
-                op.pending_transfers.emplace_back(std::move(submit_result.value()));
+                op.pending_transfers.emplace_back(
+                    std::move(submit_result.value()));
             }
         }
 
@@ -1116,28 +1119,28 @@ void Client::PutToLocalFile(const std::string& key,
         value.append(static_cast<char*>(slice.ptr), slice.size);
     }
 
-    write_thread_pool_.enqueue(
-        [this, backend = storage_backend_, key, value = std::move(value), path] {
-            // Store the object
-            auto store_result = backend->StoreObject(path, value);
-            ReplicaType replica_type = ReplicaType::DISK;
-            
-            if (!store_result) {
-                // If storage failed, revoke the put operation
-                LOG(ERROR) << "Failed to store object for key: " << key;
-                auto revoke_result = master_client_.PutRevoke(key, replica_type);
-                if (!revoke_result) {
-                    LOG(ERROR) << "Failed to revoke put operation for key: " << key;
-                }
-                return;
+    write_thread_pool_.enqueue([this, backend = storage_backend_, key,
+                                value = std::move(value), path] {
+        // Store the object
+        auto store_result = backend->StoreObject(path, value);
+        ReplicaType replica_type = ReplicaType::DISK;
+
+        if (!store_result) {
+            // If storage failed, revoke the put operation
+            LOG(ERROR) << "Failed to store object for key: " << key;
+            auto revoke_result = master_client_.PutRevoke(key, replica_type);
+            if (!revoke_result) {
+                LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
-            
-            // If storage succeeded, end the put operation
-            auto end_result = master_client_.PutEnd(key, replica_type);
-            if (!end_result) {
-                LOG(ERROR) << "Failed to end put operation for key: " << key;
-            }
-        });
+            return;
+        }
+
+        // If storage succeeded, end the put operation
+        auto end_result = master_client_.PutEnd(key, replica_type);
+        if (!end_result) {
+            LOG(ERROR) << "Failed to end put operation for key: " << key;
+        }
+    });
 }
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
