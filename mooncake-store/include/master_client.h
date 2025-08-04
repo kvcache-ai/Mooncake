@@ -102,8 +102,8 @@ class MasterClient {
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key,
-                                                       ReplicaType);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
