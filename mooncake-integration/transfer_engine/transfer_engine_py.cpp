@@ -631,15 +631,15 @@ std::string TransferEnginePy::getLocalTopology(bool original, const char *device
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     std::shared_ptr<TransferEngine> tmp_engine = std::make_shared<TransferEngine>(true, device_filter);
-    auto custom_topo_path = std::getenv("MC_CUSTOM_TOPO_JSON");
-    if (original) {
+    auto custom_topology_path = std::getenv("MC_CUSTOM_TOPO_JSON");
+    if (original && custom_topology_path) {
         setenv("MC_CUSTOM_TOPO_JSON", "", 1);
     }
 
     std::string metadata_conn_string {"P2PHANDSHAKE"}, local_server_name {};
     tmp_engine->init(metadata_conn_string, local_server_name);
 
-    if (original) {
+    if (original && custom_topology_path) {
         setenv("MC_CUSTOM_TOPO_JSON", custom_topo_path, 1);
     }
 
