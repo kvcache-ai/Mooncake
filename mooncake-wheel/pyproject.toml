@@ -30,6 +30,7 @@ mooncake_master = "mooncake.cli:main"
 transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:main"
+transfer_engine_topology_check = "mooncake.transfer_engine_topology_check:main"
 
 [tool.setuptools]
 zip-safe = false
