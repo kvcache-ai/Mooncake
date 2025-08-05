@@ -222,8 +222,7 @@ struct ReplicateConfig {
         return os << "ReplicateConfig: { replica_num: " << config.replica_num
                   << ", with_soft_pin: " << config.with_soft_pin
                   << ", preferred_segment: " << config.preferred_segment
-                  << ", Local VRAM only: " << config.local_vram_only
-                  << " }";
+                  << ", Local VRAM only: " << config.local_vram_only << " }";
     }
 };
 

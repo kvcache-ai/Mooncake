@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-static std::unordered_map<void*, void*> g_cuda_aligned_allocations;
+static std::unordered_map<void *, void *> g_cuda_aligned_allocations;
 static std::mutex g_cuda_alloc_mutex;
 
 void *allocate_buffer_allocator_memory(size_t total_size) {
@@ -22,7 +22,7 @@ void *allocate_buffer_allocator_memory(size_t total_size) {
     return aligned_alloc(alignment, total_size);
 }
 
-void* allocate_vram_buffer_allocator_memory(size_t total_size) {
+void *allocate_vram_buffer_allocator_memory(size_t total_size) {
     const size_t alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (total_size < alignment) {
@@ -31,14 +31,16 @@ void* allocate_vram_buffer_allocator_memory(size_t total_size) {
     }
 
     size_t alloc_size = total_size + alignment - 1 + sizeof(void *);
-    void* raw_ptr = nullptr;
+    void *raw_ptr = nullptr;
     cudaError_t err = cudaMalloc(&raw_ptr, alloc_size);
     if (err != cudaSuccess) {
         return nullptr;
     }
-    uintptr_t start_ptr_int = reinterpret_cast<uintptr_t>(raw_ptr) + sizeof(void*);
-    uintptr_t aligned_ptr_int = (start_ptr_int + alignment - 1) & ~(alignment - 1);
-    void* aligned_ptr = reinterpret_cast<void*>(aligned_ptr_int);
+    uintptr_t start_ptr_int =
+        reinterpret_cast<uintptr_t>(raw_ptr) + sizeof(void *);
+    uintptr_t aligned_ptr_int =
+        (start_ptr_int + alignment - 1) & ~(alignment - 1);
+    void *aligned_ptr = reinterpret_cast<void *>(aligned_ptr_int);
     {
         std::lock_guard<std::mutex> lock(g_cuda_alloc_mutex);
         g_cuda_aligned_allocations[aligned_ptr] = raw_ptr;
@@ -49,12 +51,12 @@ void* allocate_vram_buffer_allocator_memory(size_t total_size) {
     return aligned_ptr;
 }
 
-void cudaAlignedFree(void* ptr) {
+void cudaAlignedFree(void *ptr) {
     if (ptr == nullptr) {
         return;
     }
 
-    void* raw_ptr = nullptr;
+    void *raw_ptr = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(g_cuda_alloc_mutex);

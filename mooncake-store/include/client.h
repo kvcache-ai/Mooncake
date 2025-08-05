@@ -154,7 +154,8 @@ class Client {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer, size_t size, bool is_vram);
+    tl::expected<void, ErrorCode> MountSegment(const void* buffer, size_t size,
+                                               bool is_vram);
 
     /**
      * @brief Unregisters a memory segment from master

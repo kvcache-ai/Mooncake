@@ -226,10 +226,11 @@ int DistributedObjectStore::setup(const std::string &local_hostname,
         protocol, rdma_devices, master_server_addr));
 }
 
-tl::expected<void, ErrorCode> DistributedObjectStore::setup_vram_internal(size_t vram_buffer_size) {
-    auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
+tl::expected<void, ErrorCode> DistributedObjectStore::setup_vram_internal(
+    size_t vram_buffer_size) {
+    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
     uint64_t total_glbseg_size = vram_buffer_size;  // For logging
-    uint64_t current_glbseg_size = 0;                  // For logging
+    uint64_t current_glbseg_size = 0;               // For logging
     // Normally, The vram buffer is smaller than max_mr_size.
     while (vram_buffer_size > 0) {
         size_t segment_size = std::min(vram_buffer_size, max_mr_size);
@@ -1570,7 +1571,7 @@ void DistributedObjectStore::evict_key(std::string key) {
     auto alloc_result = client_buffer_allocator_->allocate(total_size);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for evict operation, key: "
-                    << key << ", size: " << total_size;
+                   << key << ", size: " << total_size;
         return;
     }
 
@@ -1584,7 +1585,7 @@ void DistributedObjectStore::evict_key(std::string key) {
     auto get_result = client_->Get(key, replica_list, slices);
     if (!get_result) {
         LOG(ERROR) << "Evict Get operation failed with error: "
-                    << toString(get_result.error());
+                   << toString(get_result.error());
         return;
     }
 
@@ -1625,11 +1626,13 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_to_vram_internal(
     tl::expected<void, ErrorCode> put_result;
     do {
         put_result = client_->PutToVRAM(key, slices, config);
-        if (!put_result && put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+        if (!put_result &&
+            put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
             evict_key(evict_queue.front());
             evict_queue.pop();
         }
-    } while (!put_result && put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE);
+    } while (!put_result &&
+             put_result.error() == ErrorCode::NO_AVAILABLE_HANDLE);
 
     if (!put_result && put_result.error() != ErrorCode::NO_AVAILABLE_HANDLE) {
         LOG(ERROR) << "Put operation failed with error: "
@@ -1642,20 +1645,19 @@ tl::expected<void, ErrorCode> DistributedObjectStore::put_to_vram_internal(
     return {};
 }
 
-int DistributedObjectStore::put_to_vram(const std::string &key,
-                                        void *buffer, size_t size,
+int DistributedObjectStore::put_to_vram(const std::string &key, void *buffer,
+                                        size_t size,
                                         const ReplicateConfig &config) {
     return to_py_ret(put_to_vram_internal(key, buffer, size, config));
 }
 
 tl::expected<int64_t, ErrorCode> DistributedObjectStore::get_from_vram_internal(
-                                                        const std::string &key,
-                                                       void *buffer,
-                                                       size_t size) {
+    const std::string &key, void *buffer, size_t size) {
     return get_into_internal(key, buffer, size);
 }
 
-int DistributedObjectStore::get_from_vram(const std::string &key, void *buffer, size_t size) {
+int DistributedObjectStore::get_from_vram(const std::string &key, void *buffer,
+                                          size_t size) {
     return to_py_ret(get_from_vram_internal(key, buffer, size));
 }
 

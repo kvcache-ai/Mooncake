@@ -79,9 +79,11 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->client_segments_[client_id].push_back(segment.id);
 
     if (segment.is_vram)
-        segment_manager_->vram_allocators_by_name_[segment.name].push_back(allocator);
+        segment_manager_->vram_allocators_by_name_[segment.name].push_back(
+            allocator);
     else
-        segment_manager_->allocators_by_name_[segment.name].push_back(allocator);
+        segment_manager_->allocators_by_name_[segment.name].push_back(
+            allocator);
 
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};

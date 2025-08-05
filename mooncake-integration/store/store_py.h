@@ -303,9 +303,8 @@ class DistributedObjectStore {
                                                        void *buffer,
                                                        size_t size);
 
-    tl::expected<int64_t, ErrorCode> get_from_vram_internal(const std::string &key,
-                                                       void *buffer,
-                                                       size_t size);
+    tl::expected<int64_t, ErrorCode> get_from_vram_internal(
+        const std::string &key, void *buffer, size_t size);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -377,7 +376,8 @@ class DistributedObjectStore {
     };
 
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
-    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> local_vram_segment_ptrs_;
+    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>>
+        local_vram_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

@@ -81,8 +81,8 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
     // Define the name of the test segment.
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress,
-                    kSegmentSize, false);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize,
+                    false);
     UUID client_id = generate_uuid();
 
     // Test invalid parameters.
@@ -164,7 +164,8 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         // Define the size of the segment (16MB).
         size_t kSegmentSize = 1024 * 1024 * 16 * random_number;
 
-        Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize, false);
+        Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize,
+                        false);
 
         // Test remounting after unmount.
         auto mount_result = service_->MountSegment(segment, client_id);
@@ -1004,8 +1005,8 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress,
-                    kSegmentSize, false);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize,
+                    false);
     UUID client_id = generate_uuid();
 
     // Mount a segment for testing

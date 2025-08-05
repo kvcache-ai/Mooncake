@@ -373,7 +373,8 @@ auto MasterService::PutStart(const std::string& key,
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
-        auto& vram_allocators_by_name = allocator_access.getVRAMAllocatorsByName();
+        auto& vram_allocators_by_name =
+            allocator_access.getVRAMAllocatorsByName();
         for (size_t i = 0; i < config.replica_num; ++i) {
             std::vector<std::unique_ptr<AllocatedBuffer>> handles;
             handles.reserve(slice_lengths.size());
@@ -385,7 +386,8 @@ auto MasterService::PutStart(const std::string& key,
                 // Use the unified allocation strategy with replica config
                 auto handle = allocation_strategy_->Allocate(
                     allocators,
-                    config.local_vram_only ? vram_allocators_by_name : allocators_by_name,
+                    config.local_vram_only ? vram_allocators_by_name
+                                           : allocators_by_name,
                     chunk_size, config);
 
                 if (!handle) {
@@ -884,8 +886,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

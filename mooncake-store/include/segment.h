@@ -135,7 +135,7 @@ class ScopedAllocatorAccess {
     }
 
     const std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
     getVRAMAllocatorsByName() {
         return vram_allocators_by_name_;
     }
@@ -179,8 +179,7 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocators_by_name_,
-                                     vram_allocators_by_name_,
-                                     allocators_,
+                                     vram_allocators_by_name_, allocators_,
                                      segment_mutex_);
     }
 
