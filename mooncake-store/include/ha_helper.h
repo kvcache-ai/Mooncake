@@ -11,6 +11,7 @@
 
 #include "etcd_helper.h"
 #include "rpc_service.h"
+#include "config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -91,6 +92,7 @@ class MasterServiceSupervisor {
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterServiceSupervisor(const MasterConfig& master_config);
     int Start();
     ~MasterServiceSupervisor();
 
