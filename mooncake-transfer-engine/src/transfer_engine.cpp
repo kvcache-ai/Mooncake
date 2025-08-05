@@ -70,7 +70,9 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
-    setFilesLimit();
+    if (!setFilesLimit()) {
+        LOG(WARNING) << "Failed to set file descriptor limit. Continuing initialization, but this may cause issues if too many files are opened.";
+    }
     // Set resources to the maximum value
 
 #ifdef USE_ASCEND
