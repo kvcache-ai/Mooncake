@@ -19,6 +19,7 @@ if (WITH_STORE)
 endif()
 
 include_directories("/usr/include/jsoncpp")
+include_directories("./")
 
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -50,6 +51,7 @@ endif()
 if (WITH_STORE)
     pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
         store/store_py.cpp
+        integration_utils.h
     )
     target_link_libraries(store PUBLIC
         transfer_engine
