@@ -21,8 +21,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <memory>
+#include <regex>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -66,6 +68,40 @@ size_t CxlTransport::cxlGetDeviceSize() {
         unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
         if (end != env_cxl_dev_size && *end == '\0')
             return static_cast<size_t>(val);
+    } else {
+        // try to read dev size from sys
+
+        // find "dax*.*" in path
+        std::regex dax_pattern(R"(dax\d+\.\d+)");
+        std::smatch match;
+        std::string dev_name;
+        std::string str_cxl_dev_path = std::string(cxl_dev_path);
+        if (std::regex_search(str_cxl_dev_path, match, dax_pattern)) {
+            dev_name = match.str();
+        } else {
+            LOG(ERROR) << "Can not find CXL device name in path: "
+                       << cxl_dev_path;
+            return 0;
+        }
+
+        std::string size_path = "/sys/bus/dax/devices/" + dev_name + "/size";
+        LOG(INFO) << "Try to get CXL device size from: " << size_path;
+        std::ifstream file(size_path);
+        if (!file.is_open()) {
+            LOG(ERROR) << "CXL size file does not exist";
+            return 0;
+        }
+
+        std::string content;
+        if (!std::getline(file, content)) {
+            LOG(ERROR) << "Failed to read from: " << size_path;
+            return 0;
+        }
+
+        unsigned long long val = strtoull(content.c_str(), nullptr, 10);
+        // the content is written by kernel, so it should be a valid ull
+        LOG(INFO) << "CXL device size is: " << val;
+        return static_cast<size_t>(val);
     }
     return 0;
 }
