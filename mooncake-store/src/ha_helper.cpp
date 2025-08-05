@@ -90,35 +90,34 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
 }
 
 MasterServiceSupervisor::MasterServiceSupervisor(
-    int rpc_port, size_t rpc_thread_num, bool enable_gc,
-    bool enable_metric_reporting, int metrics_port,
-    int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
-    bool allow_evict_soft_pinned_objects, double eviction_ratio,
-    double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
-    const std::string& etcd_endpoints, const std::string& local_hostname,
-    const std::string& rpc_address,
-    std::chrono::steady_clock::duration rpc_conn_timeout,
-    bool rpc_enable_tcp_no_delay, const std::string& cluster_id,
-    BufferAllocatorType memory_allocator)
-    : enable_gc_(enable_gc),
-      enable_metric_reporting_(enable_metric_reporting),
-      metrics_port_(metrics_port),
-      default_kv_lease_ttl_(default_kv_lease_ttl),
-      default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
-      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
-      eviction_ratio_(eviction_ratio),
-      eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
-      client_live_ttl_sec_(client_live_ttl_sec),
-      rpc_port_(rpc_port),
-      rpc_thread_num_(rpc_thread_num > 0 ? rpc_thread_num
-                                         : std::thread::hardware_concurrency()),
-      rpc_address_(rpc_address),
-      rpc_conn_timeout_(rpc_conn_timeout),
-      rpc_enable_tcp_no_delay_(rpc_enable_tcp_no_delay),
-      etcd_endpoints_(etcd_endpoints),
-      local_hostname_(local_hostname),
-      cluster_id_(cluster_id),
-      memory_allocator_(memory_allocator) {}
+    const MasterConfig& master_config)
+    : enable_gc_(master_config.enable_gc),
+      enable_metric_reporting_(master_config.enable_metric_reporting),
+      metrics_port_(master_config.metrics_port),
+      default_kv_lease_ttl_(master_config.default_kv_lease_ttl),
+      default_kv_soft_pin_ttl_(master_config.default_kv_soft_pin_ttl),
+      allow_evict_soft_pinned_objects_(
+          master_config.allow_evict_soft_pinned_objects),
+      eviction_ratio_(master_config.eviction_ratio),
+      eviction_high_watermark_ratio_(
+          master_config.eviction_high_watermark_ratio),
+      client_live_ttl_sec_(master_config.client_live_ttl_sec),
+      rpc_port_(master_config.rpc_port),
+      rpc_thread_num_(master_config.rpc_thread_num),
+      rpc_address_(master_config.rpc_address),
+      rpc_conn_timeout_(
+          std::chrono::seconds(master_config.rpc_conn_timeout_seconds)),
+      rpc_enable_tcp_no_delay_(master_config.rpc_enable_tcp_no_delay),
+      etcd_endpoints_(master_config.etcd_endpoints),
+      local_hostname_(master_config.rpc_address + ":" +
+                      std::to_string(master_config.rpc_port)),
+      cluster_id_(master_config.cluster_id) {
+    if (master_config.memory_allocator == "cachelib") {
+        memory_allocator_ = BufferAllocatorType::CACHELIB;
+    } else {
+        memory_allocator_ = BufferAllocatorType::OFFSET;
+    }
+}
 
 int MasterServiceSupervisor::Start() {
     while (true) {

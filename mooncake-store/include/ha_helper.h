@@ -11,6 +11,7 @@
 
 #include "etcd_helper.h"
 #include "rpc_service.h"
+#include "config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -90,6 +91,7 @@ class MasterServiceSupervisor {
         bool rpc_enable_tcp_no_delay = true,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterServiceSupervisor(const MasterConfig& master_config);
     int Start();
     ~MasterServiceSupervisor();
 
