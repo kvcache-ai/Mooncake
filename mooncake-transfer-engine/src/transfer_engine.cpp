@@ -27,6 +27,7 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
 static bool setFilesLimit() {
     struct rlimit filesLimit;
     if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
