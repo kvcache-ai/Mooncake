@@ -254,6 +254,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
     }
+    if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.root_fs_dir = FLAGS_root_fs_dir;
+    }
     if ((google::GetCommandLineFlagInfo("memory_allocator", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -322,6 +327,7 @@ int main(int argc, char* argv[]) {
               << ", rpc_enable_tcp_no_delay="
               << master_config.rpc_enable_tcp_no_delay
               << ", cluster_id=" << master_config.cluster_id
+              << ", root_fs_dir=" << master_config.root_fs_dir
               << ", memory_allocator=" << master_config.memory_allocator;
 
     if (master_config.enable_ha) {
