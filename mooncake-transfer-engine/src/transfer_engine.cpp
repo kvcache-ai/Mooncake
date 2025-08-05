@@ -28,17 +28,22 @@
 
 namespace mooncake {
 static bool setFilesLimit() {
-  struct rlimit filesLimit;
-  if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
-    LOG(ERROR) << "getrlimit failed: " << strerror(errno);
-    return false;
-  }
-  filesLimit.rlim_cur = filesLimit.rlim_max;
-  if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
-    LOG(ERROR) << "setrlimit failed: " << strerror(errno);
-    return false;
-  }
-  return true;
+    struct rlimit filesLimit;
+    if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "getrlimit failed: " << strerror(errno);
+        return false;
+    }
+    rlim_t target_limit = filesLimit.rlim_max;
+    // Skip if already sufficient
+    if (filesLimit.rlim_cur >= target_limit) {
+        return true;
+    }
+    filesLimit.rlim_cur = target_limit;
+    if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "setrlimit failed: " << strerror(errno);
+        return false;
+    }
+    return true;
 }
 
 static std::string loadTopologyJsonFile(const std::string &path) {
