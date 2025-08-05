@@ -67,16 +67,21 @@ class MasterMetricManager {
     void inc_ping_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
-    void inc_batch_exist_key_requests(int64_t val = 1);
-    void inc_batch_exist_key_failures(int64_t val = 1);
-    void inc_batch_get_replica_list_requests(int64_t val = 1);
-    void inc_batch_get_replica_list_failures(int64_t val = 1);
-    void inc_batch_put_start_requests(int64_t val = 1);
-    void inc_batch_put_start_failures(int64_t val = 1);
-    void inc_batch_put_end_requests(int64_t val = 1);
-    void inc_batch_put_end_failures(int64_t val = 1);
-    void inc_batch_put_revoke_requests(int64_t val = 1);
-    void inc_batch_put_revoke_failures(int64_t val = 1);
+    void inc_batch_exist_key_requests(int64_t items);
+    void inc_batch_exist_key_failures(int64_t failed_items);
+    void inc_batch_exist_key_partial_success(int64_t failed_items);
+    void inc_batch_get_replica_list_requests(int64_t items);
+    void inc_batch_get_replica_list_failures(int64_t failed_items);
+    void inc_batch_get_replica_list_partial_success(int64_t failed_items);
+    void inc_batch_put_start_requests(int64_t items);
+    void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_partial_success(int64_t failed_items);
+    void inc_batch_put_end_requests(int64_t items);
+    void inc_batch_put_end_failures(int64_t failed_items);
+    void inc_batch_put_end_partial_success(int64_t failed_items);
+    void inc_batch_put_revoke_requests(int64_t items);
+    void inc_batch_put_revoke_failures(int64_t failed_items);
+    void inc_batch_put_revoke_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -105,14 +110,29 @@ class MasterMetricManager {
     // Batch Operation Statistics Getters
     int64_t get_batch_exist_key_requests();
     int64_t get_batch_exist_key_failures();
+    int64_t get_batch_exist_key_partial_successes();
+    int64_t get_batch_exist_key_items();
+    int64_t get_batch_exist_key_failed_items();
     int64_t get_batch_get_replica_list_requests();
     int64_t get_batch_get_replica_list_failures();
+    int64_t get_batch_get_replica_list_partial_successes();
+    int64_t get_batch_get_replica_list_items();
+    int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_partial_successes();
+    int64_t get_batch_put_start_items();
+    int64_t get_batch_put_start_failed_items();
     int64_t get_batch_put_end_requests();
     int64_t get_batch_put_end_failures();
+    int64_t get_batch_put_end_partial_successes();
+    int64_t get_batch_put_end_items();
+    int64_t get_batch_put_end_failed_items();
     int64_t get_batch_put_revoke_requests();
     int64_t get_batch_put_revoke_failures();
+    int64_t get_batch_put_revoke_partial_successes();
+    int64_t get_batch_put_revoke_items();
+    int64_t get_batch_put_revoke_failed_items();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
@@ -186,14 +206,29 @@ class MasterMetricManager {
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
     ylt::metric::counter_t batch_exist_key_failures_;
+    ylt::metric::counter_t batch_exist_key_partial_successes_;
+    ylt::metric::counter_t batch_exist_key_items_;
+    ylt::metric::counter_t batch_exist_key_failed_items_;
     ylt::metric::counter_t batch_get_replica_list_requests_;
     ylt::metric::counter_t batch_get_replica_list_failures_;
+    ylt::metric::counter_t batch_get_replica_list_partial_successes_;
+    ylt::metric::counter_t batch_get_replica_list_items_;
+    ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_partial_successes_;
+    ylt::metric::counter_t batch_put_start_items_;
+    ylt::metric::counter_t batch_put_start_failed_items_;
     ylt::metric::counter_t batch_put_end_requests_;
     ylt::metric::counter_t batch_put_end_failures_;
+    ylt::metric::counter_t batch_put_end_partial_successes_;
+    ylt::metric::counter_t batch_put_end_items_;
+    ylt::metric::counter_t batch_put_end_failed_items_;
     ylt::metric::counter_t batch_put_revoke_requests_;
     ylt::metric::counter_t batch_put_revoke_failures_;
+    ylt::metric::counter_t batch_put_revoke_partial_successes_;
+    ylt::metric::counter_t batch_put_revoke_items_;
+    ylt::metric::counter_t batch_put_revoke_failed_items_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;
