@@ -145,6 +145,14 @@ jobs:
         echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
       shell: bash
 
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
