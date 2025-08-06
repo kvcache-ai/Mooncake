@@ -219,10 +219,9 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     return Status::OK();
 }
 
-
 #ifdef USE_CUDA
 class PinnedBuffer {
-public:
+   public:
     explicit PinnedBuffer(size_t size) : size_(size), ptr_(nullptr) {
         cudaError_t err = cudaMallocHost(&ptr_, size_);
         if (err != cudaSuccess) {
@@ -237,14 +236,14 @@ public:
         }
     }
 
-    void* data() { return ptr_; }
-    const void* data() const { return ptr_; }
+    void *data() { return ptr_; }
+    const void *data() const { return ptr_; }
 
     size_t size() const { return size_; }
 
-private:
+   private:
     size_t size_;
-    void* ptr_;
+    void *ptr_;
 };
 
 thread_local PinnedBuffer ref_buf(FLAGS_block_size);
@@ -261,15 +260,18 @@ void fillData(int thread_id, void *addr, uint8_t seed) {
     cudaStreamCreate(&s);
     for (int i = 0; i < FLAGS_batch_size; ++i) {
         uint8_t *local_addr =
-            (uint8_t *)(addr) + FLAGS_block_size * (i * FLAGS_threads + thread_id);
-        cudaMemcpyAsync(local_addr, ref_buf.data(), FLAGS_block_size, cudaMemcpyDefault, s);
+            (uint8_t *)(addr) +
+            FLAGS_block_size * (i * FLAGS_threads + thread_id);
+        cudaMemcpyAsync(local_addr, ref_buf.data(), FLAGS_block_size,
+                        cudaMemcpyDefault, s);
     }
     cudaStreamSynchronize(s);
     cudaStreamDestroy(s);
 #else
     for (int i = 0; i < FLAGS_batch_size; ++i) {
         uint8_t *local_addr =
-            (uint8_t *)(addr) + FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            (uint8_t *)(addr) +
+            FLAGS_block_size * (i * FLAGS_threads + thread_id);
         memset(local_addr, seed, FLAGS_block_size);
     }
 #endif
@@ -279,11 +281,13 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
     memset(ref_buf.data(), seed, FLAGS_block_size);
     for (int i = 0; i < FLAGS_batch_size; ++i) {
         uint8_t *local_addr =
-            (uint8_t *)(addr) + FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            (uint8_t *)(addr) +
+            FLAGS_block_size * (i * FLAGS_threads + thread_id);
 #ifdef USE_CUDA
         cudaStream_t s;
         cudaStreamCreate(&s);
-        cudaMemcpyAsync(user_buf.data(), local_addr, FLAGS_block_size, cudaMemcpyDefault, s);
+        cudaMemcpyAsync(user_buf.data(), local_addr, FLAGS_block_size,
+                        cudaMemcpyDefault, s);
         cudaStreamSynchronize(s);
         cudaStreamDestroy(s);
         if (memcmp(user_buf.data(), ref_buf.data(), FLAGS_block_size) != 0) {
