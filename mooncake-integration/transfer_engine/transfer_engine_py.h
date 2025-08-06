@@ -143,8 +143,7 @@ class TransferEnginePy {
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
-    std::string getLocalTopology(bool original = true,
-                                 const char *device_name = "");
+    std::string getLocalTopology();
 
    private:
     char *allocateRawBuffer(size_t capacity);
