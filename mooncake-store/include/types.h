@@ -458,7 +458,7 @@ struct Segment {
             size_t size, bool is_vram)
         : id(id), name(name), base(base), size(size), is_vram(is_vram) {}
 };
-YLT_REFL(Segment, id, name, base, size);
+YLT_REFL(Segment, id, name, base, size, is_vram);
 
 /**
  * @brief Client status from the master's perspective

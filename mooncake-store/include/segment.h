@@ -149,7 +149,7 @@ class ScopedAllocatorAccess {
                              std::vector<std::shared_ptr<BufferAllocatorBase>>>&
         allocators_by_name_;  // segment name -> allocators
     std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>&
         vram_allocators_by_name_;
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;

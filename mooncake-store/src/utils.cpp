@@ -45,7 +45,6 @@ void *allocate_vram_buffer_allocator_memory(size_t total_size) {
         std::lock_guard<std::mutex> lock(g_cuda_alloc_mutex);
         g_cuda_aligned_allocations[aligned_ptr] = raw_ptr;
     }
-    std::cout << "alloc good" << std::endl;
 
     // Allocate aligned memory
     return aligned_ptr;
