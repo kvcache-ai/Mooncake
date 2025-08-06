@@ -355,17 +355,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
-    // Any state -> RESET
+    // Any state -> RESET (removed)
+    // Modifing to RESET is not necessary here because it is already 
+    // and avoid 'invalid argument' issuse on some RDMA devices such as Intel E810.
     ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-    if (ret) {
-        std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
-    }
+    int ret;
 
     // RESET -> INIT
     memset(&attr, 0, sizeof(attr));
