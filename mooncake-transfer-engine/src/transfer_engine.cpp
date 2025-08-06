@@ -17,13 +17,35 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+
+static bool setFilesLimit() {
+    struct rlimit filesLimit;
+    if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "getrlimit failed: " << strerror(errno);
+        return false;
+    }
+    rlim_t target_limit = filesLimit.rlim_max;
+    // Skip if already sufficient
+    if (filesLimit.rlim_cur >= target_limit) {
+        return true;
+    }
+    filesLimit.rlim_cur = target_limit;
+    if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "setrlimit failed: " << strerror(errno);
+        return false;
+    }
+    return true;
+}
 
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
@@ -48,6 +70,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
+
+    if (!setFilesLimit()) {
+        LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
+                        "initialization, but this may cause issues if too many "
+                        "files are opened.";
+    }
+    // Set resources to the maximum value
 
 #ifdef USE_ASCEND
     // The only difference in initializing the Ascend Transport is that the
