@@ -630,17 +630,9 @@ std::string TransferEnginePy::getLocalTopology() {
     pybind11::gil_scoped_release release;
     std::shared_ptr<TransferEngine> tmp_engine =
         std::make_shared<TransferEngine>(true);
-    auto custom_topology_path = std::getenv("MC_CUSTOM_TOPO_JSON");
-    if (custom_topology_path) {
-        setenv("MC_CUSTOM_TOPO_JSON", "", 1);
-    }
 
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
-
-    if (custom_topology_path) {
-        setenv("MC_CUSTOM_TOPO_JSON", custom_topology_path, 1);
-    }
 
     return tmp_engine->getLocalTopology()->toString();
 }
