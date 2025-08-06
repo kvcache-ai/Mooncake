@@ -1,4 +1,5 @@
-import sys, os
+import sys
+import os
 
 def main():
     os.environ['MC_LOG_LEVEL'] = 'ERROR'
