@@ -87,7 +87,8 @@ void cleanup_segment() {
         auto result =
             g_client->UnmountSegment(g_segment_ptr, g_ram_buffer_size);
         if (!result.has_value()) {
-            LOG(ERROR) << "Failed to unmount segment: " << toString(result.error());
+            LOG(ERROR) << "Failed to unmount segment: "
+                       << toString(result.error());
         }
     }
 }

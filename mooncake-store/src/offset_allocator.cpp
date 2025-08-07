@@ -3,8 +3,12 @@
 
 #include "offset_allocator/offset_allocator.hpp"
 
-#include "mutex.h"
+#include <cmath>
+#include <iomanip>
 #include <iostream>
+
+#include "mutex.h"
+#include "utils.h"
 
 #ifdef DEBUG
 #include <assert.h>
@@ -470,20 +474,22 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 }
 
 // OffsetAllocationHandle implementation
-OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
-                                   OffsetAllocation allocation, uint64_t base,
-                                   uint64_t size)
+OffsetAllocationHandle::OffsetAllocationHandle(
+    std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
+    uint64_t base, uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
       requested_size(size) {}
 
-OffsetAllocationHandle::OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept
+OffsetAllocationHandle::OffsetAllocationHandle(
+    OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
       requested_size(other.requested_size) {
-    other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    other.m_allocation = {OffsetAllocation::NO_SPACE,
+                          OffsetAllocation::NO_SPACE};
     other.real_base = 0;
     other.requested_size = 0;
 }
@@ -494,7 +500,7 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         // Free current allocation if valid{
         auto allocator = m_allocator.lock();
         if (allocator) {
-            allocator->freeAllocation(m_allocation);
+            allocator->freeAllocation(m_allocation, requested_size);
         }
 
         // Move from other
@@ -504,7 +510,8 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         requested_size = other.requested_size;
 
         // Reset other
-        other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+        other.m_allocation = {OffsetAllocation::NO_SPACE,
+                              OffsetAllocation::NO_SPACE};
         other.real_base = 0;
         other.requested_size = 0;
     }
@@ -514,7 +521,7 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
 OffsetAllocationHandle::~OffsetAllocationHandle() {
     auto allocator = m_allocator.lock();
     if (allocator) {
-        allocator->freeAllocation(m_allocation);
+        allocator->freeAllocation(m_allocation, requested_size);
     }
 }
 
@@ -527,14 +534,16 @@ static uint64_t calculateMultiplier(size_t size) {
 }
 
 // Thread-safe OffsetAllocator implementation
-std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t size,
-                                             uint32 maxAllocs) {
+std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
+                                                         size_t size,
+                                                         uint32 maxAllocs) {
     // Use a custom deleter to allow private constructor
-    return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(base, size, maxAllocs));
+    return std::shared_ptr<OffsetAllocator>(
+        new OffsetAllocator(base, size, maxAllocs));
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
-    : m_base(base), m_multiplier(calculateMultiplier(size)) {
+    : m_base(base), m_multiplier(calculateMultiplier(size)), m_capacity(size) {
     m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
 }
 
@@ -557,13 +566,22 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.offset == OffsetAllocation::NO_SPACE) {
+        // Log metrics to help understand why allocation failed
+        // Note: We're already holding m_mutex, so use internal method
+        OffsetAllocatorMetrics metrics = get_metrics_internal();
+        VLOG(1) << "OffsetAllocator allocation failed: size=" << size
+                << ", fake_size=" << fake_size << ", " << metrics;
         return std::nullopt;
     }
 
+    // Update lightweight metrics
+    m_allocated_size += size;
+    m_allocated_num++;
+
     // Use shared_from_this to get a shared_ptr to this OffsetAllocator
     return OffsetAllocationHandle(shared_from_this(), allocation,
-                            m_base + allocation.offset * m_multiplier,
-                            size);
+                                  m_base + allocation.offset * m_multiplier,
+                                  size);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
@@ -584,17 +602,63 @@ OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
     }
     OffsetAllocStorageReportFull report = m_allocator->storageReportFull();
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
-        report.freeRegions[i] = {.size = report.freeRegions[i].size * m_multiplier,
-                                 .count = report.freeRegions[i].count};
+        report.freeRegions[i] = {
+            .size = report.freeRegions[i].size * m_multiplier,
+            .count = report.freeRegions[i].count};
     }
     return report;
 }
 
-void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation) {
+OffsetAllocatorMetrics OffsetAllocator::get_metrics_internal() const {
+    if (!m_allocator) {
+        return {0, 0, 0, 0, m_capacity};
+    }
+
+    // Get basic storage report
+    OffsetAllocStorageReport basic_report = m_allocator->storageReport();
+    return {
+        m_allocated_size,                               // allocated_size_
+        m_allocated_num,                                // allocated_num_
+        basic_report.largestFreeRegion * m_multiplier,  // largest_free_region_
+        basic_report.totalFreeSpace * m_multiplier,     // total_free_space_
+        m_capacity,                                     // capacity
+    };
+}
+
+OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
+    MutexLocker guard(&m_mutex);
+    return get_metrics_internal();
+}
+
+void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
+                                     uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);
+        // Update lightweight metrics
+        m_allocated_size -= size;
+        m_allocated_num--;
     }
+}
+
+// Stream output operator implementation
+std::ostream& operator<<(std::ostream& os,
+                         const OffsetAllocatorMetrics& metrics) {
+    double utilization =
+        metrics.capacity > 0
+            ? (double)metrics.allocated_size_ / metrics.capacity * 100.0
+            : 0.0;
+    os << "OffsetAllocatorMetrics{"
+       << "allocated=" << mooncake::byte_size_to_string(metrics.allocated_size_)
+       << ", allocs=" << metrics.allocated_num_
+       << ", capacity=" << mooncake::byte_size_to_string(metrics.capacity)
+       << ", utilization=" << std::fixed << std::setprecision(1) << utilization
+       << "%"
+       << ", free_space="
+       << mooncake::byte_size_to_string(metrics.total_free_space_)
+       << ", largest_free="
+       << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";
+    return os;
 }
 
 }  // namespace mooncake::offset_allocator

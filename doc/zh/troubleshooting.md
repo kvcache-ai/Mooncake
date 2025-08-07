@@ -48,6 +48,9 @@
 3. 显示 `Failed to exchange handshake description` 错误，表明通信双方无法建立 RDMA 可靠连接通路。在大多数情况下，通常是因为某一方配置有误，或者双方本身无法通达所致。首先使用 `ib_send_bw` 等工具确认两个节点的可通达性，并留意输出的 GID、LID、MTU 等参数信息，之后对照报错信息分析可能的出错点：
     1. 在启动后输出日志通常包含数行形如 `RDMA device: XXX, LID: XXX, GID: (X) XX:XX:XX:...` 的日志信息。如果显示的 GID 地址全部为 0（括号内表示 GID Index），则需要结合网络环境选择正确的 GID Index，启动时使用使用 `MC_GID_INDEX` 环境变量加以指定。
     2. 显示 `Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num` 错误，首先需要确定发生错误的是哪一方，没有显示 `Handshake request rejected by peer endpoint: ` 前缀的就表明问题来自显示错误的一方。按照错误提示指引，需要检查 MTU 长度配置（使用 `MC_MTU` 环境变量调节）、自己及对方的 GID 地址是否有效等。同时，如果两个节点无法实现物理连接，也可能会在这一步中断，敬请留意。
+    3. 如果显示 `Failed to create QP: Cannot allocate memory` 错误，通常是由于创建的 QP 数量过多，达到了驱动限制。可以使用 `rdma resource` 命令追踪已创建的 QP 数量。解决此问题的一种可能方法：
+       - 将 Mooncake 更新到 v0.3.5 或更高版本
+       - 在启动应用程序前设置环境变量 `MC_ENABLE_DEST_DEVICE_AFFINITY=1`
 
 ## RDMA 传输期间
 ### 建议排查方向

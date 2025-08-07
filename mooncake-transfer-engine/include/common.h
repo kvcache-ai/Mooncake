@@ -123,48 +123,54 @@ static inline std::string getCurrentDateTime() {
 
 uint16_t getDefaultHandshakePort();
 
-template<typename T>
+template <typename T>
 std::optional<T> parseFromString(std::string_view str) {
     T result = T();
-    auto [ptr, ec] = std::from_chars(str.data(), str.data() + str.size(), result);
+    auto [ptr, ec] =
+        std::from_chars(str.data(), str.data() + str.size(), result);
     if (ec != std::errc() || ptr != str.data() + str.size()) {
         return {};
     }
     return {std::move(result)};
 }
 
-static inline uint16_t getPortFromString(std::string_view port_string, uint16_t default_port) {
+static inline uint16_t getPortFromString(std::string_view port_string,
+                                         uint16_t default_port) {
     std::optional<uint16_t> port = parseFromString<uint16_t>(port_string);
     if (port.has_value()) {
         return *port;
     }
-    LOG(WARNING) << "Illegal port number in " << port_string << ". Use default port " << default_port << " instead";
+    LOG(WARNING) << "Illegal port number in " << port_string
+                 << ". Use default port " << default_port << " instead";
     return default_port;
 }
 
-static inline bool isValidIpV6(const std::string& address) {
+static inline bool isValidIpV6(const std::string &address) {
     sockaddr_in6 addr;
     std::memset(&addr, 0, sizeof(addr));
     return inet_pton(AF_INET6, address.c_str(), &addr.sin6_addr) == 1;
 }
 
-static inline std::string maybeWrapIpV6(const std::string& address) {
+static inline std::string maybeWrapIpV6(const std::string &address) {
     if (isValidIpV6(address)) {
         return "[" + address + "]";
     }
     return address;
 }
 
-static inline std::pair<std::string, uint16_t> parseHostNameWithPort(const std::string &server_name) {
+static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
+    const std::string &server_name) {
     uint16_t port = getDefaultHandshakePort();
 
     if (server_name.starts_with("[")) {
         // [ipv6] or [ipv6]:port
         const size_t closing_bracket_pos = server_name.find(']');
         const size_t colon_pos = server_name.find(':', closing_bracket_pos);
-        std::string potentialHost = server_name.substr(1, closing_bracket_pos - 1);
+        std::string potentialHost =
+            server_name.substr(1, closing_bracket_pos - 1);
         if (isValidIpV6(potentialHost)) {
-            return {std::move(potentialHost), getPortFromString(server_name.substr(colon_pos + 1), port)};
+            return {std::move(potentialHost),
+                    getPortFromString(server_name.substr(colon_pos + 1), port)};
         }
         // Not valid ipv6, fallback to ipv4/host/etc mode
     } else if (isValidIpV6(server_name)) {
@@ -177,10 +183,13 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(const std::
     if (colon_pos == server_name.npos) {
         return {server_name, port};
     }
-    return {server_name.substr(0, colon_pos), getPortFromString(server_name.substr(colon_pos + 1), port)};
+    return {server_name.substr(0, colon_pos),
+            getPortFromString(server_name.substr(colon_pos + 1), port)};
 }
 
-static inline uint16_t parsePortAndDevice(std::string_view suffix, uint16_t default_port, int *device_id) {
+static inline uint16_t parsePortAndDevice(std::string_view suffix,
+                                          uint16_t default_port,
+                                          int *device_id) {
     auto colon_pos = suffix.find(':');
     if (colon_pos == suffix.npos) {
         return getPortFromString(suffix, default_port);
@@ -189,8 +198,10 @@ static inline uint16_t parsePortAndDevice(std::string_view suffix, uint16_t defa
     auto npu_str = suffix.substr(colon_pos + 1);
 
     auto npu_ops = npu_str.find('_');
-    if (npu_ops != npu_str.npos && npu_ops != 0 && npu_ops != npu_str.size() - 1) {
-        *device_id = parseFromString<int>(npu_str.substr(npu_ops + 1)).value_or(0);
+    if (npu_ops != npu_str.npos && npu_ops != 0 &&
+        npu_ops != npu_str.size() - 1) {
+        *device_id =
+            parseFromString<int>(npu_str.substr(npu_ops + 1)).value_or(0);
     }
     return getPortFromString(port_str, default_port);
 }
@@ -203,12 +214,12 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
         // [ipv6] or [ipv6]:port
         const size_t closing_bracket_pos = server_name.find(']');
         const size_t colon_pos = server_name.find(':', closing_bracket_pos);
-        std::string potentialHost = server_name.substr(1, closing_bracket_pos - 1);
+        std::string potentialHost =
+            server_name.substr(1, closing_bracket_pos - 1);
         if (isValidIpV6(potentialHost)) {
-            return {
-                std::move(potentialHost),
-                parsePortAndDevice(server_name.substr(colon_pos + 1), port, device_id)
-            };
+            return {std::move(potentialHost),
+                    parsePortAndDevice(server_name.substr(colon_pos + 1), port,
+                                       device_id)};
         }
         // Not valid ipv6, fallback to ipv4/host/etc mode
     } else if (isValidIpV6(server_name)) {
@@ -222,8 +233,7 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
 
     return {
         server_name.substr(0, colon_pos),
-        parsePortAndDevice(server_name.substr(colon_pos + 1), port, device_id)
-    };
+        parsePortAndDevice(server_name.substr(colon_pos + 1), port, device_id)};
 }
 
 static inline ssize_t writeFully(int fd, const void *buf, size_t len) {

@@ -818,8 +818,9 @@ int TransferEnginePy::batchRegisterMemory(
         return 0;
     }
     std::vector<BufferEntry> buffers;
-    for (int i = 0; i < batch_size; i ++ ) {
-        buffers.push_back(BufferEntry{(void *)buffer_addresses[i], capacities[i]});
+    for (size_t i = 0; i < batch_size; i++) {
+        buffers.push_back(
+            BufferEntry{(void *)buffer_addresses[i], capacities[i]});
     }
     return engine_->registerLocalMemoryBatch(buffers, kWildcardLocation);
 }
@@ -841,7 +842,7 @@ int TransferEnginePy::batchUnregisterMemory(
     }
     auto batch_size = buffer_addresses.size();
     std::vector<void *> buffers;
-    for (int i = 0; i < batch_size; i ++ ) {
+    for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(reinterpret_cast<char *>(buffer_addresses[i]));
     }
     return engine_->unregisterLocalMemoryBatch(buffers);
@@ -896,6 +897,17 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     return segment_desc->buffers[0].addr;
 }
 
+std::string TransferEnginePy::getLocalTopology() {
+    pybind11::gil_scoped_release release;
+    std::shared_ptr<TransferEngine> tmp_engine =
+        std::make_shared<TransferEngine>(true);
+
+    std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
+    tmp_engine->init(metadata_conn_string, local_server_name);
+
+    return tmp_engine->getLocalTopology()->toString();
+}
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(engine, m) {
@@ -942,6 +954,7 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchRegisterMemory)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress);
 

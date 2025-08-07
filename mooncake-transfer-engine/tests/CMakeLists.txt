@@ -14,6 +14,12 @@ add_executable(rdma_loopback_test rdma_loopback_test.cpp)
 target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+if (USE_CXL)
+    add_executable(cxl_transport_test cxl_transport_test.cpp)
+    target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest gtest_main )
+    add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
+endif()
+
 if (USE_NVMEOF)
     add_executable(nvmeof_transport_test nvmeof_transport_test.cpp)
     target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest gtest_main )

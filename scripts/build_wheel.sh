@@ -51,6 +51,12 @@ echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
+if [ -f "build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
+    cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
+    echo "Copying ascend_transport_mem libraries..."
+else
+    echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
+fi
 
 echo "Building wheel package..."
 # Build the wheel package

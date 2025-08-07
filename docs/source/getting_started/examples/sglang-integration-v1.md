@@ -26,11 +26,41 @@ cd sglang
 pip install --upgrade pip
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
+
+#####  If running on AMD GPU, tried below steps to install sglang for rocm or just run in rocm docker from https://hub.docker.com/r/rocm/sgl-dev directly
+```bash
+
+pip install --upgrade pip
+cd sgl-kernel
+python setup_rocm.py install
+cd ..
+pip install -e "python[all_hip]"
+
+or
+
+docker run -it --rm --network=host \
+    --device=/dev/kfd --device=/dev/dri \
+    --ipc=host --shm-size 16G \
+    --group-add video \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    -v /home/workspace:/workspace \
+   rocm/sgl-dev:20250707
+
+pip3 install mooncake-transfer-engine
+sudo apt update
+sudo apt install libibverbs1 libibverbs-dev -y
+sudo apt-get install lsof net-tools iputils-ping -y
+
+```
+
  - If you encounter any problems that you cannot solve, please refer to the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html).
 
 ## Configuration
 
  - **Update(Apr 10, 2025)** Good news: The configuration file requirement has been removed since [PR 5460](https://github.com/sgl-project/sglang/pull/5460). There is no need to prepare the _mooncake.json_ file anymore.
+
+
 
 ### To run prefill instance and decode instance on different node
 

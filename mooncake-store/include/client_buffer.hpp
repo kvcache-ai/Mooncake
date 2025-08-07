@@ -1,8 +1,10 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include "offset_allocator/offset_allocator.hpp"
+#include "types.h"
 
 namespace mooncake {
 
@@ -78,5 +80,31 @@ class BufferHandle {
     std::shared_ptr<ClientBufferAllocator> allocator_;
     offset_allocator::OffsetAllocationHandle handle_;
 };
+
+// Utility functions for buffer and slice management
+/**
+ * @brief Split a BufferHandle into slices of maximum size kMaxSliceSize
+ * @param handle The buffer handle to split
+ * @return Vector of slices covering the entire buffer
+ */
+std::vector<Slice> split_into_slices(BufferHandle& handle);
+
+/**
+ * @brief Calculate the total size of a replica descriptor
+ * @param replica The replica descriptor to calculate size for
+ * @return Total size in bytes
+ */
+uint64_t calculate_total_size(const Replica::Descriptor& replica);
+
+/**
+ * @brief Allocate slices from a buffer handle based on replica descriptor
+ * @param slices Output vector to store the allocated slices
+ * @param replica The replica descriptor defining the slice structure
+ * @param buffer_handle The buffer handle to allocate slices from
+ * @return 0 on success, non-zero on error
+ */
+int allocateSlices(std::vector<Slice>& slices,
+                   const Replica::Descriptor& replica,
+                   BufferHandle& buffer_handle);
 
 }  // namespace mooncake

@@ -20,7 +20,7 @@ else()
         HINTS ${PC_MPI_INCLUDEDIR} ${PC_MPI_INCLUDE_DIRS}
         PATHS /usr/include /usr/local/include ${MPI_INCLUDE_SEARCH_PATHS})
 
-    file(GLOB MPI_LIB_DIRS "/usr/lib/mpich*" "/usr/local/lib/mpich*" "/usr/local/mpich*/lib")
+    file(GLOB MPI_LIB_DIRS "/usr/lib/mpich*" "/usr/local/lib/mpich*" "/usr/local/mpich*/lib" "/usr/lib/*-linux-gnu" "/usr/lib64/mpich/lib")
 
     set(MPI_LIB_SEARCH_PATHS "")
     foreach(dir IN LISTS MPI_LIB_DIRS)

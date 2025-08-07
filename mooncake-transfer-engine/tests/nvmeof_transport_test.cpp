@@ -45,7 +45,8 @@ DEFINE_string(device_name, "erdma_1",
 DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
 
-// python /workspace/Mooncake/mooncake-transfer-engine/scripts/register.py localhost test_nvmeof /workspace/sample
+// python /workspace/Mooncake/mooncake-transfer-engine/scripts/register.py
+// localhost test_nvmeof /workspace/sample
 DEFINE_string(segment_id, "nvmeof/test_nvmeof", "Segment ID to access data");
 
 static void *allocateMemoryPool(size_t size, int socket_id,

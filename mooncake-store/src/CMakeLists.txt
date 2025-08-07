@@ -20,7 +20,7 @@ set(MOONCAKE_STORE_SOURCES
     rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
-
+    client_buffer.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -51,6 +51,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    mooncake_common
     ${ETCD_WRAPPER_LIB}
 )
 if (STORE_USE_ETCD)

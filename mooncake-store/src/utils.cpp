@@ -4,7 +4,7 @@
 #include <glog/logging.h>
 
 namespace mooncake {
-void* allocate_buffer_allocator_memory(size_t total_size) {
+void *allocate_buffer_allocator_memory(size_t total_size) {
     const size_t alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (total_size < alignment) {

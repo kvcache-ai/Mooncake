@@ -7,7 +7,8 @@
 
 namespace mooncake {
 
-ThreeFSFile::ThreeFSFile(const std::string& filename, int fd, USRBIOResourceManager* resource_manager) 
+ThreeFSFile::ThreeFSFile(const std::string& filename, int fd,
+                         USRBIOResourceManager* resource_manager)
     : StorageFile(filename, fd), resource_manager_(resource_manager) {}
 
 ThreeFSFile::~ThreeFSFile() {
@@ -30,11 +31,13 @@ ThreeFSFile::~ThreeFSFile() {
     }
 }
 
-tl::expected<size_t, ErrorCode> ThreeFSFile::write(const std::string& buffer, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::write(const std::string& buffer,
+                                                   size_t length) {
     return write(std::span<const char>(buffer.data(), length), length);
 }
 
-tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
+                                                   size_t length) {
     // 1. Parameter validation
     if (length == 0) {
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
@@ -62,14 +65,16 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, s
 
     while (total_bytes_written < length) {
         // Calculate current chunk size
-        size_t chunk_size = std::min(length - total_bytes_written, max_chunk_size);
+        size_t chunk_size =
+            std::min(length - total_bytes_written, max_chunk_size);
 
         // Copy data to shared buffer
         memcpy(threefs_iov.base, data_ptr + total_bytes_written, chunk_size);
 
         // Prepare IO request
-        int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
-                               threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
+        int ret =
+            hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base,
+                          fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -92,18 +97,19 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data, s
         current_offset += bytes_written;
 
         if (bytes_written < chunk_size) {
-            break; // Short write, possibly disk full
+            break;  // Short write, possibly disk full
         }
     }
 
-    if(total_bytes_written != length) {
+    if (total_bytes_written != length) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
     return total_bytes_written;
 }
 
-tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t length) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer,
+                                                  size_t length) {
     // 1. Parameter validation
     if (length == 0) {
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
@@ -132,14 +138,12 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t le
     // 5. Read in chunks
     while (total_bytes_read < length) {
         // Calculate current chunk size
-        size_t chunk_size = std::min<size_t>(
-            length - total_bytes_read,
-            resource->config_.iov_size
-        );
+        size_t chunk_size = std::min<size_t>(length - total_bytes_read,
+                                             resource->config_.iov_size);
 
         // Prepare IO request
-        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true,
-                               threefs_iov.base, fd_, current_offset, chunk_size, nullptr);
+        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
+                                fd_, current_offset, chunk_size, nullptr);
         if (ret < 0) {
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
@@ -158,7 +162,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t le
         }
 
         size_t bytes_read = cqe.result;
-        if (bytes_read == 0) { // EOF
+        if (bytes_read == 0) {  // EOF
             break;
         }
 
@@ -167,19 +171,21 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::read(std::string& buffer, size_t le
         total_bytes_read += bytes_read;
         current_offset += bytes_read;
 
-        if (bytes_read < chunk_size) { // Short read
+        if (bytes_read < chunk_size) {  // Short read
             break;
         }
     }
 
-    if(total_bytes_read != length) {
+    if (total_bytes_read != length) {
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
-    
+
     return total_bytes_read;
 }
 
-tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int iovcnt, off_t offset) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
+                                                          int iovcnt,
+                                                          off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
@@ -202,36 +208,34 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int 
     size_t total_bytes_written = 0;
     off_t current_offset = offset;
     size_t bytes_remaining = total_length;
-    int  current_iov_index = 0;
+    int current_iov_index = 0;
     size_t current_iov_offset = 0;
 
     while (bytes_remaining > 0) {
-        // 2. Determine current write chunk size (not exceeding shared buffer size)
-        size_t current_chunk_size = std::min<size_t>(
-            bytes_remaining,
-            resource->config_.iov_size
-        );
+        // 2. Determine current write chunk size (not exceeding shared buffer
+        // size)
+        size_t current_chunk_size =
+            std::min<size_t>(bytes_remaining, resource->config_.iov_size);
 
         // 3. Copy data from user IOV to shared buffer
         size_t bytes_copied = 0;
         char* dest_ptr = reinterpret_cast<char*>(threefs_iov.base);
-        
-        while (bytes_copied < current_chunk_size && current_iov_index < iovcnt) {
-            const iovec* current_iov = &iov[current_iov_index];
-            size_t copy_size = std::min(
-                current_chunk_size - bytes_copied,
-                current_iov->iov_len - current_iov_offset
-            );
 
-            memcpy(
-                dest_ptr + bytes_copied,
-                reinterpret_cast<char*>(current_iov->iov_base) + current_iov_offset,
-                copy_size
-            );
+        while (bytes_copied < current_chunk_size &&
+               current_iov_index < iovcnt) {
+            const iovec* current_iov = &iov[current_iov_index];
+            size_t copy_size =
+                std::min(current_chunk_size - bytes_copied,
+                         current_iov->iov_len - current_iov_offset);
+
+            memcpy(dest_ptr + bytes_copied,
+                   reinterpret_cast<char*>(current_iov->iov_base) +
+                       current_iov_offset,
+                   copy_size);
 
             bytes_copied += copy_size;
             current_iov_offset += copy_size;
-            
+
             if (current_iov_offset >= current_iov->iov_len) {
                 current_iov_index++;
                 current_iov_offset = 0;
@@ -239,8 +243,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int 
         }
 
         // 4. Prepare and submit IO request
-        int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
-                               threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
+        int ret =
+            hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base,
+                          fd_, current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -263,14 +268,16 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov, int 
         current_offset += bytes_written;
 
         if (bytes_written < current_chunk_size) {
-            break; // Short write, possibly disk full
+            break;  // Short write, possibly disk full
         }
     }
 
     return total_bytes_written;
 }
 
-tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int iovcnt, off_t offset) {
+tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
+                                                         int iovcnt,
+                                                         off_t offset) {
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         return make_error<size_t>(ErrorCode::FILE_OPEN_FAIL);
@@ -296,14 +303,15 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int i
     int current_iov_index = 0;
     size_t current_iov_offset = 0;
 
-    while(bytes_remaining > 0) {
+    while (bytes_remaining > 0) {
         // Determine current block size
         size_t current_chunk_size =
             std::min<size_t>(bytes_remaining, resource->config_.iov_size);
 
         // Prepare IO request
-        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, 
-                            threefs_iov.base, fd_, current_offset, current_chunk_size, nullptr);
+        int ret =
+            hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base, fd_,
+                          current_offset, current_chunk_size, nullptr);
         if (ret < 0) {
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
@@ -325,19 +333,15 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int i
         // Copy data from shared buffer to user IOV
         size_t bytes_to_copy = bytes_read;
         char* src_ptr = reinterpret_cast<char*>(threefs_iov.base);
-        
+
         while (bytes_to_copy > 0 && current_iov_index < iovcnt) {
             const iovec* current_iov = &iov[current_iov_index];
             size_t copy_size = std::min(
-                bytes_to_copy,
-                current_iov->iov_len - current_iov_offset
-            );
+                bytes_to_copy, current_iov->iov_len - current_iov_offset);
 
             memcpy(
                 static_cast<char*>(current_iov->iov_base) + current_iov_offset,
-                src_ptr,
-                copy_size
-            );
+                src_ptr, copy_size);
 
             src_ptr += copy_size;
             bytes_to_copy -= copy_size;
@@ -351,8 +355,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int i
                 current_iov_offset = 0;
             }
         }
-        if(bytes_read < current_chunk_size) {
-            // If bytes read is less than requested chunk size, we've reached EOF
+        if (bytes_read < current_chunk_size) {
+            // If bytes read is less than requested chunk size, we've reached
+            // EOF
             break;
         }
     }
@@ -360,4 +365,4 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov, int i
     return total_bytes_read;
 }
 
-} // namespace mooncake
+}  // namespace mooncake

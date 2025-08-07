@@ -17,77 +17,11 @@
 #include "config.h"
 #include "types.h"
 #include "utils.h"
+#include "integration_utils.h"
 
 namespace py = pybind11;
 
 namespace mooncake {
-
-auto torch = py::module_::import("torch");
-
-enum class TensorDtype : int32_t {
-    FLOAT32 = 0,
-    FLOAT64 = 1,
-    INT8 = 2,
-    UINT8 = 3,
-    INT16 = 4,
-    UINT16 = 5,
-    INT32 = 6,
-    UINT32 = 7,
-    INT64 = 8,
-    UINT64 = 9,
-    BOOL = 10,
-    UNKNOWN = -1
-};
-
-template <typename T>
-py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length) {
-    py::capsule free_when_done(
-        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), free_when_done);
-}
-
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
-
-static const std::array<ArrayCreatorFunc, 11> array_creators = {{
-    create_typed_array<float>,     // FLOAT32 = 0
-    create_typed_array<double>,    // FLOAT64 = 1
-    create_typed_array<int8_t>,    // INT8 = 2
-    create_typed_array<uint8_t>,   // UINT8 = 3
-    create_typed_array<int16_t>,   // INT16 = 4
-    create_typed_array<uint16_t>,  // UINT16 = 5
-    create_typed_array<int32_t>,   // INT32 = 6
-    create_typed_array<uint32_t>,  // UINT32 = 7
-    create_typed_array<int64_t>,   // INT64 = 8
-    create_typed_array<uint64_t>,  // UINT64 = 9
-    create_typed_array<bool>       // BOOL = 10
-}};
-TensorDtype get_tensor_dtype(py::object dtype_obj) {
-    if (dtype_obj.is_none()) {
-        return TensorDtype::UNKNOWN;
-    }
-
-    if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
-    if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
-    if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
-    if (dtype_obj.equal(torch.attr("uint8"))) return TensorDtype::UINT8;
-    if (dtype_obj.equal(torch.attr("int16"))) return TensorDtype::INT16;
-    if (dtype_obj.equal(torch.attr("uint16"))) return TensorDtype::UINT16;
-    if (dtype_obj.equal(torch.attr("int32"))) return TensorDtype::INT32;
-    if (dtype_obj.equal(torch.attr("uint32"))) return TensorDtype::UINT32;
-    if (dtype_obj.equal(torch.attr("int64"))) return TensorDtype::INT64;
-    if (dtype_obj.equal(torch.attr("uint64"))) return TensorDtype::UINT64;
-    if (dtype_obj.equal(torch.attr("bool"))) return TensorDtype::BOOL;
-
-    return TensorDtype::UNKNOWN;
-}
-
-struct TensorMetadata {
-    int32_t dtype;
-    int32_t ndim;
-    int32_t shape[4];
-};
 
 // ResourceTracker implementation using singleton pattern
 ResourceTracker &ResourceTracker::getInstance() {
@@ -231,14 +165,21 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
     }
     client_ = *client_opt;
 
+    // Local_buffer_size is allowed to be 0, but we only register memory when
+    // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
+    // fail in some rdma implementations.
     client_buffer_allocator_ = ClientBufferAllocator::create(local_buffer_size);
-    auto result = client_->RegisterLocalMemory(
-        client_buffer_allocator_->getBase(), local_buffer_size,
-        kWildcardLocation, false, true);
-    if (!result.has_value()) {
-        LOG(ERROR) << "Failed to register local memory: "
-                   << toString(result.error());
-        return tl::unexpected(result.error());
+    if (local_buffer_size > 0) {
+        auto result = client_->RegisterLocalMemory(
+            client_buffer_allocator_->getBase(), local_buffer_size,
+            kWildcardLocation, false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to register local memory: "
+                       << toString(result.error());
+            return tl::unexpected(result.error());
+        }
+    } else {
+        LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
     // If global_segment_size is 0, skip mount segment;
@@ -265,6 +206,9 @@ tl::expected<void, ErrorCode> DistributedObjectStore::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
+    }
+    if (total_glbseg_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
     }
 
     return {};
@@ -319,59 +263,6 @@ tl::expected<void, ErrorCode> DistributedObjectStore::tearDownAll_internal() {
 
 int DistributedObjectStore::tearDownAll() {
     return to_py_ret(tearDownAll_internal());
-}
-
-std::vector<Slice> split_into_slices(BufferHandle &handle) {
-    std::vector<Slice> slices;
-    auto base = static_cast<uint8_t *>(handle.ptr());
-    size_t offset = 0;
-
-    while (offset < handle.size()) {
-        size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
-        slices.push_back({base + offset, chunk_size});
-        offset += chunk_size;
-    }
-    return slices;
-}
-
-uint64_t calculate_total_size(const Replica::Descriptor &replica) {
-    uint64_t total_length = 0;
-    if (replica.is_memory_replica() == false) {
-        auto &disk_descriptor = replica.get_disk_descriptor();
-        total_length = disk_descriptor.file_size;
-    } else {
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            total_length += handle.size_;
-        }
-    }
-    return total_length;
-}
-
-int allocateSlices(std::vector<Slice> &slices,
-                   const Replica::Descriptor &replica,
-                   BufferHandle &buffer_handle) {
-    uint64_t offset = 0;
-    if (replica.is_memory_replica() == false) {
-        // For disk-based replica, split into slices based on file size
-        uint64_t total_length = replica.get_disk_descriptor().file_size;
-        while (offset < total_length) {
-            auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-    } else {
-        // For memory-based replica, split into slices based on buffer
-        // descriptors
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
-    }
-    return 0;
 }
 
 tl::expected<void, ErrorCode> DistributedObjectStore::put_internal(

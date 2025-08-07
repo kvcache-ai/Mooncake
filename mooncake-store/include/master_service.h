@@ -59,20 +59,20 @@ class MasterService {
     };
 
    public:
-    MasterService(bool enable_gc = true,
-                  uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
-                  uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-                  bool allow_evict_soft_pinned_objects =
-                      DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-                  double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                  double eviction_high_watermark_ratio =
-                      DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                  ViewVersionId view_version = 0,
-                  int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-                  bool enable_ha = false,
-                  const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-                  BufferAllocatorType memory_allocator =
-                      BufferAllocatorType::CACHELIB);
+    MasterService(
+        bool enable_gc = true,
+        uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
+        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
+        bool allow_evict_soft_pinned_objects =
+            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
+        double eviction_ratio = DEFAULT_EVICTION_RATIO,
+        double eviction_high_watermark_ratio =
+            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+        ViewVersionId view_version = 0,
+        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+        bool enable_ha = false,
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
     ~MasterService();
 
     /**
@@ -231,13 +231,11 @@ class MasterService {
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
-     * @param[out] view_version The view version of the master
-     * @param[out] client_status The status of the client from the master
+     * @return PingResponse containing view version and client status
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id)
-        -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>;
+    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name

@@ -315,10 +315,12 @@ int initiator() {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
         if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
-            LOG(INFO) << "GPU ID is not specified, found " << gpu_num << " GPUs to use";
+            LOG(INFO) << "GPU ID is not specified, found " << gpu_num
+                      << " GPUs to use";
             buffer_num = gpu_num;
         } else {
-            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use " << FLAGS_gpu_id << " GPU";
+            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use "
+                      << FLAGS_gpu_id << " GPU";
             buffer_num = 1;
         }
     } else {
@@ -376,7 +378,6 @@ int initiator() {
     auto duration = (stop_tv.tv_sec - start_tv.tv_sec) +
                     (stop_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
     auto batch_count = total_batch_count.load();
-
 
     LOG(INFO) << "Test completed: duration " << std::fixed
               << std::setprecision(2) << duration << ", batch count "

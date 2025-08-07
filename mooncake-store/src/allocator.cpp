@@ -22,8 +22,8 @@ AllocatedBuffer::~AllocatedBuffer() {
 }
 
 // Removed allocated_bytes parameter and member initialization
-CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name, size_t base,
-                                 size_t size)
+CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
+                                                 size_t base, size_t size)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
@@ -60,7 +60,8 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name, size_
 
 CachelibBufferAllocator::~CachelibBufferAllocator() = default;
 
-std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(size_t size) {
+std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
+    size_t size) {
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
@@ -120,7 +121,8 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         uint32_t max_allocs = size < (1ull << 32)
                                   ? size / 4096
                                   : 1024 * 1024;  // min(size / 4K, 1M)
-        max_allocs = std::max(max_allocs, 1024u * 64u);  // at least 64K allocations
+        max_allocs =
+            std::max(max_allocs, 1024u * 64u);  // at least 64K allocations
         // Create the offset allocator
         offset_allocator_ =
             offset_allocator::OffsetAllocator::create(base, size, max_allocs);

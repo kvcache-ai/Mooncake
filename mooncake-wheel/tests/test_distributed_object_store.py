@@ -11,14 +11,17 @@ DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 
-def get_client(store):
+def get_client(store, local_buffer_size_param=None):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = (
+        local_buffer_size_param if local_buffer_size_param is not None 
+        else 512 * 1024 * 1024  # 512 MB
+    )
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
     retcode = store.setup(
@@ -34,6 +37,25 @@ def get_client(store):
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
+class TestZeroLocalBufferSize(unittest.TestCase):
+    """Test class for zero local buffer size scenarios."""
+    
+    def test_zero_local_buffer_size(self):
+        """Test that put operations fail when local_buffer_size is set to zero."""
+        test_data = b"test_zero_buffer_value"
+        key = "test_zero_buffer_key"
+        
+        # Create a new store instance with zero local buffer size
+        zero_buffer_store = MooncakeDistributedStore()
+        get_client(zero_buffer_store, local_buffer_size_param=0)
+        
+        # Attempt to put data - this should fail
+        result = zero_buffer_store.put(key, test_data)
+        self.assertNotEqual(result, 0, "Put operation should fail with zero local buffer size")
+        
+        # Verify that the key doesn't exist
+        result = zero_buffer_store.is_exist(key)
+        self.assertEqual(result, 0, "Key should not exist after failed put")
 
 class TestDistributedObjectStore(unittest.TestCase):
     @classmethod
@@ -818,7 +840,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         time.sleep(default_kv_lease_ttl / 1000)
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
-
 
 if __name__ == '__main__':
     unittest.main()

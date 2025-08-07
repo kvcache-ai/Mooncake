@@ -208,6 +208,10 @@ class TransferEngine {
         return (int)local_topology_->getHcaList().size();
     }
 
+    std::shared_ptr<Topology> getLocalTopology() const {
+        return local_topology_;
+    }
+
    private:
     struct MemoryRegion {
         void *addr;
@@ -222,7 +226,7 @@ class TransferEngine {
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
-    
+
     RWSpinlock send_notifies_lock_;
     std::unordered_map<BatchID,
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
