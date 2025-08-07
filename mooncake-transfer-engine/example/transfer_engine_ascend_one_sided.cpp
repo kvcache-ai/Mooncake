@@ -39,16 +39,20 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "write", "Operation type: read or write");
 DEFINE_string(protocol, "hccl", "Transfer protocol: rdma|tcp|hccl");
 DEFINE_string(segment_id, "10.20.130.154:12346", "Segment ID to access data");
-DEFINE_int32(batch_size, 20, "Batch size");
+DEFINE_int32(batch_size, 32, "Batch size");
 DEFINE_uint64(block_size, 8388608, "Block size for each transfer request");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_uint64(device_id, 65536, "The device logic and phy ID of this machine");
 DEFINE_uint64(device_logicid, 0, "The device logic ID of this machine");
 DEFINE_uint64(device_phyid, 0, "The device phy ID of this machine");
-DEFINE_string(segment_id_1, "NA",
-              "A segment ID that a sender wants to another receiver");
-DEFINE_uint64(recv_num, 1, "Num of coonections received by the receiver");
-DEFINE_uint64(send_index, 0, "which one is sent to the same receiver");
+DEFINE_string(segment_id_2, "NA",
+              "Segment ID that a initiators to access another target data");
+DEFINE_uint64(
+    target_recv_count, 1,
+    "Number of initiators connected to this target in 2-to-1 scenario");
+DEFINE_uint64(initiator_id, 0,
+              "Unique identifier for the initiator sending to the target in "
+              "2-to-1 scenario");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
@@ -177,9 +181,6 @@ int initiator() {
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
-    struct timeval start_tv, stop_tv;
-    gettimeofday(&start_tv, nullptr);
-
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
         opcode = TransferRequest::READ;
@@ -206,8 +207,8 @@ int initiator() {
         entry.length = FLAGS_block_size;
         entry.source = (uint8_t *)(devAddr) + FLAGS_block_size * i;
         entry.target_id = segment_id;
-        entry.target_offset =
-            remote_base + FLAGS_block_size * i + g_TotalSize * FLAGS_send_index;
+        entry.target_offset = remote_base + FLAGS_block_size * i +
+                              g_TotalSize * FLAGS_initiator_id;
         requests.emplace_back(entry);
     }
 
@@ -234,6 +235,8 @@ int initiator() {
 
     LOG(INFO) << "The First Time Send OK";
 
+    struct timeval start_tv, stop_tv;
+    gettimeofday(&start_tv, nullptr);
     uint64_t remote_base2 = (uint64_t)segment_desc->buffers[1].addr;
 
     auto batch_id_2 = engine->allocateBatchID(FLAGS_batch_size);
@@ -245,7 +248,7 @@ int initiator() {
         entry.source = (uint8_t *)(devAddr2) + FLAGS_block_size * i;
         entry.target_id = segment_id;
         entry.target_offset = remote_base2 + FLAGS_block_size * i +
-                              g_TotalSize * FLAGS_send_index;
+                              g_TotalSize * FLAGS_initiator_id;
         requests2.emplace_back(entry);
     }
     completed = false;
@@ -282,9 +285,9 @@ int initiator() {
     // segment_id of the second receiver. If not filled, it defaults to "NA" and
     // 1-to-2 transmission is not enabled, only 1-to-1 transmission is
     // performed.
-    if (FLAGS_segment_id_1 != "NA") {
+    if (FLAGS_segment_id_2 != "NA") {
         sleep(10);
-        auto segment_id_1 = engine->openSegment(FLAGS_segment_id_1.c_str());
+        auto segment_id_2 = engine->openSegment(FLAGS_segment_id_2.c_str());
 
         TransferRequest::OpCode opcode;
         if (FLAGS_operation == "read")
@@ -296,13 +299,13 @@ int initiator() {
             return -1;
         }
 
-        auto segment_desc_1 =
-            engine->getMetadata()->getSegmentDescByID(segment_id_1);
-        if (!segment_desc_1) {
+        auto segment_desc_2 =
+            engine->getMetadata()->getSegmentDescByID(segment_id_2);
+        if (!segment_desc_2) {
             LOG(ERROR) << "Unable to get target segment ID, please recheck";
             return -1;
         }
-        uint64_t remote_base_1 = (uint64_t)segment_desc_1->buffers[0].addr;
+        uint64_t remote_base_desc_2 = (uint64_t)segment_desc_2->buffers[0].addr;
 
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         std::vector<TransferRequest> requests;
@@ -311,9 +314,9 @@ int initiator() {
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
             entry.source = (uint8_t *)(devAddr) + FLAGS_block_size * i;
-            entry.target_id = segment_id_1;
-            entry.target_offset = remote_base_1 + FLAGS_block_size * i +
-                                  g_TotalSize * FLAGS_send_index;
+            entry.target_id = segment_id_2;
+            entry.target_offset = remote_base_desc_2 + FLAGS_block_size * i +
+                                  g_TotalSize * FLAGS_initiator_id;
             requests.emplace_back(entry);
         }
 
@@ -375,7 +378,8 @@ int target() {
 
     LOG(INFO) << "devAddr_target: " << devAddr;
 
-    ret = engine->registerLocalMemory(devAddr, g_TotalSize * FLAGS_recv_num,
+    ret = engine->registerLocalMemory(devAddr,
+                                      g_TotalSize * FLAGS_target_recv_count,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
@@ -391,7 +395,8 @@ int target() {
 
     LOG(INFO) << "devAddr_target_2: " << devAddr2;
 
-    ret = engine->registerLocalMemory(devAddr2, g_TotalSize * FLAGS_recv_num,
+    ret = engine->registerLocalMemory(devAddr2,
+                                      g_TotalSize * FLAGS_target_recv_count,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
