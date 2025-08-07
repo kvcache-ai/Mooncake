@@ -1,8 +1,5 @@
 #pragma once
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
 #include <csignal>
 #include <mutex>
 #include <string>
@@ -13,7 +10,7 @@
 
 namespace mooncake {
 
-class DistributedObjectStore;
+class PyClient;
 
 template <class T>
 constexpr bool is_supported_return_type_v =
@@ -42,10 +39,10 @@ class ResourceTracker {
     static ResourceTracker &getInstance();
 
     // Register a DistributedObjectStore instance for cleanup
-    void registerInstance(DistributedObjectStore *instance);
+    void registerInstance(PyClient *instance);
 
     // Unregister a DistributedObjectStore instance
-    void unregisterInstance(DistributedObjectStore *instance);
+    void unregisterInstance(PyClient *instance);
 
    private:
     ResourceTracker();
@@ -65,13 +62,13 @@ class ResourceTracker {
     static void exitHandler();
 
     std::mutex mutex_;
-    std::unordered_set<DistributedObjectStore *> instances_;
+    std::unordered_set<PyClient *> instances_;
 };
 
-class DistributedObjectStore {
+class PyClient {
    public:
-    DistributedObjectStore();
-    ~DistributedObjectStore();
+    PyClient();
+    ~PyClient();
 
     int setup(const std::string &local_hostname,
               const std::string &metadata_server,
@@ -179,11 +176,6 @@ class DistributedObjectStore {
 
     [[nodiscard]] std::string get_hostname() const;
 
-    pybind11::bytes get(const std::string &key);
-
-    std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys);
-
     /**
      * @brief Get a buffer containing the data for a key
      * @param key Key to get data for
@@ -229,20 +221,6 @@ class DistributedObjectStore {
      * exist
      */
     int64_t getSize(const std::string &key);
-
-    /**
-     * @brief Get a PyTorch tensor from the store
-     * @param key Key of the tensor to get
-     * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
-     */
-    pybind11::object get_tensor(const std::string &key);
-    /**
-     * @brief Put a PyTorch tensor into the store
-     * @param key Key for the tensor
-     * @param tensor PyTorch tensor to store
-     * @return 0 on success, negative value on error
-     */
-    int put_tensor(const std::string &key, pybind11::object tensor);
 
     // Internal versions that return tl::expected
     tl::expected<void, ErrorCode> setup_internal(
@@ -292,11 +270,6 @@ class DistributedObjectStore {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{});
 
-    tl::expected<void, ErrorCode> put_batch_internal(
-        const std::vector<std::string> &keys,
-        const std::vector<pybind11::buffer> &buffers,
-        const ReplicateConfig &config = ReplicateConfig{});
-
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal();
@@ -309,9 +282,6 @@ class DistributedObjectStore {
         const std::vector<std::string> &keys);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
-
-    tl::expected<void, ErrorCode> put_tensor_internal(const std::string &key,
-                                                      pybind11::object tensor);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
