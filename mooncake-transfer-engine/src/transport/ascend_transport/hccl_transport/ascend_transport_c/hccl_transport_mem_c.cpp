@@ -215,7 +215,7 @@ static int initControlSocket(RankInfo *local_rank_info) {
         close(g_server_socket_);
         return ret;
     }
-    LOG(INFO) << "initControlSocket successful, Server listening on host port: "
+    LOG(INFO) << "initControlSocket successful, listen on hostPort: "
               << local_rank_info->hostPort << "..." << " g_server_socket_"
               << g_server_socket_;
     g_epoll_fd = epoll_create1(0);
@@ -533,6 +533,8 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     attrInfo.remoteRankId = remote_rank_info->deviceLogicId;
     attrInfo.sdid = 0xFFFFFFFF;
     attrInfo.serverId = local_rank_info->serverIdx;
+    attrInfo.trafficClass = 132;
+    attrInfo.serviceLevel = 4;
     if (is_cross_hccs) {
         transport_mem = hccl::TransportMem::Create(
             hccl::TransportMem::TpType::ROCE, notifyPool_, nicNetDevCtx_,
@@ -547,7 +549,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp,
                   sizeof(deviceIp));
-        LOG(ERROR) << "client SetDataSocket failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem SetDataSocket failed, target devicePhyId: "
                    << remote_rank_info->devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp
@@ -560,7 +562,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp,
                   sizeof(deviceIp));
-        LOG(ERROR) << "client SetSocket failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem SetSocket failed, target devicePhyId: "
                    << remote_rank_info->devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp
@@ -577,7 +579,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
         char deviceIp[64];
         inet_ntop(AF_INET, &remote_rank_info->deviceIp, deviceIp,
                   sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem Connect failed, target devicePhyId: "
                    << remote_rank_info->devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp
@@ -914,6 +916,8 @@ int transportMemAccept(RankInfo *local_rank_info) {
     attrInfo.remoteRankId = remote_control_info.deviceLogicId;
     attrInfo.sdid = 0xFFFFFFFF;
     attrInfo.serverId = local_rank_info->serverIdx;
+    attrInfo.trafficClass = 132;
+    attrInfo.serviceLevel = 4;
     if (is_cross_hccs) {
         transport_mem = hccl::TransportMem::Create(
             hccl::TransportMem::TpType::ROCE, notifyPool_, nicNetDevCtx_,
@@ -927,7 +931,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client SetDataSocket failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem SetDataSocket failed, target devicePhyId: "
                    << remote_control_info.devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp << ", ret: " << ret;
@@ -938,7 +942,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem SetSocket failed, target devicePhyId: "
                    << remote_control_info.devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp << ", ret: " << ret;
@@ -952,7 +956,7 @@ int transportMemAccept(RankInfo *local_rank_info) {
     if (ret) {
         char deviceIp[64];
         inet_ntop(AF_INET, &rempoteDevIp, deviceIp, sizeof(deviceIp));
-        LOG(ERROR) << "client Connect failed, target devicePhyId: "
+        LOG(ERROR) << "transport_mem Connect failed, target devicePhyId: "
                    << remote_control_info.devicePhyId
                    << ", local devicePhyId: " << local_rank_info->devicePhyId
                    << ", rempoteDevIp: " << deviceIp << ", ret: " << ret;
