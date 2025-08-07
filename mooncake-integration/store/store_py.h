@@ -15,9 +15,6 @@ namespace mooncake {
 
 class DistributedObjectStore;
 
-// Forward declarations
-class SliceBuffer;
-
 template <class T>
 constexpr bool is_supported_return_type_v =
     std::is_void_v<T> || std::is_integral_v<T>;
@@ -71,24 +68,8 @@ class ResourceTracker {
     std::unordered_set<DistributedObjectStore *> instances_;
 };
 
-/**
- * @brief A class that holds a contiguous buffer of data
- * This class is responsible for freeing the buffer when it's destroyed (RAII)
- */
-class SliceBuffer {
-   public:
-    SliceBuffer(BufferHandle handle);
-
-    void *ptr() const;
-    uint64_t size() const;
-
-   private:
-    BufferHandle handle_;
-};
-
 class DistributedObjectStore {
    public:
-    friend class SliceBuffer;  // Allow SliceBuffer to access private members
     DistributedObjectStore();
     ~DistributedObjectStore();
 
@@ -101,7 +82,7 @@ class DistributedObjectStore {
               const std::string &master_server_addr = "127.0.0.1:50051");
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
+                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16M
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -206,18 +187,18 @@ class DistributedObjectStore {
     /**
      * @brief Get a buffer containing the data for a key
      * @param key Key to get data for
-     * @return std::shared_ptr<SliceBuffer> Buffer containing the data, or
+     * @return std::shared_ptr<BufferHandle> Buffer containing the data, or
      * nullptr if error
      */
-    std::shared_ptr<SliceBuffer> get_buffer(const std::string &key);
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
-     * @return Vector of std::shared_ptr<SliceBuffer> buffers containing the
+     * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
      * data, or nullptr for each key if error
      */
-    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer(
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
     int remove(const std::string &key);
@@ -332,7 +313,7 @@ class DistributedObjectStore {
     tl::expected<void, ErrorCode> put_tensor_internal(const std::string &key,
                                                       pybind11::object tensor);
 
-    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer_internal(
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;

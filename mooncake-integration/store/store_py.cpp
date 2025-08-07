@@ -6,12 +6,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <chrono>   // for timing
 #include <cstdlib>  // for atexit
-#include <iomanip>  // for std::setprecision
-#include <numeric>  // for std::accumulate
 #include <optional>
-#include <random>
 
 #include "client_buffer.hpp"
 #include "config.h"
@@ -87,39 +83,6 @@ void ResourceTracker::signalHandler(int signal) {
 }
 
 void ResourceTracker::exitHandler() { getInstance().cleanupAllResources(); }
-
-static bool isPortAvailable(int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-    close(sock);
-    return available;
-}
-
-// Get a random available port between min_port and max_port
-static int getRandomAvailablePort(int min_port = 12300, int max_port = 14300) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(min_port, max_port);
-
-    for (int attempts = 0; attempts < 10; attempts++) {
-        int port = dis(gen);
-        if (isPortAvailable(port)) {
-            return port;
-        }
-    }
-    return -1;  // Failed to find available port
-}
 
 DistributedObjectStore::DistributedObjectStore() {
     // Register this instance with the global tracker
@@ -695,15 +658,8 @@ int64_t DistributedObjectStore::getSize(const std::string &key) {
     return to_py_ret(getSize_internal(key));
 }
 
-// SliceBuffer implementation
-SliceBuffer::SliceBuffer(BufferHandle handle) : handle_(std::move(handle)) {}
-
-void *SliceBuffer::ptr() const { return handle_.ptr(); }
-
-uint64_t SliceBuffer::size() const { return handle_.size(); }
-
 // Implementation of get_buffer method
-std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
+std::shared_ptr<BufferHandle> DistributedObjectStore::get_buffer(
     const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -755,17 +711,17 @@ std::shared_ptr<SliceBuffer> DistributedObjectStore::get_buffer(
         return nullptr;
     }
 
-    // Create SliceBuffer with the allocated memory
-    // The buffer will be managed by the SliceBuffer's shared_ptr
-    return std::make_shared<SliceBuffer>(std::move(buffer_handle));
+    // Create BufferHandle with the allocated memory
+    // The buffer will be managed by the BufferHandle's shared_ptr
+    return std::make_shared<BufferHandle>(std::move(buffer_handle));
 }
 
 // Implementation of batch_get_buffer_internal method
-std::vector<std::shared_ptr<SliceBuffer>>
+std::vector<std::shared_ptr<BufferHandle>>
 DistributedObjectStore::batch_get_buffer_internal(
     const std::vector<std::string> &keys) {
-    std::vector<std::shared_ptr<SliceBuffer>> final_results(keys.size(),
-                                                            nullptr);
+    std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
+                                                             nullptr);
 
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -851,12 +807,12 @@ DistributedObjectStore::batch_get_buffer_internal(
     auto batch_get_results =
         client_->BatchGet(batch_keys, batch_replica_lists, batch_slices);
 
-    // 4. Process results and create SliceBuffers
+    // 4. Process results and create BufferHandles
     for (size_t i = 0; i < valid_ops.size(); ++i) {
         if (batch_get_results[i]) {
             auto &op = valid_ops[i];
             final_results[op.original_index] =
-                std::make_shared<SliceBuffer>(std::move(*op.buffer_handle));
+                std::make_shared<BufferHandle>(std::move(*op.buffer_handle));
         } else {
             LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
                        << "': " << toString(batch_get_results[i].error());
@@ -867,7 +823,7 @@ DistributedObjectStore::batch_get_buffer_internal(
 }
 
 // Implementation of batch_get_buffer method
-std::vector<std::shared_ptr<SliceBuffer>>
+std::vector<std::shared_ptr<BufferHandle>>
 DistributedObjectStore::batch_get_buffer(const std::vector<std::string> &keys) {
     return batch_get_buffer_internal(keys);
 }
@@ -1538,18 +1494,18 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
 
-    // Define the SliceBuffer class
-    py::class_<SliceBuffer, std::shared_ptr<SliceBuffer>>(m, "SliceBuffer",
-                                                          py::buffer_protocol())
+    // Define the BufferHandle class
+    py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
+        m, "BufferHandle", py::buffer_protocol())
         .def("ptr",
-             [](const SliceBuffer &self) {
+             [](const BufferHandle &self) {
                  // Return the pointer as an integer for Python
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
-        .def("size", &SliceBuffer::size)
-        .def("__len__", &SliceBuffer::size)
-        .def_buffer([](SliceBuffer &self) -> py::buffer_info {
-            // SliceBuffer now always contains contiguous memory
+        .def("size", &BufferHandle::size)
+        .def("__len__", &BufferHandle::size)
+        .def_buffer([](BufferHandle &self) -> py::buffer_info {
+            // BufferHandle now always contains contiguous memory
             if (self.size() > 0) {
                 return py::buffer_info(
                     self.ptr(),   /* Pointer to buffer */
