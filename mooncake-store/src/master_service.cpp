@@ -164,16 +164,16 @@ void MasterService::ClearInvalidHandles() {
         MutexLocker lock(&shard.mutex);
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            // Check if the object has any invalid replicas
-            bool has_invalid = false;
+            // Check if the object has any valid replicas
+            bool has_valid_replica = true;
             for (auto& replica : it->second.replicas) {
-                if (replica.has_invalid_handle()) {
-                    has_invalid = true;
+                if (!replica.has_invalid_handle()) {
+                    has_valid_replica = false;
                     break;
                 }
             }
             // Remove the object if it has no valid replicas
-            if (has_invalid || CleanupStaleHandles(it->second)) {
+            if (!has_valid_replica || CleanupStaleHandles(it->second)) {
                 it = shard.metadata.erase(it);
             } else {
                 ++it;
