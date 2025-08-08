@@ -1,0 +1,2 @@
+[default]
+extend-ignore-words = ["ASO", "aso", "fre"]

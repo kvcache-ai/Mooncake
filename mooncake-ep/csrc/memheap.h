@@ -15,7 +15,7 @@ struct memheap {
 };
 
 static inline struct memheap *memheap_create(size_t size) {
-    struct memheap *heap = (struct memheap*)malloc(sizeof(struct memheap));
+    struct memheap *heap = (struct memheap *)malloc(sizeof(struct memheap));
     if (!heap) {
         return NULL;
     }
@@ -32,12 +32,13 @@ static inline void memheap_destroy(struct memheap *heap) {
     }
 }
 
-static inline size_t memheap_aligned_alloc(struct memheap *heap, size_t size, size_t align) {
+static inline size_t memheap_aligned_alloc(struct memheap *heap, size_t size,
+                                           size_t align) {
     if (size == 0) {
-        return 0; // No allocation for zero size
+        return 0;  // No allocation for zero size
     }
     if (align == 0 || (align & (align - 1)) != 0) {
-        errno = EINVAL; // Invalid alignment
+        errno = EINVAL;  // Invalid alignment
         return -1;
     }
     size_t ret = -1;
@@ -50,7 +51,7 @@ static inline size_t memheap_aligned_alloc(struct memheap *heap, size_t size, si
         ret = offset;
         heap->allocated = offset + size;
     } else {
-        errno = ENOMEM; // Not enough memory
+        errno = ENOMEM;  // Not enough memory
     }
     mutex_unlock(&heap->lock);
     return ret;
@@ -69,4 +70,3 @@ static inline void memheap_free(struct memheap *heap, size_t offset) {
 }
 
 #endif
-

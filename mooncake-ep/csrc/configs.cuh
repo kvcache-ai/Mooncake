@@ -9,7 +9,7 @@
 
 #define FINISHED_SUM_TAG 1024
 #define NUM_CPU_TIMEOUT_SECS 100
-#define NUM_TIMEOUT_CYCLES 200000000000ull // 200G cycles ~= 100s
+#define NUM_TIMEOUT_CYCLES 200000000000ull  // 200G cycles ~= 100s
 #define NUM_WAIT_NANOSECONDS 500
 
 #define LOW_LATENCY_SEND_PHASE 1
@@ -17,8 +17,8 @@
 
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__
-#define __CUDA_ARCH__ 900 // NOLINT(*-reserved-identifier)
-#define __CUDACC_RDC__ // NOLINT(*-reserved-identifier)
+#define __CUDA_ARCH__ 900  // NOLINT(*-reserved-identifier)
+#define __CUDACC_RDC__     // NOLINT(*-reserved-identifier)
 #endif
 
 // Remove Torch restrictions

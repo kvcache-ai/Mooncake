@@ -1,7 +1,6 @@
 #ifndef _MXA_OS_H_
 #define _MXA_OS_H_
 
-
 #include <errno.h>
 
 #include <unistd.h>

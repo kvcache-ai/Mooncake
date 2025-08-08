@@ -1279,51 +1279,68 @@ struct mlx5_ifc_flow_table_nic_cap_bits {
 
     u8 reserved_at_40[0x1c0];
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_receive;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_receive;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_receive_rdma;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_receive_rdma;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_receive_sniffer;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_receive_sniffer;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_transmit;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_transmit;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_transmit_rdma;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_transmit_rdma;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_transmit_sniffer;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_transmit_sniffer;
 
     u8 reserved_at_e00[0x200];
 
     struct mlx5_ifc_header_modify_cap_properties_bits header_modify_nic_receive;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_receive;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_receive;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_bitmask_support_2_nic_receive;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_bitmask_support_2_nic_receive;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_receive_rdma;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_receive_rdma;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_bitmask_support_2_nic_receive_rdma;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_bitmask_support_2_nic_receive_rdma;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_receive_sniffer;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_receive_sniffer;
 
     struct mlx5_ifc_flow_table_fields_supported_2_bits
         ft_field_bitmask_support_2_nic_receive_sniffer;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_transmit;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_transmit;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_bitmask_support_2_nic_transmit;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_bitmask_support_2_nic_transmit;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_transmit_rdma;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_transmit_rdma;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_bitmask_support_2_nic_transmit_rdma;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_bitmask_support_2_nic_transmit_rdma;
 
-    struct mlx5_ifc_flow_table_fields_supported_2_bits ft_field_support_2_nic_transmit_sniffer;
+    struct mlx5_ifc_flow_table_fields_supported_2_bits
+        ft_field_support_2_nic_transmit_sniffer;
 
     struct mlx5_ifc_flow_table_fields_supported_2_bits
         ft_field_bitmask_support_2_nic_transmit_sniffer;
 
     u8 reserved_at_1400[0x200];
 
-    struct mlx5_ifc_header_modify_cap_properties_bits header_modify_nic_transmit;
+    struct mlx5_ifc_header_modify_cap_properties_bits
+        header_modify_nic_transmit;
 
     u8 sw_steering_nic_rx_action_drop_icm_address[0x40];
 
@@ -1339,11 +1356,14 @@ struct mlx5_ifc_flow_table_eswitch_cap_bits {
     u8 fdb_multi_path_to_table[0x1];
     u8 reserved_at_1d[0x1e3];
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_nic_esw_fdb;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_nic_esw_fdb;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_esw_acl_ingress;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_esw_acl_ingress;
 
-    struct mlx5_ifc_flow_table_prop_layout_bits flow_table_properties_esw_acl_egress;
+    struct mlx5_ifc_flow_table_prop_layout_bits
+        flow_table_properties_esw_acl_egress;
 
     u8 reserved_at_800[0x1000];
 

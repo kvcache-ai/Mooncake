@@ -17,14 +17,13 @@ inline T IBGDA_ILOG2(T _n) {
 
 #define IBGDA_ILOG2_OR0(_n) (((_n) == 0) ? 0 : IBGDA_ILOG2(_n))
 
-template<typename T>
+template <typename T>
 constexpr T round_up_pow2(T n) {
     static_assert(std::is_unsigned_v<T>, "Only works with unsigned types");
     if (n <= 1) return 1;
 
     T pow2 = 1;
-    while (pow2 < n)
-        pow2 <<= 1;
+    while (pow2 < n) pow2 <<= 1;
     return pow2;
 }
 
@@ -35,13 +34,16 @@ static void print_cuda_error(const char *msg) {
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
-static struct mlx5dv_devx_uar* create_uar(struct ibv_context *ctx) {
-    struct mlx5dv_devx_uar *uar = mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
+static struct mlx5dv_devx_uar *create_uar(struct ibv_context *ctx) {
+    struct mlx5dv_devx_uar *uar =
+        mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
     if (!uar) {
         errno = EIO;
         return NULL;
     }
-    if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2, cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterIoMemory) != cudaSuccess) {
+    if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
+                         cudaHostRegisterPortable | cudaHostRegisterMapped |
+                             cudaHostRegisterIoMemory) != cudaSuccess) {
         print_cuda_error("Failed to register MMIO memory");
         errno = EIO;
         mlx5dv_devx_free_uar(uar);
@@ -58,7 +60,10 @@ static void destroy_uar(struct mlx5dv_devx_uar *uar) {
     mlx5dv_devx_free_uar(uar);
 }
 
-struct mlx5gda_cq* mlx5gda_create_cq(void *ctrl_buf, struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap, struct ibv_pd *pd, int cqe) {
+struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
+                                     struct mlx5dv_devx_umem *ctrl_buf_umem,
+                                     struct memheap *ctrl_buf_heap,
+                                     struct ibv_pd *pd, int cqe) {
     struct mlx5gda_cq *cq = NULL;
     struct mlx5dv_devx_uar *uar = NULL;
     uint32_t eqn = 0;
@@ -79,12 +84,15 @@ struct mlx5gda_cq* mlx5gda_create_cq(void *ctrl_buf, struct mlx5dv_devx_umem *ct
     uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_cq_in)] = {0};
     uint8_t cmd_out[DEVX_ST_SZ_BYTES(create_cq_out)] = {0};
 
-    cq_offset = memheap_aligned_alloc(ctrl_buf_heap, num_cqe * sizeof(struct mlx5_cqe64), (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
+    cq_offset = memheap_aligned_alloc(ctrl_buf_heap,
+                                      num_cqe * sizeof(struct mlx5_cqe64),
+                                      (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
     if (cq_offset == -1) {
         perror("Failed to allocate CQ memory");
         goto fail;
     }
-    if (cudaMemset(ctrl_buf + cq_offset, -1, num_cqe * sizeof(struct mlx5_cqe64)) != cudaSuccess) {
+    if (cudaMemset(ctrl_buf + cq_offset, -1,
+                   num_cqe * sizeof(struct mlx5_cqe64)) != cudaSuccess) {
         print_cuda_error("Failed to memset CQ memory");
         goto fail;
     }
@@ -93,13 +101,15 @@ struct mlx5gda_cq* mlx5gda_create_cq(void *ctrl_buf, struct mlx5dv_devx_umem *ct
         perror("Failed to allocate DBR memory");
         goto fail;
     }
-    cq = (struct mlx5gda_cq*)malloc(sizeof(struct mlx5gda_cq));
+    cq = (struct mlx5gda_cq *)malloc(sizeof(struct mlx5gda_cq));
     if (!cq) goto fail;
     if (mlx5dv_devx_query_eqn(ctx, 0, &eqn)) {
         perror("Failed to query EQN");
         goto fail;
     }
-    uar = mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_NC); // cq uar is required but we don't use it
+    uar = mlx5dv_devx_alloc_uar(
+        ctx,
+        MLX5DV_UAR_ALLOC_TYPE_NC);  // cq uar is required but we don't use it
     if (!uar) {
         perror("Failed to create UAR");
         goto fail;
@@ -120,7 +130,8 @@ struct mlx5gda_cq* mlx5gda_create_cq(void *ctrl_buf, struct mlx5dv_devx_umem *ct
     DEVX_SET(cqc, cq_context, c_eqn, eqn);
     DEVX_SET64(cqc, cq_context, dbr_addr, dbr_offset);  // DBR offset
 
-    mlx5_cq = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    mlx5_cq = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
     if (mlx5_cq == NULL) {
         perror("Failed to create command queue");
         goto fail;
@@ -155,7 +166,11 @@ void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq) {
     free(cq);
 }
 
-struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap, struct ibv_pd *pd, int wqe, uint8_t port_num) {
+struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
+                                        struct mlx5dv_devx_umem *ctrl_buf_umem,
+                                        struct memheap *ctrl_buf_heap,
+                                        struct ibv_pd *pd, int wqe,
+                                        uint8_t port_num) {
     struct mlx5gda_qp *qp = NULL;
     struct mlx5gda_cq *send_cq = NULL;
     struct mlx5dv_devx_uar *uar = NULL;
@@ -194,9 +209,11 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, st
 
     DEVX_SET(query_hca_cap_in, cmd_cap_in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
     DEVX_SET(query_hca_cap_in, cmd_cap_in, op_mod,
-        MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE | (MLX5_CAP_GENERAL << 1) | HCA_CAP_OPMOD_GET_CUR);
+             MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE | (MLX5_CAP_GENERAL << 1) |
+                 HCA_CAP_OPMOD_GET_CUR);
 
-    if (mlx5dv_devx_general_cmd(ctx, cmd_cap_in, sizeof(cmd_cap_in), cmd_cap_out, sizeof(cmd_cap_out))) {
+    if (mlx5dv_devx_general_cmd(ctx, cmd_cap_in, sizeof(cmd_cap_in),
+                                cmd_cap_out, sizeof(cmd_cap_out))) {
         perror("mlx5dv_devx_general_cmd failed");
         goto fail;
     }
@@ -210,7 +227,8 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, st
     }
 
     // Create send_cq on GPU memory.
-    send_cq = mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe);
+    send_cq =
+        mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe);
     if (send_cq == NULL) {
         perror("mlx5gda_create_cq failed");
         goto fail;
@@ -222,7 +240,9 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, st
         goto fail;
     }
 
-    wq_offset = memheap_aligned_alloc(ctrl_buf_heap, num_wqebb * sizeof(struct mlx5gda_wqebb), (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
+    wq_offset = memheap_aligned_alloc(ctrl_buf_heap,
+                                      num_wqebb * sizeof(struct mlx5gda_wqebb),
+                                      (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
     if (wq_offset == -1) {
         perror("Failed to allocate WQ memory");
         goto fail;
@@ -233,13 +253,15 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, st
         perror("Failed to allocate DBR memory");
         goto fail;
     }
-    if (cudaMemset(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr)) != cudaSuccess) {
+    if (cudaMemset(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr)) !=
+        cudaSuccess) {
         print_cuda_error("Failed to zero DBR memory");
         goto fail;
     }
 
     DEVX_SET(create_qp_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_QP);
-    DEVX_SET(create_qp_in, cmd_in, wq_umem_id, ctrl_buf_umem->umem_id);  // WQ buffer
+    DEVX_SET(create_qp_in, cmd_in, wq_umem_id,
+             ctrl_buf_umem->umem_id);  // WQ buffer
     DEVX_SET64(create_qp_in, cmd_in, wq_umem_offset, wq_offset);
     DEVX_SET(create_qp_in, cmd_in, wq_umem_valid, 1);  // Enable wq_umem_id
 
@@ -248,19 +270,24 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf, st
     DEVX_SET(qpc, qp_context, pm_state, MLX5_QPC_PM_STATE_MIGRATED);
     DEVX_SET(qpc, qp_context, pd, mpd.pdn);
     DEVX_SET(qpc, qp_context, uar_page, uar->page_id);  // BF register
-    #define MLX5_RQ_TYPE_ZERO_SIZE_RQ 0x3
-    DEVX_SET(qpc, qp_context, rq_type, MLX5_RQ_TYPE_ZERO_SIZE_RQ);        // no receive queue
+#define MLX5_RQ_TYPE_ZERO_SIZE_RQ 0x3
+    DEVX_SET(qpc, qp_context, rq_type,
+             MLX5_RQ_TYPE_ZERO_SIZE_RQ);  // no receive queue
     DEVX_SET(qpc, qp_context, cqn_snd, send_cq->cqn);
     // DEVX_SET(qpc, qp_context, cqn_rcv, device->qp_shared_object.rcqn);
     DEVX_SET(qpc, qp_context, log_sq_size, IBGDA_ILOG2_OR0(num_wqebb));
     DEVX_SET(qpc, qp_context, log_rq_size, 0);
     DEVX_SET(qpc, qp_context, dbr_umem_valid, 1);  // Enable dbr_umem_id
-    DEVX_SET64(qpc, qp_context, dbr_addr, dbr_offset);  // Offset of dbr_umem_id (behavior changed because of dbr_umem_valid)
-    DEVX_SET(qpc, qp_context, dbr_umem_id, ctrl_buf_umem->umem_id);  // DBR buffer
+    DEVX_SET64(qpc, qp_context, dbr_addr,
+               dbr_offset);  // Offset of dbr_umem_id (behavior changed because
+                             // of dbr_umem_valid)
+    DEVX_SET(qpc, qp_context, dbr_umem_id,
+             ctrl_buf_umem->umem_id);  // DBR buffer
     DEVX_SET(qpc, qp_context, user_index, 0);
     DEVX_SET(qpc, qp_context, page_offset, 0);
 
-    mlx5_qp = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    mlx5_qp = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
     if (mlx5_qp == NULL) {
         goto fail;
     }
@@ -315,7 +342,7 @@ int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
     DEVX_SET(qpc, qpc, rwe, 1);
     DEVX_SET(qpc, qpc, rre, 1);
     DEVX_SET(qpc, qpc, rae, 1);
-    DEVX_SET(qpc, qpc, atomic_mode, 3); // up to 64 bit
+    DEVX_SET(qpc, qpc, atomic_mode, 3);  // up to 64 bit
 
     DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, qp->port_num);
 
@@ -325,15 +352,17 @@ int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
 
     DEVX_SET(qpc, qpc, pm_state, MLX5_QPC_PM_STATE_MIGRATED);
 
-    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
     if (ret) {
         perror("Failed to modify RC QP (rst2init)");
     }
     return ret;
 }
 
-int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp, struct ibv_ah_attr ah_attr, uint32_t remote_qpn,
-                                  enum ibv_mtu mtu) {
+int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
+                                  struct ibv_ah_attr ah_attr,
+                                  uint32_t remote_qpn, enum ibv_mtu mtu) {
     if (!qp || !qp->mqp) {
         errno = EINVAL;
         return -1;
@@ -350,9 +379,10 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp, struct ibv_ah_attr ah_a
     DEVX_SET(qpc, qpc, log_msg_max, 30);
     DEVX_SET(qpc, qpc, remote_qpn, remote_qpn);
     DEVX_SET(qpc, qpc, min_rnr_nak, 7);
-    DEVX_SET(qpc, qpc, log_rra_max, 1); // log2(max_rd_atomic)
+    DEVX_SET(qpc, qpc, log_rra_max, 1);  // log2(max_rd_atomic)
     if (qp->port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
-        DEVX_SET(qpc, qpc, primary_address_path.sl, ah_attr.sl); // infiniband only
+        DEVX_SET(qpc, qpc, primary_address_path.sl,
+                 ah_attr.sl);  // infiniband only
         DEVX_SET(qpc, qpc, primary_address_path.rlid, ah_attr.dlid);
     } else if (qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
         struct mlx5dv_obj dv;
@@ -367,16 +397,18 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp, struct ibv_ah_attr ah_a
         dv.ah.out = &dah;
         mlx5dv_init_obj(&dv, MLX5DV_OBJ_AH);
 
-        memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), &dah.av->rmac,
-               sizeof(dah.av->rmac));
+        memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32),
+               &dah.av->rmac, sizeof(dah.av->rmac));
         DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 255);
-        DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, ah_attr.grh.sgid_index);
+        DEVX_SET(qpc, qpc, primary_address_path.src_addr_index,
+                 ah_attr.grh.sgid_index);
         DEVX_SET(qpc, qpc, primary_address_path.udp_sport, ah_attr.dlid);
-        memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rgid_rip), &dah.av->rgid,
-               sizeof(dah.av->rgid));
+        memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rgid_rip),
+               &dah.av->rgid, sizeof(dah.av->rgid));
     }
 
-    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
     if (ret) {
         perror("Failed to modify RC QP (init2rtr)");
     }
@@ -397,13 +429,14 @@ int mlx5gda_modify_rc_qp_rtr2rts(struct mlx5gda_qp *qp) {
     void *qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
 
     DEVX_SET(qpc, qpc, log_ack_req_freq, 0x0);  // Ack every packet
-    DEVX_SET(qpc, qpc, log_sra_max, 1); // log2(max_qp_rd_atomic)
+    DEVX_SET(qpc, qpc, log_sra_max, 1);         // log2(max_qp_rd_atomic)
     DEVX_SET(qpc, qpc, next_send_psn, 0x0);
     DEVX_SET(qpc, qpc, retry_count, 7);
     DEVX_SET(qpc, qpc, rnr_retry, 7);
     DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 20);
 
-    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
     if (ret) {
         perror("Failed to modify RC QP (rtr2rts)");
     }
