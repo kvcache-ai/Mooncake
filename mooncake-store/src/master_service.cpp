@@ -301,15 +301,9 @@ auto MasterService::GetReplicaList(std::string_view key)
         replica_list.emplace_back(replica.get_descriptor());
     }
 
-    // Only mark for GC if enabled
-    if (enable_gc_) {
-        MarkForGC(std::string(key),
-                  1000);  // After 1 second, the object will be removed
-    } else {
-        // Grant a lease to the object so it will not be removed
-        // when the client is reading it.
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-    }
+    // Grant a lease to the object so it will not be removed
+    // when the client is reading it.
+    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
     return replica_list;
 }
