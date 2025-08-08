@@ -1,2 +1,4 @@
-[default]
-extend-ignore-words = ["ASO", "aso", "fre"]
+[default.extend-words]
+ASO = "ASO"
+aso = "aso"
+fre = "fre"
