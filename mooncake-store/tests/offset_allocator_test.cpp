@@ -104,7 +104,8 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    public:
     // Constructor
     AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
-        : m_allocator(OffsetAllocator::create(base, size, maxAllocs)),
+        : m_allocator(
+              OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
           m_base(base),
           m_buffer_size(size) {
         // The allocator is created with the specified base and size
@@ -408,7 +409,7 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
     }
 }
 
-// Can only allocate MAX_ALLOCS - 2 times.
+// Can only allocate MAX_ALLOCS - 1 times.
 TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
@@ -416,7 +417,7 @@ TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
         std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
-    for (uint32 i = 0; i < MAX_ALLOCS - 2; ++i) {
+    for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
         auto handle = allocator->allocate(1024);
         ASSERT_TRUE(handle.has_value())
             << "Failed to allocate size: " << 1024 << " at iteration: " << i;
@@ -731,7 +732,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocationCountEdgeCase) {
     std::vector<AllocationHandleWrapper> handles;
 
     // Allocate up to the limit
-    for (uint32 i = 0; i < MAX_ALLOCS - 2; ++i) {
+    for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
         auto handle = allocator->allocate(1024);
         ASSERT_TRUE(handle.has_value()) << "Failed at iteration " << i;
         handles.push_back(std::move(*handle));
