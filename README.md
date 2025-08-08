@@ -55,6 +55,9 @@ Both P2P Store and Mooncake Store are built on the Transfer Engine and provide k
 **Mooncake Integration with Leading LLM Inference Systems**  
 Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
 
+**Elastic Expert Parallelism Support (Work in Progress)**
+Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
+
 <h2 id="show-cases">🔥 Show Cases</h2>
 
 ### Use Transfer Engine Standalone ([Guide](doc/en/transfer-engine.md))
