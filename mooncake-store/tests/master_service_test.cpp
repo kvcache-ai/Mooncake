@@ -999,7 +999,6 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
               segment2.name);
 }
 
-
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     std::unique_ptr<MasterService> service_(new MasterService(false));
 
@@ -1007,8 +1006,9 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     // Mount two segments sized to fit exactly one replica each
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t object_size = 1024 * 1024;  // 1MB per replica
-    constexpr size_t segment_size = object_size; // force at most 1 replica per segment
+    constexpr size_t object_size = 1024 * 1024 * 16;
+    constexpr size_t segment_size = 
+        object_size; // force at most 1 replica per segment
 
     Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
     Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
@@ -1041,7 +1041,8 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
         ASSERT_EQ(1u, mem.buffer_descriptors.size());
         seg_names.insert(mem.buffer_descriptors[0].segment_name_);
     }
-    ASSERT_EQ(2u, seg_names.size()) << "Replicas should be on different segments";
+    ASSERT_EQ(2u, seg_names.size()) 
+        << "Replicas should be on different segments";
 
     // Unmount one segment
     ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id).has_value());
