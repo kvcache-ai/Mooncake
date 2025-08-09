@@ -23,7 +23,7 @@
 #include <vector>
 
 #define FMT_HEADER_ONLY
-#include <fmt/core.h>
+#include <fmt/base.h>
 #include <folly/logging/xlog.h>
 
 #include "Slab.h"
