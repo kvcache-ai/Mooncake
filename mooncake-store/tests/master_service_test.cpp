@@ -481,7 +481,9 @@ TEST_F(MasterServiceTest, RemoveAll) {
 }
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
 
     // Mount a segment with sufficient size for multiple replicas
     constexpr size_t buffer = 0x300000000;
@@ -573,11 +575,16 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         }
     }
 
-    // Sleep for 2 seconds to ensure the object is marked for GC
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Immediately after GetReplicaList, object should have an active lease;
+    // Remove should fail due to lease, not because object is gone.
     auto remove_result = service_->Remove(key);
     EXPECT_FALSE(remove_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result.error());
+
+    // After the lease TTL expires, removal should succeed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    auto remove_result2 = service_->Remove(key);
+    EXPECT_TRUE(remove_result2.has_value());
 
     // Verify object is truly removed
     auto get_result3 = service_->GetReplicaList(key);
