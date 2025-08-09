@@ -165,10 +165,10 @@ void MasterService::ClearInvalidHandles() {
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
             // Check if the object has any valid replicas
-            bool has_valid_replica = true;
+            bool has_valid_replica = false;
             for (auto& replica : it->second.replicas) {
                 if (!replica.has_invalid_handle()) {
-                    has_valid_replica = false;
+                    has_valid_replica = true;
                     break;
                 }
             }
