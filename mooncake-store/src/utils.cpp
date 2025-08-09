@@ -2,6 +2,11 @@
 
 #include <Slab.h>
 #include <glog/logging.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <random>
 
 namespace mooncake {
 void *allocate_buffer_allocator_memory(size_t total_size) {
@@ -44,6 +49,43 @@ void **rdma_args(const std::string &device_name) {
     args[0] = (void *)nic_priority_matrix.c_str();
     args[1] = nullptr;
     return args;
+}
+
+bool isPortAvailable(int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    close(sock);
+    return available;
+}
+
+int getRandomAvailablePort(int min_port, int max_port) {
+    // Handle invalid range
+    if (min_port > max_port) {
+        std::swap(min_port, max_port);
+    }
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(min_port, max_port);
+
+    for (int attempts = 0; attempts < 10; attempts++) {
+        int port = dis(gen);
+        if (isPortAvailable(port)) {
+            return port;
+        }
+    }
+    return -1;  // Failed to find available port
 }
 
 }  // namespace mooncake
