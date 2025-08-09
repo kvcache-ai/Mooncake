@@ -1003,13 +1003,15 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     std::unique_ptr<MasterService> service_(new MasterService(false));
 
-    // Mount two segments for testing
+    // TODO: mount two larger segments when replication affinity fixed
+    // Mount two segments sized to fit exactly one replica each
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;  // 1MB per replica
+    constexpr size_t segment_size = object_size; // force at most 1 replica per segment
 
-    Segment segment1(generate_uuid(), "segment1", buffer1, size);
-    Segment segment2(generate_uuid(), "segment2", buffer2, size);
+    Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
+    Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
     UUID client_id = generate_uuid();
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
