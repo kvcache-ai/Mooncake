@@ -81,8 +81,8 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
     // Define the name of the test segment.
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress,
-                    kSegmentSize);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize,
+                    false);
     UUID client_id = generate_uuid();
 
     // Test invalid parameters.
@@ -164,7 +164,8 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
         // Define the size of the segment (16MB).
         size_t kSegmentSize = 1024 * 1024 * 16 * random_number;
 
-        Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize);
+        Segment segment(segment_id, segment_name, kBufferAddress, kSegmentSize,
+                        false);
 
         // Test remounting after unmount.
         auto mount_result = service_->MountSegment(segment, client_id);
@@ -218,7 +219,7 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -247,7 +248,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -292,7 +293,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -345,7 +346,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -374,7 +375,7 @@ TEST_F(MasterServiceTest, RemoveObject) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -411,7 +412,7 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -450,7 +451,7 @@ TEST_F(MasterServiceTest, RemoveAll) {
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -489,7 +490,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         1024 * 1024 * 64;  // 64MB to accommodate multiple replicas
     std::string segment_name = "test_segment_multi";
 
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size, false);
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -593,7 +594,7 @@ TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
     constexpr size_t size =
         1024 * 1024 * 256;  // Larger segment for concurrent use
     std::string segment_name = "concurrent_gc_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -675,7 +676,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     constexpr size_t size = 1024 * 1024 * 16;  // 16MB
     std::string segment_name = "test_segment";
 
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
 
     // Mount the segment
@@ -740,7 +741,7 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result_concurrent = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result_concurrent.has_value());
@@ -817,7 +818,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -898,7 +899,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     constexpr size_t size =
         1024 * 1024 * 16 * 100;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -954,8 +955,8 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     constexpr size_t buffer2 = 0x400000000;
     constexpr size_t size = 1024 * 1024 * 16;
 
-    Segment segment1(generate_uuid(), "segment1", buffer1, size);
-    Segment segment2(generate_uuid(), "segment2", buffer2, size);
+    Segment segment1(generate_uuid(), "segment1", buffer1, size, false);
+    Segment segment2(generate_uuid(), "segment2", buffer2, size, false);
     UUID client_id = generate_uuid();
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
@@ -1004,8 +1005,8 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
-    Segment segment(generate_uuid(), segment_name, kBufferAddress,
-                    kSegmentSize);
+    Segment segment(generate_uuid(), segment_name, kBufferAddress, kSegmentSize,
+                    false);
     UUID client_id = generate_uuid();
 
     // Mount a segment for testing
@@ -1067,7 +1068,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -1153,7 +1154,7 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -1200,7 +1201,7 @@ TEST_F(MasterServiceTest, EvictObject) {
     constexpr size_t size = 1024 * 1024 * 16 * 15;
     constexpr size_t object_size = 1024 * 15;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -1236,7 +1237,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     constexpr size_t size = 1024 * 1024 * 16;
     constexpr size_t object_size = 1024 * 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -1287,7 +1288,7 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
@@ -1323,7 +1324,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     constexpr size_t segment_size = 1024 * 1024 * 16;
     constexpr size_t value_size = 1024 * 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size, false);
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
@@ -1386,7 +1387,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     constexpr size_t segment_size = 1024 * 1024 * 16;
     constexpr size_t value_size = 1024 * 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size, false);
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
@@ -1430,7 +1431,7 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
     constexpr size_t segment_size = 1024 * 1024 * 16;
     constexpr size_t value_size = 1024 * 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size, false);
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
@@ -1504,7 +1505,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     constexpr size_t segment_size = 1024 * 1024 * 16;
     constexpr size_t value_size = 1024 * 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size, false);
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
@@ -1541,7 +1542,7 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     constexpr size_t size = 1024 * 1024 * 128;
     constexpr size_t value_size = 1024;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment(generate_uuid(), segment_name, buffer, size, false);
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());

@@ -542,6 +542,56 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::PutToVRAM(const ObjectKey& key,
+                                                std::vector<Slice>& slices,
+                                                const ReplicateConfig& config) {
+    // Prepare slice lengths
+    std::vector<size_t> slice_lengths;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        slice_lengths.emplace_back(slices[i].size);
+    }
+
+    // Start put operation
+    ReplicateConfig conf = config;
+    conf.local_vram_only = true;
+    auto start_result = master_client_.PutStart(key, slice_lengths, conf);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            VLOG(1) << "object_already_exists key=" << key;
+            return {};
+        }
+
+        LOG(ERROR) << "Failed to start put operation: " << err;
+        return tl::unexpected(err);
+    }
+
+    // Transfer data using allocated handles from all replicas
+    // For now, vram only support RDMA
+    for (const auto& replica : start_result.value()) {
+        ErrorCode transfer_err = TransferWrite(replica, slices);
+        if (transfer_err != ErrorCode::OK) {
+            // Revoke put operation
+            auto revoke_result = master_client_.PutRevoke(key);
+            if (!revoke_result) {
+                LOG(ERROR) << "Failed to revoke put operation";
+                return tl::unexpected(revoke_result.error());
+            }
+            return tl::unexpected(transfer_err);
+        }
+    }
+
+    // End put operation
+    auto end_result = master_client_.PutEnd(key);
+    if (!end_result) {
+        ErrorCode err = end_result.error();
+        LOG(ERROR) << "Failed to end put operation: " << err;
+        return tl::unexpected(err);
+    }
+
+    return {};
+}
+
 // TODO: `client.cpp` is too long, consider split it into multiple files
 enum class PutOperationState {
     PENDING,
@@ -956,7 +1006,7 @@ tl::expected<long, ErrorCode> Client::RemoveAll() {
 }
 
 tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
-                                                   size_t size) {
+                                                   size_t size, bool is_vram) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -988,7 +1038,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     }
 
     Segment segment(generate_uuid(), local_hostname_,
-                    reinterpret_cast<uintptr_t>(buffer), size);
+                    reinterpret_cast<uintptr_t>(buffer), size, is_vram);
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {

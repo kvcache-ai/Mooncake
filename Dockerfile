@@ -12,6 +12,8 @@ RUN apt update \
      && apt install -y unzip wget cmake git sudo \
      && pip install pybind11
 
+RUN apt install -y cuda-toolkit-12
+
 # Execute installation in the container
 RUN bash dependencies.sh \
      && apt autoremove -y \

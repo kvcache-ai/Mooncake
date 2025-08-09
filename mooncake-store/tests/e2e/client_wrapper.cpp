@@ -62,7 +62,7 @@ ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    auto mount_result = client_->MountSegment(buffer, size);
+    auto mount_result = client_->MountSegment(buffer, size, false);
     ErrorCode error_code =
         mount_result.has_value() ? ErrorCode::OK : mount_result.error();
     if (error_code != ErrorCode::OK) {

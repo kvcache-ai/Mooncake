@@ -83,7 +83,7 @@ class ClientIntegrationTest : public ::testing::Test {
         segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
         LOG_ASSERT(segment_ptr_);
         auto mount_result = segment_provider_client_->MountSegment(
-            segment_ptr_, ram_buffer_size_);
+            segment_ptr_, ram_buffer_size_, false);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -116,7 +116,7 @@ class ClientIntegrationTest : public ::testing::Test {
             allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
         LOG_ASSERT(test_client_segment_ptr_);
         auto test_client_mount_result = test_client_->MountSegment(
-            test_client_segment_ptr_, test_client_ram_buffer_size_);
+            test_client_segment_ptr_, test_client_ram_buffer_size_, false);
         if (!test_client_mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment for test_client_: "
                        << toString(test_client_mount_result.error());
