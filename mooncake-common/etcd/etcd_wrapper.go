@@ -44,13 +44,29 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	MaxMsgSize := 32*1024*1024
-	endpoint := C.GoString(endpoints)
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:          []string{endpoint},
-		DialTimeout:        5 * time.Second,
-		MaxCallSendMsgSize: MaxMsgSize,
-		MaxCallRecvMsgSize: MaxMsgSize,
-	})
+    endpointStr := C.GoString(endpoints)
+    // Support multiple endpoints separated by comma or semicolon
+    // Normalize separators to semicolon first, then split
+    endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+    parts := strings.Split(endpointStr, ";")
+    var validEndpoints []string
+    for _, ep := range parts {
+        ep = strings.TrimSpace(ep)
+        if ep != "" {
+            validEndpoints = append(validEndpoints, ep)
+        }
+    }
+    if len(validEndpoints) == 0 {
+        *errMsg = C.CString("no valid endpoints provided")
+        return -1
+    }
+
+    cli, err := clientv3.New(clientv3.Config{
+        Endpoints:          validEndpoints,
+        DialTimeout:        5 * time.Second,
+        MaxCallSendMsgSize: MaxMsgSize,
+        MaxCallRecvMsgSize: MaxMsgSize,
+    })
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
