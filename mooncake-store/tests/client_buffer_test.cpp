@@ -301,7 +301,7 @@ TEST_F(ClientBufferTest, CalculateTotalSizeDiskReplica) {
     // Create a disk replica descriptor
     Replica::Descriptor replica;
     DiskDescriptor disk_desc;
-    disk_desc.file_size = 4096;
+    disk_desc.object_size = 4096;
 
     replica.descriptor_variant = disk_desc;
     replica.status = ReplicaStatus::COMPLETE;
@@ -386,7 +386,7 @@ TEST_F(ClientBufferTest, AllocateSlicesDiskReplica) {
     // Create a disk replica descriptor
     Replica::Descriptor replica;
     DiskDescriptor disk_desc;
-    disk_desc.file_size = 8192;
+    disk_desc.object_size = 8192;
 
     replica.descriptor_variant = disk_desc;
     replica.status = ReplicaStatus::COMPLETE;

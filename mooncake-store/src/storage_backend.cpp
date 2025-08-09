@@ -10,13 +10,8 @@
 namespace mooncake {
 
 tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const ObjectKey& key, const std::vector<Slice>& slices) {
-    std::string path = ResolvePath(key);
-
-    if (std::filesystem::exists(path)) {
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
+    const std::string& path, const std::vector<Slice>& slices) {
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
@@ -50,18 +45,13 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 }
 
 tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const ObjectKey& key, const std::string& str) {
-    return StoreObject(key, std::span<const char>(str.data(), str.size()));
+    const std::string& path, const std::string& str) {
+    return StoreObject(path, std::span<const char>(str.data(), str.size()));
 }
 
 tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const ObjectKey& key, std::span<const char> data) {
-    std::string path = ResolvePath(key);
-
-    if (std::filesystem::exists(path)) {
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
+    const std::string& path, std::span<const char> data) {
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
         LOG(INFO) << "Failed to open file for writing: " << path;
@@ -87,7 +77,8 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    std::string& path, std::vector<Slice>& slices, size_t length) {
+    const std::string& path, std::vector<Slice>& slices, size_t length) {
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
@@ -116,9 +107,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::LoadObject(std::string& path,
-                                                         std::string& str,
-                                                         size_t length) {
+tl::expected<void, ErrorCode> StorageBackend::LoadObject(
+    const std::string& path, std::string& str, size_t length) {
+    ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
         LOG(INFO) << "Failed to open file for reading: " << path;
@@ -140,65 +131,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(std::string& path,
     return {};
 }
 
-bool StorageBackend::Existkey(const ObjectKey& key) {
-    std::string path = ResolvePath(key);
-    namespace fs = std::filesystem;
-
-    // Check if the file exists
-    if (fs::exists(path)) {
-        return true;
-    } else {
-        return false;
-    }
-}
-
-std::optional<Replica::Descriptor> StorageBackend::Querykey(
-    const ObjectKey& key) {
-    std::string path = ResolvePath(key);
-    namespace fs = std::filesystem;
-
-    // Check if the file exists
-    if (!fs::exists(path)) {
-        return std::nullopt;  // File does not exist
-    }
-
-    // Populate object_info with file metadata
-    Replica::Descriptor desc;
-    auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
-    disk_desc.file_path = path;
-    disk_desc.file_size = fs::file_size(path);
-    desc.status = ReplicaStatus::COMPLETE;
-
-    return desc;
-}
-
-std::unordered_map<ObjectKey, Replica::Descriptor>
-StorageBackend::BatchQueryKey(const std::vector<ObjectKey>& keys) {
-    namespace fs = std::filesystem;
-    std::unordered_map<ObjectKey, Replica::Descriptor> result;
-
-    for (const auto& key : keys) {
-        std::string path = ResolvePath(key);
-
-        if (!fs::exists(path)) {
-            LOG(WARNING) << "Key not found: " << key << ", skipping...";
-            return {};
-        }
-
-        Replica::Descriptor desc;
-        auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
-        disk_desc.file_path = path;
-        disk_desc.file_size = fs::file_size(path);
-        desc.status = ReplicaStatus::COMPLETE;
-
-        result.emplace(key, std::move(desc));
-    }
-
-    return result;
-}
-
-void StorageBackend::RemoveFile(const ObjectKey& key) {
-    std::string path = ResolvePath(key);
+void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
     // TODO: attention: this function is not thread-safe, need to add lock if
     // used in multi-thread environment Check if the file exists before
@@ -232,49 +165,20 @@ void StorageBackend::RemoveAll() {
     }
 }
 
-std::string StorageBackend::SanitizeKey(const ObjectKey& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string StorageBackend::ResolvePath(const ObjectKey& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
+void StorageBackend::ResolvePath(const std::string& path) const {
     // Safely construct path using std::filesystem
     namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(root_dir_) / fsdir_ / std::string(1, dir1) /
-                        std::string(1, dir2);
+    fs::path full_path = path;
 
-    // Create directory if not exists
+    // Create all parent directories if they don't exist
     std::error_code ec;
-    if (!fs::exists(dir_path)) {
-        if (!fs::create_directories(dir_path, ec) && ec) {
-            LOG(INFO) << "Failed to create directory: " << dir_path
+    fs::path parent_path = full_path.parent_path();
+    if (!parent_path.empty() && !fs::exists(parent_path)) {
+        if (!fs::create_directories(parent_path, ec) && ec) {
+            LOG(INFO) << "Failed to create directories: " << parent_path
                       << ", error: " << ec.message();
-            return "";  // Empty string indicates failure
         }
     }
-
-    // Combine directory path with sanitized filename
-    fs::path full_path = dir_path / SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
 }
 
 std::unique_ptr<StorageFile> StorageBackend::create_file(

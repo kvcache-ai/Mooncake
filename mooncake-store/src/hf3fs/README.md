@@ -23,10 +23,11 @@ cmake -DUSE_3FS=ON ...
 ## Usage
 
 ### Basic Operation
-Set the environment variable to specify the 3FS mount point:
+Start master server and specify the 3FS mount point:
 ```bash
 
-MOONCAKE_STORAGE_ROOT_DIR=/path/to/3fs_mount_point python3 ...
+./build/mooncake-store/src/mooncake_master \
+    --root_fs_dir=/path/to/3fs_mount_point 
 ```
 ### Important Notes
 1. The specified directory **must** be a 3FS mount point  

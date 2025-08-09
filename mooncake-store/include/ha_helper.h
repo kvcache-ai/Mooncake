@@ -90,6 +90,7 @@ class MasterServiceSupervisor {
                 0),  // Client connection timeout. 0 = no timeout (infinite)
         bool rpc_enable_tcp_no_delay = true,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
     MasterServiceSupervisor(const MasterConfig& master_config);
     int Start();
@@ -124,6 +125,7 @@ class MasterServiceSupervisor {
     std::string local_hostname_;
 
     std::string cluster_id_;
+    std::string root_fs_dir_;
     BufferAllocatorType memory_allocator_;
 };
 

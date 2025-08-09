@@ -26,6 +26,7 @@ struct MasterConfig {
     std::string etcd_endpoints;
 
     std::string cluster_id;
+    std::string root_fs_dir;
     std::string memory_allocator;
 };
 

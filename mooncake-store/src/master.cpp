@@ -66,6 +66,8 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
 
+DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
+              "Root directory for storage backend, used in HA mode");
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
@@ -119,6 +121,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
+                             FLAGS_root_fs_dir);
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
@@ -250,6 +254,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
     }
+    if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.root_fs_dir = FLAGS_root_fs_dir;
+    }
     if ((google::GetCommandLineFlagInfo("memory_allocator", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -318,6 +327,7 @@ int main(int argc, char* argv[]) {
               << ", rpc_enable_tcp_no_delay="
               << master_config.rpc_enable_tcp_no_delay
               << ", cluster_id=" << master_config.cluster_id
+              << ", root_fs_dir=" << master_config.root_fs_dir
               << ", memory_allocator=" << master_config.memory_allocator;
 
     if (master_config.enable_ha) {
@@ -347,7 +357,8 @@ int main(int argc, char* argv[]) {
             master_config.eviction_ratio,
             master_config.eviction_high_watermark_ratio, version,
             master_config.client_live_ttl_sec, master_config.enable_ha,
-            master_config.cluster_id, allocator_type);
+            master_config.cluster_id, master_config.root_fs_dir,
+            allocator_type);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

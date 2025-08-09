@@ -111,7 +111,8 @@ MasterServiceSupervisor::MasterServiceSupervisor(
       etcd_endpoints_(master_config.etcd_endpoints),
       local_hostname_(master_config.rpc_address + ":" +
                       std::to_string(master_config.rpc_port)),
-      cluster_id_(master_config.cluster_id) {
+      cluster_id_(master_config.cluster_id),
+      root_fs_dir_(master_config.root_fs_dir) {
     if (master_config.memory_allocator == "cachelib") {
         memory_allocator_ = BufferAllocatorType::CACHELIB;
     } else {
@@ -156,7 +157,7 @@ int MasterServiceSupervisor::Start() {
             enable_gc_, default_kv_lease_ttl_, default_kv_soft_pin_ttl_,
             allow_evict_soft_pinned_objects_, enable_metric_reporting_,
             metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version, client_live_ttl_sec_, enable_ha, cluster_id_,
+            version, client_live_ttl_sec_, enable_ha, cluster_id_, root_fs_dir_,
             memory_allocator_);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
