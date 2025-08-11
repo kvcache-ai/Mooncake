@@ -30,10 +30,13 @@ int64_t to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
     }
 
     if constexpr (std::is_void_v<T>) {
+        // LOG(WARNING) << "is_void_v";
         return 0;
     } else if constexpr (std::is_integral_v<T>) {
+        // LOG(WARNING) << "is_integral bane";
         return static_cast<int64_t>(exp.value());
     } else {
+        // LOG(WARNING) << "Unsupported payload type in to_py_ret()";
         static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
     }
 }
@@ -138,6 +141,19 @@ class DistributedObjectStore {
                                     const std::vector<size_t> &sizes);
 
     /**
+     * @brief Get object data directly into pre-allocated buffers for multiple
+     * keys(batch version) on Ascend NPU
+     * @param keys Key of the objects to get
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @return Vector of integers, where each element is the number of bytes
+     * read on success, or a negative value on error
+     */
+    std::vector<int> batch_get_into_ascend(const std::string key,
+                                           const std::vector<void *> &buffers,
+                                           const std::vector<size_t> &sizes);
+
+    /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
      * @param buffer Pointer to the buffer containing data (must be registered
@@ -185,6 +201,23 @@ class DistributedObjectStore {
 
     std::vector<int> batch_put_from(
         const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    /**
+     * @brief Put object data directly from pre-allocated buffers for multiple
+     * keys (batch version) on Ascend NPU
+     * @param keys keys of the objects to put
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @param config Replication configuration
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_put_from_ascend(
+        const std::string keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
@@ -293,12 +326,21 @@ class DistributedObjectStore {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal_ascend(
+        const std::string key,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal_ascend(
+        const std::string key,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 

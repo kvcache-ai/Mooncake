@@ -239,9 +239,9 @@ struct MemcpyOperation {
     void* dest;
     const void* src;
     size_t size;
-
-    MemcpyOperation(void* d, const void* s, size_t sz)
-        : dest(d), src(s), size(sz) {}
+    bool is_write;
+    MemcpyOperation(void* d, const void* s, size_t sz, bool w)
+        : dest(d), src(s), size(sz), is_write(w) {}
 };
 
 /**
@@ -280,7 +280,7 @@ class MemcpyWorkerPool {
     void submitTask(MemcpyTask task);
 
    private:
-    void workerThread();
+    void workerThread(int deviceLogicId);
 
     std::vector<std::thread> workers_;
     std::queue<MemcpyTask> task_queue_;

@@ -320,9 +320,18 @@ WrappedMasterService::BatchPutStart(
         results;
     results.reserve(keys.size());
 
+    uint32_t all_slice_len = 0;
+    std::vector<uint64_t> slice_len;
     for (size_t i = 0; i < keys.size(); ++i) {
+        slice_len.reserve(keys.size());
+        all_slice_len = 0;
+        for (size_t j = 0; j < slice_lengths[i].size(); ++j) {
+            all_slice_len += slice_lengths[i][j];
+        }
+        slice_len.emplace_back(all_slice_len);
+        // LOG(ERROR) << "master_server put start, len:" << slice_lengths[i].size();
         results.emplace_back(
-            master_service_.PutStart(keys[i], slice_lengths[i], config));
+            master_service_.PutStart(keys[i], slice_len, config));
     }
 
     size_t failure_count = 0;

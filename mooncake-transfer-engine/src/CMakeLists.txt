@@ -4,7 +4,7 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+add_library(transfer_engine SHARED ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
