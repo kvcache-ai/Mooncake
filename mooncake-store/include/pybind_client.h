@@ -79,7 +79,7 @@ class PyClient {
               const std::string &master_server_addr = "127.0.0.1:50051");
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16M
+                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
