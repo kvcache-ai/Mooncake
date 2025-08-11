@@ -239,7 +239,7 @@ Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                     cudaHostRegisterDefault));
 #endif
     if (options.shm_path.empty())
-        return Status::OK();  // Return sliently but not regard it as valid
+        return Status::OK();  // Return silently but not regard it as valid
                               // buffer for shared memory transport
     desc.shm_path = options.shm_path;
     // desc.shm_offset = options.shm_offset;
