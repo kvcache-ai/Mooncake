@@ -22,3 +22,6 @@ if (USE_ASCEND)
     add_executable(transfer_engine_ascend_perf transfer_engine_ascend_perf.cpp)
     target_link_libraries(transfer_engine_ascend_perf PUBLIC transfer_engine)
 endif()
+
+add_executable(transfer_engine_bench_v1 transfer_engine_bench_v1.cpp)
+target_link_libraries(transfer_engine_bench_v1 PUBLIC transfer_engine_v1)
