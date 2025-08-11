@@ -111,4 +111,21 @@ void** rdma_args(const std::string& device_name);
     return oss.str();
 }
 
+// Network utility functions
+
+/**
+ * @brief Check if a TCP port is available for binding
+ * @param port The port number to check
+ * @return true if port is available, false otherwise
+ */
+bool isPortAvailable(int port);
+
+/**
+ * @brief Get a random available port in the specified range
+ * @param min_port Minimum port number (default: 12300)
+ * @param max_port Maximum port number (default: 14300)
+ * @return Available port number, or -1 if no port found after 10 attempts
+ */
+int getRandomAvailablePort(int min_port = 12300, int max_port = 14300);
+
 }  // namespace mooncake
