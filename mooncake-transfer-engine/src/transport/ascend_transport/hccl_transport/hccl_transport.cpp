@@ -52,7 +52,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret: " << ret;
     }
 
-    while (1) {
+    while (running_) {
         auto waitlock = std::chrono::high_resolution_clock::now();
         std::unique_lock<std::mutex> lock(initiator_mutex_);
         if (allReqQueues_[selfIdx].empty()) {

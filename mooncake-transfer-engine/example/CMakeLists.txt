@@ -1,4 +1,10 @@
-file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if("$ENV{ASCEND_TOOLKIT_PATH}" STREQUAL "")
+    set(ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+else()
+set(ASCEND_TOOLKIT_ROOT $ENV{ASCEND_TOOLKIT_PATH})
+endif()
+
+file(GLOB ASCEND_TOOLKIT_ROOT "${ASCEND_TOOLKIT_ROOT}")
 set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
 
 link_directories(${ASCEND_LIB_DIR})

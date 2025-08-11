@@ -85,7 +85,7 @@ static inline std::string calculateRate(uint64_t data_bytes,
 
 int allocateDevMem(void *&devAddr, size_t size) {
     // malloc device mem
-    aclError ret = aclrtMalloc(&devAddr, size, ACL_MEM_MALLOC_NORMAL_ONLY);
+    aclError ret = aclrtMalloc(&devAddr, size, ACL_MEM_MALLOC_HUGE_ONLY);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to allocate device memory, ret:" << ret;
         return ret;

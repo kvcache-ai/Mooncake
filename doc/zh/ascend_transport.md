@@ -16,6 +16,8 @@ apt-get install -y mpich libmpich-dev
 
 **昇腾Compute Architecture for Neural Networks**
 更新到昇腾Compute Architecture for Neural Networks 8.2.RC1版本，不再需要pkg包。
+如果CANN不是安装在默认路径，可手动指定路径，只需设置环境变量：
+export ASCEND_TOOLKIT_PATH修改ascend-toolkit的路径。
 
 ### 一键式编译脚本
 Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh,执行命令如下：

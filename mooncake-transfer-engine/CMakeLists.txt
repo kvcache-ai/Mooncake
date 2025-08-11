@@ -12,7 +12,13 @@ endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  if("$ENV{ASCEND_TOOLKIT_PATH}" STREQUAL "")
+    set(ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  else()
+    set(ASCEND_TOOLKIT_ROOT $ENV{ASCEND_TOOLKIT_PATH})
+  endif()
+
+  file(GLOB ASCEND_TOOLKIT_ROOT "${ASCEND_TOOLKIT_ROOT}")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
 
   include_directories(/usr/local/include
