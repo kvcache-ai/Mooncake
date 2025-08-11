@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <glog/logging.h>
+
 #include <atomic>
 #include <list>
 #include <mutex>
@@ -35,6 +37,64 @@ enum class SlabIterationStatus {
     kAbortIteration
 };
 
+class MemoryAllocInfo_ {
+   public:
+    void* memory;
+    bool allocated;
+    MemoryAllocInfo_* prev;
+    MemoryAllocInfo_* next;
+
+   private:
+};
+
+class MemoryFreeList {
+   public:
+    MemoryFreeList() {
+        head = 0;
+        tail = 0;
+    }
+
+    void release(MemoryAllocInfo_* mem) {
+        if (head == mem) {
+            head = 0;
+            return;
+        }
+        if (mem->prev != 0) {
+            mem->prev = mem->next;
+        }
+        if (mem->next != 0) {
+            mem->next = mem->prev;
+        }
+    }
+    void push_front(MemoryAllocInfo_* mem) {
+        mem->next = 0;
+        mem->prev = 0;
+        // append to tail
+        if (head == 0) {
+            head = mem;
+            tail = mem;
+        } else {
+            tail->next = mem;
+            mem->prev = tail;
+            tail = mem;
+        }
+    }
+
+    bool empty() { return head == 0; }
+
+    MemoryAllocInfo_* front() { return head; }
+
+    void pop_front() {
+        if (head != 0) head = head->next;
+    }
+
+    MemoryAllocInfo_* head;
+
+    MemoryAllocInfo_* tail;
+
+   private:
+};
+
 // An AllocationClass is used to allocate memory for a given allocation size
 // from Slabs
 class AllocationClass {
@@ -45,7 +105,8 @@ class AllocationClass {
     //                  handles.
     // @param s         the slab allocator for fetching the header info.
     //
-    // @throw std::invalid_argument if the classId is invalid or the allocSize
+    // @throw std::invalid_argument if the classId is invalid or the
+    // allocSize
     //        is invalid.
     AllocationClass(ClassId classId, PoolId poolId, uint32_t allocSize,
                     const SlabAllocator& s);
@@ -67,33 +128,36 @@ class AllocationClass {
         return static_cast<unsigned int>(Slab::kSize / allocationSize_);
     }
 
-    // Whether the pool is full or free to allocate more in the current state.
-    // This is only a hint and not a guarantee that subsequent allocate will
-    // fail/succeed.
+    // Whether the pool is full or free to allocate more in the current
+    // state. This is only a hint and not a guarantee that subsequent
+    // allocate will fail/succeed.
     bool isFull() const noexcept { return !canAllocate_; }
 
     // allocate memory corresponding to the allocation size of this
     // AllocationClass.
     //
     // @return  ptr to the memory of allocationSize_ chunk or nullptr if we
-    //          don't have any free memory. The caller will have to add a slab
-    //          to this slab class to make further allocations out of it.
+    //          don't have any free memory. The caller will have to add a
+    //          slab to this slab class to make further allocations out of
+    //          it.
     void* allocate();
 
     // @param ctx     release context for the slab owning this alloc
     // @param memory  memory to check
     //
-    // @return true  if the memory corresponds to an alloc that has been freed
+    // @return true  if the memory corresponds to an alloc that has been
+    // freed
     //
-    // @throws std::invalid_argument  if the memory does not belong to a slab of
-    //         this slab class, or if the slab is not actively being released,
-    //         or if the context belongs to a different slab.
+    // @throws std::invalid_argument  if the memory does not belong to a
+    // slab of
+    //         this slab class, or if the slab is not actively being
+    //         released, or if the context belongs to a different slab.
     // @throws std::runtime_error  if the slab cannot be found inside
     //         slabReleaseAllocMap_
     bool isAllocFreed(const SlabReleaseContext& ctx, void* memory) const;
 
-    // The callback is executed under the lock, immediately after checking if
-    // the alloc has been freed.
+    // The callback is executed under the lock, immediately after checking
+    // if the alloc has been freed.
     //
     // @param ctx       release context for the slab owning this alloc
     // @param memory    memory to check
@@ -101,9 +165,10 @@ class AllocationClass {
     // This
     //                  takes a single argument - the alloc being processed.
     //
-    // @throws std::invalid_argument  if the memory does not belong to a slab of
-    //         this slab class, or if the slab is not actively being released,
-    //         or if the context belongs to a different slab.
+    // @throws std::invalid_argument  if the memory does not belong to a
+    // slab of
+    //         this slab class, or if the slab is not actively being
+    //         released, or if the context belongs to a different slab.
     // @throws std::runtime_error  if the slab cannot be found inside
     //         slabReleaseAllocMap_
     void processAllocForRelease(
@@ -187,9 +252,9 @@ class AllocationClass {
     // release the memory back to the slab class.
     //
     // @param memory  memory to be released.
-    // @throws std::invalid_argument if the memory does not belong to a slab of
-    // this slab class.
-    void free(void* memory);
+    // @throws std::invalid_argument if the memory does not belong to a slab
+    // of this slab class.
+    bool free(void* memory);
 
     // acquires a new slab for this allocation class.
     // @param slab    a new slab to be added. This can NOT be nullptr.
@@ -204,17 +269,18 @@ class AllocationClass {
     // 1. Mark a slab for release, by calling `startSlabRelease`.
     // 2. Free all the activeAllocations
     // 3. Actually release the slab, by calling `completeSlabRelease`.
-    //    In some scenario (i.e. when the slab is already released in step 1),
-    //    there is no need to do step 2.
+    //    In some scenario (i.e. when the slab is already released in step
+    //    1), there is no need to do step 2.
     //
     // In between the two steps, the user must ensure any active allocation
-    // from the slab is freed by calling ac->free(alloc). completeSlabRelease
-    // will block until all the active allocations for the slab are freed back.
+    // from the slab is freed by calling ac->free(alloc).
+    // completeSlabRelease will block until all the active allocations for
+    // the slab are freed back.
     //
-    // These allocations will not be moved to the free allocation list. Instead
-    // the free simply becomes an no-op. This is fine since the slab will be
-    // released eventually, and we do not want the freed allocations to be used
-    // again in the meanwhile.
+    // These allocations will not be moved to the free allocation list.
+    // Instead the free simply becomes an no-op. This is fine since the slab
+    // will be released eventually, and we do not want the freed allocations
+    // to be used again in the meanwhile.
     //
     // @param  mode   slab release mode
     //
@@ -228,12 +294,13 @@ class AllocationClass {
     // @return  SlabReleaseContext
     //          isReleased == true means the slab is already released
     //          as there was no active allocation to be freed. If not, the
-    //          caller is responsible for ensuring that all active allocations
-    //          returned by getActiveAllocs are freed back and
+    //          caller is responsible for ensuring that all active
+    //          allocations returned by getActiveAllocs are freed back and
     //
     // @throw std::invalid_argument if the hint is invalid.
     //
-    // @throw exception::SlabReleaseAborted if slab release is aborted due to
+    // @throw exception::SlabReleaseAborted if slab release is aborted due
+    // to
     //        shouldAbortFn returning true.
     SlabReleaseContext startSlabRelease(
         SlabReleaseMode mode, const void* hint,
@@ -262,22 +329,24 @@ class AllocationClass {
     // @throw std::runtime_error
     //        a runtime_error is thrown when the context is invalid or
     //        the slab associated with the context is not in a valid state.
-    void completeSlabRelease(const SlabReleaseContext& context);
+    bool completeSlabRelease(const SlabReleaseContext& context);
 
     // check if the slab has all its allocations freed back to the
-    // AllocationClass.  This must be called only for a slab that has an active
-    // slab release.
+    // AllocationClass.  This must be called only for a slab that has an
+    // active slab release.
     //
     // @param slab  the slab that we are interested in.
-    // @return    True if all the allocations are freed back to the allocator.
+    // @return    True if all the allocations are freed back to the
+    // allocator.
     //            False if not.
-    // @throw   std::runtime_error if the slab does not have the allocStateMap
+    // @throw   std::runtime_error if the slab does not have the
+    // allocStateMap
     //          entry.
     bool allFreed(const Slab* slab) const;
 
    private:
-    // check if the state of the AllocationClass is valid and if not, throws an
-    // std::invalid_argument exception. This is intended for use in
+    // check if the state of the AllocationClass is valid and if not, throws
+    // an std::invalid_argument exception. This is intended for use in
     // constructors.
     void checkState() const;
 
@@ -285,42 +354,47 @@ class AllocationClass {
     // precondition: freeSlabs_ must not be empty.
     void setupCurrentSlabLocked();
 
-    // returns true if the allocation can be satisfied from the current slab.
+    // returns true if the allocation can be satisfied from the current
+    // slab.
     bool canAllocateFromCurrentSlabLocked() const noexcept;
 
-    // returns a new allocation from the current slab. Caller needs to ensure
-    // that precondition canAllocateFromCurrentSlabLocked is satisfied
+    // returns a new allocation from the current slab. Caller needs to
+    // ensure that precondition canAllocateFromCurrentSlabLocked is
+    // satisfied
     void* allocateFromCurrentSlabLocked() noexcept;
 
-    // get a suitable slab for being released from either the set of free slabs
-    // or the allocated slabs.
+    // get a suitable slab for being released from either the set of free
+    // slabs or the allocated slabs.
     const Slab* getSlabForReleaseLocked() const noexcept;
 
-    // prune the freeAllocs_ to eliminate any  allocs belonging to this slab and
-    // also return a list of active allocations. If there are any active
+    // prune the freeAllocs_ to eliminate any  allocs belonging to this slab
+    // and also return a list of active allocations. If there are any active
     // allocations, it maintains the freeState for the slab release.
     //
     // @param  slab   Eliminate allocs belonging to this slab
     //
-    // @param  shouldAbortFn  invoked in the code to see if this release slab
+    // @param  shouldAbortFn  invoked in the code to see if this release
+    // slab
     //         process should be aborted
     //
     // @return a pair with
-    //         a bool indicating if slab release should be aborted or not and
-    //         a list of active allocations if should abort is false.
+    //         a bool indicating if slab release should be aborted or not
+    //         and a list of active allocations if should abort is false.
     //
-    // @throw exception::SlabReleaseAborted if slab release is aborted due to
+    // @throw exception::SlabReleaseAborted if slab release is aborted due
+    // to
     //        shouldAbortFn returning true.
     std::pair<bool, std::vector<void*>> pruneFreeAllocs(
         const Slab* slab,
         SlabReleaseAbortFn shouldAbortFn = []() { return false; });
 
-    // wraps around allFreed and blocks until all the allocations belonging to
-    // the slab are freed back.
+    // wraps around allFreed and blocks until all the allocations belonging
+    // to the slab are freed back.
     void waitUntilAllFreed(const Slab* slab);
 
     // return the allocation's index into the slab. It is the caller's
-    // responsibility to ensure that the alloc belongs to the slab and is valid.
+    // responsibility to ensure that the alloc belongs to the slab and is
+    // valid.
     size_t getAllocIdx(const Slab* slab, void* alloc) const noexcept;
 
     // return the allocation pointer into the slab for a given index.
@@ -330,8 +404,8 @@ class AllocationClass {
         return reinterpret_cast<uintptr_t>(slab);
     }
 
-    // Internal logic for checking if an allocation has been freed. This should
-    // be called under a lock.
+    // Internal logic for checking if an allocation has been freed. This
+    // should be called under a lock.
     //
     // @param ctx     release context for the slab owning the alloc
     // @param memory  memory to check
@@ -340,15 +414,16 @@ class AllocationClass {
     //         slabReleaseAllocMap_
     bool isAllocFreedLocked(const SlabReleaseContext& ctx, void* memory) const;
 
-    // Checks if the memory belongs to a slab being released, and if that slab
-    // matches with the provided release context.
+    // Checks if the memory belongs to a slab being released, and if that
+    // slab matches with the provided release context.
     //
     // @param ctx     release context for the slab owning this alloc
     // @param memory  memory to check
     //
-    // @throws std::invalid_argument if the memory does not belong to a slab of
-    //         this slab class, or if the slab is not actively being released,
-    //         or if the context belongs to a different slab.
+    // @throws std::invalid_argument if the memory does not belong to a slab
+    // of
+    //         this slab class, or if the slab is not actively being
+    //         released, or if the context belongs to a different slab.
     void checkSlabInRelease(const SlabReleaseContext& ctx,
                             const void* memory) const;
 
@@ -359,9 +434,11 @@ class AllocationClass {
 
     // @param slab    the slab associated with a release alloc map
     //
-    // @return  std::vector<bool>&    this is the alloc state map
+    // @return  std::vector<MemoryAllocInfo_>&    this is the alloc state
+    // map
     // @throws std::out_of_range if alloc map does not exist
-    std::vector<bool>& getSlabReleaseAllocMapLocked(const Slab* slab);
+    std::vector<MemoryAllocInfo_>& getSlabReleaseAllocMapLocked(
+        const Slab* slab);
 
     // acquires a new slab for this allocation class.
     void addSlabLocked(Slab* slab);
@@ -370,12 +447,13 @@ class AllocationClass {
     // AllocationClass.
     //
     // @return  ptr to the memory of allocationSize_ chunk or nullptr if we
-    //          don't have any free memory. The caller will have to add a slab
-    //          to this slab class to make further allocations out of it.
+    //          don't have any free memory. The caller will have to add a
+    //          slab to this slab class to make further allocations out of
+    //          it.
     void* allocateLocked();
 
-    // lock for serializing access to currSlab_, currOffset, allocatedSlabs_,
-    // freeSlabs_, freedAllocations_.
+    // lock for serializing access to currSlab_, currOffset,
+    // allocatedSlabs_, freeSlabs_, freedAllocations_.
     mutable std::mutex lock_;
 
     // the allocation class id.
@@ -390,17 +468,17 @@ class AllocationClass {
     // the offset of the next available allocation.
     uint32_t currOffset_{0};
 
-    // the next available chunk that can be allocated from the current active
-    // slab. If nullptr, then there are no active slabs that are being chunked
-    // out.
+    // the next available chunk that can be allocated from the current
+    // active slab. If nullptr, then there are no active slabs that are
+    // being chunked out.
     Slab* currSlab_{nullptr};
 
     const SlabAllocator& slabAlloc_;
 
-    // slabs that belong to this allocation class and are not entirely free. The
-    // un-used allocations in this are present in freedAllocations_.
-    // TODO store the index of the slab instead of the actual pointer. Pointer
-    // is 8byte vs index which can be half of it.
+    // slabs that belong to this allocation class and are not entirely free.
+    // The un-used allocations in this are present in freedAllocations_.
+    // TODO store the index of the slab instead of the actual pointer.
+    // Pointer is 8byte vs index which can be half of it.
     std::vector<Slab*> allocatedSlabs_;
 
     // slabs which are empty and can be used for allocations.
@@ -409,11 +487,13 @@ class AllocationClass {
 
     // list of freed allocations for this allocation class.
     using FreeList = std::list<void*>;
-    FreeList freedAllocations_{};
+    // FreeList freedAllocations_{};
+    MemoryFreeList freedAllocations_;
 
-    // Partition the 'freeAllocs' into two different SList depending on whether
-    // they are in slab memory or outside. Does not take a lock. If access to
-    // 'freeAllocs' requires a lock, it should be taken by the caller.
+    // Partition the 'freeAllocs' into two different SList depending on
+    // whether they are in slab memory or outside. Does not take a lock. If
+    // access to 'freeAllocs' requires a lock, it should be taken by the
+    // caller.
     void partitionFreeAllocs(const Slab* slab, FreeList& freeAllocs,
                              FreeList& inSlab, FreeList& notInSlab);
 
@@ -424,9 +504,9 @@ class AllocationClass {
     std::atomic<int64_t> activeReleases_{0};
 
     // stores the list of outstanding allocations for a given slab. This is
-    // created when we start a slab release process and if there are any active
-    // allocations need to be marked as free.
-    std::unordered_map<uintptr_t, std::vector<bool>> slabReleaseAllocMap_;
+    // created when we start a slab release process and if there are any
+    // active allocations need to be marked as free.
+    std::unordered_map<uintptr_t, std::vector<MemoryAllocInfo_>> slabAllocMap_;
 
     // Starting releasing a slab is serialized across threads.
     // Afterwards, the multiple threads can proceed in parallel to
