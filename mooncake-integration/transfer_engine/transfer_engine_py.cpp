@@ -14,11 +14,11 @@
 
 #include "transfer_engine_py.h"
 
-#include <cassert>
-#include <numeric>
-#include <fstream>
-
 #include <pybind11/stl.h>
+
+#include <cassert>
+#include <fstream>
+#include <numeric>
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -33,6 +33,9 @@ static void *allocateMemory(size_t size) { return malloc(size); }
 static void freeMemory(void *ptr) { free(ptr); }
 #endif
 
+static bool g_enable_v1 = (getenv("MC_USE_TEV1") != nullptr);
+#define CAST(ptr) ((mooncake::v1::TransferEngine *)ptr)
+
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     if (getenv("MC_TRANSFER_TIMEOUT")) {
@@ -44,9 +47,16 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
-    for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
-    handle_map_.clear();
-    engine_.reset();
+    if (g_enable_v1) {
+        for (auto &handle : handle_map_)
+            engine_v1_->closeSegment(handle.second);
+        handle_map_.clear();
+        engine_v1_.reset();
+    } else {
+        for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
+        handle_map_.clear();
+        engine_.reset();
+    }
     for (auto &buffer : buffer_list_) freeMemory(buffer);
     buffer_list_.clear();
     for (auto &buffer : large_buffer_list_) freeMemory(buffer);
@@ -112,6 +122,22 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *device_name,
                                     const char *metadata_type) {
     (void)(protocol);
+    if (g_enable_v1) {
+        auto config = std::make_shared<mooncake::v1::ConfigManager>();
+        if (strcmp(metadata_type, P2PHANDSHAKE)) {
+            config->set("local_segment_name", local_hostname);
+            config->set("metadata_type", metadata_type);
+            config->set("metadata_servers", metadata_server);
+        }
+        engine_v1_ = std::make_unique<mooncake::v1::TransferEngine>(config);
+        if (!engine_v1_->available()) return -1;
+        free_list_.resize(kSlabSizeKBTabLen);
+#ifndef USE_ASCEND
+        doBuddyAllocate(kMaxClassId);
+#endif
+        return 0;
+    }
+
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
@@ -136,12 +162,19 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     return 0;
 }
 
-int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+int TransferEnginePy::getRpcPort() {
+    if (g_enable_v1) return engine_v1_->getRpcServerPort();
+    return engine_->getRpcPort();
+}
 
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
+    int ret = 0;
+    if (g_enable_v1) {
+        engine_v1_->registerLocalMemory(buffer, capacity);
+    } else
+        ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
         freeMemory(buffer);
         return nullptr;
@@ -199,7 +232,10 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
-        engine_->unregisterLocalMemory(buffer);
+        if (g_enable_v1)
+            engine_v1_->unregisterLocalMemory(buffer, length);
+        else
+            engine_->unregisterLocalMemory(buffer);
         freeMemory(buffer);
         return 0;
     }
@@ -264,9 +300,53 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
-            handle = engine_->openSegment(target_hostname);
+            if (g_enable_v1) {
+                auto status = engine_v1_->openSegment(handle, target_hostname);
+                if (!status.ok()) {
+                    LOG(ERROR) << "openSegment: " << status.ToString();
+                    return -1;
+                }
+            } else
+                handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (g_enable_v1) {
+        auto batch_id = engine_v1_->allocateBatch(1);
+        mooncake::v1::Request entry;
+        if (opcode == TransferOpcode::WRITE)
+            entry.opcode = mooncake::v1::Request::WRITE;
+        else
+            entry.opcode = mooncake::v1::Request::READ;
+        entry.length = length;
+        entry.source = (void *)buffer;
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_address;
+        auto ret = engine_v1_->submitTransfer(batch_id, {entry});
+        if (!ret.ok()) {
+            LOG(ERROR) << "submitTransfer: " << ret.ToString();
+            return -1;
+        }
+
+        while (true) {
+            mooncake::v1::TransferStatus status;
+            ret = engine_v1_->getTransferStatus(batch_id, 0, status);
+            if (!ret.ok()) {
+                LOG(ERROR) << "getTransferStatus: " << ret.ToString();
+                engine_v1_->freeBatch(batch_id);
+                return -1;
+            }
+            if (status.s == mooncake::v1::PENDING ||
+                status.s == mooncake::v1::WAITING)
+                continue;
+            engine_v1_->freeBatch(batch_id);
+            if (status.s == mooncake::v1::COMPLETED) {
+                return 0;
+            } else if (status.s == mooncake::v1::CANCELED) {
+                return -1;
+            }
         }
     }
 
@@ -337,7 +417,14 @@ int TransferEnginePy::batchTransferSync(
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
-            handle = engine_->openSegment(target_hostname);
+            if (g_enable_v1) {
+                auto status = engine_v1_->openSegment(handle, target_hostname);
+                if (!status.ok()) {
+                    LOG(ERROR) << "openSegment: " << status.ToString();
+                    return -1;
+                }
+            } else
+                handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
         }
@@ -348,6 +435,48 @@ int TransferEnginePy::batchTransferSync(
         LOG(ERROR)
             << "buffers, peer_buffer_addresses and lengths have different size";
         return -1;
+    }
+
+    if (g_enable_v1) {
+        auto batch_size = buffers.size();
+        std::vector<mooncake::v1::Request> entries;
+        for (size_t i = 0; i < batch_size; ++i) {
+            mooncake::v1::Request entry;
+            if (opcode == TransferOpcode::WRITE)
+                entry.opcode = mooncake::v1::Request::WRITE;
+            else
+                entry.opcode = mooncake::v1::Request::READ;
+            entry.length = lengths[i];
+            entry.source = (void *)buffers[i];
+            entry.target_id = handle;
+            entry.target_offset = peer_buffer_addresses[i];
+            entries.push_back(entry);
+        }
+        auto batch_id = engine_v1_->allocateBatch(batch_size);
+        auto ret = engine_v1_->submitTransfer(batch_id, entries);
+        if (!ret.ok()) {
+            LOG(ERROR) << "submitTransfer: " << ret.ToString();
+            return -1;
+        }
+
+        while (true) {
+            mooncake::v1::TransferStatus status;
+            ret = engine_v1_->getTransferStatus(batch_id, status);
+            if (!ret.ok()) {
+                LOG(ERROR) << "getTransferStatus: " << ret.ToString();
+                engine_v1_->freeBatch(batch_id);
+                return -1;
+            }
+            if (status.s == mooncake::v1::PENDING ||
+                status.s == mooncake::v1::WAITING)
+                continue;
+            engine_v1_->freeBatch(batch_id);
+            if (status.s == mooncake::v1::COMPLETED) {
+                return 0;
+            } else if (status.s == mooncake::v1::CANCELED) {
+                return -1;
+            }
+        }
     }
 
     const int max_retry = engine_->numContexts() + 1;
@@ -425,7 +554,14 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
-            handle = engine_->openSegment(target_hostname);
+            if (g_enable_v1) {
+                auto status = engine_v1_->openSegment(handle, target_hostname);
+                if (!status.ok()) {
+                    LOG(ERROR) << "openSegment: " << status.ToString();
+                    return -1;
+                }
+            } else
+                handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
         }
@@ -436,6 +572,25 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         LOG(ERROR)
             << "buffers, peer_buffer_addresses and lengths have different size";
         return 0;
+    }
+
+    if (g_enable_v1) {
+        auto batch_size = buffers.size();
+        std::vector<mooncake::v1::Request> entries;
+        for (size_t i = 0; i < batch_size; ++i) {
+            mooncake::v1::Request entry;
+            if (opcode == TransferOpcode::WRITE) {
+                entry.opcode = mooncake::v1::Request::WRITE;
+            } else {
+                entry.opcode = mooncake::v1::Request::READ;
+            }
+            entry.length = lengths[i];
+            entry.source = (void *)buffers[i];
+            entry.target_id = handle;
+            entry.target_offset = peer_buffer_addresses[i];
+            entries.push_back(entry);
+        }
+        return engine_v1_->allocateBatch(batch_size);
     }
 
     const int max_retry = engine_->numContexts() + 1;
@@ -479,6 +634,30 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t> &batch_ids) {
     pybind11::gil_scoped_release release;
+    if (g_enable_v1) {
+        mooncake::v1::TransferStatus status;
+        for (auto &batch_id : batch_ids) {
+            bool completed = false;
+            while (!completed) {
+                auto ret = engine_v1_->getTransferStatus(batch_id, status);
+                if (!ret.ok()) {
+                    LOG(ERROR) << "getTransferStatus: " << ret.ToString();
+                    engine_v1_->freeBatch(batch_id);
+                    return -1;
+                }
+                if (status.s == mooncake::v1::PENDING ||
+                    status.s == mooncake::v1::WAITING)
+                    continue;
+                engine_v1_->freeBatch(batch_id);
+                if (status.s == mooncake::v1::COMPLETED) {
+                    completed = true;
+                } else if (status.s == mooncake::v1::CANCELED) {
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto &batch_id : batch_ids) {
@@ -547,10 +726,33 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
-            handle = engine_->openSegment(target_hostname);
+            if (g_enable_v1) {
+                auto status = engine_v1_->openSegment(handle, target_hostname);
+                if (!status.ok()) {
+                    LOG(ERROR) << "openSegment: " << status.ToString();
+                    return -1;
+                }
+            } else
+                handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
         }
+    }
+
+    if (g_enable_v1) {
+        auto batch_id = engine_v1_->allocateBatch(1);
+        mooncake::v1::Request entry;
+        entry.opcode = mooncake::v1::Request::WRITE;
+        entry.length = length;
+        entry.source = (void *)buffer;
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_address;
+        auto ret = engine_v1_->submitTransfer(batch_id, {entry});
+        if (!ret.ok()) {
+            LOG(ERROR) << "submitTransfer: " << ret.ToString();
+            return -1;
+        }
+        return batch_id;
     }
 
     auto batch_id = engine_->allocateBatchID(1);
@@ -569,6 +771,21 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
+    if (g_enable_v1) {
+        mooncake::v1::TransferStatus status;
+        engine_v1_->getTransferStatus(batch_id, 0, status);
+        if (status.s == mooncake::v1::COMPLETED) {
+            engine_v1_->freeBatch(batch_id);
+            return 1;
+        } else if (status.s == mooncake::v1::FAILED) {
+            engine_v1_->freeBatch(batch_id);
+            return -1;
+        } else if (status.s == mooncake::v1::TIMEOUT) {
+            return -2;
+        } else {
+            return 0;
+        }
+    }
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
     LOG_ASSERT(s.ok());
@@ -589,6 +806,17 @@ int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities) {
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
+    if (g_enable_v1) {
+        for (size_t i = 0; i < batch_size; i++) {
+            auto ret = engine_v1_->registerLocalMemory(
+                (void *)buffer_addresses[i], capacities[i]);
+            if (!ret.ok()) {
+                LOG(ERROR) << "registerLocalMemory: " << ret.ToString();
+                return -1;
+            }
+        }
+        return 0;
+    }
     std::vector<BufferEntry> buffers;
     for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(
@@ -600,6 +828,18 @@ int TransferEnginePy::batchRegisterMemory(
 int TransferEnginePy::batchUnregisterMemory(
     std::vector<uintptr_t> buffer_addresses) {
     pybind11::gil_scoped_release release;
+    if (g_enable_v1) {
+        auto batch_size = buffer_addresses.size();
+        for (size_t i = 0; i < batch_size; i++) {
+            auto ret = engine_v1_->unregisterLocalMemory(
+                (void *)buffer_addresses[i], 0);
+            if (!ret.ok()) {
+                LOG(ERROR) << "unregisterLocalMemory: " << ret.ToString();
+                return -1;
+            }
+        }
+        return 0;
+    }
     auto batch_size = buffer_addresses.size();
     std::vector<void *> buffers;
     for (size_t i = 0; i < batch_size; i++) {
@@ -610,16 +850,47 @@ int TransferEnginePy::batchUnregisterMemory(
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
+    if (g_enable_v1) {
+        auto ret = engine_v1_->registerLocalMemory(buffer, capacity);
+        if (!ret.ok()) {
+            LOG(ERROR) << "registerLocalMemory: " << ret.ToString();
+            return -1;
+        }
+        return 0;
+    }
     return engine_->registerLocalMemory(buffer, capacity);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
+    if (g_enable_v1) {
+        auto ret = engine_v1_->unregisterLocalMemory(buffer, 0);
+        if (!ret.ok()) {
+            LOG(ERROR) << "unregisterLocalMemory: " << ret.ToString();
+            return -1;
+        }
+        return 0;
+    }
     return engine_->unregisterLocalMemory(buffer);
 }
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string &segment_name) {
+    if (g_enable_v1) {
+        mooncake::v1::SegmentID handle = 0;
+        mooncake::v1::SegmentInfo info;
+        auto ret = engine_v1_->openSegment(handle, segment_name);
+        if (!ret.ok()) {
+            LOG(ERROR) << "openSegment: " << ret.ToString();
+            return 0;
+        }
+        ret = engine_v1_->getSegmentInfo(handle, info);
+        if (!ret.ok()) {
+            LOG(ERROR) << "getSegmentInfo: " << ret.ToString();
+            return 0;
+        }
+        return info.buffers[0].base;
+    }
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
