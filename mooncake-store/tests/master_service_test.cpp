@@ -1006,9 +1006,9 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     // Mount two segments sized to fit exactly one replica each
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t object_size = 1024 * 1024 * 16;
-    constexpr size_t segment_size =
-        object_size;  // force at most 1 replica per segment
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t object_size =
+        segment_size - 16;  // force at most 1 replica per segment
 
     Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
     Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
