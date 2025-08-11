@@ -999,6 +999,60 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
               segment2.name);
 }
 
+TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
+    std::unique_ptr<MasterService> service_(new MasterService(false));
+
+    // TODO: mount two larger segments when replication affinity fixed
+    // Mount two segments sized to fit exactly one replica each
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t object_size =
+        segment_size / 2 + 16;  // force at most 1 replica per segment
+
+    Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
+    Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
+    UUID client_id = generate_uuid();
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    // Put a key with 2 replicas
+    std::string key = "replicated_key";
+    std::vector<uint64_t> slice_lengths = {object_size};
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_EQ(2u, put_start_result->size());
+    ASSERT_TRUE(service_->PutEnd(key).has_value());
+
+    // Verify two replicas exist and they are on distinct segments
+    auto get_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result.has_value());
+    auto replicas = get_result.value();
+    ASSERT_EQ(2u, replicas.size());
+    std::unordered_set<std::string> seg_names;
+    for (const auto& rep : replicas) {
+        ASSERT_EQ(ReplicaStatus::COMPLETE, rep.status);
+        const auto& mem = rep.get_memory_descriptor();
+        ASSERT_EQ(1u, mem.buffer_descriptors.size());
+        seg_names.insert(mem.buffer_descriptors[0].segment_name_);
+    }
+    ASSERT_EQ(2u, seg_names.size())
+        << "Replicas should be on different segments";
+
+    // Unmount one segment
+    ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id).has_value());
+
+    // Key should still be readable via the remaining replica
+    auto get_after_unmount = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_after_unmount.has_value())
+        << "Object should remain accessible with surviving replica";
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;
