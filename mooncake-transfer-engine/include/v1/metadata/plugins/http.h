@@ -87,7 +87,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
             std::string message =
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
-                std::string("HTTP received unexcepted response: ") + message +
+                std::string("HTTP received unexpected response: ") + message +
                 LOC_MARK);
         }
         value = std::string(readBuffer);
@@ -132,7 +132,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
             std::string message =
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
-                std::string("HTTP received unexcepted response: ") + message +
+                std::string("HTTP received unexpected response: ") + message +
                 LOC_MARK);
         }
 
@@ -169,7 +169,7 @@ class HttpMetadataPlugin : public MetadataPlugin {
             std::string message =
                 std::to_string(responseCode) + ": " + readBuffer;
             return Status::MetadataError(
-                std::string("HTTP received unexcepted response: ") + message +
+                std::string("HTTP received unexpected response: ") + message +
                 LOC_MARK);
         }
 

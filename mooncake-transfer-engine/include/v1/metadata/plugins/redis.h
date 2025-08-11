@@ -21,6 +21,7 @@
 #include <atomic>
 
 #include "v1/metadata/plugin.h"
+#include "v1/utility/ip.h"
 
 namespace mooncake {
 namespace v1 {

@@ -101,7 +101,7 @@ class Transport {
     virtual bool supportNotification() const { return false; }
 
     virtual Status sendNotification(SegmentID target_id,
-                              const Notification &notify) {
+                                    const Notification &notify) {
         return Status::NotImplemented(
             "sendNotification not implemented" LOC_MARK);
     }
