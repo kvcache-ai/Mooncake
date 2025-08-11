@@ -36,7 +36,7 @@ class RedisMetadataPlugin : public MetadataPlugin {
             return Status::MetadataError(
                 "Redis connection already established" LOC_MARK);
         }
-        auto hostname_port = parseHostNameWithPort(endpoint);
+        auto hostname_port = parseHostNameWithPort(endpoint, 6379);
         client_ =
             redisConnect(hostname_port.first.c_str(), hostname_port.second);
         if (!client_ || client_->err) {
