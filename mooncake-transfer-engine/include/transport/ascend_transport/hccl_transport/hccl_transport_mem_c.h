@@ -43,11 +43,11 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif // __cplusplus
+#endif  // __cplusplus
 
 struct RankInfo {
     uint64_t rankId = 0xFFFFFFFF;
-    uint64_t serverIdx; 
+    uint64_t serverIdx;
     struct in_addr hostIp;
     uint64_t hostPort;
     uint64_t deviceLogicId;
@@ -69,7 +69,7 @@ struct RankControlInfo {
 struct MergeMem {
     void *addr = nullptr;
     uint64_t len = 0;
-    MergeMem(void* addr_, size_t len_) : addr(addr_), len(len_) {}
+    MergeMem(void *addr_, size_t len_) : addr(addr_), len(len_) {}
 };
 
 struct ConnectionInfo {
@@ -80,25 +80,28 @@ struct ConnectionInfo {
 };
 
 // Retry mechanism for initialization function failure
-#define RETRY_CALL(funcCall, errorMsg) \
-    do { \
-        int retryCount = 0; \
-        int __ret = funcCall; \
-        while (__ret && retryCount < 3) { \
-            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount << "/3)"; \
-            __ret = funcCall; \
-        } \
-        if (__ret) { \
-            LOG(ERROR) << errorMsg << " failed after 3 retries."; \
-            return __ret; \
-        } \
+#define RETRY_CALL(funcCall, errorMsg)                                  \
+    do {                                                                \
+        int retryCount = 0;                                             \
+        int __ret = funcCall;                                           \
+        while (__ret && retryCount < 3) {                               \
+            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount \
+                       << "/3), ret :" << __ret;                        \
+            __ret = funcCall;                                           \
+        }                                                               \
+        if (__ret) {                                                    \
+            LOG(ERROR) << errorMsg                                      \
+                       << " failed after 3 retries, ret: " << __ret;    \
+            return __ret;                                               \
+        }                                                               \
     } while (0)
 
 extern int initTransportMem(RankInfo *local_rank_info);
 
-extern int transportMemTask(RankInfo *local_rank_info, 
-                            RankInfo *remote_rank_info, int op_code, uint64_t offset,
-                            uint64_t req_len, void *local_mem, aclrtStream stream);
+extern int transportMemTask(RankInfo *local_rank_info,
+                            RankInfo *remote_rank_info, int op_code,
+                            uint64_t offset, uint64_t req_len, void *local_mem,
+                            aclrtStream stream);
 
 extern int transportMemAccept(RankInfo *local_rank_info);
 
@@ -106,10 +109,11 @@ extern int regLocalRmaMem(void *addr, uint64_t length);
 
 extern bool printEnabled();
 
-extern int transportMemAddOpFence(RankInfo *remote_rank_info, aclrtStream stream);
+extern int transportMemAddOpFence(RankInfo *remote_rank_info,
+                                  aclrtStream stream);
 
 #ifdef __cplusplus
 }
-#endif // __cplusplus
+#endif  // __cplusplus
 
-#endif // HCCL_TRANSPORT_MEM_C_H
+#endif  // HCCL_TRANSPORT_MEM_C_H

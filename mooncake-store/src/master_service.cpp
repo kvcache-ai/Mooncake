@@ -7,20 +7,18 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
+#include "segment.h"
 #include "types.h"
 
 namespace mooncake {
 
-MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                             uint64_t default_kv_soft_pin_ttl,
-                             bool allow_evict_soft_pinned_objects,
-                             double eviction_ratio,
-                             double eviction_high_watermark_ratio,
-                             ViewVersionId view_version,
-                             int64_t client_live_ttl_sec, bool enable_ha,
-                             const std::string& cluster_id)
-    : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
-      enable_gc_(enable_gc),
+MasterService::MasterService(
+    bool enable_gc, uint64_t default_kv_lease_ttl,
+    uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
+    double eviction_ratio, double eviction_high_watermark_ratio,
+    ViewVersionId view_version, int64_t client_live_ttl_sec, bool enable_ha,
+    const std::string& cluster_id, BufferAllocatorType memory_allocator)
+    : enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
@@ -28,7 +26,9 @@ MasterService::MasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
       eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
       client_live_ttl_sec_(client_live_ttl_sec),
       enable_ha_(enable_ha),
-      cluster_id_(cluster_id) {
+      cluster_id_(cluster_id),
+      segment_manager_(memory_allocator),
+      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -385,9 +385,6 @@ auto MasterService::PutStart(const std::string& key,
                     allocators, allocators_by_name, chunk_size, config);
 
                 if (!handle) {
-                    LOG(ERROR)
-                        << "key=" << key << ", replica_id=" << i
-                        << ", slice_index=" << j << ", error=allocation_failed";
                     // If the allocation failed, we need to evict some objects
                     // to free up space for future allocations.
                     need_eviction_ = true;
@@ -580,7 +577,7 @@ size_t MasterService::GetKeyCount() const {
 }
 
 auto MasterService::Ping(const UUID& client_id)
-    -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> {
+    -> tl::expected<PingResponse, ErrorCode> {
     if (!enable_ha_) {
         LOG(ERROR) << "Ping is only available in HA mode";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -601,7 +598,7 @@ auto MasterService::Ping(const UUID& client_id)
                    << ", error=client_ping_queue_full";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return std::make_pair(view_version_, client_status);
+    return PingResponse(view_version_, client_status);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {

@@ -11,6 +11,7 @@
 
 #include "etcd_helper.h"
 #include "rpc_service.h"
+#include "config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -79,9 +80,8 @@ class MasterServiceSupervisor {
         int rpc_port, size_t rpc_thread_num, bool enable_gc,
         bool enable_metric_reporting, int metrics_port,
         int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
-        bool allow_evict_soft_pinned_objects,
-        double eviction_ratio, double eviction_high_watermark_ratio,
-        int64_t client_live_ttl_sec,
+        bool allow_evict_soft_pinned_objects, double eviction_ratio,
+        double eviction_high_watermark_ratio, int64_t client_live_ttl_sec,
         const std::string& etcd_endpoints = "0.0.0.0:2379",
         const std::string& local_hostname = "0.0.0.0:50051",
         const std::string& rpc_address = "0.0.0.0",
@@ -89,7 +89,9 @@ class MasterServiceSupervisor {
             std::chrono::seconds(
                 0),  // Client connection timeout. 0 = no timeout (infinite)
         bool rpc_enable_tcp_no_delay = true,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID);
+        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterServiceSupervisor(const MasterConfig& master_config);
     int Start();
     ~MasterServiceSupervisor();
 
@@ -122,6 +124,7 @@ class MasterServiceSupervisor {
     std::string local_hostname_;
 
     std::string cluster_id_;
+    BufferAllocatorType memory_allocator_;
 };
 
 }  // namespace mooncake

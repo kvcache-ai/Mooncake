@@ -3,8 +3,12 @@
 
 #include "offset_allocator/offset_allocator.hpp"
 
-#include "mutex.h"
+#include <cmath>
+#include <iomanip>
 #include <iostream>
+
+#include "mutex.h"
+#include "utils.h"
 
 #ifdef DEBUG
 #include <assert.h>
@@ -122,20 +126,22 @@ uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
 }
 
 // __Allocator...
-__Allocator::__Allocator(uint32 size, uint32 maxAllocs)
+__Allocator::__Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity)
     : m_size(size),
-      m_maxAllocs(maxAllocs),
+      m_current_capacity(init_capacity),
+      m_max_capacity(std::max(init_capacity, max_capacity)),
       m_nodes(nullptr),
       m_freeNodes(nullptr) {
     if (sizeof(NodeIndex) == 2) {
-        ASSERT(maxAllocs <= 65536);
+        ASSERT(m_max_capacity <= 65536);
     }
     reset();
 }
 
 __Allocator::__Allocator(__Allocator&& other)
     : m_size(other.m_size),
-      m_maxAllocs(other.m_maxAllocs),
+      m_current_capacity(other.m_current_capacity),
+      m_max_capacity(other.m_max_capacity),
       m_freeStorage(other.m_freeStorage),
       m_usedBinsTop(other.m_usedBinsTop),
       m_nodes(other.m_nodes),
@@ -147,14 +153,15 @@ __Allocator::__Allocator(__Allocator&& other)
     other.m_nodes = nullptr;
     other.m_freeNodes = nullptr;
     other.m_freeOffset = 0;
-    other.m_maxAllocs = 0;
+    other.m_current_capacity = 0;
+    other.m_max_capacity = 0;
     other.m_usedBinsTop = 0;
 }
 
 void __Allocator::reset() {
     m_freeStorage = 0;
     m_usedBinsTop = 0;
-    m_freeOffset = m_maxAllocs - 1;
+    m_freeOffset = 0;
 
     for (uint32 i = 0; i < NUM_TOP_BINS; i++) m_usedBins[i] = 0;
 
@@ -163,12 +170,12 @@ void __Allocator::reset() {
     if (m_nodes) delete[] m_nodes;
     if (m_freeNodes) delete[] m_freeNodes;
 
-    m_nodes = new Node[m_maxAllocs];
-    m_freeNodes = new NodeIndex[m_maxAllocs];
+    m_nodes = new Node[m_max_capacity];
+    m_freeNodes = new NodeIndex[m_max_capacity];
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
-    for (uint32 i = 0; i < m_maxAllocs; i++) {
-        m_freeNodes[i] = m_maxAllocs - i - 1;
+    for (uint32 i = 0; i < m_current_capacity; i++) {
+        m_freeNodes[i] = i;
     }
 
     // Start state: Whole storage as one big node
@@ -183,9 +190,13 @@ __Allocator::~__Allocator() {
 
 OffsetAllocation __Allocator::allocate(uint32 size) {
     // Out of allocations?
-    if (m_freeOffset == 0) {
-        return {.offset = OffsetAllocation::NO_SPACE,
-                .metadata = OffsetAllocation::NO_SPACE};
+    if (m_freeOffset == m_max_capacity) {
+        return OffsetAllocation(OffsetAllocation::NO_SPACE,
+                                OffsetAllocation::NO_SPACE);
+    }
+    if (m_freeOffset == m_current_capacity) {
+        m_freeNodes[m_current_capacity] = m_current_capacity;
+        m_current_capacity++;
     }
 
     // Round up to bin index to ensure that alloc >= bin
@@ -210,8 +221,8 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
 
         // Out of space?
         if (topBinIndex == OffsetAllocation::NO_SPACE) {
-            return {.offset = OffsetAllocation::NO_SPACE,
-                    .metadata = OffsetAllocation::NO_SPACE};
+            return OffsetAllocation(OffsetAllocation::NO_SPACE,
+                                    OffsetAllocation::NO_SPACE);
         }
 
         // All leaf bins here fit the alloc, since the top bin was rounded up.
@@ -273,7 +284,7 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
         node.neighborNext = newNodeIndex;
     }
 
-    return {.offset = node.dataOffset, .metadata = nodeIndex};
+    return OffsetAllocation(node.dataOffset, nodeIndex);
 }
 
 void __Allocator::free(OffsetAllocation allocation) {
@@ -324,9 +335,9 @@ void __Allocator::free(OffsetAllocation allocation) {
     // Insert the removed node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (free)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     // Insert the (combined) free node to bin
     uint32 combinedNodeIndex = insertNodeIntoBin(size, offset);
@@ -359,9 +370,9 @@ uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
     // Take a freelist node and insert on top of the bin linked list (next = old
     // top)
     uint32 topNodeIndex = m_binIndices[binIndex];
-    uint32 nodeIndex = m_freeNodes[m_freeOffset--];
+    uint32 nodeIndex = m_freeNodes[m_freeOffset++];
 #ifdef DEBUG_VERBOSE
-    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset + 1);
+    printf("Getting node %u from freelist[%u]\n", nodeIndex, m_freeOffset - 1);
 #endif
     m_nodes[nodeIndex] = {.dataOffset = dataOffset,
                           .dataSize = size,
@@ -416,9 +427,9 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
     // Insert the node to freelist
 #ifdef DEBUG_VERBOSE
     printf("Putting node %u into freelist[%u] (removeNodeFromBin)\n", nodeIndex,
-           m_freeOffset + 1);
+           m_freeOffset - 1);
 #endif
-    m_freeNodes[++m_freeOffset] = nodeIndex;
+    m_freeNodes[--m_freeOffset] = nodeIndex;
 
     m_freeStorage -= node.dataSize;
 #ifdef DEBUG_VERBOSE
@@ -439,7 +450,7 @@ OffsetAllocStorageReport __Allocator::storageReport() const {
     uint32 freeStorage = 0;
 
     // Out of allocations? -> Zero free space
-    if (m_freeOffset > 0) {
+    if (m_freeOffset < m_max_capacity) {
         freeStorage = m_freeStorage;
         if (m_usedBinsTop) {
             uint32 topBinIndex = 31 - lzcnt_nonzero(m_usedBinsTop);
@@ -470,20 +481,22 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 }
 
 // OffsetAllocationHandle implementation
-OffsetAllocationHandle::OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
-                                   OffsetAllocation allocation, uint64_t base,
-                                   uint64_t size)
+OffsetAllocationHandle::OffsetAllocationHandle(
+    std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
+    uint64_t base, uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
       requested_size(size) {}
 
-OffsetAllocationHandle::OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept
+OffsetAllocationHandle::OffsetAllocationHandle(
+    OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
       requested_size(other.requested_size) {
-    other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    other.m_allocation = {OffsetAllocation::NO_SPACE,
+                          OffsetAllocation::NO_SPACE};
     other.real_base = 0;
     other.requested_size = 0;
 }
@@ -494,7 +507,7 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         // Free current allocation if valid{
         auto allocator = m_allocator.lock();
         if (allocator) {
-            allocator->freeAllocation(m_allocation);
+            allocator->freeAllocation(m_allocation, requested_size);
         }
 
         // Move from other
@@ -504,7 +517,8 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         requested_size = other.requested_size;
 
         // Reset other
-        other.m_allocation = {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+        other.m_allocation = {OffsetAllocation::NO_SPACE,
+                              OffsetAllocation::NO_SPACE};
         other.real_base = 0;
         other.requested_size = 0;
     }
@@ -514,28 +528,36 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
 OffsetAllocationHandle::~OffsetAllocationHandle() {
     auto allocator = m_allocator.lock();
     if (allocator) {
-        allocator->freeAllocation(m_allocation);
+        allocator->freeAllocation(m_allocation, requested_size);
     }
 }
 
 // Helper function to calculate the multiplier
 static uint64_t calculateMultiplier(size_t size) {
-    uint64_t multiplier = 1;
-    for (; SmallFloat::MAX_BIN_SIZE < size / multiplier; multiplier *= 2) {
+    uint64_t multiplier_bits = 0;
+    for (; SmallFloat::MAX_BIN_SIZE < (size >> multiplier_bits);
+         multiplier_bits++) {
     }
-    return multiplier;
+    return multiplier_bits;
 }
 
 // Thread-safe OffsetAllocator implementation
-std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base, size_t size,
-                                             uint32 maxAllocs) {
+std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
+                                                         size_t size,
+                                                         uint32 init_capacity,
+                                                         uint32 max_capacity) {
     // Use a custom deleter to allow private constructor
-    return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(base, size, maxAllocs));
+    return std::shared_ptr<OffsetAllocator>(
+        new OffsetAllocator(base, size, init_capacity, max_capacity));
 }
 
-OffsetAllocator::OffsetAllocator(uint64_t base, size_t size, uint32 maxAllocs)
-    : m_base(base), m_multiplier(calculateMultiplier(size)) {
-    m_allocator = std::make_unique<__Allocator>(size / m_multiplier, maxAllocs);
+OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
+                                 uint32 init_capacity, uint32 max_capacity)
+    : m_base(base),
+      m_multiplier_bits(calculateMultiplier(size)),
+      m_capacity(size) {
+    m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
+                                                init_capacity, max_capacity);
 }
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
@@ -549,21 +571,33 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     }
 
     size_t fake_size =
-        m_multiplier > 1 ? (size + m_multiplier - 1) / m_multiplier : size;
+        m_multiplier_bits > 0
+            ? ((size + (static_cast<uint64_t>(1) << m_multiplier_bits) - 1u) >>
+               m_multiplier_bits)
+            : size;
 
     if (fake_size > SmallFloat::MAX_BIN_SIZE) {
         return std::nullopt;
     }
 
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
-    if (allocation.offset == OffsetAllocation::NO_SPACE) {
+    if (allocation.isNoSpace()) {
+        // Log metrics to help understand why allocation failed
+        // Note: We're already holding m_mutex, so use internal method
+        OffsetAllocatorMetrics metrics = get_metrics_internal();
+        VLOG(1) << "OffsetAllocator allocation failed: size=" << size
+                << ", fake_size=" << fake_size << ", " << metrics;
         return std::nullopt;
     }
 
+    // Update lightweight metrics
+    m_allocated_size += size;
+    m_allocated_num++;
+
     // Use shared_from_this to get a shared_ptr to this OffsetAllocator
-    return OffsetAllocationHandle(shared_from_this(), allocation,
-                            m_base + allocation.offset * m_multiplier,
-                            size);
+    return OffsetAllocationHandle(
+        shared_from_this(), allocation,
+        m_base + (allocation.getOffset() << m_multiplier_bits), size);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
@@ -572,8 +606,8 @@ OffsetAllocStorageReport OffsetAllocator::storageReport() const {
         return {0, 0};
     }
     OffsetAllocStorageReport report = m_allocator->storageReport();
-    return {report.totalFreeSpace * m_multiplier,
-            report.largestFreeRegion * m_multiplier};
+    return {report.totalFreeSpace << m_multiplier_bits,
+            report.largestFreeRegion << m_multiplier_bits};
 }
 
 OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
@@ -584,17 +618,63 @@ OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
     }
     OffsetAllocStorageReportFull report = m_allocator->storageReportFull();
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) {
-        report.freeRegions[i] = {.size = report.freeRegions[i].size * m_multiplier,
-                                 .count = report.freeRegions[i].count};
+        report.freeRegions[i] = {
+            .size = report.freeRegions[i].size << m_multiplier_bits,
+            .count = report.freeRegions[i].count};
     }
     return report;
 }
 
-void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation) {
+OffsetAllocatorMetrics OffsetAllocator::get_metrics_internal() const {
+    if (!m_allocator) {
+        return {0, 0, 0, 0, m_capacity};
+    }
+
+    // Get basic storage report
+    OffsetAllocStorageReport basic_report = m_allocator->storageReport();
+    return {
+        m_allocated_size,  // allocated_size_
+        m_allocated_num,   // allocated_num_
+        basic_report.largestFreeRegion
+            << m_multiplier_bits,  // largest_free_region_
+        basic_report.totalFreeSpace << m_multiplier_bits,  // total_free_space_
+        m_capacity,                                        // capacity
+    };
+}
+
+OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
+    MutexLocker guard(&m_mutex);
+    return get_metrics_internal();
+}
+
+void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
+                                     uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);
+        // Update lightweight metrics
+        m_allocated_size -= size;
+        m_allocated_num--;
     }
+}
+
+// Stream output operator implementation
+std::ostream& operator<<(std::ostream& os,
+                         const OffsetAllocatorMetrics& metrics) {
+    double utilization =
+        metrics.capacity > 0
+            ? (double)metrics.allocated_size_ / metrics.capacity * 100.0
+            : 0.0;
+    os << "OffsetAllocatorMetrics{"
+       << "allocated=" << mooncake::byte_size_to_string(metrics.allocated_size_)
+       << ", allocs=" << metrics.allocated_num_
+       << ", capacity=" << mooncake::byte_size_to_string(metrics.capacity)
+       << ", utilization=" << std::fixed << std::setprecision(1) << utilization
+       << "%" << ", free_space="
+       << mooncake::byte_size_to_string(metrics.total_free_space_)
+       << ", largest_free="
+       << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";
+    return os;
 }
 
 }  // namespace mooncake::offset_allocator

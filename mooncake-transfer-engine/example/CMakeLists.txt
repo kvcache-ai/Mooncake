@@ -6,6 +6,9 @@ link_directories(${ASCEND_LIB_DIR})
 add_executable(transfer_engine_bench transfer_engine_bench.cpp)
 target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 
+add_executable(transfer_engine_validator transfer_engine_validator.cpp)
+target_link_libraries(transfer_engine_validator PUBLIC transfer_engine)
+
 add_executable(transfer_engine_bench_with_notify transfer_engine_bench_with_notify.cpp)
 target_link_libraries(transfer_engine_bench_with_notify PUBLIC transfer_engine)
 

@@ -68,6 +68,15 @@ performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
 :::
 
+% API Documentation
+
+:::{toctree}
+:caption: Mooncake Store API
+:maxdepth: 1
+
+mooncake-store-api/python-binding
+:::
+
 % Explanation of Mooncake internals
 
 :::{toctree}

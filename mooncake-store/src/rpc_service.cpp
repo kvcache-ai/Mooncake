@@ -28,11 +28,13 @@ WrappedMasterService::WrappedMasterService(
     uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
     bool enable_metric_reporting, uint16_t http_port, double eviction_ratio,
     double eviction_high_watermark_ratio, ViewVersionId view_version,
-    int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id)
+    int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id,
+    BufferAllocatorType memory_allocator)
     : master_service_(enable_gc, default_kv_lease_ttl, default_kv_soft_pin_ttl,
                       allow_evict_soft_pinned_objects, eviction_ratio,
                       eviction_high_watermark_ratio, view_version,
-                      client_live_ttl_sec, enable_ha, cluster_id),
+                      client_live_ttl_sec, enable_ha, cluster_id,
+                      memory_allocator),
       http_server_(4, http_port),
       metric_report_running_(enable_metric_reporting) {
     init_http_server();
@@ -191,8 +193,9 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchExistKey");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_exist_key_requests();
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
 
     auto result = master_service_.BatchExistKey(keys);
 
@@ -204,7 +207,14 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
                        << keys[i] << "': " << toString(result[i].error());
         }
     }
-    MasterMetricManager::instance().inc_batch_exist_key_failures(failure_count);
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_exist_key_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_exist_key_partial_success(
+            failure_count);
+    }
 
     timer.LogResponse("total=", result.size(),
                       ", success=", result.size() - failure_count,
@@ -227,8 +237,10 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_get_replica_list_requests();
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_keys);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
@@ -246,8 +258,14 @@ WrappedMasterService::BatchGetReplicaList(
                        << keys[i] << "': " << toString(results[i].error());
         }
     }
-    MasterMetricManager::instance().inc_batch_get_replica_list_failures(
-        failure_count);
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
+    }
 
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
@@ -294,8 +312,9 @@ WrappedMasterService::BatchPutStart(
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_put_start_requests();
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
@@ -314,7 +333,14 @@ WrappedMasterService::BatchPutStart(
                        << keys[i] << "': " << toString(results[i].error());
         }
     }
-    MasterMetricManager::instance().inc_batch_put_start_failures(failure_count);
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_start_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_start_partial_success(
+            failure_count);
+    }
 
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
@@ -325,8 +351,9 @@ WrappedMasterService::BatchPutStart(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_put_end_requests();
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
@@ -343,7 +370,14 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
                        << "': " << toString(results[i].error());
         }
     }
-    MasterMetricManager::instance().inc_batch_put_end_failures(failure_count);
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_end_partial_success(
+            failure_count);
+    }
 
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
@@ -354,8 +388,9 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchPutRevoke");
-    timer.LogRequest("keys_count=", keys.size());
-    MasterMetricManager::instance().inc_batch_put_revoke_requests();
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
 
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
@@ -372,8 +407,14 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
                        << keys[i] << "': " << toString(results[i].error());
         }
     }
-    MasterMetricManager::instance().inc_batch_put_revoke_failures(
-        failure_count);
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_revoke_partial_success(
+            failure_count);
+    }
 
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
@@ -449,8 +490,8 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
-tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>
-WrappedMasterService::Ping(const UUID& client_id) {
+tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 

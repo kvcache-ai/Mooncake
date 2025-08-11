@@ -9,6 +9,11 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 import os
 from mooncake.store import MooncakeDistributedStore
+import threading
+import queue
+import copy
+import math
+from collections import defaultdict
 
 # Disable memcpy optimization
 os.environ["MC_STORE_MEMCPY"] = "0"
@@ -72,11 +77,46 @@ class PerformanceTracker:
     def __init__(self):
         self.operation_latencies: List[float] = []
         self.operation_sizes: List[int] = []
+        self.error_codes: Dict[int, int] = defaultdict(int)
+        self.start_time: float = 0
+        self.end_time: float = 0
+        self.total_operations: int = 0
+        self.failed_operations: int = 0
+        self.bytes_transferred: int = 0
 
     def record_operation(self, latency_seconds: float, data_size_bytes: int):
         """Record a single operation's performance."""
         self.operation_latencies.append(latency_seconds)
         self.operation_sizes.append(data_size_bytes)
+        
+    def record_error(self, error_code: int):
+        """Record an error code."""
+        self.error_codes[error_code] += 1
+        self.failed_operations += 1
+        
+    def extend(self, other: 'PerformanceTracker'):
+        """Combine data from another tracker."""
+        self.operation_latencies.extend(other.operation_latencies)
+        self.operation_sizes.extend(other.operation_sizes)
+        self.total_operations += other.total_operations
+        self.failed_operations += other.failed_operations
+        self.bytes_transferred += other.bytes_transferred
+        
+        # Merge error codes
+        for code, count in other.error_codes.items():
+            self.error_codes[code] += count
+            
+    def start_timer(self):
+        """Start the overall timer for the test."""
+        self.start_time = time.perf_counter()
+        
+    def stop_timer(self):
+        """Stop the overall timer for the test."""
+        self.end_time = time.perf_counter()
+        
+    def get_total_time(self) -> float:
+        """Get the total wall time for the test."""
+        return self.end_time - self.start_time if self.end_time > self.start_time else 0
 
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate and return comprehensive performance statistics."""
@@ -93,22 +133,37 @@ class PerformanceTracker:
         # Calculate percentiles
         p90_latency = statistics.quantiles(latencies_ms, n=10)[8] if len(latencies_ms) >= 10 else max(latencies_ms)
         p99_latency = statistics.quantiles(latencies_ms, n=100)[98] if len(latencies_ms) >= 100 else max(latencies_ms)
+        p999_latency = statistics.quantiles(latencies_ms, n=1000)[998] if len(latencies_ms) >= 1000 else max(latencies_ms)
 
         # Calculate throughput metrics
         ops_per_second = total_operations / total_time if total_time > 0 else 0
         bytes_per_second = total_bytes / total_time if total_time > 0 else 0
         mbps = bytes_per_second / (1024 * 1024)  # MB/s
 
+        # Wall time throughput
+        wall_time = self.get_total_time()
+        wall_ops_per_second = total_operations / wall_time if wall_time > 0 else 0
+        wall_mbps = total_bytes / wall_time / (1024 * 1024) if wall_time > 0 else 0
+
         return {
             "total_operations": total_operations,
+            "succeeded_operations": total_operations - self.failed_operations,
+            "failed_operations": self.failed_operations,
             "total_time_seconds": total_time,
+            "wall_time_seconds": wall_time,
             "total_bytes": total_bytes,
             "p90_latency_ms": p90_latency,
             "p99_latency_ms": p99_latency,
-            "mean_latency_ms": statistics.mean(latencies_ms),
+            "p999_latency_ms": p999_latency,
+            "mean_latency_ms": statistics.mean(latencies_ms) if latencies_ms else 0,
+            "min_latency_ms": min(latencies_ms) if latencies_ms else 0,
+            "max_latency_ms": max(latencies_ms) if latencies_ms else 0,
             "operations_per_second": ops_per_second,
+            "wall_operations_per_second": wall_ops_per_second,
             "throughput_mbps": mbps,
-            "throughput_bytes_per_second": bytes_per_second
+            "wall_throughput_mbps": wall_mbps,
+            "throughput_bytes_per_second": bytes_per_second,
+            "error_codes": dict(self.error_codes)
         }
 
 
@@ -122,7 +177,12 @@ class TestInstance:
 
     def setup(self):
         """Initialize the MooncakeDistributedStore and allocate registered memory."""
+        if self.args.root_dir:
+            os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = self.args.root_dir
+            logger.info(f"Set storage root directory to: {self.args.root_dir}")
+
         self.store = MooncakeDistributedStore()
+        self.performance_tracker.start_timer()
 
         # Setup store
         protocol = self.args.protocol
@@ -201,11 +261,19 @@ class TestInstance:
                 successful_ops = batch_result.num_succeeded()
                 failed_ops = batch_result.num_failed()
                 total_failed_operations += failed_ops
+                self.performance_tracker.failed_operations += failed_ops
+                self.performance_tracker.total_operations += current_batch_size
+                
+                # Record error codes
+                for code in return_codes:
+                    if (operation_type == "prefill" and code != 0) or (operation_type == "decode" and code < 0):
+                        self.performance_tracker.record_error(code)
 
                 if successful_ops > 0:
                     # Record successful operations
                     total_data_size = successful_ops * self.args.value_length
                     self.performance_tracker.record_operation(operation_latency, total_data_size)
+                    self.performance_tracker.bytes_transferred += total_data_size
 
                 total_operations += current_batch_size
                 
@@ -213,6 +281,7 @@ class TestInstance:
                 pbar.update(1)
                 pbar.set_postfix({"failed_ops": total_failed_operations})
 
+        self.performance_tracker.stop_timer()
         logger.info(f"{operation_type.capitalize()} phase completed. Failed operations: {total_failed_operations}")
         self._print_performance_stats(operation_type.upper())
         
@@ -260,25 +329,93 @@ class TestInstance:
         self._run_benchmark("decode", get_batch)
 
     def _print_performance_stats(self, operation_type: str):
-        """Print comprehensive performance statistics."""
+        """Print comprehensive performance statistics in a structured format."""
         stats = self.performance_tracker.get_statistics()
 
         if "error" in stats:
             logger.info(f"No performance data available for {operation_type}: {stats['error']}")
             return
 
-        logger.info(f"\n=== {operation_type} PERFORMANCE STATISTICS ===")
-        logger.info(f"Total operations: {stats['total_operations']}")
-        logger.info(f"Total time: {stats['total_time_seconds']:.2f} seconds")
-        logger.info(f"Total data transferred: {stats['total_bytes'] / (1024*1024):.2f} MB")
-        logger.info(f"Latency metrics:")
-        logger.info(f"  Mean latency: {stats['mean_latency_ms']:.2f} ms")
-        logger.info(f"  P90 latency:  {stats['p90_latency_ms']:.2f} ms")
-        logger.info(f"  P99 latency:  {stats['p99_latency_ms']:.2f} ms")
-        logger.info(f"Throughput metrics:")
-        logger.info(f"  Operations/sec: {stats['operations_per_second']:.2f}")
-        logger.info(f"  Throughput:     {stats['throughput_mbps']:.2f} MB/s")
-        logger.info(f"===============================================\n")
+        # Calculate success rate
+        success_rate = (stats["succeeded_operations"] / stats["total_operations"]) * 100
+        
+        # Format bytes to human-readable format
+        def format_bytes(size):
+            if size == 0:
+                return "0B"
+            size_name = ("B", "KB", "MB", "GB", "TB")
+            i = int(math.floor(math.log(size, 1024)))
+            p = math.pow(1024, i)
+            s = round(size / p, 2)
+            return f"{s} {size_name[i]}"
+
+        # Build the entire report as a single string
+        report = f"\n=== {operation_type} PERFORMANCE STATISTICS ===\n"
+        report += f"Total operations: {stats['total_operations']}\n"
+        report += f"  Succeeded: {stats['succeeded_operations']} ({success_rate:.2f}%)\n"
+        report += f"  Failed:    {stats['failed_operations']}\n"
+        report += f"Total data transferred: {format_bytes(stats['total_bytes'])}\n"
+        report += f"Total wall time: {stats['wall_time_seconds']:.2f} seconds\n"
+        report += f"Total operation time: {stats['total_time_seconds']:.2f} seconds\n"
+        report += "Latency metrics:\n"
+        report += f"  Mean latency: {stats['mean_latency_ms']:.2f} ms\n"
+        report += f"  Min latency:  {stats['min_latency_ms']:.2f} ms\n"
+        report += f"  Max latency:  {stats['max_latency_ms']:.2f} ms\n"
+        report += f"  P90 latency:  {stats['p90_latency_ms']:.2f} ms\n"
+        report += f"  P99 latency:  {stats['p99_latency_ms']:.2f} ms\n"
+        report += f"  P999 latency: {stats['p999_latency_ms']:.2f} ms\n"
+        report += "Throughput metrics:\n"
+        report += f"  Operations/sec (operation time): {stats['operations_per_second']:.2f}\n"
+        report += f"  Operations/sec (wall time):      {stats['wall_operations_per_second']:.2f}\n"
+        report += f"  Throughput (operation time):     {stats['throughput_mbps']:.2f} MB/s\n"
+        report += f"  Throughput (wall time):          {stats['wall_throughput_mbps']:.2f} MB/s\n"
+        
+        # Add error codes if any
+        if stats['error_codes']:
+            report += "Error codes encountered:\n"
+            for code, count in stats['error_codes'].items():
+                report += f"  Code {code}: {count} times\n"
+                
+        report += "===============================================\n"
+        
+        # Log the entire report as a single message
+        logger.info(report)
+
+
+def worker_thread(args, results_queue, start_barrier, end_barrier):
+    """Worker thread function for executing tests."""
+    try:
+        thread_name = threading.current_thread().name
+        logger.info(f"Worker thread {thread_name} initializing...")
+        
+        # Create tester instance and setup
+        tester = TestInstance(args)
+        tester.setup()
+        
+        # Wait for all threads to be ready
+        logger.info(f"Worker thread {thread_name} waiting at start barrier")
+        start_barrier.wait()
+        logger.info(f"Worker thread {thread_name} passed start barrier")
+        
+        # Execute test
+        if args.role == "decode":
+            tester.decode()
+        else:
+            tester.prefill()
+
+        # Put results in the queue
+        results_queue.put(tester.performance_tracker)
+        logger.info(f"Worker thread {thread_name} completed successfully")
+    except Exception as e:
+        logger.error(f"Worker thread {threading.current_thread().name} failed: {e}")
+        tracker = PerformanceTracker()
+        tracker.record_error(-999)  # Special error code for thread failure
+        results_queue.put(tracker)
+    finally:
+        # Ensure we always reach the end barrier
+        logger.info(f"Worker thread {thread_name} waiting at end barrier")
+        end_barrier.wait()
+        logger.info(f"Worker thread {thread_name} passed end barrier")
 
 
 def parse_arguments():
@@ -308,8 +445,68 @@ def parse_arguments():
     parser.add_argument("--value-length", type=int, default=4*1024*1024, help="Size of each value in bytes")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for operations")
     parser.add_argument("--wait-time", type=int, default=20, help="Wait time in seconds after operations complete")
+    parser.add_argument("--root-dir", type=str, default="", help="Root directory for storage (sets MOONCAKE_STORAGE_ROOT_DIR)")
+    
+    # Multi-threading parameters
+    parser.add_argument("--num-workers", type=int, default=1,
+                       help="Number of worker threads to use for concurrent operations")
+    
+    # Statistics parameters
+    parser.add_argument("--detailed-stats", action="store_true", 
+                       help="Enable detailed statistics per worker thread")
 
     return parser.parse_args()
+
+
+def print_performance_stats(stats: Dict[str, Any], title: str):
+    """Print performance statistics in a structured format."""
+    # Calculate success rate
+    total_ops = stats["total_operations"]
+    succeeded_ops = stats["succeeded_operations"]
+    failed_ops = stats["failed_operations"]
+    success_rate = (succeeded_ops / total_ops) * 100 if total_ops > 0 else 0
+    
+    # Format bytes to human-readable format
+    def format_bytes(size):
+        if size == 0:
+            return "0B"
+        size_name = ("B", "KB", "MB", "GB", "TB")
+        i = int(math.floor(math.log(size, 1024)))
+        p = math.pow(1024, i)
+        s = round(size / p, 2)
+        return f"{s} {size_name[i]}"
+
+    # Build the entire report as a single string
+    report = f"\n=== {title} PERFORMANCE STATISTICS ===\n"
+    report += f"Total operations: {total_ops}\n"
+    report += f"  Succeeded: {succeeded_ops} ({success_rate:.2f}%)\n"
+    report += f"  Failed:    {failed_ops}\n"
+    report += f"Total data transferred: {format_bytes(stats['total_bytes'])}\n"
+    report += f"Total wall time: {stats['wall_time_seconds']:.2f} seconds\n"
+    report += f"Total operation time: {stats['total_time_seconds']:.2f} seconds\n"
+    report += "Latency metrics:\n"
+    report += f"  Mean latency: {stats['mean_latency_ms']:.2f} ms\n"
+    report += f"  Min latency:  {stats['min_latency_ms']:.2f} ms\n"
+    report += f"  Max latency:  {stats['max_latency_ms']:.2f} ms\n"
+    report += f"  P90 latency:  {stats['p90_latency_ms']:.2f} ms\n"
+    report += f"  P99 latency:  {stats['p99_latency_ms']:.2f} ms\n"
+    report += f"  P999 latency: {stats['p999_latency_ms']:.2f} ms\n"
+    report += "Throughput metrics:\n"
+    report += f"  Operations/sec (operation time): {stats['operations_per_second']:.2f}\n"
+    report += f"  Operations/sec (wall time):      {stats['wall_operations_per_second']:.2f}\n"
+    report += f"  Throughput (operation time):     {stats['throughput_mbps']:.2f} MB/s\n"
+    report += f"  Throughput (wall time):          {stats['wall_throughput_mbps']:.2f} MB/s\n"
+    
+    # Add error codes if any
+    if stats['error_codes']:
+        report += "Error codes encountered:\n"
+        for code, count in stats['error_codes'].items():
+            report += f"  Code {code}: {count} times\n"
+            
+    report += "=" * 50 + "\n"
+    
+    # Log the entire report as a single message
+    logger.info(report)
 
 
 def main():
@@ -322,16 +519,84 @@ def main():
     logger.info(f"Max requests: {args.max_requests}")
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Value size: {args.value_length // (1024*1024)} MB")
+    logger.info(f"Number of workers: {args.num_workers}")
     logger.info("=" * 50)
 
     try:
-        tester = TestInstance(args)
-        tester.setup()
-
-        if args.role == "decode":
-            tester.decode()
+        if args.num_workers > 1:
+            # Create barriers for precise timing
+            start_barrier = threading.Barrier(args.num_workers + 1)  # +1 for main thread
+            end_barrier = threading.Barrier(args.num_workers + 1)    # +1 for main thread
+            
+            # Multi-threaded execution
+            results_queue = queue.Queue()
+            threads = []
+            start_time = time.perf_counter()
+            
+            # Adjust requests per worker
+            requests_per_worker = args.max_requests // args.num_workers
+            remainder = args.max_requests % args.num_workers
+            
+            # Create and start worker threads
+            for i in range(args.num_workers):
+                worker_args = copy.copy(args)
+                worker_args.max_requests = requests_per_worker + (1 if i < remainder else 0)
+                
+                thread = threading.Thread(
+                    target=worker_thread,
+                    args=(worker_args, results_queue, start_barrier, end_barrier),
+                    name=f"Worker-{i+1}"
+                )
+                threads.append(thread)
+                thread.start()
+            
+            # Wait for all workers to be ready at start barrier
+            logger.info("Main thread waiting at start barrier")
+            start_barrier.wait()
+            logger.info("Main thread passed start barrier")
+            start_time = time.perf_counter()
+            
+            # Wait for all workers to complete at end barrier
+            logger.info("Main thread waiting at end barrier")
+            end_barrier.wait()
+            logger.info("Main thread passed end barrier")
+            end_time = time.perf_counter()
+            wall_time = end_time - start_time
+            
+            # Combine results
+            combined_tracker = PerformanceTracker()
+            worker_stats = []
+            
+            while not results_queue.empty():
+                tracker = results_queue.get()
+                worker_stats.append(tracker)
+                combined_tracker.extend(tracker)
+            
+            # Set combined wall time
+            combined_tracker.start_time = start_time
+            combined_tracker.end_time = end_time
+            
+            # Print detailed worker stats if requested
+            if args.detailed_stats:
+                for i, tracker in enumerate(worker_stats):
+                    stats = tracker.get_statistics()
+                    print_performance_stats(stats, f"Worker {i+1} {args.role}")
+            
+            # Print combined statistics
+            combined_stats = combined_tracker.get_statistics()
+            print_performance_stats(combined_stats, "COMBINED PERFORMANCE")
+            
+            # Log precise wall time measurement
+            logger.info(f"Precise wall time measurement: {wall_time:.4f} seconds")
         else:
-            tester.prefill()
+            # Single-threaded execution
+            tester = TestInstance(args)
+            tester.setup()
+
+            if args.role == "decode":
+                tester.decode()
+            else:
+                tester.prefill()
 
         logger.info("Test completed successfully!")
 

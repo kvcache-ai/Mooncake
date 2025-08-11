@@ -12,10 +12,12 @@ namespace mooncake {
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
-//to fully utilize the available ssd bandwidth, we use a default of 8 worker threads.
-constexpr int kDefaultFilereadWorkers = 8;
+// to fully utilize the available ssd bandwidth, we use a default of 10 worker
+// threads.
+constexpr int kDefaultFilereadWorkers = 10;
 
-FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend) : shutdown_(false) {
+FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
+    : shutdown_(false) {
     VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
             << " workers";
 
@@ -86,20 +88,22 @@ void FilereadWorkerPool::workerThread() {
         if (task.state) {
             try {
                 if (!backend_) {
-                    LOG(ERROR) << "Backend is not initialized, cannot load object";
+                    LOG(ERROR)
+                        << "Backend is not initialized, cannot load object";
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
-                    continue; 
+                    continue;
                 }
 
-                auto error_code = backend_->LoadObject("", task.slices, task.file_path);
-                if(error_code == ErrorCode::OK){
+                auto load_result = backend_->LoadObject(
+                    task.file_path, task.slices, task.file_size);
+                if (load_result) {
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;
                     task.state->set_completed(ErrorCode::OK);
-                }else{
-                    LOG(ERROR) << "Fileread task failed for file: "
-                               << task.file_path
-                               << " with error code: " << toString(error_code);
+                } else {
+                    LOG(ERROR)
+                        << "Fileread task failed for file: " << task.file_path
+                        << " with error: " << toString(load_result.error());
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                 }
             } catch (const std::exception& e) {
@@ -325,7 +329,10 @@ void TransferEngineOperationState::wait_for_completion() {
 
 TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
     : state_(std::move(state)) {
-    CHECK(state_) << "TransferFuture requires valid state";
+    if (!state_) {
+        LOG(ERROR) << "TransferFuture requires valid state";
+        throw std::invalid_argument("TransferFuture requires valid state");
+    }
 }
 
 bool TransferFuture::isReady() const { return state_->is_completed(); }
@@ -354,7 +361,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)) {
-    CHECK(!local_hostname_.empty()) << "Local hostname cannot be empty";
+    if (local_hostname_.empty()) {
+        LOG(ERROR) << "Local hostname cannot be empty";
+        throw std::invalid_argument("Local hostname cannot be empty");
+    }
 
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
@@ -383,10 +393,9 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
-    const Replica::Descriptor& replica,
-    std::vector<Slice>& slices,  Transport::TransferRequest::OpCode op_code) {
-
-    if(replica.is_memory_replica()) {
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    Transport::TransferRequest::OpCode op_code) {
+    if (replica.is_memory_replica()) {
         std::vector<AllocatedBuffer::Descriptor> handles;
         auto& mem_desc = replica.get_memory_descriptor();
         handles = mem_desc.buffer_descriptors;
@@ -406,7 +415,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
-    }else{
+    } else {
         return submitFileReadOperation(replica, slices, op_code);
     }
 }
@@ -509,7 +518,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
-    const Replica::Descriptor& replica, std::vector<Slice>& slices, 
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
     Transport::TransferRequest::OpCode op_code) {
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
@@ -520,8 +529,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     FilereadTask task(file_path, file_length, slices, state);
     fileread_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Fileread transfer submitted to worker pool with "
-            << file_path ;
+    VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
 
     return TransferFuture(state);
 }

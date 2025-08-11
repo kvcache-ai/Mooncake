@@ -51,10 +51,11 @@ if(SCCACHE AND ENABLE_SCCACHE)
 endif()
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
+add_compile_options(-fno-tree-slp-vectorize)
 
 option(BUILD_EXAMPLES "Build examples" ON)
 
-option(BUILD_UNIT_TESTS "Build uint tests" ON)
+option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
@@ -67,7 +68,8 @@ option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
-
+option(USE_3FS "option for using 3FS storage backend" OFF)
+option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -100,6 +102,11 @@ if (USE_CUDA)
   )
 endif()
 
+if (USE_CXL)
+  add_compile_definitions(USE_CXL)
+  message(STATUS "CXL support is enabled")
+endif()
+
 if (USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
@@ -111,12 +118,9 @@ if (USE_ASCEND)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
-
-  message(STATUS "Found lib64 directories: ${ASCEND_LIB_DIR}")
-  message(STATUS "Found include directories: ${ASCEND_INCLUDE_DIR}")
-
   add_compile_definitions(USE_ASCEND)
-  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR} /usr/include/jsoncpp)
+  add_compile_options(-Wno-ignored-qualifiers)
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
   link_directories(${ASCEND_LIB_DIR})
 endif()
 
@@ -139,6 +143,14 @@ if (WITH_METRICS)
   message(STATUS "metrics is enabled")
 endif()
 
+if(USE_3FS)
+  add_compile_definitions(USE_3FS)
+  message(STATUS "3FS storage backend is enabled")
+endif()
+
+if(WITH_NVIDIA_PEERMEM)
+  add_compile_definitions(WITH_NVIDIA_PEERMEM)
+endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(yaml-cpp REQUIRED)

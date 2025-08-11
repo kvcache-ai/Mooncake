@@ -37,7 +37,7 @@ class CUFileDescPool {
     CUFileDescPool(CUFileDescPool &&) = delete;
 
     int allocCUfileDesc(size_t batch_size);  // ret: (desc_idx, start_idx)
-    
+
     int pushParams(int idx, CUfileIOParams_t &io_params);
 
     int submitBatch(int idx);

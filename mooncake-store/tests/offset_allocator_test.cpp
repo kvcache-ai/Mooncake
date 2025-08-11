@@ -1,10 +1,10 @@
+#include "offset_allocator/offset_allocator.hpp"
+
 #include <gtest/gtest.h>
 
 #include <map>
 #include <random>
 #include <vector>
-
-#include "offset_allocator/offset_allocator.hpp"
 
 using namespace mooncake::offset_allocator;
 
@@ -104,7 +104,8 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    public:
     // Constructor
     AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
-        : m_allocator(OffsetAllocator::create(base, size, maxAllocs)),
+        : m_allocator(
+              OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
           m_base(base),
           m_buffer_size(size) {
         // The allocator is created with the specified base and size
@@ -144,6 +145,11 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
     // Get storage report
     OffsetAllocStorageReport storageReport() const {
         return m_allocator->storageReport();
+    }
+
+    // Get metrics
+    OffsetAllocatorMetrics getMetrics() const {
+        return m_allocator->get_metrics();
     }
 
    private:
@@ -403,7 +409,7 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
     }
 }
 
-// Can only allocate MAX_ALLOCS - 2 times.
+// Can only allocate MAX_ALLOCS - 1 times.
 TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
@@ -411,7 +417,7 @@ TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
         std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
-    for (uint32 i = 0; i < MAX_ALLOCS - 2; ++i) {
+    for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
         auto handle = allocator->allocate(1024);
         ASSERT_TRUE(handle.has_value())
             << "Failed to allocate size: " << 1024 << " at iteration: " << i;
@@ -726,7 +732,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocationCountEdgeCase) {
     std::vector<AllocationHandleWrapper> handles;
 
     // Allocate up to the limit
-    for (uint32 i = 0; i < MAX_ALLOCS - 2; ++i) {
+    for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
         auto handle = allocator->allocate(1024);
         ASSERT_TRUE(handle.has_value()) << "Failed at iteration " << i;
         handles.push_back(std::move(*handle));
@@ -1120,6 +1126,73 @@ TEST_F(OffsetAllocatorTest, BinSystemPageSizeMultiples) {
         EXPECT_EQ(handle->size(), size);
         // Handle will be automatically freed when it goes out of scope
     }
+}
+
+// Test metrics interface functionality
+TEST_F(OffsetAllocatorTest, MetricsInterface) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+
+    // Test initial metrics - should show empty allocator
+    OffsetAllocatorMetrics initial_metrics = allocator->getMetrics();
+    EXPECT_EQ(initial_metrics.allocated_size_, 0);
+    EXPECT_EQ(initial_metrics.allocated_num_, 0);
+    EXPECT_EQ(initial_metrics.capacity, ALLOCATOR_SIZE);
+    EXPECT_GT(initial_metrics.total_free_space_, 0);
+    EXPECT_GT(initial_metrics.largest_free_region_, 0);
+    EXPECT_EQ(initial_metrics.total_free_space_, ALLOCATOR_SIZE);
+
+    // Allocate some memory and verify metrics update
+    constexpr size_t ALLOC_SIZE_1 = 1024;
+    auto handle1 = allocator->allocate(ALLOC_SIZE_1);
+    ASSERT_TRUE(handle1.has_value());
+
+    OffsetAllocatorMetrics after_first_alloc = allocator->getMetrics();
+    EXPECT_EQ(after_first_alloc.allocated_size_, ALLOC_SIZE_1);
+    EXPECT_EQ(after_first_alloc.allocated_num_, 1);
+    EXPECT_EQ(after_first_alloc.capacity, ALLOCATOR_SIZE);
+    EXPECT_LT(after_first_alloc.total_free_space_,
+              initial_metrics.total_free_space_);
+    EXPECT_EQ(after_first_alloc.total_free_space_,
+              ALLOCATOR_SIZE - ALLOC_SIZE_1);
+
+    // Allocate more memory and verify metrics continue to update
+    constexpr size_t ALLOC_SIZE_2 = 2048;
+    auto handle2 = allocator->allocate(ALLOC_SIZE_2);
+    ASSERT_TRUE(handle2.has_value());
+
+    OffsetAllocatorMetrics after_second_alloc = allocator->getMetrics();
+    EXPECT_EQ(after_second_alloc.allocated_size_, ALLOC_SIZE_1 + ALLOC_SIZE_2);
+    EXPECT_EQ(after_second_alloc.allocated_num_, 2);
+    EXPECT_EQ(after_second_alloc.capacity, ALLOCATOR_SIZE);
+    EXPECT_LT(after_second_alloc.total_free_space_,
+              after_first_alloc.total_free_space_);
+    EXPECT_EQ(after_second_alloc.total_free_space_,
+              ALLOCATOR_SIZE - ALLOC_SIZE_1 - ALLOC_SIZE_2);
+
+    // Free first allocation and verify metrics reflect the change
+    handle1.reset();
+
+    OffsetAllocatorMetrics after_first_free = allocator->getMetrics();
+    EXPECT_EQ(after_first_free.allocated_size_, ALLOC_SIZE_2);
+    EXPECT_EQ(after_first_free.allocated_num_, 1);
+    EXPECT_EQ(after_first_free.capacity, ALLOCATOR_SIZE);
+    EXPECT_GT(after_first_free.total_free_space_,
+              after_second_alloc.total_free_space_);
+    EXPECT_EQ(after_first_free.total_free_space_,
+              ALLOCATOR_SIZE - ALLOC_SIZE_2);
+
+    // Free remaining allocation and verify metrics return to initial state
+    handle2.reset();
+
+    OffsetAllocatorMetrics after_all_free = allocator->getMetrics();
+    EXPECT_EQ(after_all_free.allocated_size_, 0);
+    EXPECT_EQ(after_all_free.allocated_num_, 0);
+    EXPECT_EQ(after_all_free.capacity, ALLOCATOR_SIZE);
+    EXPECT_EQ(after_all_free.total_free_space_, ALLOCATOR_SIZE);
+    EXPECT_EQ(after_all_free.largest_free_region_, ALLOCATOR_SIZE);
 }
 
 int main(int argc, char** argv) {

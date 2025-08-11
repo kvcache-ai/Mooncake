@@ -112,8 +112,7 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     return 0;
 }
 
-int TransferMetadata::getNotifies(
-    std::vector<NotifyDesc> &notifies) {
+int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
         std::move(notifys.begin(), notifys.end(), std::back_inserter(notifies));
@@ -186,14 +185,20 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         segmentJSON["buffers"] = buffersJSON;
 
         Json::Value rankInfoJSON;
-        rankInfoJSON["rankId"] = static_cast<Json::UInt64>(desc.rank_info.rankId);
+        rankInfoJSON["rankId"] =
+            static_cast<Json::UInt64>(desc.rank_info.rankId);
         rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
-        rankInfoJSON["hostPort"] = static_cast<Json::UInt64>(desc.rank_info.hostPort);
-        rankInfoJSON["deviceLogicId"] = static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
-        rankInfoJSON["devicePhyId"] = static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
-        rankInfoJSON["deviceType"] = static_cast<Json::UInt64>(desc.rank_info.deviceType);
+        rankInfoJSON["hostPort"] =
+            static_cast<Json::UInt64>(desc.rank_info.hostPort);
+        rankInfoJSON["deviceLogicId"] =
+            static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
+        rankInfoJSON["devicePhyId"] =
+            static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
+        rankInfoJSON["deviceType"] =
+            static_cast<Json::UInt64>(desc.rank_info.deviceType);
         rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
-        rankInfoJSON["devicePort"] = static_cast<Json::UInt64>(desc.rank_info.devicePort);
+        rankInfoJSON["devicePort"] =
+            static_cast<Json::UInt64>(desc.rank_info.devicePort);
         rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
 
         segmentJSON["rank_info"] = rankInfoJSON;
@@ -205,6 +210,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["shm_name"] = buffer.shm_name;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "cxl") {
+        segmentJSON["cxl_name"] = desc.cxl_name;
+        segmentJSON["cxl_base_addr"] =
+            static_cast<Json::UInt64>(desc.cxl_base_addr);
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -370,12 +388,28 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
         desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
         desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
-        desc->rank_info.deviceLogicId = rankInfoJSON["deviceLogicId"].asUInt64();
+        desc->rank_info.deviceLogicId =
+            rankInfoJSON["deviceLogicId"].asUInt64();
         desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt64();
         desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
         desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+    } else if (desc->protocol == "cxl") {
+        desc->cxl_name = segmentJSON["cxl_name"].asString();
+        desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -552,7 +586,12 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         segment_desc = new_segment_desc;
         for (auto iter = segment_desc->buffers.begin();
              iter != segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr) {
+            if (iter->addr == (uint64_t)addr
+#ifdef USE_CXL
+                ||
+                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+#endif
+            ) {
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 break;
@@ -643,8 +682,10 @@ int TransferMetadata::startHandshakeDaemon(
                                Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
             TransferHandshakeUtil::decode(peer, peer_desc);
-            int ret = on_receive_handshake(peer_desc, local_desc);
-            if (ret) return ret;
+            if (on_receive_handshake) {
+                int ret = on_receive_handshake(peer_desc, local_desc);
+                if (ret) return ret;
+            }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });

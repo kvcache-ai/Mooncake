@@ -40,7 +40,7 @@ inline std::ostream& operator<<(std::ostream& os,
 struct MountedSegment {
     Segment segment;
     SegmentStatus status;
-    std::shared_ptr<BufferAllocator> buf_allocator;
+    std::shared_ptr<BufferAllocatorBase> buf_allocator;
 };
 
 // Forward declarations
@@ -67,8 +67,8 @@ class ScopedSegmentAccess {
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
      * errors that may be solved by subsequent remount tryings are considered as
-     * errors. When encounters unsolvable errors, the segment will not be mounted
-     * while the return value will be OK.
+     * errors. When encounters unsolvable errors, the segment will not be
+     * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
@@ -116,34 +116,42 @@ class ScopedAllocatorAccess {
    public:
     explicit ScopedAllocatorAccess(
         std::unordered_map<std::string,
-                           std::vector<std::shared_ptr<BufferAllocator>>>&
+                           std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        std::vector<std::shared_ptr<BufferAllocator>>& allocators,
+        std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         std::shared_mutex& mutex)
         : allocators_by_name_(allocators_by_name),
           allocators_(allocators),
           lock_(mutex) {}
 
     const std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>&
+                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
     getAllocatorsByName() {
         return allocators_by_name_;
     }
 
-    const std::vector<std::shared_ptr<BufferAllocator>>& getAllocators() {
+    const std::vector<std::shared_ptr<BufferAllocatorBase>>& getAllocators() {
         return allocators_;
     }
 
    private:
     const std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>&
+                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
         allocators_by_name_;  // segment name -> allocators
-    const std::vector<std::shared_ptr<BufferAllocator>>& allocators_;
+    const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators_;
     std::shared_lock<std::shared_mutex> lock_;
 };
 
 class SegmentManager {
    public:
+    /**
+     * @brief Constructor for SegmentManager
+     * @param memory_allocator Type of buffer allocator to use for new segments
+     */
+    explicit SegmentManager(
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
+        : memory_allocator_(memory_allocator) {}
+
     /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
@@ -164,19 +172,22 @@ class SegmentManager {
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    const BufferAllocatorType
+        memory_allocator_;  // Type of buffer allocator to use
     // Each allocator is put into both of allocators_by_name_ and allocators_.
     // These two containers only contain allocators whose segment status is OK.
     std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocator>>>
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_by_name_;  // segment name -> allocators
-    std::vector<std::shared_ptr<BufferAllocator>> allocators_;  // allocators
+    std::vector<std::shared_ptr<BufferAllocatorBase>>
+        allocators_;  // allocators
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
 
     friend class ScopedSegmentAccess;
-    friend class SegmentTest; // for unit tests
+    friend class SegmentTest;  // for unit tests
 };
 
 }  // namespace mooncake

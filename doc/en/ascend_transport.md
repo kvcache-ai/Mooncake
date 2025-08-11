@@ -24,9 +24,7 @@ apt-get install -y mpich libmpich-dev
 ```
 
 **Ascend Compute Architecture for Neural Networks**
-Ascend Compute Architecture for Neural Networks 8.1.RC1 Version + pkg Dependency Package
-
-The pkg package contains header files and shared libraries (.so), located at scripts/ascend/pkg. Please navigate to the pkg directory and execute the commands specified in the ReadMe.txt file according to your system architecture (ARM/x86).
+Updated to Ascend Compute Architecture for Neural Networks 8.2.RC1. pkg packages are no longer required.
 
 ## One-Step Compilation Script
 
@@ -66,8 +64,8 @@ Alternatively, you can copy the `.so` file to another path referenced by `$LD_LI
 5. **potential MPI Conflicts**:
    Concurrently installing MPI (typically MPICH) and OpenMPI may cause conflicts. If you encounter MPI-related issues, try running the following commands:
 ```bash
-   sudo apt purge openmpi-bin libopenmpi-dev
    sudo apt install mpich libmpich-dev
+   sudo apt purge openmpi-bin libopenmpi-dev
 ```
 
 6. **IPV6 is not support**:
@@ -131,38 +129,51 @@ Ascend Transport supports write/read semantics and automatically determines whet
 
 ### Fault Handling
 
-Building upon HCCL’s built-in fault handling mechanisms, Ascend Transport implements comprehensive error recovery strategies across multiple stages, including initialization, connection setup, and data transfer. It incorporates retry logic and returns precise error codes based on HCCL collective communication standards when retries fail. For detailed logs, refer to `/root/Ascend/log/plog`.
+Building upon HCCL’s built-in fault handling mechanisms, Ascend Transport implements comprehensive error recovery strategies across multiple stages, including initialization, connection setup, and data transfer. It incorporates retry logic and returns precise error codes based on HCCL collective communication standards when retries fail. For detailed logs, refer to `/root/Ascend/log/debug/plog`.
 
 ### Test Cases
 
-Ascend Transport provides two test files:
-- Multi-scenario test: `mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp`
-- Performance test: `mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp`
+Ascend Transport provides multi-scenario test files: `mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp`, which supports one-to-one, one-to-two, and two-to-one transfer tests, as well as a performance benchmark file `mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp`. After successfully compiling the Transfer Engine, the corresponding test programs can be found in the `build/mooncake-transfer-engine/example` directory.The test programs accept configuration parameters via command-line arguments. For the full list of configurable options, refer to the DEFINE_string definitions at the beginning of each test file.
 
-You can configure various scenarios (e.g., 1-to-1, 1-to-2, 2-to-1) and performance tests by passing valid parameters to these programs.
+When `metadata_server` is set to `P2PHANDSHAKE`, Mooncake randomly selects a port in the new RPC port-mapping to avoid conflicts.  
+Therefore, in testing:
+
+1. **Start the target node first**.  
+   Watch the log produced by `mooncake-transfer-engine/src/transfer_engine.cpp`; you should see a line similar to  
+   ```
+   Transfer Engine RPC using <protocol> listening on <IP>:<actual-port>
+   ```  
+   Note the **actual port** the target node is listening on.
+
+2. **Edit the initiator’s launch command**:  
+   Change the value of `--segment_id` to `<IP>:<actual-port>` (i.e., the target node’s IP plus the port you just captured).
+
+3. **Launch the initiator node** to complete the test.
+
+Refer to the command format shown below:
 
 #### Example Commands for Scenario Testing
 
 **Start Initiator Node:**
 ```bash
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608 --batch_size=32 
 ```
 
 **Start Target Node:**
 ```bash
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608 --batch_size=32 
 ```
 
 #### Example Commands for Performance Testing
 
 **Start Initiator Node:**
 ```bash
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384 --batch_size=32 --block_iteration=10
 ```
 
 **Start Target Node:**
 ```bash
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --batch_size=32 --block_iteration=10
 ```
 
 **Note:** The `device_id` parameter mentioned above represents both the NPU logical ID and physical ID. If not all devices are mounted in your container, please specify the logical ID and physical ID separately when using the demo above. Replace `--device_id` with `--device_logicid` and `--device_phyid`.
@@ -187,13 +198,13 @@ export ASCEND_TRANSPORT_PRINT=1
 ```
 
 ### Timeout Configuration
-Ascend Transport uses TCP-based out-of-band communication on the host side, with a receive timeout set to 120 seconds.
+Ascend Transport based on TCP for out-of-band communication, has a connection timeout configured via the environment variable `Ascend_TCP_TIMEOUT`, with a default value of 30 seconds. On the host side, the `recv` timeout is set to 30 seconds, meaning that if no message is received from the peer within 30 seconds, an error will be reported.
 
-Connection timeout is controlled by the environment variable HCCL_CONNECT_TIMEOUT.
-Execution timeout is configured via HCCL_EXEC_TIMEOUT.
-If no communication occurs within this timeout, the hccl_socket connection will be terminated.
+The connection timeout for `hccl_socket` is configured through the environment variable `Ascend_HCCL_SOCKET_TIMEOUT`, with a default value of 30 seconds. If this timeout is exceeded, the current transmission will report an error and return.
 
-Point-to-point communication between endpoints involves a connection handshake with a timeout of 120 seconds.
+`hccl_socket` has a keep-alive requirement, and the execution timeout is configured via the environment variable `HCCL_EXEC_TIMEOUT`. If no communication occurs within the `HCCL_EXEC_TIMEOUT` period, the `hccl_socket` connection will be disconnected.
+
+In `transport_mem`, the point-to-point communication between endpoints involves a connection handshake process, and its timeout is configured via `Ascend_TRANSPORT_MEM_TIMEOUT`, with a default value of 120 seconds.
 
 ### Error Code
 Ascend transport error codes reuse the HCCL collective communication transport error codes.

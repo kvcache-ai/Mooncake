@@ -41,13 +41,14 @@ target_link_libraries(stress_workload_test PUBLIC
     mooncake_store
     cachelib_memory_allocator
     ${ETCD_WRAPPER_LIB}
+    mooncake_common
     glog
     gflags
     pthread
 )
 
-add_executable(local_file_test local_file_test.cpp)
-target_link_libraries(local_file_test PUBLIC
+add_executable(posix_file_test posix_file_test.cpp)
+target_link_libraries(posix_file_test PUBLIC
     mooncake_store
     cachelib_memory_allocator
     glog
@@ -55,7 +56,7 @@ target_link_libraries(local_file_test PUBLIC
     gtest_main
     pthread
 )
-add_test(NAME local_file_test COMMAND local_file_test)
+add_test(NAME posix_file_test COMMAND posix_file_test)
 
 add_executable(thread_pool_test thread_pool_test.cpp)
 target_link_libraries(thread_pool_test PUBLIC
@@ -100,5 +101,39 @@ target_link_libraries(offset_allocator_test PUBLIC
     pthread
 )
 add_test(NAME offset_allocator_test COMMAND offset_allocator_test)
+
+add_executable(utils_test utils_test.cpp)
+target_link_libraries(utils_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME utils_test COMMAND utils_test)
+
+add_executable(client_buffer_test client_buffer_test.cpp)
+target_link_libraries(client_buffer_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME client_buffer_test COMMAND client_buffer_test)
+
+add_executable(pybind_client_test pybind_client_test.cpp)
+target_link_libraries(pybind_client_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    ${ETCD_WRAPPER_LIB}
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME pybind_client_test COMMAND pybind_client_test)
 
 add_subdirectory(e2e)

@@ -84,4 +84,48 @@ void* allocate_buffer_allocator_memory(size_t total_size);
 
 void** rdma_args(const std::string& device_name);
 
+[[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
+    const double KB = 1024.0;
+    const double MB = KB * 1024.0;
+    const double GB = MB * 1024.0;
+    const double TB = GB * 1024.0;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+
+    if (bytes >= static_cast<uint64_t>(TB)) {
+        oss << bytes / TB << " TB";
+    } else if (bytes >= static_cast<uint64_t>(GB)) {
+        oss << bytes / GB << " GB";
+    } else if (bytes >= static_cast<uint64_t>(MB)) {
+        oss << bytes / MB << " MB";
+    } else if (bytes >= static_cast<uint64_t>(KB)) {
+        oss << bytes / KB << " KB";
+    } else {
+        // Less than 1 KB, don't use fixed point
+        oss.unsetf(std::ios::fixed);
+        oss << bytes << " B";
+        return oss.str();
+    }
+
+    return oss.str();
+}
+
+// Network utility functions
+
+/**
+ * @brief Check if a TCP port is available for binding
+ * @param port The port number to check
+ * @return true if port is available, false otherwise
+ */
+bool isPortAvailable(int port);
+
+/**
+ * @brief Get a random available port in the specified range
+ * @param min_port Minimum port number (default: 12300)
+ * @param max_port Maximum port number (default: 14300)
+ * @return Available port number, or -1 if no port found after 10 attempts
+ */
+int getRandomAvailablePort(int min_port = 12300, int max_port = 14300);
+
 }  // namespace mooncake

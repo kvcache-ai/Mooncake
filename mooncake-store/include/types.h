@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "Slab.h"
+#include "allocator.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -25,7 +26,7 @@ static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    200;  // in milliseconds
+    5000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
@@ -36,7 +37,9 @@ static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 
 // Forward declarations
-class BufferAllocator;
+class BufferAllocatorBase;
+class CachelibBufferAllocator;
+class OffsetBufferAllocator;
 class AllocatedBuffer;
 class Replica;
 
@@ -49,7 +52,7 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 // using ReplicaList = std::vector<ReplicaInfo>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
-    std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocator>>>;
+    std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
 // Mapping between c++ and go types
 #ifdef STORE_USE_ETCD
 using EtcdRevisionId = GoInt64;
@@ -86,7 +89,8 @@ enum class ErrorCode : int32_t {
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
 
     // Handle selection errors (Range: -200 to -299)
-    NO_AVAILABLE_HANDLE = -200,  ///< Memory allocation failed due to insufficient space.
+    NO_AVAILABLE_HANDLE =
+        -200,  ///< Memory allocation failed due to insufficient space.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
@@ -223,17 +227,21 @@ struct ReplicateConfig {
 
 class AllocatedBuffer {
    public:
-    friend class BufferAllocator;
+    friend class CachelibBufferAllocator;
+    friend class OffsetBufferAllocator;
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
-    AllocatedBuffer(std::shared_ptr<BufferAllocator> allocator,
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     std::string segment_name, void* buffer_ptr,
-                    std::size_t size)
+                    std::size_t size,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
           segment_name_(std::move(segment_name)),
           buffer_ptr_(buffer_ptr),
-          size_(size) {}
+          size_(size),
+          offset_handle_(std::move(offset_handle)) {}
 
     ~AllocatedBuffer();
 
@@ -269,11 +277,14 @@ class AllocatedBuffer {
     void mark_complete() { status = BufStatus::COMPLETE; }
 
    private:
-    std::weak_ptr<BufferAllocator> allocator_;
+    std::weak_ptr<BufferAllocatorBase> allocator_;
     std::string segment_name_;
     BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    // RAII handle for buffer allocated by offset allocator
+    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
+        std::nullopt};
 };
 
 // Implementation of get_descriptor
@@ -456,7 +467,6 @@ enum class ClientStatus {
     NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
                     // need to remount
 };
-YLT_REFL(ClientStatus);
 
 /**
  * @brief Stream operator for ClientStatus
@@ -470,6 +480,44 @@ inline std::ostream& operator<<(std::ostream& os,
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
+    return os;
+}
+
+/**
+ * @brief Response structure for Ping operation
+ */
+struct PingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
+
+    PingResponse() = default;
+    PingResponse(ViewVersionId view_version, ClientStatus status)
+        : view_version_id(view_version), client_status(status) {}
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const PingResponse& response) noexcept {
+        return os << "PingResponse: { view_version_id: "
+                  << response.view_version_id
+                  << ", client_status: " << response.client_status << " }";
+    }
+};
+YLT_REFL(PingResponse, view_version_id, client_status);
+
+enum class BufferAllocatorType {
+    CACHELIB = 0,  // CachelibBufferAllocator
+    OFFSET = 1,    // OffsetBufferAllocator
+};
+
+/**
+ * @brief Stream operator for BufferAllocatorType
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const BufferAllocatorType& type) noexcept {
+    static const std::unordered_map<BufferAllocatorType, std::string_view>
+        type_strings{{BufferAllocatorType::CACHELIB, "CACHELIB"},
+                     {BufferAllocatorType::OFFSET, "OFFSET"}};
+
+    os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
     return os;
 }
 

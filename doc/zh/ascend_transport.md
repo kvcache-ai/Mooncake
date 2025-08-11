@@ -15,8 +15,7 @@ yum install -y mpich mpich-devel
 apt-get install -y mpich libmpich-dev
 
 **昇腾Compute Architecture for Neural Networks**
-昇腾Compute Architecture for Neural Networks 8.1.RC1版本 + pkg依赖包
-pkg包含一些头文件和so包，路径在scripts/ascend/pkg,请进入pkg文件夹，根据arm/x86系统执行ReadMe.txt的命令。
+更新到昇腾Compute Architecture for Neural Networks 8.2.RC1版本，不再需要pkg包。
 
 ### 一键式编译脚本
 Ascend Transport提供一键式编译脚本，脚本位置为scripts/ascend/dependencies_ascend.sh,执行命令如下：
@@ -38,8 +37,8 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packa
 
 5.潜在的 MPI 冲突,同时安装 MPI 和 OpenMPI 可能导致冲突。如果遇到与 MPI 相关的问题，请尝试按顺序执行以下命令进行解决：
 
-sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
 sudo apt install mpich libmpich-dev        # 安装 MPICH
+sudo apt purge openmpi-bin libopenmpi-dev  # 卸载 OpenMPI
 
 6.当前版本不支持IPV6，我们会很快完成针对IPV6的适配。
 
@@ -83,23 +82,31 @@ Ascend Transport兼容所有Mooncake当前支持的metadata服务，包括 etcd,
 Ascend Transport支持write/read语义，且会自动判断是否跨HCCS通信，选择HCCS/ROCE的底层通信协议，用户只需采用Mooncake的getTransferStatus接口即可获取每个请求的传输情况。
 
 ### 故障处理
-Ascend Transport在HCCL本身的故障处理基础上，设计了完善的故障处理机制。针对初始化、建链、数据传输等多个阶段可能出现的故障，新增或沿用了失败重试机制。在重试仍然失败后，沿用了HCCL集合通信相关操作错误码，给出精准的报错信息。为获取更详细的错误信息，也可以查询/root/Ascend/log目录下的plog日志。
+Ascend Transport在HCCL本身的故障处理基础上，设计了完善的故障处理机制。针对初始化、建链、数据传输等多个阶段可能出现的故障，新增或沿用了失败重试机制。在重试仍然失败后，沿用了HCCL集合通信相关操作错误码，给出精准的报错信息。为获取更详细的错误信息，也可以查询/root/Ascend/log/debug目录下的plog日志。
 
 ### 测试用例
-Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp和性能测试mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp两个测试文件，根据测试头部设置的可传入参数传入合法参数，
-可以完成一对一、一对二、二对一多种场景和性能测试。
+Ascend Transport提供多场景测试文件mooncake-transfer-engine/example/transfer_engine_ascend_one_sided.cpp，可以完成一对一、一对二、二对一多种场景的传输测试，以及性能测试文件mooncake-transfer-engine/example/transfer_engine_ascend_perf.cpp。编译 Transfer Engine 成功后，可在 `build/mooncake-transfer-engine/example` 目录下找到对应的测试程序。执行命令可通过传入参数配置，具体的可配置参数请查看测试文件开头DEFINE_string的参数列表。
+
+当 metadata_server 配置为 P2PHANDSHAKE 时，Mooncake 会在新的 RPC 端口映射中随机选择监听端口，以避免端口冲突。因此，测试时需要按以下步骤操作：
+1.先启动目标节点，观察其在 mooncake-transfer-engine/src/transfer_engine.cpp 中打印的日志，找到如下格式的语句：
+Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目标节点实际监听的端口号。
+2.修改发起节点的启动命令：
+将 --segment_id 参数的值改为目标节点的 IP + 实际监听的端口号（格式为 <IP>:<端口>）。
+3.启动发起节点，完成连接测试。
+
+完整命令格式见下文：
 
 多场景用例执行命令如：
 ```启动发起节点：```
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608 --batch_size=32
 ```启动目标节点：```
-./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608
+./transfer_engine_ascend_one_sided --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=8388608 --batch_size=32
 
 性能用例执行命令如：
 ```启动发起节点：```
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=8388608
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12345 --protocol=hccl --operation=write --segment_id=10.0.0.0:12346 --device_id=0 --mode=initiator --block_size=16384 --batch_size=32 --block_iteration=10
 ```启动目标节点：```
-./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target
+./transfer_engine_ascend_perf --metadata_server=P2PHANDSHAKE --local_server_name=10.0.0.0:12346 --protocol=hccl --operation=write --device_id=1 --mode=target --block_size=16384 --batch_size=32 --block_iteration=10
 
 需要注意的是，上面传入的device_id既代表NPU逻辑id也代表物理id，如果您在容器里没有挂载所有的卡，使用上面的demo时请分别传入逻辑id和物理id，即--device_id改为--device_logicid和--device_phyid，如容器内只挂载了5卡和7卡，5卡为发起端，7卡为接收端，多场景用例执行命令改为：
 ```启动发起节点：```
@@ -112,11 +119,13 @@ Ascend Transport提供多场景测试mooncake-transfer-engine/example/transfer_e
 export ASCEND_TRANSPORT_PRINT=1
 
 ### 超时时间配置
-Ascend Transport基于TCP的带外通信，在主机侧接收超时设置为 120 秒。
+Ascend Transport基于TCP的带外通信，连接的超时时间通过环境变量Ascend_TCP_TIMEOUT配置，默认为30秒，在主机侧recv接收超时设置为30秒，即recv阻塞超过30s未收到对端的消息会报错。
 
-在hccl_socket中，连接超时时间由环境变量HCCL_CONNECT_TIMEOUT配置，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+hccl_socket的连接超时时间通过环境变量Ascend_HCCL_SOCKET_TIMEOUT配置，默认为30秒，超时则本次传输会报错并返回。
 
-在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间为 120 秒。
+hccl_socket有保活要求，执行超时通过环境变量HCCL_EXEC_TIMEOUT配置，超过HCCL_EXEC_TIMEOUT未进行通信，会断开hccl_socket连接。
+
+在transport_mem中，端到端之间的点对点通信涉及连接握手过程，其超时时间通过Ascend_TRANSPORT_MEM_TIMEOUT配置，默认为120秒。
 
 ### 错误码
 Ascend传输错误码沿用HCCL集合通信传输错误码。

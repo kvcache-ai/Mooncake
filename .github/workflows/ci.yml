@@ -94,7 +94,9 @@ jobs:
     - name: Start Mooncake Master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        mooncake_master &
+        # Set a small kv lease ttl to make the test faster.
+        # Must be consistent with the client test parameters.
+        mooncake_master --default_kv_lease_ttl=500 &
       shell: bash
 
     - name: Test (in build env)
@@ -102,7 +104,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
       shell: bash
 
     - name: Stop Mooncake Master Service
@@ -310,10 +312,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
-  
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
-    
+
     - name: Build Docker image
       run: docker build -t mooncake-app .
 
@@ -325,3 +327,32 @@ jobs:
       uses: actions/checkout@v4
     - name: Spell Check Repo
       uses: crate-ci/typos@v1.30.2
+
+  clang-format:
+    name: Check code format
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Actions Repository
+      uses: actions/checkout@v4
+
+    - name: Install clang-format 20
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 20
+        sudo apt-get install -y clang-format-20
+
+    - name: run clang-format-20
+      run: |
+        # the old clang-format-14 which is the defaut version in ubuntu 22.04,
+        # is inconsistent with clang-format-20.
+        ls -lh /usr/bin/clang-format*
+        clang-format --version
+        clang-format-20 --version
+        # skip cachelib_memory_allocator
+        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
+        if ! git diff --exit-code; then
+          echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
+          exit 1
+        fi
+      shell: bash

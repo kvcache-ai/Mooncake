@@ -116,9 +116,7 @@ class Transport {
                 const char *file_path;
             } nvmeof;
             struct {
-                void *remote_filename;
-                void *remote_addr;
-                size_t remote_offset;
+                void *dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
@@ -198,6 +196,8 @@ class Transport {
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
+        // record the origin request
+        const TransferRequest *request = nullptr;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -230,7 +230,6 @@ class Transport {
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
