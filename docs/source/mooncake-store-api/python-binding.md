@@ -351,7 +351,7 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ## get_buffer Buffer Protocol
 
-The `get_buffer` method returns a `SliceBuffer` object that implements the Python buffer protocol:
+The `get_buffer` method returns a `BufferHandle` object that implements the Python buffer protocol:
 
 <details>
 <summary>Click to expand: Buffer protocol usage example</summary>
@@ -684,14 +684,14 @@ else:
 Get object data as a buffer that implements Python's buffer protocol.
 
 ```python
-def get_buffer(self, key: str) -> SliceBuffer
+def get_buffer(self, key: str) -> BufferHandle
 ```
 
 **Parameters:**
 - `key` (str): Object identifier
 
 **Returns:**
-- `SliceBuffer`: Buffer object or None if not found
+- `BufferHandle`: Buffer object or None if not found
 
 **Example:**
 ```python
