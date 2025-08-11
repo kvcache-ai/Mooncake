@@ -23,8 +23,8 @@
 namespace mooncake {
 namespace v1 {
 struct MetadataPlugin {
-    static std::shared_ptr<MetadataPlugin> Create(
-        const std::string &type, const std::string &servers);
+    static std::shared_ptr<MetadataPlugin> Create(const std::string &type,
+                                                  const std::string &servers);
 
     MetadataPlugin() {}
 

@@ -102,11 +102,13 @@ class Transport {
 
     virtual Status sendNotification(SegmentID target_id,
                               const Notification &notify) {
-        return Status::NotImplemented("sendNotification not implemented" LOC_MARK);
+        return Status::NotImplemented(
+            "sendNotification not implemented" LOC_MARK);
     }
 
     virtual Status receiveNotification(std::vector<Notification> &notify_list) {
-        return Status::NotImplemented("receiveNotification not implemented" LOC_MARK);
+        return Status::NotImplemented(
+            "receiveNotification not implemented" LOC_MARK);
     }
 
     virtual const char *getName() const { return "<generic>"; }

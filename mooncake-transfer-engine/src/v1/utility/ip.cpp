@@ -89,14 +89,13 @@ Status checkLocalIpAddress(std::string &hostname, bool &ipv6) {
     return Status::InvalidArgument("No available IP address");
 }
 
-std::pair<std::string, uint16_t> parseHostNameWithPort(
-    const std::string &url, uint16_t default_port) {
+std::pair<std::string, uint16_t> parseHostNameWithPort(const std::string &url,
+                                                       uint16_t default_port) {
     uint16_t port = default_port;
 
     // Check if url is valid IPv6 address
     in6_addr addr;
-    if (inet_pton(AF_INET6, url.c_str(), &addr) == 1)
-        return {url, port};
+    if (inet_pton(AF_INET6, url.c_str(), &addr) == 1) return {url, port};
 
     // Check if url is valid IPv6 address with port
     size_t start_pos = 0;

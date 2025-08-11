@@ -22,7 +22,7 @@ namespace mooncake {
 namespace v1 {
 
 struct DeviceParams {
-    int num_cq_list = 4; // == num_workers is preferred
+    int num_cq_list = 4;  // == num_workers is preferred
     int num_comp_channels = 1;
     uint8_t port = 1;
     int gid_index = 0;
@@ -31,7 +31,7 @@ struct DeviceParams {
 
 struct EndPointParams {
     int endpoint_store_cap = 256;
-    int qp_mul_factor = 4; // == num_workers is preferred
+    int qp_mul_factor = 4;  // == num_workers is preferred
     int max_sge = 4;
     int max_qp_wr = 256;
     int max_inline_bytes = 64;
@@ -62,7 +62,7 @@ struct WorkerParams {
     int num_workers = 4;
     int max_retry_count = 8;
     int block_size = 65536;
-    uint64_t grace_period_ns = 50000; // 50us
+    uint64_t grace_period_ns = 50000;  // 50us
 };
 
 struct RdmaParams {

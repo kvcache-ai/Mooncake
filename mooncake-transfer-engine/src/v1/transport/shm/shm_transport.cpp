@@ -225,7 +225,7 @@ Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
 #ifdef USE_CUDA
     if (parseLocation(desc.location).first == "cuda") {
-        // If the memory region is allocated using cuMemAlloc, 
+        // If the memory region is allocated using cuMemAlloc,
         // we cannot use cudaIpcGetMemHandle, so skip it
         if (options.type == MNNVL) return Status::OK();
         cudaIpcMemHandle_t handle;

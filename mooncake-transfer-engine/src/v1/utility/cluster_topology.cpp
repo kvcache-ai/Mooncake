@@ -54,7 +54,7 @@ Status ClusterTopology::load(const std::string& filename) {
         for (const auto& ep : entry["endpoints"]) {
             RdmaDevicePair rdma_pair{ep["src_dev"].asString(),
                                      ep["dst_dev"].asString()};
-            Endpoint e{ep["src_numa"].asInt(),     ep["dst_numa"].asInt(),
+            Endpoint e{ep["src_numa"].asInt(), ep["dst_numa"].asInt(),
                        ep["bandwidth"].asDouble(), ep["latency"].asDouble()};
             node.endpoints[rdma_pair] = e;
         }

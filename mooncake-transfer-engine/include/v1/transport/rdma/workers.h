@@ -143,7 +143,8 @@ class Workers {
         }
     };
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(int thread_id, Workers::PostPath path);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(int thread_id,
+                                              Workers::PostPath path);
 
     using GroupedRequests =
         std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;

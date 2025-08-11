@@ -71,7 +71,7 @@ class TcpTransport : public Transport {
     virtual bool supportNotification() const { return true; }
 
     virtual Status sendNotification(SegmentID target_id,
-                              const Notification &notify);
+                                    const Notification &notify);
 
     virtual Status receiveNotification(std::vector<Notification> &notify_list);
 

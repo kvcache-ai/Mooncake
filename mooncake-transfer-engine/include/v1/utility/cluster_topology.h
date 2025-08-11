@@ -47,7 +47,6 @@ struct NumaIdPair {
     }
 };
 
-
 namespace std {
 template <>
 struct hash<RdmaDevicePair> {

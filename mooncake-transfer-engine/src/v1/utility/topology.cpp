@@ -351,8 +351,7 @@ Status Topology::selectDevice(int &device_id, const std::string &storage_type,
         for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
             auto &list = entry.device_list[rank];
             if (list.empty()) continue;
-            if (rand_seed < 0)
-                rand_seed = SimpleRandom::Get().next(32);
+            if (rand_seed < 0) rand_seed = SimpleRandom::Get().next(32);
             device_id = list[rand_seed % list.size()];
             return Status::OK();
         }

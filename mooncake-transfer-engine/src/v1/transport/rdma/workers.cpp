@@ -382,8 +382,9 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
             "No matched buffer in given address range" LOC_MARK);
     }
 
-    CHECK_STATUS(target_topology.selectDevice(
-        device_id, target_buffer_desc->location, slice->retry_count, rand_seed));
+    CHECK_STATUS(target_topology.selectDevice(device_id,
+                                              target_buffer_desc->location,
+                                              slice->retry_count, rand_seed));
     slice->target_dev_id = device_id;
     slice->target_rkey = target_buffer_desc->rkey[slice->target_dev_id];
     return Status::OK();
