@@ -1020,7 +1020,7 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
 
     // Put a key with 2 replicas
     std::string key = "replicated_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    std::vector<uint64_t> slice_lengths = {object_size};
     ReplicateConfig config;
     config.replica_num = 2;
 
