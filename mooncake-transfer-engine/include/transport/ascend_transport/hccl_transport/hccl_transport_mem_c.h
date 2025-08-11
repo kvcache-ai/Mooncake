@@ -16,102 +16,41 @@
 #ifndef HCCL_TRANSPORT_MEM_C_H
 #define HCCL_TRANSPORT_MEM_C_H
 
-#include <condition_variable>
-#include <glog/logging.h>
 #include <functional>
-#include "acl/acl.h"
-#include "adapter_hccp_common.h"
-#include "dispatcher.h"
-#include "dtype_common.h"
-#include "externalinput_pub.h"
-#include "hccl.h"
-#include "hccl_types.h"
-#include "hccl_check_buf_init.h"
-#include "hccl_check_common.h"
-#include "hccl_ip_address.h"
-#include "hccl_network_pub.h"
-#include "hccl_opbase_rootinfo_base.h"
-#include "hccl_socket.h"
-#include "mem_device_pub.h"
-#include "notify_pool.h"
-#include "p2p_mgmt_pub.h"
-#include "sal_pub.h"
-#include "transport_mem.h"
-#include "transport_pub.h"
-#include "hccl_mem.h"
-#include "hccl_mem_defs.h"
+#include "hccl_transport_mem_internals.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
 
-struct RankInfo {
-    uint64_t rankId = 0xFFFFFFFF;
-    uint64_t serverIdx;
-    struct in_addr hostIp;
-    uint64_t hostPort;
-    uint64_t deviceLogicId;
-    uint64_t devicePhyId;
-    DevType deviceType{DevType::DEV_TYPE_NOSOC};
-    struct in_addr deviceIp;
-    uint64_t devicePort;
-    uint64_t pid;
-};
+#define READ 0
+#define WRITE 1
+#define DDR 0
+#define HBM 1
+#define VECTOR_RESERVE_SIZE 200
+#define TOTAL_AGG_DEV_SIZE 0x2000000
+#define PER_HUGE_BUFFER_SIZE 0x800000
+#define HUGE_BUFFER_NUM TOTAL_AGG_DEV_SIZE / PER_HUGE_BUFFER_SIZE
+#define RESERVED_MEMORY_SIZE 0x40000
 
-struct RankControlInfo {
-    uint64_t deviceLogicId;
-    uint64_t devicePhyId;
-    struct in_addr hostIp;
-    struct in_addr deviceIp;
-    uint64_t pid;
-};
+/* Public External Interface */
+extern bool enableAscendLogging();
+extern int initTransportMem(RankInfo *local_rank_info, bool aggregateEnabled);
+extern int transportMemAccept(RankInfo *local_rank_info, bool aggregateEnabled);
 
-struct MergeMem {
-    void *addr = nullptr;
-    uint64_t len = 0;
-    MergeMem(void *addr_, size_t len_) : addr(addr_), len(len_) {}
-};
-
-struct ConnectionInfo {
-    int tcp_socket;
-    std::shared_ptr<hccl::HcclSocket> hccl_ctrl_socket;
-    std::shared_ptr<hccl::HcclSocket> hccl_data_socket;
-    std::shared_ptr<hccl::TransportMem> transport_mem;
-};
-
-// Retry mechanism for initialization function failure
-#define RETRY_CALL(funcCall, errorMsg)                                  \
-    do {                                                                \
-        int retryCount = 0;                                             \
-        int __ret = funcCall;                                           \
-        while (__ret && retryCount < 3) {                               \
-            LOG(ERROR) << errorMsg << ", retrying... (" << ++retryCount \
-                       << "/3), ret :" << __ret;                        \
-            __ret = funcCall;                                           \
-        }                                                               \
-        if (__ret) {                                                    \
-            LOG(ERROR) << errorMsg                                      \
-                       << " failed after 3 retries, ret: " << __ret;    \
-            return __ret;                                               \
-        }                                                               \
-    } while (0)
-
-extern int initTransportMem(RankInfo *local_rank_info);
-
-extern int transportMemTask(RankInfo *local_rank_info,
-                            RankInfo *remote_rank_info, int op_code,
-                            uint64_t offset, uint64_t req_len, void *local_mem,
-                            aclrtStream stream);
-
-extern int transportMemAccept(RankInfo *local_rank_info);
-
-extern int regLocalRmaMem(void *addr, uint64_t length);
-
-extern bool printEnabled();
-
+/* Non-Aggregated External Interface */
+extern void nonAggRegLocalMem(uint64_t addr, uint64_t length, bool is_pool);
+extern int nonAggTransportMemTask(RankInfo *local_rank_info,
+                                  RankInfo *remote_rank_info, int op_code,
+                                  uint64_t offset, uint64_t req_len,
+                                  void *local_mem, int mem_type, aclrtStream stream);
 extern int transportMemAddOpFence(RankInfo *remote_rank_info,
                                   aclrtStream stream);
-
+extern int transportMemIntegrate(RankInfo *local_rank_info, 
+                                 RankInfo *remote_rank_info, int op_code,
+                                 uint64_t offset, uint64_t req_len,
+                                 void *local_mem, aclrtStream stream);
+extern int transportMemTarget(aclrtStream stream);
 #ifdef __cplusplus
 }
 #endif  // __cplusplus

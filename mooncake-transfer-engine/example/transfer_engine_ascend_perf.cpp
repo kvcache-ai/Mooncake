@@ -95,7 +95,7 @@ int allocateDevMem(void *&devAddr, size_t size) {
     void *host_addr = nullptr;
     ret = aclrtMallocHost(&host_addr, size);
     if (ret != ACL_ERROR_NONE || host_addr == nullptr) {
-        LOG(ERROR) << "Failed to allocate device memory, ret:" << ret;
+        LOG(ERROR) << "Failed to allocate host memory, ret:" << ret;
         return ret;
     }
 
@@ -142,15 +142,15 @@ int initiator() {
 
     // Warm-up transmission
     void *tmp_devAddr = NULL;
-    ret = allocateDevMem(tmp_devAddr, FLAGS_block_size);
+    ret = allocateDevMem(tmp_devAddr, FLAGS_batch_size * FLAGS_block_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
     LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
-              << ", len: " << FLAGS_block_size;
-    ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
+              << ", len: " << FLAGS_batch_size * FLAGS_block_size;
+    ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_batch_size * FLAGS_block_size,
                                       "npu:" + std::to_string(g_devicePhyId));
 
     void *devAddr = NULL;
@@ -200,7 +200,7 @@ int initiator() {
     std::vector<TransferRequest> tmp_requests;
     TransferRequest entry;
     entry.opcode = opcode;
-    entry.length = FLAGS_block_size;
+    entry.length = FLAGS_batch_size * FLAGS_block_size;
     entry.source = (uint8_t *)tmp_devAddr;
     entry.target_id = segment_id;
     entry.target_offset = remote_base;
@@ -302,15 +302,15 @@ int target() {
 
     // Warm-up transmission
     void *tmp_devAddr = NULL;
-    ret = allocateDevMem(tmp_devAddr, FLAGS_block_size);
+    ret = allocateDevMem(tmp_devAddr, FLAGS_batch_size * FLAGS_block_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
     LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
-              << ", len: " << FLAGS_block_size;
-    ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
+              << ", len: " << FLAGS_batch_size * FLAGS_block_size;
+    ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_batch_size * FLAGS_block_size,
                                       "npu:" + std::to_string(g_devicePhyId));
 
     void *devAddr = NULL;

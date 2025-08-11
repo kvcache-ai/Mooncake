@@ -60,7 +60,7 @@ using namespace mooncake;
 
 int g_deviceLogicId = 0;
 int g_devicePhyId = 0;
-uint64_t g_TotalSize = 0;
+uint64_t g_totalSize = 0;
 
 const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
     {"GB", 1000ull * 1000ull * 1000ull},
@@ -148,7 +148,7 @@ int initiator() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     void *devAddr = nullptr;
-    ret = allocateDevMem(devAddr, FLAGS_block_size * FLAGS_batch_size);
+    ret = allocateDevMem(devAddr, g_totalSize);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
@@ -156,7 +156,7 @@ int initiator() {
 
     LOG(INFO) << "devAddr_initiator: " << devAddr;
 
-    ret = engine->registerLocalMemory(devAddr, g_TotalSize,
+    ret = engine->registerLocalMemory(devAddr, g_totalSize,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
@@ -164,7 +164,7 @@ int initiator() {
     }
 
     void *devAddr2 = nullptr;
-    ret = allocateDevMem(devAddr2, FLAGS_block_size * FLAGS_batch_size);
+    ret = allocateDevMem(devAddr2, g_totalSize);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
@@ -172,7 +172,7 @@ int initiator() {
 
     LOG(INFO) << "devAddr_initiator2: " << devAddr2;
 
-    ret = engine->registerLocalMemory(devAddr2, g_TotalSize,
+    ret = engine->registerLocalMemory(devAddr2, g_totalSize,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
@@ -208,7 +208,7 @@ int initiator() {
         entry.source = (uint8_t *)(devAddr) + FLAGS_block_size * i;
         entry.target_id = segment_id;
         entry.target_offset = remote_base + FLAGS_block_size * i +
-                              g_TotalSize * FLAGS_initiator_id;
+                              g_totalSize * FLAGS_initiator_id;
         requests.emplace_back(entry);
     }
 
@@ -248,7 +248,7 @@ int initiator() {
         entry.source = (uint8_t *)(devAddr2) + FLAGS_block_size * i;
         entry.target_id = segment_id;
         entry.target_offset = remote_base2 + FLAGS_block_size * i +
-                              g_TotalSize * FLAGS_initiator_id;
+                              g_totalSize * FLAGS_initiator_id;
         requests2.emplace_back(entry);
     }
     completed = false;
@@ -278,8 +278,8 @@ int initiator() {
                         (stop_tv.tv_usec - start_tv.tv_usec);
 
     LOG(INFO) << "Test completed: duration " << duration << "us, batch count "
-              << FLAGS_batch_size * FLAGS_block_size << ", throughput "
-              << calculateRate(FLAGS_batch_size * FLAGS_block_size, duration);
+              << g_totalSize << ", throughput "
+              << calculateRate(g_totalSize, duration);
 
     // When testing 1-to-2 transmission (1 initiator to 2 targets), fill in the
     // segment_id of the second receiver. If not filled, it defaults to "NA" and
@@ -316,7 +316,7 @@ int initiator() {
             entry.source = (uint8_t *)(devAddr) + FLAGS_block_size * i;
             entry.target_id = segment_id_2;
             entry.target_offset = remote_base_desc_2 + FLAGS_block_size * i +
-                                  g_TotalSize * FLAGS_initiator_id;
+                                  g_totalSize * FLAGS_initiator_id;
             requests.emplace_back(entry);
         }
 
@@ -370,7 +370,7 @@ int target() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     void *devAddr = nullptr;
-    ret = allocateDevMem(devAddr, FLAGS_block_size * FLAGS_batch_size);
+    ret = allocateDevMem(devAddr, g_totalSize);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
@@ -379,7 +379,7 @@ int target() {
     LOG(INFO) << "devAddr_target: " << devAddr;
 
     ret = engine->registerLocalMemory(devAddr,
-                                      g_TotalSize * FLAGS_target_recv_count,
+                                      g_totalSize * FLAGS_target_recv_count,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
@@ -387,7 +387,7 @@ int target() {
     }
 
     void *devAddr2 = nullptr;
-    ret = allocateDevMem(devAddr2, FLAGS_block_size * FLAGS_batch_size);
+    ret = allocateDevMem(devAddr2, g_totalSize);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
@@ -396,7 +396,7 @@ int target() {
     LOG(INFO) << "devAddr_target_2: " << devAddr2;
 
     ret = engine->registerLocalMemory(devAddr2,
-                                      g_TotalSize * FLAGS_target_recv_count,
+                                      g_totalSize * FLAGS_target_recv_count,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
@@ -414,7 +414,7 @@ int target() {
 
 int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    g_TotalSize = (uint64_t)(FLAGS_batch_size * FLAGS_block_size);
+    g_totalSize = (uint64_t)(FLAGS_batch_size * FLAGS_block_size);
 
     if (FLAGS_device_id != 65536) {
         g_deviceLogicId = FLAGS_device_id;

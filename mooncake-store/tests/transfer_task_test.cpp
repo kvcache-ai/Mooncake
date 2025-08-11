@@ -38,7 +38,7 @@ TEST_F(TransferTaskTest, MemcpyOperationBasic) {
     std::vector<char> dest_data(data_size, 'B');
 
     // Create memcpy operation
-    MemcpyOperation op(dest_data.data(), src_data.data(), data_size);
+    MemcpyOperation op(dest_data.data(), src_data.data(), data_size, false);
 
     // Verify operation parameters
     EXPECT_EQ(op.dest, dest_data.data());
@@ -81,7 +81,7 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolBasic) {
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
-    operations.emplace_back(dest_data.data(), src_data.data(), data_size);
+    operations.emplace_back(dest_data.data(), src_data.data(), data_size, false);
 
     // Create and submit task
     MemcpyTask task(std::move(operations), state);
@@ -122,7 +122,7 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
     std::vector<MemcpyOperation> operations;
     for (size_t i = 0; i < num_ops; ++i) {
         operations.emplace_back(dest_buffers[i].data(), src_buffers[i].data(),
-                                data_size);
+                                data_size, false);
     }
 
     // Create and submit task

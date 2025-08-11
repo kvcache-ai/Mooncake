@@ -69,7 +69,7 @@ def link(datadist, prefill_device_id, decode_device_id):
                         "rank_id": "0"
                     }
                 ],
-                "server_id": "1"
+                "server_id": "0"
             },
             {
                 "device": [
@@ -79,7 +79,7 @@ def link(datadist, prefill_device_id, decode_device_id):
                         "rank_id": "1"
                     }
                 ],
-                "server_id": "2"
+                "server_id": "1"
             }
         ]
     }

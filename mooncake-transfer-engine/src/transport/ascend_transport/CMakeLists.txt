@@ -5,16 +5,11 @@ add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
 
 target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)
 
-set_target_properties(ascend_transport
-                      PROPERTIES
-                      PREFIX ""
-                    )
+set_target_properties(ascend_transport PROPERTIES PREFIX "")
 
 target_compile_options(ascend_transport PRIVATE
                        -O2
                        -Xlinker -export-dynamic     
                     )
 
-target_link_options(ascend_transport PRIVATE
-                    -s
-                    )
+target_link_options(ascend_transport PRIVATE -s)
