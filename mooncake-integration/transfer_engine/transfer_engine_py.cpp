@@ -36,7 +36,7 @@ static void synchronizePyTorchEvents() {
     cudaEvent_t ev;
     cudaEventCreate(&ev);
     cudaEventRecord(ev, stream);
-    cudaStreamWaitEvent(0, ev, 0);
+    cudaEventSynchronize(ev);
     cudaEventDestroy(ev);
 }
 #else
