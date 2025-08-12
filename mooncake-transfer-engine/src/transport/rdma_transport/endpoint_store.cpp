@@ -114,6 +114,15 @@ int FIFOEndpointStore::disconnectQPs() {
     return 0;
 }
 
+size_t FIFOEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second->getQPNumber();
+    }
+    return total_qps;
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
@@ -168,8 +177,8 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         if (hand_.has_value() && hand_.value() == fifo_iter) {
-            fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
-                                            : hand_ = std::prev(fifo_iter);
+            if (fifo_iter == fifo_list_.begin()) hand_ = std::nullopt;
+            else hand_ = std::prev(fifo_iter);
         }
         fifo_list_.erase(fifo_iter);
         fifo_map_.erase(peer_nic_path);
@@ -185,47 +194,4 @@ void SIEVEEndpointStore::evictEndpoint() {
     std::string victim;
     while (true) {
         victim = *o;
-        if (endpoint_map_[victim].second.load(std::memory_order_relaxed)) {
-            endpoint_map_[victim].second.store(false,
-                                               std::memory_order_relaxed);
-            o = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
-        } else {
-            break;
-        }
-    }
-    hand_ = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
-    fifo_list_.erase(o);
-    fifo_map_.erase(victim);
-    // LOG(INFO) << victim << " evicted";
-    auto victim_instance = endpoint_map_[victim].first;
-    victim_instance->set_active(false);
-    waiting_list_len_++;
-    waiting_list_.insert(victim_instance);
-    endpoint_map_.erase(victim);
-    return;
-}
-
-void SIEVEEndpointStore::reclaimEndpoint() {
-    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto &endpoint : waiting_list_)
-        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
-    for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
-    waiting_list_len_ -= to_delete.size();
-}
-
-int SIEVEEndpointStore::destroyQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->destroyQP();
-    for (auto &kv : endpoint_map_) kv.second.first->destroyQP();
-    return 0;
-}
-
-int SIEVEEndpointStore::disconnectQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->disconnect();
-    for (auto &kv : endpoint_map_) kv.second.first->disconnect();
-    return 0;
-}
-
-size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
-}  // namespace mooncake
+        if (endpoint
