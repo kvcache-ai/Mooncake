@@ -21,6 +21,7 @@ set(MOONCAKE_STORE_SOURCES
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
+    pybind_client.cpp
 )
 
 set(EXTRA_LIBS "")

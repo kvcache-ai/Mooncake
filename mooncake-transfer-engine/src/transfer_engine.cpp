@@ -17,13 +17,35 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+
+static bool setFilesLimit() {
+    struct rlimit filesLimit;
+    if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "getrlimit failed: " << strerror(errno);
+        return false;
+    }
+    rlim_t target_limit = filesLimit.rlim_max;
+    // Skip if already sufficient
+    if (filesLimit.rlim_cur >= target_limit) {
+        return true;
+    }
+    filesLimit.rlim_cur = target_limit;
+    if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "setrlimit failed: " << strerror(errno);
+        return false;
+    }
+    return true;
+}
 
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
@@ -48,6 +70,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
+
+    if (!setFilesLimit()) {
+        LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
+                        "initialization, but this may cause issues if too many "
+                        "files are opened.";
+    }
+    // Set resources to the maximum value
 
 #ifdef USE_ASCEND
     // The only difference in initializing the Ascend Transport is that the
@@ -146,8 +175,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
 
 #if defined(USE_CXL) && !defined(USE_ASCEND)
-    if (std::getenv("MC_CXL_DEV_PATH") != nullptr &&
-        std::getenv("MC_CXL_DEV_SIZE") != nullptr) {
+    if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport *cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
         if (!cxl_transport) {
@@ -194,7 +222,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             }
         }
 #else
-        if (local_topology_->getHcaList().size() > 0) {
+        if (local_topology_->getHcaList().size() > 0 &&
+            !getenv("MC_FORCE_TCP")) {
             // only install RDMA transport when there is at least one HCA
             Transport *rdma_transport =
                 multi_transports_->installTransport("rdma", local_topology_);

@@ -128,4 +128,16 @@ target_link_libraries(client_buffer_test PUBLIC
 )
 add_test(NAME client_buffer_test COMMAND client_buffer_test)
 
+add_executable(pybind_client_test pybind_client_test.cpp)
+target_link_libraries(pybind_client_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    ${ETCD_WRAPPER_LIB}
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME pybind_client_test COMMAND pybind_client_test)
+
 add_subdirectory(e2e)

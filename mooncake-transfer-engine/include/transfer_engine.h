@@ -208,6 +208,10 @@ class TransferEngine {
         return (int)local_topology_->getHcaList().size();
     }
 
+    std::shared_ptr<Topology> getLocalTopology() const {
+        return local_topology_;
+    }
+
    private:
     struct MemoryRegion {
         void *addr;

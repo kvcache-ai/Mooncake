@@ -1,8 +1,5 @@
 #pragma once
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
 #include <csignal>
 #include <mutex>
 #include <string>
@@ -13,10 +10,7 @@
 
 namespace mooncake {
 
-class DistributedObjectStore;
-
-// Forward declarations
-class SliceBuffer;
+class PyClient;
 
 template <class T>
 constexpr bool is_supported_return_type_v =
@@ -45,10 +39,10 @@ class ResourceTracker {
     static ResourceTracker &getInstance();
 
     // Register a DistributedObjectStore instance for cleanup
-    void registerInstance(DistributedObjectStore *instance);
+    void registerInstance(PyClient *instance);
 
     // Unregister a DistributedObjectStore instance
-    void unregisterInstance(DistributedObjectStore *instance);
+    void unregisterInstance(PyClient *instance);
 
    private:
     ResourceTracker();
@@ -68,29 +62,13 @@ class ResourceTracker {
     static void exitHandler();
 
     std::mutex mutex_;
-    std::unordered_set<DistributedObjectStore *> instances_;
+    std::unordered_set<PyClient *> instances_;
 };
 
-/**
- * @brief A class that holds a contiguous buffer of data
- * This class is responsible for freeing the buffer when it's destroyed (RAII)
- */
-class SliceBuffer {
+class PyClient {
    public:
-    SliceBuffer(BufferHandle handle);
-
-    void *ptr() const;
-    uint64_t size() const;
-
-   private:
-    BufferHandle handle_;
-};
-
-class DistributedObjectStore {
-   public:
-    friend class SliceBuffer;  // Allow SliceBuffer to access private members
-    DistributedObjectStore();
-    ~DistributedObjectStore();
+    PyClient();
+    ~PyClient();
 
     int setup(const std::string &local_hostname,
               const std::string &metadata_server,
@@ -198,26 +176,21 @@ class DistributedObjectStore {
 
     [[nodiscard]] std::string get_hostname() const;
 
-    pybind11::bytes get(const std::string &key);
-
-    std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys);
-
     /**
      * @brief Get a buffer containing the data for a key
      * @param key Key to get data for
-     * @return std::shared_ptr<SliceBuffer> Buffer containing the data, or
+     * @return std::shared_ptr<BufferHandle> Buffer containing the data, or
      * nullptr if error
      */
-    std::shared_ptr<SliceBuffer> get_buffer(const std::string &key);
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
-     * @return Vector of std::shared_ptr<SliceBuffer> buffers containing the
+     * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
      * data, or nullptr for each key if error
      */
-    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer(
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
     int remove(const std::string &key);
@@ -248,20 +221,6 @@ class DistributedObjectStore {
      * exist
      */
     int64_t getSize(const std::string &key);
-
-    /**
-     * @brief Get a PyTorch tensor from the store
-     * @param key Key of the tensor to get
-     * @return PyTorch tensor, or nullptr if error or tensor doesn't exist
-     */
-    pybind11::object get_tensor(const std::string &key);
-    /**
-     * @brief Put a PyTorch tensor into the store
-     * @param key Key for the tensor
-     * @param tensor PyTorch tensor to store
-     * @return 0 on success, negative value on error
-     */
-    int put_tensor(const std::string &key, pybind11::object tensor);
 
     // Internal versions that return tl::expected
     tl::expected<void, ErrorCode> setup_internal(
@@ -311,11 +270,6 @@ class DistributedObjectStore {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{});
 
-    tl::expected<void, ErrorCode> put_batch_internal(
-        const std::vector<std::string> &keys,
-        const std::vector<pybind11::buffer> &buffers,
-        const ReplicateConfig &config = ReplicateConfig{});
-
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal();
@@ -329,10 +283,7 @@ class DistributedObjectStore {
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 
-    tl::expected<void, ErrorCode> put_tensor_internal(const std::string &key,
-                                                      pybind11::object tensor);
-
-    std::vector<std::shared_ptr<SliceBuffer>> batch_get_buffer_internal(
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;

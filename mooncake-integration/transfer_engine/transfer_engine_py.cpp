@@ -626,6 +626,17 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     return segment_desc->buffers[0].addr;
 }
 
+std::string TransferEnginePy::getLocalTopology() {
+    pybind11::gil_scoped_release release;
+    std::shared_ptr<TransferEngine> tmp_engine =
+        std::make_shared<TransferEngine>(true);
+
+    std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
+    tmp_engine->init(metadata_conn_string, local_server_name);
+
+    return tmp_engine->getLocalTopology()->toString();
+}
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(engine, m) {
@@ -672,6 +683,7 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchRegisterMemory)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress);
 

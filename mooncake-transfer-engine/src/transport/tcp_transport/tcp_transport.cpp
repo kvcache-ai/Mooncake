@@ -30,6 +30,11 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
@@ -39,6 +44,16 @@ struct SessionHeader {
     uint64_t addr;
     uint8_t opcode;
 };
+
+#ifdef USE_CUDA
+static bool isCudaMemory(void *addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return false;
+    if (attributes.type == cudaMemoryTypeDevice) return true;
+    return false;
+}
+#endif
 
 struct Session : public std::enable_shared_from_this<Session> {
     explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
@@ -130,13 +145,28 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#ifdef USE_CUDA
+        if (isCudaMemory(addr)) {
+            dram_buffer = new char[buffer_size];
+            cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                       buffer_size, cudaMemcpyDefault);
+        }
+#endif
+
         asio::async_write(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, self](const asio::error_code &ec,
+                                            std::size_t transferred_bytes) {
+#ifdef USE_CUDA
+                delete[] dram_buffer;
+#endif
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::writeBody failed. Error: " << ec.message()
+                        << "Session::writeBody failed. "
+                        << "Attempt to write data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -164,21 +194,42 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#ifdef USE_CUDA
+        bool is_cuda_memory = isCudaMemory(addr);
+        if (is_cuda_memory) {
+            dram_buffer = new char[buffer_size];
+        }
+#else
+        bool is_cuda_memory = false;
+#endif
+
         asio::async_read(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, is_cuda_memory, self](
+                const asio::error_code &ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::readBody failed. Error: " << ec.message()
+                        << "Session::readBody failed. "
+                        << "Attempt to read data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+#ifdef USE_CUDA
+                    if (is_cuda_memory) delete[] dram_buffer;
+#endif
                     session_mutex_.unlock();
                     return;
                 }
+#ifdef USE_CUDA
+                cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                           transferred_bytes, cudaMemcpyDefault);
+                if (is_cuda_memory) delete[] dram_buffer;
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
