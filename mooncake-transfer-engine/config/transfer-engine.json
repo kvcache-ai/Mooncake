@@ -8,6 +8,7 @@
         "rdma_whitelist": ["mlx5_0", "mlx5_2"],
         "rdma_blacklist": []
     },
+    "cluster_topology": "/work/Mooncake-next/mooncake-transfer-engine/config/cluster-topology.json",
     "log_level": "warning",
     "transports": {
         "rdma": {

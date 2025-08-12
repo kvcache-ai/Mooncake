@@ -92,7 +92,6 @@ struct hash<NodePair> {
 
 namespace mooncake {
 namespace v1 {
-
 class ClusterTopology {
    public:
     Status load(const std::string& filename);
@@ -100,8 +99,25 @@ class ClusterTopology {
     const Node* getNode(const std::string& src_host,
                         const std::string& dst_host) const;
 
+    const Endpoint* getEndpoint(const std::string& src_host,
+                                const std::string& src_dev,
+                                const std::string& dst_host,
+                                const std::string& dst_dev);
+
+    std::string findOptionalDevice(const std::string& src_host,
+                                   const std::string& src_dev,
+                                   const std::string& dst_host, int dst_numa);
+
+   private:
+    struct DeviceInfo {
+        int numa;
+    };
+
    private:
     std::unordered_map<NodePair, Node> entries_;
+
+    std::unordered_map<std::string, std::unordered_map<std::string, DeviceInfo>>
+        device_list_;
 };
 
 }  // namespace v1

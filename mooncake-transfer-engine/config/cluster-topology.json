@@ -1,0 +1,658 @@
+[
+  {
+    "src_host": "node050",
+    "dst_host": "node049",
+    "endpoints": [
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21350.28,
+        "latency": 10.81
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 19978.24,
+        "latency": 8.23
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 19969.57,
+        "latency": 10.81
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21470.68,
+        "latency": 8.43
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 11311.18,
+        "latency": 5.91
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21310.46,
+        "latency": 10.75
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 10723.74,
+        "latency": 8.07
+      },
+      {
+        "src_dev": "mlx5_bond_0",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21927.1,
+        "latency": 5.68
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21923.28,
+        "latency": 8.45
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21913.24,
+        "latency": 10.57
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21927.86,
+        "latency": 8.52
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 18103.85,
+        "latency": 6.06
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21922.34,
+        "latency": 8.05
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21532.53,
+        "latency": 7.95
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 18220.7,
+        "latency": 6.0
+      },
+      {
+        "src_dev": "mlx5_bond_1",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 18340.17,
+        "latency": 8.52
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21784.31,
+        "latency": 8.01
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21912.56,
+        "latency": 10.27
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21652.22,
+        "latency": 8.27
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 11548.84,
+        "latency": 5.71
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21907.88,
+        "latency": 8.21
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21922.88,
+        "latency": 7.94
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21938.39,
+        "latency": 5.66
+      },
+      {
+        "src_dev": "mlx5_bond_2",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 20815.99,
+        "latency": 8.14
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 20246.48,
+        "latency": 10.85
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 18940.85,
+        "latency": 8.43
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 17745.88,
+        "latency": 10.8
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 18657.57,
+        "latency": 8.18
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21927.7,
+        "latency": 5.82
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21922.5,
+        "latency": 10.54
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 1,
+        "dst_numa": 1,
+        "bandwidth": 21924.78,
+        "latency": 7.98
+      },
+      {
+        "src_dev": "mlx5_bond_3",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 1,
+        "dst_numa": 0,
+        "bandwidth": 21937.31,
+        "latency": 5.93
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21558.55,
+        "latency": 8.5
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 7626.84,
+        "latency": 10.79
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21280.81,
+        "latency": 7.97
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 14129.05,
+        "latency": 5.5
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21912.19,
+        "latency": 8.04
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 19984.2,
+        "latency": 8.45
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21092.58,
+        "latency": 6.04
+      },
+      {
+        "src_dev": "mlx5_bond_4",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 19435.87,
+        "latency": 8.47
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21710.3,
+        "latency": 10.45
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21912.84,
+        "latency": 7.84
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21918.86,
+        "latency": 10.82
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 17373.14,
+        "latency": 8.31
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 19047.55,
+        "latency": 6.1
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 19510.7,
+        "latency": 10.82
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 19897.46,
+        "latency": 8.43
+      },
+      {
+        "src_dev": "mlx5_bond_5",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 19017.73,
+        "latency": 6.11
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21761.45,
+        "latency": 8.21
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 19761.55,
+        "latency": 5.99
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21613.49,
+        "latency": 8.38
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21698.32,
+        "latency": 10.8
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21649.27,
+        "latency": 8.36
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 20674.82,
+        "latency": 8.48
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 21543.06,
+        "latency": 10.55
+      },
+      {
+        "src_dev": "mlx5_bond_6",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21920.13,
+        "latency": 8.03
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_1",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21932.55,
+        "latency": 5.9
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_2",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 17673.75,
+        "latency": 8.25
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_3",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 19486.15,
+        "latency": 6.03
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_4",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 20294.59,
+        "latency": 8.17
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_5",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 20406.98,
+        "latency": 10.66
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_6",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 12078.55,
+        "latency": 6.11
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_7",
+        "src_numa": 0,
+        "dst_numa": 1,
+        "bandwidth": 12661.63,
+        "latency": 7.91
+      },
+      {
+        "src_dev": "mlx5_bond_8",
+        "dst_dev": "mlx5_bond_8",
+        "src_numa": 0,
+        "dst_numa": 0,
+        "bandwidth": 21920.96,
+        "latency": 10.33
+      }
+    ],
+    "partition_matchings": {
+      "1-0": [
+        {
+          "src_dev": "mlx5_bond_0",
+          "dst_dev": "mlx5_bond_8",
+          "src_numa": 1,
+          "dst_numa": 0,
+          "bandwidth": 21927.1,
+          "latency": 5.68
+        },
+        {
+          "src_dev": "mlx5_bond_1",
+          "dst_dev": "mlx5_bond_6",
+          "src_numa": 1,
+          "dst_numa": 0,
+          "bandwidth": 21532.53,
+          "latency": 7.95
+        },
+        {
+          "src_dev": "mlx5_bond_2",
+          "dst_dev": "mlx5_bond_1",
+          "src_numa": 1,
+          "dst_numa": 0,
+          "bandwidth": 21784.31,
+          "latency": 8.01
+        },
+        {
+          "src_dev": "mlx5_bond_3",
+          "dst_dev": "mlx5_bond_3",
+          "src_numa": 1,
+          "dst_numa": 0,
+          "bandwidth": 17745.88,
+          "latency": 10.8
+        }
+      ],
+      "1-1": [
+        {
+          "src_dev": "mlx5_bond_0",
+          "dst_dev": "mlx5_bond_2",
+          "src_numa": 1,
+          "dst_numa": 1,
+          "bandwidth": 19978.24,
+          "latency": 8.23
+        },
+        {
+          "src_dev": "mlx5_bond_1",
+          "dst_dev": "mlx5_bond_7",
+          "src_numa": 1,
+          "dst_numa": 1,
+          "bandwidth": 18220.7,
+          "latency": 6.0
+        },
+        {
+          "src_dev": "mlx5_bond_2",
+          "dst_dev": "mlx5_bond_4",
+          "src_numa": 1,
+          "dst_numa": 1,
+          "bandwidth": 11548.84,
+          "latency": 5.71
+        },
+        {
+          "src_dev": "mlx5_bond_3",
+          "dst_dev": "mlx5_bond_5",
+          "src_numa": 1,
+          "dst_numa": 1,
+          "bandwidth": 21927.7,
+          "latency": 5.82
+        }
+      ],
+      "0-0": [
+        {
+          "src_dev": "mlx5_bond_4",
+          "dst_dev": "mlx5_bond_3",
+          "src_numa": 0,
+          "dst_numa": 0,
+          "bandwidth": 21280.81,
+          "latency": 7.97
+        },
+        {
+          "src_dev": "mlx5_bond_5",
+          "dst_dev": "mlx5_bond_8",
+          "src_numa": 0,
+          "dst_numa": 0,
+          "bandwidth": 19017.73,
+          "latency": 6.11
+        },
+        {
+          "src_dev": "mlx5_bond_6",
+          "dst_dev": "mlx5_bond_1",
+          "src_numa": 0,
+          "dst_numa": 0,
+          "bandwidth": 21761.45,
+          "latency": 8.21
+        },
+        {
+          "src_dev": "mlx5_bond_8",
+          "dst_dev": "mlx5_bond_6",
+          "src_numa": 0,
+          "dst_numa": 0,
+          "bandwidth": 12078.55,
+          "latency": 6.11
+        }
+      ],
+      "0-1": [
+        {
+          "src_dev": "mlx5_bond_4",
+          "dst_dev": "mlx5_bond_4",
+          "src_numa": 0,
+          "dst_numa": 1,
+          "bandwidth": 14129.05,
+          "latency": 5.5
+        },
+        {
+          "src_dev": "mlx5_bond_5",
+          "dst_dev": "mlx5_bond_5",
+          "src_numa": 0,
+          "dst_numa": 1,
+          "bandwidth": 19047.55,
+          "latency": 6.1
+        },
+        {
+          "src_dev": "mlx5_bond_6",
+          "dst_dev": "mlx5_bond_2",
+          "src_numa": 0,
+          "dst_numa": 1,
+          "bandwidth": 19761.55,
+          "latency": 5.99
+        },
+        {
+          "src_dev": "mlx5_bond_8",
+          "dst_dev": "mlx5_bond_7",
+          "src_numa": 0,
+          "dst_numa": 1,
+          "bandwidth": 12661.63,
+          "latency": 7.91
+        }
+      ]
+    }
+  }
+]

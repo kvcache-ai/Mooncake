@@ -32,6 +32,9 @@
 namespace mooncake {
 namespace v1 {
 Status ClusterTopology::load(const std::string& filename) {
+    entries_.clear();
+    device_list_.clear();
+
     std::ifstream ifs(filename);
     if (!ifs.is_open()) {
         return Status::InvalidArgument("Unable to open cluster topology file");
@@ -57,6 +60,8 @@ Status ClusterTopology::load(const std::string& filename) {
             Endpoint e{ep["src_numa"].asInt(), ep["dst_numa"].asInt(),
                        ep["bandwidth"].asDouble(), ep["latency"].asDouble()};
             node.endpoints[rdma_pair] = e;
+            device_list_[src_host][rdma_pair.src_dev].numa = e.src_numa;
+            device_list_[dst_host][rdma_pair.dst_dev].numa = e.dst_numa;
         }
 
         // Process partition matchings
@@ -84,6 +89,34 @@ const Node* ClusterTopology::getNode(const std::string& src_host,
     NodePair node_pair{src_host, dst_host};
     if (entries_.count(node_pair)) return &entries_.at(node_pair);
     return nullptr;
+}
+
+const Endpoint* ClusterTopology::getEndpoint(const std::string& src_host,
+                                             const std::string& src_dev,
+                                             const std::string& dst_host,
+                                             const std::string& dst_dev) {
+    auto node = getNode(src_host, dst_host);
+    if (!node) return nullptr;
+    RdmaDevicePair pair{src_dev, dst_dev};
+    if (node && node->endpoints.count(pair)) return &node->endpoints.at(pair);
+    return nullptr;
+}
+
+std::string ClusterTopology::findOptionalDevice(const std::string& src_host,
+                                                const std::string& src_dev,
+                                                const std::string& dst_host,
+                                                int dst_numa) {
+    auto node = getNode(src_host, dst_host);
+    if (!node || !device_list_.count(src_host) ||
+        !device_list_[src_host].count(src_dev))
+        return "";
+    auto src_numa = device_list_[src_host][src_dev].numa;
+    NumaIdPair numa_pair{src_numa, dst_numa};
+    if (!node->partition_matchings.count(numa_pair)) return "";
+    auto& mapping = node->partition_matchings.at(numa_pair);
+    for (auto& entry : mapping)
+        if (entry.src_dev == src_dev) return entry.dst_dev;
+    return "";
 }
 
 }  // namespace v1

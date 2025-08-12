@@ -112,6 +112,11 @@ Status RdmaTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
+    auto cluster_topology_path = conf_->get("cluster_topology", "");
+    if (!cluster_topology_path.empty()) {
+        cluster_topology_ = std::make_shared<ClusterTopology>();
+        CHECK_STATUS(cluster_topology_->load(cluster_topology_path));
+    }
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getDeviceList();

@@ -382,9 +382,26 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
             "No matched buffer in given address range" LOC_MARK);
     }
 
-    CHECK_STATUS(target_topology.selectDevice(device_id,
-                                              target_buffer_desc->location,
-                                              slice->retry_count, rand_seed));
+    device_id = -1;
+    if (transport_->cluster_topology_) {
+        // Read best partition using cluster topology
+        auto local_device_name =
+            transport_->local_topology_->getDeviceList()[slice->source_dev_id];
+        auto target_device_name =
+            transport_->cluster_topology_->findOptionalDevice(
+                local_segment_desc->machine_id, local_device_name,
+                target_segment_desc->machine_id, 0);
+        device_id = target_topology.findDeviceID(target_device_name);
+    } 
+    
+    if (device_id < 0) {
+        // In other cases, guess the optimal device using rand seed to keep the
+        // static association between local and remote devices.
+        CHECK_STATUS(target_topology.selectDevice(
+            device_id, target_buffer_desc->location, slice->retry_count,
+            rand_seed));
+    }
+
     slice->target_dev_id = device_id;
     slice->target_rkey = target_buffer_desc->rkey[slice->target_dev_id];
     return Status::OK();

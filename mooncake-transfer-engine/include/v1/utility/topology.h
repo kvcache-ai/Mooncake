@@ -91,6 +91,16 @@ class Topology {
         return rdma_device_list_;
     }
 
+    int findDeviceID(const std::string &name) const {
+        int index = 0;
+        for (auto &entry : rdma_device_list_)
+            if (entry == name)
+                return index;
+            else
+                index++;
+        return -1;
+    }
+
    private:
     Status resolve();
 
