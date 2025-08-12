@@ -62,6 +62,20 @@ if (WITH_STORE)
     )
 endif()
 
+if (WITH_EP)
+    pybind11_add_module(ep ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        ep/ep_py.cpp
+        integration_utils.h
+    )
+    target_link_libraries(ep PUBLIC
+        transfer_engine
+        glog::glog
+        gflags::gflags
+        mooncake_ep
+        cachelib_memory_allocator
+    )
+endif ()
+
 message("${PYTHON_SYS_PATH}")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py

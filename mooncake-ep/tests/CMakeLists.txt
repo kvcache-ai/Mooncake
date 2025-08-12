@@ -1,0 +1,2 @@
+add_executable(mooncake_backend_test mooncake_backend_test.cpp)
+target_link_libraries(mooncake_backend_test PUBLIC mooncake_ep gtest gtest_main)
