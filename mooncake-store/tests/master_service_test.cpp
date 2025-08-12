@@ -1029,7 +1029,7 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto put_start_result = service_->PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(2u, put_start_result->size());
-    ASSERT_TRUE(service_->PutEnd(key).has_value());
+    ASSERT_TRUE(service_->PutEnd(key, ReplicaType::MEMORY).has_value());
 
     // Verify two replicas exist and they are on distinct segments
     auto get_result = service_->GetReplicaList(key);
