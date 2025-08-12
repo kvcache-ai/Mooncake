@@ -160,7 +160,9 @@ struct Session : public std::enable_shared_from_this<Session> {
             [this, addr, dram_buffer, self](const asio::error_code &ec,
                                             std::size_t transferred_bytes) {
 #ifdef USE_CUDA
+            if (isCudaMemory(addr)) {
                 delete[] dram_buffer;
+            }
 #endif
                 if (ec) {
                     LOG(ERROR)
