@@ -5,13 +5,11 @@
 #include <thread>
 #include <future>
 
-namespace torch {
-namespace distributed {
+namespace mooncake {
 
 MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
                                  int rank, int size,
                                  c10::intrusive_ptr<Options> options)
     : ::c10d::Backend(rank, size) {}
 
-}  // namespace distributed
-}  // namespace torch
+}  // namespace mooncake

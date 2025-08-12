@@ -4,8 +4,7 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 
-namespace torch {
-namespace distributed {
+namespace mooncake {
 
 class MooncakeBackend : public ::c10d::Backend {
    public:
@@ -13,7 +12,6 @@ class MooncakeBackend : public ::c10d::Backend {
                     c10::intrusive_ptr<Options> options);
 };
 
-}  // namespace distributed
-}  // namespace torch
+}  // namespace mooncake
 
 #endif  // MOONCAKE_BACKEND_H

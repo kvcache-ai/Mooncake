@@ -18,6 +18,10 @@ if (WITH_STORE)
     include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
 endif()
 
+if (WITH_EP)
+    include_directories("../mooncake-ep/include")
+endif()
+
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
 
@@ -106,6 +110,10 @@ install(
 
 if (WITH_STORE)
     install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
+if (WITH_EP)
+    install(TARGETS ep DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})

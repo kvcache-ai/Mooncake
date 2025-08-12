@@ -5,8 +5,7 @@
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <mooncake_backend.h>
 
-namespace torch {
-namespace distributed {
+namespace mooncake {
 
 class MooncakeBackendTest : public ::testing::Test {
    protected:
@@ -24,7 +23,7 @@ class MooncakeBackendTest : public ::testing::Test {
 };
 
 TEST_F(MooncakeBackendTest, BroadcastTest) {
-    std::vector<Tensor> tensors;
+    std::vector<torch::Tensor> tensors;
     tensors.push_back(torch::ones({2, 2}));
 
     ::c10d::BroadcastOptions opts;
@@ -33,8 +32,7 @@ TEST_F(MooncakeBackendTest, BroadcastTest) {
     EXPECT_THROW({ backend->broadcast(tensors, opts); }, c10::Error);
 }
 
-}  // namespace distributed
-}  // namespace torch
+}  // namespace mooncake
 
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
