@@ -194,7 +194,6 @@ class TransferEngine {
         return multi_transports_->getTransport(proto);
     }
 
-
     int syncSegmentCache(const std::string &segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);
     }

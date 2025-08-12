@@ -241,17 +241,17 @@ size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
 size_t SIEVEEndpointStore::getTotalQPNumber() {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     size_t total_qps = 0;
-    
+
     // Count QPs in active endpoints
     for (const auto &kv : endpoint_map_) {
         total_qps += kv.second.first->getQPNumber();
     }
-    
+
     // Count QPs in waiting list
     for (const auto &endpoint : waiting_list_) {
         total_qps += endpoint->getQPNumber();
     }
-    
+
     return total_qps;
 }
 
