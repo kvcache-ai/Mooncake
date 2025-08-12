@@ -10,6 +10,10 @@ class MooncakeBackend : public ::c10d::Backend {
    public:
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
                     c10::intrusive_ptr<Options> options);
+
+    static c10::intrusive_ptr<Backend> createMooncakeBackend(
+        const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size,
+        const std::chrono::duration<float>& timeout);
 };
 
 }  // namespace mooncake

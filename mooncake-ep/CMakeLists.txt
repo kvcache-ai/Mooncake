@@ -16,7 +16,6 @@ list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
 find_package(CUDAToolkit REQUIRED)
 find_package(Torch REQUIRED)
 include_directories(${TORCH_INCLUDE_DIRS})
-link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib)
 
 include_directories(include)
 add_subdirectory(include)

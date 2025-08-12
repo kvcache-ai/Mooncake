@@ -12,11 +12,16 @@ namespace py = pybind11;
 
 namespace mooncake {
 
+__attribute__((constructor)) static void MooncakeBackendConstructor() {
+    py::object module = py::module::import("torch.distributed");
+    py::object register_backend =
+        module.attr("Backend").attr("register_backend");
+    register_backend("mooncake",
+                     py::cpp_function(MooncakeBackend::createMooncakeBackend));
+}
+
 PYBIND11_MODULE(ep, m) {
-    py::class_<MooncakeBackend>(m, "MooncakeBackend")
-        .def(py::init<c10::intrusive_ptr<::c10d::Store>, int, int,
-                      c10::intrusive_ptr<::c10d::Backend::Options>>())
-        .def("broadcast", &MooncakeBackend::broadcast);
+    m.def("createMooncakeBackend", &MooncakeBackend::createMooncakeBackend);
 }
 
 }  // namespace mooncake
