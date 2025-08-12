@@ -67,6 +67,8 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+
     long RemoveAll();
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,

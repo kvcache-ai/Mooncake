@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <queue>
 #include <shared_mutex>
+#include <regex>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -272,6 +273,43 @@ auto MasterService::QuerySegments(const std::string& segment)
     return std::make_pair(used, capacity);
 }
 
+auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
+    -> tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode> {
+
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
+    std::regex pattern;
+
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MutexLocker lock(&metadata_shards_[i].mutex);
+
+        for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
+            if (std::regex_match(key, pattern)) {
+                if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    LOG(WARNING) << "key=" << key << " matched by regex, but replica not ready, status=" << *status;
+                    continue;
+                }
+
+                std::vector<Replica::Descriptor> replica_list;
+                replica_list.reserve(metadata.replicas.size());
+                for (const auto& replica : metadata.replicas) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                }
+
+                results.emplace(key, std::move(replica_list));
+            }
+        }
+    }
+
+    return results;
+}
+
 auto MasterService::GetReplicaList(std::string_view key)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
@@ -490,6 +528,47 @@ auto MasterService::Remove(const std::string& key)
     // Remove object metadata
     accessor.Erase();
     return {};
+}
+
+auto MasterService::RemoveByRegex(const std::string& regex_pattern)
+    -> tl::expected<long, ErrorCode> {
+    long removed_count = 0;
+    std::regex pattern;
+
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MutexLocker lock(&metadata_shards_[i].mutex);
+
+        for (auto it = metadata_shards_[i].metadata.begin(); it != metadata_shards_[i].metadata.end();) {
+            if (std::regex_match(it->first, pattern)) {
+                if (!it->second.IsLeaseExpired()) {
+                    VLOG(1) << "key=" << it->first << " matched by regex, but has lease. Skipping removal.";
+                    ++it;
+                    continue;
+                }
+                if (auto status = it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    LOG(WARNING) << "key=" << it->first << " matched by regex, but replica not ready, status=" << *status << ". Skipping removal.";
+                    ++it;
+                    continue;
+                }
+
+                VLOG(1) << "key=" << it->first << " matched by regex. Removing.";
+                it = metadata_shards_[i].metadata.erase(it);
+                removed_count++;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern << ", removed_count=" << removed_count;
+    return removed_count;
 }
 
 long MasterService::RemoveAll() {

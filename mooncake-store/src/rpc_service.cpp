@@ -431,6 +431,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
+tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
+    const std::string& str) {
+    return execute_rpc(
+        "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
+        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        [] { MasterMetricManager::instance().inc_remove_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_failures(); });
+}
+
 long WrappedMasterService::RemoveAll() {
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects");

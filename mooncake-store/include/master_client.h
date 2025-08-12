@@ -131,6 +131,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
 
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+
     /**
      * @brief Removes all objects and all its replicas
      * @return tl::expected<long, ErrorCode> number of removed objects or error

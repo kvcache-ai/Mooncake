@@ -6,6 +6,7 @@
 #include <sys/uio.h>
 #include <string>
 #include <vector>
+#include <regex>
 
 namespace mooncake {
 
@@ -152,6 +153,53 @@ bool StorageBackend::Existkey(const ObjectKey& key) {
     }
 }
 
+std::unordered_map<std::string, Replica::Descriptor> StorageBackend::QueryByRegex(
+    const std::string& regex_pattern) {
+
+    namespace fs = std::filesystem;
+    std::unordered_map<std::string, Replica::Descriptor> result;
+    std::regex pattern;
+
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern for storage query: " << regex_pattern
+                   << ", error: " << e.what();
+        return result;
+    }
+
+    fs::path storage_root = fs::path(root_dir_) / fsdir_;
+    if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
+        LOG(WARNING) << "Storage root directory does not exist: " << storage_root;
+        return result;
+    }
+
+    for (const auto& entry : fs::recursive_directory_iterator(storage_root)) {
+        if (fs::is_regular_file(entry.status())) {
+            std::string filename = entry.path().filename().string();
+
+            if (std::regex_match(filename, pattern)) {
+                Replica::Descriptor desc;
+                auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+                disk_desc.file_path = entry.path().string();
+
+                std::error_code ec;
+                disk_desc.file_size = fs::file_size(entry.path(), ec);
+                if (ec) {
+                    LOG(WARNING) << "Failed to get file size for: " << disk_desc.file_path
+                                 << ", error: " << ec.message();
+                    continue;
+                }
+
+                desc.status = ReplicaStatus::COMPLETE;
+                result.emplace(filename, std::move(desc));
+            }
+        }
+    }
+
+    return result;
+}
+
 std::optional<Replica::Descriptor> StorageBackend::Querykey(
     const ObjectKey& key) {
     std::string path = ResolvePath(key);
@@ -215,6 +263,49 @@ void StorageBackend::RemoveFile(const ObjectKey& key) {
                        << ", error: " << ec.message();
         }
     }
+}
+
+void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
+    namespace fs = std::filesystem;
+    std::regex pattern;
+
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern for storage removal: " << regex_pattern
+                   << ", error: " << e.what();
+        return;
+    }
+
+    fs::path storage_root = fs::path(root_dir_) / fsdir_;
+    if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
+        LOG(WARNING) << "Storage root directory does not exist: " << storage_root;
+        return;
+    }
+
+    std::vector<fs::path> paths_to_remove;
+
+    for (const auto& entry : fs::recursive_directory_iterator(storage_root)) {
+        if (fs::is_regular_file(entry.status())) {
+            std::string filename = entry.path().filename().string();
+
+            if (std::regex_match(filename, pattern)) {
+                paths_to_remove.push_back(entry.path());
+            }
+        }
+    }
+
+    for (const auto& path : paths_to_remove) {
+        std::error_code ec;
+        if (fs::remove(path, ec)) {
+            VLOG(1) << "Removed file by regex: " << path;
+        } else {
+            LOG(ERROR) << "Failed to delete file: " << path
+                       << ", error: " << ec.message();
+        }
+    }
+
+    return;
 }
 
 void StorageBackend::RemoveAll() {

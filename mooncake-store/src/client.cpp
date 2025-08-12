@@ -1006,6 +1006,17 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     return {};
 }
 
+tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
+    auto result = master_client_.RemoveByRegex(str);
+    if (storage_backend_) {
+        storage_backend_->RemoveByRegex(str);
+    }
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
 tl::expected<long, ErrorCode> Client::RemoveAll() {
     if (storage_backend_) {
         storage_backend_->RemoveAll();

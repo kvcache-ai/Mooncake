@@ -134,6 +134,9 @@ class StorageBackend {
      */
     bool Existkey(const ObjectKey& key);
 
+    std::unordered_map<std::string, Replica::Descriptor> QueryByRegex(
+        const std::string& regex_pattern);
+
     /**
      * @brief Queries metadata for an object by key
      * @param key Object identifier
@@ -157,6 +160,8 @@ class StorageBackend {
      * @param key Object identifier
      */
     void RemoveFile(const ObjectKey& key);
+
+    void RemoveByRegex(const std::string& key);
 
     /**
      * @brief Deletes all objects from the storage backend

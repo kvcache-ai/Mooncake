@@ -195,6 +195,8 @@ class PyClient {
 
     int remove(const std::string &key);
 
+    long removeByRegex(const std::string &str);
+
     long removeAll();
 
     int tearDownAll();
@@ -271,6 +273,8 @@ class PyClient {
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
+
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal();
 

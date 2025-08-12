@@ -136,6 +136,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+
     /**
      * @brief Removes all objects and all its replicas
      * @return tl::expected<long, ErrorCode> number of removed objects or error
