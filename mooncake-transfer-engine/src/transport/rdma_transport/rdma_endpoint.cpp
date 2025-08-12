@@ -319,7 +319,6 @@ int RdmaEndPoint::submitPostSend(
 }
 
 size_t RdmaEndPoint::getQPNumber() const {
-    RWSpinlock::ReadGuard guard(lock_);
     return qp_list_.size();
 }
 
