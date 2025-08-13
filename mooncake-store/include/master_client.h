@@ -4,12 +4,9 @@
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include "client_metric.h"
 
-#include "rpc_service.h"
 #include "types.h"
-
-using namespace async_simple;
-using namespace coro_rpc;
 
 namespace mooncake {
 
@@ -20,7 +17,7 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient();
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {}
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -219,21 +216,24 @@ class MasterClient {
      */
     class RpcClientAccessor {
        public:
-        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+        void SetClient(std::shared_ptr<coro_rpc::coro_rpc_client> client) {
             std::lock_guard<std::shared_mutex> lock(client_mutex_);
             client_ = client;
         }
 
-        std::shared_ptr<coro_rpc_client> GetClient() {
+        std::shared_ptr<coro_rpc::coro_rpc_client> GetClient() {
             std::shared_lock<std::shared_mutex> lock(client_mutex_);
             return client_;
         }
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc_client> client_;
+        std::shared_ptr<coro_rpc::coro_rpc_client> client_;
     };
     RpcClientAccessor client_accessor_;
+
+    // Metrics for tracking RPC operations
+    MasterClientMetric* metrics_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

@@ -5,6 +5,7 @@ set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
     client.cpp
+    client_metric.cpp
     types.cpp
     master_client.cpp
     utils.cpp

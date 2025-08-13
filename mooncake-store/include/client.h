@@ -5,9 +5,11 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -196,6 +198,24 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    // For human-readable metrics
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
+
+    // For Prometheus-style metrics
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::string str;
+        metrics_->serialize(str);
+        return str;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -254,6 +274,9 @@ class Client {
     void BatchPuttoLocalFile(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+
+    // Client-side metrics
+    std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
     TransferEngine transfer_engine_;

@@ -136,4 +136,15 @@ target_link_libraries(pybind_client_test PUBLIC
 )
 add_test(NAME pybind_client_test COMMAND pybind_client_test)
 
+add_executable(client_metrics_test client_metrics_test.cpp)
+target_link_libraries(client_metrics_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME client_metrics_test COMMAND client_metrics_test)
+
 add_subdirectory(e2e)
