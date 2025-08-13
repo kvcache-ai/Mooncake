@@ -249,6 +249,18 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+MasterClient::GetReplicaListByRegex(const std::string& str) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
+    timer.LogRequest("Regex=", str);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListByRegex,
+                             std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(str);
+    // Now operator<< not support for std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+    //timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::GetReplicaList(const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");

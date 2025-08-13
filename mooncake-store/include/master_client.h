@@ -56,6 +56,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     GetReplicaList(const std::string& object_key);
 
+    [[nodiscard]] tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
+
     /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
