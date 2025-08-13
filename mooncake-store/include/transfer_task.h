@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,9 @@
 #include "transport/transport.h"
 #include "types.h"
 #include "storage_backend.h"
+
+#include "ylt/metric/counter.hpp"
+#include "ylt/metric/histogram.hpp"
 
 namespace mooncake {
 
@@ -44,6 +48,23 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "UNKNOWN";
     }
 }
+
+// latency bucket is in microsecond
+// 50us ~ 1000ms
+const std::vector<double> kLatencyBucket = {
+    100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 10000, 100000, 1000000};
+
+struct TransferMetric {
+    ylt::metric::counter_t total_read_bytes{"mooncake_transfer_read_bytes",
+                                            "Total bytes read"};
+    ylt::metric::counter_t total_write_bytes{"mooncake_transfer_write_bytes",
+                                             "Total bytes written"};
+    ylt::metric::histogram_t read_latency{"mooncake_transfer_read_latency",
+                                          "Read latency (us)", kLatencyBucket};
+    ylt::metric::histogram_t write_latency{"mooncake_transfer_write_latency",
+                                           "Write latency (us)",
+                                           kLatencyBucket};
+};
 
 /**
  * @brief Abstract base class for operation state management
