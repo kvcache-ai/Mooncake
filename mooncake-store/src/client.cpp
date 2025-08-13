@@ -1381,7 +1381,14 @@ void Client::InitializeMetricsConfig() {
                     << ", using default: " << metrics_interval_seconds_;
             }
         } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse MC_CLIENT_METRIC_INTERVAL: "
+                          << "s via MC_STORE_METRIC_REPORT_INTERVAL";
+            } else {
+                LOG(WARNING)
+                    << "Invalid metrics interval: " << interval_env
+                    << ", using default: " << metrics_interval_seconds_;
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_STORE_METRIC_REPORT_INTERVAL: "
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
