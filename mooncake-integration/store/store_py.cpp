@@ -372,14 +372,15 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_.remove(key);
              })
-        .def("remove_by_regex",
-             [](MooncakeStorePyWrapper &self, const std::string &str) {
-                 py::gil_scoped_release release;
-                 return self.store_.removeByRegex(str);
-             },
-             py::arg("regex_pattern"),
-             "Removes objects from the store whose keys match the given "
-             "regular expression.")
+        .def(
+            "remove_by_regex",
+            [](MooncakeStorePyWrapper &self, const std::string &str) {
+                py::gil_scoped_release release;
+                return self.store_.removeByRegex(str);
+            },
+            py::arg("regex_pattern"),
+            "Removes objects from the store whose keys match the given "
+            "regular expression.")
         .def("remove_all",
              [](MooncakeStorePyWrapper &self) {
                  py::gil_scoped_release release;
