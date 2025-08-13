@@ -203,7 +203,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
                                    hostname, port);
-    CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+        return ErrorCode::INTERNAL_ERROR;
+    }
 
     Transport* transport = nullptr;
     if (protocol == "rdma") {

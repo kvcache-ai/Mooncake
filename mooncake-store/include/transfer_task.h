@@ -157,10 +157,7 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {
-        CHECK(batch_id_ != Transport::INVALID_BATCH_ID)
-            << "Invalid batch ID for transfer engine operation";
-    }
+        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 

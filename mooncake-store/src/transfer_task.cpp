@@ -509,6 +509,11 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         return std::nullopt;
     }
 
+    if (batch_id == Transport::INVALID_BATCH_ID) {
+        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
+        return std::nullopt;
+    }
+
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
