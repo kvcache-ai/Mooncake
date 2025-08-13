@@ -249,7 +249,7 @@ struct ClientMetric {
      *         nullptr if disabled
      *
      * Environment variables:
-     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default, 
+     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default,
      *   set to 0/false to disable)
      * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
      *   (default: 0, 0 = collect but don't report)

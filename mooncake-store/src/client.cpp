@@ -49,13 +49,16 @@ Client::Client(const std::string& local_hostname,
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
-            LOG(INFO) << "Client metrics enabled with reporting thread started (interval: " 
+            LOG(INFO) << "Client metrics enabled with reporting thread started "
+                         "(interval: "
                       << metrics_->GetReportingInterval() << "s)";
         } else {
-            LOG(INFO) << "Client metrics enabled but reporting disabled (interval=0)";
+            LOG(INFO)
+                << "Client metrics enabled but reporting disabled (interval=0)";
         }
     } else {
-        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to enable)";
+        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
+                     "enable)";
     }
 }
 
