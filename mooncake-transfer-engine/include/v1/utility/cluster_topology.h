@@ -104,7 +104,7 @@ class ClusterTopology {
                                 const std::string& dst_host,
                                 const std::string& dst_dev);
 
-    std::string findOptionalDevice(const std::string& src_host,
+    std::string findOptimalMapping(const std::string& src_host,
                                    const std::string& src_dev,
                                    const std::string& dst_host, int dst_numa);
 

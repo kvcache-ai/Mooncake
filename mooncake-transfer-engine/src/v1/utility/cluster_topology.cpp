@@ -102,7 +102,7 @@ const Endpoint* ClusterTopology::getEndpoint(const std::string& src_host,
     return nullptr;
 }
 
-std::string ClusterTopology::findOptionalDevice(const std::string& src_host,
+std::string ClusterTopology::findOptimalMapping(const std::string& src_host,
                                                 const std::string& src_dev,
                                                 const std::string& dst_host,
                                                 int dst_numa) {

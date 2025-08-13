@@ -56,6 +56,14 @@ struct TopologyEntry {
 using TopologyMatrix =
     std::unordered_map<std::string /* storage type */, TopologyEntry>;
 
+struct ResolvedTopologyEntry {
+    int numa_node;
+    std::vector<int> device_list[DevicePriorityRanks];
+};
+
+using ResolvedTopologyMatrix =
+    std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>;
+
 class Topology {
    public:
     Topology();
@@ -101,20 +109,17 @@ class Topology {
         return -1;
     }
 
+    const ResolvedTopologyMatrix &getResolvedMatrix() const {
+        return resolved_matrix_;
+    }
+
    private:
     Status resolve();
 
    private:
     TopologyMatrix matrix_;
     std::vector<std::string> rdma_device_list_;
-
-    struct ResolvedTopologyEntry {
-        int numa_node;
-        std::vector<int> device_list[DevicePriorityRanks];
-    };
-
-    std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
-        resolved_matrix_;
+    ResolvedTopologyMatrix resolved_matrix_;
 };
 }  // namespace v1
 }  // namespace mooncake

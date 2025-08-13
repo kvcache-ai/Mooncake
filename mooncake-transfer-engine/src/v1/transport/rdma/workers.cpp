@@ -22,6 +22,7 @@
 #include "v1/utility/ip.h"
 #include "v1/utility/string_builder.h"
 #include "v1/utility/system.h"
+#include "v1/utility/random.h"
 
 namespace mooncake {
 namespace v1 {
@@ -345,94 +346,73 @@ void Workers::monitorThread() {
     }
 }
 
-Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
-    auto target_id = slice->task->request.target_id;
-#ifndef LEGACY_PATH_SELECTION
+Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
+                             uint64_t addr, uint64_t length) {
     auto &segment_manager = transport_->metadata_->segmentManager();
-
-    auto local_segment_desc = segment_manager.getLocal().get();
-    auto local_buffer_desc = getBufferDesc(
-        local_segment_desc, (uint64_t)slice->source_addr, slice->length);
-    if (!local_buffer_desc) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-
-    int device_id;
-    int rand_seed = -1;
-    CHECK_STATUS(transport_->local_topology_->selectDevice(
-        device_id, local_buffer_desc->location, slice->retry_count, rand_seed));
-    slice->source_dev_id = device_id;
-    slice->source_lkey = local_buffer_desc->lkey[device_id];
-    if (target_id == LOCAL_SEGMENT_ID) {
-        slice->target_dev_id = device_id;
-        slice->target_rkey = local_buffer_desc->rkey[device_id];
-        return Status::OK();
-    }
-
-    SegmentDesc *target_segment_desc = nullptr;
-    CHECK_STATUS(
-        segment_manager.getRemoteCached(target_segment_desc, target_id));
-    auto &target_topology =
-        std::get<MemorySegmentDesc>(target_segment_desc->detail).topology;
-    auto target_buffer_desc = getBufferDesc(
-        target_segment_desc, (uint64_t)slice->target_addr, slice->length);
-    if (!target_buffer_desc) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-
-    device_id = -1;
-    if (transport_->cluster_topology_) {
-        // Read best partition using cluster topology
-        auto local_device_name =
-            transport_->local_topology_->getDeviceList()[slice->source_dev_id];
-        auto target_device_name =
-            transport_->cluster_topology_->findOptionalDevice(
-                local_segment_desc->machine_id, local_device_name,
-                target_segment_desc->machine_id, 0);
-        device_id = target_topology.findDeviceID(target_device_name);
-    } 
-    
-    if (device_id < 0) {
-        // In other cases, guess the optimal device using rand seed to keep the
-        // static association between local and remote devices.
-        CHECK_STATUS(target_topology.selectDevice(
-            device_id, target_buffer_desc->location, slice->retry_count,
-            rand_seed));
-    }
-
-    slice->target_dev_id = device_id;
-    slice->target_rkey = target_buffer_desc->rkey[slice->target_dev_id];
-    return Status::OK();
-#else
-    std::vector<BufferQueryResult> local, remote;
-    auto status = transport_->local_buffer_manager_.query(
-        AddressRange{slice->source_addr, slice->length}, local,
-        slice->retry_count);
-    if (!status.ok()) return status;
-    if (target_id == LOCAL_SEGMENT_ID) {
-        status = transport_->local_buffer_manager_.query(
-            AddressRange{(void *)slice->target_addr, slice->length}, remote,
-            slice->retry_count);
-        if (!status.ok()) return status;
+    if (segment_id == LOCAL_SEGMENT_ID) {
+        hint.segment = segment_manager.getLocal().get();
     } else {
-        SegmentDesc *desc = nullptr;
-        status = transport_->metadata_->segmentManager().getRemoteCached(
-            desc, target_id);
-        if (!status.ok()) return status;
-        status = queryRemoteSegment(
-            desc, AddressRange{(void *)slice->target_addr, slice->length},
-            remote, slice->retry_count);
-        if (!status.ok()) return status;
+        CHECK_STATUS(segment_manager.getRemoteCached(hint.segment, segment_id));
     }
-    assert(local.size() == 1 && remote.size() == 1);
-    slice->source_lkey = local[0].lkey;
-    slice->target_rkey = remote[0].rkey;
-    slice->source_dev_id = local[0].device_id;
-    slice->target_dev_id = remote[0].device_id;
+    hint.buffer = getBufferDesc(hint.segment, addr, length);
+    if (!hint.buffer) {
+        return Status::AddressNotRegistered(
+            "No matched buffer in given address range" LOC_MARK);
+    }
+    hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
+    auto &matrix = hint.topo->getResolvedMatrix();
+    if (!matrix.count(hint.buffer->location))
+        hint.topo_entry = &matrix.at(kWildcardLocation);
+    else
+        hint.topo_entry = &matrix.at(hint.buffer->location);
     return Status::OK();
-#endif
+}
+
+Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
+                                    RdmaSlice *slice) {
+    // Source device: select one in the preferred group randomly
+    int seed = SimpleRandom::Get().next(32);
+    for (size_t rank = 0;
+         slice->source_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
+        auto &list = source.topo_entry->device_list[rank];
+        if (!list.empty()) slice->source_dev_id = list[seed % list.size()];
+    }
+
+    // Target device: read the cluster topology and find best matching
+    if (slice->target_dev_id < 0 && transport_->cluster_topology_) {
+        auto source_dev = source.topo->getDeviceList()[slice->source_dev_id];
+        auto target_dev = transport_->cluster_topology_->findOptimalMapping(
+            source.segment->machine_id, source_dev, target.segment->machine_id,
+            target.topo_entry->numa_node);
+        slice->target_dev_id = target.topo->findDeviceID(target_dev);
+    }
+
+    // Target device: find the associated one
+    for (size_t rank = 0;
+         slice->target_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
+        auto &list = target.topo_entry->device_list[rank];
+        if (!list.empty()) slice->target_dev_id = list[seed % list.size()];
+    }
+
+    if (slice->source_dev_id < 0 || slice->target_dev_id < 0)
+        return Status::DeviceNotFound(
+            "No device could access the slice memory region");
+
+    slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
+    slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    return Status::OK();
+}
+
+Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
+    RuoteHint source, target;
+    CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
+                              (uint64_t)slice->source_addr, slice->length));
+
+    auto target_id = slice->task->request.target_id;
+    CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
+                              slice->length));
+
+    return selectOptimalDevice(source, target, slice);
 }
 }  // namespace v1
 }  // namespace mooncake

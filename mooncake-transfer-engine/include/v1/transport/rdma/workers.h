@@ -115,6 +115,20 @@ class Workers {
     Status generatePostPath(int thread_id, RdmaSlice *slice);
 
    private:
+    struct RuoteHint {
+        SegmentDesc *segment;
+        BufferDesc *buffer;
+        const ResolvedTopologyEntry *topo_entry;
+        const Topology *topo;
+    };
+
+    Status getRouteHint(RuoteHint &hint, SegmentID segment_id, uint64_t addr,
+                        uint64_t length);
+
+    Status selectOptimalDevice(RuoteHint &source, RuoteHint &target,
+                               RdmaSlice *slice);
+
+   private:
     RdmaTransport *transport_;
     size_t num_workers_;
     std::thread monitor_;
