@@ -1,9 +1,10 @@
-#ifndef CORO_RPC_TRANSFER_H
-#define CORO_RPC_TRANSFER_H
-
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <pybind11/buffer_info.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+#include <array>
+#include <functional>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -16,11 +17,65 @@
 
 namespace py = pybind11;
 
-struct tensor_metadata {
+py::module_ torch = py::module_::import("torch");
+
+enum class TensorDtype : int32_t {
+    FLOAT32 = 0,
+    FLOAT64 = 1,
+    INT8 = 2,
+    UINT8 = 3,
+    INT16 = 4,
+    UINT16 = 5,
+    INT32 = 6,
+    UINT32 = 7,
+    INT64 = 8,
+    UINT64 = 9,
+    BOOL = 10,
+    FLOAT16 = 11,
+    BFLOAT16 = 12,
+    FLOAT8_E4M3 = 13,
+    FLOAT8_E5M2 = 14,
+    W8A8 = 15,
+    UNKNOWN = -1
+  };
+
+  struct tensor_metadata {
     int32_t size;
     std::vector<size_t> shape;
-    int32_t dtype;
-};
+    TensorDtype dtype;
+  };
+
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
+
+namespace{
+  template <typename T>
+  static py::array create_typed_array(char *exported_data, size_t offset,
+                             size_t total_length) {
+    py::capsule free_when_done(
+        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                          (T *)(exported_data + offset), free_when_done);
+  }
+
+  const std::array<ArrayCreatorFunc, 16> array_creators = {{
+    create_typed_array<float>,     // FLOAT32 = 0
+    create_typed_array<double>,    // FLOAT64 = 1
+    create_typed_array<int8_t>,    // INT8 = 2
+    create_typed_array<uint8_t>,   // UINT8 = 3
+    create_typed_array<int16_t>,   // INT16 = 4
+    create_typed_array<uint16_t>,  // UINT16 = 5
+    create_typed_array<int32_t>,   // INT32 = 6
+    create_typed_array<uint32_t>,  // UINT32 = 7
+    create_typed_array<int64_t>,   // INT64 = 8
+    create_typed_array<uint64_t>,  // UINT64 = 9
+    create_typed_array<bool>,      // BOOL = 10
+    create_typed_array<uint16_t>,  // FLOAT16 = 11
+    create_typed_array<uint16_t>,  // BFLOAT16 = 12
+    create_typed_array<uint8_t>,   // FLOAT8_E4M3 = 13
+    create_typed_array<uint8_t>,   // FLOAT8_E5M2 = 14
+    create_typed_array<int8_t>     // W8A8 = 15
+  }};
+}
 
 class py_rpc_context {
  public:
@@ -41,67 +96,11 @@ class py_rpc_context {
 
   coro_rpc::context<void> context_;
 };
-
-class py_coro_rpc_client_pool;
-class py_coro_rpc_server {
- private:
-  py::module_ torch = py::module_::import("torch");
-
-  enum class TensorDtype : int32_t {
-    FLOAT32 = 0,
-    FLOAT64 = 1,
-    INT8 = 2,
-    UINT8 = 3,
-    INT16 = 4,
-    UINT16 = 5,
-    INT32 = 6,
-    UINT32 = 7,
-    INT64 = 8,
-    UINT64 = 9,
-    BOOL = 10,
-    FLOAT16 = 11,
-    BFLOAT16 = 12,
-    FLOAT8_E4M3 = 13,
-    FLOAT8_E5M2 = 14,
-    W8A8 = 15,
-    UNKNOWN = -1
-};
-
-template <typename T>
-py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length) {
-    py::capsule free_when_done(
-        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), free_when_done);
-}
-
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
-
-static const std::array<ArrayCreatorFunc, 16> array_creators = {{
-    create_typed_array<float>,     // FLOAT32 = 0
-    create_typed_array<double>,    // FLOAT64 = 1
-    create_typed_array<int8_t>,    // INT8 = 2
-    create_typed_array<uint8_t>,   // UINT8 = 3
-    create_typed_array<int16_t>,   // INT16 = 4
-    create_typed_array<uint16_t>,  // UINT16 = 5
-    create_typed_array<int32_t>,   // INT32 = 6
-    create_typed_array<uint32_t>,  // UINT32 = 7
-    create_typed_array<int64_t>,   // INT64 = 8
-    create_typed_array<uint64_t>,  // UINT64 = 9
-    create_typed_array<bool>,      // BOOL = 10
-    create_typed_array<uint16_t>,  // FLOAT16 = 11 (using uint16_t as storage)
-    create_typed_array<uint16_t>,  // BFLOAT16 = 12 (using uint16_t as storage)
-    create_typed_array<uint8_t>,  // FLOAT8_E4M3 = 13 (using uint8_t as storage)
-    create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
-    create_typed_array<int8_t>    // W8A8 = 15 (using int8_t as storage)
-}};
-
+  
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;
     }
-
     if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
     if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
     if (dtype_obj.equal(torch.attr("int8"))) return TensorDtype::INT8;
@@ -122,8 +121,11 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.equal(torch.attr("w8a8"))) return TensorDtype::W8A8;
 
     return TensorDtype::UNKNOWN;
-}
- public:
+  }
+
+class py_coro_rpc_client_pool;
+class py_coro_rpc_server {
+public:
   py_coro_rpc_server(size_t thd_num, std::string address,
                      py::handle py_callback, size_t seconds)
       : server_(thd_num, address, std::chrono::seconds(seconds)),
@@ -168,36 +170,35 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     auto dtype = metadata.dtype;
     auto size = metadata.size;
 
-    try {
-        if (data.size() != size) {
-            std::string error_msg = "Data size mismatch: expected " + 
-                                  std::to_string(size) + ", got " + 
-                                  std::to_string(data.size());
+    if (data.size() != static_cast<size_t>(size)) {
+        std::string error_msg = "Data size mismatch: expected " + 
+                            std::to_string(size) + ", got " + 
+                            std::to_string(data.size());
+        ctx_info->set_response_attachment(error_msg);
+        context.response_msg();
+        return;
+      }
+
+      int dtype_index = static_cast<int>(dtype);
+      if (dtype_index < 0) {
+            std::string error_msg = "Unsupported dtype: " + std::to_string(static_cast<int>(dtype));
             ctx_info->set_response_attachment(error_msg);
             context.response_msg();
             return;
         }
-
+        auto np_array = array_creators[dtype_index](const_cast<char*>(data.data()), 0, data.size());
         py::tuple py_shape = py::cast(shape);
-
-        int dtype_index = static_cast<int>(dtype);
-         if (dtype_index >= 0){
-            auto np_array = array_creators[dtype_index]((char*)data.data(), 0, data.size());
-         } else {
-            std::string error_msg = "Unsupported dtype: " + std::to_string(dtype);
-            ctx_info->set_response_attachment(error_msg);
-            context.response_msg();
-            return;
-         }
-         np_array = np_array.attr("reshape")(py_shape);
-         py::gil_scoped_acquire acquire_gil;
-         pybind11::object tensor = torch.attr("from_numpy")(np_array);
-         //tensor processing logic here, for example, call a python function
+        np_array = np_array.attr("reshape")(py_shape);
+        py::gil_scoped_acquire acquire_gil;
+        pybind11::object tensor = torch.attr("from_numpy")(np_array);
+        //tensor processing logic here, for example, call a python function
         std::string success_msg = "success";
         ctx_info->set_response_attachment(success_msg);
         context.response_msg();
         return;
-        }
+    }
+  coro_rpc::coro_rpc_server server_;
+  py::handle py_callback_;
 };
 
 class string_holder {
@@ -314,23 +315,25 @@ class py_coro_rpc_client_pool {
       tensor_handle.inc_ref();
     }
 
-    pool_
-        ->send_request([tensor_handle, loop,
+    pool_->send_request([tensor_handle, loop,
                         future](coro_rpc::coro_rpc_client &client)
                            -> async_simple::coro::Lazy<void> {
-          {
-            py::gil_scoped_acquire acquire;
-            uintptr_t data_ptr =
-                tensor_handle.attr("data_ptr")().cast<uintptr_t>();
-            size_t numel = tensor_handle.attr("numel")().cast<size_t>();
-            size_t element_size =
-                tensor_handle.attr("element_size")().cast<size_t>();
-            size_t tensor_size = numel * element_size;
-            client.set_req_attachment(
-                std::string_view((char *)data_ptr, tensor_size));
-          }
+          uintptr_t data_ptr =
+              tensor_handle.attr("data_ptr")().cast<uintptr_t>();
+          size_t numel = tensor_handle.attr("numel")().cast<size_t>();
+          size_t element_size =
+              tensor_handle.attr("element_size")().cast<size_t>();
+          size_t tensor_size = numel * element_size;
+          client.set_req_attachment(
+              std::string_view((char *)data_ptr, tensor_size));
+          tensor_metadata metadata;
+          metadata.size = static_cast<int32_t>(tensor_size);
+          metadata.shape = tensor_handle.attr("shape").cast<std::vector<size_t>>();
+          metadata.dtype = get_tensor_dtype(tensor_handle.attr("dtype"));
+          std::cout << "Tensor ready and prepared to be sent.";
 
-          auto r = co_await client.call<&py_coro_rpc_server::handle_tensor>();
+          //auto r = co_await client.call<&py_coro_rpc_server::handle_tensor>(metadata);
+          auto r = co_await client.call<&py_coro_rpc_server::reflect_tensor>();
           rpc_result result{};
           ELOG_INFO << "rpc result: " << client.get_resp_attachment();
           if (!r.has_value()) {
@@ -359,7 +362,7 @@ class py_coro_rpc_client_pool {
   coro_rpc::coro_rpc_client client_;
 };
 
-PYBIND11_MODULE(py_coro_rpc, m) {
+PYBIND11_MODULE(coro_rpc_transfer, m) {
   m.def("hello", [] {
     return std::string("hello");
   });
@@ -397,5 +400,3 @@ PYBIND11_MODULE(py_coro_rpc, m) {
     ELOG_INFO << str;
   });
 }
-
-#endif
