@@ -71,13 +71,7 @@ if (WITH_EP)
         ep/ep_py.cpp
         integration_utils.h
     )
-    target_link_libraries(ep PUBLIC
-        transfer_engine
-        glog::glog
-        gflags::gflags
-        mooncake_ep
-        cachelib_memory_allocator
-    )
+    target_link_libraries(ep PUBLIC mooncake_ep)
 endif ()
 
 message("${PYTHON_SYS_PATH}")

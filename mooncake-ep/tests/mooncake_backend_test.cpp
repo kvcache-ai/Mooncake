@@ -22,6 +22,22 @@ class MooncakeBackendTest : public ::testing::Test {
     std::shared_ptr<MooncakeBackend> backend;
 };
 
+TEST_F(MooncakeBackendTest, AllreduceTest) {
+    std::vector<torch::Tensor> tensors;
+    tensors.push_back(torch::ones({2, 2}));
+
+    ::c10d::AllreduceOptions opts;
+    opts.reduceOp = ::c10d::ReduceOp::SUM;
+
+    auto work = backend->allreduce(tensors, opts);
+    work->wait();
+
+    auto expected = torch::ones({2, 2}) * backend->getSize();
+    ASSERT_TRUE(torch::allclose(tensors[0], expected))
+        << "Allreduce result mismatch. Got: " << tensors[0]
+        << " Expected: " << expected;
+}
+
 TEST_F(MooncakeBackendTest, BroadcastTest) {
     std::vector<torch::Tensor> tensors;
     tensors.push_back(torch::ones({2, 2}));
