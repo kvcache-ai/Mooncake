@@ -40,7 +40,10 @@ class MasterMetricManager {
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
+    void inc_cluster_total_qp_num(int64_t val = 1);
+    void dec_cluster_total_qp_num(int64_t val = 1);
     int64_t get_active_clients();
+    int64_t get_cluster_total_qp_num();
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -178,6 +181,7 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    ylt::metric::gauge_t cluster_total_qp_num_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

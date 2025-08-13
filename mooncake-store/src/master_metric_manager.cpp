@@ -34,6 +34,8 @@ MasterMetricManager::MasterMetricManager()
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
+      cluster_total_qp_num_("master_cluster_total_qp_num",
+                            "Total number of QP across all clients"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -239,6 +241,18 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+void MasterMetricManager::inc_cluster_total_qp_num(int64_t val) {
+    cluster_total_qp_num_.inc(val);
+}
+
+void MasterMetricManager::dec_cluster_total_qp_num(int64_t val) {
+    cluster_total_qp_num_.dec(val);
+}
+
+int64_t MasterMetricManager::get_cluster_total_qp_num() {
+    return cluster_total_qp_num_.value();
 }
 
 // Operation Statistics (Counters)
@@ -616,6 +630,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(total_capacity_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
+    serialize_metric(cluster_total_qp_num_);
     if (enable_ha_) {
         serialize_metric(active_clients_);
     }
@@ -680,6 +695,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
+    int64_t cluster_total_qp_num = cluster_total_qp_num_.value();
 
     // Request counters
     int64_t exist_keys = exist_key_requests_.value();
@@ -754,6 +770,7 @@ std::string MasterMetricManager::get_summary_string() {
            << ((double)allocated / (double)capacity * 100.0) << "%)";
     }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
+    ss << " | QP: " << cluster_total_qp_num;
     if (enable_ha_) {
         ss << " | Clients: " << active_clients;
     }

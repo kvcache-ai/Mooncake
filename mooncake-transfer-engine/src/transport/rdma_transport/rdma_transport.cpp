@@ -505,4 +505,14 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
                         retry_count);
 }
+
+size_t RdmaTransport::getTotalQpNum() const {
+    size_t total_qps = 0;
+    for (const auto &context : context_list_) {
+        if (context && context->active()) {
+            total_qps += context->getTotalQpNum();
+        }
+    }
+    return total_qps;
+}
 }  // namespace mooncake

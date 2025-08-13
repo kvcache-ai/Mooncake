@@ -235,7 +235,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
+    auto Ping(const UUID& client_id, const size_t& qp_count) -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
@@ -435,6 +435,8 @@ class MasterService {
     mutable std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
+    std::unordered_map<UUID, uint64_t, boost::hash<UUID>>
+        client_qp_counts_;  // QP count per client
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};

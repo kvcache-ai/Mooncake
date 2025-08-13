@@ -23,8 +23,10 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include "common.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
 
@@ -433,6 +435,22 @@ int TransferEngine::unregisterLocalMemoryBatch(
         }
     }
     return 0;
+}
+
+size_t TransferEngine::getTotalQpNum() const {
+    Transport *rdma_transport = multi_transports_->getTransport("rdma");
+    if (!rdma_transport) {
+        return 0;
+    }
+    
+    // Cast to RdmaTransport to access the actual QP counting functionality
+    RdmaTransport *rdma = dynamic_cast<RdmaTransport*>(rdma_transport);
+    if (!rdma) {
+        LOG(ERROR) << "Failed to cast RDMA transport to RdmaTransport type";
+        return 0;
+    }
+    
+    return rdma->getTotalQpNum();
 }
 
 #ifdef WITH_METRICS

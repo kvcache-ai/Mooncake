@@ -181,7 +181,7 @@ class MasterClient {
      * containing view version and client status
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping(
-        const UUID& client_id);
+        const UUID& client_id, const size_t& qp_count);
 
    private:
     /**
