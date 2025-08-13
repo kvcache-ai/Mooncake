@@ -13,7 +13,7 @@ class MooncakeBackendTest : public ::testing::Test {
         auto store = c10::make_intrusive<::c10d::FileStore>(
             "/tmp/mooncake_backend_test_store", 1);
         auto options =
-            c10::make_intrusive<::c10d::Backend::Options>("mooncake_backend");
+            c10::make_intrusive<::c10d::Backend::Options>("mooncake");
         backend = std::make_shared<MooncakeBackend>(store, 0, 1, options);
     }
 

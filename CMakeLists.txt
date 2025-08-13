@@ -52,14 +52,15 @@ if (WITH_STORE)
   include_directories(mooncake-store/include)
 endif()
 
+if (WITH_EP)
+  message(STATUS "Mooncake EP will be built")
+  add_subdirectory(mooncake-ep)
+  include_directories(mooncake-ep/include)
+endif()
+
 add_subdirectory(mooncake-integration)
 
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be built")
-endif()
-
-if (WITH_EP)
-  add_subdirectory(mooncake-ep)
-  message(STATUS "Mooncake EP will be built")
 endif()

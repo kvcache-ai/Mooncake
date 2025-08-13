@@ -138,6 +138,11 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libffi.so* \
 --exclude libcuda.so* \
 --exclude libcudart.so* \
+--exclude libc10.so* \
+--exclude libtorch.so* \
+--exclude libtorch_cpu.so* \
+--exclude libtorch_cuda.so* \
+--exclude libtorch_python.so* \
 -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 
