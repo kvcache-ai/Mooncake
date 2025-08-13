@@ -51,8 +51,8 @@ TEST_F(ClientMetricsTest, TransferMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("Put: count=2") != std::string::npos);
 
     // Check percentiles are present
-    EXPECT_TRUE(summary.find("p50<") != std::string::npos);
     EXPECT_TRUE(summary.find("p95<") != std::string::npos);
+    EXPECT_TRUE(summary.find("max<") != std::string::npos);
 
     std::cout << "Transfer Metrics Summary:\n" << summary << std::endl;
 }
@@ -89,8 +89,8 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("UnmountSegment: count=1") != std::string::npos);
 
     // Check percentiles are present for RPCs with data
-    EXPECT_TRUE(summary.find("p50<") != std::string::npos);
     EXPECT_TRUE(summary.find("p95<") != std::string::npos);
+    EXPECT_TRUE(summary.find("max<") != std::string::npos);
 
     std::cout << "Master Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -128,7 +128,7 @@ TEST_F(ClientMetricsTest, ByteFormattingTest) {
     // Test different byte sizes
     metrics.total_read_bytes.inc(512);  // 512 B
     std::string summary = metrics.summary_metrics();
-    EXPECT_TRUE(summary.find("512.00 B") != std::string::npos);
+    EXPECT_TRUE(summary.find("512 B") != std::string::npos);
 
     metrics.total_read_bytes.inc(1024 - 512);  // Total 1024 B = 1 KB
     summary = metrics.summary_metrics();
@@ -169,7 +169,9 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
     // Summary should be much shorter and more readable
     EXPECT_LT(summary.length(), serialized.length());
     EXPECT_TRUE(summary.find("count=") != std::string::npos);
-    EXPECT_TRUE(summary.find("p50<") != std::string::npos ||
+    EXPECT_TRUE(summary.find("p95<") != std::string::npos ||
+                summary.find("No data") != std::string::npos);
+    EXPECT_TRUE(summary.find("max<") != std::string::npos ||
                 summary.find("No data") != std::string::npos);
 }
 
