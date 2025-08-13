@@ -1362,7 +1362,7 @@ void Client::InitializeMetricsConfig() {
                             value == "on" || value == "enable");
         LOG(INFO) << "Client metrics reporting "
                   << (metrics_enabled_ ? "enabled" : "disabled")
-                  << " via MC_CLIENT_METRIC=" << metric_env;
+                  << " via MC_STORE_METRIC_REPORT=" << metric_env;
     }
 
     // Check for custom metrics interval
