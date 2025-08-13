@@ -6,8 +6,10 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <ranges>
+#include <thread>
 
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -36,15 +38,24 @@ namespace mooncake {
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& storage_root_dir)
-    : local_hostname_(local_hostname),
+    : metrics_(),
+      master_client_(metrics_.master_client_metric),
+      local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       storage_root_dir_(storage_root_dir),
       write_thread_pool_(2) {
     client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
+
+    // Initialize and start metrics reporting thread
+    InitializeMetricsConfig();
+    StartMetricsReportingThread();
 }
 
 Client::~Client() {
+    // Stop metrics reporting thread first
+    StopMetricsReportingThread();
+
     // Make a copy of mounted_segments_ to avoid modifying while iterating
     std::vector<Segment> segments_to_unmount;
     {
@@ -232,7 +243,8 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 
     // Initialize TransferSubmitter after transfer engine is ready
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_);
+        transfer_engine_, local_hostname, storage_backend_,
+        metrics_.transfer_metric);
 
     return ErrorCode::OK;
 }
@@ -400,7 +412,13 @@ tl::expected<void, ErrorCode> Client::Get(
         return tl::unexpected(err);
     }
 
+    auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
+    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_get)
+                      .count();
+    metrics_.transfer_metric.get_latency_us.observe(us_get);
+
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
@@ -439,6 +457,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture>>
         pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
+    // Record batch get transfer latency (Submit + Wait)
+    auto t0_batch_get = std::chrono::steady_clock::now();
 
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -492,6 +512,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
+    auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0_batch_get)
+                            .count();
+    metrics_.transfer_metric.batch_get_latency_us.observe(us_batch_get);
+
     VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     return results;
 }
@@ -517,6 +542,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    // Record Put transfer latency (all replicas)
+    auto t0_put = std::chrono::steady_clock::now();
+
     // Transfer data using allocated handles from all replicas
     for (const auto& replica : start_result.value()) {
         ErrorCode transfer_err = TransferWrite(replica, slices);
@@ -530,6 +558,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(transfer_err);
         }
     }
+
+    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_put)
+                      .count();
+    metrics_.transfer_metric.put_latency_us.observe(us_put);
 
     // End put operation
     auto end_result = master_client_.PutEnd(key);
@@ -933,8 +966,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     StartBatchPut(ops, config);
+
+    auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    metrics_.transfer_metric.batch_put_latency_us.observe(us);
+
     FinalizeBatchPut(ops);
     BatchPuttoLocalFile(ops);
     return CollectResults(ops);
@@ -1304,6 +1344,93 @@ ErrorCode Client::FindFirstCompleteReplica(
 
     // No complete replica found
     return ErrorCode::INVALID_REPLICA;
+}
+
+static std::string toLower(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return result;
+}
+
+void Client::InitializeMetricsConfig() {
+    // Check if metrics reporting is enabled via environment variable
+    const char* metric_env = std::getenv("MC_STORE_METRIC_REPORT");
+    if (metric_env) {
+        std::string value = toLower(metric_env);
+        metrics_enabled_ = (value == "1" || value == "true" || value == "yes" ||
+                            value == "on" || value == "enable");
+        LOG(INFO) << "Client metrics reporting "
+                  << (metrics_enabled_ ? "enabled" : "disabled")
+                  << " via MC_CLIENT_METRIC=" << metric_env;
+    }
+
+    // Check for custom metrics interval
+    const char* interval_env = std::getenv("MC_STORE_METRIC_REPORT_INTERVAL");
+    if (interval_env) {
+        try {
+            uint64_t interval = std::stoull(interval_env);
+            if (interval > 0) {
+                metrics_interval_seconds_ = interval;
+                LOG(INFO) << "Client metrics interval set to "
+                          << metrics_interval_seconds_
+                          << "s via MC_CLIENT_METRIC_INTERVAL";
+            } else {
+                LOG(WARNING)
+                    << "Invalid metrics interval: " << interval_env
+                    << ", using default: " << metrics_interval_seconds_;
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_CLIENT_METRIC_INTERVAL: "
+                         << interval_env
+                         << ", using default: " << metrics_interval_seconds_;
+        }
+    }
+}
+
+void Client::StartMetricsReportingThread() {
+    // Only start the metrics thread if metrics are enabled
+    if (!metrics_enabled_) {
+        LOG(INFO) << "Client metrics reporting is disabled (set "
+                     "MC_CLIENT_METRIC=1 to enable)";
+        return;
+    }
+
+    should_stop_metrics_thread_ = false;
+    metrics_reporting_thread_ = std::jthread([this](
+                                                 std::stop_token stop_token) {
+        LOG(INFO) << "Client metrics reporting thread started (interval: "
+                  << metrics_interval_seconds_ << "s)";
+
+        while (!stop_token.stop_requested() && !should_stop_metrics_thread_) {
+            // Sleep for the interval, checking periodically for stop signal
+            for (uint64_t i = 0;
+                 i < metrics_interval_seconds_ &&
+                 !stop_token.stop_requested() && !should_stop_metrics_thread_;
+                 ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (stop_token.stop_requested() || should_stop_metrics_thread_) {
+                break;  // Exit if stopped during sleep
+            }
+
+            // Print metrics summary
+            std::string summary = summary_metrics();
+            LOG(INFO) << "Client Metrics Report:\n" << summary;
+        }
+        LOG(INFO) << "Client metrics reporting thread stopped";
+    });
+}
+
+void Client::StopMetricsReportingThread() {
+    should_stop_metrics_thread_ = true;  // Signal the thread to stop
+    if (metrics_reporting_thread_.joinable()) {
+        LOG(INFO) << "Waiting for client metrics reporting thread to join...";
+        metrics_reporting_thread_.request_stop();
+        metrics_reporting_thread_.join();  // Wait for the thread to finish
+        LOG(INFO) << "Client metrics reporting thread joined";
+    }
 }
 
 }  // namespace mooncake

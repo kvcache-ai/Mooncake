@@ -356,11 +356,13 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      const std::string& local_hostname,
-                                     std::shared_ptr<StorageBackend>& backend)
+                                     std::shared_ptr<StorageBackend>& backend,
+                                     TransferMetric& transfer_metric)
     : engine_(engine),
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
-      fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)) {
+      fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
+      transfer_metric_(transfer_metric) {
     if (local_hostname_.empty()) {
         LOG(ERROR) << "Local hostname cannot be empty";
         throw std::invalid_argument("Local hostname cannot be empty");
@@ -395,6 +397,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     Transport::TransferRequest::OpCode op_code) {
+    std::optional<TransferFuture> future;
+
     if (replica.is_memory_replica()) {
         std::vector<AllocatedBuffer::Descriptor> handles;
         auto& mem_desc = replica.get_memory_descriptor();
@@ -408,16 +412,26 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
-                return submitMemcpyOperation(handles, slices, op_code);
+                future = submitMemcpyOperation(handles, slices, op_code);
+                break;
             case TransferStrategy::TRANSFER_ENGINE:
-                return submitTransferEngineOperation(handles, slices, op_code);
+                future =
+                    submitTransferEngineOperation(handles, slices, op_code);
+                break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
     } else {
-        return submitFileReadOperation(replica, slices, op_code);
+        future = submitFileReadOperation(replica, slices, op_code);
     }
+
+    // Update metrics on successful submission
+    if (future.has_value()) {
+        updateTransferMetrics(slices, op_code);
+    }
+
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -590,6 +604,21 @@ bool TransferSubmitter::validateTransferParams(
     }
 
     return true;
+}
+
+void TransferSubmitter::updateTransferMetrics(
+    const std::vector<Slice>& slices,
+    Transport::TransferRequest::OpCode op_code) {
+    size_t total_bytes = 0;
+    for (const auto& slice : slices) {
+        total_bytes += slice.size;
+    }
+
+    if (op_code == Transport::TransferRequest::READ) {
+        transfer_metric_.total_read_bytes.inc(total_bytes);
+    } else if (op_code == Transport::TransferRequest::WRITE) {
+        transfer_metric_.total_write_bytes.inc(total_bytes);
+    }
 }
 
 }  // namespace mooncake

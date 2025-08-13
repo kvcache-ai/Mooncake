@@ -1,12 +1,10 @@
 #pragma once
 
-#include <array>
 #include <memory>
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
-#include <ylt/metric/counter.hpp>
-#include <ylt/metric/summary.hpp>
+#include "client_metric.h"
 
 #include "types.h"
 
@@ -14,28 +12,12 @@ namespace mooncake {
 
 static const std::string kDefaultMasterAddress = "localhost:50051";
 
-struct MasterClientMetric {
-    std::array<std::string, 1> rpc_names = {"rpc_name"};
-    MasterClientMetric()
-        : rpc_count("mooncake_client_rpc_count",
-                    "Total number of RPC calls made by the client", rpc_names),
-          rpc_latency("mooncake_client_rpc_latency",
-                      "Latency of RPC calls made by the client (in us)",
-                      {0.1, 0.5, 0.9, 0.99, 0.999}, rpc_names) {}
-    ylt::metric::dynamic_counter_1t rpc_count;
-    ylt::metric::dynamic_summary_1 rpc_latency;
-    void serialize(std::string& str) {
-        rpc_count.serialize(str);
-        rpc_latency.serialize(str);
-    }
-};
-
 /**
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
    public:
-    MasterClient();
+    MasterClient(MasterClientMetric& metrics) : metrics_(metrics) {}
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -251,7 +233,7 @@ class MasterClient {
     RpcClientAccessor client_accessor_;
 
     // Metrics for tracking RPC operations
-    MasterClientMetric metrics_;
+    MasterClientMetric& metrics_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

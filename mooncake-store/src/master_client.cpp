@@ -151,6 +151,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     // Increment RPC counter
     metrics_.rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
 
+    auto start_time = std::chrono::steady_clock::now();
     auto request_result =
         client->send_request<ServiceMethod>(std::forward<Args>(args)...);
     return async_simple::coro::syncAwait(
@@ -167,11 +168,16 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 }
                 co_return error_results;
             }
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time);
+            metrics_.rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
+                                         latency.count());
             co_return result->result();
         }());
 }
 
-MasterClient::MasterClient() = default;
 MasterClient::~MasterClient() = default;
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {

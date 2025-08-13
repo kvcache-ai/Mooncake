@@ -17,9 +17,7 @@
 #include "transport/transport.h"
 #include "types.h"
 #include "storage_backend.h"
-
-#include "ylt/metric/counter.hpp"
-#include "ylt/metric/histogram.hpp"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -48,23 +46,6 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "UNKNOWN";
     }
 }
-
-// latency bucket is in microsecond
-// 50us ~ 1000ms
-const std::vector<double> kLatencyBucket = {
-    100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 10000, 100000, 1000000};
-
-struct TransferMetric {
-    ylt::metric::counter_t total_read_bytes{"mooncake_transfer_read_bytes",
-                                            "Total bytes read"};
-    ylt::metric::counter_t total_write_bytes{"mooncake_transfer_write_bytes",
-                                             "Total bytes written"};
-    ylt::metric::histogram_t read_latency{"mooncake_transfer_read_latency",
-                                          "Read latency (us)", kLatencyBucket};
-    ylt::metric::histogram_t write_latency{"mooncake_transfer_write_latency",
-                                           "Write latency (us)",
-                                           kLatencyBucket};
-};
 
 /**
  * @brief Abstract base class for operation state management
@@ -370,7 +351,8 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                const std::string& local_hostname,
-                               std::shared_ptr<StorageBackend>& backend);
+                               std::shared_ptr<StorageBackend>& backend,
+                               TransferMetric& transfer_metric);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -395,6 +377,7 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    TransferMetric& transfer_metric_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -433,6 +416,12 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         Transport::TransferRequest::OpCode op_code);
+
+    /**
+     * @brief Calculate total bytes for transfer operation and update metrics
+     */
+    void updateTransferMetrics(const std::vector<Slice>& slices,
+                               Transport::TransferRequest::OpCode op);
 };
 
 }  // namespace mooncake
