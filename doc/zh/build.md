@@ -127,3 +127,4 @@
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
