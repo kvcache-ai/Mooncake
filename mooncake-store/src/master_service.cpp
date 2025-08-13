@@ -290,7 +290,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         MutexLocker lock(&metadata_shards_[i].mutex);
 
         for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
-            if (std::regex_match(key, pattern)) {
+            if (std::regex_search(key, pattern)) {
                 if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
                     LOG(WARNING) << "key=" << key << " matched by regex, but replica not ready, status=" << *status;
                     continue;
@@ -546,7 +546,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
         MutexLocker lock(&metadata_shards_[i].mutex);
 
         for (auto it = metadata_shards_[i].metadata.begin(); it != metadata_shards_[i].metadata.end();) {
-            if (std::regex_match(it->first, pattern)) {
+            if (std::regex_search(it->first, pattern)) {
                 if (!it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first << " matched by regex, but has lease. Skipping removal.";
                     ++it;

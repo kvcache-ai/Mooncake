@@ -178,7 +178,7 @@ std::unordered_map<std::string, Replica::Descriptor> StorageBackend::QueryByRege
         if (fs::is_regular_file(entry.status())) {
             std::string filename = entry.path().filename().string();
 
-            if (std::regex_match(filename, pattern)) {
+            if (std::regex_search(filename, pattern)) {
                 Replica::Descriptor desc;
                 auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
                 disk_desc.file_path = entry.path().string();
@@ -289,7 +289,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         if (fs::is_regular_file(entry.status())) {
             std::string filename = entry.path().filename().string();
 
-            if (std::regex_match(filename, pattern)) {
+            if (std::regex_search(filename, pattern)) {
                 paths_to_remove.push_back(entry.path());
             }
         }

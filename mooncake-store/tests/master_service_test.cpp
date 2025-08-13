@@ -333,6 +333,49 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     }
 }
 
+TEST_F(MasterServiceTest, GetReplicaListByRegex) {
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
+    // Test getting non-existent key
+    auto get_result = service_->GetReplicaList(".*non_existent.*");
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+
+    Segment segment(generate_uuid(), segment_name, buffer, size);
+    UUID client_id = generate_uuid();
+
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    int times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result = service_->PutEnd(key);
+        ASSERT_TRUE(put_end_result.has_value());
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+    }
+    // wait for all the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+
+    // Test getting existing key
+    auto get_result2 = service_->GetReplicaListByRegex("^test_key");
+    EXPECT_TRUE(get_result2.has_value());
+    auto replica_list_local = get_result2.value();
+    EXPECT_EQ(10, replica_list_local.size());
+}
+
 TEST_F(MasterServiceTest, GetReplicaList) {
     std::unique_ptr<MasterService> service_(new MasterService());
     // Test getting non-existent key
@@ -440,6 +483,48 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
 }
+
+TEST_F(MasterServiceTest, RemoveByRegex) {
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
+    // Mount segment and put 10 objects
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+
+    Segment segment(generate_uuid(), segment_name, buffer, size);
+    UUID client_id = generate_uuid();
+
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+    int times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        std::vector<uint64_t> slice_lengths = {1024};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result = service_->PutStart(key, slice_lengths, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result = service_->PutEnd(key);
+        ASSERT_TRUE(put_end_result.has_value());
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+    }
+    // wait for all the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    auto res =  service_->RemoveByRegex("^test_key");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(10, res.value());
+    times = 10;
+    while (times--) {
+        std::string key = "test_key" + std::to_string(times);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value());
+    }
+}
+
 
 TEST_F(MasterServiceTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;
