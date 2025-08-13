@@ -357,7 +357,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>
+             ErrorCode>
 Client::QueryByRegex(const std::string& str) {
     auto result = master_client_.GetReplicaListByRegex(str);
     if (!result) {

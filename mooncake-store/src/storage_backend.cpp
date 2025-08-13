@@ -188,8 +188,8 @@ StorageBackend::QueryByRegex(const std::string& regex_pattern) {
                 disk_desc.file_size = fs::file_size(entry.path(), ec);
                 if (ec) {
                     LOG(WARNING)
-                        << "Failed to get file size for: " << disk_desc.file_path
-                        << ", error: " << ec.message();
+                        << "Failed to get file size for: "
+                        << disk_desc.file_path << ", error: " << ec.message();
                     continue;
                 }
 

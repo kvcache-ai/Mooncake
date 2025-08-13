@@ -564,9 +564,10 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
                 }
                 if (auto status =
                         it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                    LOG(WARNING) << "key=" << it->first
-                                 << " matched by regex, but replica not ready, status="
-                                 << *status << ". Skipping removal.";
+                    LOG(WARNING)
+                        << "key=" << it->first
+                        << " matched by regex, but replica not ready, status="
+                        << *status << ". Skipping removal.";
                     ++it;
                     continue;
                 }
@@ -965,8 +966,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

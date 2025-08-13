@@ -226,7 +226,8 @@ tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
     return execute_rpc(
-        "GetReplicaListByRegex", [&] { return master_service_.GetReplicaListByRegex(str); },
+        "GetReplicaListByRegex",
+        [&] { return master_service_.GetReplicaListByRegex(str); },
         [&](auto& timer) { timer.LogRequest("Regex=", str); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {

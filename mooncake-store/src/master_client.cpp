@@ -250,7 +250,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>
+             ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
     timer.LogRequest("Regex=", str);
