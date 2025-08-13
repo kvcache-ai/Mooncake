@@ -258,9 +258,8 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     auto result = invoke_rpc<
         &WrappedMasterService::GetReplicaListByRegex,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(str);
-    // Now operator<< not support for std::unordered_map<std::string,
-    // std::vector<Replica::Descriptor>>
-    // timer.LogResponseExpected(result);
+
+    timer.LogResponseExpected(result);
     return result;
 }
 
