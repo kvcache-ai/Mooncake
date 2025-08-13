@@ -6,21 +6,17 @@ import coro_rpc_transfer
 import time
 
 async def send_tensor_to_server():
-    """发送tensor到服务器"""
-    print("🚀 Starting tensor transfer client...")
+    print("Starting tensor transfer client...")
     
-    # 创建客户端连接池
     try:
         client = coro_rpc_transfer.py_coro_rpc_client_pool("127.0.0.1:8801")
-        print("✅ Connected to server at 127.0.0.1:8801")
+        print(" Connected to server at 127.0.0.1:8801")
     except Exception as e:
-        print(f"❌ Failed to connect to server: {e}")
+        print(f" Failed to connect to server: {e}")
         return
     
-    # 创建测试tensor
-    print("\n📊 Creating test tensors...")
+    print("\n Creating test tensors...")
     
-    # 测试不同类型的tensor
     test_tensors = [
         {
             "name": "Float32 Matrix",
@@ -44,50 +40,44 @@ async def send_tensor_to_server():
         }
     ]
     
-    # 获取事件循环
     loop = asyncio.get_running_loop()
     
     for i, test_case in enumerate(test_tensors, 1):
         tensor = test_case["tensor"]
-        print(f"\n🔄 Test {i}: {test_case['name']}")
+        print(f"\n Test {i}: {test_case['name']}")
         print(f"   Description: {test_case['description']}")
         print(f"   Shape: {tensor.shape}")
         print(f"   Dtype: {tensor.dtype}")
         print(f"   Size: {tensor.numel()} elements, {tensor.numel() * tensor.element_size()} bytes")
         
         try:
-            # 发送tensor
-            print(f"   📤 Sending tensor...")
+            print(f"   Sending tensor...")
             start_time = time.time()
             
-            # 调用异步发送tensor方法
             future = client.async_send_tensor(loop, tensor)
             result = await future
             
             end_time = time.time()
-            transfer_time = (end_time - start_time) * 1000  # 毫秒
+            transfer_time = (end_time - start_time) * 1000
             
-            print(f"   ⏱️  Transfer time: {transfer_time:.2f}ms")
+            print(f"   Transfer time: {transfer_time:.2f}ms")
             
-            # 检查结果
             if hasattr(result, 'code') and result.code == 0:
-                print(f"   ✅ Success! Server response: {result.str_view()}")
+                print(f"   Success! Server response: {result.str_view()}")
             else:
-                print(f"   ❌ Failed! Error code: {getattr(result, 'code', 'unknown')}")
+                print(f"   Failed! Error code: {getattr(result, 'code', 'unknown')}")
                 if hasattr(result, 'err_msg'):
                     print(f"       Error message: {result.err_msg}")
             
         except Exception as e:
-            print(f"   ❌ Exception during transfer: {e}")
+            print(f"   Exception during transfer: {e}")
         
-        # 短暂延迟
         await asyncio.sleep(0.5)
     
-    print(f"\n🎉 All tensor transfer tests completed!")
+    print(f"\n All tensor transfer tests completed!")
 
 async def send_simple_message():
-    """发送简单消息测试连接"""
-    print("\n📨 Testing simple message transfer...")
+    print("\n Testing simple message transfer...")
     
     try:
         client = coro_rpc_transfer.py_coro_rpc_client_pool("127.0.0.1:8801")
@@ -100,19 +90,17 @@ async def send_simple_message():
         result = await future
         
         if hasattr(result, 'code') and result.code == 0:
-            print(f"   ✅ Message sent successfully!")
-            print(f"   📥 Server response: {result.str_view()}")
+            print(f"    Message sent successfully!")
+            print(f"    Server response: {result.str_view()}")
         else:
-            print(f"   ❌ Message failed! Error: {getattr(result, 'err_msg', 'unknown')}")
+            print(f"    Message failed! Error: {getattr(result, 'err_msg', 'unknown')}")
             
     except Exception as e:
-        print(f"   ❌ Exception: {e}")
+        print(f"    Exception: {e}")
 
 def create_custom_tensor():
-    """创建自定义tensor进行测试"""
-    print("\n🎨 Creating custom tensor...")
+    print("\n Creating custom tensor...")
     
-    # 创建一个包含特定模式的tensor
     data = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
@@ -125,18 +113,17 @@ def create_custom_tensor():
     return tensor
 
 async def main():
-    """主函数"""
-    print("🌟 Mooncake Tensor Transfer Client")
+    print(" Mooncake Tensor Transfer Client")
     print("=" * 50)
     
-    print("⏳ Waiting for server to be ready...")
+    print(" Waiting for server to be ready...")
     await asyncio.sleep(2)
     
     await send_simple_message()
     
     await send_tensor_to_server()
     
-    print("\n🎨 Testing custom tensor...")
+    print("\n Testing custom tensor...")
     custom_tensor = create_custom_tensor()
     
     try:
@@ -147,14 +134,14 @@ async def main():
         result = await future
         
         if hasattr(result, 'code') and result.code == 0:
-            print("✅ Custom tensor sent successfully!")
+            print(" Custom tensor sent successfully!")
         else:
-            print(f"❌ Custom tensor failed: {getattr(result, 'err_msg', 'unknown')}")
+            print(f" Custom tensor failed: {getattr(result, 'err_msg', 'unknown')}")
             
     except Exception as e:
-        print(f"❌ Exception with custom tensor: {e}")
+        print(f" Exception with custom tensor: {e}")
     
-    print("\n🏁 Client finished!")
+    print("\n Client finished!")
 
 if __name__ == "__main__":
     print(f"PyTorch version: {torch.__version__}")
