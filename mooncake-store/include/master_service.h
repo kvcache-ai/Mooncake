@@ -142,7 +142,9 @@ class MasterService {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
     auto GetReplicaListByRegex(const std::string& regex_pattern)
-        -> tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>;
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
 
     /**
      * @brief Get list of replicas for an object

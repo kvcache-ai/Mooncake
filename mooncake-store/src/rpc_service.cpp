@@ -222,17 +222,16 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
-    // return execute_rpc(
-    //     "GetReplicaListByRegex", [&] { return master_service_.GetReplicaListByRegex(str); },
-    //     [&](auto& timer) { timer.LogRequest("Regex=", str); },
-    //     [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
-    //     [] {
-    //         MasterMetricManager::instance().inc_get_replica_list_failures();
-    //     });
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>> res;
-    return res;
+    return execute_rpc(
+        "GetReplicaListByRegex", [&] { return master_service_.GetReplicaListByRegex(str); },
+        [&](auto& timer) { timer.LogRequest("Regex=", str); },
+        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_get_replica_list_failures();
+        });
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -530,7 +529,8 @@ void RegisterRpcService(
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaListByRegex>(
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);

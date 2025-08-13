@@ -153,9 +153,8 @@ bool StorageBackend::Existkey(const ObjectKey& key) {
     }
 }
 
-std::unordered_map<std::string, Replica::Descriptor> StorageBackend::QueryByRegex(
-    const std::string& regex_pattern) {
-
+std::unordered_map<std::string, Replica::Descriptor>
+StorageBackend::QueryByRegex(const std::string& regex_pattern) {
     namespace fs = std::filesystem;
     std::unordered_map<std::string, Replica::Descriptor> result;
     std::regex pattern;
@@ -163,14 +162,15 @@ std::unordered_map<std::string, Replica::Descriptor> StorageBackend::QueryByRege
     try {
         pattern = std::regex(regex_pattern, std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern for storage query: " << regex_pattern
-                   << ", error: " << e.what();
+        LOG(ERROR) << "Invalid regex pattern for storage query: "
+                   << regex_pattern << ", error: " << e.what();
         return result;
     }
 
     fs::path storage_root = fs::path(root_dir_) / fsdir_;
     if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
-        LOG(WARNING) << "Storage root directory does not exist: " << storage_root;
+        LOG(WARNING) << "Storage root directory does not exist: "
+                     << storage_root;
         return result;
     }
 
@@ -180,14 +180,16 @@ std::unordered_map<std::string, Replica::Descriptor> StorageBackend::QueryByRege
 
             if (std::regex_search(filename, pattern)) {
                 Replica::Descriptor desc;
-                auto& disk_desc = desc.descriptor_variant.emplace<DiskDescriptor>();
+                auto& disk_desc =
+                    desc.descriptor_variant.emplace<DiskDescriptor>();
                 disk_desc.file_path = entry.path().string();
 
                 std::error_code ec;
                 disk_desc.file_size = fs::file_size(entry.path(), ec);
                 if (ec) {
-                    LOG(WARNING) << "Failed to get file size for: " << disk_desc.file_path
-                                 << ", error: " << ec.message();
+                    LOG(WARNING)
+                        << "Failed to get file size for: " << disk_desc.file_path
+                        << ", error: " << ec.message();
                     continue;
                 }
 
@@ -272,14 +274,15 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
     try {
         pattern = std::regex(regex_pattern, std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern for storage removal: " << regex_pattern
-                   << ", error: " << e.what();
+        LOG(ERROR) << "Invalid regex pattern for storage removal: "
+                   << regex_pattern << ", error: " << e.what();
         return;
     }
 
     fs::path storage_root = fs::path(root_dir_) / fsdir_;
     if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
-        LOG(WARNING) << "Storage root directory does not exist: " << storage_root;
+        LOG(WARNING) << "Storage root directory does not exist: "
+                     << storage_root;
         return;
     }
 

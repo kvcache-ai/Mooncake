@@ -513,7 +513,7 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto res =  service_->RemoveByRegex("^test_key");
+    auto res = service_->RemoveByRegex("^test_key");
     ASSERT_TRUE(res.has_value());
     ASSERT_EQ(10, res.value());
     times = 10;
@@ -524,7 +524,6 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
         ASSERT_FALSE(exist_result.value());
     }
 }
-
 
 TEST_F(MasterServiceTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;

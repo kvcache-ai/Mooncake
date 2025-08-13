@@ -40,8 +40,10 @@ class WrappedMasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
 
-    tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode> GetReplicaListByRegex(
-        const std::string& str);
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
         const std::string& key);

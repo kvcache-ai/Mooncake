@@ -274,7 +274,8 @@ class PyClient {
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str);
+    tl::expected<long, ErrorCode> removeByRegex_internal(
+        const std::string &str);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal();
 

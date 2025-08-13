@@ -56,7 +56,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     GetReplicaList(const std::string& object_key);
 
-    [[nodiscard]] tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
     /**
@@ -134,7 +136,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
 
-    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str);
 
     /**
      * @brief Removes all objects and all its replicas
