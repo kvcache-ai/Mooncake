@@ -120,12 +120,27 @@ void** rdma_args(const std::string& device_name);
  */
 bool isPortAvailable(int port);
 
-/**
- * @brief Get a random available port in the specified range
- * @param min_port Minimum port number (default: 12300)
- * @param max_port Maximum port number (default: 14300)
- * @return Available port number, or -1 if no port found after 10 attempts
- */
-int getRandomAvailablePort(int min_port = 12300, int max_port = 14300);
+// Simple RAII class for automatically binding to an available port
+// The socket is bound during construction and released during destruction
+class AutoPortBinder {
+   public:
+    // Constructs binder and attempts to bind to an available port in range
+    // [min_port, max_port] After successful construction, the port is bound and
+    // reserved until destruction
+    AutoPortBinder(int min_port = 12300, int max_port = 14300);
+    ~AutoPortBinder();
+
+    // Non-copyable, non-movable
+    AutoPortBinder(const AutoPortBinder&) = delete;
+    AutoPortBinder& operator=(const AutoPortBinder&) = delete;
+    AutoPortBinder(AutoPortBinder&&) = delete;
+    AutoPortBinder& operator=(AutoPortBinder&&) = delete;
+
+    int getPort() const { return port_; }
+
+   private:
+    int socket_fd_;
+    int port_;
+};
 
 }  // namespace mooncake

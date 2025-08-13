@@ -4,7 +4,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <set>
+#include <errno.h>
 
 using namespace mooncake;
 
@@ -101,42 +101,73 @@ TEST(UtilsTest, IsPortAvailableWithBindingConflict) {
     EXPECT_TRUE(isPortAvailable(test_port));
 }
 
-TEST(UtilsTest, GetRandomAvailablePort) {
-    // Test with default parameters
-    int port = getRandomAvailablePort();
-    EXPECT_GE(port, 12300);
-    EXPECT_LE(port, 14300);
-    EXPECT_TRUE(isPortAvailable(port));
+TEST(UtilsTest, AutoPortBinderMultipleInstances) {
+    // Test that multiple binders get different ports
+    AutoPortBinder binder1;
+    AutoPortBinder binder2;
+
+    int port1 = binder1.getPort();
+    int port2 = binder2.getPort();
+
+    EXPECT_GT(port1, 0);
+    EXPECT_GT(port2, 0);
+
+    EXPECT_GE(port1, 12300);  // Should be in default range
+    EXPECT_LE(port1, 14300);
+    EXPECT_GE(port2, 12300);  // Should be in default range
+    EXPECT_LE(port2, 14300);
+
+    // If both successfully bound, they should have different ports
+    EXPECT_NE(port1, port2);
 }
 
-TEST(UtilsTest, GetRandomAvailablePortCustomRange) {
-    // Test with custom range
-    int port = getRandomAvailablePort(20000, 20010);
-    if (port != -1) {  // If we found a port
-        EXPECT_GE(port, 20000);
-        EXPECT_LE(port, 20010);
-        EXPECT_TRUE(isPortAvailable(port));
-    }
+TEST(UtilsTest, AutoPortBinderRAII) {
+    // Test RAII behavior - port should be released when binder is destroyed
+    int port;
+    {
+        AutoPortBinder binder;
+        port = binder.getPort();
+        EXPECT_GT(port, 0);  // Should successfully get a port
+
+        // Try to bind to the same port - should fail due to conflict
+        int test_socket = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(test_socket, 0);
+
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        // This should fail because port is already bound by AutoPortBinder
+        int bind_result = bind(test_socket, (sockaddr*)&addr, sizeof(addr));
+        EXPECT_EQ(bind_result, -1);    // Should fail
+        EXPECT_EQ(errno, EADDRINUSE);  // Should be "address already in use"
+
+        close(test_socket);
+
+    }  // AutoPortBinder destroyed here, port should be released
+
+    // Now try to bind to the same port again - should succeed
+    int test_socket2 = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(test_socket2, 0);
+
+    sockaddr_in addr2 = {};
+    addr2.sin_family = AF_INET;
+    addr2.sin_addr.s_addr = INADDR_ANY;
+    addr2.sin_port = htons(port);
+
+    // This should succeed because port was released
+    int bind_result2 = bind(test_socket2, (sockaddr*)&addr2, sizeof(addr2));
+    EXPECT_EQ(bind_result2, 0);  // Should succeed
+
+    close(test_socket2);
 }
 
-TEST(UtilsTest, GetRandomAvailablePortInvalidRange) {
-    // Test with invalid range (min > max)
-    int port = getRandomAvailablePort(14300, 12300);
-    // Should still work by swapping or handling gracefully
-    EXPECT_TRUE(port == -1 || (port >= 12300 && port <= 14300));
-}
+TEST(UtilsTest, AutoPortBinderCustomRange) {
+    // Test custom port range
+    AutoPortBinder binder(50000, 50100);
+    int port = binder.getPort();
 
-TEST(UtilsTest, GetRandomAvailablePortReturnsValidPorts) {
-    // Test that multiple calls return valid, potentially different ports
-    std::set<int> ports_found;
-    for (int i = 0; i < 5; ++i) {
-        int port = getRandomAvailablePort(30000, 30100);
-        if (port != -1) {
-            EXPECT_TRUE(isPortAvailable(port));
-            ports_found.insert(port);
-        }
-    }
-
-    // We should find at least some available ports in this range
-    EXPECT_GT(ports_found.size(), 0u);
+    EXPECT_GE(port, 50000);
+    EXPECT_LE(port, 50100);
 }

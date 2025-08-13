@@ -100,13 +100,13 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     std::string hostname = local_hostname;
     size_t colon_pos = hostname.find(":");
     if (colon_pos == std::string::npos) {
-        // Get a random available port
-        int port = getRandomAvailablePort();
+        // Create port binder to hold a port
+        port_binder_ = std::make_unique<AutoPortBinder>();
+        int port = port_binder_->getPort();
         if (port < 0) {
-            LOG(ERROR) << "Failed to find available port";
+            LOG(ERROR) << "Failed to bind available port";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        // Combine hostname with port
         this->local_hostname = hostname + ":" + std::to_string(port);
     } else {
         this->local_hostname = local_hostname;
@@ -210,6 +210,7 @@ tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
     // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
+    port_binder_.reset();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";

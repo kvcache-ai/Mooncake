@@ -7,6 +7,7 @@
 
 #include "client.h"
 #include "client_buffer.hpp"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -288,6 +289,7 @@ class PyClient {
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
+    std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
         void operator()(void *ptr) {
