@@ -352,7 +352,7 @@ class TransferSubmitter {
     explicit TransferSubmitter(TransferEngine& engine,
                                const std::string& local_hostname,
                                std::shared_ptr<StorageBackend>& backend,
-                               TransferMetric& transfer_metric);
+                               TransferMetric* transfer_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -377,7 +377,7 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
-    TransferMetric& transfer_metric_;
+    TransferMetric* transfer_metric_;
 
     /**
      * @brief Select the optimal transfer strategy

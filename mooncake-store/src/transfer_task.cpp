@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <cstdlib>
 
-#include "utils.h"
-
 namespace mooncake {
 
 // ============================================================================
@@ -357,7 +355,7 @@ TransferStrategy TransferFuture::strategy() const {
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      const std::string& local_hostname,
                                      std::shared_ptr<StorageBackend>& backend,
-                                     TransferMetric& transfer_metric)
+                                     TransferMetric* transfer_metric)
     : engine_(engine),
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
@@ -614,10 +612,15 @@ void TransferSubmitter::updateTransferMetrics(
         total_bytes += slice.size;
     }
 
+    if (transfer_metric_ == nullptr) {
+        return;
+    }
+
     if (op_code == Transport::TransferRequest::READ) {
-        transfer_metric_.total_read_bytes.inc(total_bytes);
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+
     } else if (op_code == Transport::TransferRequest::WRITE) {
-        transfer_metric_.total_write_bytes.inc(total_bytes);
+        transfer_metric_->total_write_bytes.inc(total_bytes);
     }
 }
 

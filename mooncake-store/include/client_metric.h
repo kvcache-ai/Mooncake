@@ -1,7 +1,9 @@
 #pragma once
 
-#include <vector>
+#include <atomic>
 #include <sstream>
+#include <thread>
+#include <vector>
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
@@ -240,18 +242,35 @@ struct MasterClientMetric {
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
-    void serialize(std::string& str) {
-        transfer_metric.serialize(str);
-        master_client_metric.serialize(str);
-    }
 
-    std::string summary_metrics() {
-        std::stringstream ss;
-        ss << "Client Metrics Summary\n";
-        ss << transfer_metric.summary_metrics();
-        ss << "\n";
-        ss << master_client_metric.summary_metrics();
-        return ss.str();
-    }
+    /**
+     * @brief Creates a ClientMetric instance based on environment variables
+     * @return std::unique_ptr<ClientMetric> containing the instance if enabled,
+     *         nullptr if disabled
+     *
+     * Environment variables:
+     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default, 
+     *   set to 0/false to disable)
+     * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
+     *   (default: 0, 0 = collect but don't report)
+     */
+    static std::unique_ptr<ClientMetric> Create();
+
+    void serialize(std::string& str);
+    std::string summary_metrics();
+
+    uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
+
+    explicit ClientMetric(uint64_t interval_seconds = 0);
+    ~ClientMetric();
+
+   private:
+    // Metrics reporting thread management
+    std::jthread metrics_reporting_thread_;
+    std::atomic<bool> should_stop_metrics_thread_{false};
+    uint64_t metrics_interval_seconds_{0};
+
+    void StartMetricsReportingThread();
+    void StopMetricsReportingThread();
 };
 };  // namespace mooncake

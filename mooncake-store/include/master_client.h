@@ -17,7 +17,7 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient(MasterClientMetric& metrics) : metrics_(metrics) {}
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {}
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -233,7 +233,7 @@ class MasterClient {
     RpcClientAccessor client_accessor_;
 
     // Metrics for tracking RPC operations
-    MasterClientMetric& metrics_;
+    MasterClientMetric* metrics_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

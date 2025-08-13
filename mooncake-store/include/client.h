@@ -9,6 +9,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -198,12 +199,20 @@ class Client {
         const std::vector<std::string>& keys);
 
     // For human-readable metrics
-    std::string summary_metrics() { return metrics_.summary_metrics(); }
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
 
     // For Prometheus-style metrics
-    std::string serialize_metrics() {
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         std::string str;
-        metrics_.serialize(str);
+        metrics_->serialize(str);
         return str;
     }
 
@@ -267,7 +276,7 @@ class Client {
         const std::vector<PutOperation>& ops);
 
     // Client-side metrics
-    ClientMetric metrics_;
+    std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
     TransferEngine transfer_engine_;
@@ -292,17 +301,6 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadFunc();
-
-    // Metrics reporting thread
-    std::jthread metrics_reporting_thread_;
-    std::atomic<bool> should_stop_metrics_thread_{false};
-    bool metrics_enabled_{false};            // Default to disabled
-    uint64_t metrics_interval_seconds_{10};  // Default to 10 seconds
-
-    // Helper methods for metrics reporting thread management
-    void InitializeMetricsConfig();
-    void StartMetricsReportingThread();
-    void StopMetricsReportingThread();
 
     // Client identification
     UUID client_id_;

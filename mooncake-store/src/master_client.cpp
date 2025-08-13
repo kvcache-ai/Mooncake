@@ -115,7 +115,9 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     }
 
     // Increment RPC counter
-    metrics_.rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
 
     auto start_time = std::chrono::steady_clock::now();
     auto request_result =
@@ -128,12 +130,14 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            auto end_time = std::chrono::steady_clock::now();
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end_time - start_time);
-            metrics_.rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
-                                         latency.count());
+            if (metrics_) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto latency =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        end_time - start_time);
+                metrics_->rpc_latency.observe(
+                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
+            }
             co_return result->result();
         }());
 }
@@ -149,7 +153,9 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     // Increment RPC counter
-    metrics_.rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
 
     auto start_time = std::chrono::steady_clock::now();
     auto request_result =
@@ -168,12 +174,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 }
                 co_return error_results;
             }
-            auto end_time = std::chrono::steady_clock::now();
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end_time - start_time);
-            metrics_.rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
-                                         latency.count());
+            if (metrics_) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto latency =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        end_time - start_time);
+                metrics_->rpc_latency.observe(
+                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
+            }
             co_return result->result();
         }());
 }
