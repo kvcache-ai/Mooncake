@@ -1399,7 +1399,7 @@ void Client::StartMetricsReportingThread() {
     // Only start the metrics thread if metrics are enabled
     if (!metrics_enabled_) {
         LOG(INFO) << "Client metrics reporting is disabled (set "
-                     "MC_CLIENT_METRIC=1 to enable)";
+                     "MC_STORE_METRIC_REPORT=1 to enable)";
         return;
     }
 
