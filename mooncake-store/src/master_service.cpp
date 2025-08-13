@@ -363,6 +363,9 @@ auto MasterService::PutStart(const std::string& key,
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
+
+        std::vector<std::unordered_set<std::string>> excluded_segments_per_slice(slice_lengths.size());
+
         for (size_t i = 0; i < config.replica_num; ++i) {
             std::vector<std::unique_ptr<AllocatedBuffer>> handles;
             handles.reserve(slice_lengths.size());
@@ -373,7 +376,7 @@ auto MasterService::PutStart(const std::string& key,
 
                 // Use the unified allocation strategy with replica config
                 auto handle = allocation_strategy_->Allocate(
-                    allocators, allocators_by_name, chunk_size, config);
+                    allocators, allocators_by_name, chunk_size, config, excluded_segments_per_slice[j]);
 
                 if (!handle) {
                     // If the allocation failed, we need to evict some objects
@@ -381,6 +384,8 @@ auto MasterService::PutStart(const std::string& key,
                     need_eviction_ = true;
                     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                 }
+
+                excluded_segments_per_slice[j].insert(handle->getSegmentName());
 
                 VLOG(1) << "key=" << key << ", replica_id=" << i
                         << ", slice_index=" << j << ", handle=" << *handle

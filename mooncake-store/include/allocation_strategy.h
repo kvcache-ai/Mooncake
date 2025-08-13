@@ -4,6 +4,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
 #include "types.h"
@@ -34,7 +35,8 @@ class AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+        size_t objectSize, const ReplicateConfig& config,
+        const std::unordered_set<std::string>& excluded_segments) = 0;
 };
 
 /**
@@ -53,20 +55,22 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) override {
+        size_t objectSize, const ReplicateConfig& config,
+        const std::unordered_set<std::string>& excluded_segments = {}) override {
         // Fast path: single allocator case
         if (allocators.size() == 1) {
-            return allocators[0]->allocate(objectSize);
+            return excluded_segments.contains(allocators[0]->getSegmentName()) 
+                ? nullptr : allocators[0]->allocate(objectSize);
         }
 
         // Try preferred segment first if specified
         if (auto preferred_buffer =
-                TryPreferredAllocate(allocators_by_name, objectSize, config)) {
+                TryPreferredAllocate(allocators_by_name, objectSize, config, excluded_segments)) {
             return preferred_buffer;
         }
 
         // Fall back to random allocation among all eligible allocators
-        return TryRandomAllocate(allocators, objectSize);
+        return TryRandomAllocate(allocators, objectSize, excluded_segments);
     }
 
    private:
@@ -82,13 +86,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators,
-        size_t objectSize, const ReplicateConfig& config) {
+        size_t objectSize, const ReplicateConfig& config,
+        const std::unordered_set<std::string>& excluded_segments) {
         if (config.preferred_segment.empty()) {
             return nullptr;
         }
 
         auto preferred_it = allocators.find(config.preferred_segment);
-        if (preferred_it == allocators.end()) {
+        if (preferred_it == allocators.end() || excluded_segments.contains(preferred_it->first)) {
             return nullptr;
         }
 
@@ -108,12 +113,19 @@ class RandomAllocationStrategy : public AllocationStrategy {
      */
     std::unique_ptr<AllocatedBuffer> TryRandomAllocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        size_t objectSize) {
-        const size_t max_tries = std::min(kMaxRetryLimit, allocators.size());
+        size_t objectSize,
+        const std::unordered_set<std::string>& excluded_segments) {
+        std::vector<size_t> allocator_indices;
+        allocator_indices.reserve(allocators.size());
 
-        std::vector<size_t> allocator_indices(allocators.size());
-        std::iota(allocator_indices.begin(), allocator_indices.end(), 0);
+        for (size_t index = 0; index < allocators.size(); ++index) {
+            const auto& segment_name = allocators[index]->getSegmentName();
+            if (!excluded_segments.contains(segment_name)) {
+                allocator_indices.push_back(index);
+            }
+        }
 
+        const size_t max_tries = std::min(kMaxRetryLimit, allocator_indices.size());
         for (size_t try_count = 0; try_count < max_tries; ++try_count) {
             // Randomly select an allocator
             std::uniform_int_distribution<size_t> dist(

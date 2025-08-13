@@ -8,6 +8,7 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <unordered_set>
 
 #include "types.h"
 
@@ -288,15 +289,17 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16;
-    std::string segment_name = "test_segment";
-
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    
+    // Mount 5 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
     UUID client_id = generate_uuid();
-
-    auto mount_result = service_->MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
+    for (int i = 0; i < 5; ++i) {
+        Segment segment(generate_uuid(), "segment_" + std::to_string(i),
+                        kBaseAddr + static_cast<size_t>(i) * kSegmentSize,
+                        kSegmentSize);
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+    }
 
     // Test PutStart
     std::string key = "test_key";
@@ -481,19 +484,20 @@ TEST_F(MasterServiceTest, RemoveAll) {
 }
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    const uint64_t kv_lease_ttl = 50;
+    std::unique_ptr<MasterService> service_(
+        new MasterService(false, kv_lease_ttl));
 
-    // Mount a segment with sufficient size for multiple replicas
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t segment_size =
-        1024 * 1024 * 64;  // 64MB to accommodate multiple replicas
-    std::string segment_name = "test_segment_multi";
-
-    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    // Mount 3 segments, each 64MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 64;  // 64MB
     UUID client_id = generate_uuid();
-
-    auto mount_result = service_->MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
+    for (int i = 0; i < 5; ++i) {
+        Segment segment(generate_uuid(), "segment_" + std::to_string(i),
+                        kBaseAddr + static_cast<size_t>(i) * kSegmentSize,
+                        kSegmentSize);
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+    }
 
     // Test parameters
     std::string key = "multi_slice_object";
@@ -1002,13 +1006,11 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     std::unique_ptr<MasterService> service_(new MasterService(false));
 
-    // TODO: mount two larger segments when replication affinity fixed
-    // Mount two segments sized to fit exactly one replica each
+    // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t segment_size = 1024 * 1024 * 16;
-    constexpr size_t object_size =
-        segment_size / 2 + 16;  // force at most 1 replica per segment
+    constexpr size_t segment_size = 1024 * 1024 * 64; // 64MB
+    constexpr size_t object_size = 1024 * 1024; // 1MB
 
     Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
     Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
@@ -1585,6 +1587,70 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 20 segments, each 16MB and slab-aligned
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    UUID client_id = generate_uuid();
+    for (int i = 0; i < 20; ++i) {
+        Segment segment(generate_uuid(), "segment_" + std::to_string(i),
+                        kBaseAddr + static_cast<size_t>(i) * kSegmentSize,
+                        kSegmentSize);
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+    }
+
+    // Object with 16 slices of ~1MB and replication factor 10
+    const std::string key = "replica_uniqueness_test_key";
+    std::vector<uint64_t> slice_lengths(16, 1024 * 1024 - 16);
+    ReplicateConfig config;
+    config.replica_num = 10;
+
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto replica_list_local = put_start_result.value();
+    ASSERT_EQ(config.replica_num, replica_list_local.size());
+
+    // For each slice index, segment names across replicas must be unique
+    for (size_t slice_idx = 0; slice_idx < slice_lengths.size(); ++slice_idx) {
+        std::unordered_set<std::string> segment_names;
+        for (const auto& replica : replica_list_local) {
+            ASSERT_TRUE(replica.is_memory_replica());
+            const auto& mem = replica.get_memory_descriptor();
+            ASSERT_EQ(slice_lengths.size(),
+                      mem.buffer_descriptors.size());
+            segment_names.insert(
+                mem.buffer_descriptors[slice_idx].segment_name_);
+        }
+        EXPECT_EQ(segment_names.size(), config.replica_num)
+            << "Duplicate segment found for slice index " << slice_idx;
+    }
+
+    ASSERT_TRUE(service_->PutEnd(key).has_value());
+}
+
+TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount a single 16MB segment
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    Segment segment(generate_uuid(), "single_segment", kBaseAddr, kSegmentSize);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Request replication factor 2 with a single 1KB slice
+    const std::string key = "replication_factor_two_single_segment";
+    std::vector<uint64_t> slice_lengths{1024};
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto put_start_result = service_->PutStart(key, slice_lengths, config);
+    ASSERT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {
