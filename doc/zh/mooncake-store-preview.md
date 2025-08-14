@@ -94,7 +94,7 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，在内存的 `Put` 请求成功后，会异步发起一次数据向SSD的持久化操作）
+用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，`Put`除了对memory pool的写入之外，还会异步发起一次向SSD的数据持久化操作）
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
@@ -462,12 +462,17 @@ struct ReplicateConfig {
 
 #### 持久化功能启用方法
 
-当用户在启动client时指定了`MOONCAKE_STORAGE_ROOT_DIR`的环境变量，且该路径为一个已存在的有效路径时，则client端的数据持久化功能就会开始工作。同时在client启动时，会向master请求一个`cluster_id`，该id可以在初始化master进行指定，若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`。注意在使用DFS时，需要在各client上分别指定DFS对应的挂载目录，以实现SSD上数据之间的共享。
+当用户在启动master时指定了`--root_fs_dir=/path/to/dir`，且该路径在各client所属的机器上都是有效的DFS挂载目录时，mooncake store的分级缓存功能即可正常工作。此外master初始化时会加载一个`cluster_id`，该id可以在初始化master进行指定（`--cluster_id=xxxx`），若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<root_fs_dir>/<cluster_id>`。
+
+注意在开启该功能时，用户需要保证各client所在主机的DFS挂载目录都是有效且相同的（`root_fs_dir=/path/to/dir`），如果存在部分client挂载目录无效或错误，会导致mooncake store运行出现一些异常情况。
 
 #### 数据访问机制
-在目前的实现版本中，kvcache object的读\写\查询等操作都是完全在client端完成的，master对其无感知。在文件系统中key -> kvcache object的索引信息是由固定的索引机制来维护的，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
+持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
 
-启用持久化功能后，对于每次成功写入memory的 `Put`或`BatchPut` 操作，都会异步地发起一次持久化操作，写入DFS当中。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
+启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
+
+#### 3FS USRBIO 插件
+如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/READMD.md)。
 
 ## Mooncake Store Python API
 
@@ -576,9 +581,9 @@ retcode = store.setup(
 ```
 
 2. 在一台机器上运行 `ROLE=prefill python3 ./stress_cluster_benchmark.py`，启动 Prefill 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。
 3. 在另一台机器上运行 `ROLE=decode python3 ./stress_cluster_benchmark.py`，启动 Decode 节点。
-   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。如需启用持久化功能，可运行`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir  python3 ./stress_cluster_benchmark.py`。
+   对于 rdma 协议, 你可以开启自动探索 topology 和设置网卡白名单, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`。
 
 无报错信息表示数据传输成功。
 

@@ -17,7 +17,8 @@ MasterService::MasterService(
     uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
     double eviction_ratio, double eviction_high_watermark_ratio,
     ViewVersionId view_version, int64_t client_live_ttl_sec, bool enable_ha,
-    const std::string& cluster_id, BufferAllocatorType memory_allocator)
+    const std::string& cluster_id, const std::string& root_fs_dir,
+    BufferAllocatorType memory_allocator)
     : enable_gc_(enable_gc),
       default_kv_lease_ttl_(default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
@@ -27,6 +28,7 @@ MasterService::MasterService(
       client_live_ttl_sec_(client_live_ttl_sec),
       enable_ha_(enable_ha),
       cluster_id_(cluster_id),
+      root_fs_dir_(root_fs_dir),
       segment_manager_(memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
@@ -50,6 +52,10 @@ MasterService::MasterService(
         client_monitor_thread_ =
             std::thread(&MasterService::ClientMonitorFunc, this);
         VLOG(1) << "action=start_client_monitor_thread";
+    }
+
+    if (!root_fs_dir_.empty()) {
+        use_disk_replica_ = true;
     }
 }
 
@@ -165,6 +171,7 @@ void MasterService::ClearInvalidHandles() {
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
+                // If the object is empty, we need to erase the iterator
                 it = shard.metadata.erase(it);
             } else {
                 ++it;
@@ -216,16 +223,17 @@ auto MasterService::ExistKey(const std::string& key)
     }
 
     auto& metadata = accessor.Get();
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-        LOG(WARNING) << "key=" << key << ", status=" << *status
-                     << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    for (const auto& replica : metadata.replicas) {
+        if (replica.status() == ReplicaStatus::COMPLETE) {
+            // Grant a lease to the object as it may be further used by the
+            // client.
+            metadata.GrantLease(default_kv_lease_ttl_,
+                                default_kv_soft_pin_ttl_);
+            return true;
+        }
     }
 
-    // Grant a lease to the object as it may be further used by the client.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-
-    return true;
+    return false;  // If no complete replica is found, return false
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
@@ -280,16 +288,18 @@ auto MasterService::GetReplicaList(std::string_view key)
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-        LOG(WARNING) << "key=" << key << ", status=" << *status
-                     << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
 
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(metadata.replicas.size());
     for (const auto& replica : metadata.replicas) {
-        replica_list.emplace_back(replica.get_descriptor());
+        if (replica.status() == ReplicaStatus::COMPLETE) {
+            replica_list.emplace_back(replica.get_descriptor());
+        }
+    }
+
+    if (replica_list.empty()) {
+        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Only mark for GC if enabled
@@ -357,7 +367,7 @@ auto MasterService::PutStart(const std::string& key,
 
     // Allocate replicas
     std::vector<Replica> replicas;
-    replicas.reserve(config.replica_num);
+    replicas.reserve(config.replica_num + use_disk_replica_);
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
@@ -393,6 +403,14 @@ auto MasterService::PutStart(const std::string& key,
         }
     }
 
+    // If disk replica is enabled, allocate a disk replica
+    if (use_disk_replica_) {
+        // Allocate a file path for the disk replica
+        std::string file_path = ResolvePath(key);
+        replicas.emplace_back(file_path, total_length,
+                              ReplicaStatus::PROCESSING);
+    }
+
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(replicas.size());
     for (const auto& replica : replicas) {
@@ -408,7 +426,7 @@ auto MasterService::PutStart(const std::string& key,
     return replica_list;
 }
 
-auto MasterService::PutEnd(const std::string& key)
+auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -418,7 +436,9 @@ auto MasterService::PutEnd(const std::string& key)
 
     auto& metadata = accessor.Get();
     for (auto& replica : metadata.replicas) {
-        replica.mark_complete();
+        if (replica.type() == replica_type) {
+            replica.mark_complete();
+        }
     }
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
@@ -427,7 +447,7 @@ auto MasterService::PutEnd(const std::string& key)
     return {};
 }
 
-auto MasterService::PutRevoke(const std::string& key)
+auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -436,13 +456,16 @@ auto MasterService::PutRevoke(const std::string& key)
     }
 
     auto& metadata = accessor.Get();
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING)) {
+    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING,
+                                                replica_type)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
-
-    accessor.Erase();
+    metadata.EraseReplica(replica_type);
+    if (metadata.IsValid() == false) {
+        accessor.Erase();
+    }
     return {};
 }
 
@@ -451,7 +474,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(key));
+        results.emplace_back(PutEnd(key, ReplicaType::MEMORY));
     }
     return results;
 }
@@ -461,7 +484,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(key));
+        results.emplace_back(PutRevoke(key, ReplicaType::MEMORY));
     }
     return results;
 }
@@ -481,9 +504,8 @@ auto MasterService::Remove(const std::string& key)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-        LOG(ERROR) << "key=" << key << ", status=" << *status
-                   << ", error=invalid_replica_status";
+    if (!metadata.IsAllReplicasComplete()) {
+        LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -510,7 +532,7 @@ long MasterService::RemoveAll() {
         while (it != shard.metadata.end()) {
             if (it->second.IsLeaseExpired(now)) {
                 total_freed_size +=
-                    it->second.size * it->second.replicas.size();
+                    it->second.size * it->second.GetMemReplicaCount();
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -544,10 +566,10 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     auto replica_it = metadata.replicas.begin();
     while (replica_it != metadata.replicas.end()) {
         // Use any_of algorithm to check if any handle has an invalid allocator
-        bool has_invalid_handle = replica_it->has_invalid_handle();
+        bool has_invalid_mem_handle = replica_it->has_invalid_mem_handle();
 
         // Remove replicas with invalid handles using erase-remove idiom
-        if (has_invalid_handle) {
+        if (has_invalid_mem_handle) {
             replica_it = metadata.replicas.erase(replica_it);
         } else {
             ++replica_it;
@@ -593,11 +615,11 @@ auto MasterService::Ping(const UUID& client_id)
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
-    if (cluster_id_.empty()) {
-        LOG(ERROR) << "Cluster ID is not initialized";
+    if (root_fs_dir_.empty() || cluster_id_.empty()) {
+        LOG(ERROR) << "root_fs_dir or cluster_id is not set";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return cluster_id_;
+    return root_fs_dir_ + "/" + cluster_id_;
 }
 
 void MasterService::GCThreadFunc() {
@@ -699,7 +721,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
              it++) {
             // Skip objects that are not expired or have incomplete replicas
             if (!it->second.IsLeaseExpired(now) ||
-                it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                            ReplicaType::MEMORY)) {
                 continue;
             }
             if (!it->second.IsSoftPinned(now)) {
@@ -733,15 +756,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 // pass
                 if (!it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
-                    it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                    it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                ReplicaType::MEMORY) ||
+                    !it->second.HasMemReplica()) {
                     ++it;
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
                     // Evict this object
                     total_freed_size +=
-                        it->second.size * it->second.replicas.size();
-                    it = shard.metadata.erase(it);
+                        it->second.size * it->second.GetMemReplicaCount();
+                    it->second.EraseReplica(
+                        ReplicaType::MEMORY);  // Erase memory replicas
+                    if (it->second.IsValid() == false) {
+                        it = shard.metadata.erase(it);
+                    } else {
+                        ++it;
+                    }
                     shard_evicted_count++;
                 } else {
                     // second pass candidates
@@ -789,11 +820,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 while (it != shard.metadata.end() && target_evict_num > 0) {
                     if (it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
-                        !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                        !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                     ReplicaType::MEMORY) &&
+                        it->second.HasMemReplica()) {
                         // Evict this object
                         total_freed_size +=
-                            it->second.size * it->second.replicas.size();
-                        it = shard.metadata.erase(it);
+                            it->second.size * it->second.GetMemReplicaCount();
+                        it->second.EraseReplica(
+                            ReplicaType::MEMORY);  // Erase memory replicas
+                        if (it->second.IsValid() == false) {
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
                         evicted_count++;
                         target_evict_num--;
                     } else {
@@ -828,7 +867,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // Skip objects that are not expired or have incomplete
                     // replicas
                     if (!it->second.IsLeaseExpired(now) ||
-                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                    ReplicaType::MEMORY) ||
+                        !it->second.HasMemReplica()) {
                         ++it;
                         continue;
                     }
@@ -837,8 +878,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
                         total_freed_size +=
-                            it->second.size * it->second.replicas.size();
-                        it = shard.metadata.erase(it);
+                            it->second.size * it->second.GetMemReplicaCount();
+                        it->second.EraseReplica(
+                            ReplicaType::MEMORY);  // Erase memory replicas
+                        if (it->second.IsValid() == false) {
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
                         evicted_count++;
                         target_evict_num--;
                     } else {
@@ -967,6 +1014,41 @@ void MasterService::ClientMonitorFunc() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
+}
+
+std::string MasterService::SanitizeKey(const std::string& key) const {
+    // Set of invalid filesystem characters to be replaced
+    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
+    std::string sanitized_key;
+    sanitized_key.reserve(key.size());
+
+    for (char c : key) {
+        // Replace invalid characters with underscore
+        sanitized_key.push_back(
+            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+    }
+    return sanitized_key;
+}
+
+std::string MasterService::ResolvePath(const std::string& key) const {
+    // Compute hash of the key
+    size_t hash = std::hash<std::string>{}(key);
+
+    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
+    char dir1 =
+        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
+    char dir2 = static_cast<char>(
+        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
+
+    // Safely construct path using std::filesystem
+    namespace fs = std::filesystem;
+    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
+
+    // Combine directory path with sanitized filename
+    fs::path full_path =
+        fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
+
+    return full_path.lexically_normal().string();
 }
 
 }  // namespace mooncake
