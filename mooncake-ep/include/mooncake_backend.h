@@ -28,8 +28,11 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     TransferEngine engine_{true};
-    void* buffer_;
-    MooncakeWorker worker_{&engine_};
+    void* send_buffer_;
+    void* recv_buffer_;
+    int32_t* cpu_sync_send_region_;
+    int32_t* cpu_sync_recv_region_;
+    MooncakeWorker worker_;
 };
 
 }  // namespace mooncake

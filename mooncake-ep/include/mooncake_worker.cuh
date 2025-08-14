@@ -16,28 +16,33 @@ __global__ enum TaskStatus {
 };
 
 __global__ struct Task {
-    TaskStatus status = IDLE;
+    volatile TaskStatus status = IDLE;
     c10d::OpType opType = c10d::OpType::UNKNOWN;
-    void* inputPtr;
-    void* outputPtr;
+    size_t tensorSize;  // In bytes
+    BatchID batchID;
 };
 
 class MooncakeWorker {
    public:
-    explicit MooncakeWorker(TransferEngine* engine);
+    explicit MooncakeWorker(TransferEngine* engine, int rank, int size);
 
     c10::intrusive_ptr<c10d::Work> putTask(
-        c10d::OpType opType, void* inputPtr, void* outputPtr,
-        cudaStream_t stream, const std::function<void()>& asyncCallback);
+        c10d::OpType opType, size_t tensorSize, cudaStream_t stream,
+        const std::function<void(void* dst)>& tensorToBuffer,
+        const std::function<void(void* src)>& bufferToTensor);
 
     void initWorker();
 
-   private:
     static constexpr size_t kNumTasks_ = 1024;
 
+   private:
     Task *tasks_, *tasks_device_;
 
+    int rank_, size_;
+
     TransferEngine* engine_;
+    std::vector<TransferMetadata::SegmentID> segment_ids_;
+    std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segment_descs_;
 };
 
 }  // namespace mooncake

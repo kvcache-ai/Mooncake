@@ -30,17 +30,15 @@ __device__ int findIdleTask(Task* tasks, size_t numTasks) {
     return -1;
 }
 
-__global__ void enqueueTaskKernel(c10d::OpType opType, void* inputPtr,
-                                  void* outputPtr, Task* tasks,
-                                  size_t numTasks) {
+__global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
+                                  Task* tasks, size_t numTasks) {
     // Find idle task
     int idx = findIdleTask(tasks, numTasks);
     assert(idx >= 0);
 
     // Copy task into slot
     tasks[idx].opType = opType;
-    tasks[idx].inputPtr = inputPtr;
-    tasks[idx].outputPtr = outputPtr;
+    tasks[idx].tensorSize = tensorSize;
 
     // Mark READY
     __threadfence();  // Ensure writes visible to host
@@ -53,7 +51,8 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, void* inputPtr,
     tasks[idx].status = IDLE;
 }
 
-MooncakeWorker::MooncakeWorker(TransferEngine* engine) : engine_(engine) {
+MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
+    : engine_(engine), rank_(rank), size_(size) {
     // Pin memory for task array
     cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
     cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
@@ -63,11 +62,13 @@ MooncakeWorker::MooncakeWorker(TransferEngine* engine) : engine_(engine) {
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTask(
-    c10d::OpType opType, void* inputPtr, void* outputPtr, cudaStream_t stream,
-    const std::function<void()>& asyncCallback) {
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, inputPtr, outputPtr,
-                                           tasks_device_, kNumTasks_);
-    asyncCallback();
+    c10d::OpType opType, size_t tensorSize, cudaStream_t stream,
+    const std::function<void(void* dst)>& tensorToBuffer,
+    const std::function<void(void* src)>& bufferToTensor) {
+    tensorToBuffer((void*)segment_descs_[rank_]->buffers[0].addr);
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, tasks_device_,
+                                           kNumTasks_);
+    bufferToTensor((void*)segment_descs_[rank_]->buffers[1].addr);
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     cudaEventRecord(event, stream);

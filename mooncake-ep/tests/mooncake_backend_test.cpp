@@ -7,6 +7,8 @@
 
 namespace mooncake {
 
+constexpr size_t kNumRanks = 1;
+
 class MooncakeBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -14,29 +16,49 @@ class MooncakeBackendTest : public ::testing::Test {
             "/tmp/mooncake_backend_test_store", 1);
         auto options =
             c10::make_intrusive<::c10d::Backend::Options>("mooncake");
-        backend = std::make_shared<MooncakeBackend>(store, 0, 1, options);
+        for (size_t rank = 0; rank < kNumRanks; ++rank) {
+            backends.emplace_back(std::make_shared<MooncakeBackend>(
+                store, rank, kNumRanks, options));
+        }
     }
 
     void TearDown() override {}
 
-    std::shared_ptr<MooncakeBackend> backend;
+    std::vector<std::shared_ptr<MooncakeBackend>> backends;
 };
 
-TEST_F(MooncakeBackendTest, AllreduceTest) {
-    std::vector<torch::Tensor> tensors;
-    tensors.push_back(torch::ones({2, 2}));
+TEST_F(MooncakeBackendTest, AllgatherTest) {
+    std::vector<c10::intrusive_ptr<c10d::Work>> works;
+    std::vector<std::vector<std::vector<at::Tensor>>> allOutputTensors;
+    std::vector<std::vector<torch::Tensor>> allInputTensors;
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        std::vector<at::Tensor> outputTensorsInner;
+        for (size_t i = 0; i < kNumRanks; ++i) {
+            outputTensorsInner.emplace_back(torch::zeros({2, 2}));
+        }
+        std::vector<std::vector<at::Tensor>> outputTensors;
+        outputTensors.emplace_back(outputTensorsInner);
 
-    ::c10d::AllreduceOptions opts;
-    opts.reduceOp = ::c10d::ReduceOp::SUM;
+        std::vector<at::Tensor> inputTensors;
+        inputTensors.push_back(torch::full({2, 2}, rank));
 
-    auto work = backend->allreduce(tensors, opts);
-    bool success = work->wait();
-    ASSERT_TRUE(success) << "Allreduce failed";
+        works.emplace_back(backends[rank]->allgather(
+            outputTensors, inputTensors, c10d::AllgatherOptions()));
+        allOutputTensors.emplace_back(outputTensors);
+        allInputTensors.emplace_back(inputTensors);
+    }
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        bool success = works[rank]->wait();
+        ASSERT_TRUE(success) << "Allgather failed at rank " << rank;
 
-    auto expected = torch::ones({2, 2}) * backend->getSize();
-    ASSERT_TRUE(torch::allclose(tensors[0], expected))
-        << "Allreduce result mismatch. Got: " << tensors[0]
-        << " Expected: " << expected;
+        std::vector<at::Tensor> outputTensors = allOutputTensors[rank][0];
+        for (size_t i = 0; i < kNumRanks; ++i) {
+            auto expected = torch::full({2, 2}, i);
+            ASSERT_TRUE(torch::allclose(outputTensors[i], expected))
+                << "Allgather result mismatch. Got: " << outputTensors[i]
+                << " Expected: " << expected;
+        }
+    }
 }
 
 TEST_F(MooncakeBackendTest, BroadcastTest) {
@@ -46,7 +68,7 @@ TEST_F(MooncakeBackendTest, BroadcastTest) {
     ::c10d::BroadcastOptions opts;
     opts.rootRank = 0;
 
-    EXPECT_THROW({ backend->broadcast(tensors, opts); }, c10::Error);
+    EXPECT_THROW({ backends[0]->broadcast(tensors, opts); }, c10::Error);
 }
 
 }  // namespace mooncake
