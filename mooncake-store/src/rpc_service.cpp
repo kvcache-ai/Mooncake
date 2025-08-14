@@ -229,9 +229,13 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
         "GetReplicaListByRegex",
         [&] { return master_service_.GetReplicaListByRegex(str); },
         [&](auto& timer) { timer.LogRequest("Regex=", str); },
-        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
-            MasterMetricManager::instance().inc_get_replica_list_failures();
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_requests();
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_failures();
         });
 }
 
@@ -449,8 +453,8 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     return execute_rpc(
         "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
         [&](auto& timer) { timer.LogRequest("regex=", str); },
-        [] { MasterMetricManager::instance().inc_remove_requests(); },
-        [] { MasterMetricManager::instance().inc_remove_failures(); });
+        [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
 long WrappedMasterService::RemoveAll() {

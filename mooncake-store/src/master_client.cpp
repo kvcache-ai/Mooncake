@@ -373,7 +373,7 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
 
 tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
     const std::string& str) {
-    ScopedVLogTimer timer(1, "MasterClient::RemoveBy");
+    ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
     timer.LogRequest("key=", str);
 
     auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str);

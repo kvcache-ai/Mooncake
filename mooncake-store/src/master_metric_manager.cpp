@@ -54,6 +54,12 @@ MasterMetricManager::MasterMetricManager()
       get_replica_list_failures_(
           "master_get_replica_list_failures_total",
           "Total number of failed GetReplicaList requests"),
+      get_replica_list_by_regex_requests_(
+          "master_get_replica_list_by_regex_requests_total",
+          "Total number of GetReplicaListByRegex requests received"),
+      get_replica_list_by_regex_failures_(
+          "master_get_replica_list_by_regex_failures_total",
+          "Total number of failed GetReplicaListByRegex requests"),
       exist_key_requests_("master_exist_key_requests_total",
                           "Total number of ExistKey requests received"),
       exist_key_failures_("master_exist_key_failures_total",
@@ -62,6 +68,12 @@ MasterMetricManager::MasterMetricManager()
                        "Total number of Remove requests received"),
       remove_failures_("master_remove_failures_total",
                        "Total number of failed Remove requests"),
+      remove_by_regex_requests_(
+          "master_remove_by_regex_requests_total",
+          "Total number of RemoveByRegex requests received"),
+      remove_by_regex_failures_(
+          "master_remove_by_regex_failures_total",
+          "Total number of failed RemoveByRegex requests"),
       remove_all_requests_("master_remove_all_requests_total",
                            "Total number of Remove all requests received"),
       remove_all_failures_("master_remove_all_failures_total",
@@ -272,11 +284,23 @@ void MasterMetricManager::inc_get_replica_list_requests(int64_t val) {
 void MasterMetricManager::inc_get_replica_list_failures(int64_t val) {
     get_replica_list_failures_.inc(val);
 }
+void MasterMetricManager::inc_get_replica_list_by_regex_requests(int64_t val) {
+    get_replica_list_by_regex_requests_.inc(val);
+}
+void MasterMetricManager::inc_get_replica_list_by_regex_failures(int64_t val) {
+    get_replica_list_by_regex_failures_.inc(val);
+}
 void MasterMetricManager::inc_remove_requests(int64_t val) {
     remove_requests_.inc(val);
 }
 void MasterMetricManager::inc_remove_failures(int64_t val) {
     remove_failures_.inc(val);
+}
+void MasterMetricManager::inc_remove_by_regex_requests(int64_t val) {
+    remove_by_regex_requests_.inc(val);
+}
+void MasterMetricManager::inc_remove_by_regex_failures(int64_t val) {
+    remove_by_regex_failures_.inc(val);
 }
 void MasterMetricManager::inc_remove_all_requests(int64_t val) {
     remove_all_requests_.inc(val);
@@ -409,12 +433,28 @@ int64_t MasterMetricManager::get_get_replica_list_failures() {
     return get_replica_list_failures_.value();
 }
 
+int64_t MasterMetricManager::get_get_replica_list_by_regex_requests() {
+    return get_replica_list_by_regex_requests_.value();
+}
+
+int64_t MasterMetricManager::get_get_replica_list_by_regex_failures() {
+    return get_replica_list_by_regex_failures_.value();
+}
+
 int64_t MasterMetricManager::get_exist_key_requests() {
     return exist_key_requests_.value();
 }
 
 int64_t MasterMetricManager::get_exist_key_failures() {
     return exist_key_failures_.value();
+}
+
+int64_t MasterMetricManager::get_remove_by_regex_requests() {
+    return remove_by_regex_requests_.value();
+}
+
+int64_t MasterMetricManager::get_remove_by_regex_failures() {
+    return remove_by_regex_failures_.value();
 }
 
 int64_t MasterMetricManager::get_remove_requests() {
@@ -634,8 +674,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_revoke_failures_);
     serialize_metric(get_replica_list_requests_);
     serialize_metric(get_replica_list_failures_);
+    serialize_metric(get_replica_list_by_regex_requests_);
+    serialize_metric(get_replica_list_by_regex_failures_);
     serialize_metric(remove_requests_);
     serialize_metric(remove_failures_);
+    serialize_metric(remove_by_regex_requests_);
+    serialize_metric(remove_by_regex_failures_);
     serialize_metric(remove_all_requests_);
     serialize_metric(remove_all_failures_);
     serialize_metric(mount_segment_requests_);
