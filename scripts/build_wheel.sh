@@ -99,6 +99,7 @@ echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
 python -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
+--exclude libetcd_wrapper.so* \
 --exclude libibverbs.so* \
 --exclude libnuma.so* \
 --exclude libstdc++.so* \
