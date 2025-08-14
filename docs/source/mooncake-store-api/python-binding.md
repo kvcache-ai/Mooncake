@@ -765,9 +765,9 @@ store.close()
 
 ---
 
-## Batch Zero-Copy Operations
+### Batch Zero-Copy Operations
 
-### batch_put_from()
+#### batch_put_from()
 Store multiple objects from pre-registered buffers (zero-copy).
 
 ```python
@@ -781,11 +781,11 @@ def batch_put_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 - `config` (ReplicateConfig, optional): Replication configuration
 
 **Returns:**
-- `List[int]`: List of status codes for each operation
+- `List[int]`: List of status codes for each operation (0 = success, negative = error)
 
 ---
 
-### batch_get_into()
+#### batch_get_into()
 Retrieve multiple objects into pre-registered buffers (zero-copy).
 
 ```python
