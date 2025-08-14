@@ -1040,7 +1040,7 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return {};
+    return result.value();
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
