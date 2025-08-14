@@ -361,7 +361,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
         config.replica_num = 1;
         auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(key);
+        auto put_end_result = service_->PutEnd(key, ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         auto exist_result = service_->ExistKey(key);
         ASSERT_TRUE(exist_result.has_value());
@@ -384,7 +384,7 @@ void put_object(MasterService& service, const std::string& key) {
     auto put_start_result = service.PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result.has_value())
         << "Failed to PutStart for key: " << key;
-    auto put_end_result = service.PutEnd(key);
+    auto put_end_result = service.PutEnd(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value())
         << "Failed to PutEnd for key: " << key;
     auto exist_result = service.ExistKey(key);
@@ -643,7 +643,7 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
         config.replica_num = 1;
         auto put_start_result = service_->PutStart(key, slice_lengths, config);
         ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(key);
+        auto put_end_result = service_->PutEnd(key, ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         auto exist_result = service_->ExistKey(key);
         ASSERT_TRUE(exist_result.has_value());

@@ -360,26 +360,7 @@ tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 Client::QueryByRegex(const std::string& str) {
     auto result = master_client_.GetReplicaListByRegex(str);
-    if (!result) {
-        // Check storage backend if master query fails
-        if (storage_backend_) {
-            auto storage_map = storage_backend_->QueryByRegex(str);
-
-            if (!storage_map.empty()) {
-                std::unordered_map<std::string,
-                                   std::vector<Replica::Descriptor>>
-                    final_result;
-                for (auto& [filename, descriptor] : storage_map) {
-                    final_result[filename].push_back(std::move(descriptor));
-                }
-                return final_result;
-            } else {
-                return tl::unexpected(result.error());
-            }
-        }
-        return tl::unexpected(result.error());
-    }
-    return result.value();
+    return result;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(

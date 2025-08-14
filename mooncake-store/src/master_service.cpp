@@ -301,19 +301,18 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
         for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
-                if (auto status =
-                        metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                    LOG(WARNING)
-                        << "key=" << key
-                        << " matched by regex, but replica not ready, status="
-                        << *status;
-                    continue;
-                }
-
                 std::vector<Replica::Descriptor> replica_list;
                 replica_list.reserve(metadata.replicas.size());
                 for (const auto& replica : metadata.replicas) {
-                    replica_list.emplace_back(replica.get_descriptor());
+                    if (replica.status() == ReplicaStatus::COMPLETE) {
+                        replica_list.emplace_back(replica.get_descriptor());
+                    }
+                }
+                if (replica_list.empty()) {
+                    LOG(WARNING)
+                        << "key=" << key
+                        << " matched by regex, but has no complete replicas.";
+                    continue;
                 }
 
                 results.emplace(key, std::move(replica_list));
@@ -584,12 +583,10 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
                     ++it;
                     continue;
                 }
-                if (auto status =
-                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
-                    LOG(WARNING)
-                        << "key=" << it->first
-                        << " matched by regex, but replica not ready, status="
-                        << *status << ". Skipping removal.";
+                if (!it->second.IsAllReplicasComplete()) {
+                    LOG(WARNING) << "key=" << it->first
+                                 << " matched by regex, but not all replicas "
+                                    "are complete. Skipping removal.";
                     ++it;
                     continue;
                 }
