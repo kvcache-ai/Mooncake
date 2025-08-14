@@ -223,6 +223,23 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
+    return execute_rpc(
+        "GetReplicaListByRegex",
+        [&] { return master_service_.GetReplicaListByRegex(str); },
+        [&](auto& timer) { timer.LogRequest("Regex=", str); },
+        [] {
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_requests();
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_failures();
+        });
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key) {
     return execute_rpc(
@@ -438,6 +455,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
+tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
+    const std::string& str) {
+    return execute_rpc(
+        "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
+        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
+}
+
 long WrappedMasterService::RemoveAll() {
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects");
@@ -515,6 +541,9 @@ void RegisterRpcService(
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListByRegex>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
     server
@@ -533,6 +562,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
         &wrapped_master_service);

@@ -392,6 +392,19 @@ int PyClient::remove(const std::string &key) {
     return to_py_ret(remove_internal(key));
 }
 
+tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
+    const std::string &str) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->RemoveByRegex(str);
+}
+
+long PyClient::removeByRegex(const std::string &str) {
+    return to_py_ret(removeByRegex_internal(str));
+}
+
 tl::expected<int64_t, ErrorCode> PyClient::removeAll_internal() {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";

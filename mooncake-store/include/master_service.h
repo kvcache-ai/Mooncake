@@ -143,6 +143,11 @@ class MasterService {
     auto QuerySegments(const std::string& segment)
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
+    auto GetReplicaListByRegex(const std::string& regex_pattern)
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
+
     /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
@@ -221,6 +226,8 @@ class MasterService {
      * found
      */
     auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+
+    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas

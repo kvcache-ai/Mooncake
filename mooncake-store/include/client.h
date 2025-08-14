@@ -74,6 +74,11 @@ class Client {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
         const std::string& object_key);
 
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& str);
+
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
@@ -135,6 +140,8 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
+
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
     /**
      * @brief Removes all objects and all its replicas

@@ -37,6 +37,11 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
+    static constexpr const char* value = "GetReplicaListByRegex";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
     static constexpr const char* value = "BatchGetReplicaList";
 };
@@ -74,6 +79,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveByRegex> {
+    static constexpr const char* value = "RemoveByRegex";
 };
 
 template <>
@@ -249,6 +259,20 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+MasterClient::GetReplicaListByRegex(const std::string& str) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
+    timer.LogRequest("Regex=", str);
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::GetReplicaListByRegex,
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(str);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::GetReplicaList(const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
@@ -357,6 +381,16 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
+    const std::string& str) {
+    ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
+    timer.LogRequest("key=", str);
+
+    auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str);
     timer.LogResponseExpected(result);
     return result;
 }
