@@ -30,7 +30,8 @@ TEST_F(MooncakeBackendTest, AllreduceTest) {
     opts.reduceOp = ::c10d::ReduceOp::SUM;
 
     auto work = backend->allreduce(tensors, opts);
-    work->wait();
+    bool success = work->wait();
+    ASSERT_TRUE(success) << "Allreduce failed";
 
     auto expected = torch::ones({2, 2}) * backend->getSize();
     ASSERT_TRUE(torch::allclose(tensors[0], expected))

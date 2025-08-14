@@ -140,6 +140,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcuda.so* \
 --exclude libcudart.so* \
 --exclude libc10.so* \
+--exclude libc10_cuda.so* \
 --exclude libtorch.so* \
 --exclude libtorch_cpu.so* \
 --exclude libtorch_cuda.so* \

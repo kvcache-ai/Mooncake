@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <mooncake_worker.cuh>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
@@ -28,31 +29,7 @@ class MooncakeBackend final : public ::c10d::Backend {
    private:
     TransferEngine engine_{true};
     void* buffer_;
-};
-
-class MooncakeWork : public ::c10d::Work {
-   public:
-    MooncakeWork(c10d::OpType opType,
-                 c10::intrusive_ptr<c10::ivalue::Future> future)
-        : Work(-1, opType), future_(std::move(future)) {}
-
-    bool isCompleted() override { return future_->completed(); }
-
-    bool isSuccess() const override {
-        return future_->completed() && !future_->hasError();
-    }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        future_->wait();
-        return isSuccess();
-    }
-
-    c10::intrusive_ptr<c10::ivalue::Future> getFuture() override {
-        return future_;
-    }
-
-   private:
-    c10::intrusive_ptr<c10::ivalue::Future> future_;
+    MooncakeWorker worker_{&engine_};
 };
 
 }  // namespace mooncake
