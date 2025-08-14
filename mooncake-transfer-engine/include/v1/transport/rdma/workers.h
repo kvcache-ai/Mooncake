@@ -128,6 +128,11 @@ class Workers {
     Status selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                                RdmaSlice *slice);
 
+    Status selectFallbackDevice(RuoteHint &source, RuoteHint &target,
+                                  RdmaSlice *slice);
+
+    int getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx);
+
    private:
     RdmaTransport *transport_;
     size_t num_workers_;

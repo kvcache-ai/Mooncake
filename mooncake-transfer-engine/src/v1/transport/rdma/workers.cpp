@@ -379,10 +379,13 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
     }
 
     // Target device: read the cluster topology and find best matching
-    if (slice->target_dev_id < 0 && transport_->cluster_topology_) {
-        auto source_dev = source.topo->getDeviceList()[slice->source_dev_id];
+    bool same_machine =
+        (source.segment->machine_id == target.segment->machine_id);
+    if (!same_machine && slice->target_dev_id < 0 &&
+        transport_->cluster_topology_) {
+        auto source_dev = source.topo->getDeviceName(slice->source_dev_id);
         auto target_dev = transport_->cluster_topology_->findOptimalMapping(
-            source.segment->machine_id, source_dev, target.segment->machine_id,
+            source_dev, target.segment->machine_id,
             target.topo_entry->numa_node);
         slice->target_dev_id = target.topo->findDeviceID(target_dev);
     }
@@ -403,6 +406,65 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
     return Status::OK();
 }
 
+int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
+    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+        auto &list = hint.topo_entry->device_list[rank];
+        if (flat_idx < list.size()) return list[flat_idx];
+        flat_idx -= list.size();
+    }
+    return -1;
+}
+
+Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
+                                     RdmaSlice *slice) {
+    bool same_machine =
+        (source.segment->machine_id == target.segment->machine_id);
+
+    size_t src_total = 0;
+    for (size_t srank = 0; srank < DevicePriorityRanks; ++srank)
+        src_total += source.topo_entry->device_list[srank].size();
+
+    size_t dst_total = 0;
+    for (size_t trank = 0; trank < DevicePriorityRanks; ++trank)
+        dst_total += target.topo_entry->device_list[trank].size();
+
+    size_t total_combos = src_total * dst_total;
+    if ((size_t)slice->retry_count >= total_combos)
+        return Status::DeviceNotFound(
+            "No more device combo could access the slice memory region");
+
+    size_t idx = slice->retry_count;
+    while (idx < total_combos) {
+        size_t src_idx = idx / dst_total;
+        size_t dst_idx = idx % dst_total;
+        int sdev = getDeviceByFlatIndex(source, src_idx);
+        int tdev = getDeviceByFlatIndex(target, dst_idx);
+        bool reachable = true;
+
+        if (same_machine) {
+            reachable = (sdev == tdev);  // loopback is safe
+        } else if (!same_machine && transport_->cluster_topology_) {
+            auto source_dev = source.topo->getDeviceName(sdev);
+            auto target_dev = target.topo->getDeviceName(tdev);
+            reachable = transport_->cluster_topology_->getEndpoint(
+                source_dev, target.segment->machine_id, target_dev);
+        }
+
+        if (reachable) {
+            slice->source_dev_id = sdev;
+            slice->target_dev_id = tdev;
+            slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
+            slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+            return Status::OK();
+        }
+
+        ++idx;
+    }
+
+    return Status::DeviceNotFound(
+        "No device could access the slice memory region");
+}
+
 Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
     RuoteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
@@ -412,7 +474,10 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
     CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
                               slice->length));
 
-    return selectOptimalDevice(source, target, slice);
+    if (slice->retry_count == 0)
+        return selectOptimalDevice(source, target, slice);
+    else
+        return selectFallbackDevice(source, target, slice);
 }
 }  // namespace v1
 }  // namespace mooncake

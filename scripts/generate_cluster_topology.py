@@ -2,6 +2,8 @@ import json
 import time
 import os
 import argparse
+import socket
+import subprocess
 import paramiko
 from tqdm import tqdm
 from itertools import product
@@ -10,19 +12,16 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-# -------------------- Section 1: SSH + RDMA Testing --------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description="Transfer Engine Cluster Topology Generator")
-    parser.add_argument("--src-host", required=True, help="Source hostname")
-    parser.add_argument("--dst-host", required=True, help="Destination hostname")
-    parser.add_argument("--src-port", type=int, default=22, help="SSH port for source host")
-    parser.add_argument("--dst-port", type=int, default=22, help="SSH port for destination host")
-    parser.add_argument("--sudo", action="store_true", help="Use sudo for remote commands")
-    parser.add_argument("--file", default="cluster_topology.json", help="Path of the generated cluster topology file")
-    return parser.parse_args()
+def is_local_host(host):
+    return host in ("localhost", "127.0.0.1", socket.gethostname())
 
+def local_exec(command):
+    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return result.stdout.decode() + result.stderr.decode()
 
 def ssh_exec(host, port, command):
+    if is_local_host(host):
+        return local_exec(command)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(host, port=port)
@@ -32,6 +31,21 @@ def ssh_exec(host, port, command):
     err = stderr.read().decode()
     client.close()
     return out + err
+
+def get_machine_id(host, port):
+    return ssh_exec(host, port, "cat /etc/machine-id").strip()
+
+
+# -------------------- Section 1: SSH + RDMA Testing --------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Transfer Engine Cluster Topology Generator")
+    parser.add_argument("--src-host", default="localhost", help="Source hostname")
+    parser.add_argument("--dst-host", required=True, help="Destination hostname")
+    parser.add_argument("--src-port", type=int, default=22, help="SSH port for source host")
+    parser.add_argument("--dst-port", type=int, default=22, help="SSH port for destination host")
+    parser.add_argument("--sudo", action="store_true", help="Use sudo for remote commands")
+    parser.add_argument("--file", default="cluster-topology.json", help="Path of the generated cluster topology file")
+    return parser.parse_args()
 
 
 def list_rdma_devices(host, port, use_sudo):
@@ -170,13 +184,9 @@ def solve_partition_group(pairs, allow_partial=False):
     row_ind, col_ind = linear_sum_assignment(norm)
 
     matched = []
-    used_src = Counter()
-    used_dst = Counter()
     for i, j in zip(row_ind, col_ind):
         if i < N_src and j < N_dst and valid[i, j]:
             matched.append(latency_map[(i, j)])
-            used_src[src_devs[i]] += 1
-            used_dst[dst_devs[j]] += 1
         elif not allow_partial:
             return []
 
@@ -207,6 +217,9 @@ def process_host_pair(record):
 def main():
     args = parse_args()
 
+    src_machine_id = get_machine_id(args.src_host, args.src_port)
+    dst_machine_id = get_machine_id(args.dst_host, args.dst_port)
+
     src = {"host": args.src_host, "port": args.src_port}
     dst = {"host": args.dst_host, "port": args.dst_port}
     use_sudo = args.sudo
@@ -215,11 +228,11 @@ def main():
     all_results = load_results(result_file)
 
     existing_idx = next((i for i, e in enumerate(all_results)
-                         if e["src_host"] == src["host"] and e["dst_host"] == dst["host"]),
+                         if e["src_host"] == src_machine_id and e["dst_host"] == dst_machine_id),
                         None)
 
     if existing_idx is not None:
-        confirm = input(f"\nEntry already exists for {src['host']} → {dst['host']}. "
+        confirm = input(f"\nEntry already exists for {src_machine_id} → {dst_machine_id}. "
                         f"Do you want to overwrite and re-test? (y = overwrite and retest / n = skip): ").strip().lower()
         if confirm != 'y':
             print("Skipping test and keeping existing result.")
@@ -240,8 +253,8 @@ def main():
             endpoints.append(result)
 
     new_entry = {
-        "src_host": src["host"],
-        "dst_host": dst["host"],
+        "src_host": src_machine_id,
+        "dst_host": dst_machine_id,
         "endpoints": endpoints
     }
 

@@ -71,53 +71,24 @@ struct Node {
         partition_matchings;
 };
 
-struct NodePair {
-    std::string src_host;
-    std::string dst_host;
-
-    bool operator==(const NodePair& other) const {
-        return src_host == other.src_host && dst_host == other.dst_host;
-    }
-};
-
-namespace std {
-template <>
-struct hash<NodePair> {
-    size_t operator()(const NodePair& pair) const {
-        return std::hash<std::string>{}(pair.src_host) ^
-               std::hash<std::string>{}(pair.dst_host);
-    }
-};
-}  // namespace std
-
 namespace mooncake {
 namespace v1 {
 class ClusterTopology {
    public:
-    Status load(const std::string& filename);
+    Status load(const std::string& src_host, const std::string& filename);
 
-    const Node* getNode(const std::string& src_host,
-                        const std::string& dst_host) const;
+    const Node* getNode(const std::string& dst_host) const;
 
-    const Endpoint* getEndpoint(const std::string& src_host,
-                                const std::string& src_dev,
+    const Endpoint* getEndpoint(const std::string& src_dev,
                                 const std::string& dst_host,
                                 const std::string& dst_dev);
 
-    std::string findOptimalMapping(const std::string& src_host,
-                                   const std::string& src_dev,
+    std::string findOptimalMapping(const std::string& src_dev,
                                    const std::string& dst_host, int dst_numa);
 
    private:
-    struct DeviceInfo {
-        int numa;
-    };
-
-   private:
-    std::unordered_map<NodePair, Node> entries_;
-
-    std::unordered_map<std::string, std::unordered_map<std::string, DeviceInfo>>
-        device_list_;
+    std::unordered_map<std::string, Node> entries_;
+    std::unordered_map<std::string, int> src_dev_numa_cache_;
 };
 
 }  // namespace v1

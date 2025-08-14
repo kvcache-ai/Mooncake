@@ -31,9 +31,10 @@
 
 namespace mooncake {
 namespace v1 {
-Status ClusterTopology::load(const std::string& filename) {
+Status ClusterTopology::load(const std::string& src_host,
+                             const std::string& filename) {
     entries_.clear();
-    device_list_.clear();
+    src_dev_numa_cache_.clear();
 
     std::ifstream ifs(filename);
     if (!ifs.is_open()) {
@@ -49,10 +50,10 @@ Status ClusterTopology::load(const std::string& filename) {
     }
 
     for (const auto& entry : root) {
-        std::string src_host = entry["src_host"].asString();
+        if (src_host != entry["src_host"].asString()) continue;
         std::string dst_host = entry["dst_host"].asString();
-        Node node;
 
+        Node node;
         // Process endpoints
         for (const auto& ep : entry["endpoints"]) {
             RdmaDevicePair rdma_pair{ep["src_dev"].asString(),
@@ -60,8 +61,7 @@ Status ClusterTopology::load(const std::string& filename) {
             Endpoint e{ep["src_numa"].asInt(), ep["dst_numa"].asInt(),
                        ep["bandwidth"].asDouble(), ep["latency"].asDouble()};
             node.endpoints[rdma_pair] = e;
-            device_list_[src_host][rdma_pair.src_dev].numa = e.src_numa;
-            device_list_[dst_host][rdma_pair.dst_dev].numa = e.dst_numa;
+            src_dev_numa_cache_[rdma_pair.src_dev] = e.src_numa;
         }
 
         // Process partition matchings
@@ -76,42 +76,33 @@ Status ClusterTopology::load(const std::string& filename) {
             }
         }
 
-        // Store the node in entries_
-        NodePair node_pair{src_host, dst_host};
-        entries_[node_pair] = node;
+        entries_[dst_host] = node;
     }
 
     return Status::OK();
 }
 
-const Node* ClusterTopology::getNode(const std::string& src_host,
-                                     const std::string& dst_host) const {
-    NodePair node_pair{src_host, dst_host};
-    if (entries_.count(node_pair)) return &entries_.at(node_pair);
+const Node* ClusterTopology::getNode(const std::string& dst_host) const {
+    if (entries_.count(dst_host)) return &entries_.at(dst_host);
     return nullptr;
 }
 
-const Endpoint* ClusterTopology::getEndpoint(const std::string& src_host,
-                                             const std::string& src_dev,
+const Endpoint* ClusterTopology::getEndpoint(const std::string& src_dev,
                                              const std::string& dst_host,
                                              const std::string& dst_dev) {
-    auto node = getNode(src_host, dst_host);
+    auto node = getNode(dst_host);
     if (!node) return nullptr;
     RdmaDevicePair pair{src_dev, dst_dev};
     if (node && node->endpoints.count(pair)) return &node->endpoints.at(pair);
     return nullptr;
 }
 
-std::string ClusterTopology::findOptimalMapping(const std::string& src_host,
-                                                const std::string& src_dev,
+std::string ClusterTopology::findOptimalMapping(const std::string& src_dev,
                                                 const std::string& dst_host,
                                                 int dst_numa) {
-    auto node = getNode(src_host, dst_host);
-    if (!node || !device_list_.count(src_host) ||
-        !device_list_[src_host].count(src_dev))
-        return "";
-    auto src_numa = device_list_[src_host][src_dev].numa;
-    NumaIdPair numa_pair{src_numa, dst_numa};
+    auto node = getNode(dst_host);
+    if (!node || !src_dev_numa_cache_.count(src_dev)) return "";
+    NumaIdPair numa_pair{src_dev_numa_cache_[src_dev], dst_numa};
     if (!node->partition_matchings.count(numa_pair)) return "";
     auto& mapping = node->partition_matchings.at(numa_pair);
     for (auto& entry : mapping)

@@ -115,7 +115,9 @@ Status RdmaTransport::install(std::string &local_segment_name,
     auto cluster_topology_path = conf_->get("cluster_topology", "");
     if (!cluster_topology_path.empty()) {
         cluster_topology_ = std::make_shared<ClusterTopology>();
-        CHECK_STATUS(cluster_topology_->load(cluster_topology_path));
+        auto machine_id = metadata_->segmentManager().getLocal()->machine_id;
+        CHECK_STATUS(
+            cluster_topology_->load(machine_id, cluster_topology_path));
     }
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);
