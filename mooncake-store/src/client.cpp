@@ -36,13 +36,11 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring,
-               const std::string& storage_root_dir)
+               const std::string& metadata_connstring)
     : metrics_(ClientMetric::Create()),
       master_client_(metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
-      storage_root_dir_(storage_root_dir),
       write_thread_pool_(2) {
     client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
@@ -260,32 +258,34 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, void** protocol_args,
     const std::string& master_server_entry) {
-    // If MOONCAKE_STORAGE_ROOT_DIR is set, use it as the storage root directory
-    std::string storage_root_dir =
-        std::getenv("MOONCAKE_STORAGE_ROOT_DIR")
-            ? std::getenv("MOONCAKE_STORAGE_ROOT_DIR")
-            : "";
-
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, storage_root_dir));
+        new Client(local_hostname, metadata_connstring));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
     }
 
-    // Initialize storage backend if storage_root_dir is provided
+    // Initialize storage backend if storage_root_dir is valid
     auto response = client->master_client_.GetFsdir();
     if (!response) {
         LOG(ERROR) << "Failed to get fsdir from master";
-    } else if (storage_root_dir.empty()) {
+    } else if (response.value().empty()) {
         LOG(INFO) << "Storage root directory is not set. persisting data is "
                      "disabled.";
     } else {
-        LOG(INFO) << "Storage root directory is: " << storage_root_dir;
-        LOG(INFO) << "Fs subdir is: " << response.value();
-        // Initialize storage backend
-        client->PrepareStorageBackend(storage_root_dir, response.value());
+        auto dir_string = response.value();
+        size_t pos = dir_string.find_last_of('/');
+        if (pos != std::string::npos) {
+            std::string storage_root_dir = dir_string.substr(0, pos);
+            std::string fs_subdir = dir_string.substr(pos + 1);
+            LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+            LOG(INFO) << "Fs subdir is: " << fs_subdir;
+            // Initialize storage backend
+            client->PrepareStorageBackend(storage_root_dir, fs_subdir);
+        } else {
+            LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+        }
     }
 
     // Initialize transfer engine
@@ -359,16 +359,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
     const std::string& object_key) {
     auto result = master_client_.GetReplicaList(object_key);
-    if (!result) {
-        // Check storage backend if master query fails
-        if (storage_backend_) {
-            if (auto desc_opt = storage_backend_->Querykey(object_key)) {
-                return std::vector<Replica::Descriptor>{std::move(*desc_opt)};
-            }
-        }
-        return tl::unexpected(result.error());
-    }
-    return result.value();
+    return result;
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -388,20 +379,6 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
         }
         return results;
     }
-
-    // For failed queries, check storage backend if available
-    if (storage_backend_) {
-        for (size_t i = 0; i < response.size(); ++i) {
-            if (!response[i]) {
-                if (auto desc_opt =
-                        storage_backend_->Querykey(object_keys[i])) {
-                    response[i] =
-                        std::vector<Replica::Descriptor>{std::move(*desc_opt)};
-                }
-            }
-        }
-    }
-
     return response;
 }
 
@@ -556,17 +533,35 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // Record Put transfer latency (all replicas)
     auto t0_put = std::chrono::steady_clock::now();
 
-    // Transfer data using allocated handles from all replicas
-    for (const auto& replica : start_result.value()) {
-        ErrorCode transfer_err = TransferWrite(replica, slices);
-        if (transfer_err != ErrorCode::OK) {
-            // Revoke put operation
-            auto revoke_result = master_client_.PutRevoke(key);
-            if (!revoke_result) {
-                LOG(ERROR) << "Failed to revoke put operation";
-                return tl::unexpected(revoke_result.error());
+    // We must deal with disk replica first, then the disk putrevoke/putend can
+    // be called surely
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                // Store to local file if storage backend is available
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor);
+                break;  // Only one disk replica is needed
             }
-            return tl::unexpected(transfer_err);
+        }
+    }
+
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            // Transfer data using allocated handles from all replicas
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                // Revoke put operation
+                auto revoke_result =
+                    master_client_.PutRevoke(key, ReplicaType::MEMORY);
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return tl::unexpected(revoke_result.error());
+                }
+                return tl::unexpected(transfer_err);
+            }
         }
     }
 
@@ -578,15 +573,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // End put operation
-    auto end_result = master_client_.PutEnd(key);
+    auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end put operation: " << err;
         return tl::unexpected(err);
     }
-
-    // Store to local file if storage backend is available
-    PutToLocalFile(key, slices);
 
     return {};
 }
@@ -740,21 +732,37 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         bool all_transfers_submitted = true;
         std::string failure_context;
 
+        // We must deal with disk replica first, then the disk putrevoke/putend
+        // can be called surely
+        if (storage_backend_) {
+            for (auto it = op.replicas.rbegin(); it != op.replicas.rend();
+                 ++it) {
+                const auto& replica = *it;
+                if (replica.is_disk_replica()) {
+                    auto disk_descriptor = replica.get_disk_descriptor();
+                    PutToLocalFile(op.key, op.slices, disk_descriptor);
+                    break;  // Only one disk replica is needed
+                }
+            }
+        }
+
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
+            if (replica.is_memory_replica()) {
+                auto submit_result = transfer_submitter_->submit(
+                    replica, op.slices, TransferRequest::WRITE);
 
-            auto submit_result = transfer_submitter_->submit(
-                replica, op.slices, TransferRequest::WRITE);
+                if (!submit_result) {
+                    failure_context = "Failed to submit transfer for replica " +
+                                      std::to_string(replica_idx);
+                    all_transfers_submitted = false;
+                    break;
+                }
 
-            if (!submit_result) {
-                failure_context = "Failed to submit transfer for replica " +
-                                  std::to_string(replica_idx);
-                all_transfers_submitted = false;
-                break;
+                op.pending_transfers.emplace_back(
+                    std::move(submit_result.value()));
             }
-
-            op.pending_transfers.emplace_back(std::move(submit_result.value()));
         }
 
         if (!all_transfers_submitted) {
@@ -957,22 +965,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
-void Client::BatchPuttoLocalFile(std::vector<PutOperation>& ops) {
-    if (!storage_backend_) {
-        return;  // No storage backend initialized
-    }
-
-    for (const auto& op : ops) {
-        if (op.IsSuccessful()) {
-            // Store to local file if operation was successful
-            PutToLocalFile(op.key, op.slices);
-        } else {
-            LOG(ERROR) << "Skipping local file storage for key " << op.key
-                       << " due to failure: " << toString(op.result.error());
-        }
-    }
-}
-
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -991,15 +983,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    BatchPuttoLocalFile(ops);
     return CollectResults(ops);
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     auto result = master_client_.Remove(key);
-    if (storage_backend_) {
-        storage_backend_->RemoveFile(key);
-    }
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveFile(key);
+    // }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -1007,9 +998,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {
-    if (storage_backend_) {
-        storage_backend_->RemoveAll();
-    }
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveAll();
+    // }
     return master_client_.RemoveAll();
 }
 
@@ -1129,16 +1120,7 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
-    if (!result) {
-        if (storage_backend_) {
-            // If master query fails, check storage backend
-            if (storage_backend_->Existkey(key)) {
-                return true;  // Key exists in storage backend
-            }
-        }
-        return tl::unexpected(result.error());
-    }
-    return result.value();
+    return result;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
@@ -1173,7 +1155,8 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
 }
 
 void Client::PutToLocalFile(const std::string& key,
-                            const std::vector<Slice>& slices) {
+                            const std::vector<Slice>& slices,
+                            const DiskDescriptor& disk_descriptor) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;
@@ -1181,6 +1164,7 @@ void Client::PutToLocalFile(const std::string& key,
         total_size += slice.size;
     }
 
+    std::string path = disk_descriptor.file_path;
     // Currently, persistence is achieved through asynchronous writes, but
     // before asynchronous writing in 3FS, significant performance degradation
     // may occur due to data copying. Profiling reveals that the number of page
@@ -1194,10 +1178,28 @@ void Client::PutToLocalFile(const std::string& key,
         value.append(static_cast<char*>(slice.ptr), slice.size);
     }
 
-    write_thread_pool_.enqueue(
-        [backend = storage_backend_, key, value = std::move(value)] {
-            backend->StoreObject(key, value);
-        });
+    write_thread_pool_.enqueue([this, backend = storage_backend_, key,
+                                value = std::move(value), path] {
+        // Store the object
+        auto store_result = backend->StoreObject(path, value);
+        ReplicaType replica_type = ReplicaType::DISK;
+
+        if (!store_result) {
+            // If storage failed, revoke the put operation
+            LOG(ERROR) << "Failed to store object for key: " << key;
+            auto revoke_result = master_client_.PutRevoke(key, replica_type);
+            if (!revoke_result) {
+                LOG(ERROR) << "Failed to revoke put operation for key: " << key;
+            }
+            return;
+        }
+
+        // If storage succeeded, end the put operation
+        auto end_result = master_client_.PutEnd(key, replica_type);
+        if (!end_result) {
+            LOG(ERROR) << "Failed to end put operation for key: " << key;
+        }
+    });
 }
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
@@ -1235,7 +1237,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         }
     } else {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
-        total_size = disk_desc.file_size;
+        total_size = disk_desc.object_size;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
