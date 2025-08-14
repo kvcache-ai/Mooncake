@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include "transport/transport.h"
 #include "types.h"
 #include "storage_backend.h"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -157,10 +159,7 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {
-        CHECK(batch_id_ != Transport::INVALID_BATCH_ID)
-            << "Invalid batch ID for transfer engine operation";
-    }
+        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -352,7 +351,8 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                const std::string& local_hostname,
-                               std::shared_ptr<StorageBackend>& backend);
+                               std::shared_ptr<StorageBackend>& backend,
+                               TransferMetric* transfer_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -377,6 +377,7 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    TransferMetric* transfer_metric_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -415,6 +416,12 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         Transport::TransferRequest::OpCode op_code);
+
+    /**
+     * @brief Calculate total bytes for transfer operation and update metrics
+     */
+    void updateTransferMetrics(const std::vector<Slice>& slices,
+                               Transport::TransferRequest::OpCode op);
 };
 
 }  // namespace mooncake

@@ -6,8 +6,10 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <ranges>
+#include <thread>
 
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -35,11 +37,27 @@ namespace mooncake {
 
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
-    : local_hostname_(local_hostname),
+    : metrics_(ClientMetric::Create()),
+      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr),
+      local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       write_thread_pool_(2) {
     client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
+
+    if (metrics_) {
+        if (metrics_->GetReportingInterval() > 0) {
+            LOG(INFO) << "Client metrics enabled with reporting thread started "
+                         "(interval: "
+                      << metrics_->GetReportingInterval() << "s)";
+        } else {
+            LOG(INFO)
+                << "Client metrics enabled but reporting disabled (interval=0)";
+        }
+    } else {
+        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
+                     "enable)";
+    }
 }
 
 Client::~Client() {
@@ -201,7 +219,10 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
                                    hostname, port);
-    CHECK_EQ(rc, 0) << "Failed to initialize transfer engine";
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+        return ErrorCode::INTERNAL_ERROR;
+    }
 
     Transport* transport = nullptr;
     if (protocol == "rdma") {
@@ -227,7 +248,8 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 
     // Initialize TransferSubmitter after transfer engine is ready
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_);
+        transfer_engine_, local_hostname, storage_backend_,
+        metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
 }
@@ -374,7 +396,15 @@ tl::expected<void, ErrorCode> Client::Get(
         return tl::unexpected(err);
     }
 
+    auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
+    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_get)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.get_latency_us.observe(us_get);
+    }
+
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
@@ -413,6 +443,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture>>
         pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
+    // Record batch get transfer latency (Submit + Wait)
+    auto t0_batch_get = std::chrono::steady_clock::now();
 
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -466,6 +498,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
+    auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0_batch_get)
+                            .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
+    }
+
     VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     return results;
 }
@@ -490,6 +529,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         LOG(ERROR) << "Failed to start put operation: " << err;
         return tl::unexpected(err);
     }
+
+    // Record Put transfer latency (all replicas)
+    auto t0_put = std::chrono::steady_clock::now();
 
     // We must deal with disk replica first, then the disk putrevoke/putend can
     // be called surely
@@ -521,6 +563,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 return tl::unexpected(transfer_err);
             }
         }
+    }
+
+    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_put)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
 
     // End put operation
@@ -922,8 +971,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     StartBatchPut(ops, config);
+
+    auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
     FinalizeBatchPut(ops);
     return CollectResults(ops);
 }

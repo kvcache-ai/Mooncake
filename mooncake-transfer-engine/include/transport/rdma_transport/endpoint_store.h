@@ -47,6 +47,9 @@ class EndpointStore {
 
     virtual int destroyQPs() = 0;
     virtual int disconnectQPs() = 0;
+
+    // Get the total number of QPs across all endpoints
+    virtual size_t getTotalQPNumber() = 0;
 };
 
 // FIFO
@@ -64,6 +67,8 @@ class FIFOEndpointStore : public EndpointStore {
 
     int destroyQPs() override;
     int disconnectQPs() override;
+
+    size_t getTotalQPNumber() override;
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -93,6 +98,8 @@ class SIEVEEndpointStore : public EndpointStore {
 
     int destroyQPs() override;
     int disconnectQPs() override;
+
+    size_t getTotalQPNumber() override;
 
    private:
     RWSpinlock endpoint_map_lock_;
