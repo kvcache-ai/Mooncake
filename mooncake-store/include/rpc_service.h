@@ -41,6 +41,11 @@ class WrappedMasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
 
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
         const std::string& key);
 
@@ -69,6 +74,8 @@ class WrappedMasterService {
         const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
+
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
     long RemoveAll();
 

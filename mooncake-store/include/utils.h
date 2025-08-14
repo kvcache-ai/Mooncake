@@ -49,6 +49,22 @@ void to_stream(std::ostream& os, const std::vector<T>& vec) {
     os << "]";
 }
 
+template <typename K, typename V>
+void to_stream(std::ostream& os, const std::unordered_map<K, V>& map) {
+    os << "{";
+    auto it = map.begin();
+    while (it != map.end()) {
+        to_stream(os, it->first);
+        os << ": ";
+        to_stream(os, it->second);
+        ++it;
+        if (it != map.end()) {
+            os << ", ";
+        }
+    }
+    os << "}";
+}
+
 // Specialization for std::pair
 template <typename T1, typename T2>
 void to_stream(std::ostream& os, const std::pair<T1, T2>& p) {

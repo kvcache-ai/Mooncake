@@ -356,6 +356,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     return results;
 }
 
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+Client::QueryByRegex(const std::string& str) {
+    auto result = master_client_.GetReplicaListByRegex(str);
+    return result;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
     const std::string& object_key) {
     auto result = master_client_.GetReplicaList(object_key);
@@ -995,6 +1002,17 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
         return tl::unexpected(result.error());
     }
     return {};
+}
+
+tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
+    auto result = master_client_.RemoveByRegex(str);
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveByRegex(str);
+    // }
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return result.value();
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll() {

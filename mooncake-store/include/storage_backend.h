@@ -133,6 +133,8 @@ class StorageBackend {
      */
     void RemoveFile(const std::string& path);
 
+    void RemoveByRegex(const std::string& key);
+
     /**
      * @brief Deletes all objects from the storage backend
      *
