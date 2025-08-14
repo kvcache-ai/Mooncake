@@ -402,13 +402,13 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode> MasterClient::Ping(
-    const UUID& client_id, const size_t& qp_count) {
+tl::expected<PingResponse, ErrorCode> MasterClient::Ping(const UUID& client_id,
+                                                         size_t qp_count) {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id, qp_count);
+    auto result = invoke_rpc<&WrappedMasterService::Ping, PingResponse>(
+        client_id, qp_count);
     timer.LogResponseExpected(result);
     return result;
 }

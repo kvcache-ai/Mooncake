@@ -567,9 +567,8 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-auto MasterService::Ping(const UUID& client_id, const size_t& qp_count)
+auto MasterService::Ping(const UUID& client_id, const size_t qp_count)
     -> tl::expected<PingResponse, ErrorCode> {
-
     if (!enable_ha_) {
         LOG(ERROR) << "Ping is only available in HA mode";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);

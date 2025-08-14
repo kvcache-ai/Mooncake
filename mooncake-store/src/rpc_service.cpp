@@ -491,7 +491,7 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
 }
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
-    const UUID& client_id, const size_t& qp_count) {
+    const UUID& client_id, size_t qp_count) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 

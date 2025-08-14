@@ -492,8 +492,11 @@ struct PingResponse {
     uint64_t total_qp_num{0};
 
     PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status, uint64_t qp_number = 0)
-        : view_version_id(view_version), client_status(status), total_qp_num(qp_number) {}
+    PingResponse(ViewVersionId view_version, ClientStatus status,
+                 uint64_t qp_number = 0)
+        : view_version_id(view_version),
+          client_status(status),
+          total_qp_num(qp_number) {}
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const PingResponse& response) noexcept {
