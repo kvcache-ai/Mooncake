@@ -37,6 +37,11 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
+    static constexpr const char* value = "GetReplicaListByRegex";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
     static constexpr const char* value = "BatchGetReplicaList";
 };
@@ -74,6 +79,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveByRegex> {
+    static constexpr const char* value = "RemoveByRegex";
 };
 
 template <>
