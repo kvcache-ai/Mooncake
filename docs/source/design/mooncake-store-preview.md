@@ -89,7 +89,7 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, after a successful in-memory put request, an asynchronous persistence operation to SSD will be initiated.)​ The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​ The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
 struct ReplicateConfig {
@@ -455,13 +455,21 @@ This system provides support for a hierarchical cache architecture, enabling eff
 
 #### Enabling Persistence Functionality
 
-When a user specifies the environment variable `MOONCAKE_STORAGE_ROOT_DIR` at client startup, and the path is a valid existing directory, the client-side data persistence feature will be activated. During initialization, the client requests a `cluster_id` from the master. This ID can be specified when initializing the master; if not provided, the default value `mooncake_cluster` will be used. The root directory for persistence is then set to `<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`. Note that when using DFS, each client must specify the corresponding DFS mount directory to enable data sharing across SSDs.
+When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
+
+​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Data Access Mechanism
 
-In the current implementation, all operations on kvcache objects (e.g., read/write/query) are performed entirely on the client side, with no awareness by the master. The file system maintains the key-to-kvcache-object mapping through a fixed indexing mechanism, where each file corresponds to one kvcache object (the filename is the associated key).
+The persistence feature also follows Mooncake Store's design principle of separating control flow from data flow. The read/write operations of kvcache objects are completed on the client side, while the query and management functions of kvcache objects are handled on the master side. In the file system, the key -> kvcache object index information is maintained by a fixed indexing mechanism, with each file corresponding to one kvcache object (the filename serves as the associated key name).
 
-When persistence is enabled, every successful `Put`or`BatchPut` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `Get`or `BatchGet` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
+After enabling the persistence feature:
+
+- For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
+- For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
+
+#### 3FS USRBIO Plugin
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](/mooncake-store/src/hf3fs/READMD.md).
 
 ## Mooncake Store Python API
 
@@ -565,13 +573,9 @@ retcode = store.setup(
 
 2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
    For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-   To enable the persistence feature, run:
-`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
    For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-   To enable the persistence feature, run:
-`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 The absence of error messages indicates successful data transfer.
 

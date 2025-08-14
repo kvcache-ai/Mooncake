@@ -15,6 +15,7 @@
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
+#include <filesystem>
 
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
@@ -72,6 +73,7 @@ class MasterService {
         int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
         bool enable_ha = false,
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
+        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
     ~MasterService();
 
@@ -185,18 +187,22 @@ class MasterService {
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
-     * @brief Complete a put operation
+     * @brief Complete a put operation, replica_type indicates the type of
+     * replica to complete (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Revoke a put operation
+     * @brief Revoke a put operation, replica_type indicates the type of
+     * replica to revoke (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -252,6 +258,10 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
    private:
+    // Resolve the key to a sanitized format for storage
+    std::string SanitizeKey(const std::string& key) const;
+    std::string ResolvePath(const std::string& key) const;
+
     // GC thread function
     void GCThreadFunc();
 
@@ -311,9 +321,10 @@ class MasterService {
         // given value. If there are, return the status of the first replica
         // that is not equal to the given value. Otherwise, return false.
         std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status) const {
+            ReplicaStatus status, ReplicaType replica_type) const {
             for (const auto& replica : replicas) {
-                if (replica.status() != status) {
+                if (replica.status() != status &&
+                    replica.type() == replica_type) {
                     return replica.status();
                 }
             }
@@ -332,6 +343,32 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
+        }
+
+        // Erase all replicas of the given type
+        void EraseReplica(ReplicaType replica_type) {
+            replicas.erase(
+                std::remove_if(replicas.begin(), replicas.end(),
+                               [replica_type](const Replica& replica) {
+                                   return replica.type() == replica_type;
+                               }),
+                replicas.end());
+        }
+
+        // Check if there is a memory replica
+        bool HasMemReplica() const {
+            return std::any_of(replicas.begin(), replicas.end(),
+                               [](const Replica& replica) {
+                                   return replica.type() == ReplicaType::MEMORY;
+                               });
+        }
+
+        // Get the count of memory replicas
+        int GetMemReplicaCount() const {
+            return std::count_if(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.type() == ReplicaType::MEMORY;
+                });
         }
 
         // Check if the lease has expired
@@ -353,6 +390,17 @@ class MasterService {
         // Check if is in soft pin status
         bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
             return soft_pin_timeout && now < *soft_pin_timeout;
+        }
+
+        // Check if the metadata is valid
+        // Valid means it has at least one replica and size is greater than 0
+        bool IsValid() const { return !replicas.empty() && size > 0; }
+
+        bool IsAllReplicasComplete() const {
+            return std::all_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
         }
     };
 
@@ -462,6 +510,10 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // root filesystem directory for persistent storage
+    const std::string root_fs_dir_;
+
+    bool use_disk_replica_{false};
 
     // Segment management
     SegmentManager segment_manager_;

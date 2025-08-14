@@ -29,11 +29,12 @@ WrappedMasterService::WrappedMasterService(
     bool enable_metric_reporting, uint16_t http_port, double eviction_ratio,
     double eviction_high_watermark_ratio, ViewVersionId view_version,
     int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id,
-    BufferAllocatorType memory_allocator)
+    const std::string& root_fs_dir, BufferAllocatorType memory_allocator)
     : master_service_(enable_gc, default_kv_lease_ttl, default_kv_soft_pin_ttl,
                       allow_evict_soft_pinned_objects, eviction_ratio,
                       eviction_high_watermark_ratio, view_version,
-                      client_live_ttl_sec, enable_ha, cluster_id,
+                      client_live_ttl_sec, enable_ha, cluster_id, root_fs_dir,
+
                       memory_allocator),
       http_server_(4, http_port),
       metric_report_running_(enable_metric_reporting) {
@@ -306,19 +307,24 @@ WrappedMasterService::PutStart(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const std::string& key) {
+    const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutEnd", [&] { return master_service_.PutEnd(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "PutEnd", [&] { return master_service_.PutEnd(key, replica_type); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+        },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
-    const std::string& key) {
+    const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutRevoke", [&] { return master_service_.PutRevoke(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "PutRevoke",
+        [&] { return master_service_.PutRevoke(key, replica_type); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+        },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
@@ -376,7 +382,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutEnd(key));
+        results.emplace_back(master_service_.PutEnd(key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;
@@ -413,7 +419,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutRevoke(key));
+        results.emplace_back(
+            master_service_.PutRevoke(key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;
