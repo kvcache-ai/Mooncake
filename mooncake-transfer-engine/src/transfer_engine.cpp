@@ -442,14 +442,14 @@ size_t TransferEngine::getTotalQpNum() const {
     if (!rdma_transport) {
         return 0;
     }
-    
+
     // Cast to RdmaTransport to access the actual QP counting functionality
-    RdmaTransport *rdma = dynamic_cast<RdmaTransport*>(rdma_transport);
+    RdmaTransport *rdma = dynamic_cast<RdmaTransport *>(rdma_transport);
     if (!rdma) {
         LOG(ERROR) << "Failed to cast RDMA transport to RdmaTransport type";
         return 0;
     }
-    
+
     return rdma->getTotalQpNum();
 }
 
