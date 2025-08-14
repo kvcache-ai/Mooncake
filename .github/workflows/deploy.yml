@@ -22,6 +22,7 @@ concurrency:
 jobs:
   # Build and deploy job
   build-and-deploy:
+    if: github.repository == 'ykwd/Mooncake'
     environment:
       name: github-pages
       url: https://kvcache-ai.github.io/Mooncake/
