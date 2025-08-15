@@ -66,6 +66,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         engine_->submitTransfer(task.batchID, entries);
                         task_status[i].store(TASK_TRANSFERRED_1,
                                              std::memory_order_release);
+                        printf("[%d] Op %d to TASK_TRANSFERRED_1\n", rank_, task.opType);
                     } else if (task_status[i].load(std::memory_order_acquire) ==
                                TASK_TRANSFERRED_1) {
                         bool batch_done = true;
@@ -99,6 +100,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         engine_->submitTransfer(task.batchID, entries);
                         task_status[i].store(TASK_SIGNALED_1,
                                              std::memory_order_release);
+                        printf("[%d] Op %d to TASK_SIGNALED_1\n", rank_, task.opType);
                     } else if (task_status[i].load(std::memory_order_acquire) ==
                                TASK_SIGNALED_1) {
                         bool all_received = true;
@@ -117,6 +119,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             task_status[i].store(TASK_DONE,
                                                  std::memory_order_release);
                             task.status = DONE;
+                            printf("[%d] Op %d to TASK_DONE\n", rank_, task.opType);
                         }
                     }
                 }
