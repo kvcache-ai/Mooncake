@@ -9,6 +9,9 @@ namespace mooncake {
 constexpr const char* MULTI_DEVICE_ERROR_MSG =
     "Expecting one tensor only but got multiple.";
 constexpr const char* SYNC_OP_ERROR_MSG = "Expecting async op but got sync op.";
+constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
+constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
+constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
                                  int rank, int size,
@@ -77,6 +80,27 @@ MooncakeBackend::~MooncakeBackend() {
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
+    std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+    TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
+    TORCH_CHECK(opts.reduceOp == c10d::ReduceOp::SUM, REDUCE_OP_ERROR_MSG);
+    TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
+    auto tensor = tensors.back();
+    size_t tensorSize = tensor.numel() * tensor.element_size();
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream(tensor.device().index());
+    return worker_.putTask(
+        c10d::OpType::ALLREDUCE, tensorSize, stream,
+        [&](void* dst) {
+            cudaMemcpyAsync(dst, tensor.data_ptr(), tensorSize,
+                            cudaMemcpyHostToDevice, stream);
+        },
+        [&](void* src) {
+            cudaMemsetAsync(tensor.data_ptr(), 0, tensorSize, stream);
+            launchReduceKernel(tensor, src, size_, stream);
+        });
+}
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,

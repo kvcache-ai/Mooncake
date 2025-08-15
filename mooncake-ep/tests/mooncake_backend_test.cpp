@@ -20,6 +20,7 @@ class MooncakeBackendTest : public ::testing::Test {
         std::thread threads[kNumRanks];
         for (size_t rank = 0; rank < kNumRanks; ++rank) {
             threads[rank] = std::thread([this, store, rank, options] {
+                cudaSetDevice(rank);
                 backends[rank].reset(
                     new MooncakeBackend(store, rank, kNumRanks, options));
             });
@@ -72,6 +73,35 @@ TEST_F(MooncakeBackendTest, AllgatherTest) {
                 << "Allgather result mismatch. Got: " << outputTensors[i]
                 << " Expected: " << expected;
         }
+    }
+}
+
+TEST_F(MooncakeBackendTest, AllreduceTest) {
+    std::vector<c10::intrusive_ptr<c10d::Work>> works;
+    std::vector<std::vector<torch::Tensor>> allTensors;
+    auto options = torch::dtype(torch::kInt32).device(torch::kCUDA);
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
+        std::vector<at::Tensor> tensors;
+        tensors.emplace_back(
+            torch::full({2, 2}, rank, options.device_index(rank)));
+        works.emplace_back(
+            backends[rank]->allreduce(tensors, c10d::AllreduceOptions()));
+        allTensors.emplace_back(tensors);
+    }
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
+        bool success = works[rank]->wait();
+        ASSERT_TRUE(success) << "Allreduce failed at rank " << rank;
+
+        at::Tensor tensor = allTensors[rank][0];
+        auto expected = torch::full({2, 2}, kNumRanks * (kNumRanks - 1) / 2,
+                                    options.device_index(rank));
+        ASSERT_TRUE(torch::allclose(tensor, expected))
+            << "Allreduce result mismatch. Got: " << tensor
+            << " Expected: " << expected;
     }
 }
 

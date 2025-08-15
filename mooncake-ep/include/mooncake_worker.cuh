@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Work.hpp>
@@ -21,6 +22,9 @@ __global__ struct Task {
     size_t tensorSize;  // In bytes
     BatchID batchID;
 };
+
+void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
+                        cudaStream_t stream);
 
 class MooncakeWorker {
    public:
