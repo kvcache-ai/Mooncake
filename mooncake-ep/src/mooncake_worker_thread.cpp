@@ -11,10 +11,10 @@ enum WorkerTaskStatus {
     TASK_DONE = 3,
 };
 
-void MooncakeWorker::initWorker() {
+void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
     // Sync metadata
     for (int i = 0; i < size_; ++i) {
-        auto segment_id = engine_->openSegment(std::to_string(i));
+        auto segment_id = engine_->openSegment(server_names[i]);
         segment_ids_.emplace_back(segment_id);
         auto segment_desc =
             engine_->getMetadata()->getSegmentDescByID(segment_id);
@@ -32,11 +32,12 @@ void MooncakeWorker::initWorker() {
             for (size_t i = 0; i < kNumTasks_; ++i) {
                 auto &task = tasks_[i];
                 if (task.status == IDLE) {
-                    task_status[i] = TASK_IDLE;
+                    task_status[i].store(TASK_IDLE, std::memory_order_release);
                 } else if (task.status == READY) {
                     switch (task.opType) {
                         case c10d::OpType::ALLGATHER: {
-                            if (task_status[i].load(std::memory_order_acquire) == TASK_IDLE) {
+                            if (task_status[i].load(
+                                    std::memory_order_acquire) == TASK_IDLE) {
                                 std::vector<TransferRequest> entries;
                                 for (int j = 0; j < size_; ++j) {
                                     entries.push_back(TransferRequest{
@@ -52,14 +53,18 @@ void MooncakeWorker::initWorker() {
                                 task.batchID =
                                     engine_->allocateBatchID(entries.size());
                                 engine_->submitTransfer(task.batchID, entries);
-                                task_status[i].store(TASK_TRANSFERRED_1, std::memory_order_release);
-                            } else if (task_status[i].load(std::memory_order_acquire) == TASK_TRANSFERRED_1) {
+                                task_status[i].store(TASK_TRANSFERRED_1,
+                                                     std::memory_order_release);
+                            } else if (task_status[i].load(
+                                           std::memory_order_acquire) ==
+                                       TASK_TRANSFERRED_1) {
                                 bool batch_done = true;
                                 TransferStatus status;
                                 for (int j = 0; j < size_; ++j) {
                                     engine_->getTransferStatus(task.batchID, j,
                                                                status);
-                                    if (status.s != TransferStatusEnum::COMPLETED) {
+                                    if (status.s !=
+                                        TransferStatusEnum::COMPLETED) {
                                         batch_done = false;
                                         break;
                                     }
@@ -67,7 +72,8 @@ void MooncakeWorker::initWorker() {
                                 if (!batch_done) {
                                     break;
                                 }
-                                auto source_ptr = (int32_t *)cpu_source + i * size_;
+                                auto source_ptr =
+                                    (int32_t *)cpu_source + i * size_;
                                 std::vector<TransferRequest> entries;
                                 for (int j = 0; j < size_; ++j) {
                                     *source_ptr = 1;
@@ -77,20 +83,25 @@ void MooncakeWorker::initWorker() {
                                         .target_id = segment_ids_[j],
                                         .target_offset =
                                             segment_descs_[j]->buffers[3].addr +
-                                            (i * size_ + rank_) * sizeof(int32_t),
+                                            (i * size_ + rank_) *
+                                                sizeof(int32_t),
                                         .length = sizeof(int32_t),
                                     });
                                 }
                                 task.batchID =
                                     engine_->allocateBatchID(entries.size());
                                 engine_->submitTransfer(task.batchID, entries);
-                                task_status[i].store(TASK_SIGNALED_1, std::memory_order_release);
-                            } else if (task_status[i].load(std::memory_order_acquire) == TASK_SIGNALED_1) {
+                                task_status[i].store(TASK_SIGNALED_1,
+                                                     std::memory_order_release);
+                            } else if (task_status[i].load(
+                                           std::memory_order_acquire) ==
+                                       TASK_SIGNALED_1) {
                                 bool all_received = true;
-                                auto signal_ptr = (int32_t *)segment_descs_[rank_]
-                                                      ->buffers[3]
-                                                      .addr +
-                                                  i * size_;
+                                auto signal_ptr =
+                                    (int32_t *)segment_descs_[rank_]
+                                        ->buffers[3]
+                                        .addr +
+                                    i * size_;
                                 for (int j = 0; j < size_; ++j) {
                                     if (signal_ptr[j] != 1) {
                                         all_received = false;
@@ -101,7 +112,8 @@ void MooncakeWorker::initWorker() {
                                     for (int j = 0; j < size_; ++j) {
                                         signal_ptr[j] = 0;
                                     }
-                                    task_status[i].store(TASK_DONE, std::memory_order_release);
+                                    task_status[i].store(
+                                        TASK_DONE, std::memory_order_release);
                                     task.status = DONE;
                                 }
                             }

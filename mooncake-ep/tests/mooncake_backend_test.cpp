@@ -1,46 +1,58 @@
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/HashStore.hpp>
 #include <mooncake_backend.h>
 
 namespace mooncake {
 
-constexpr size_t kNumRanks = 1;
+constexpr size_t kNumRanks = 2;
 
 class MooncakeBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        auto store = c10::make_intrusive<::c10d::FileStore>(
-            "/tmp/mooncake_backend_test_store", 1);
+        auto store = c10::make_intrusive<::c10d::HashStore>();
         auto options =
             c10::make_intrusive<::c10d::Backend::Options>("mooncake");
+        std::thread threads[kNumRanks];
         for (size_t rank = 0; rank < kNumRanks; ++rank) {
-            backends.emplace_back(std::make_shared<MooncakeBackend>(
-                store, rank, kNumRanks, options));
+            threads[rank] = std::thread([this, store, rank, options] {
+                backends[rank].reset(
+                    new MooncakeBackend(store, rank, kNumRanks, options));
+            });
+        }
+        for (size_t rank = 0; rank < kNumRanks; ++rank) {
+            threads[rank].join();
         }
     }
 
     void TearDown() override {}
 
-    std::vector<std::shared_ptr<MooncakeBackend>> backends;
+    std::shared_ptr<MooncakeBackend> backends[kNumRanks];
 };
 
 TEST_F(MooncakeBackendTest, AllgatherTest) {
     std::vector<c10::intrusive_ptr<c10d::Work>> works;
     std::vector<std::vector<std::vector<at::Tensor>>> allOutputTensors;
     std::vector<std::vector<torch::Tensor>> allInputTensors;
+    auto options = torch::dtype(torch::kInt32).device(torch::kCUDA);
     for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
         std::vector<at::Tensor> outputTensorsInner;
         for (size_t i = 0; i < kNumRanks; ++i) {
-            outputTensorsInner.emplace_back(torch::zeros({2, 2}));
+            outputTensorsInner.emplace_back(
+                torch::zeros({2, 2}, options.device_index(rank)));
         }
         std::vector<std::vector<at::Tensor>> outputTensors;
         outputTensors.emplace_back(outputTensorsInner);
 
         std::vector<at::Tensor> inputTensors;
-        inputTensors.push_back(torch::full({2, 2}, rank));
+        inputTensors.emplace_back(
+            torch::full({2, 2}, rank, options.device_index(rank)));
 
         works.emplace_back(backends[rank]->allgather(
             outputTensors, inputTensors, c10d::AllgatherOptions()));
@@ -48,12 +60,14 @@ TEST_F(MooncakeBackendTest, AllgatherTest) {
         allInputTensors.emplace_back(inputTensors);
     }
     for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
         bool success = works[rank]->wait();
         ASSERT_TRUE(success) << "Allgather failed at rank " << rank;
 
         std::vector<at::Tensor> outputTensors = allOutputTensors[rank][0];
         for (size_t i = 0; i < kNumRanks; ++i) {
-            auto expected = torch::full({2, 2}, i);
+            auto expected = torch::full({2, 2}, i, options.device_index(rank));
             ASSERT_TRUE(torch::allclose(outputTensors[i], expected))
                 << "Allgather result mismatch. Got: " << outputTensors[i]
                 << " Expected: " << expected;

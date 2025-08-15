@@ -14,25 +14,31 @@ MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
                                  int rank, int size,
                                  c10::intrusive_ptr<Options> options)
     : Backend(rank, size), worker_(&engine_, rank, size) {
+    // Get device data
+    cudaError err = cudaGetDevice(&device_id_);
+    TORCH_CHECK(!err, c10::str("Failed to get device id"));
+
     // Initialize transfer engine
-    engine_.init("127.0.0.1:2379", std::to_string(rank));
+    engine_.init(P2PHANDSHAKE, p2p_ip_);
     auto transport = engine_.installTransport("rdma", nullptr);
     TORCH_CHECK(transport != nullptr, c10::str("Failed to install transport"));
+    auto localRpcMeta = transport->meta()->localRpcMeta();
+    std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
+                                  std::to_string(localRpcMeta.rpc_port);
 
     // Register GPU buffers
     constexpr size_t buffer_size = 1u << 30;
-    cudaError err = cudaMalloc(&send_buffer_, buffer_size);
+    err = cudaMalloc(&send_buffer_, buffer_size);
     TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
-    int rc = engine_.registerLocalMemory(
-        send_buffer_, buffer_size, std::string("cuda:") + std::to_string(rank));
+    std::string location = "cuda:" + std::to_string(device_id_);
+    int rc = engine_.registerLocalMemory(send_buffer_, buffer_size, location);
     TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
 
     err = cudaMalloc(&recv_buffer_, buffer_size);
     TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
-    rc = engine_.registerLocalMemory(
-        recv_buffer_, buffer_size, std::string("cuda:") + std::to_string(rank));
+    rc = engine_.registerLocalMemory(recv_buffer_, buffer_size, location);
     TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
 
     // Register CPU sync regions
@@ -48,7 +54,15 @@ MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
         MooncakeWorker::kNumTasks_ * size * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
 
-    worker_.initWorker();
+    // Sync metadata
+    store->set("server_name_" + std::to_string(rank), localServerName);
+
+    std::vector<std::string> server_names;
+    for (int i = 0; i < size; i++) {
+        server_names.push_back(
+            store->get_to_str({"server_name_" + std::to_string(i)}));
+    }
+    worker_.initWorker(server_names);
 }
 
 MooncakeBackend::~MooncakeBackend() {

@@ -31,7 +31,7 @@ class MooncakeWorker {
         const std::function<void(void* dst)>& tensorToBuffer,
         const std::function<void(void* src)>& bufferToTensor);
 
-    void initWorker();
+    void initWorker(const std::vector<std::string>& server_names);
 
     static constexpr size_t kNumTasks_ = 1024;
 

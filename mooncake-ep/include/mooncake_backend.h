@@ -28,6 +28,8 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     TransferEngine engine_{true};
+    std::string p2p_ip_ = "127.0.0.1";
+    int device_id_;
     void* send_buffer_;
     void* recv_buffer_;
     int32_t* cpu_sync_send_region_;
