@@ -93,7 +93,7 @@ void FilereadWorkerPool::workerThread() {
                 }
 
                 auto load_result = backend_->LoadObject(
-                    task.file_path, task.slices, task.file_size);
+                    task.file_path, task.slices, task.object_size);
                 if (load_result) {
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;
@@ -540,7 +540,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
-    size_t file_length = disk_replica.file_size;
+    size_t file_length = disk_replica.object_size;
 
     // Submit memcpy operations to worker pool for async execution
     FilereadTask task(file_path, file_length, slices, state);

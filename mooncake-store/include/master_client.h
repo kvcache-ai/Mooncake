@@ -56,6 +56,11 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     GetReplicaList(const std::string& object_key);
 
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
+
     /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
@@ -96,9 +101,11 @@ class MasterClient {
     /**
      * @brief Ends a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -111,10 +118,11 @@ class MasterClient {
     /**
      * @brief Revokes a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key);
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -130,6 +138,9 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
+
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str);
 
     /**
      * @brief Removes all objects and all its replicas

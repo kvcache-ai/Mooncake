@@ -35,6 +35,7 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_ROOT_FS_DIR = "";
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -179,6 +180,29 @@ inline std::ostream& operator<<(std::ostream& os,
 class BufferAllocator;
 
 /**
+ * @brief Type of buffer allocator used in the system
+ */
+enum class ReplicaType {
+    MEMORY,  // Memory replica
+    DISK,    // Disk replica
+};
+
+/**
+ * @brief Stream operator for ReplicaType
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const ReplicaType& replicaType) noexcept {
+    static const std::unordered_map<ReplicaType, std::string_view>
+        replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
+                             {ReplicaType::DISK, "DISK"}};
+
+    os << (replica_type_strings.count(replicaType)
+               ? replica_type_strings.at(replicaType)
+               : "UNKNOWN");
+    return os;
+}
+
+/**
  * @brief Status of a replica in the system
  */
 enum class ReplicaStatus {
@@ -307,6 +331,15 @@ inline std::ostream& operator<<(std::ostream& os,
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
+struct MemoryReplicaData {
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+struct DiskReplicaData {
+    std::string file_path;
+    uint64_t object_size = 0;
+};
+
 struct MemoryDescriptor {
     std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
     YLT_REFL(MemoryDescriptor, buffer_descriptors);
@@ -314,33 +347,50 @@ struct MemoryDescriptor {
 
 struct DiskDescriptor {
     std::string file_path{};
-    uint64_t file_size = 0;
-    YLT_REFL(DiskDescriptor, file_path, file_size);
+    uint64_t object_size = 0;
+    YLT_REFL(DiskDescriptor, file_path, object_size);
 };
 
 class Replica {
    public:
     struct Descriptor;
 
-    Replica() = default;
+    // memory replica constructor
     Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
             ReplicaStatus status)
-        : buffers_(std::move(buffers)), status_(status) {}
+        : data_(MemoryReplicaData{std::move(buffers)}), status_(status) {}
 
-    void reset() noexcept {
-        buffers_.clear();
-        status_ = ReplicaStatus::UNDEFINED;
-    }
+    // disk replica constructor
+    Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
+        : data_(DiskReplicaData{std::move(file_path), object_size}),
+          status_(status) {}
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
 
-    [[nodiscard]] bool has_invalid_handle() const {
-        return std::any_of(buffers_.begin(), buffers_.end(),
-                           [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
-                               return !buf_ptr->isAllocatorValid();
-                           });
+    [[nodiscard]] ReplicaType type() const {
+        return std::visit(ReplicaTypeVisitor{}, data_);
+    }
+
+    [[nodiscard]] bool is_memory_replica() const {
+        return std::holds_alternative<MemoryReplicaData>(data_);
+    }
+
+    [[nodiscard]] bool is_disk_replica() const {
+        return std::holds_alternative<DiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] bool has_invalid_mem_handle() const {
+        if (is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(data_);
+            return std::any_of(
+                mem_data.buffers.begin(), mem_data.buffers.end(),
+                [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
+                    return !buf_ptr->isAllocatorValid();
+                });
+        }
+        return false;  // DiskReplicaData does not have handles
     }
 
     [[nodiscard]] std::vector<std::unique_ptr<std::string>> get_segment_names()
@@ -361,8 +411,11 @@ class Replica {
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
-            for (const auto& buf_ptr : buffers_) {
-                buf_ptr->mark_complete();
+            if (is_memory_replica()) {
+                auto& mem_data = std::get<MemoryReplicaData>(data_);
+                for (const auto& buf_ptr : mem_data.buffers) {
+                    buf_ptr->mark_complete();
+                }
             }
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
@@ -372,6 +425,15 @@ class Replica {
     }
 
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
+
+    struct ReplicaTypeVisitor {
+        ReplicaType operator()(const MemoryReplicaData&) const {
+            return ReplicaType::MEMORY;
+        }
+        ReplicaType operator()(const DiskReplicaData&) const {
+            return ReplicaType::DISK;
+        }
+    };
 
     struct Descriptor {
         std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
@@ -385,6 +447,14 @@ class Replica {
 
         bool is_memory_replica() const noexcept {
             return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        bool is_disk_replica() noexcept {
+            return std::holds_alternative<DiskDescriptor>(descriptor_variant);
+        }
+
+        bool is_disk_replica() const noexcept {
+            return std::holds_alternative<DiskDescriptor>(descriptor_variant);
         }
 
         MemoryDescriptor& get_memory_descriptor() {
@@ -419,34 +489,55 @@ class Replica {
     };
 
    private:
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers_;
+    std::variant<MemoryReplicaData, DiskReplicaData> data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.status = status_;
-    MemoryDescriptor mem_desc;
-    mem_desc.buffer_descriptors.reserve(buffers_.size());
-    for (const auto& buf_ptr : buffers_) {
-        if (buf_ptr) {
-            mem_desc.buffer_descriptors.push_back(buf_ptr->get_descriptor());
+
+    if (is_memory_replica()) {
+        const auto& mem_data = std::get<MemoryReplicaData>(data_);
+        MemoryDescriptor mem_desc;
+        mem_desc.buffer_descriptors.reserve(mem_data.buffers.size());
+        for (const auto& buf_ptr : mem_data.buffers) {
+            if (buf_ptr) {
+                mem_desc.buffer_descriptors.push_back(
+                    buf_ptr->get_descriptor());
+            }
         }
+        desc.descriptor_variant = std::move(mem_desc);
+    } else if (is_disk_replica()) {
+        const auto& disk_data = std::get<DiskReplicaData>(data_);
+        DiskDescriptor disk_desc;
+        disk_desc.file_path = disk_data.file_path;
+        disk_desc.object_size = disk_data.object_size;
+        desc.descriptor_variant = std::move(disk_desc);
     }
-    desc.descriptor_variant = std::move(mem_desc);
+
     return desc;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
-    os << "Replica: { "
-       << "status: " << replica.status_ << ", "
-       << "buffers: [";
-    for (const auto& buf_ptr : replica.buffers_) {
-        if (buf_ptr) {
-            os << *buf_ptr;
+    os << "Replica: { status: " << replica.status_ << ", ";
+
+    if (replica.is_memory_replica()) {
+        const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
+        os << "type: MEMORY, buffers: [";
+        for (const auto& buf_ptr : mem_data.buffers) {
+            if (buf_ptr) {
+                os << *buf_ptr;
+            }
         }
+        os << "]";
+    } else if (replica.is_disk_replica()) {
+        const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
+        os << "type: DISK, file_path: " << disk_data.file_path
+           << ", object_size: " << disk_data.object_size;
     }
-    os << "] }";
+
+    os << " }";
     return os;
 }
 
@@ -467,8 +558,8 @@ const static uint64_t kMaxSliceSize =
  */
 struct Segment {
     UUID id{0, 0};
-    std::string name{};  // The name of the segment, also might be the hostname
-                         // of the server that owns the segment
+    std::string name{};  // The name of the segment, also might be the
+                         // hostname of the server that owns the segment
     uintptr_t base{0};
     size_t size{0};
     Segment() = default;
@@ -484,8 +575,8 @@ YLT_REFL(Segment, id, name, base, size);
 enum class ClientStatus {
     UNDEFINED = 0,  // Uninitialized
     OK,             // Client is alive, no need to remount for now
-    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master, so
-                    // need to remount
+    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master,
+                    // so need to remount
 };
 
 /**
