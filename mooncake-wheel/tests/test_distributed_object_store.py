@@ -11,6 +11,9 @@ DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 
+# Global variable to keep references to additional stores to prevent unmounting
+_additional_stores = []
+
 def get_client(store, local_buffer_size_param=None):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -56,9 +59,9 @@ def get_client(store, local_buffer_size_param=None):
         raise RuntimeError(f"Failed to setup second segment for replica testing. Return code: {retcode2}")
     
     # Keep reference to additional store so segments stay mounted
-    if not hasattr(store, '_additional_stores'):
-        store._additional_stores = []
-    store._additional_stores.append(additional_store)
+    # Use global variable since we can't add attributes to C++ bound objects
+    global _additional_stores
+    _additional_stores.append(additional_store)
 
 class TestZeroLocalBufferSize(unittest.TestCase):
     """Test class for zero local buffer size scenarios."""
