@@ -15,19 +15,20 @@ def get_client(store, local_buffer_size_param=None):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-    local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
+    base_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata")
-    global_segment_size = 3200 * 1024 * 1024  # 3200 MB
+    segment_size = 1600 * 1024 * 1024  # 1600 MB per segment
     local_buffer_size = (
         local_buffer_size_param if local_buffer_size_param is not None 
         else 512 * 1024 * 1024  # 512 MB
     )
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
+    hostname1 = f"{base_hostname}:12345"
     retcode = store.setup(
-        local_hostname, 
+        hostname1, 
         metadata_server, 
-        global_segment_size,
+        segment_size,
         local_buffer_size, 
         protocol, 
         device_name,
@@ -35,7 +36,29 @@ def get_client(store, local_buffer_size_param=None):
     )
     
     if retcode:
-        raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+        raise RuntimeError(f"Failed to setup first segment. Return code: {retcode}")
+    
+    # Create additional segments with different hostnames to ensure
+    # we have multiple segments for replica testing (required for replica_num > 1)
+    hostname2 = f"{base_hostname}:12346"
+    additional_store = MooncakeDistributedStore()
+    retcode2 = additional_store.setup(
+        hostname2,
+        metadata_server,
+        segment_size,
+        local_buffer_size,
+        protocol,
+        device_name,
+        master_server_address
+    )
+    
+    if retcode2 != 0:
+        raise RuntimeError(f"Failed to setup second segment for replica testing. Return code: {retcode2}")
+    
+    # Keep reference to additional store so segments stay mounted
+    if not hasattr(store, '_additional_stores'):
+        store._additional_stores = []
+    store._additional_stores.append(additional_store)
 
 class TestZeroLocalBufferSize(unittest.TestCase):
     """Test class for zero local buffer size scenarios."""
