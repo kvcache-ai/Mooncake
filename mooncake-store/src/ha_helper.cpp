@@ -91,70 +91,10 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
     }
 }
 
-WrappedMasterServiceConfig
-MasterServiceSupervisorConfig::createWrappedMasterServiceConfig(
-    ViewVersionId view_version) const {
-    WrappedMasterServiceConfig config;
-
-    // Set required parameters using assignment operator
-    config.enable_gc = enable_gc;
-    config.default_kv_lease_ttl = default_kv_lease_ttl;
-
-    // Set optional parameters (these have default values)
-    config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl;
-    config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
-    config.enable_metric_reporting = enable_metric_reporting;
-    config.http_port = static_cast<uint16_t>(metrics_port);
-    config.eviction_ratio = eviction_ratio;
-    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio;
-    config.view_version = view_version;
-    config.client_live_ttl_sec = client_live_ttl_sec;
-    config.enable_ha =
-        true;  // This is used in HA mode, so enable_ha should be true
-    config.cluster_id = cluster_id;
-    config.root_fs_dir = root_fs_dir;
-    config.memory_allocator = memory_allocator;
-
-    return config;
-}
-
 MasterServiceSupervisor::MasterServiceSupervisor(
     const MasterServiceSupervisorConfig& config)
     : config_(config) {
-    // Validate that all required parameters are set
-    if (!config.enable_gc.IsSet()) {
-        throw std::runtime_error("enable_gc is not set");
-    }
-    if (!config.enable_metric_reporting.IsSet()) {
-        throw std::runtime_error("enable_metric_reporting is not set");
-    }
-    if (!config.metrics_port.IsSet()) {
-        throw std::runtime_error("metrics_port is not set");
-    }
-    if (!config.default_kv_lease_ttl.IsSet()) {
-        throw std::runtime_error("default_kv_lease_ttl is not set");
-    }
-    if (!config.default_kv_soft_pin_ttl.IsSet()) {
-        throw std::runtime_error("default_kv_soft_pin_ttl is not set");
-    }
-    if (!config.allow_evict_soft_pinned_objects.IsSet()) {
-        throw std::runtime_error("allow_evict_soft_pinned_objects is not set");
-    }
-    if (!config.eviction_ratio.IsSet()) {
-        throw std::runtime_error("eviction_ratio is not set");
-    }
-    if (!config.eviction_high_watermark_ratio.IsSet()) {
-        throw std::runtime_error("eviction_high_watermark_ratio is not set");
-    }
-    if (!config.client_live_ttl_sec.IsSet()) {
-        throw std::runtime_error("client_live_ttl_sec is not set");
-    }
-    if (!config.rpc_port.IsSet()) {
-        throw std::runtime_error("rpc_port is not set");
-    }
-    if (!config.rpc_thread_num.IsSet()) {
-        throw std::runtime_error("rpc_thread_num is not set");
-    }
+    config_.validate();
 }
 
 int MasterServiceSupervisor::Start() {
@@ -192,7 +132,7 @@ int MasterServiceSupervisor::Start() {
 
         LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
-            config_.createWrappedMasterServiceConfig(view_version));
+            mooncake::WrappedMasterServiceConfig(config_, view_version));
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

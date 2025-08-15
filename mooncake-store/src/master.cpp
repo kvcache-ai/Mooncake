@@ -9,6 +9,7 @@
 #include "ha_helper.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "config_helper.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
@@ -75,108 +76,8 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 
-struct MasterConfig {
-    bool enable_gc;
-    bool enable_metric_reporting;
-    uint32_t metrics_port;
-    uint32_t rpc_port;
-    uint32_t rpc_thread_num;
-    std::string rpc_address;
-    int32_t rpc_conn_timeout_seconds;
-    bool rpc_enable_tcp_no_delay;
-
-    uint64_t default_kv_lease_ttl;
-    uint64_t default_kv_soft_pin_ttl;
-    bool allow_evict_soft_pinned_objects;
-    double eviction_ratio;
-    double eviction_high_watermark_ratio;
-    int64_t client_live_ttl_sec;
-
-    bool enable_ha;
-    std::string etcd_endpoints;
-
-    std::string cluster_id;
-    std::string root_fs_dir;
-    std::string memory_allocator;
-
-    /**
-     * @brief Creates a MasterServiceSupervisorConfig from this MasterConfig
-     * @return MasterServiceSupervisorConfig with all required parameters set
-     */
-    mooncake::MasterServiceSupervisorConfig createMasterSupervisorConfig() const {
-        mooncake::MasterServiceSupervisorConfig config;
-        
-        // Set required parameters using RequiredParam
-        config.enable_gc = enable_gc;
-        config.enable_metric_reporting = enable_metric_reporting;
-        config.metrics_port = static_cast<int>(metrics_port);
-        config.default_kv_lease_ttl = default_kv_lease_ttl;
-        config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl;
-        config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
-        config.eviction_ratio = eviction_ratio;
-        config.eviction_high_watermark_ratio = eviction_high_watermark_ratio;
-        config.client_live_ttl_sec = client_live_ttl_sec;
-        config.rpc_port = static_cast<int>(rpc_port);
-        config.rpc_thread_num = static_cast<size_t>(rpc_thread_num);
-        
-        // Set optional parameters (these have default values)
-        config.rpc_address = rpc_address;
-        config.rpc_conn_timeout = std::chrono::seconds(rpc_conn_timeout_seconds);
-        config.rpc_enable_tcp_no_delay = rpc_enable_tcp_no_delay;
-        config.etcd_endpoints = etcd_endpoints;
-        config.local_hostname = rpc_address + ":" + std::to_string(rpc_port);
-        config.cluster_id = cluster_id;
-        config.root_fs_dir = root_fs_dir;
-        
-        // Convert string memory_allocator to BufferAllocatorType enum
-        if (memory_allocator == "cachelib") {
-            config.memory_allocator = mooncake::BufferAllocatorType::CACHELIB;
-        } else {
-            config.memory_allocator = mooncake::BufferAllocatorType::OFFSET;
-        }
-        
-        return config;
-    }
-
-    /**
-     * @brief Creates a WrappedMasterServiceConfig from this MasterConfig
-     * @return WrappedMasterServiceConfig with all required parameters set
-     */
-    mooncake::WrappedMasterServiceConfig createWrappedMasterServiceConfig(
-        mooncake::ViewVersionId view_version) const {
-        mooncake::WrappedMasterServiceConfig config;
-
-        // Set required parameters using RequiredParam
-        config.enable_gc = enable_gc;
-        config.default_kv_lease_ttl = default_kv_lease_ttl;
-
-        // Set optional parameters (these have default values)
-        config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl;
-        config.allow_evict_soft_pinned_objects =
-            allow_evict_soft_pinned_objects;
-        config.enable_metric_reporting = enable_metric_reporting;
-        config.http_port = static_cast<uint16_t>(metrics_port);
-        config.eviction_ratio = eviction_ratio;
-        config.eviction_high_watermark_ratio = eviction_high_watermark_ratio;
-        config.view_version = view_version;
-        config.client_live_ttl_sec = client_live_ttl_sec;
-        config.enable_ha = enable_ha;
-        config.cluster_id = cluster_id;
-        config.root_fs_dir = root_fs_dir;
-
-        // Convert string memory_allocator to BufferAllocatorType enum
-        if (memory_allocator == "cachelib") {
-            config.memory_allocator = mooncake::BufferAllocatorType::CACHELIB;
-        } else {
-            config.memory_allocator = mooncake::BufferAllocatorType::OFFSET;
-        }
-        
-        return config;
-    }
-};
-
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
-                    MasterConfig& master_config) {
+                    mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
     default_config.GetBool("enable_gc", &master_config.enable_gc,
                            FLAGS_enable_gc);
@@ -228,7 +129,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_memory_allocator);
 }
 
-void LoadConfigFromCmdline(MasterConfig& master_config,
+void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
     if (FLAGS_max_threads != 4) {  // 4 is the default value
         LOG(WARNING) << "max_threads is deprecated, use rpc_thread_num instead";
@@ -371,7 +272,7 @@ int main(int argc, char* argv[]) {
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     // Initialize the master configuration
-    MasterConfig master_config;
+    mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_conf_path;
     if (!conf_path.empty()) {
         mooncake::DefaultConfig default_config;
@@ -431,7 +332,7 @@ int main(int argc, char* argv[]) {
               << ", memory_allocator=" << master_config.memory_allocator;
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisor supervisor(master_config.createMasterSupervisorConfig());
+        mooncake::MasterServiceSupervisor supervisor(mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value
@@ -442,7 +343,7 @@ int main(int argc, char* argv[]) {
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
         mooncake::WrappedMasterService wrapped_master_service(
-            master_config.createWrappedMasterServiceConfig(version));
+            mooncake::WrappedMasterServiceConfig(master_config, version));
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

@@ -3,15 +3,13 @@
 
 #include <glog/logging.h>
 
-#include <chrono>
-#include <cstdint>
+
 #include <string>
 #include <thread>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "types.h"
 #include "config_helper.h"
-#include "rpc_service.h"
 
 namespace mooncake {
 
@@ -64,36 +62,6 @@ class MasterViewHelper {
      */
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version);
-};
-
-class MasterServiceSupervisorConfig {
-   public:
-    // no default values (required parameters) - using RequiredParam
-    RequiredParam<bool> enable_gc;
-    RequiredParam<bool> enable_metric_reporting;
-    RequiredParam<int> metrics_port;
-    RequiredParam<int64_t> default_kv_lease_ttl;
-    RequiredParam<int64_t> default_kv_soft_pin_ttl;
-    RequiredParam<bool> allow_evict_soft_pinned_objects;
-    RequiredParam<double> eviction_ratio;
-    RequiredParam<double> eviction_high_watermark_ratio;
-    RequiredParam<int64_t> client_live_ttl_sec;
-    RequiredParam<int> rpc_port;
-    RequiredParam<size_t> rpc_thread_num;
-
-    // Parameters with default values (optional parameters)
-    std::string rpc_address = "0.0.0.0";
-    std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
-        0);  // Client connection timeout. 0 = no timeout (infinite)
-    bool rpc_enable_tcp_no_delay = true;
-    std::string etcd_endpoints = "0.0.0.0:2379";
-    std::string local_hostname = "0.0.0.0:50051";
-    std::string cluster_id = DEFAULT_CLUSTER_ID;
-    std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-
-    WrappedMasterServiceConfig createWrappedMasterServiceConfig(
-        ViewVersionId view_version) const;
 };
 
 /*

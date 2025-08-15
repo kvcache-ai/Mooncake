@@ -4,6 +4,7 @@
 #include <thread>
 #include <vector>
 
+#include "config_helper.h"
 #include "rpc_service.h"
 #include "types.h"
 

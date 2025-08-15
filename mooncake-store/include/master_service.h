@@ -15,13 +15,13 @@
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
-#include <filesystem>
 
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
 #include "types.h"
+#include "config_helper.h"
 
 namespace mooncake {
 // Forward declarations
@@ -75,6 +75,8 @@ class MasterService {
         const std::string& cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    
+    MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
     /**
