@@ -8,6 +8,9 @@
 
 namespace mooncake {
 
+// Forward declarations
+class MasterServiceConfig;
+
 /**
  * @brief A template class that wraps std::optional to provide configurable variables
  *        with setter/getter functionality and exception handling for unset values.
@@ -171,7 +174,7 @@ class MasterServiceSupervisorConfig {
         }
     }
 
-    // Some of the parameters are not used in constructor but will be used in the future
+    // Some of the parameters are not used in constructor but will be used in the future.
     // So we need to validate them at the beginning of the program to avoid unexpected errors
     // in the future.
     void validate() const {
@@ -285,6 +288,88 @@ class WrappedMasterServiceConfig {
     }
 };
 
+// Builder class for MasterServiceConfig
+class MasterServiceConfigBuilder {
+private:
+    bool enable_gc_ = true;
+    uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
+    uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    bool allow_evict_soft_pinned_objects_ = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
+    double eviction_high_watermark_ratio_ = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    ViewVersionId view_version_ = 0;
+    int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    bool enable_ha_ = false;
+    std::string cluster_id_ = DEFAULT_CLUSTER_ID;
+    std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
+    BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+
+public:
+    MasterServiceConfigBuilder() = default;
+
+    MasterServiceConfigBuilder& set_enable_gc(bool enable_gc) {
+        enable_gc_ = enable_gc;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
+        default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
+        default_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(bool allow) {
+        allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_eviction_ratio(double ratio) {
+        eviction_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_view_version(ViewVersionId version) {
+        view_version_ = version;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
+        client_live_ttl_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_ha(bool enable) {
+        enable_ha_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_cluster_id(const std::string& id) {
+        cluster_id_ = id;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_root_fs_dir(const std::string& dir) {
+        root_fs_dir_ = dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_memory_allocator(BufferAllocatorType allocator) {
+        memory_allocator_ = allocator;
+        return *this;
+    }
+
+    MasterServiceConfig build() const;
+};
+
 class MasterServiceConfig {
    public:
     bool enable_gc = true;
@@ -302,7 +387,7 @@ class MasterServiceConfig {
 
     MasterServiceConfig() = default;
 
-    // Frome WrappedMasterServiceConfig
+    // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
         enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
@@ -317,7 +402,33 @@ class MasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         memory_allocator = config.memory_allocator;
     }
+
+    // Static factory method to create a builder
+    static MasterServiceConfigBuilder builder();
 };
  
+
+// Implementation of MasterServiceConfigBuilder::build()
+inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
+    MasterServiceConfig config;
+    config.enable_gc = enable_gc_;
+    config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.eviction_ratio = eviction_ratio_;
+    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.view_version = view_version_;
+    config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.enable_ha = enable_ha_;
+    config.cluster_id = cluster_id_;
+    config.root_fs_dir = root_fs_dir_;
+    config.memory_allocator = memory_allocator_;
+    return config;
+}
+
+// Implementation of MasterServiceConfig::builder()
+inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
+    return MasterServiceConfigBuilder();
+}
 
 } // namespace mooncake

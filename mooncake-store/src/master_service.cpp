@@ -13,52 +13,7 @@
 
 namespace mooncake {
 
-MasterService::MasterService(
-    bool enable_gc, uint64_t default_kv_lease_ttl,
-    uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
-    double eviction_ratio, double eviction_high_watermark_ratio,
-    ViewVersionId view_version, int64_t client_live_ttl_sec, bool enable_ha,
-    const std::string& cluster_id, const std::string& root_fs_dir,
-    BufferAllocatorType memory_allocator)
-    : enable_gc_(enable_gc),
-      default_kv_lease_ttl_(default_kv_lease_ttl),
-      default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
-      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
-      eviction_ratio_(eviction_ratio),
-      eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
-      client_live_ttl_sec_(client_live_ttl_sec),
-      enable_ha_(enable_ha),
-      cluster_id_(cluster_id),
-      root_fs_dir_(root_fs_dir),
-      segment_manager_(memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
-    if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
-        LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
-                   << "current value: " << eviction_ratio_;
-        throw std::invalid_argument("Invalid eviction ratio");
-    }
-    if (eviction_high_watermark_ratio_ < 0.0 ||
-        eviction_high_watermark_ratio_ > 1.0) {
-        LOG(ERROR)
-            << "Eviction high watermark ratio must be between 0.0 and 1.0, "
-            << "current value: " << eviction_high_watermark_ratio_;
-        throw std::invalid_argument("Invalid eviction high watermark ratio");
-    }
-    gc_running_ = true;
-    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-    VLOG(1) << "action=start_gc_thread";
-
-    if (enable_ha) {
-        client_monitor_running_ = true;
-        client_monitor_thread_ =
-            std::thread(&MasterService::ClientMonitorFunc, this);
-        VLOG(1) << "action=start_client_monitor_thread";
-    }
-
-    if (!root_fs_dir_.empty()) {
-        use_disk_replica_ = true;
-    }
-}
+MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
     : enable_gc_(config.enable_gc),
