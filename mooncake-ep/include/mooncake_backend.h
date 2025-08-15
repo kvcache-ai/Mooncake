@@ -22,9 +22,9 @@ class MooncakeBackend final : public ::c10d::Backend {
         std::vector<at::Tensor>& inputTensors,
         const c10d::AllgatherOptions& opts) override;
 
-    c10::intrusive_ptr<c10d::Work> allreduce(
-        std::vector<at::Tensor>& tensors,
-        const c10d::AllreduceOptions& opts) override;
+    c10::intrusive_ptr<c10d::Work> _allgather_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        const c10d::AllgatherOptions& opts) override;
 
    private:
     TransferEngine engine_{true};
