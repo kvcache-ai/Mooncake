@@ -13,9 +13,8 @@ namespace mooncake::test {
 
 std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
-    return std::make_unique<MasterService>(MasterServiceConfig::builder()
-    .set_root_fs_dir(root_fs_dir)
-    .build());
+    return std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
 }
 
 class MasterServiceSSDTest : public ::testing::Test {
