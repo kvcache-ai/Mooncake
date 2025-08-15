@@ -51,6 +51,39 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[idx].status = IDLE;
 }
 
+template <typename scalar_t>
+__global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
+                             size_t numElements, size_t numRanks) {
+    size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+    for (size_t elem_idx = thread_idx; elem_idx < numElements;
+         elem_idx += stride) {
+        scalar_t sum = 0;
+        for (size_t rank = 0; rank < numRanks; ++rank) {
+            sum += src[rank * numElements + elem_idx];
+        }
+        dst[elem_idx] = sum;
+    }
+}
+
+void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
+                        cudaStream_t stream) {
+    switch (dst.scalar_type()) {
+        case c10::kInt:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
+                                                 dst.numel(), numRanks);
+            break;
+        case c10::kBFloat16:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<at::BFloat16>(),
+                                                 (at::BFloat16*)src,
+                                                 dst.numel(), numRanks);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
+                                        dst.scalar_type()));
+    }
+}
+
 MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
     : engine_(engine), rank_(rank), size_(size) {
     // Pin memory for task array

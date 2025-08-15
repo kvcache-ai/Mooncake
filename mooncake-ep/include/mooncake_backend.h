@@ -17,6 +17,10 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
+    c10::intrusive_ptr<c10d::Work> allreduce(
+        std::vector<at::Tensor>& tensors,
+        const c10d::AllreduceOptions& opts) override;
+
     c10::intrusive_ptr<c10d::Work> allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
         std::vector<at::Tensor>& inputTensors,
