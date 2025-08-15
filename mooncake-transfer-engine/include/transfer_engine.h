@@ -216,6 +216,9 @@ class TransferEngine {
         return local_topology_;
     }
 
+    // Get the total number of QPs from RDMA transport
+    size_t getTotalQpNum() const;
+
    private:
     struct MemoryRegion {
         void *addr;
