@@ -23,26 +23,21 @@ namespace mooncake {
 
 const uint64_t kMetricReportIntervalSeconds = 10;
 
-WrappedMasterService::WrappedMasterService(
-    bool enable_gc, uint64_t default_kv_lease_ttl,
-    uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
-    bool enable_metric_reporting, uint16_t http_port, double eviction_ratio,
-    double eviction_high_watermark_ratio, ViewVersionId view_version,
-    int64_t client_live_ttl_sec, bool enable_ha, const std::string& cluster_id,
-    const std::string& root_fs_dir, BufferAllocatorType memory_allocator)
-    : master_service_(enable_gc, default_kv_lease_ttl, default_kv_soft_pin_ttl,
-                      allow_evict_soft_pinned_objects, eviction_ratio,
-                      eviction_high_watermark_ratio, view_version,
-                      client_live_ttl_sec, enable_ha, cluster_id, root_fs_dir,
-
-                      memory_allocator),
-      http_server_(4, http_port),
-      metric_report_running_(enable_metric_reporting) {
+WrappedMasterService::WrappedMasterService(const WrappedMasterServiceConfig& config)
+    : master_service_(config.enable_gc, config.default_kv_lease_ttl,
+                      config.default_kv_soft_pin_ttl,
+                      config.allow_evict_soft_pinned_objects,
+                      config.eviction_ratio, config.eviction_high_watermark_ratio,
+                      config.view_version, config.client_live_ttl_sec,
+                      config.enable_ha, config.cluster_id, config.root_fs_dir,
+                      config.memory_allocator),
+      http_server_(4, config.http_port),
+      metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
-    MasterMetricManager::instance().set_enable_ha(enable_ha);
+    MasterMetricManager::instance().set_enable_ha(config.enable_ha);
 
-    if (enable_metric_reporting) {
+    if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
                 std::string metrics_summary =
