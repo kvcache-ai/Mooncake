@@ -357,45 +357,27 @@ auto MasterService::PutStart(const std::string& key,
 
     // Allocate replicas
     std::vector<Replica> replicas;
-    replicas.reserve(config.replica_num);
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
 
-        std::vector<std::unordered_set<std::string>> excluded_segments_per_slice(slice_lengths.size());
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocators, allocators_by_name, slice_lengths, config);
 
-        for (size_t i = 0; i < config.replica_num; ++i) {
-            std::vector<std::unique_ptr<AllocatedBuffer>> handles;
-            handles.reserve(slice_lengths.size());
-
-            // Allocate space for each slice
-            for (size_t j = 0; j < slice_lengths.size(); ++j) {
-                auto chunk_size = slice_lengths[j];
-
-                // Use the unified allocation strategy with replica config
-                auto handle = allocation_strategy_->Allocate(
-                    allocators, allocators_by_name, chunk_size, config, excluded_segments_per_slice[j]);
-
-                if (!handle) {
-                    // If the allocation failed, we need to evict some objects
-                    // to free up space for future allocations.
-                    need_eviction_ = true;
-                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                }
-
-                excluded_segments_per_slice[j].insert(handle->getSegmentName());
-
-                VLOG(1) << "key=" << key << ", replica_id=" << i
-                        << ", slice_index=" << j << ", handle=" << *handle
-                        << ", action=slice_allocated";
-                handles.emplace_back(std::move(handle));
+        if (!allocation_result.isSuccess()) {
+            LOG(ERROR) << "Failed to allocate all replicas for key=" << key
+                       << ": " << allocation_result.error_message;
+            if (allocation_result.status ==
+                AllocationResult::Status::INVALID_PARAMS) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-
-            replicas.emplace_back(std::move(handles),
-                                  ReplicaStatus::PROCESSING);
+            need_eviction_ = true;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
+
+        replicas = std::move(allocation_result.replicas);
     }
 
     std::vector<Replica::Descriptor> replica_list;

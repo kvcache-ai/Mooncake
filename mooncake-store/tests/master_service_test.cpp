@@ -289,7 +289,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
-    
+
     // Mount 5 segments, each 16MB
     constexpr size_t kBaseAddr = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
@@ -486,13 +486,13 @@ TEST_F(MasterServiceTest, RemoveAll) {
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
     std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+        new MasterService(true, kv_lease_ttl));
 
     // Mount 3 segments, each 64MB
     constexpr size_t kBaseAddr = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;  // 64MB
     UUID client_id = generate_uuid();
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         Segment segment(generate_uuid(), "segment_" + std::to_string(i),
                         kBaseAddr + static_cast<size_t>(i) * kSegmentSize,
                         kSegmentSize);
@@ -1009,8 +1009,8 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
     constexpr size_t buffer2 = 0x400000000;
-    constexpr size_t segment_size = 1024 * 1024 * 64; // 64MB
-    constexpr size_t object_size = 1024 * 1024; // 1MB
+    constexpr size_t segment_size = 1024 * 1024 * 64;  // 64MB
+    constexpr size_t object_size = 1024 * 1024;        // 1MB
 
     Segment segment1(generate_uuid(), "segment1", buffer1, segment_size);
     Segment segment2(generate_uuid(), "segment2", buffer2, segment_size);
@@ -1620,8 +1620,7 @@ TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
         for (const auto& replica : replica_list_local) {
             ASSERT_TRUE(replica.is_memory_replica());
             const auto& mem = replica.get_memory_descriptor();
-            ASSERT_EQ(slice_lengths.size(),
-                      mem.buffer_descriptors.size());
+            ASSERT_EQ(slice_lengths.size(), mem.buffer_descriptors.size());
             segment_names.insert(
                 mem.buffer_descriptors[slice_idx].segment_name_);
         }

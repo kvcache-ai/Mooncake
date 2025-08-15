@@ -343,6 +343,21 @@ class Replica {
                            });
     }
 
+    [[nodiscard]] std::vector<std::unique_ptr<std::string>> get_segment_names()
+        const {
+        std::vector<std::unique_ptr<std::string>> segment_names(
+            buffers_.size());
+        for (size_t i = 0; i < buffers_.size(); ++i) {
+            if (buffers_[i] && buffers_[i]->isAllocatorValid()) {
+                segment_names[i] = std::make_unique<std::string>(
+                    buffers_[i]->getSegmentName());
+            } else {
+                segment_names[i] = nullptr;
+            }
+        }
+        return segment_names;
+    }
+
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
@@ -423,7 +438,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
-    os << "Replica: { " << "status: " << replica.status_ << ", "
+    os << "Replica: { "
+       << "status: " << replica.status_ << ", "
        << "buffers: [";
     for (const auto& buf_ptr : replica.buffers_) {
         if (buf_ptr) {
