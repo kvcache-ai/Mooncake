@@ -35,7 +35,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     task_status[i].store(TASK_IDLE, std::memory_order_release);
                 } else if (task.status == READY) {
                     switch (task.opType) {
-                        case c10d::OpType::ALLGATHER: {
+                        case c10d::OpType::ALLGATHER:
+                        case c10d::OpType::_ALLGATHER_BASE: {
                             if (task_status[i].load(
                                     std::memory_order_acquire) == TASK_IDLE) {
                                 std::vector<TransferRequest> entries;
