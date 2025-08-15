@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <memory>
 #include <random>
 #include <string>
@@ -116,11 +117,11 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return result;
         }
 
-        // Allocate all slices with their replicas
-        // Structure: slices_buffers[slice_idx][replica_idx] = buffer
         std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
-            slices_buffers;
-        slices_buffers.reserve(slice_sizes.size());
+            replica_buffers(config.replica_num);
+        for (auto& replica_buffer : replica_buffers) {
+            replica_buffer.reserve(slice_sizes.size());
+        }
 
         // Allocate each slice across replicas
         for (size_t slice_idx = 0; slice_idx < slice_sizes.size();
@@ -139,11 +140,20 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 return result;
             }
 
-            slices_buffers.push_back(std::move(slice_replicas));
+            for (size_t replica_idx = 0; replica_idx < config.replica_num;
+                 ++replica_idx) {
+                replica_buffers[replica_idx].push_back(
+                    std::move(slice_replicas[replica_idx]));
+            }
         }
 
-        // Transpose: group buffers by replica instead of by slice
-        result.replicas = assembleReplicas(slices_buffers, config.replica_num);
+        result.replicas.reserve(config.replica_num);
+        for (size_t replica_idx = 0; replica_idx < config.replica_num;
+             ++replica_idx) {
+            result.replicas.emplace_back(
+                std::move(replica_buffers[replica_idx]),
+                ReplicaStatus::PROCESSING);
+        }
         result.status = AllocationResult::Status::SUCCESS;
 
         return result;
@@ -167,10 +177,11 @@ class RandomAllocationStrategy : public AllocationStrategy {
         std::vector<std::unordered_set<std::string>> slice_used_segments =
             extractUsedSegmentsPerSlice(existing_replicas, slice_sizes.size());
 
-        // Allocate additional replicas for each slice
         std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
-            slices_buffers;
-        slices_buffers.reserve(slice_sizes.size());
+            replica_buffers(additional_count);
+        for (auto& replica_buffer : replica_buffers) {
+            replica_buffer.reserve(slice_sizes.size());
+        }
 
         for (size_t slice_idx = 0; slice_idx < slice_sizes.size();
              ++slice_idx) {
@@ -187,12 +198,20 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 return result;
             }
 
-            slices_buffers.push_back(std::move(slice_replicas));
+            for (size_t replica_idx = 0; replica_idx < additional_count;
+                 ++replica_idx) {
+                replica_buffers[replica_idx].push_back(
+                    std::move(slice_replicas[replica_idx]));
+            }
         }
 
-        // Assemble replicas
-        result.replicas =
-            assembleReplicas(slices_buffers, slices_buffers[0].size());
+        result.replicas.reserve(additional_count);
+        for (size_t replica_idx = 0; replica_idx < additional_count;
+             ++replica_idx) {
+            result.replicas.emplace_back(
+                std::move(replica_buffers[replica_idx]),
+                ReplicaStatus::PROCESSING);
+        }
 
         if (result.replicas.size() == additional_count) {
             result.status = AllocationResult::Status::SUCCESS;
@@ -331,36 +350,6 @@ class RandomAllocationStrategy : public AllocationStrategy {
     }
 
     /**
-     * @brief Assembles replicas from slice-oriented buffer structure
-     * Transposes from [slice][replica] to [replica][slice]
-     */
-    std::vector<Replica> assembleReplicas(
-        const std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>&
-            slices_buffers,
-        size_t replica_num) {
-        std::vector<Replica> replicas;
-        replicas.reserve(replica_num);
-
-        for (size_t replica_idx = 0; replica_idx < replica_num; ++replica_idx) {
-            std::vector<std::unique_ptr<AllocatedBuffer>> replica_buffers;
-            replica_buffers.reserve(slices_buffers.size());
-
-            for (size_t slice_idx = 0; slice_idx < slices_buffers.size();
-                 ++slice_idx) {
-                // Move buffer from [slice][replica] to this replica
-                replica_buffers.push_back(
-                    std::move(const_cast<std::unique_ptr<AllocatedBuffer>&>(
-                        slices_buffers[slice_idx][replica_idx])));
-            }
-
-            replicas.emplace_back(std::move(replica_buffers),
-                                  ReplicaStatus::PROCESSING);
-        }
-
-        return replicas;
-    }
-
-    /**
      * @brief Extracts used segments per slice from existing replicas
      */
     std::vector<std::unordered_set<std::string>> extractUsedSegmentsPerSlice(
@@ -369,11 +358,17 @@ class RandomAllocationStrategy : public AllocationStrategy {
         std::vector<std::unordered_set<std::string>> slice_segments(
             slice_count);
 
+        for (auto& segment_set : slice_segments) {
+            segment_set.reserve(existing_replicas.size());
+        }
+
         for (const auto& replica : existing_replicas) {
             auto segment_names = replica.get_segment_names();
-            for (size_t i = 0; i < slice_count && i < segment_names.size(); ++i) {
+            for (size_t i = 0; i < std::min(slice_count, segment_names.size());
+                 ++i) {
                 if (segment_names[i].has_value()) {
-                    slice_segments[i].emplace(segment_names[i].value());
+                    slice_segments[i].emplace(
+                        std::move(segment_names[i].value()));
                 }
             }
         }

@@ -508,7 +508,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     return desc;
 }
 
-inline std::vector<std::optional<std::string>> Replica::get_segment_names() const {
+inline std::vector<std::optional<std::string>> Replica::get_segment_names()
+    const {
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         std::vector<std::optional<std::string>> segment_names(
