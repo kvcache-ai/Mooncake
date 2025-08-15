@@ -119,6 +119,11 @@ Status RdmaTransport::install(std::string &local_segment_name,
         CHECK_STATUS(
             cluster_topology_->load(machine_id, cluster_topology_path));
     }
+    if (conf_->get("transports/rdma/scheduler", false)) {
+        auto scheduler_path =
+            conf_->get("transports/rdma/scheduler_path", "/mooncake_sched");
+        scheduler_ = std::make_shared<Scheduler>(scheduler_path);
+    }
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getDeviceList();
@@ -160,6 +165,8 @@ Status RdmaTransport::uninstall() {
         local_buffer_manager_.clear();
         context_set_.clear();
         context_name_lookup_.clear();
+        cluster_topology_.reset();
+        scheduler_.reset();
         installed_ = false;
     }
     return Status::OK();

@@ -47,7 +47,7 @@ static uint64_t now_ms() {
 
 constexpr size_t DEVNAME_LEN = 64;
 constexpr size_t MAX_DEVICES = 64;
-constexpr size_t MAX_LEASES_PER_DEVICE = 64;
+constexpr size_t MAX_LEASES_PER_DEVICE = 4096;
 const uint32_t MAGIC_NUMBER = 0x6D6FCAFE;
 
 // total wait for follower to see ftruncate+magic
@@ -58,6 +58,7 @@ static constexpr int SHM_POLL_INTERVAL_MS = 10;  // poll interval
 
 // Shared memory layout
 struct SharedLease {
+    bool is_valid;
     LeaseId lease_id;
     uint64_t allocated_bytes;
     uint64_t expires_at_ms;  // epoch ms
@@ -69,6 +70,7 @@ struct SharedDeviceEntry {
     int numa_node;
     uint32_t lease_count;
     uint64_t outstanding_bytes;
+    uint32_t free_slot;
     SharedLease leases[MAX_LEASES_PER_DEVICE];
 };
 
@@ -321,6 +323,9 @@ Scheduler::Scheduler(const std::string& shm_name, Duration default_ttl)
         state_ = nullptr;
         return;
     }
+    for (uint32_t i = 0; i < state_->device_count; ++i) {
+        device_name_cache_.emplace(state_->devices[i].name, i);
+    }
 }
 
 Scheduler::~Scheduler() {
@@ -330,33 +335,36 @@ Scheduler::~Scheduler() {
     }
 }
 
-int Scheduler::findDeviceIndexByName(const std::string& name) {
-    if (!state_) return -1;
-    for (uint32_t i = 0; i < state_->device_count; ++i) {
-        if (strncmp(state_->devices[i].name, name.c_str(), DEVNAME_LEN) == 0)
-            return static_cast<int>(i);
-    }
-    return -1;
-}
-
 size_t Scheduler::reclaimExpiredLeasesUnlocked() {
     size_t reclaimed = 0;
     uint64_t now = now_ms();
     for (uint32_t i = 0; i < state_->device_count; ++i) {
         auto& dev = state_->devices[i];
-        uint64_t dev_outstanding = 0;
-        uint32_t j = 0;
+        uint32_t valid_count = 0;
+        uint64_t outstanding = 0;
+        uint32_t first_free = MAX_LEASES_PER_DEVICE;
         for (uint32_t k = 0; k < dev.lease_count; ++k) {
-            if (dev.leases[k].expires_at_ms == 0 ||
-                now <= dev.leases[k].expires_at_ms) {
-                dev.leases[j++] = dev.leases[k];
-                dev_outstanding += dev.leases[k].allocated_bytes;
-            } else {
+            if (dev.leases[k].is_valid &&
+                (dev.leases[k].expires_at_ms == 0 ||
+                 now <= dev.leases[k].expires_at_ms)) {
+                if (k != valid_count) {
+                    dev.leases[valid_count] = dev.leases[k];
+                }
+                outstanding += dev.leases[valid_count].allocated_bytes;
+                ++valid_count;
+            } else if (dev.leases[k].is_valid) {
+                dev.leases[k].is_valid = false;
                 ++reclaimed;
+                if (k < first_free) first_free = k;
+            } else if (k < first_free) {
+                first_free = k;
             }
         }
-        dev.lease_count = j;
-        dev.outstanding_bytes = dev_outstanding;
+        dev.lease_count = valid_count;
+        dev.outstanding_bytes = outstanding;
+        dev.free_slot = (valid_count < MAX_LEASES_PER_DEVICE)
+                            ? std::min(first_free, valid_count)
+                            : MAX_LEASES_PER_DEVICE;
     }
     return reclaimed;
 }
@@ -368,115 +376,102 @@ size_t Scheduler::reclaimExpiredLeases() {
     return reclaimed;
 }
 
-bool Scheduler::closeJob(const JobLease& lease) {
-    if (!state_) return false;
-    if (robust_mutex_lock(&state_->mtx) != 0) return false;
-    bool found = false;
+bool Scheduler::closeJob(LeaseId lease) {
+    if (!state_ || robust_mutex_lock(&state_->mtx) != 0) return false;
     for (uint32_t i = 0; i < state_->device_count; ++i) {
         auto& dev = state_->devices[i];
         for (uint32_t j = 0; j < dev.lease_count; ++j) {
-            if (dev.leases[j].lease_id == lease.id) {
-                // Subtract closed lease's bytes from outstanding_bytes
+            if (dev.leases[j].is_valid && dev.leases[j].lease_id == lease) {
                 dev.outstanding_bytes -= dev.leases[j].allocated_bytes;
-                // Shift remaining leases
-                for (uint32_t k = j; k < dev.lease_count - 1; ++k) {
-                    dev.leases[k] = dev.leases[k + 1];
-                }
-                --dev.lease_count;
-                found = true;
-                break;
+                dev.leases[j].is_valid = false;
+                if (j < dev.free_slot) dev.free_slot = j;
+                pthread_mutex_unlock(&state_->mtx);
+                return true;
             }
         }
-        if (found) break;
     }
     pthread_mutex_unlock(&state_->mtx);
-    return found;
+    return false;
 }
 
-Status Scheduler::createJobs(uint64_t total_bytes,
-                             const std::vector<std::string>& device_list,
-                             std::vector<JobLease>& jobs,
-                             Duration requested_ttl) {
-    jobs.clear();
+Status Scheduler::createJob(LeaseId& lease, int& selected_index,
+                            uint64_t length,
+                            const std::vector<std::string>& device_list) {
     if (!state_) return Status::InternalError("no shared state");
-    if (total_bytes == 0)
+    if (length == 0)
         return Status::InvalidArgument("total_bytes must be positive");
     if (device_list.empty())
         return Status::InvalidArgument("prefer_devices is empty");
-
-    if (requested_ttl.count() <= 0) requested_ttl = default_ttl_;
-    uint64_t ttl_ms = static_cast<uint64_t>(requested_ttl.count());
-
-    if (robust_mutex_lock(&state_->mtx) != 0) {
+    if (robust_mutex_lock(&state_->mtx) != 0)
         return Status::InternalError("mutex lock failed");
-    }
 
     pid_t me = getpid();
+    uint64_t now = now_ms();
+    uint64_t ttl_ms = static_cast<uint64_t>(default_ttl_.count());
     reclaimExpiredLeasesUnlocked();
 
-    constexpr uint64_t GRANULARITY = 128 * 1024;
-    uint64_t remaining = total_bytes;
-
-    // Collect available devices pair<index, outstanding_bytes>
-    std::vector<std::pair<int, uint64_t>> avail;
+    selected_index = -1;
+    uint64_t min_outstanding_bytes = UINT64_MAX;
     for (const auto& device : device_list) {
-        int idx = findDeviceIndexByName(device);
-        if (idx >= 0 &&
-            state_->devices[idx].lease_count < MAX_LEASES_PER_DEVICE) {
-            avail.emplace_back(idx, state_->devices[idx].outstanding_bytes);
+        if (!device_name_cache_.count(device)) continue;
+        int idx = device_name_cache_[device];
+        auto& dev = state_->devices[idx];
+        if (dev.lease_count < MAX_LEASES_PER_DEVICE &&
+            dev.outstanding_bytes < min_outstanding_bytes) {
+            selected_index = idx;
+            min_outstanding_bytes = dev.outstanding_bytes;
         }
     }
 
-    if (avail.empty()) {
+    if (selected_index == -1) {
         pthread_mutex_unlock(&state_->mtx);
         return Status::DeviceNotFound("no idle devices");
     }
 
-    // Sort by outstanding_bytes for load balancing, then by index
-    std::sort(avail.begin(), avail.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second) return a.second < b.second;
-        return a.first < b.first;
-    });
-
-    std::unordered_map<int, uint64_t> device_bytes;
-    size_t num_devices = avail.size();
-    uint64_t total_units = remaining / GRANULARITY;
-    uint64_t units_per_device = total_units / num_devices;
-    uint64_t extra_units = total_units % num_devices;
-    for (size_t i = 0; i < num_devices; ++i) {
-        int d = avail[i].first;
-        uint64_t units = units_per_device + (i < extra_units ? 1 : 0);
-        device_bytes[d] = units * GRANULARITY;
+    auto& dev = state_->devices[selected_index];
+    lease = state_->lease_id_counter++;
+    uint32_t slot = dev.free_slot;
+    if (slot >= MAX_LEASES_PER_DEVICE) {
+        pthread_mutex_unlock(&state_->mtx);
+        return Status::InternalError("no free lease slots");
     }
+    dev.leases[slot].lease_id = lease;
+    dev.leases[slot].allocated_bytes = length;
+    dev.leases[slot].expires_at_ms = now + ttl_ms;
+    dev.leases[slot].owner_pid = me;
+    dev.leases[slot].is_valid = true;
+    if (slot == dev.lease_count) ++dev.lease_count;
 
-    uint64_t leftover_bytes = remaining % GRANULARITY;
-    if (leftover_bytes > 0) device_bytes[avail[0].first] += leftover_bytes;
-
-    // Create one lease per device with combined bytes
-    for (const auto& [d, bytes] : device_bytes) {
-        if (bytes == 0) continue;
-        auto& dev = state_->devices[d];
-
-        LeaseId id = state_->lease_id_counter++;
-        uint32_t lc = dev.lease_count;
-        dev.leases[lc].lease_id = id;
-        dev.leases[lc].allocated_bytes = bytes;
-        dev.leases[lc].expires_at_ms = now_ms() + ttl_ms;
-        dev.leases[lc].owner_pid = me;
-        dev.lease_count = lc + 1;
-        dev.outstanding_bytes += bytes;  // Update outstanding_bytes
-
-        JobLease jl;
-        jl.id = id;
-        jl.nic_name = std::string(dev.name);
-        jl.bytes = bytes;
-        jl.expires_at = Clock::now() + std::chrono::milliseconds(ttl_ms);
-        jl.owner_pid = me;
-        jobs.push_back(std::move(jl));
+    dev.free_slot = (dev.lease_count < MAX_LEASES_PER_DEVICE)
+                        ? dev.lease_count
+                        : MAX_LEASES_PER_DEVICE;
+    for (uint32_t i = slot + 1; i < dev.lease_count; ++i) {
+        if (!dev.leases[i].is_valid) {
+            dev.free_slot = i;
+            break;
+        }
     }
-
+    dev.outstanding_bytes += length;
     pthread_mutex_unlock(&state_->mtx);
     return Status::OK();
 }
+
+Status Scheduler::getEstimatedDeviceLoads(
+    std::unordered_map<std::string, uint64_t>& result) {
+    if (!state_) return Status::InternalError("no shared state");
+    if (robust_mutex_lock(&state_->mtx) != 0)
+        return Status::InternalError("mutex lock failed");
+
+    result.clear();
+    result.reserve(state_->device_count);
+    reclaimExpiredLeasesUnlocked();
+    for (uint32_t i = 0; i < state_->device_count; ++i) {
+        result.emplace(state_->devices[i].name,
+                       state_->devices[i].outstanding_bytes);
+    }
+    pthread_mutex_unlock(&state_->mtx);
+    return Status::OK();
+}
+
 }  // namespace v1
 }  // namespace mooncake

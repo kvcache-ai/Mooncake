@@ -268,6 +268,9 @@ void Workers::asyncPollCq(int thread_id) {
                     submit(slice);
                 }
             } else {
+                if (slice->has_lease) {
+                    transport_->scheduler_->closeJob(slice->lease);
+                }
                 markSliceSuccess(slice);
             }
         }
@@ -361,24 +364,43 @@ Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
     }
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
     auto &matrix = hint.topo->getResolvedMatrix();
-    if (!matrix.count(hint.buffer->location))
+    auto &raw_matrix = hint.topo->getMatrix();
+    if (!matrix.count(hint.buffer->location)) {
         hint.topo_entry = &matrix.at(kWildcardLocation);
-    else
+        hint.topo_entry_raw = &raw_matrix.at(kWildcardLocation);
+    } else {
         hint.topo_entry = &matrix.at(hint.buffer->location);
+        hint.topo_entry_raw = &raw_matrix.at(hint.buffer->location);
+    }
     return Status::OK();
 }
 
 Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                                     RdmaSlice *slice) {
-    // Source device: select one in the preferred group randomly
+    // Source device: select one in the preferred group
+    // If scheduler is available, use it as the guide. Otherwise random choosing
     int seed = SimpleRandom::Get().next(32);
+    slice->has_lease = false;
     for (size_t rank = 0;
          slice->source_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
         auto &list = source.topo_entry->device_list[rank];
-        if (!list.empty()) slice->source_dev_id = list[seed % list.size()];
+        if (!list.empty()) {
+            if (transport_->scheduler_) {
+                LeaseId lease;
+                auto &raw_list = source.topo_entry_raw->device_list[rank];
+                auto status = transport_->scheduler_->createJob(
+                    lease, seed, slice->length, raw_list);
+                if (status.ok()) {
+                    slice->has_lease = true;
+                    slice->lease = lease;
+                }
+            }
+            if (!slice->has_lease)
+                slice->source_dev_id = list[seed % list.size()];
+        }
     }
 
-    // Target device: read the cluster topology and find best matching
+    // Target device: first read the cluster topology and find best matching
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
     if (!same_machine && slice->target_dev_id < 0 &&
@@ -390,7 +412,7 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
         slice->target_dev_id = target.topo->findDeviceID(target_dev);
     }
 
-    // Target device: find the associated one
+    // Target device: then find the statically associated one
     for (size_t rank = 0;
          slice->target_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
         auto &list = target.topo_entry->device_list[rank];
@@ -419,6 +441,7 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
                                      RdmaSlice *slice) {
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
+    slice->has_lease = false;
 
     size_t src_total = 0;
     for (size_t srank = 0; srank < DevicePriorityRanks; ++srank)
@@ -430,8 +453,7 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
 
     size_t total_combos = src_total * dst_total;
     if ((size_t)slice->retry_count >= total_combos)
-        return Status::DeviceNotFound(
-            "No more device combo could access the slice memory region");
+        return Status::DeviceNotFound("All devices are tried but failed");
 
     size_t idx = slice->retry_count;
     while (idx < total_combos) {
@@ -461,8 +483,7 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
         ++idx;
     }
 
-    return Status::DeviceNotFound(
-        "No device could access the slice memory region");
+    return Status::DeviceNotFound("All devices are tried but failed");
 }
 
 Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {

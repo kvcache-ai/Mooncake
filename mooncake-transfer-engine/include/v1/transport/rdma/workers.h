@@ -118,6 +118,7 @@ class Workers {
     struct RuoteHint {
         SegmentDesc *segment;
         BufferDesc *buffer;
+        const TopologyEntry *topo_entry_raw;
         const ResolvedTopologyEntry *topo_entry;
         const Topology *topo;
     };

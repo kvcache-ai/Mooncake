@@ -32,47 +32,33 @@ using TimePoint = std::chrono::time_point<Clock>;
 using Duration = std::chrono::milliseconds;
 using LeaseId = uint64_t;
 
-// JobLease returned to caller
-struct JobLease {
-    LeaseId id;
-    std::string nic_name;
-    uint64_t bytes;  // allocated bytes
-    TimePoint expires_at;
-    pid_t owner_pid;
-};
-
 struct SharedState;
 
 class Scheduler {
    public:
-    // shm_name: shared memory object name (must start with '/')
-    // default_ttl: default lease TTL
     Scheduler(const std::string& shm_name = "/mooncake_sched",
-              Duration default_ttl = Duration(30000));
+              Duration default_ttl = Duration(5000));
 
     ~Scheduler();
 
-    Status createJobs(uint64_t total_bytes,
-                      const std::vector<std::string>& device_list,
-                      std::vector<JobLease>& jobs,
-                      Duration requested_ttl = Duration(30000));
+    Status createJob(LeaseId& lease, int& selected_index, uint64_t length,
+                     const std::vector<std::string>& device_list);
 
-    // Close/release a lease (pass the JobLease returned earlier)
-    // Returns true if found & released.
-    bool closeJob(const JobLease& lease);
+    bool closeJob(LeaseId lease);
 
-    // Manually reclaim expired leases; returns number reclaimed.
     size_t reclaimExpiredLeases();
 
-   private:
-    int findDeviceIndexByName(const std::string& name);
+    Status getEstimatedDeviceLoads(
+        std::unordered_map<std::string, uint64_t>& result);
 
+   private:
     size_t reclaimExpiredLeasesUnlocked();
 
     SharedState* state_;
     std::string shm_name_;
     Duration default_ttl_;
     std::mutex local_mtx_;
+    std::unordered_map<std::string, int> device_name_cache_;
 };
 
 }  // namespace v1
