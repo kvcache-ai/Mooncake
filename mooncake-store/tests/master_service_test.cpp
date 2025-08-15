@@ -2019,7 +2019,7 @@ TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
             << "Duplicate segment found for slice index " << slice_idx;
     }
 
-    ASSERT_TRUE(service_->PutEnd(key).has_value());
+    ASSERT_TRUE(service_->PutEnd(key, ReplicaType::MEMORY).has_value());
 }
 
 TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {

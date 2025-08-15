@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -393,20 +394,8 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
-    [[nodiscard]] std::vector<std::unique_ptr<std::string>> get_segment_names()
-        const {
-        std::vector<std::unique_ptr<std::string>> segment_names(
-            buffers_.size());
-        for (size_t i = 0; i < buffers_.size(); ++i) {
-            if (buffers_[i] && buffers_[i]->isAllocatorValid()) {
-                segment_names[i] = std::make_unique<std::string>(
-                    buffers_[i]->getSegmentName());
-            } else {
-                segment_names[i] = nullptr;
-            }
-        }
-        return segment_names;
-    }
+    [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
+        const;
 
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
@@ -517,6 +506,24 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     }
 
     return desc;
+}
+
+inline std::vector<std::optional<std::string>> Replica::get_segment_names() const {
+    if (is_memory_replica()) {
+        const auto& mem_data = std::get<MemoryReplicaData>(data_);
+        std::vector<std::optional<std::string>> segment_names(
+            mem_data.buffers.size());
+        for (size_t i = 0; i < mem_data.buffers.size(); ++i) {
+            if (mem_data.buffers[i] &&
+                mem_data.buffers[i]->isAllocatorValid()) {
+                segment_names[i] = mem_data.buffers[i]->getSegmentName();
+            } else {
+                segment_names[i] = std::nullopt;
+            }
+        }
+        return segment_names;
+    }
+    return std::vector<std::optional<std::string>>();
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {

@@ -371,12 +371,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         for (const auto& replica : existing_replicas) {
             auto segment_names = replica.get_segment_names();
-            // if (segment_names.size() != slice_count) {
-            //    // TODO: throw smth
-            //}
-            for (size_t i = 0; i < slice_count; ++i) {
-                if (segment_names[i]) {
-                    slice_segments[i].emplace(std::move(*segment_names[i]));
+            for (size_t i = 0; i < slice_count && i < segment_names.size(); ++i) {
+                if (segment_names[i].has_value()) {
+                    slice_segments[i].emplace(segment_names[i].value());
                 }
             }
         }
