@@ -94,6 +94,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     WrappedMasterServiceConfig service_config;
     service_config.enable_gc = false;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    service_config.enable_metric_reporting = true;
     WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;

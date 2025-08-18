@@ -3,7 +3,6 @@
 
 #include <glog/logging.h>
 
-
 #include <string>
 #include <thread>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
