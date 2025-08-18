@@ -121,6 +121,9 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } hccl;
+            struct {
+                uint64_t dest_addr;
+            } ascend_direct;
         };
 
        public:

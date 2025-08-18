@@ -165,7 +165,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport *ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
     if (!ascend_transport) {
