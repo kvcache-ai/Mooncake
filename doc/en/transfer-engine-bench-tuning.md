@@ -1,6 +1,4 @@
 # Transfer Engine Benchmarking & Tuning Guide
-明白👌 既然你要改成 **doc 风格**，那就要比 README/博客更简洁、更规整，避免碎碎念，突出「背景 → 用法 → 测试流程 → 调优 → 路线图」。下面是改写后的英文 **documentation draft (Markdown 源码)**：
-
 ## Background
 
 Mooncake’s data transfer backbone is the **Transfer Engine (Mooncake TE)**. Through the adoption of **SGLang**, Mooncake TE is being widely applied across different scenarios and vendors, and user feedback has been increasing.
