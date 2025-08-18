@@ -3,9 +3,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <memory>
-#include <random>
 #include <thread>
 #include <vector>
 
@@ -16,15 +14,7 @@ namespace mooncake::test {
 std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
     return std::make_unique<MasterService>(
-        false,                         // enable_gc
-        DEFAULT_DEFAULT_KV_LEASE_TTL,  // default_kv_lease_ttl
-        DEFAULT_KV_SOFT_PIN_TTL_MS,    // default_kv_soft_pin_ttl
-        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_EVICTION_RATIO,
-        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        0,  // view_version
-        DEFAULT_CLIENT_LIVE_TTL_SEC,
-        false,  // enable_ha
-        DEFAULT_CLUSTER_ID, root_fs_dir, BufferAllocatorType::CACHELIB);
+        MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
 }
 
 class MasterServiceSSDTest : public ::testing::Test {
