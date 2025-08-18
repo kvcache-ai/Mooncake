@@ -4,7 +4,6 @@
 #include <thread>
 #include <vector>
 
-
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
