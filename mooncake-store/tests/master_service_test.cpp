@@ -72,9 +72,13 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
     }
 }
 
-TEST_F(MasterServiceTest, MountUnmountSegment) {
+TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
     // Create a MasterService instance for testing.
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the size of the segment (16MB).
@@ -113,6 +117,69 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     auto mount_result4 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result4.error());
+
+    // Test normal mount operation.
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    auto mount_result5 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result5.has_value());
+
+    // Test mounting the same segment again (idempotent request should succeed).
+    auto mount_result6 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result6.has_value());
+
+    // Test unmounting the segment.
+    auto unmount_result1 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result1.has_value());
+
+    // Test unmounting the same segment again (idempotent request should
+    // succeed).
+    auto unmount_result2 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result2.has_value());
+
+    // Test unmounting a non-existent segment (idempotent request should
+    // succeed).
+    UUID non_existent_id = generate_uuid();
+    auto unmount_result3 = service_->UnmountSegment(non_existent_id, client_id);
+    EXPECT_TRUE(unmount_result3.has_value());
+
+    // Test remounting after unmount.
+    auto mount_result7 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result7.has_value());
+    auto unmount_result4 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result4.has_value());
+}
+
+TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
+    // Create a MasterService instance for testing.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    // Define a constant buffer address for the segment.
+    constexpr size_t kBufferAddress = 0x300000000;
+    // Define the size of the segment (16MB).
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    // Define the name of the test segment.
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, kBufferAddress,
+                    kSegmentSize);
+    UUID client_id = generate_uuid();
+
+    // Test invalid parameters.
+    // Invalid buffer address (0).
+    segment.base = 0;
+    segment.size = kSegmentSize;
+    auto mount_result1 = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(mount_result1.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
+
+    // Invalid segment size (0).
+    segment.base = kBufferAddress;
+    segment.size = 0;
+    auto mount_result2 = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(mount_result2.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Test normal mount operation.
     segment.base = kBufferAddress;
@@ -887,7 +954,9 @@ TEST_F(MasterServiceTest, RemoveAll) {
 }
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_enable_gc(true).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount a segment with sufficient size for multiple replicas
     constexpr size_t buffer = 0x300000000;
@@ -992,7 +1061,9 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_enable_gc(true).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment for testing
     constexpr size_t buffer = 0x300000000;

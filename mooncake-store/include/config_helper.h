@@ -293,7 +293,7 @@ class WrappedMasterServiceConfig {
 // Builder class for MasterServiceConfig
 class MasterServiceConfigBuilder {
    private:
-    bool enable_gc_ = true;
+    bool enable_gc_ = false;
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
@@ -379,7 +379,7 @@ class MasterServiceConfigBuilder {
 
 class MasterServiceConfig {
    public:
-    bool enable_gc = true;
+    bool enable_gc = false;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
