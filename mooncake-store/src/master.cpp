@@ -1,7 +1,10 @@
 #include <gflags/gflags.h>
 
-#include <chrono>  // For std::chrono
-#include <thread>  // For std::thread
+#include <chrono>      // For std::chrono
+#include <thread>      // For std::thread
+#include <cstdlib>     // For system()
+#include <unistd.h>    // For fork(), exec()
+#include <sys/wait.h>  // For waitpid()
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
@@ -75,6 +78,12 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
+DEFINE_bool(enable_http_metadata_server, false,
+            "Enable HTTP metadata server instead of etcd");
+DEFINE_int32(http_metadata_server_port, 8080,
+             "Port for HTTP metadata server to listen on");
+DEFINE_string(http_metadata_server_host, "0.0.0.0",
+              "Host for HTTP metadata server to bind to");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -125,6 +134,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
+    default_config.GetBool("enable_http_metadata_server",
+                           &master_config.enable_http_metadata_server,
+                           FLAGS_enable_http_metadata_server);
+    default_config.GetUInt32("http_metadata_server_port",
+                             &master_config.http_metadata_server_port,
+                             FLAGS_http_metadata_server_port);
+    default_config.GetString("http_metadata_server_host",
+                             &master_config.http_metadata_server_host,
+                             FLAGS_http_metadata_server_host);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -258,6 +276,49 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.memory_allocator = FLAGS_memory_allocator;
     }
+    if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_http_metadata_server =
+            FLAGS_enable_http_metadata_server;
+    }
+    if ((google::GetCommandLineFlagInfo("http_metadata_server_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.http_metadata_server_port =
+            FLAGS_http_metadata_server_port;
+    }
+    if ((google::GetCommandLineFlagInfo("http_metadata_server_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.http_metadata_server_host =
+            FLAGS_http_metadata_server_host;
+    }
+}
+
+// Function to start HTTP metadata server
+bool StartHttpMetadataServer(int port, const std::string& host) {
+    LOG(INFO) << "Starting HTTP metadata server on " << host << ":" << port;
+
+    // Build the command to start the Python HTTP metadata server
+    std::string command = "python3 -m mooncake.http_metadata_server";
+    command += " --port " + std::to_string(port);
+    command += " --host " + host;
+    command += " --log-level INFO";
+
+    LOG(INFO) << "Executing command: " << command;
+
+    // Use system() to start the server in background
+    int result = system((command + " &").c_str());
+
+    if (result == 0) {
+        LOG(INFO) << "HTTP metadata server started successfully";
+        return true;
+    } else {
+        LOG(ERROR) << "Failed to start HTTP metadata server, return code: "
+                   << result;
+        return false;
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -321,7 +382,25 @@ int main(int argc, char* argv[]) {
               << master_config.rpc_enable_tcp_no_delay
               << ", cluster_id=" << master_config.cluster_id
               << ", root_fs_dir=" << master_config.root_fs_dir
-              << ", memory_allocator=" << master_config.memory_allocator;
+              << ", memory_allocator=" << master_config.memory_allocator
+              << ", enable_http_metadata_server="
+              << master_config.enable_http_metadata_server
+              << ", http_metadata_server_port="
+              << master_config.http_metadata_server_port
+              << ", http_metadata_server_host="
+              << master_config.http_metadata_server_host;
+
+    // Start HTTP metadata server if enabled
+    if (master_config.enable_http_metadata_server) {
+        if (!StartHttpMetadataServer(master_config.http_metadata_server_port,
+                                     master_config.http_metadata_server_host)) {
+            LOG(FATAL) << "Failed to start HTTP metadata server";
+            return 1;
+        }
+
+        // Give the server some time to start
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
 
     if (master_config.enable_ha) {
         mooncake::MasterServiceSupervisor supervisor(
