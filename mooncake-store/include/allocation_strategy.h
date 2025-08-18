@@ -58,9 +58,8 @@ class AllocationStrategy {
      *               placement constraints
      * @return AllocationResult containing allocated replicas and status.
      *         - SUCCESS: All requested replicas with all slices allocated
-     *         - PARTIAL_SUCCESS: Some replicas allocated, check replicas vector
      *         - FAILURE: No allocation possible
-     *         - INSUFFICIENT_SPACE: Not enough space for requested allocation
+     *         - INVALID_PARAMS: Invalid configuration provided
      */
     virtual AllocationResult Allocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
