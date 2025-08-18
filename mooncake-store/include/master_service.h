@@ -15,13 +15,13 @@
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
-#include <filesystem>
 
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
 #include "types.h"
+#include "master_config.h"
 
 namespace mooncake {
 // Forward declarations
@@ -60,21 +60,8 @@ class MasterService {
     };
 
    public:
-    MasterService(
-        bool enable_gc = true,
-        uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
-        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-        bool allow_evict_soft_pinned_objects =
-            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-        double eviction_ratio = DEFAULT_EVICTION_RATIO,
-        double eviction_high_watermark_ratio =
-            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        ViewVersionId view_version = 0,
-        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-        const std::string& root_fs_dir = DEFAULT_ROOT_FS_DIR,
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterService();
+    MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
     /**

@@ -10,6 +10,8 @@
 #include "rpc_service.h"
 #include "types.h"
 
+#include "master_config.h"
+
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
@@ -331,34 +333,19 @@ int main(int argc, char* argv[]) {
               << ", memory_allocator=" << master_config.memory_allocator;
 
     if (master_config.enable_ha) {
-        // Construct local hostname from rpc_address and rpc_port
-        mooncake::MasterServiceSupervisor supervisor(master_config);
-
+        mooncake::MasterServiceSupervisor supervisor(
+            mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
-        mooncake::BufferAllocatorType allocator_type;
-        if (master_config.memory_allocator == "cachelib") {
-            allocator_type = mooncake::BufferAllocatorType::CACHELIB;
-        } else {
-            allocator_type = mooncake::BufferAllocatorType::OFFSET;
-        }
         coro_rpc::coro_rpc_server server(
             master_config.rpc_thread_num, master_config.rpc_port,
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
         mooncake::WrappedMasterService wrapped_master_service(
-            master_config.enable_gc, master_config.default_kv_lease_ttl,
-            master_config.default_kv_soft_pin_ttl,
-            master_config.allow_evict_soft_pinned_objects,
-            master_config.enable_metric_reporting, master_config.metrics_port,
-            master_config.eviction_ratio,
-            master_config.eviction_high_watermark_ratio, version,
-            master_config.client_live_ttl_sec, master_config.enable_ha,
-            master_config.cluster_id, master_config.root_fs_dir,
-            allocator_type);
+            mooncake::WrappedMasterServiceConfig(master_config, version));
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

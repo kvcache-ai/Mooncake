@@ -1,15 +1,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
-#include <memory>
-#include <random>
 #include <thread>
 #include <vector>
 
-#include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "master_config.h"
 
 namespace mooncake::test {
 
@@ -94,7 +91,11 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
-    WrappedMasterService service_(false, default_kv_lease_ttl, true);
+    WrappedMasterServiceConfig service_config;
+    service_config.enable_gc = false;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -202,7 +203,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 TEST_F(MasterMetricsTest, BatchRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
-    WrappedMasterService service_(false, default_kv_lease_ttl, true);
+    WrappedMasterServiceConfig service_config;
+    service_config.enable_gc = false;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;
