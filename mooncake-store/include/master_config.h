@@ -36,17 +36,19 @@ struct MasterConfig {
 class MasterServiceSupervisorConfig {
    public:
     // no default values (required parameters) - using RequiredParam
-    RequiredParam<bool> enable_gc;
-    RequiredParam<bool> enable_metric_reporting;
-    RequiredParam<int> metrics_port;
-    RequiredParam<int64_t> default_kv_lease_ttl;
-    RequiredParam<int64_t> default_kv_soft_pin_ttl;
-    RequiredParam<bool> allow_evict_soft_pinned_objects;
-    RequiredParam<double> eviction_ratio;
-    RequiredParam<double> eviction_high_watermark_ratio;
-    RequiredParam<int64_t> client_live_ttl_sec;
-    RequiredParam<int> rpc_port;
-    RequiredParam<size_t> rpc_thread_num;
+    RequiredParam<bool> enable_gc{"enable_gc"};
+    RequiredParam<bool> enable_metric_reporting{"enable_metric_reporting"};
+    RequiredParam<int> metrics_port{"metrics_port"};
+    RequiredParam<int64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
+    RequiredParam<int64_t> default_kv_soft_pin_ttl{"default_kv_soft_pin_ttl"};
+    RequiredParam<bool> allow_evict_soft_pinned_objects{
+        "allow_evict_soft_pinned_objects"};
+    RequiredParam<double> eviction_ratio{"eviction_ratio"};
+    RequiredParam<double> eviction_high_watermark_ratio{
+        "eviction_high_watermark_ratio"};
+    RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<int> rpc_port{"rpc_port"};
+    RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
@@ -143,8 +145,8 @@ class MasterServiceSupervisorConfig {
 class WrappedMasterServiceConfig {
    public:
     // Required parameters (no default values) - using RequiredParam
-    RequiredParam<bool> enable_gc;
-    RequiredParam<uint64_t> default_kv_lease_ttl;
+    RequiredParam<bool> enable_gc{"enable_gc"};
+    RequiredParam<uint64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
 
     // Optional parameters (with default values)
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
@@ -195,7 +197,8 @@ class WrappedMasterServiceConfig {
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
     WrappedMasterServiceConfig(const MasterServiceSupervisorConfig& config,
-                               ViewVersionId view_version_param) {
+                               ViewVersionId view_version_param)
+        : WrappedMasterServiceConfig() {
         // Set required parameters using assignment operator
         enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
