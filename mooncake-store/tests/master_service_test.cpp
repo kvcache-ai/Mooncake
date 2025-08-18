@@ -73,9 +73,13 @@ std::string GenerateKeyForSegment(const std::unique_ptr<MasterService>& service,
     }
 }
 
-TEST_F(MasterServiceTest, MountUnmountSegment) {
+TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
     // Create a MasterService instance for testing.
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the size of the segment (16MB).
@@ -114,6 +118,69 @@ TEST_F(MasterServiceTest, MountUnmountSegment) {
     auto mount_result4 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result4.error());
+
+    // Test normal mount operation.
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    auto mount_result5 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result5.has_value());
+
+    // Test mounting the same segment again (idempotent request should succeed).
+    auto mount_result6 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result6.has_value());
+
+    // Test unmounting the segment.
+    auto unmount_result1 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result1.has_value());
+
+    // Test unmounting the same segment again (idempotent request should
+    // succeed).
+    auto unmount_result2 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result2.has_value());
+
+    // Test unmounting a non-existent segment (idempotent request should
+    // succeed).
+    UUID non_existent_id = generate_uuid();
+    auto unmount_result3 = service_->UnmountSegment(non_existent_id, client_id);
+    EXPECT_TRUE(unmount_result3.has_value());
+
+    // Test remounting after unmount.
+    auto mount_result7 = service_->MountSegment(segment, client_id);
+    EXPECT_TRUE(mount_result7.has_value());
+    auto unmount_result4 = service_->UnmountSegment(segment.id, client_id);
+    EXPECT_TRUE(unmount_result4.has_value());
+}
+
+TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
+    // Create a MasterService instance for testing.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    // Define a constant buffer address for the segment.
+    constexpr size_t kBufferAddress = 0x300000000;
+    // Define the size of the segment (16MB).
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    // Define the name of the test segment.
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, kBufferAddress,
+                    kSegmentSize);
+    UUID client_id = generate_uuid();
+
+    // Test invalid parameters.
+    // Invalid buffer address (0).
+    segment.base = 0;
+    segment.size = kSegmentSize;
+    auto mount_result1 = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(mount_result1.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
+
+    // Invalid segment size (0).
+    segment.base = kBufferAddress;
+    segment.size = 0;
+    auto mount_result2 = service_->MountSegment(segment, client_id);
+    EXPECT_FALSE(mount_result2.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Test normal mount operation.
     segment.base = kBufferAddress;
@@ -338,8 +405,10 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
 
 TEST_F(MasterServiceTest, GetReplicaListByRegex) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Test getting non-existent key
     auto get_result = service_->GetReplicaList(".*non_existent.*");
     EXPECT_FALSE(get_result.has_value());
@@ -397,7 +466,10 @@ void put_object(MasterService& service, const std::string& key) {
 
 TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
-    auto service_ = std::make_unique<MasterService>(false, kv_lease_ttl);
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    auto service_ = std::make_unique<MasterService>(service_config);
 
     // 1. Mount segment
     constexpr size_t buffer = 0x300000000;
@@ -626,8 +698,10 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
 
 TEST_F(MasterServiceTest, RemoveByRegex) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount segment and put 10 objects
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -667,7 +741,10 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
 
 TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
-    auto service_ = std::make_unique<MasterService>(false, kv_lease_ttl);
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    auto service_ = std::make_unique<MasterService>(service_config);
 
     // 1. Mount segment
     constexpr size_t buffer = 0x300000000;
@@ -736,8 +813,10 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         SCOPED_TRACE("Test Case 2: Removing all keys with '.*'");
         // Store is already populated from the previous (failed) test run, or we
         // can repopulate For isolation, let's assume we start fresh
-        service_ = std::make_unique<MasterService>(
-            false, kv_lease_ttl);  // Reset the service for a clean slate
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl)
+                                  .build();
+        service_ = std::make_unique<MasterService>(service_config);
         service_->MountSegment(segment, client_id);
         populate_store();
 
@@ -757,8 +836,11 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     // --- Test Case 3: Attempt to remove with a non-matching pattern ---
     {
         SCOPED_TRACE("Test Case 3: Removing with a non-matching pattern");
-        service_ =
-            std::make_unique<MasterService>(false, kv_lease_ttl);  // Reset
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl)
+                                  .build();
+        service_ = std::make_unique<MasterService>(
+            service_config);  // Reset the service
         service_->MountSegment(segment, client_id);
         populate_store();
 
@@ -779,8 +861,10 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     {
         SCOPED_TRACE(
             "Test Case 4: Removing based on file paths or containing digits");
-        service_ =
-            std::make_unique<MasterService>(false, kv_lease_ttl);  // Reset
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl)
+                                  .build();
+        service_ = std::make_unique<MasterService>(service_config);  // Reset
         service_->MountSegment(segment, client_id);
         populate_store();
 
@@ -801,8 +885,10 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     {
         SCOPED_TRACE(
             "Test Case 4 (Corrected): Removing based on complex pattern");
-        service_ =
-            std::make_unique<MasterService>(false, kv_lease_ttl);  // Reset
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl)
+                                  .build();
+        service_ = std::make_unique<MasterService>(service_config);  // Reset
         service_->MountSegment(segment, client_id);
         populate_store();
 
@@ -831,8 +917,10 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
 
 TEST_F(MasterServiceTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount segment and put 10 objects
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -870,8 +958,12 @@ TEST_F(MasterServiceTest, RemoveAll) {
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(true, kv_lease_ttl));
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_enable_gc(true)
+            .set_default_kv_lease_ttl(kv_lease_ttl)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 3 segments, each 64MB
     constexpr size_t kBaseAddr = 0x300000000;
@@ -975,7 +1067,9 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_enable_gc(true).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment for testing
     constexpr size_t buffer = 0x300000000;
@@ -1203,8 +1297,10 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
 TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 200;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     std::string segment_name = "concurrent_segment";
@@ -1391,7 +1487,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
-    std::unique_ptr<MasterService> service_(new MasterService(false));
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -1504,8 +1600,10 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
 
 TEST_F(MasterServiceTest, RemoveLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -1590,8 +1688,10 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
 TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount segment and put 10 objects, with 5 of them having lease
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -1633,8 +1733,10 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
 TEST_F(MasterServiceTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
     // we need to fill each shard with enough objects to thoroughly
@@ -1673,8 +1775,10 @@ TEST_F(MasterServiceTest, EvictObject) {
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 500;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     constexpr size_t object_size = 1024 * 1024;
@@ -1724,8 +1828,13 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const bool allow_evict_soft_pinned_objects = true;
-    std::unique_ptr<MasterService> service_(new MasterService(
-        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -1757,9 +1866,14 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     const uint64_t kv_soft_pin_ttl = 10000;
     const double eviction_ratio = 0.5;
     const bool allow_evict_soft_pinned_objects = true;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl,
-                          allow_evict_soft_pinned_objects, eviction_ratio));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .set_eviction_ratio(eviction_ratio)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1823,8 +1937,13 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const bool allow_evict_soft_pinned_objects = true;
-    std::unique_ptr<MasterService> service_(new MasterService(
-        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1866,9 +1985,14 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
     const double eviction_ratio = 0.5;
     const bool allow_evict_soft_pinned_objects = true;
-    std::unique_ptr<MasterService> service_(
-        new MasterService(false, kv_lease_ttl, kv_soft_pin_ttl,
-                          allow_evict_soft_pinned_objects, eviction_ratio));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .set_eviction_ratio(eviction_ratio)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1943,8 +2067,13 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     // set allow_evict_soft_pinned_objects to false to disable eviction of soft
     // pinned objects
     const bool allow_evict_soft_pinned_objects = false;
-    std::unique_ptr<MasterService> service_(new MasterService(
-        false, kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects));
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;

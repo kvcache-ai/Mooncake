@@ -13,24 +13,20 @@
 
 namespace mooncake {
 
-MasterService::MasterService(
-    bool enable_gc, uint64_t default_kv_lease_ttl,
-    uint64_t default_kv_soft_pin_ttl, bool allow_evict_soft_pinned_objects,
-    double eviction_ratio, double eviction_high_watermark_ratio,
-    ViewVersionId view_version, int64_t client_live_ttl_sec, bool enable_ha,
-    const std::string& cluster_id, const std::string& root_fs_dir,
-    BufferAllocatorType memory_allocator)
-    : enable_gc_(enable_gc),
-      default_kv_lease_ttl_(default_kv_lease_ttl),
-      default_kv_soft_pin_ttl_(default_kv_soft_pin_ttl),
-      allow_evict_soft_pinned_objects_(allow_evict_soft_pinned_objects),
-      eviction_ratio_(eviction_ratio),
-      eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
-      client_live_ttl_sec_(client_live_ttl_sec),
-      enable_ha_(enable_ha),
-      cluster_id_(cluster_id),
-      root_fs_dir_(root_fs_dir),
-      segment_manager_(memory_allocator),
+MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
+
+MasterService::MasterService(const MasterServiceConfig& config)
+    : enable_gc_(config.enable_gc),
+      default_kv_lease_ttl_(config.default_kv_lease_ttl),
+      default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
+      allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      eviction_ratio_(config.eviction_ratio),
+      eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      client_live_ttl_sec_(config.client_live_ttl_sec),
+      enable_ha_(config.enable_ha),
+      cluster_id_(config.cluster_id),
+      root_fs_dir_(config.root_fs_dir),
+      segment_manager_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
@@ -48,7 +44,7 @@ MasterService::MasterService(
     gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
     VLOG(1) << "action=start_gc_thread";
 
-    if (enable_ha) {
+    if (enable_ha_) {
         client_monitor_running_ = true;
         client_monitor_thread_ =
             std::thread(&MasterService::ClientMonitorFunc, this);
@@ -997,8 +993,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
