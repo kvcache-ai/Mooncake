@@ -11,11 +11,9 @@ DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
 
-# Global variable to keep references to additional stores to prevent unmounting
-_additional_stores = []
 
-def get_client(store, local_buffer_size_param=None):
-    """Initialize and setup the distributed store client."""
+def get_clients(stores, local_buffer_size_param=None):
+    """Initialize and setup the distributed store clients."""
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     base_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
@@ -27,41 +25,25 @@ def get_client(store, local_buffer_size_param=None):
     )
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
-    hostname1 = f"{base_hostname}:12345"
-    retcode = store.setup(
-        hostname1, 
-        metadata_server, 
-        segment_size,
-        local_buffer_size, 
-        protocol, 
-        device_name,
-        master_server_address
-    )
-    
-    if retcode:
-        raise RuntimeError(f"Failed to setup first segment. Return code: {retcode}")
-    
-    # Create additional segments with different hostnames to ensure
-    # we have multiple segments for replica testing (required for replica_num > 1)
-    hostname2 = f"{base_hostname}:12346"
-    additional_store = MooncakeDistributedStore()
-    retcode2 = additional_store.setup(
-        hostname2,
-        metadata_server,
-        segment_size,
-        local_buffer_size,
-        protocol,
-        device_name,
-        master_server_address
-    )
-    
-    if retcode2 != 0:
-        raise RuntimeError(f"Failed to setup second segment for replica testing. Return code: {retcode2}")
-    
-    # Keep reference to additional store so segments stay mounted
-    # Use global variable since we can't add attributes to C++ bound objects
-    global _additional_stores
-    _additional_stores.append(additional_store)
+    base_port = 12345
+    for i, store in enumerate(stores):
+        hostname = f"{base_hostname}:{base_port + i}"
+        retcode = store.setup(
+            hostname, 
+            metadata_server, 
+            segment_size,
+            local_buffer_size, 
+            protocol, 
+            device_name,
+            master_server_address
+        )
+        
+        if retcode:
+            raise RuntimeError(f"Failed to setup first segment. Return code: {retcode}")
+
+def get_client(store, local_buffer_size_param=None):
+    """Initialize and setup the distributed store client."""
+    return get_clients([store], local_buffer_size_param)
 
 class TestZeroLocalBufferSize(unittest.TestCase):
     """Test class for zero local buffer size scenarios."""
@@ -83,7 +65,9 @@ class TestZeroLocalBufferSize(unittest.TestCase):
         result = zero_buffer_store.is_exist(key)
         self.assertEqual(result, 0, "Key should not exist after failed put")
 
-class TestDistributedObjectStore(unittest.TestCase):
+class TestDistributedObjectStoreSingleStore(unittest.TestCase):
+    """Test class for single store operations (no replication)."""
+    
     @classmethod
     def setUpClass(cls):
         """Initialize the store once for all tests."""
@@ -593,6 +577,86 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
 
+    def test_batch_get_buffer_operations(self):
+        """Test batch_get_buffer operations for multiple keys."""
+        # Test data
+        test_data = [
+            b"Batch Buffer Data 1! " * 100,  # ~2.1KB
+            b"Batch Buffer Data 2! " * 200,  # ~4.2KB
+        ]
+        keys = ["test_batch_get_buffer_key1", "test_batch_get_buffer_key2"]
+
+        # First, put the test data using regular put operations
+        for key, data in zip(keys, test_data):
+            result = self.store.put(key, data)
+            self.assertEqual(result, 0, f"Failed to put data for key {key}")
+
+        # Test 1: Batch get two successful keys
+        results = self.store.batch_get_buffer(keys)
+
+        # Verify results
+        self.assertEqual(len(results), len(keys), "Should return result for each key")
+
+        for i, (expected_data, buffer) in enumerate(zip(test_data, results)):
+            self.assertIsNotNone(buffer, f"batch_get_buffer should succeed for key {keys[i]}")
+            self.assertEqual(buffer.size(), len(expected_data), f"Buffer size should match for key {keys[i]}")
+
+            # Verify data integrity using buffer protocol
+            buffer_data = bytes(buffer)
+            self.assertEqual(buffer_data, expected_data, f"Data should match for key {keys[i]}")
+
+        # Test 2: Batch get one successful key and one non-existent key
+        mixed_keys = [keys[0], "non_existent_key"]
+        mixed_results = self.store.batch_get_buffer(mixed_keys)
+
+        # Verify mixed results
+        self.assertEqual(len(mixed_results), len(mixed_keys), "Should return result for each key")
+
+        # First key should succeed
+        self.assertIsNotNone(mixed_results[0], "First key should exist")
+        self.assertEqual(mixed_results[0].size(), len(test_data[0]), "First buffer size should match")
+        buffer_data = bytes(mixed_results[0])
+        self.assertEqual(buffer_data, test_data[0], "First buffer data should match")
+
+        # Second key should fail (return None)
+        self.assertIsNone(mixed_results[1], "Second key should not exist")
+
+        # Test edge cases
+        # Test with empty keys list
+        empty_results = self.store.batch_get_buffer([])
+        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+
+        # Test with single existing key
+        single_result = self.store.batch_get_buffer([keys[0]])
+        self.assertEqual(len(single_result), 1, "Should return one result")
+        self.assertIsNotNone(single_result[0], "Single key should exist")
+
+        # Test with single non-existent key
+        non_existent_result = self.store.batch_get_buffer(["definitely_non_existent_key"])
+        self.assertEqual(len(non_existent_result), 1, "Should return one result")
+        self.assertIsNone(non_existent_result[0], "Non-existent key should return None")
+
+        # Cleanup
+        time.sleep(default_kv_lease_ttl / 1000)
+        for key in keys:
+            self.assertEqual(self.store.remove(key), 0)
+
+class TestDistributedObjectStoreReplication(unittest.TestCase):
+    """Test class for replication operations (multiple stores)."""
+    
+    @classmethod
+    def setUpClass(cls):
+        """Initialize the main store and additional stores for replication."""
+        cls.store = MooncakeDistributedStore()
+        
+        # Additional stores for replication testing
+        cls.additional_stores = []
+        cls.max_replicate_num = 2
+        for _ in range(cls.max_replicate_num - 1):  # -1 because main store is already created
+            cls.additional_stores.append(MooncakeDistributedStore())
+        
+        get_clients([cls.store] + cls.additional_stores)
+
     def test_put_with_config_parameter(self):
         """Test put method with config parameter."""
         from mooncake.store import ReplicateConfig
@@ -614,7 +678,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Test with custom config
         config = ReplicateConfig()
-        config.replica_num = 2
+        config.replica_num = self.max_replicate_num
         
         key2 = "test_put_config_key2"
         result = self.store.put(key=key2, value=test_data, config=config)
@@ -636,7 +700,6 @@ class TestDistributedObjectStore(unittest.TestCase):
             
         with self.assertRaises(TypeError):
             result = self.store.put(key=key, value=test_data, config_arg_name_error=config)
-
 
     def test_put_batch_with_config_parameter(self):
         """Test put_batch method with config parameter."""
@@ -661,7 +724,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Test with custom config
         config = ReplicateConfig()
-        config.replica_num = 2
+        config.replica_num = self.max_replicate_num
         
         keys2 = ["test_batch_config_key4", "test_batch_config_key5", "test_batch_config_key6"]
         result = self.store.put_batch(keys=keys2, values=values, config=config)
@@ -710,7 +773,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         # Test with custom config
         config = ReplicateConfig()
-        config.replica_num = 2
+        config.replica_num = self.max_replicate_num
         config.with_soft_pin = False
         
         key2 = "test_put_from_config_key2"
@@ -781,7 +844,7 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Test with custom config
         config = ReplicateConfig()
-        config.replica_num = 2
+        config.replica_num = self.max_replicate_num
         config.with_soft_pin = False
 
         keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]
@@ -801,69 +864,46 @@ class TestDistributedObjectStore(unittest.TestCase):
         for key in keys2:
             self.assertEqual(self.store.remove(key), 0)
 
-    def test_batch_get_buffer_operations(self):
-        """Test batch_get_buffer operations for multiple keys."""
-        # Test data
-        test_data = [
-            b"Batch Buffer Data 1! " * 100,  # ~2.1KB
-            b"Batch Buffer Data 2! " * 200,  # ~4.2KB
-        ]
-        keys = ["test_batch_get_buffer_key1", "test_batch_get_buffer_key2"]
+    def test_replication_failure_tolerance(self):
+        """Test that replicated data remains accessible after main store failure and reinit."""
+        from mooncake.store import ReplicateConfig
+        
+        test_data = b"Replicated failure tolerance test data!"
+        key = "test_replication_failure_key"
+        
+        # Create config with replication
+        config = ReplicateConfig()
+        config.replica_num = self.max_replicate_num
+        
+        # Put data with replication
+        result = self.store.put(key=key, value=test_data, config=config)
+        self.assertEqual(result, 0, "Put with replication should succeed")
+        
+        # Verify data is initially accessible
+        retrieved_data = self.store.get(key)
+        self.assertEqual(retrieved_data, test_data, "Data should be accessible after put")
+        
+        # Teardown the main store (simulate failure)
+        result = self.store.close()
+        self.assertEqual(result, 0, "Store teardown should succeed")
+        time.sleep(1)  # Allow time for teardown to complete
+        
+        # Verify data is still accessible from replica stores
+        # Since main store is down, read from one of the additional stores
+        replica_store = self.additional_stores[0]  # Use first replica
+        retrieved_data = replica_store.get(key)
+        self.assertEqual(retrieved_data, test_data, "Data should remain accessible from replica after main store teardown")
+        
+        # Reinitialize the main store
+        get_client(self.store)
+        
+        # Verify data is still accessible after main store reinit
+        retrieved_data = self.store.get(key)
+        self.assertEqual(retrieved_data, test_data, "Data should remain accessible after main store reinit")
 
-        # First, put the test data using regular put operations
-        for key, data in zip(keys, test_data):
-            result = self.store.put(key, data)
-            self.assertEqual(result, 0, f"Failed to put data for key {key}")
-
-        # Test 1: Batch get two successful keys
-        results = self.store.batch_get_buffer(keys)
-
-        # Verify results
-        self.assertEqual(len(results), len(keys), "Should return result for each key")
-
-        for i, (expected_data, buffer) in enumerate(zip(test_data, results)):
-            self.assertIsNotNone(buffer, f"batch_get_buffer should succeed for key {keys[i]}")
-            self.assertEqual(buffer.size(), len(expected_data), f"Buffer size should match for key {keys[i]}")
-
-            # Verify data integrity using buffer protocol
-            buffer_data = bytes(buffer)
-            self.assertEqual(buffer_data, expected_data, f"Data should match for key {keys[i]}")
-
-        # Test 2: Batch get one successful key and one non-existent key
-        mixed_keys = [keys[0], "non_existent_key"]
-        mixed_results = self.store.batch_get_buffer(mixed_keys)
-
-        # Verify mixed results
-        self.assertEqual(len(mixed_results), len(mixed_keys), "Should return result for each key")
-
-        # First key should succeed
-        self.assertIsNotNone(mixed_results[0], "First key should exist")
-        self.assertEqual(mixed_results[0].size(), len(test_data[0]), "First buffer size should match")
-        buffer_data = bytes(mixed_results[0])
-        self.assertEqual(buffer_data, test_data[0], "First buffer data should match")
-
-        # Second key should fail (return None)
-        self.assertIsNone(mixed_results[1], "Second key should not exist")
-
-        # Test edge cases
-        # Test with empty keys list
-        empty_results = self.store.batch_get_buffer([])
-        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
-
-        # Test with single existing key
-        single_result = self.store.batch_get_buffer([keys[0]])
-        self.assertEqual(len(single_result), 1, "Should return one result")
-        self.assertIsNotNone(single_result[0], "Single key should exist")
-
-        # Test with single non-existent key
-        non_existent_result = self.store.batch_get_buffer(["definitely_non_existent_key"])
-        self.assertEqual(len(non_existent_result), 1, "Should return one result")
-        self.assertIsNone(non_existent_result[0], "Non-existent key should return None")
-
-        # Cleanup
+        # Clean up
         time.sleep(default_kv_lease_ttl / 1000)
-        for key in keys:
-            self.assertEqual(self.store.remove(key), 0)
+        self.assertEqual(self.store.remove(key), 0)
 
 if __name__ == '__main__':
     unittest.main()
