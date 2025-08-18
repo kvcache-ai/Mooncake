@@ -958,11 +958,10 @@ TEST_F(MasterServiceTest, RemoveAll) {
 
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config =
-        MasterServiceConfig::builder()
-            .set_enable_gc(true)
-            .set_default_kv_lease_ttl(kv_lease_ttl)
-            .build();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_gc(true)
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 3 segments, each 64MB
