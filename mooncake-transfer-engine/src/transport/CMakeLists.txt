@@ -28,3 +28,6 @@ if (USE_MNNVL)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
+
+add_subdirectory(coro_rpc_transfer)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:coro_rpc_transfer>)
