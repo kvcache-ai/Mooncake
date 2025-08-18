@@ -21,11 +21,10 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
         segment_descs_.emplace_back(segment_desc);
     }
 
-    uint64_t gpu_source = segment_descs_[rank_]->buffers[0].addr;
-
     // Start worker thread
-    std::thread([this, gpu_source] {
+    std::thread([this] {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
+        int taskCount = 0;
         while (true) {
             _mm_pause();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -37,19 +36,19 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         TASK_IDLE) {
                         std::vector<TransferRequest> entries;
                         for (int j = 0; j < size_; ++j) {
-                            uint64_t source;
+                            uint64_t source = segment_descs_[rank_]
+                                                  ->buffers[taskCount % 2]
+                                                  .addr;
                             switch (task.opType) {
                                 case c10d::OpType::ALLREDUCE:
                                 case c10d::OpType::ALLGATHER:
                                 case c10d::OpType::_ALLGATHER_BASE:
-                                    source = gpu_source;
                                     break;
                                 case c10d::OpType::ALLTOALL_BASE:
                                 case c10d::OpType::ALLTOALL:
-                                    source = gpu_source + j * task.tensorSize;
+                                    source += j * task.tensorSize;
                                     break;
                                 default:
-                                    source = gpu_source;
                                     break;
                             }
                             entries.push_back(TransferRequest{
@@ -57,7 +56,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 .source = (void *)source,
                                 .target_id = segment_ids_[j],
                                 .target_offset =
-                                    segment_descs_[j]->buffers[1].addr +
+                                    segment_descs_[j]
+                                        ->buffers[2 + taskCount % 2]
+                                        .addr +
                                     rank_ * task.tensorSize,
                                 .length = task.tensorSize,
                             });
@@ -80,8 +81,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         if (!batch_done) {
                             break;
                         }
-                        auto source_ptr =
-                            (int32_t *)segment_descs_[rank_]->buffers[2].addr;
+                        auto source_ptr = (int32_t *)segment_descs_[rank_]
+                                              ->buffers[4 + taskCount % 2]
+                                              .addr;
                         std::vector<TransferRequest> entries;
                         for (int j = 0; j < size_; ++j) {
                             *source_ptr = 1;
@@ -90,7 +92,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 .source = (void *)source_ptr,
                                 .target_id = segment_ids_[j],
                                 .target_offset =
-                                    segment_descs_[j]->buffers[3].addr +
+                                    segment_descs_[j]
+                                        ->buffers[6 + taskCount % 2]
+                                        .addr +
                                     rank_ * sizeof(int32_t),
                                 .length = sizeof(int32_t),
                             });
@@ -102,8 +106,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     } else if (task_status[i].load(std::memory_order_acquire) ==
                                TASK_SIGNALED_1) {
                         bool all_received = true;
-                        auto signal_ptr =
-                            (int32_t *)segment_descs_[rank_]->buffers[3].addr;
+                        auto signal_ptr = (int32_t *)segment_descs_[rank_]
+                                              ->buffers[6 + taskCount % 2]
+                                              .addr;
                         for (int j = 0; j < size_; ++j) {
                             if (signal_ptr[j] != 1) {
                                 all_received = false;
@@ -117,6 +122,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             task_status[i].store(TASK_DONE,
                                                  std::memory_order_release);
                             task.status = DONE;
+                            ++taskCount;
                         }
                     }
                 }

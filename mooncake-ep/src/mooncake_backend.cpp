@@ -30,32 +30,46 @@ MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
                                   std::to_string(localRpcMeta.rpc_port);
 
     // Register GPU buffers
-    constexpr size_t buffer_size = 1u << 30;
-    err = cudaMalloc(&send_buffer_, buffer_size);
-    TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
-
+    constexpr size_t buffer_size = 1u << 29;
     std::string location = "cuda:" + std::to_string(device_id_);
-    int rc = engine_.registerLocalMemory(send_buffer_, buffer_size, location);
-    TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    for (size_t i = 0; i < 2; i++) {
+        err = cudaMalloc(&send_buffer_[i], buffer_size);
+        TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
-    err = cudaMalloc(&recv_buffer_, buffer_size);
-    TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
+        int rc =
+            engine_.registerLocalMemory(send_buffer_[i], buffer_size, location);
+        TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    }
 
-    rc = engine_.registerLocalMemory(recv_buffer_, buffer_size, location);
-    TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    for (size_t i = 0; i < 2; i++) {
+        err = cudaMalloc(&recv_buffer_[i], buffer_size);
+        TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
+
+        int rc =
+            engine_.registerLocalMemory(recv_buffer_[i], buffer_size, location);
+        TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    }
 
     // Register CPU sync regions
-    cpu_sync_send_region_ = new int32_t[MooncakeWorker::kNumTasks_ * size];
-    rc = engine_.registerLocalMemory(
-        cpu_sync_send_region_,
-        MooncakeWorker::kNumTasks_ * size * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    for (size_t i = 0; i < 2; i++) {
+        cpu_sync_send_region_[i] =
+            new int32_t[MooncakeWorker::kNumTasks_ * size];
+        int rc = engine_.registerLocalMemory(
+            cpu_sync_send_region_[i],
+            MooncakeWorker::kNumTasks_ * size * sizeof(int32_t),
+            kWildcardLocation);
+        TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    }
 
-    cpu_sync_recv_region_ = new int32_t[MooncakeWorker::kNumTasks_ * size];
-    rc = engine_.registerLocalMemory(
-        cpu_sync_recv_region_,
-        MooncakeWorker::kNumTasks_ * size * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    for (size_t i = 0; i < 2; i++) {
+        cpu_sync_recv_region_[i] =
+            new int32_t[MooncakeWorker::kNumTasks_ * size];
+        int rc = engine_.registerLocalMemory(
+            cpu_sync_recv_region_[i],
+            MooncakeWorker::kNumTasks_ * size * sizeof(int32_t),
+            kWildcardLocation);
+        TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
+    }
 
     // Sync metadata
     store->set("server_name_" + std::to_string(rank), localServerName);
@@ -69,14 +83,16 @@ MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
 }
 
 MooncakeBackend::~MooncakeBackend() {
-    engine_.unregisterLocalMemory(cpu_sync_send_region_);
-    delete[] cpu_sync_send_region_;
-    engine_.unregisterLocalMemory(cpu_sync_recv_region_);
-    delete[] cpu_sync_recv_region_;
-    engine_.unregisterLocalMemory(send_buffer_);
-    cudaFree(send_buffer_);
-    engine_.unregisterLocalMemory(recv_buffer_);
-    cudaFree(recv_buffer_);
+    for (size_t i = 0; i < 2; i++) {
+        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
+        delete[] cpu_sync_send_region_[i];
+        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
+        delete[] cpu_sync_recv_region_[i];
+        engine_.unregisterLocalMemory(send_buffer_[i]);
+        cudaFree(send_buffer_[i]);
+        engine_.unregisterLocalMemory(recv_buffer_[i]);
+        cudaFree(recv_buffer_[i]);
+    }
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }

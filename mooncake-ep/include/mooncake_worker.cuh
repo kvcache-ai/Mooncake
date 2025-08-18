@@ -47,6 +47,8 @@ class MooncakeWorker {
     TransferEngine* engine_;
     std::vector<TransferMetadata::SegmentID> segment_ids_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segment_descs_;
+
+    int taskCount = 0;
 };
 
 }  // namespace mooncake
