@@ -7,9 +7,9 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "config_helper.h"
 #include "master_service.h"
 #include "types.h"
+#include "master_config.h"
 
 namespace mooncake {
 

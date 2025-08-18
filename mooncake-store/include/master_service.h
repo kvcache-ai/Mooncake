@@ -21,7 +21,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "types.h"
-#include "config_helper.h"
+#include "master_config.h"
 
 namespace mooncake {
 // Forward declarations

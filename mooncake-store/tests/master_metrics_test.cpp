@@ -4,9 +4,10 @@
 #include <thread>
 #include <vector>
 
-#include "config_helper.h"
+
 #include "rpc_service.h"
 #include "types.h"
+#include "master_config.h"
 
 namespace mooncake::test {
 

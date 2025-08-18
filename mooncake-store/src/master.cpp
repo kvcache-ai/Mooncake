@@ -9,7 +9,8 @@
 #include "ha_helper.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "config_helper.h"
+
+#include "master_config.h"
 
 using namespace coro_rpc;
 using namespace async_simple;

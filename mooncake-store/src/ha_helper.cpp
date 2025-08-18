@@ -93,9 +93,7 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
 
 MasterServiceSupervisor::MasterServiceSupervisor(
     const MasterServiceSupervisorConfig& config)
-    : config_(config) {
-    config_.validate();
-}
+    : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
