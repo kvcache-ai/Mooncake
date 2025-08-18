@@ -86,7 +86,8 @@ class AscendDirectTransport : public Transport {
 
     int checkAndConnect(const std::string &target_adxl_engine_name);
 
-    int disconnect(const std::string &target_adxl_engine_name, int32_t timeout_in_millis);
+    int disconnect(const std::string &target_adxl_engine_name,
+                   int32_t timeout_in_millis);
 
     std::atomic_bool running_;
     std::unique_ptr<adxl::AdxlEngine> adxl_;
