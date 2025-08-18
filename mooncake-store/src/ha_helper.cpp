@@ -100,9 +100,9 @@ MasterServiceSupervisor::MasterServiceSupervisor(
 int MasterServiceSupervisor::Start() {
     while (true) {
         LOG(INFO) << "Init master service...";
-        coro_rpc::coro_rpc_server server(config_.rpc_thread_num, config_.rpc_port,
-                                         config_.rpc_address, config_.rpc_conn_timeout,
-                                         config_.rpc_enable_tcp_no_delay);
+        coro_rpc::coro_rpc_server server(
+            config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
+            config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
         LOG(INFO) << "Init leader election helper...";
         MasterViewHelper mv_helper;
         if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {

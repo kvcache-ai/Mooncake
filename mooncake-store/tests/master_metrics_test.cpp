@@ -93,7 +93,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.enable_gc = false;
-    service_config.default_kv_lease_ttl = default_kv_lease_ttl;   
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;

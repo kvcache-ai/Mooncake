@@ -332,7 +332,8 @@ int main(int argc, char* argv[]) {
               << ", memory_allocator=" << master_config.memory_allocator;
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisor supervisor(mooncake::MasterServiceSupervisorConfig{master_config});
+        mooncake::MasterServiceSupervisor supervisor(
+            mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value

@@ -30,7 +30,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
-                    << "current value: " << eviction_ratio_;
+                   << "current value: " << eviction_ratio_;
         throw std::invalid_argument("Invalid eviction ratio");
     }
     if (eviction_high_watermark_ratio_ < 0.0 ||
@@ -1006,8 +1006,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

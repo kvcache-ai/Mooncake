@@ -12,81 +12,74 @@ namespace mooncake {
 class MasterServiceConfig;
 
 /**
- * @brief A template class that wraps std::optional to provide configurable variables
- *        with setter/getter functionality and exception handling for unset values.
+ * @brief A template class that wraps std::optional to provide configurable
+ * variables with setter/getter functionality and exception handling for unset
+ * values.
  * @tparam T The type of the configurable variable
  */
- template<typename T>
- class RequiredParam {
- private:
-     std::optional<T> value_;
- 
- public:
-     RequiredParam() = default;
-     
-     /**
-      * @brief Assignment operator to set the value
-      * @param value The value to set
-      * @return Reference to this object
-      */
-     RequiredParam& operator=(const T& value) {
-         value_ = value;
-         return *this;
-     }
-     
-     /**
-      * @brief Set the value of the config variable
-      * @param value The value to set
-      */
-     void Set(const T& value) {
-         value_ = value;
-     }
-     
-     /**
-      * @brief Get the value of the config variable
-      * @return The stored value
-      * @throws std::runtime_error if the value has not been set
-      */
-     T Get() const {
-         if (!value_.has_value()) {
-             throw std::runtime_error("RequiredParam value has not been set");
-         }
-         return value_.value();
-     }
-     
-     /**
-      * @brief Implicit conversion operator to type T
-      * @return The stored value
-      * @throws std::runtime_error if the value has not been set
-      */
-     operator T() const {
-         return Get();
-     }
-     
-     /**
-      * @brief Check if the value has been set
-      * @return true if the value is set, false otherwise
-      */
-     bool IsSet() const {
-         return value_.has_value();
-     }
-     
-     /**
-      * @brief Get the value if set, otherwise return a default value
-      * @param default_value The default value to return if not set
-      * @return The stored value or the default value
-      */
-     T GetOrDefault(const T& default_value) const {
-         return value_.value_or(default_value);
-     }
-     
-     /**
-      * @brief Clear the stored value
-      */
-     void Clear() {
-         value_.reset();
-     }
- };
+template <typename T>
+class RequiredParam {
+   private:
+    std::optional<T> value_;
+
+   public:
+    RequiredParam() = default;
+
+    /**
+     * @brief Assignment operator to set the value
+     * @param value The value to set
+     * @return Reference to this object
+     */
+    RequiredParam& operator=(const T& value) {
+        value_ = value;
+        return *this;
+    }
+
+    /**
+     * @brief Set the value of the config variable
+     * @param value The value to set
+     */
+    void Set(const T& value) { value_ = value; }
+
+    /**
+     * @brief Get the value of the config variable
+     * @return The stored value
+     * @throws std::runtime_error if the value has not been set
+     */
+    T Get() const {
+        if (!value_.has_value()) {
+            throw std::runtime_error("RequiredParam value has not been set");
+        }
+        return value_.value();
+    }
+
+    /**
+     * @brief Implicit conversion operator to type T
+     * @return The stored value
+     * @throws std::runtime_error if the value has not been set
+     */
+    operator T() const { return Get(); }
+
+    /**
+     * @brief Check if the value has been set
+     * @return true if the value is set, false otherwise
+     */
+    bool IsSet() const { return value_.has_value(); }
+
+    /**
+     * @brief Get the value if set, otherwise return a default value
+     * @param default_value The default value to return if not set
+     * @return The stored value or the default value
+     */
+    T GetOrDefault(const T& default_value) const {
+        return value_.value_or(default_value);
+    }
+
+    /**
+     * @brief Clear the stored value
+     */
+    void Clear() { value_.reset(); }
+};
 
 // The configuration for the master server
 struct MasterConfig {
@@ -141,31 +134,33 @@ class MasterServiceSupervisorConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     MasterServiceSupervisorConfig() = default;
-    
+
     // From MasterConfig
-    MasterServiceSupervisorConfig (const MasterConfig& config) {
+    MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
         enable_gc = config.enable_gc;
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects = config.allow_evict_soft_pinned_objects;
+        allow_evict_soft_pinned_objects =
+            config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
-        
+
         // Set optional parameters (these have default values)
         rpc_address = config.rpc_address;
-        rpc_conn_timeout = std::chrono::seconds(config.rpc_conn_timeout_seconds);
+        rpc_conn_timeout =
+            std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
-        
+
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
             memory_allocator = BufferAllocatorType::CACHELIB;
@@ -174,9 +169,9 @@ class MasterServiceSupervisorConfig {
         }
     }
 
-    // Some of the parameters are not used in constructor but will be used in the future.
-    // So we need to validate them at the beginning of the program to avoid unexpected errors
-    // in the future.
+    // Some of the parameters are not used in constructor but will be used in
+    // the future. So we need to validate them at the beginning of the program
+    // to avoid unexpected errors in the future.
     void validate() const {
         // Validate that all required parameters are set
         if (!enable_gc.IsSet()) {
@@ -195,13 +190,15 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error("default_kv_soft_pin_ttl is not set");
         }
         if (!allow_evict_soft_pinned_objects.IsSet()) {
-            throw std::runtime_error("allow_evict_soft_pinned_objects is not set");
+            throw std::runtime_error(
+                "allow_evict_soft_pinned_objects is not set");
         }
         if (!eviction_ratio.IsSet()) {
             throw std::runtime_error("eviction_ratio is not set");
         }
         if (!eviction_high_watermark_ratio.IsSet()) {
-            throw std::runtime_error("eviction_high_watermark_ratio is not set");
+            throw std::runtime_error(
+                "eviction_high_watermark_ratio is not set");
         }
         if (!client_live_ttl_sec.IsSet()) {
             throw std::runtime_error("client_live_ttl_sec is not set");
@@ -220,14 +217,16 @@ class WrappedMasterServiceConfig {
     // Required parameters (no default values) - using RequiredParam
     RequiredParam<bool> enable_gc;
     RequiredParam<uint64_t> default_kv_lease_ttl;
-    
+
     // Optional parameters (with default values)
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-    bool allow_evict_soft_pinned_objects = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool allow_evict_soft_pinned_objects =
+        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
-    double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
@@ -238,7 +237,8 @@ class WrappedMasterServiceConfig {
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
-    WrappedMasterServiceConfig (const MasterConfig& config, ViewVersionId view_version_param) {
+    WrappedMasterServiceConfig(const MasterConfig& config,
+                               ViewVersionId view_version_param) {
         // Set required parameters using RequiredParam
         enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
@@ -266,14 +266,16 @@ class WrappedMasterServiceConfig {
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
-    WrappedMasterServiceConfig(const MasterServiceSupervisorConfig& config, ViewVersionId view_version_param) {
+    WrappedMasterServiceConfig(const MasterServiceSupervisorConfig& config,
+                               ViewVersionId view_version_param) {
         // Set required parameters using assignment operator
         enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
-    
+
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects = config.allow_evict_soft_pinned_objects;
+        allow_evict_soft_pinned_objects =
+            config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
@@ -290,13 +292,15 @@ class WrappedMasterServiceConfig {
 
 // Builder class for MasterServiceConfig
 class MasterServiceConfigBuilder {
-private:
+   private:
     bool enable_gc_ = true;
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
-    bool allow_evict_soft_pinned_objects_ = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool allow_evict_soft_pinned_objects_ =
+        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
-    double eviction_high_watermark_ratio_ = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double eviction_high_watermark_ratio_ =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
@@ -304,7 +308,7 @@ private:
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
 
-public:
+   public:
     MasterServiceConfigBuilder() = default;
 
     MasterServiceConfigBuilder& set_enable_gc(bool enable_gc) {
@@ -322,7 +326,8 @@ public:
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(bool allow) {
+    MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
+        bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
         return *this;
     }
@@ -332,7 +337,8 @@ public:
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+    MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
+        double ratio) {
         eviction_high_watermark_ratio_ = ratio;
         return *this;
     }
@@ -362,7 +368,8 @@ public:
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_memory_allocator(BufferAllocatorType allocator) {
+    MasterServiceConfigBuilder& set_memory_allocator(
+        BufferAllocatorType allocator) {
         memory_allocator_ = allocator;
         return *this;
     }
@@ -375,9 +382,11 @@ class MasterServiceConfig {
     bool enable_gc = true;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-    bool allow_evict_soft_pinned_objects = DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool allow_evict_soft_pinned_objects =
+        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
-    double eviction_high_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
@@ -392,7 +401,8 @@ class MasterServiceConfig {
         enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects = config.allow_evict_soft_pinned_objects;
+        allow_evict_soft_pinned_objects =
+            config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = config.view_version;
@@ -406,7 +416,6 @@ class MasterServiceConfig {
     // Static factory method to create a builder
     static MasterServiceConfigBuilder builder();
 };
- 
 
 // Implementation of MasterServiceConfigBuilder::build()
 inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
@@ -431,4 +440,4 @@ inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
     return MasterServiceConfigBuilder();
 }
 
-} // namespace mooncake
+}  // namespace mooncake
