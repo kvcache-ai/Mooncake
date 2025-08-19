@@ -651,7 +651,8 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(VECTOR_MAX_SIZE);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
+        VECTOR_MAX_SIZE);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
     remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
@@ -663,7 +664,8 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
                    << ", remote_rank: " << remote_rank_info->devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(actualNumOfRemote);
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(
+        actualNumOfRemote);
     for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
@@ -1026,7 +1028,8 @@ int transportMemAccept(RankInfo *local_rank_info) {
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(VECTOR_MAX_SIZE);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
+        VECTOR_MAX_SIZE);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
     remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
@@ -1038,7 +1041,8 @@ int transportMemAccept(RankInfo *local_rank_info) {
                    << ", remote_rank: " << remote_control_info.devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(actualNumOfRemote);
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(
+        actualNumOfRemote);
     for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
