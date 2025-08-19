@@ -433,12 +433,11 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
                                       slice_sizes, config);
     // With best-effort semantics, should succeed with available replicas
     EXPECT_TRUE(result.has_value());
-    auto replicas = result.value();
     // Should get 2 replicas (limited by number of segments)
-    EXPECT_EQ(2u, replicas.size());
+    EXPECT_EQ(2u, result.value().size());
 
     // Verify each replica has the expected slice structure
-    for (const auto& replica : replicas) {
+    for (const auto& replica : result.value()) {
         auto descriptor = replica.get_descriptor();
         ASSERT_TRUE(descriptor.is_memory_replica());
         const auto& mem_desc = descriptor.get_memory_descriptor();
@@ -448,7 +447,7 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
 
     // Verify replicas are on different segments
     std::unordered_set<std::string> segment_names;
-    for (const auto& replica : replicas) {
+    for (const auto& replica : result.value()) {
         auto descriptor = replica.get_descriptor();
         const auto& mem_desc = descriptor.get_memory_descriptor();
         segment_names.insert(mem_desc.buffer_descriptors[0].segment_name_);
