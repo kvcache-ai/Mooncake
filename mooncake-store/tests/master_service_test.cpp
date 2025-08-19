@@ -2161,14 +2161,25 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     // Request replication factor 2 with a single 1KB slice
+    // With best-effort semantics, should succeed with 1 replica
     const std::string key = "replication_factor_two_single_segment";
     std::vector<uint64_t> slice_lengths{1024};
     ReplicateConfig config;
     config.replica_num = 2;
 
     auto put_start_result = service_->PutStart(key, slice_lengths, config);
-    ASSERT_FALSE(put_start_result.has_value());
-    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
+    ASSERT_TRUE(put_start_result.has_value());
+    auto replicas = put_start_result.value();
+
+    // Should get 1 replica instead of the requested 2 (best-effort)
+    EXPECT_EQ(1u, replicas.size());
+    EXPECT_TRUE(replicas[0].is_memory_replica());
+
+    // Verify the replica is properly allocated on the single segment
+    auto mem_desc = replicas[0].get_memory_descriptor();
+    EXPECT_EQ(1u, mem_desc.buffer_descriptors.size());
+    EXPECT_EQ("single_segment", mem_desc.buffer_descriptors[0].segment_name_);
+    EXPECT_EQ(1024u, mem_desc.buffer_descriptors[0].size_);
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {

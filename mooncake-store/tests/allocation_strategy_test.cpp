@@ -407,7 +407,8 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-// Test insufficient allocators for requested replica count
+// Test best-effort behavior when insufficient allocators for requested replica
+// count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 =
         CreateTestAllocator("segment1", 0, BufferAllocatorType::OFFSET);
@@ -430,8 +431,29 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
                                       slice_sizes, config);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    // With best-effort semantics, should succeed with available replicas
+    EXPECT_TRUE(result.has_value());
+    auto replicas = result.value();
+    // Should get 2 replicas (limited by number of segments)
+    EXPECT_EQ(2u, replicas.size());
+
+    // Verify each replica has the expected slice structure
+    for (const auto& replica : replicas) {
+        auto descriptor = replica.get_descriptor();
+        ASSERT_TRUE(descriptor.is_memory_replica());
+        const auto& mem_desc = descriptor.get_memory_descriptor();
+        ASSERT_EQ(mem_desc.buffer_descriptors.size(), 1u);
+        EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 1024u);
+    }
+
+    // Verify replicas are on different segments
+    std::unordered_set<std::string> segment_names;
+    for (const auto& replica : replicas) {
+        auto descriptor = replica.get_descriptor();
+        const auto& mem_desc = descriptor.get_memory_descriptor();
+        segment_names.insert(mem_desc.buffer_descriptors[0].segment_name_);
+    }
+    EXPECT_EQ(2u, segment_names.size());
 }
 
 }  // namespace mooncake

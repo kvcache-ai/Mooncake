@@ -18,27 +18,40 @@ namespace mooncake {
  * @brief Abstract interface for allocation strategy, responsible for
  *        allocating multiple slices across multiple replicas using available
  *        BufferAllocators.
+ *
+ * The allocation strategy follows best-effort semantics: if the requested
+ * number of replicas cannot be fully satisfied due to resource constraints,
+ * it will allocate as many replicas as possible rather than failing entirely.
+ * Only returns an error if no replicas can be allocated at all.
  */
 class AllocationStrategy {
    public:
     virtual ~AllocationStrategy() = default;
 
     /**
-     * @brief Allocates multiple slices across the requested number of replicas.
-     *        Each replica will contain all requested slices.
+     * @brief Allocates multiple slices across the requested number of replicas
+     *        using best-effort semantics. Each replica will contain all
+     *        requested slices.
+     *
+     * The allocation follows best-effort semantics: if the full requested
+     * replica count cannot be satisfied, the method will allocate as many
+     * replicas as possible across different segments. For each slice, replicas
+     * are guaranteed to be placed on different segments to ensure redundancy.
      *
      * @param allocators Container of mounted allocators
      * @param allocators_by_name Container of mounted allocators, key is
      *                          segment_name, value is the corresponding
-     * allocators
+     *                          allocators
      * @param slice_sizes Sizes of slices to be allocated in each replica
      * @param config Replica configuration containing number of replicas and
      *               placement constraints
      * @return tl::expected<std::vector<Replica>, ErrorCode> containing
-     * allocated replicas.
-     *         - On success: vector of allocated replicas
-     *         - On failure: ErrorCode (NO_AVAILABLE_HANDLE for allocation
-     * failure, INVALID_PARAMS for invalid configuration)
+     *         allocated replicas.
+     *         - On success: vector of allocated replicas (may be fewer than
+     *           requested due to resource constraints, but at least 1)
+     *         - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can
+     *           be allocated, ErrorCode::INVALID_PARAMS for invalid
+     *           configuration
      */
     virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
@@ -51,10 +64,17 @@ class AllocationStrategy {
 
 /**
  * @brief Random batch allocation strategy with local preference and
- *        replication guarantees support.
+ *        replication guarantees support using best-effort semantics.
  *
  * This strategy ensures that for each slice, its replicas are placed in
  * different segments. Different slices may use the same segments.
+ *
+ * Best-effort behavior:
+ * - Attempts to allocate the requested number of replicas
+ * - If insufficient segments are available, allocates as many replicas as
+ *   possible (limited by the number of available segments)
+ * - Only fails if no replicas can be allocated at all
+ * - Preferred segment allocation is attempted first if specified
  */
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
@@ -77,23 +97,32 @@ class RandomAllocationStrategy : public AllocationStrategy {
             replica_buffer.reserve(slice_sizes.size());
         }
 
+        // Track the actual number of replicas we can allocate
+        size_t actual_replica_count = config.replica_num;
+
         // Allocate each slice across replicas
         for (size_t slice_idx = 0; slice_idx < slice_sizes.size();
              ++slice_idx) {
             auto slice_replicas = allocateSlice(allocators, allocators_by_name,
                                                 slice_sizes[slice_idx],
-                                                config.replica_num, config);
+                                                actual_replica_count, config);
 
             if (slice_replicas.empty()) {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-            } else if (slice_replicas.size() != config.replica_num) {
-                // NOTE: replica allocation is best effort
-                LOG(WARNING) << "Failed to allocate all replicas for slice "
-                             << slice_idx << ", only " << slice_replicas.size()
-                             << " replicas allocated";
             }
 
-            for (size_t replica_idx = 0; replica_idx < config.replica_num;
+            if (slice_replicas.size() < actual_replica_count) {
+                actual_replica_count = slice_replicas.size();
+                // NOTE: replica allocation is best effort
+                LOG(WARNING)
+                    << "Failed to allocate all replicas for slice " << slice_idx
+                    << ", reducing replica count to " << actual_replica_count;
+
+                // Resize replica_buffers to match the new count
+                replica_buffers.resize(actual_replica_count);
+            }
+
+            for (size_t replica_idx = 0; replica_idx < actual_replica_count;
                  ++replica_idx) {
                 replica_buffers[replica_idx].push_back(
                     std::move(slice_replicas[replica_idx]));
@@ -101,8 +130,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         std::vector<Replica> replicas;
-        replicas.reserve(config.replica_num);
-        for (size_t replica_idx = 0; replica_idx < config.replica_num;
+        replicas.reserve(actual_replica_count);
+        for (size_t replica_idx = 0; replica_idx < actual_replica_count;
              ++replica_idx) {
             replicas.emplace_back(std::move(replica_buffers[replica_idx]),
                                   ReplicaStatus::PROCESSING);
