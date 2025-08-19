@@ -10,7 +10,6 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
-#include "error_code.h"
 #include "types.h"
 
 namespace mooncake {
@@ -42,9 +41,9 @@ class AllocationStrategy {
      * failure, INVALID_PARAMS for invalid configuration)
      */
     virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase> > >&
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         const std::vector<size_t>& slice_sizes,
         const ReplicateConfig& config) = 0;
@@ -62,9 +61,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase> > >&
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         const std::vector<size_t>& slice_sizes, const ReplicateConfig& config) {
         if (auto validation_error =
@@ -72,7 +71,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(*validation_error);
         }
 
-        std::vector<std::vector<std::unique_ptr<AllocatedBuffer> > >
+        std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
             replica_buffers(config.replica_num);
         for (auto& replica_buffer : replica_buffers) {
             replica_buffer.reserve(slice_sizes.size());
@@ -85,8 +84,13 @@ class RandomAllocationStrategy : public AllocationStrategy {
                                                 slice_sizes[slice_idx],
                                                 config.replica_num, config);
 
-            if (slice_replicas.size() != config.replica_num) {
+            if (slice_replicas.empty()) {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            } else if (slice_replicas.size() != config.replica_num) {
+                // NOTE: replica allocation is best effort
+                LOG(WARNING) << "Failed to allocate all replicas for slice "
+                             << slice_idx << ", only " << slice_replicas.size()
+                             << " replicas allocated";
             }
 
             for (size_t replica_idx = 0; replica_idx < config.replica_num;
@@ -124,14 +128,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
     /**
      * @brief Allocates replicas for a single slice across different segments
      */
-    std::vector<std::unique_ptr<AllocatedBuffer> > allocateSlice(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase> > >&
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t slice_size, size_t replica_num, const ReplicateConfig& config,
         std::unordered_set<std::string>& used_segments) {
-        std::vector<std::unique_ptr<AllocatedBuffer> > buffers;
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
         buffers.reserve(replica_num);
 
         for (size_t i = 0; i < replica_num; ++i) {
@@ -150,10 +154,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return buffers;
     }
 
-    std::vector<std::unique_ptr<AllocatedBuffer> > allocateSlice(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase> > >&
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t slice_size, size_t replica_num, const ReplicateConfig& config) {
         std::unordered_set<std::string> empty_segments;
@@ -165,9 +169,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
      * @brief Allocates a single buffer respecting preferences and exclusions
      */
     std::unique_ptr<AllocatedBuffer> allocateSingleBuffer(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase> > >&
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t size, const ReplicateConfig& config,
         const std::unordered_set<std::string>& excluded_segments) {
@@ -192,7 +196,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
      * @brief Attempts allocation with random selection
      */
     std::unique_ptr<AllocatedBuffer> tryRandomAllocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase> >& allocators,
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         size_t size, const std::unordered_set<std::string>& excluded_segments) {
         std::vector<size_t> eligible_indices;
         eligible_indices.reserve(allocators.size());
