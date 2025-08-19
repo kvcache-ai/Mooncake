@@ -40,7 +40,6 @@ extern "C" {
 #define CONNECT_MAX 1000
 #define RETRY_TIMES 3
 #define VECTOR_RESERVE_SIZE 200
-#define VECTOR_MAX_SIZE 8192
 
 HcclNetDevCtx vnicNetDevCtx_{nullptr};
 HcclNetDevCtx nicNetDevCtx_{nullptr};
@@ -58,6 +57,15 @@ struct epoll_event g_events[MAX_EVENTS];
 bool printEnabled() {
     char *env = getenv("ASCEND_TRANSPORT_PRINT");
     return env != nullptr && std::string(env) == "1";
+}
+
+int getMaxRegMemoryNum() {
+    static const int g_default_max_reg_memory_num = 8192;
+    static char *env = getenv("ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM");
+    if (env != nullptr) {
+        return std::stoi(env);
+    }
+    return g_default_max_reg_memory_num;
 }
 
 uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
@@ -647,15 +655,26 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
             }
         }
     }
+
+    int max_m_num = getMaxRegMemoryNum();
+    if (m_num >= max_m_num) {
+        LOG(ERROR) << "The number of registered memory exceeds the expected "
+                      "maximum size "
+                   << max_m_num
+                   << ". To resolve this issue, you can increase the maximum "
+                      "size by setting the environment variable "
+                      "ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM.";
+        return -1;
+    }
     hccl::TransportMem::RmaMemDescs localRmaMemDescs;
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
     std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
-        VECTOR_MAX_SIZE);
+        max_m_num);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
+    remoteRmaMemDescs.arrayLength = max_m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
@@ -1024,15 +1043,26 @@ int transportMemAccept(RankInfo *local_rank_info) {
             }
         }
     }
+
+    size_t max_m_num = getMaxRegMemoryNum();
+    if (m_num >= max_m_num) {
+        LOG(ERROR) << "The number of registered memory exceeds the expected "
+                      "maximum size "
+                   << max_m_num
+                   << ". To resolve this issue, you can increase the maximum "
+                      "size by setting the environment variable "
+                      "ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM.";
+        return -1;
+    }
     hccl::TransportMem::RmaMemDescs localRmaMemDescs;
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
     std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
-        VECTOR_MAX_SIZE);
+        max_m_num);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
+    remoteRmaMemDescs.arrayLength = max_m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
