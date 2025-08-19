@@ -20,6 +20,10 @@ endif()
 
 if (WITH_EP)
     include_directories("../mooncake-ep/include")
+
+    find_package(Torch REQUIRED)
+    # https://github.com/pytorch/pytorch/issues/108041
+    find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 endif()
 
 include_directories("/usr/include/jsoncpp")
@@ -71,7 +75,7 @@ if (WITH_EP)
         ep/ep_py.cpp
         integration_utils.h
     )
-    target_link_libraries(ep PUBLIC mooncake_ep)
+    target_link_libraries(ep PUBLIC mooncake_ep ${TORCH_PYTHON_LIBRARY})
 endif ()
 
 message("${PYTHON_SYS_PATH}")

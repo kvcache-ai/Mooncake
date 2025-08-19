@@ -15,13 +15,18 @@ constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 
-MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
-                                 int rank, int size,
-                                 c10::intrusive_ptr<Options> options)
+MooncakeBackend::MooncakeBackend(
+    c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    c10::intrusive_ptr<MooncakeBackendOptions> options)
     : Backend(rank, size), worker_(&engine_, rank, size) {
     // Get device data
     cudaError err = cudaGetDevice(&device_id_);
     TORCH_CHECK(!err, c10::str("Failed to get device id"));
+
+    // Store broken ranks
+    if (options) {
+        brokenRanks_ = options->brokenRanks_;
+    }
 
     // Initialize transfer engine
     engine_.init(P2PHANDSHAKE, hostIp_);

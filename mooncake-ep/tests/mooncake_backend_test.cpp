@@ -15,12 +15,12 @@ class MooncakeBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
         auto store = c10::make_intrusive<::c10d::HashStore>();
-        auto options =
-            c10::make_intrusive<::c10d::Backend::Options>("mooncake");
         std::thread threads[kNumRanks];
         for (size_t rank = 0; rank < kNumRanks; ++rank) {
-            threads[rank] = std::thread([this, store, rank, options] {
+            threads[rank] = std::thread([this, store, rank] {
                 cudaSetDevice(rank);
+                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
+                    options;
                 backends[rank].reset(
                     new MooncakeBackend(store, rank, kNumRanks, options));
             });

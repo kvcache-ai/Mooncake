@@ -10,8 +10,17 @@ namespace mooncake {
 
 class MooncakeBackend final : public ::c10d::Backend {
    public:
+    struct MooncakeBackendOptions final : ::c10d::Backend::Options {
+        explicit MooncakeBackendOptions(at::Tensor brokenRanks)
+            : Options{"mooncake"}, brokenRanks_{brokenRanks} {}
+
+        ~MooncakeBackendOptions() override = default;
+
+        at::Tensor brokenRanks_;
+    };
+
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
-                    c10::intrusive_ptr<Options> options);
+                    c10::intrusive_ptr<MooncakeBackendOptions> options);
 
     ~MooncakeBackend() override;
 
@@ -39,6 +48,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     TransferEngine engine_{true};
+    at::Tensor brokenRanks_;
     static std::string hostIp_;
     int device_id_;
     void* send_buffer_[2];
