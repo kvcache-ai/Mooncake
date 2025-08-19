@@ -40,6 +40,7 @@ extern "C" {
 #define CONNECT_MAX 1000
 #define RETRY_TIMES 3
 #define VECTOR_RESERVE_SIZE 200
+#define VECTOR_MAX_SIZE 8192
 
 HcclNetDevCtx vnicNetDevCtx_{nullptr};
 HcclNetDevCtx nicNetDevCtx_{nullptr};
@@ -650,10 +651,10 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(m_num);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(VECTOR_MAX_SIZE);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = m_num;
+    remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
@@ -662,8 +663,8 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
                    << ", remote_rank: " << remote_rank_info->devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
-    for (uint32_t i = 0; i < m_num; ++i) {
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(actualNumOfRemote);
+    for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
         if (ret) {
@@ -1025,10 +1026,10 @@ int transportMemAccept(RankInfo *local_rank_info) {
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(m_num);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(VECTOR_MAX_SIZE);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = m_num;
+    remoteRmaMemDescs.arrayLength = VECTOR_MAX_SIZE;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
@@ -1037,8 +1038,8 @@ int transportMemAccept(RankInfo *local_rank_info) {
                    << ", remote_rank: " << remote_control_info.devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
-    for (uint32_t i = 0; i < m_num; ++i) {
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(actualNumOfRemote);
+    for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
         if (ret) {
