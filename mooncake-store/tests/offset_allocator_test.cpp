@@ -320,7 +320,7 @@ class OffsetAllocatorTest : public ::testing::Test {
         return true;
     }
 
-    void testSerializeAllocator(const std::shared_ptr<OffsetAllocator>& alloc_a) {
+    void testSerializeAllocator(const std::shared_ptr<OffsetAllocator>& alloc_a, const std::vector<OffsetAllocationHandle> &handles) {
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<uint32> size_dist(1,
@@ -355,9 +355,17 @@ class OffsetAllocatorTest : public ::testing::Test {
 
         // Add a byte to the buffer and try to deserialize
         corrupted_buffer = buffer;
-        buffer.push_back(0);
-        alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        corrupted_buffer.push_back(0);
+        alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
+
+        // Test if the deserialized allocator can properly free allocated objects.
+        alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        ASSERT_TRUE(alloc_b != nullptr);
+        for (const auto& handle : handles) {
+            OffsetAllocationHandle handle_copy(alloc_b, handle.m_allocation, handle.real_base, handle.requested_size);
+        }
+
     }
 };
 
@@ -1322,7 +1330,7 @@ TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
     const uint32_t max_capacity = 10000;
     std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
     // test
-    testSerializeAllocator(alloc_a);
+    testSerializeAllocator(alloc_a, {});
 }
 
 TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
@@ -1336,7 +1344,9 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     auto handle = alloc_a->allocate(1024);
     ASSERT_TRUE(handle.has_value());
     // test
-    testSerializeAllocator(alloc_a);
+    std::vector<OffsetAllocationHandle> handles;
+    handles.push_back(std::move(*handle));
+    testSerializeAllocator(alloc_a, handles);
 }
 
 TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
@@ -1380,7 +1390,7 @@ TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
             alloc_sizes.push_back(test_size);
         }
         // test
-        testSerializeAllocator(alloc_a);
+        testSerializeAllocator(alloc_a, handles);
     }
 }
 

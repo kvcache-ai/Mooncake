@@ -95,6 +95,8 @@ class OffsetAllocationHandle {
     // The real base and requested size of the allocated memory.
     uint64_t real_base;
     uint64_t requested_size;
+
+    friend class OffsetAllocatorTest;  // for unit tests
 };
 
 struct OffsetAllocatorMetrics {
