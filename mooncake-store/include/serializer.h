@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <glog/logging.h>
 
-#include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
 namespace mooncake {
@@ -97,7 +96,7 @@ class SerializerReader {
 };
 
 template <typename T>
-[[nodiscard]] ErrorCode serialize_to(std::shared_ptr<T>& target,
+[[nodiscard]] ErrorCode serialize_to(const std::shared_ptr<T>& target,
                                      std::vector<SerializedByte>& buffer) {
     if (target == nullptr) {
         return ErrorCode::INVALID_PARAMS;

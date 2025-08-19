@@ -244,7 +244,7 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void TearDown() override {}
 
-    void cmpAllocator(const std::shared_ptr<OffsetAllocator>& a,
+    void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
                       const std::shared_ptr<OffsetAllocator>& b) {
         // Compare basic member variables
         ASSERT_EQ(a->m_base, b->m_base);
@@ -285,6 +285,79 @@ class OffsetAllocatorTest : public ::testing::Test {
         for (uint32 i = 0; i < a->m_allocator->m_current_capacity; ++i) {
             ASSERT_EQ(a->m_allocator->m_freeNodes[i], b->m_allocator->m_freeNodes[i]);
         }
+    }
+
+    // Compare two allocators bytes by bytes to detect one bit difference.
+    bool isAllocatorEqual(const std::shared_ptr<OffsetAllocator>& a,
+                          const std::shared_ptr<OffsetAllocator>& b) {
+        // Compare basic member variables
+        if (memcmp(&a->m_base, &b->m_base, sizeof(a->m_base)) != 0) return false;
+        if (memcmp(&a->m_multiplier_bits, &b->m_multiplier_bits, sizeof(a->m_multiplier_bits)) != 0) return false;
+        if (memcmp(&a->m_capacity, &b->m_capacity, sizeof(a->m_capacity)) != 0) return false;
+        if (memcmp(&a->m_allocated_size, &b->m_allocated_size, sizeof(a->m_allocated_size)) != 0) return false;
+        if (memcmp(&a->m_allocated_num, &b->m_allocated_num, sizeof(a->m_allocated_num)) != 0) return false;
+        
+        // Compare __Allocator member variables
+        if (memcmp(&a->m_allocator->m_size, &b->m_allocator->m_size, sizeof(a->m_allocator->m_size)) != 0) return false;
+        if (memcmp(&a->m_allocator->m_current_capacity, &b->m_allocator->m_current_capacity, sizeof(a->m_allocator->m_current_capacity)) != 0) return false;
+        if (memcmp(&a->m_allocator->m_max_capacity, &b->m_allocator->m_max_capacity, sizeof(a->m_allocator->m_max_capacity)) != 0) return false;
+        if (memcmp(&a->m_allocator->m_freeStorage, &b->m_allocator->m_freeStorage, sizeof(a->m_allocator->m_freeStorage)) != 0) return false;
+        if (memcmp(&a->m_allocator->m_usedBinsTop, &b->m_allocator->m_usedBinsTop, sizeof(a->m_allocator->m_usedBinsTop)) != 0) return false;
+        if (memcmp(&a->m_allocator->m_freeOffset, &b->m_allocator->m_freeOffset, sizeof(a->m_allocator->m_freeOffset)) != 0) return false;
+        
+        // Compare arrays
+        if (memcmp(a->m_allocator->m_usedBins, b->m_allocator->m_usedBins, NUM_TOP_BINS * sizeof(a->m_allocator->m_usedBins[0])) != 0) return false;
+        
+        if (memcmp(a->m_allocator->m_binIndices, b->m_allocator->m_binIndices, NUM_LEAF_BINS * sizeof(a->m_allocator->m_binIndices[0])) != 0) return false;
+        
+        // Compare Node arrays
+        if (memcmp(a->m_allocator->m_nodes, b->m_allocator->m_nodes, a->m_allocator->m_current_capacity * sizeof(a->m_allocator->m_nodes[0])) != 0) return false;
+        
+        // Compare freeNodes array
+        if (memcmp(a->m_allocator->m_freeNodes, b->m_allocator->m_freeNodes, a->m_allocator->m_current_capacity * sizeof(a->m_allocator->m_freeNodes[0])) != 0) return false;
+        
+        // All comparisons passed, allocators are equal
+        return true;
+    }
+
+    void testSerializeAllocator(const std::shared_ptr<OffsetAllocator>& alloc_a) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<uint32> size_dist(1,
+                                                        1024 * 64);  // 1B to 64KB
+        // Serialize the allocator
+        std::vector<SerializedByte> buffer;
+        ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
+
+        // Deserialize the allocator and compare
+        std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        ASSERT_NE(alloc_b, nullptr);
+        assertAllocatorEQ(alloc_a, alloc_b);
+
+        // Remove the last byte from the buffer and try to deserialize
+        auto corrupted_buffer = buffer;
+        corrupted_buffer.pop_back();
+        alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
+        ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
+
+        // change a random bit from the buffer and try to deserialize
+        corrupted_buffer = buffer;
+        std::uniform_int_distribution<size_t> byte_index_dist(0, buffer.size() - 1);
+        std::uniform_int_distribution<int> bit_index_dist(0, 7); // 8 bits per byte
+        size_t byte_index = byte_index_dist(gen);
+        int bit_index = bit_index_dist(gen);
+        // Flip the random bit
+        corrupted_buffer[byte_index] ^= (1 << bit_index);
+        alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
+        // There are bool values whose value may not change if one bit is flipped,
+        // so the isAllocatorEqual compares variables using memcmp.
+        ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
+
+        // Add a byte to the buffer and try to deserialize
+        corrupted_buffer = buffer;
+        buffer.push_back(0);
+        alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
     }
 };
 
@@ -1240,6 +1313,7 @@ TEST_F(OffsetAllocatorTest, MetricsInterface) {
 }
 
 // ========== Serialization TESTS ==========
+
 TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
     // Create an empty allocator
     const uint64_t base = 1024 * 16;
@@ -1247,14 +1321,8 @@ TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
     const uint32_t init_capacity = 1000;
     const uint32_t max_capacity = 10000;
     std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
-    // Serialize the allocator
-    std::vector<SerializedByte> buffer;
-    ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
-    // Deserialize the allocator
-    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
-    ASSERT_NE(alloc_b, nullptr);
-    // Compare the allocator
-    cmpAllocator(alloc_a, alloc_b);
+    // test
+    testSerializeAllocator(alloc_a);
 }
 
 TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
@@ -1267,14 +1335,8 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     // Allocate one element
     auto handle = alloc_a->allocate(1024);
     ASSERT_TRUE(handle.has_value());
-    // Serialize the allocator
-    std::vector<SerializedByte> buffer;
-    ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
-    // Deserialize the allocator
-    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
-    ASSERT_NE(alloc_b, nullptr);
-    // Compare the allocator
-    cmpAllocator(alloc_a, alloc_b);
+    // test
+    testSerializeAllocator(alloc_a);
 }
 
 TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
@@ -1317,14 +1379,8 @@ TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
             handles.push_back(std::move(*handle2));
             alloc_sizes.push_back(test_size);
         }
-        // Serialize the allocator
-        std::vector<SerializedByte> buffer;
-        ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
-        // Deserialize the allocator
-        std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
-        ASSERT_NE(alloc_b, nullptr);
-        // Compare the allocator
-        cmpAllocator(alloc_a, alloc_b);
+        // test
+        testSerializeAllocator(alloc_a);
     }
 }
 
