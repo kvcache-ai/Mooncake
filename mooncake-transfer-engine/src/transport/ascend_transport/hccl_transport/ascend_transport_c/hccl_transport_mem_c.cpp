@@ -59,8 +59,8 @@ bool printEnabled() {
     return env != nullptr && std::string(env) == "1";
 }
 
-int getMaxRegMemoryNum() {
-    static const int g_default_max_reg_memory_num = 8192;
+size_t getMaxRegMemoryNum() {
+    static const size_t g_default_max_reg_memory_num = 8192;
     static char *env = getenv("ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM");
     if (env != nullptr) {
         return std::stoi(env);
@@ -656,7 +656,7 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
         }
     }
 
-    int max_m_num = getMaxRegMemoryNum();
+    size_t max_m_num = getMaxRegMemoryNum();
     if (m_num >= max_m_num) {
         LOG(ERROR) << "The number of registered memory exceeds the expected "
                       "maximum size "
