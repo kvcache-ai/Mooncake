@@ -11,10 +11,9 @@
 #include <vector>
 
 #include "Slab.h"
+#include "allocator.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
-#include "allocator.h"
-#include "offset_allocator/offset_allocator.hpp"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
