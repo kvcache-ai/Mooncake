@@ -11,9 +11,10 @@
 #include <vector>
 
 #include "Slab.h"
-#include "allocator.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "allocator.h"
+#include "offset_allocator/offset_allocator.hpp"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
@@ -66,6 +67,9 @@ using EtcdLeaseId = int64_t;
 #endif
 
 using UUID = std::pair<uint64_t, uint64_t>;
+
+using SerializedByte = uint8_t;  // Used as basic unit of serialized data
+static_assert(sizeof(SerializedByte) == 1, "SerializedByte must be exactly 1 byte in size");
 
 inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;

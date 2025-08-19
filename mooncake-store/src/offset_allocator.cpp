@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
 #include "utils.h"
@@ -480,6 +481,8 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
     return report;
 }
 
+
+
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(
     std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
@@ -559,6 +562,8 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
     m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
                                                 init_capacity, max_capacity);
 }
+
+
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
@@ -646,6 +651,8 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
     MutexLocker guard(&m_mutex);
     return get_metrics_internal();
 }
+
+
 
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
