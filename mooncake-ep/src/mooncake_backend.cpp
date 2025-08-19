@@ -13,6 +13,8 @@ constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
+std::string MooncakeBackend::hostIp_ = "127.0.0.1";
+
 MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
                                  int rank, int size,
                                  c10::intrusive_ptr<Options> options)
@@ -22,7 +24,7 @@ MooncakeBackend::MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store,
     TORCH_CHECK(!err, c10::str("Failed to get device id"));
 
     // Initialize transfer engine
-    engine_.init(P2PHANDSHAKE, p2p_ip_);
+    engine_.init(P2PHANDSHAKE, hostIp_);
     auto transport = engine_.installTransport("rdma", nullptr);
     TORCH_CHECK(transport != nullptr, c10::str("Failed to install transport"));
     auto localRpcMeta = transport->meta()->localRpcMeta();

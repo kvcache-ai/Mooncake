@@ -38,6 +38,7 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
 
 PYBIND11_MODULE(ep, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
+    m.def("set_host_ip", &MooncakeBackend::setHostIp);
 }
 
 }  // namespace mooncake

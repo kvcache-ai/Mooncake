@@ -35,9 +35,11 @@ class MooncakeBackend final : public ::c10d::Backend {
         std::vector<at::Tensor>& inputTensors,
         const c10d::AllToAllOptions& opts) override;
 
+    static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
+
    private:
     TransferEngine engine_{true};
-    std::string p2p_ip_ = "127.0.0.1";
+    static std::string hostIp_;
     int device_id_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
