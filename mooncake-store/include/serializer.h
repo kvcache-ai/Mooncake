@@ -133,11 +133,15 @@ template <typename T>
     try {
         SerializerReader reader(buffer.data(), buffer.size());
         auto ret = T::deserialize_from(reader);
-        if (reader.is_empty()) {
-            return ret;
+        if (ret == nullptr) {
+            LOG(ERROR) << "Deserializing failed, error=return_nullptr";
+            return nullptr;
         }
-        LOG(ERROR) << "Deserializing failed, error=wrong_data_size";
-        return nullptr;
+        if (!reader.is_empty()) {
+            LOG(ERROR) << "Deserializing failed, error=wrong_data_size";
+            return nullptr;
+        }
+        return ret;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing failed, error=" << e.what();
         return nullptr;

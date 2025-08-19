@@ -4,7 +4,7 @@
 
 #include <memory>
 #include <optional>
-#include <vector>
+#include <glog/logging.h>
 
 #include "mutex.h"
 
@@ -192,6 +192,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Private constructor - initialize from serialized data
     template <typename T>
     OffsetAllocator(T &serializer);
+
+    friend class OffsetAllocatorTest;  // for unit tests
 };
 
 class __Allocator {
@@ -242,6 +244,8 @@ class __Allocator {
     Node* m_nodes;
     NodeIndex* m_freeNodes;
     uint32 m_freeOffset;
+
+    friend class OffsetAllocatorTest;  // for unit tests
 };
 
 // Template method implementations
@@ -271,12 +275,17 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::deserialize_from(T &serializer
 
 template <typename T>
 OffsetAllocator::OffsetAllocator(T &serializer) {
-    serializer.read(&m_base, sizeof(m_base));
-    serializer.read(&m_multiplier_bits, sizeof(m_multiplier_bits));
-    serializer.read(&m_capacity, sizeof(m_capacity));
-    serializer.read(&m_allocated_size, sizeof(m_allocated_size));
-    serializer.read(&m_allocated_num, sizeof(m_allocated_num));
-    m_allocator = std::make_unique<__Allocator>(serializer);
+    try {
+        serializer.read(&m_base, sizeof(m_base));
+        serializer.read(&m_multiplier_bits, sizeof(m_multiplier_bits));
+        serializer.read(&m_capacity, sizeof(m_capacity));
+        serializer.read(&m_allocated_size, sizeof(m_allocated_size));
+        serializer.read(&m_allocated_num, sizeof(m_allocated_num));
+        m_allocator = std::make_unique<__Allocator>(serializer);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Deserializing OffsetAllocator failed, error=" << e.what();
+        throw std::runtime_error("Deserializing OffsetAllocator failed");
+    }
 }
 
 template <typename T>
@@ -299,24 +308,35 @@ void __Allocator::serialize_to(T &serializer) const {
 }
 
 template <typename T>
-__Allocator::__Allocator(T &serializer) noexcept(false) {
-    // Deserialize basic member variables
-    serializer.read(&m_size, sizeof(m_size));
-    serializer.read(&m_current_capacity, sizeof(m_current_capacity));
-    serializer.read(&m_max_capacity, sizeof(m_max_capacity));
-    serializer.read(&m_freeStorage, sizeof(m_freeStorage));
-    serializer.read(&m_usedBinsTop, sizeof(m_usedBinsTop));
-    serializer.read(&m_usedBins, sizeof(m_usedBins));
-    serializer.read(&m_binIndices, sizeof(m_binIndices));
-    serializer.read(&m_freeOffset, sizeof(m_freeOffset));
+__Allocator::__Allocator(T &serializer) {
+    m_nodes = nullptr;
+    m_freeNodes = nullptr;
     
-    // Allocate memory for nodes and freeNodes
-    m_nodes = new Node[m_max_capacity];
-    m_freeNodes = new NodeIndex[m_max_capacity];
-    
-    // Deserialize the arrays
-    serializer.read(m_nodes, m_current_capacity * sizeof(Node));
-    serializer.read(m_freeNodes, m_current_capacity * sizeof(NodeIndex));
+    try {
+        // Deserialize basic member variables
+        serializer.read(&m_size, sizeof(m_size));
+        serializer.read(&m_current_capacity, sizeof(m_current_capacity));
+        serializer.read(&m_max_capacity, sizeof(m_max_capacity));
+        serializer.read(&m_freeStorage, sizeof(m_freeStorage));
+        serializer.read(&m_usedBinsTop, sizeof(m_usedBinsTop));
+        serializer.read(&m_usedBins, sizeof(m_usedBins));
+        serializer.read(&m_binIndices, sizeof(m_binIndices));
+        serializer.read(&m_freeOffset, sizeof(m_freeOffset));
+        
+        // Allocate memory for nodes and freeNodes
+        m_nodes = new Node[m_max_capacity];
+        m_freeNodes = new NodeIndex[m_max_capacity];
+        
+        // Deserialize the arrays
+        serializer.read(m_nodes, m_current_capacity * sizeof(Node));
+        serializer.read(m_freeNodes, m_current_capacity * sizeof(NodeIndex));
+    } catch (const std::exception& e) {
+        // Free memory if deserialization fails
+        LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
+        if (m_nodes) delete[] m_nodes;
+        if (m_freeNodes) delete[] m_freeNodes;
+        throw std::runtime_error("Deserializing __Allocator failed");
+    }
 }
 
 }  // namespace mooncake::offset_allocator

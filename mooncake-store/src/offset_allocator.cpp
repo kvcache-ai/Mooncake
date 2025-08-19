@@ -481,8 +481,6 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
     return report;
 }
 
-
-
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(
     std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,

@@ -1,12 +1,13 @@
 #include "offset_allocator/offset_allocator.hpp"
+#include "serializer.h"
+#include "types.h"
 
 #include <gtest/gtest.h>
 
 #include <map>
 #include <random>
-#include <vector>
 
-using namespace mooncake::offset_allocator;
+namespace mooncake::offset_allocator {
 
 // 240 bins, according to https://github.com/sebbbi/OffsetAllocator
 constexpr uint32 NUM_BINS = 240;
@@ -242,6 +243,49 @@ class OffsetAllocatorTest : public ::testing::Test {
     void SetUp() override {}
 
     void TearDown() override {}
+
+    void cmpAllocator(const std::shared_ptr<OffsetAllocator>& a,
+                      const std::shared_ptr<OffsetAllocator>& b) {
+        // Compare basic member variables
+        ASSERT_EQ(a->m_base, b->m_base);
+        ASSERT_EQ(a->m_multiplier_bits, b->m_multiplier_bits);
+        ASSERT_EQ(a->m_capacity, b->m_capacity);
+        ASSERT_EQ(a->m_allocated_size, b->m_allocated_size);
+        ASSERT_EQ(a->m_allocated_num, b->m_allocated_num);
+        
+        // Compare __Allocator member variables
+        ASSERT_EQ(a->m_allocator->m_size, b->m_allocator->m_size);
+        ASSERT_EQ(a->m_allocator->m_current_capacity, b->m_allocator->m_current_capacity);
+        ASSERT_EQ(a->m_allocator->m_max_capacity, b->m_allocator->m_max_capacity);
+        ASSERT_EQ(a->m_allocator->m_freeStorage, b->m_allocator->m_freeStorage);
+        ASSERT_EQ(a->m_allocator->m_usedBinsTop, b->m_allocator->m_usedBinsTop);
+        ASSERT_EQ(a->m_allocator->m_freeOffset, b->m_allocator->m_freeOffset);
+        
+        // Compare arrays
+        for (uint32 i = 0; i < NUM_TOP_BINS; ++i) {
+            ASSERT_EQ(a->m_allocator->m_usedBins[i], b->m_allocator->m_usedBins[i]);
+        }
+        
+        for (uint32 i = 0; i < NUM_LEAF_BINS; ++i) {
+            ASSERT_EQ(a->m_allocator->m_binIndices[i], b->m_allocator->m_binIndices[i]);
+        }
+        
+        // Compare Node arrays
+        for (uint32 i = 0; i < a->m_allocator->m_current_capacity; ++i) {
+            ASSERT_EQ(a->m_allocator->m_nodes[i].dataOffset, b->m_allocator->m_nodes[i].dataOffset);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].dataSize, b->m_allocator->m_nodes[i].dataSize);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].binListPrev, b->m_allocator->m_nodes[i].binListPrev);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].binListNext, b->m_allocator->m_nodes[i].binListNext);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborPrev, b->m_allocator->m_nodes[i].neighborPrev);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborNext, b->m_allocator->m_nodes[i].neighborNext);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].used, b->m_allocator->m_nodes[i].used);
+        }
+        
+        // Compare freeNodes array
+        for (uint32 i = 0; i < a->m_allocator->m_current_capacity; ++i) {
+            ASSERT_EQ(a->m_allocator->m_freeNodes[i], b->m_allocator->m_freeNodes[i]);
+        }
+    }
 };
 
 // Test basic allocation and deallocation
@@ -1194,6 +1238,98 @@ TEST_F(OffsetAllocatorTest, MetricsInterface) {
     EXPECT_EQ(after_all_free.total_free_space_, ALLOCATOR_SIZE);
     EXPECT_EQ(after_all_free.largest_free_region_, ALLOCATOR_SIZE);
 }
+
+// ========== Serialization TESTS ==========
+TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
+    // Create an empty allocator
+    const uint64_t base = 1024 * 16;
+    const size_t size = 1024 * 1024;
+    const uint32_t init_capacity = 1000;
+    const uint32_t max_capacity = 10000;
+    std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
+    // Serialize the allocator
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
+    // Deserialize the allocator
+    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(alloc_b, nullptr);
+    // Compare the allocator
+    cmpAllocator(alloc_a, alloc_b);
+}
+
+TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
+    // Create an empty allocator
+    const uint64_t base = 1024 * 16;
+    const size_t size = 1024 * 1024;
+    const uint32_t init_capacity = 1000;
+    const uint32_t max_capacity = 10000;
+    std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
+    // Allocate one element
+    auto handle = alloc_a->allocate(1024);
+    ASSERT_TRUE(handle.has_value());
+    // Serialize the allocator
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
+    // Deserialize the allocator
+    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(alloc_b, nullptr);
+    // Compare the allocator
+    cmpAllocator(alloc_a, alloc_b);
+}
+
+TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
+    // The size multiplier is larger than 1 when the allocator size is larger
+    // than MAX_BIN_SIZE.
+    constexpr size_t MIN_BUFFER_SIZE = (1ull << 31) + 1;
+    constexpr size_t MAX_BUFFER_SIZE = (1ull << 40);
+    constexpr uint32 MAX_ALLOCS = 10000;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<size_t> buffer_size_dist(MIN_BUFFER_SIZE,
+                                                           MAX_BUFFER_SIZE);
+    for (int i = 0; i < 100; i++) {
+        size_t buffer_size = buffer_size_dist(gen);
+        auto alloc_a = OffsetAllocator::create(0, buffer_size, 1, MAX_ALLOCS);
+        size_t max_alloc_size = buffer_size / 100;
+
+        std::vector<OffsetAllocationHandle> handles;
+        std::vector<size_t> alloc_sizes;
+        std::uniform_int_distribution<size_t> size_dist(1, max_alloc_size);
+        for (uint32 i = 0; i < 200; ++i) {
+            size_t size = size_dist(gen);
+            auto handle = alloc_a->allocate(size);
+            if (handle.has_value()) {
+                handles.push_back(std::move(*handle));
+                alloc_sizes.push_back(size);
+            }
+
+            std::uniform_int_distribution<uint32> index_dist(
+                0, handles.size() - 1);
+            uint32 index = index_dist(gen);
+            std::swap(handles[index], handles.back());
+            std::swap(alloc_sizes[index], alloc_sizes.back());
+            uint32 test_size = alloc_sizes.back();
+            handles.pop_back();
+            alloc_sizes.pop_back();
+
+            auto handle2 = alloc_a->allocate(test_size);
+            ASSERT_TRUE(handle2.has_value());
+            handles.push_back(std::move(*handle2));
+            alloc_sizes.push_back(test_size);
+        }
+        // Serialize the allocator
+        std::vector<SerializedByte> buffer;
+        ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
+        // Deserialize the allocator
+        std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        ASSERT_NE(alloc_b, nullptr);
+        // Compare the allocator
+        cmpAllocator(alloc_a, alloc_b);
+    }
+}
+
+}  // namespace mooncake::offset_allocator
+
 
 int main(int argc, char** argv) {
     // Initialize Google Test

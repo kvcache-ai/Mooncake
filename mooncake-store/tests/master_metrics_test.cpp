@@ -1,13 +1,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
-#include <memory>
-#include <random>
 #include <thread>
 #include <vector>
 
-#include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
 
