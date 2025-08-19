@@ -415,18 +415,17 @@ auto MasterService::PutStart(const std::string& key,
         auto allocation_result = allocation_strategy_->Allocate(
             allocators, allocators_by_name, slice_lengths, config);
 
-        if (!allocation_result.isSuccess()) {
+        if (!allocation_result.has_value()) {
             LOG(ERROR) << "Failed to allocate all replicas for key=" << key
-                       << ": " << allocation_result.error_message;
-            if (allocation_result.status ==
-                AllocationResult::Status::INVALID_PARAMS) {
+                       << ", error: " << allocation_result.error();
+            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             need_eviction_ = true;
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        replicas = std::move(allocation_result.replicas);
+        replicas = std::move(allocation_result.value());
     }
 
     // If disk replica is enabled, allocate a disk replica

@@ -54,9 +54,8 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     std::vector<size_t> slice_sizes = {100};
     auto result = strategy_->Allocate(
         empty_allocators, empty_allocators_by_name, slice_sizes, config);
-    EXPECT_EQ(result.status, AllocationResult::Status::FAILURE);
-    EXPECT_TRUE(result.replicas.empty());
-    EXPECT_FALSE(result.isSuccess());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 // Test preferred segment behavior with empty allocators
@@ -70,8 +69,8 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     std::vector<size_t> slice_sizes = {100};
     auto result = strategy_->Allocate(
         empty_allocators, empty_allocators_by_name, slice_sizes, config);
-    EXPECT_EQ(result.status, AllocationResult::Status::FAILURE);
-    EXPECT_EQ(result.allocatedReplicasCounts(), 0);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 // Test preferred segment allocation when available
@@ -96,11 +95,11 @@ TEST_F(AllocationStrategyTest, PreferredSegmentAllocation) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           slice_sizes, config);
-        ASSERT_TRUE(result.isSuccess());
-        EXPECT_EQ(result.allocatedReplicasCounts(), 1);
-        ASSERT_FALSE(result.replicas.empty());
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
+        ASSERT_FALSE(result.value().empty());
 
-        const auto& replica = result.replicas[0];
+        const auto& replica = result.value()[0];
         auto descriptor = replica.get_descriptor();
         ASSERT_TRUE(descriptor.is_memory_replica());
         const auto& mem_desc = descriptor.get_memory_descriptor();
@@ -132,10 +131,10 @@ TEST_F(AllocationStrategyTest, PreferredSegmentNotFound) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           slice_sizes, config);
-        ASSERT_TRUE(result.isSuccess());
-        EXPECT_EQ(result.allocatedReplicasCounts(), 1);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
 
-        const auto& replica = result.replicas[0];
+        const auto& replica = result.value()[0];
         auto descriptor = replica.get_descriptor();
         ASSERT_TRUE(descriptor.is_memory_replica());
         const auto& mem_desc = descriptor.get_memory_descriptor();
@@ -168,10 +167,10 @@ TEST_F(AllocationStrategyTest, MultipleSlicesAllocation) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           slice_sizes, config);
-        ASSERT_TRUE(result.isSuccess());
-        EXPECT_EQ(result.allocatedReplicasCounts(), 1);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
 
-        const auto& replica = result.replicas[0];
+        const auto& replica = result.value()[0];
         auto descriptor = replica.get_descriptor();
         ASSERT_TRUE(descriptor.is_memory_replica());
         const auto& mem_desc = descriptor.get_memory_descriptor();
@@ -208,11 +207,11 @@ TEST_F(AllocationStrategyTest, MultipleReplicasAllocation) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           slice_sizes, config);
-        ASSERT_TRUE(result.isSuccess());
-        EXPECT_EQ(result.allocatedReplicasCounts(), 3);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 3);
 
         // Check each replica has all slices
-        for (const auto& replica : result.replicas) {
+        for (const auto& replica : result.value()) {
             auto descriptor = replica.get_descriptor();
             ASSERT_TRUE(descriptor.is_memory_replica());
             const auto& mem_desc = descriptor.get_memory_descriptor();
@@ -223,7 +222,7 @@ TEST_F(AllocationStrategyTest, MultipleReplicasAllocation) {
 
         // Check that replicas are on different segments
         std::set<std::string> used_segments;
-        for (const auto& replica : result.replicas) {
+        for (const auto& replica : result.value()) {
             auto segment_names = replica.get_segment_names();
             for (const auto& name_ptr : segment_names) {
                 if (name_ptr) {
@@ -260,8 +259,8 @@ TEST_F(AllocationStrategyTest, PreferredSegmentInsufficientSpace) {
 
         auto large_result = strategy_->Allocate(allocators, allocators_by_name,
                                                 large_slices, config);
-        ASSERT_TRUE(large_result.isSuccess());
-        auto large_desc = large_result.replicas[0].get_descriptor();
+        ASSERT_TRUE(large_result.has_value());
+        auto large_desc = large_result.value()[0].get_descriptor();
         ASSERT_TRUE(large_desc.is_memory_replica());
         EXPECT_EQ(large_desc.get_memory_descriptor()
                       .buffer_descriptors[0]
@@ -272,8 +271,8 @@ TEST_F(AllocationStrategyTest, PreferredSegmentInsufficientSpace) {
         std::vector<size_t> small_slice = {2 * 1024 * 1024};
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           small_slice, config);
-        ASSERT_TRUE(result.isSuccess());
-        auto small_desc = result.replicas[0].get_descriptor();
+        ASSERT_TRUE(result.has_value());
+        auto small_desc = result.value()[0].get_descriptor();
         ASSERT_TRUE(small_desc.is_memory_replica());
         const auto& mem_desc = small_desc.get_memory_descriptor();
         EXPECT_EQ(mem_desc.buffer_descriptors[0].segment_name_, "segment1");
@@ -306,18 +305,18 @@ TEST_F(AllocationStrategyTest, AllAllocatorsFull) {
                                             15 * 1024 * 1024};  // 60MB
         auto result1 = strategy_->Allocate(allocators, allocators_by_name,
                                            large_slices, config);
-        ASSERT_TRUE(result1.isSuccess());
+        ASSERT_TRUE(result1.has_value());
         auto result2 = strategy_->Allocate(allocators, allocators_by_name,
                                            large_slices, config);
-        ASSERT_TRUE(result2.isSuccess());
+        ASSERT_TRUE(result2.has_value());
 
         // Try to allocate more than remaining space
         std::vector<size_t> impossible_slice = {
             5 * 1024 * 1024};  // 5MB (more than remaining)
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           impossible_slice, config);
-        EXPECT_EQ(result.status, AllocationResult::Status::FAILURE);
-        EXPECT_TRUE(result.replicas.empty());
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
     }
 }
 
@@ -338,8 +337,8 @@ TEST_F(AllocationStrategyTest, ZeroSizeAllocation) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           zero_slice, config);
-        EXPECT_EQ(result.status, AllocationResult::Status::INVALID_PARAMS);
-        EXPECT_TRUE(result.replicas.empty());
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 }
 
@@ -361,58 +360,8 @@ TEST_F(AllocationStrategyTest, VeryLargeSizeAllocation) {
 
         auto result = strategy_->Allocate(allocators, allocators_by_name,
                                           huge_slice, config);
-        EXPECT_EQ(result.status, AllocationResult::Status::FAILURE);
-        EXPECT_TRUE(result.replicas.empty());
-    }
-}
-
-// Test AllocateAdditionalReplicas
-TEST_F(AllocationStrategyTest, AllocateAdditionalReplicas) {
-    for (const auto& allocator_type : allocator_types_) {
-        auto allocator1 = CreateTestAllocator("segment1", 0, allocator_type);
-        auto allocator2 =
-            CreateTestAllocator("segment2", 0x10000000ULL, allocator_type);
-        auto allocator3 =
-            CreateTestAllocator("segment3", 0x20000000ULL, allocator_type);
-
-        std::unordered_map<std::string,
-                           std::vector<std::shared_ptr<BufferAllocatorBase>>>
-            allocators_by_name;
-        std::vector<std::shared_ptr<BufferAllocatorBase>> allocators;
-
-        allocators_by_name["segment1"].push_back(allocator1);
-        allocators_by_name["segment2"].push_back(allocator2);
-        allocators_by_name["segment3"].push_back(allocator3);
-        allocators.push_back(allocator1);
-        allocators.push_back(allocator2);
-        allocators.push_back(allocator3);
-
-        // First allocate initial replica
-        ReplicateConfig config{1, false, ""};
-        std::vector<size_t> slice_sizes = {1024, 2048};
-
-        auto initial_result = strategy_->Allocate(
-            allocators, allocators_by_name, slice_sizes, config);
-        ASSERT_TRUE(initial_result.isSuccess());
-        EXPECT_EQ(initial_result.allocatedReplicasCounts(), 1);
-
-        // Now allocate additional replicas
-        auto additional_result = strategy_->AllocateAdditionalReplicas(
-            allocators, allocators_by_name, slice_sizes,
-            initial_result.replicas, 2, config);
-
-        ASSERT_TRUE(additional_result.isSuccess());
-        EXPECT_EQ(additional_result.allocatedReplicasCounts(), 2);
-
-        // Check that new replicas have the same slice structure
-        for (const auto& replica : additional_result.replicas) {
-            auto descriptor = replica.get_descriptor();
-            ASSERT_TRUE(descriptor.is_memory_replica());
-            const auto& mem_desc = descriptor.get_memory_descriptor();
-            ASSERT_EQ(mem_desc.buffer_descriptors.size(), 2);
-            EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 1024);
-            EXPECT_EQ(mem_desc.buffer_descriptors[1].size_, 2048);
-        }
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
     }
 }
 
@@ -433,8 +382,8 @@ TEST_F(AllocationStrategyTest, EmptySliceSizes) {
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
                                       empty_slices, config);
-    EXPECT_EQ(result.status, AllocationResult::Status::INVALID_PARAMS);
-    EXPECT_TRUE(result.replicas.empty());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 // Test invalid replication count
@@ -454,8 +403,8 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
                                       slice_sizes, config);
-    EXPECT_EQ(result.status, AllocationResult::Status::INVALID_PARAMS);
-    EXPECT_TRUE(result.replicas.empty());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 // Test insufficient allocators for requested replica count
@@ -481,8 +430,8 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
                                       slice_sizes, config);
-    EXPECT_EQ(result.status, AllocationResult::Status::FAILURE);
-    EXPECT_TRUE(result.replicas.empty());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 }  // namespace mooncake
