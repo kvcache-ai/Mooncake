@@ -11,7 +11,7 @@ Mooncake Store 提供了底层的对象存储和管理能力，包括可配置�
 Mooncake Store 的主要特性包括：
 
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
-*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
+*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。保证同一对象的每个slice被放置在不同的segment中，不同对象的slice可以共享segment。采用尽力而为的副本分配策略。
 *   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
 *   **零拷贝、高带宽利用**：由 Transfer Engine 提供支持, 数据链路零拷贝，对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
@@ -95,6 +95,12 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
 用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，`Put`除了对memory pool的写入之外，还会异步发起一次向SSD的数据持久化操作）
+
+**副本保证和尽力而为行为：**
+- 保证对象的每个slice被复制到不同的segment，确保分布在不同的存储节点上
+- 不同对象的slice可能被放置在同一个segment中
+- 副本采用尽力而为的方式运行：如果没有足够的空间来分配所有请求的副本，对象仍将被写入，副本数量为实际能够分配的数量
+
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
@@ -208,7 +214,7 @@ message PutStartResponse {
 * 请求: PutStartRequest，包含 key、数据长度和副本配置config。
 * 响应: PutStartResponse，包含状态码 status_code 和分配好的副本信息 replica_list。
 
-说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
+说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。分配策略确保对象的每个slice被放置在不同的segment中，同时采用尽力而为的方式运行——如果没有足够的空间来分配所有请求的副本，将分配尽可能多的副本。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
 
 3. PutEnd
 
