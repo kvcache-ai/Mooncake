@@ -28,21 +28,6 @@ namespace mooncake {
 class AllocationStrategy;
 class EvictionStrategy;
 
-// Structure to store garbage collection tasks
-struct GCTask {
-    std::string key;
-    std::chrono::steady_clock::time_point deletion_time;
-
-    GCTask() = default;
-
-    GCTask(const std::string& k, std::chrono::milliseconds delay)
-        : key(k), deletion_time(std::chrono::steady_clock::now() + delay) {}
-
-    bool is_ready() const {
-        return std::chrono::steady_clock::now() >= deletion_time;
-    }
-};
-
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -51,14 +36,6 @@ struct GCTask {
  * 3. segment_mutex_
  */
 class MasterService {
-   private:
-    // Comparator for GC tasks priority queue
-    struct GCTaskComparator {
-        bool operator()(GCTask* a, GCTask* b) const {
-            return a->deletion_time > b->deletion_time;
-        }
-    };
-
    public:
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -153,15 +130,6 @@ class MasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
     /**
-     * @brief Mark a key for garbage collection after specified delay
-     * @param key The key to be garbage collected
-     * @param delay_ms Delay in milliseconds before removing the key
-     * @return ErrorCode::OK on success
-     */
-    auto MarkForGC(const std::string& key, uint64_t delay_ms)
-        -> tl::expected<void, ErrorCode>;
-
-    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for slices
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
@@ -248,9 +216,6 @@ class MasterService {
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;
     std::string ResolvePath(const std::string& key) const;
-
-    // GC thread function
-    void GCThreadFunc();
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -408,15 +373,6 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
-
-    // GC related members
-    static constexpr size_t kGCQueueSize = 10 * 1024;  // Size of the GC queue
-    boost::lockfree::queue<GCTask*> gc_queue_{kGCQueueSize};
-    std::thread gc_thread_;
-    std::atomic<bool> gc_running_{false};
-    bool enable_gc_{true};  // Flag to enable/disable garbage collection
-    static constexpr uint64_t kGCThreadSleepMs =
-        10;  // 10 ms sleep between GC and eviction checks
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds

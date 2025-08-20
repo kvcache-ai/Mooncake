@@ -22,7 +22,6 @@ DEFINE_int32(port, 50051,
 DEFINE_int32(
     max_threads, 4,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
-DEFINE_bool(enable_gc, false, "Enable garbage collection");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
@@ -80,8 +79,6 @@ DEFINE_string(memory_allocator, "offset",
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
-    default_config.GetBool("enable_gc", &master_config.enable_gc,
-                           FLAGS_enable_gc);
     default_config.GetBool("enable_metric_reporting",
                            &master_config.enable_metric_reporting,
                            FLAGS_enable_metric_reporting);
@@ -192,11 +189,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
     }
-    if ((google::GetCommandLineFlagInfo("enable_gc", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_gc = FLAGS_enable_gc;
-    }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -305,7 +297,6 @@ int main(int argc, char* argv[]) {
     }
 
     LOG(INFO) << "Master service started on port " << master_config.rpc_port
-              << ", enable_gc=" << master_config.enable_gc
               << ", max_threads=" << master_config.rpc_thread_num
               << ", enable_metric_reporting="
               << master_config.enable_metric_reporting

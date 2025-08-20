@@ -9,7 +9,6 @@ namespace mooncake {
 
 // The configuration for the master server
 struct MasterConfig {
-    bool enable_gc;
     bool enable_metric_reporting;
     uint32_t metrics_port;
     uint32_t rpc_port;
@@ -36,7 +35,6 @@ struct MasterConfig {
 class MasterServiceSupervisorConfig {
    public:
     // no default values (required parameters) - using RequiredParam
-    RequiredParam<bool> enable_gc{"enable_gc"};
     RequiredParam<bool> enable_metric_reporting{"enable_metric_reporting"};
     RequiredParam<int> metrics_port{"metrics_port"};
     RequiredParam<int64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
@@ -66,7 +64,6 @@ class MasterServiceSupervisorConfig {
     // From MasterConfig
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
-        enable_gc = config.enable_gc;
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
         default_kv_lease_ttl = config.default_kv_lease_ttl;
@@ -104,9 +101,6 @@ class MasterServiceSupervisorConfig {
     // to avoid unexpected errors in the future.
     void validate() const {
         // Validate that all required parameters are set
-        if (!enable_gc.IsSet()) {
-            throw std::runtime_error("enable_gc is not set");
-        }
         if (!enable_metric_reporting.IsSet()) {
             throw std::runtime_error("enable_metric_reporting is not set");
         }
@@ -145,7 +139,6 @@ class MasterServiceSupervisorConfig {
 class WrappedMasterServiceConfig {
    public:
     // Required parameters (no default values) - using RequiredParam
-    RequiredParam<bool> enable_gc{"enable_gc"};
     RequiredParam<uint64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
 
     // Optional parameters (with default values)
@@ -170,7 +163,6 @@ class WrappedMasterServiceConfig {
     WrappedMasterServiceConfig(const MasterConfig& config,
                                ViewVersionId view_version_param) {
         // Set required parameters using RequiredParam
-        enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
 
         // Set optional parameters (these have default values)
@@ -200,7 +192,6 @@ class WrappedMasterServiceConfig {
                                ViewVersionId view_version_param)
         : WrappedMasterServiceConfig() {
         // Set required parameters using assignment operator
-        enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
 
         // Set optional parameters (these have default values)
@@ -227,7 +218,6 @@ class MasterServiceConfig;
 // Builder class for MasterServiceConfig
 class MasterServiceConfigBuilder {
    private:
-    bool enable_gc_ = false;
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
@@ -244,11 +234,6 @@ class MasterServiceConfigBuilder {
 
    public:
     MasterServiceConfigBuilder() = default;
-
-    MasterServiceConfigBuilder& set_enable_gc(bool enable_gc) {
-        enable_gc_ = enable_gc;
-        return *this;
-    }
 
     MasterServiceConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
         default_kv_lease_ttl_ = ttl;
@@ -313,7 +298,6 @@ class MasterServiceConfigBuilder {
 
 class MasterServiceConfig {
    public:
-    bool enable_gc = false;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
@@ -332,7 +316,6 @@ class MasterServiceConfig {
 
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
-        enable_gc = config.enable_gc;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -354,7 +337,6 @@ class MasterServiceConfig {
 // Implementation of MasterServiceConfigBuilder::build()
 inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     MasterServiceConfig config;
-    config.enable_gc = enable_gc_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
