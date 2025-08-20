@@ -11,6 +11,55 @@
 namespace mooncake {
 
 /**
+ * @brief Serialization Framework Usage Guide
+ * 
+ * To implement serialization for your class, you need to provide two methods:
+ * 
+ * 1. **serialize_to()** - Template method that works with both SerializeSizeCounter and SerializeWriter
+ * 2. **deserialize_from()** - Static template method that reconstructs the object
+ * 
+ * Example implementation:
+ * @code
+ * class MyClass {
+ * public:
+ *     // Serialization method (works with both counter and writer)
+ *     template <typename T>
+ *     void serialize_to(T& serializer) const {
+ *         serializer.write(&member1, sizeof(member1));
+ *         serializer.write(&member2, sizeof(member2));
+ *         // ... serialize other members
+ *     }
+ *     
+ *     // Deserialization method
+ *     template <typename T>
+ *     static std::shared_ptr<MyClass> deserialize_from(T& serializer) {
+ *         try {
+ *             auto obj = std::make_shared<MyClass>();
+ *             serializer.read(&obj->member1, sizeof(obj->member1));
+ *             serializer.read(&obj->member2, sizeof(obj->member2));
+ *             // ... deserialize other members
+ *             return obj;
+ *         } catch (const std::exception& e) {
+ *             return nullptr;
+ *         }
+ *     }
+ *     
+ * private:
+ *     int member1;
+ *     double member2;
+ * };
+ * @endcode
+ * 
+ * Usage:
+ * @code
+ * MyClass obj;
+ * std::vector<SerializedByte> buffer;
+ * serialize_to(obj, buffer);                    // Serialize
+ * auto restored = deserialize_from<MyClass>(buffer);  // Deserialize
+ * @endcode
+ */
+
+/**
  * @brief A utility class for calculating the size of serialized data without actually writing it.
  * 
  * This class is used in the first pass of serialization to determine the exact buffer size
@@ -231,7 +280,7 @@ class SerializerReader {
  * @return ErrorCode indicating success or failure
  */
 template <typename T>
-[[nodiscard]] ErrorCode serialize_to(const std::shared_ptr<T>& target,
+[[nodiscard]] ErrorCode serialize_to_internal(const T* target,
                                      std::vector<SerializedByte>& buffer) {
     if (target == nullptr) {
         return ErrorCode::INVALID_PARAMS;
@@ -261,6 +310,18 @@ template <typename T>
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
+}
+
+template <typename T>
+[[nodiscard]] ErrorCode serialize_to(const T& target,
+                                     std::vector<SerializedByte>& buffer) {
+    return serialize_to_internal(std::addressof(target), buffer);
+}
+
+template <typename T>
+[[nodiscard]] ErrorCode serialize_to(const std::shared_ptr<T>& target,
+                                     std::vector<SerializedByte>& buffer) {
+    return serialize_to_internal(target.get(), buffer);
 }
 
 /**
