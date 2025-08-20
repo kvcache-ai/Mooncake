@@ -20,7 +20,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     };
 
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
-                    c10::intrusive_ptr<MooncakeBackendOptions> options);
+                    c10::intrusive_ptr<MooncakeBackendOptions> options,
+                    bool isCpu = false);
 
     ~MooncakeBackend() override;
 
@@ -55,6 +56,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     TransferEngine engine_{true};
+    bool isCpu_{false};
     at::Tensor brokenRanks_;
     static std::string hostIp_;
     int device_id_;

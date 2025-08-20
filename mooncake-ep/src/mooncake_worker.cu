@@ -3,9 +3,26 @@
 
 namespace mooncake {
 
-class MooncakeWork : public ::c10d::Work {
+class MooncakeWorkCpu : public ::c10d::Work {
    public:
-    MooncakeWork(c10d::OpType opType, cudaEvent_t event)
+    MooncakeWorkCpu(c10d::OpType opType,
+                    c10::intrusive_ptr<c10::ivalue::Future> future)
+        : Work(-1, opType), future_(future) {}
+
+    bool isCompleted() override { return future_->completed(); }
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        future_->wait();
+        return future_->completed() && !future_->hasError();
+    }
+
+   private:
+    c10::intrusive_ptr<c10::ivalue::Future> future_;
+};
+
+class MooncakeWorkCuda : public ::c10d::Work {
+   public:
+    MooncakeWorkCuda(c10d::OpType opType, cudaEvent_t event)
         : Work(-1, opType), event_(event) {}
 
     bool isCompleted() override {
@@ -86,6 +103,31 @@ void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
     }
 }
 
+template <typename T>
+void reduceCpu(T* dst, const T* src, size_t numElements,
+                          size_t numRanks) {
+    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            T acc = T(0);
+            for (int64_t rank = 0; rank < numRanks; ++rank) {
+                acc += src[i + rank * numElements];
+            }
+            dst[i] = acc;
+        }
+    });
+}
+
+void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks) {
+    switch (dst.scalar_type()) {
+        case c10::kInt:
+            reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks);
+            break;
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
+                                        dst.scalar_type()));
+    }
+}
+
 MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
     : engine_(engine), rank_(rank), size_(size) {
     // Pin memory for task array
@@ -96,7 +138,41 @@ MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTask(
+c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
+    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    const std::function<void(void* dst)>& tensorToBuffer,
+    const std::function<void(void* src)>& bufferToTensor) {
+    TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
+    auto future = c10::make_intrusive<c10::ivalue::Future>(
+        c10::ListType::create(c10::TensorType::get()));
+    for (size_t i = 0; i < kNumTasks_; ++i) {
+        if (tasks_[i].status == IDLE) {
+            tasks_[i].status = OCCUPIED;
+            tasks_[i].opType = opType;
+            tasks_[i].tensorSize = tensorSize;
+            tasks_[i].broadcastRoot = broadcastRoot;
+            tensorToBuffer(
+                (void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
+
+            std::thread([this, i, bufferToTensor, future, opType] {
+                tasks_[i].status = READY;
+                while (tasks_[i].status != DONE) {
+                    _mm_pause();
+                }
+                bufferToTensor((void*)segment_descs_[rank_]
+                                   ->buffers[2 + taskCount % 2]
+                                   .addr);
+                tasks_[i].status = IDLE;
+                ++taskCount;
+                future->markCompleted(c10::IValue());
+            }).detach();
+            return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
+        }
+    }
+    TORCH_CHECK(false, "No task slots available.");
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
@@ -110,7 +186,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTask(
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     cudaEventRecord(event, stream);
-    return c10::make_intrusive<MooncakeWork>(opType, event);
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event);
 }
 
 }  // namespace mooncake

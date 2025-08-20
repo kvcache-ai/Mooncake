@@ -27,11 +27,18 @@ __global__ struct Task {
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
                         cudaStream_t stream);
 
+void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks);
+
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(TransferEngine* engine, int rank, int size);
 
-    c10::intrusive_ptr<c10d::Work> putTask(
+    c10::intrusive_ptr<c10d::Work> putTaskCpu(
+        c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+        const std::function<void(void* dst)>& tensorToBuffer,
+        const std::function<void(void* src)>& bufferToTensor);
+
+    c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         cudaStream_t stream,
         const std::function<void(void* dst)>& tensorToBuffer,
@@ -39,7 +46,7 @@ class MooncakeWorker {
 
     void initWorker(const std::vector<std::string>& server_names);
 
-    static constexpr size_t kNumTasks_ = 1024;
+    static constexpr size_t kNumTasks_ = 4;
 
    private:
     Task *tasks_, *tasks_device_;
