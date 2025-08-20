@@ -388,15 +388,23 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
             if (transport_->scheduler_) {
                 LeaseId lease;
                 auto &raw_list = source.topo_entry_raw->device_list[rank];
+                int select_index;
                 auto status = transport_->scheduler_->createJob(
-                    lease, seed, slice->length, raw_list);
+                    lease, select_index, slice->length, raw_list);
                 if (status.ok()) {
                     slice->has_lease = true;
                     slice->lease = lease;
+                    seed = select_index;
+                } else {
+                    thread_local uint64_t last_shown_ts = 0;
+                    uint64_t current_ts = getCurrentTimeInNano();
+                    if (current_ts - last_shown_ts > 500000000) {
+                        LOG(INFO) << status.ToString();
+                        last_shown_ts = current_ts;
+                    }
                 }
             }
-            if (!slice->has_lease)
-                slice->source_dev_id = list[seed % list.size()];
+            slice->source_dev_id = list[seed % list.size()];
         }
     }
 

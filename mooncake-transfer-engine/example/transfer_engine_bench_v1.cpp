@@ -34,6 +34,8 @@ DEFINE_string(metadata_servers, "",
 DEFINE_string(workload, "read", "Test workload: read|write|mix");
 DEFINE_string(local_segment, "",
               "Set the custom local segment name (optional)");
+DEFINE_string(cluster_topology, "",
+              "Set the cluster topology file (optional)");
 DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
 DEFINE_bool(integrity_check, false, "Check data integrity if workload is mix");
 DEFINE_bool(shmfs, false, "Enable shmfs");
@@ -325,6 +327,7 @@ std::shared_ptr<ConfigManager> loadConfig() {
     config->set("local_segment_name", FLAGS_local_segment);
     config->set("metadata_type", FLAGS_metadata_type);
     config->set("metadata_servers", FLAGS_metadata_servers);
+    config->set("cluster_topology", FLAGS_cluster_topology);
     return config;
 }
 

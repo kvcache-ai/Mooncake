@@ -114,15 +114,18 @@ Status RdmaTransport::install(std::string &local_segment_name,
     local_buffer_manager_.setTopology(local_topology);
     auto cluster_topology_path = conf_->get("cluster_topology", "");
     if (!cluster_topology_path.empty()) {
-        cluster_topology_ = std::make_shared<ClusterTopology>();
+        cluster_topology_ = std::make_unique<ClusterTopology>();
         auto machine_id = metadata_->segmentManager().getLocal()->machine_id;
         CHECK_STATUS(
             cluster_topology_->load(machine_id, cluster_topology_path));
+        LOG(INFO) << "Cluster topology file loaded: " << cluster_topology_path;
     }
     if (conf_->get("transports/rdma/scheduler", false)) {
         auto scheduler_path =
             conf_->get("transports/rdma/scheduler_path", "/mooncake_sched");
-        scheduler_ = std::make_shared<Scheduler>(scheduler_path);
+        scheduler_ = std::make_unique<Scheduler>(scheduler_path);
+        CHECK_STATUS(scheduler_->constructState());
+        LOG(INFO) << "Inter-process scheduler started: " << scheduler_path;
     }
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);

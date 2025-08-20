@@ -46,6 +46,7 @@ static uint64_t now_ms() {
 }
 
 constexpr size_t DEVNAME_LEN = 64;
+constexpr size_t PCI_PATH_LEN = 4096;
 constexpr size_t MAX_DEVICES = 64;
 constexpr size_t MAX_LEASES_PER_DEVICE = 4096;
 const uint32_t MAGIC_NUMBER = 0x6D6FCAFE;
@@ -63,14 +64,14 @@ struct SharedLease {
     uint64_t allocated_bytes;
     uint64_t expires_at_ms;  // epoch ms
     pid_t owner_pid;
+    int next;
 };
 
 struct SharedDeviceEntry {
     char name[DEVNAME_LEN];
     int numa_node;
-    uint32_t lease_count;
     uint64_t outstanding_bytes;
-    uint32_t free_slot;
+    int free_slot;
     SharedLease leases[MAX_LEASES_PER_DEVICE];
 };
 
@@ -199,8 +200,8 @@ static int robust_mutex_lock(pthread_mutex_t* m) {
 }
 
 static int getNumaNodeOfDevice(const char* device_name) {
-    char path[DEVNAME_LEN + 32];
-    char resolved_path[DEVNAME_LEN];
+    char path[PCI_PATH_LEN + 32];
+    char resolved_path[PCI_PATH_LEN];
     // Get the PCI bus id for the infiniband device. Note that
     // "/sys/class/infiniband/mlx5_X/" is a symlink to
     // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
@@ -229,7 +230,10 @@ static Status discoverAllDevices(SharedState* state) {
                      DEVNAME_LEN - 1);
         state->devices[i].name[DEVNAME_LEN - 1] = '\0';
         state->devices[i].numa_node = numa_node;
-        state->devices[i].lease_count = 0;
+        state->devices[i].free_slot = 0;
+        for (size_t j = 0; j < MAX_LEASES_PER_DEVICE - 1; ++j)
+            state->devices[i].leases[j].next = j + 1;
+        state->devices[i].leases[MAX_LEASES_PER_DEVICE - 1].next = -1;
     }
     ibv_free_device_list(device_list);
     state->device_count = num_devices;
@@ -340,31 +344,20 @@ size_t Scheduler::reclaimExpiredLeasesUnlocked() {
     uint64_t now = now_ms();
     for (uint32_t i = 0; i < state_->device_count; ++i) {
         auto& dev = state_->devices[i];
-        uint32_t valid_count = 0;
-        uint64_t outstanding = 0;
-        uint32_t first_free = MAX_LEASES_PER_DEVICE;
-        for (uint32_t k = 0; k < dev.lease_count; ++k) {
+        uint64_t outstanding_bytes = 0;
+        for (uint32_t k = 0; k < MAX_LEASES_PER_DEVICE; ++k) {
             if (dev.leases[k].is_valid &&
                 (dev.leases[k].expires_at_ms == 0 ||
                  now <= dev.leases[k].expires_at_ms)) {
-                if (k != valid_count) {
-                    dev.leases[valid_count] = dev.leases[k];
-                }
-                outstanding += dev.leases[valid_count].allocated_bytes;
-                ++valid_count;
+                outstanding_bytes += dev.leases[k].allocated_bytes;
             } else if (dev.leases[k].is_valid) {
                 dev.leases[k].is_valid = false;
+                dev.leases[k].next = dev.free_slot;
+                dev.free_slot = k;
                 ++reclaimed;
-                if (k < first_free) first_free = k;
-            } else if (k < first_free) {
-                first_free = k;
             }
         }
-        dev.lease_count = valid_count;
-        dev.outstanding_bytes = outstanding;
-        dev.free_slot = (valid_count < MAX_LEASES_PER_DEVICE)
-                            ? std::min(first_free, valid_count)
-                            : MAX_LEASES_PER_DEVICE;
+        dev.outstanding_bytes = outstanding_bytes;
     }
     return reclaimed;
 }
@@ -380,11 +373,12 @@ bool Scheduler::closeJob(LeaseId lease) {
     if (!state_ || robust_mutex_lock(&state_->mtx) != 0) return false;
     for (uint32_t i = 0; i < state_->device_count; ++i) {
         auto& dev = state_->devices[i];
-        for (uint32_t j = 0; j < dev.lease_count; ++j) {
+        for (uint32_t j = 0; j < MAX_LEASES_PER_DEVICE; ++j) {
             if (dev.leases[j].is_valid && dev.leases[j].lease_id == lease) {
                 dev.outstanding_bytes -= dev.leases[j].allocated_bytes;
                 dev.leases[j].is_valid = false;
-                if (j < dev.free_slot) dev.free_slot = j;
+                dev.leases[j].next = dev.free_slot;
+                dev.free_slot = j;
                 pthread_mutex_unlock(&state_->mtx);
                 return true;
             }
@@ -416,7 +410,7 @@ Status Scheduler::createJob(LeaseId& lease, int& selected_index,
         if (!device_name_cache_.count(device)) continue;
         int idx = device_name_cache_[device];
         auto& dev = state_->devices[idx];
-        if (dev.lease_count < MAX_LEASES_PER_DEVICE &&
+        if (dev.free_slot >= 0 &&
             dev.outstanding_bytes < min_outstanding_bytes) {
             selected_index = idx;
             min_outstanding_bytes = dev.outstanding_bytes;
@@ -431,26 +425,12 @@ Status Scheduler::createJob(LeaseId& lease, int& selected_index,
     auto& dev = state_->devices[selected_index];
     lease = state_->lease_id_counter++;
     uint32_t slot = dev.free_slot;
-    if (slot >= MAX_LEASES_PER_DEVICE) {
-        pthread_mutex_unlock(&state_->mtx);
-        return Status::InternalError("no free lease slots");
-    }
     dev.leases[slot].lease_id = lease;
     dev.leases[slot].allocated_bytes = length;
     dev.leases[slot].expires_at_ms = now + ttl_ms;
     dev.leases[slot].owner_pid = me;
     dev.leases[slot].is_valid = true;
-    if (slot == dev.lease_count) ++dev.lease_count;
-
-    dev.free_slot = (dev.lease_count < MAX_LEASES_PER_DEVICE)
-                        ? dev.lease_count
-                        : MAX_LEASES_PER_DEVICE;
-    for (uint32_t i = slot + 1; i < dev.lease_count; ++i) {
-        if (!dev.leases[i].is_valid) {
-            dev.free_slot = i;
-            break;
-        }
-    }
+    dev.free_slot = dev.leases[slot].next;
     dev.outstanding_bytes += length;
     pthread_mutex_unlock(&state_->mtx);
     return Status::OK();

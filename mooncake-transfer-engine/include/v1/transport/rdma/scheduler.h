@@ -50,6 +50,11 @@ class Scheduler {
 
     Status getEstimatedDeviceLoads(
         std::unordered_map<std::string, uint64_t>& result);
+    
+    Status constructState() {
+        if (!state_) return Status::InternalError("no shared state");
+        return Status::OK();
+    }
 
    private:
     size_t reclaimExpiredLeasesUnlocked();
