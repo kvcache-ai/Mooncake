@@ -31,7 +31,8 @@ __device__ int findIdleTask(Task* tasks, size_t numTasks) {
 }
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
-                                  Task* tasks, size_t numTasks) {
+                                  int64_t broadcastRoot, Task* tasks,
+                                  size_t numTasks) {
     // Find idle task
     int idx = findIdleTask(tasks, numTasks);
     assert(idx >= 0);
@@ -39,6 +40,7 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     // Copy task into slot
     tasks[idx].opType = opType;
     tasks[idx].tensorSize = tensorSize;
+    tasks[idx].broadcastRoot = broadcastRoot;
 
     // Mark READY
     __threadfence();  // Ensure writes visible to host
@@ -95,14 +97,15 @@ MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTask(
-    c10d::OpType opType, size_t tensorSize, cudaStream_t stream,
-    const std::function<void(void* dst)>& tensorToBuffer,
+    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
     tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, tasks_device_,
-                                           kNumTasks_);
-    bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
+                                           tasks_device_, kNumTasks_);
+    bufferToTensor(
+        (void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
     ++taskCount;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);

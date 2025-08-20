@@ -106,13 +106,32 @@ TEST_F(MooncakeBackendTest, AllreduceTest) {
 }
 
 TEST_F(MooncakeBackendTest, BroadcastTest) {
-    std::vector<torch::Tensor> tensors;
-    tensors.push_back(torch::ones({2, 2}));
+    std::vector<c10::intrusive_ptr<c10d::Work>> works;
+    std::vector<std::vector<torch::Tensor>> allTensors;
+    auto options = torch::dtype(torch::kInt32).device(torch::kCUDA);
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
+        std::vector<at::Tensor> tensors;
+        c10d::BroadcastOptions opts;
+        int data = rank == opts.rootRank + opts.rootTensor ? 42 : 0;
+        tensors.emplace_back(
+            torch::full({2, 2}, data, options.device_index(rank)));
+        works.emplace_back(backends[rank]->broadcast(tensors, opts));
+        allTensors.emplace_back(tensors);
+    }
+    for (size_t rank = 0; rank < kNumRanks; ++rank) {
+        auto stream = at::cuda::getStreamFromPool(false, rank);
+        c10::cuda::CUDAStreamGuard guard(stream);
+        bool success = works[rank]->wait();
+        ASSERT_TRUE(success) << "Broadcast failed at rank " << rank;
 
-    ::c10d::BroadcastOptions opts;
-    opts.rootRank = 0;
-
-    EXPECT_THROW({ backends[0]->broadcast(tensors, opts); }, c10::Error);
+        at::Tensor tensor = allTensors[rank][0];
+        auto expected = torch::full({2, 2}, 42, options.device_index(rank));
+        ASSERT_TRUE(torch::allclose(tensor, expected))
+            << "Broadcast result mismatch. Got: " << tensor
+            << " Expected: " << expected;
+    }
 }
 
 }  // namespace mooncake

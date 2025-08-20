@@ -20,6 +20,7 @@ __global__ struct Task {
     volatile TaskStatus status = IDLE;
     c10d::OpType opType = c10d::OpType::UNKNOWN;
     size_t tensorSize;  // In bytes
+    int64_t broadcastRoot;
     BatchID batchID;
 };
 
@@ -31,7 +32,8 @@ class MooncakeWorker {
     explicit MooncakeWorker(TransferEngine* engine, int rank, int size);
 
     c10::intrusive_ptr<c10d::Work> putTask(
-        c10d::OpType opType, size_t tensorSize, cudaStream_t stream,
+        c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+        cudaStream_t stream,
         const std::function<void(void* dst)>& tensorToBuffer,
         const std::function<void(void* src)>& bufferToTensor);
 

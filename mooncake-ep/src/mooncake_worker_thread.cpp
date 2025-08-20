@@ -34,12 +34,19 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                 } else if (task.status == READY) {
                     if (task_status[i].load(std::memory_order_acquire) ==
                         TASK_IDLE) {
+                        if (task.opType == c10d::OpType::BROADCAST &&
+                            rank_ != task.broadcastRoot) {
+                            task_status[i].store(TASK_TRANSFERRED_1,
+                                                 std::memory_order_release);
+                            continue;
+                        }
                         std::vector<TransferRequest> entries;
                         for (int j = 0; j < size_; ++j) {
                             uint64_t source = segment_descs_[rank_]
                                                   ->buffers[taskCount % 2]
                                                   .addr;
                             switch (task.opType) {
+                                case c10d::OpType::BROADCAST:
                                 case c10d::OpType::ALLREDUCE:
                                 case c10d::OpType::ALLGATHER:
                                 case c10d::OpType::_ALLGATHER_BASE:
@@ -51,15 +58,28 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 default:
                                     break;
                             }
+                            uint64_t target_offset =
+                                segment_descs_[j]
+                                    ->buffers[2 + taskCount % 2]
+                                    .addr;
+                            switch (task.opType) {
+                                case c10d::OpType::BROADCAST:
+                                    break;
+                                case c10d::OpType::ALLREDUCE:
+                                case c10d::OpType::ALLGATHER:
+                                case c10d::OpType::_ALLGATHER_BASE:
+                                case c10d::OpType::ALLTOALL_BASE:
+                                case c10d::OpType::ALLTOALL:
+                                    target_offset += rank_ * task.tensorSize;
+                                    break;
+                                default:
+                                    break;
+                            }
                             entries.push_back(TransferRequest{
                                 .opcode = TransferRequest::WRITE,
                                 .source = (void *)source,
                                 .target_id = segment_ids_[j],
-                                .target_offset =
-                                    segment_descs_[j]
-                                        ->buffers[2 + taskCount % 2]
-                                        .addr +
-                                    rank_ * task.tensorSize,
+                                .target_offset = target_offset,
                                 .length = task.tensorSize,
                             });
                         }
@@ -71,15 +91,20 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                TASK_TRANSFERRED_1) {
                         bool batch_done = true;
                         TransferStatus status;
-                        for (int j = 0; j < size_; ++j) {
-                            engine_->getTransferStatus(task.batchID, j, status);
-                            if (status.s != TransferStatusEnum::COMPLETED) {
-                                batch_done = false;
-                                break;
+
+                        if (task.opType != c10d::OpType::BROADCAST ||
+                            rank_ == task.broadcastRoot) {
+                            for (int j = 0; j < size_; ++j) {
+                                engine_->getTransferStatus(task.batchID, j,
+                                                           status);
+                                if (status.s != TransferStatusEnum::COMPLETED) {
+                                    batch_done = false;
+                                    break;
+                                }
                             }
                         }
                         if (!batch_done) {
-                            break;
+                            continue;
                         }
                         auto source_ptr = (int32_t *)segment_descs_[rank_]
                                               ->buffers[4 + taskCount % 2]

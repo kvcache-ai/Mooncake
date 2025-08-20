@@ -104,6 +104,29 @@ MooncakeBackend::~MooncakeBackend() {
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
+    std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
+    TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
+    auto tensor = tensors.back();
+    size_t tensorSize = tensor.numel() * tensor.element_size();
+    int64_t root = opts.rootRank + opts.rootTensor;
+    bool isRoot = (root == rank_);
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream(tensor.device().index());
+    return worker_.putTask(
+        c10d::OpType::BROADCAST, tensorSize, root, stream,
+        [&](void* dst) {
+            if (isRoot) {
+                cudaMemcpyAsync(dst, tensor.data_ptr(), tensorSize,
+                                cudaMemcpyHostToDevice, stream);
+            }
+        },
+        [&](void* src) {
+            cudaMemcpyAsync(tensor.data_ptr(), src, tensorSize,
+                            cudaMemcpyDeviceToHost, stream);
+        });
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
@@ -114,7 +137,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     cudaStream_t stream =
         at::cuda::getCurrentCUDAStream(tensor.device().index());
     return worker_.putTask(
-        c10d::OpType::ALLREDUCE, tensorSize, stream,
+        c10d::OpType::ALLREDUCE, tensorSize, 0, stream,
         [&](void* dst) {
             cudaMemcpyAsync(dst, tensor.data_ptr(), tensorSize,
                             cudaMemcpyHostToDevice, stream);
@@ -136,7 +159,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     cudaStream_t stream =
         at::cuda::getCurrentCUDAStream(inputTensor.device().index());
     return worker_.putTask(
-        c10d::OpType::ALLGATHER, tensorSize, stream,
+        c10d::OpType::ALLGATHER, tensorSize, 0, stream,
         [&](void* dst) {
             cudaMemcpyAsync(dst, inputTensor.data_ptr(), tensorSize,
                             cudaMemcpyHostToDevice, stream);
@@ -157,7 +180,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     cudaStream_t stream =
         at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
     return worker_.putTask(
-        c10d::OpType::_ALLGATHER_BASE, tensorSize, stream,
+        c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, stream,
         [&](void* dst) {
             cudaMemcpyAsync(dst, inputBuffer.data_ptr(), tensorSize,
                             cudaMemcpyHostToDevice, stream);
@@ -176,7 +199,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     cudaStream_t stream =
         at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
     return worker_.putTask(
-        c10d::OpType::ALLTOALL, tensorSize, stream,
+        c10d::OpType::ALLTOALL, tensorSize, 0, stream,
         [&](void* dst) {
             for (const auto j : c10::irange(inputTensors.size())) {
                 cudaMemcpyAsync(dst + j * tensorSize,
