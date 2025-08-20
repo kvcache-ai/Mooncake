@@ -166,7 +166,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
-    TORCH_CHECK(opts.reduceOp == c10d::ReduceOp::SUM, REDUCE_OP_ERROR_MSG);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
@@ -177,7 +176,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             [=](void* dst) { memcpy(dst, tensor.data_ptr(), tensorSize); },
             [=](void* src) {
                 memset(tensor.data_ptr(), 0, tensorSize);
-                launchReduceCpu(tensor, src, numRanks);
+                launchReduceCpu(tensor, src, numRanks, opts.reduceOp);
             });
     } else {
         cudaStream_t stream =
@@ -190,7 +189,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             },
             [&](void* src) {
                 cudaMemsetAsync(tensor.data_ptr(), 0, tensorSize, stream);
-                launchReduceKernel(tensor, src, size_, stream);
+                launchReduceKernel(tensor, src, size_, opts.reduceOp, stream);
             });
     }
 }

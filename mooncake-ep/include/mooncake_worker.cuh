@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
+#include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <transfer_engine.h>
 
@@ -25,9 +26,10 @@ __global__ struct Task {
 };
 
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        cudaStream_t stream);
+                        c10d::ReduceOp op, cudaStream_t stream);
 
-void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks);
+void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
+                     c10d::ReduceOp op);
 
 class MooncakeWorker {
    public:

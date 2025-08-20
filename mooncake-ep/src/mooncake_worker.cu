@@ -86,7 +86,8 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 }
 
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        cudaStream_t stream) {
+                        c10d::ReduceOp op, cudaStream_t stream) {
+    TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only support SUM for reduction.");
     switch (dst.scalar_type()) {
         case c10::kInt:
             reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
@@ -104,23 +105,45 @@ void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
 }
 
 template <typename T>
-void reduceCpu(T* dst, const T* src, size_t numElements,
-                          size_t numRanks) {
+T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
+    switch (op) {
+        case c10d::ReduceOp::SUM:
+            return a + b;
+        case c10d::ReduceOp::PRODUCT:
+            return a * b;
+        case c10d::ReduceOp::MIN:
+            return std::min(a, b);
+        case c10d::ReduceOp::MAX:
+            return std::max(a, b);
+        default:
+            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
+    }
+}
+
+template <typename T>
+void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
+               c10d::ReduceOp op) {
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            T acc = T(0);
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                acc += src[i + rank * numElements];
+            T acc = src[i];
+            for (int64_t rank = 1; rank < numRanks; ++rank) {
+                acc = applyReduceOp(acc, src[i + rank * numElements], op);
             }
             dst[i] = acc;
         }
     });
 }
 
-void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks) {
+void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
+                     c10d::ReduceOp op) {
     switch (dst.scalar_type()) {
         case c10::kInt:
-            reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks);
+            reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks,
+                      op);
+            break;
+        case c10::kFloat:
+            reduceCpu(dst.data_ptr<float>(), (float*)src, dst.numel(), numRanks,
+                      op);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
