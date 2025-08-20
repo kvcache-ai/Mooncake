@@ -555,8 +555,8 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
             std::make_shared<AllocatorWrapper>(0, bin_size + 10, MAX_ALLOCS);
         EXPECT_EQ(allocator->storageReport().totalFreeSpace, bin_size + 10);
 
-        for (uint32_t i = 0; i < 10; i++) {
-            auto handle = allocator->allocate(bin_size - (10 - i));
+        for (uint32_t j = 0; j < 10; j++) {
+            auto handle = allocator->allocate(bin_size - (10 - j));
             ASSERT_TRUE(handle.has_value());
         }
     }
@@ -636,7 +636,7 @@ TEST_F(OffsetAllocatorTest, RandomRepeatAllocationSameSizeAfterFree) {
 
     std::vector<AllocationHandleWrapper> handles;
     std::vector<uint32> alloc_sizes;
-    for (uint32 i = 0; i < 2000; ++i) {
+    for (int i = 0; i < 2000; ++i) {
         uint32 size = size_dist(gen);
         auto handle = allocator->allocate(size);
         if (handle.has_value()) {
@@ -708,7 +708,7 @@ TEST_F(OffsetAllocatorTest, PowerOfTwoLargeAllocatorSize) {
         std::vector<AllocationHandleWrapper> handles;
         std::vector<size_t> alloc_sizes;
         std::uniform_int_distribution<size_t> size_dist(1, max_alloc_size);
-        for (uint32 i = 0; i < 200; ++i) {
+        for (int i = 0; i < 200; ++i) {
             size_t size = size_dist(gen);
             auto handle = allocator->allocate(size);
             if (handle.has_value()) {
@@ -776,7 +776,7 @@ TEST_F(OffsetAllocatorTest, RandomSmallAllocWithLargeAllocatorSize) {
         std::vector<AllocationHandleWrapper> handles;
         std::vector<size_t> alloc_sizes;
         std::uniform_int_distribution<size_t> size_dist(1, max_alloc_size);
-        for (uint32 i = 0; i < 200; ++i) {
+        for (int j = 0; j < 200; ++j) {
             size_t size = size_dist(gen);
             auto handle = allocator->allocate(size);
             if (handle.has_value()) {
@@ -1395,7 +1395,7 @@ TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
         std::vector<OffsetAllocationHandle> handles;
         std::vector<size_t> alloc_sizes;
         std::uniform_int_distribution<size_t> size_dist(1, max_alloc_size);
-        for (uint32 i = 0; i < 200; ++i) {
+        for (int j = 0; j < 200; ++j) {
             size_t size = size_dist(gen);
             auto handle = alloc_a->allocate(size);
             if (handle.has_value()) {
