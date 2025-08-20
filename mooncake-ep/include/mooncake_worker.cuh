@@ -10,15 +10,8 @@
 
 namespace mooncake {
 
-__global__ enum TaskStatus {
-    IDLE = 0,
-    OCCUPIED = 1,
-    READY = 2,
-    DONE = 3,
-};
-
 __global__ struct Task {
-    volatile TaskStatus status = IDLE;
+    volatile bool active = false;
     c10d::OpType opType = c10d::OpType::UNKNOWN;
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
@@ -48,9 +41,9 @@ class MooncakeWorker {
 
     void initWorker(const std::vector<std::string>& server_names);
 
-    static constexpr size_t kNumTasks_ = 4;
-
    private:
+    static constexpr size_t kNumTasks_ = 2;
+
     Task *tasks_, *tasks_device_;
 
     int rank_, size_;

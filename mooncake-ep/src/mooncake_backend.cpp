@@ -79,22 +79,18 @@ MooncakeBackend::MooncakeBackend(
 
     // Register CPU sync regions
     for (size_t i = 0; i < 2; i++) {
-        cpu_sync_send_region_[i] =
-            new int32_t[MooncakeWorker::kNumTasks_ * size];
-        int rc = engine_.registerLocalMemory(
-            cpu_sync_send_region_[i],
-            MooncakeWorker::kNumTasks_ * size * sizeof(int32_t),
-            kWildcardLocation);
+        cpu_sync_send_region_[i] = new int32_t[size];
+        int rc = engine_.registerLocalMemory(cpu_sync_send_region_[i],
+                                             size * sizeof(int32_t),
+                                             kWildcardLocation);
         TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
     }
 
     for (size_t i = 0; i < 2; i++) {
-        cpu_sync_recv_region_[i] =
-            new int32_t[MooncakeWorker::kNumTasks_ * size];
-        int rc = engine_.registerLocalMemory(
-            cpu_sync_recv_region_[i],
-            MooncakeWorker::kNumTasks_ * size * sizeof(int32_t),
-            kWildcardLocation);
+        cpu_sync_recv_region_[i] = new int32_t[size];
+        int rc = engine_.registerLocalMemory(cpu_sync_recv_region_[i],
+                                             size * sizeof(int32_t),
+                                             kWildcardLocation);
         TORCH_CHECK(!rc, c10::str("Failed to register local memory"));
     }
 

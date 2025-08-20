@@ -37,37 +37,22 @@ class MooncakeWorkCuda : public ::c10d::Work {
     cudaEvent_t event_;
 };
 
-__device__ int findIdleTask(Task* tasks, size_t numTasks) {
-    for (size_t i = 0; i < numTasks; ++i) {
-        int expected = IDLE;
-        if (atomicCAS((int*)&tasks[i].status, expected, OCCUPIED) == expected) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, Task* tasks,
-                                  size_t numTasks) {
-    // Find idle task
-    int idx = findIdleTask(tasks, numTasks);
-    assert(idx >= 0);
-
+                                  size_t taskId) {
     // Copy task into slot
-    tasks[idx].opType = opType;
-    tasks[idx].tensorSize = tensorSize;
-    tasks[idx].broadcastRoot = broadcastRoot;
+    tasks[taskId].opType = opType;
+    tasks[taskId].tensorSize = tensorSize;
+    tasks[taskId].broadcastRoot = broadcastRoot;
 
-    // Mark READY
+    // Mark active
     __threadfence();  // Ensure writes visible to host
-    tasks[idx].status = READY;
+    tasks[taskId].active = true;
 
     // Spin-wait until CPU proxy sets DONE
-    while (atomicAdd((int*)&tasks[idx].status, 0) != DONE) {
+    while (tasks[taskId].active) {
         __threadfence();
     }
-    tasks[idx].status = IDLE;
 }
 
 template <typename scalar_t>
@@ -157,7 +142,7 @@ MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
     cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
     cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
     for (size_t i = 0; i < kNumTasks_; ++i) {
-        tasks_[i].status = IDLE;
+        tasks_[i].active = false;
     }
 }
 
@@ -168,31 +153,26 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
-    for (size_t i = 0; i < kNumTasks_; ++i) {
-        if (tasks_[i].status == IDLE) {
-            tasks_[i].status = OCCUPIED;
-            tasks_[i].opType = opType;
-            tasks_[i].tensorSize = tensorSize;
-            tasks_[i].broadcastRoot = broadcastRoot;
-            tensorToBuffer(
-                (void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
+    int taskId = taskCount % kNumTasks_;
+    TORCH_CHECK(!tasks_[taskId].active);
+    tasks_[taskId].active = true;
+    tasks_[taskId].opType = opType;
+    tasks_[taskId].tensorSize = tensorSize;
+    tasks_[taskId].broadcastRoot = broadcastRoot;
+    tensorToBuffer(
+        (void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
 
-            std::thread([this, i, bufferToTensor, future, opType] {
-                tasks_[i].status = READY;
-                while (tasks_[i].status != DONE) {
-                    _mm_pause();
-                }
-                bufferToTensor((void*)segment_descs_[rank_]
-                                   ->buffers[2 + taskCount % 2]
-                                   .addr);
-                tasks_[i].status = IDLE;
-                ++taskCount;
-                future->markCompleted(c10::IValue());
-            }).detach();
-            return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
+    std::thread([this, taskId, bufferToTensor, future] {
+        while (tasks_[taskId].active) {
+            _mm_pause();
         }
-    }
-    TORCH_CHECK(false, "No task slots available.");
+        bufferToTensor((void*)segment_descs_[rank_]
+                           ->buffers[2 + taskCount % 2]
+                           .addr);
+        ++taskCount;
+        future->markCompleted(c10::IValue());
+    }).detach();
+    return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
@@ -202,7 +182,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
     tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
     enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
-                                           tasks_device_, kNumTasks_);
+                                           tasks_device_, taskCount % kNumTasks_);
     bufferToTensor(
         (void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
     ++taskCount;
