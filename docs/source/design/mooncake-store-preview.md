@@ -10,7 +10,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
-- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
+- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
@@ -89,7 +89,14 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​ The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​
+
+**Replication Guarantees and Best Effort Behavior:**
+- Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
+- Different slices from different objects may be placed in the same segment
+- Replication operates on a best-effort basis: if insufficient space is available for all requested replicas, the object will still be written with as many replicas as possible
+
+The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
 struct ReplicateConfig {
@@ -202,7 +209,7 @@ message PutStartResponse {
 
 - **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
+- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
 3. PutEnd
 
