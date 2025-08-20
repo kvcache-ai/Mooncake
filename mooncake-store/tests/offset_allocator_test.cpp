@@ -104,26 +104,17 @@ class AllocationHandleWrapper {
 // allocation is legal.
 class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    public:
-    // Constructor
-    AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
-        : m_allocator(
-              OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
-          m_base(base),
-          m_buffer_size(size) {
-        // The allocator is created with the specified base and size
-        // We can now properly track the allocation bounds
+    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size, uint32 max_capacity) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<uint32> init_capacity_dist(1, max_capacity);
+        uint32 init_capacity = init_capacity_dist(gen);
+        return std::shared_ptr<AllocatorWrapper>(new AllocatorWrapper(base, size, init_capacity, max_capacity));
     }
 
-    // Constructor with specified init_capacity and max_capacity.
-    AllocatorWrapper(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity)
-        : m_allocator(
-              OffsetAllocator::create(base, size, init_capacity, max_capacity)),
-          m_base(base),
-          m_buffer_size(size) {
-        // The allocator is created with the specified base and size
-        // We can now properly track the allocation bounds
+    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity) {
+        return std::shared_ptr<AllocatorWrapper>(new AllocatorWrapper(base, size, init_capacity, max_capacity));
     }
-
     AllocatorWrapper(const AllocatorWrapper&) = delete;
     AllocatorWrapper& operator=(const AllocatorWrapper&) = delete;
     AllocatorWrapper(AllocatorWrapper&& other) = default;
@@ -174,6 +165,26 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
     }
 
    private:
+    // Constructor
+    AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
+       : m_allocator(
+             OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
+         m_base(base),
+         m_buffer_size(size) {
+       // The allocator is created with the specified base and size
+       // We can now properly track the allocation bounds
+   }
+
+   // Constructor with specified init_capacity and max_capacity.
+   AllocatorWrapper(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity)
+       : m_allocator(
+             OffsetAllocator::create(base, size, init_capacity, max_capacity)),
+         m_base(base),
+         m_buffer_size(size) {
+       // The allocator is created with the specified base and size
+       // We can now properly track the allocation bounds
+   }
+
     // Called by AllocationHandleWrapper when it's destroyed
     void onHandleDeallocated(uint64_t address, uint64_t size) {
         ASSERT_TRUE(m_allocated_regions.find(address) !=
@@ -402,7 +413,7 @@ TEST_F(OffsetAllocatorTest, BasicAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate handle
     auto handle = allocator->allocate(ALLOCATOR_SIZE);
@@ -430,7 +441,7 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Try to allocate more than available space
     auto handle =
@@ -443,7 +454,7 @@ TEST_F(OffsetAllocatorTest, MultipleAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -468,7 +479,7 @@ TEST_F(OffsetAllocatorTest, DifferentSizesNoOverlap) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
     std::vector<uint32> sizes = {100, 500, 1000, 2000, 50, 1500, 800, 300};
@@ -491,7 +502,7 @@ TEST_F(OffsetAllocatorTest, StorageReports) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     OffsetAllocStorageReport report = allocator->storageReport();
     EXPECT_GT(report.totalFreeSpace, 0);
@@ -510,7 +521,7 @@ TEST_F(OffsetAllocatorTest, ContinuousRandomAllocationDeallocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -539,7 +550,7 @@ TEST_F(OffsetAllocatorTest, FullSizeAllocation) {
         if (size == 0) continue;  // Skip 0 size
         constexpr uint32 MAX_ALLOCS = 1000;
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, size, MAX_ALLOCS);
+            AllocatorWrapper::create(0, size, MAX_ALLOCS);
 
         auto handle = allocator->allocate(size);
         ASSERT_TRUE(handle.has_value());
@@ -552,7 +563,7 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
         if (bin_size < 1024) continue;  // Skip small sizes
         constexpr uint32_t MAX_ALLOCS = 1000;
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, bin_size + 10, MAX_ALLOCS);
+            AllocatorWrapper::create(0, bin_size + 10, MAX_ALLOCS);
         EXPECT_EQ(allocator->storageReport().totalFreeSpace, bin_size + 10);
 
         for (uint32_t j = 0; j < 10; j++) {
@@ -567,7 +578,7 @@ TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
     for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
@@ -585,7 +596,7 @@ TEST_F(OffsetAllocatorTest, FullAllocationAfterRandomAllocationAndFree) {
     const uint32 ALLOCATOR_SIZE = bin_sizes[NUM_BINS - 1];
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -610,7 +621,7 @@ TEST_F(OffsetAllocatorTest, AllocationSameSizeAfterFree) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(1023);
     ASSERT_TRUE(handle.has_value());
@@ -628,7 +639,7 @@ TEST_F(OffsetAllocatorTest, RandomRepeatAllocationSameSizeAfterFree) {
     const uint32 ALLOCATOR_SIZE = bin_sizes[NUM_BINS - 1];
     constexpr uint32 MAX_ALLOCS = 10000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -670,7 +681,7 @@ TEST_F(OffsetAllocatorTest, BasicLargeAllocatorSize) {
     for (size_t buffer_size = MIN_BUFFER_SIZE; buffer_size <= MAX_BUFFER_SIZE;
          buffer_size *= 2) {
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, buffer_size, MAX_ALLOCS);
+            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = allocator->storageReport().largestFreeRegion;
         // The largest free region equals buffer size only in this specific
         // buffer size.
@@ -702,7 +713,7 @@ TEST_F(OffsetAllocatorTest, PowerOfTwoLargeAllocatorSize) {
     for (size_t buffer_size = MIN_BUFFER_SIZE; buffer_size <= MAX_BUFFER_SIZE;
          buffer_size *= 2) {
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, buffer_size, MAX_ALLOCS);
+            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
@@ -747,7 +758,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocSizeWithLargeAllocatorSize) {
     for (int i = 0; i < 100; i++) {
         size_t buffer_size = buffer_size_dist(gen);
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, buffer_size, MAX_ALLOCS);
+            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = allocator->storageReport().largestFreeRegion;
         ASSERT_GT(max_alloc_size, buffer_size / 2);
 
@@ -770,7 +781,7 @@ TEST_F(OffsetAllocatorTest, RandomSmallAllocWithLargeAllocatorSize) {
     for (int i = 0; i < 100; i++) {
         size_t buffer_size = buffer_size_dist(gen);
         auto allocator =
-            std::make_shared<AllocatorWrapper>(0, buffer_size, MAX_ALLOCS);
+            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
@@ -808,7 +819,7 @@ TEST_F(OffsetAllocatorTest, ZeroSizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(0);
     EXPECT_FALSE(handle.has_value()) << "Zero size allocation should fail";
@@ -819,7 +830,7 @@ TEST_F(OffsetAllocatorTest, OneByteAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(1);
     ASSERT_TRUE(handle.has_value());
@@ -833,7 +844,7 @@ TEST_F(OffsetAllocatorTest, ExactCapacityAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE);
     ASSERT_TRUE(handle.has_value());
@@ -850,7 +861,7 @@ TEST_F(OffsetAllocatorTest, OversizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE + 1);
     EXPECT_FALSE(handle.has_value())
@@ -862,7 +873,7 @@ TEST_F(OffsetAllocatorTest, JustBelowBinSizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate size just below a bin size
     auto handle = allocator->allocate(1023);
@@ -880,7 +891,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocationCountEdgeCase) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 10;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -908,7 +919,7 @@ TEST_F(OffsetAllocatorTest, VerySmallAllocatorSize) {
     constexpr uint32 ALLOCATOR_SIZE = 16;  // Very small
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(16);
     ASSERT_TRUE(handle.has_value());
@@ -924,7 +935,7 @@ TEST_F(OffsetAllocatorTest, AllocatorSizeMinusOne) {
     constexpr uint32 ALLOCATOR_SIZE = 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE - 1);
     ASSERT_TRUE(handle.has_value());
@@ -936,7 +947,7 @@ TEST_F(OffsetAllocatorTest, PowerOfTwoAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test various power of 2 sizes
     std::vector<uint32> power_of_two_sizes = {1,  2,   4,   8,   16,  32,
@@ -960,7 +971,7 @@ TEST_F(OffsetAllocatorTest, BinSizeCalculation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test that allocations are placed in appropriate bins
     // SmallFloat::uintToFloatRoundUp should determine the bin
@@ -984,7 +995,7 @@ TEST_F(OffsetAllocatorTest, BinOverflowScenarios) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Fill up a specific bin size with many small allocations
     std::vector<AllocationHandleWrapper> handles;
@@ -1012,7 +1023,7 @@ TEST_F(OffsetAllocatorTest, BinMergingBehavior) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate three adjacent blocks
     auto handle1 = allocator->allocate(1024);
@@ -1043,7 +1054,7 @@ TEST_F(OffsetAllocatorTest, BinSelectionEdgeCases) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are just below and above bin boundaries
     std::vector<uint32> edge_sizes = {
@@ -1081,7 +1092,7 @@ TEST_F(OffsetAllocatorTest, BinSystemLargeAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test large allocations that should go into high-numbered bins
     std::vector<uint32> large_sizes = {
@@ -1113,7 +1124,7 @@ TEST_F(OffsetAllocatorTest, BinSystemMixedPatterns) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -1138,7 +1149,7 @@ TEST_F(OffsetAllocatorTest, BinSystemRepeatedCycles) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<uint32> test_sizes = {64, 128, 256, 512, 1024, 2048, 4096};
 
@@ -1175,7 +1186,7 @@ TEST_F(OffsetAllocatorTest, BinSystemNonAlignedSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that don't align with typical bin boundaries
     std::vector<uint32> non_aligned_sizes = {
@@ -1203,7 +1214,7 @@ TEST_F(OffsetAllocatorTest, BinSystemPrimeSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are prime numbers (should be challenging for bin system)
     std::vector<uint32> prime_sizes = {
@@ -1235,7 +1246,7 @@ TEST_F(OffsetAllocatorTest, BinSystemFibonacciSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that follow the Fibonacci sequence
     std::vector<uint32> fibonacci_sizes = {
@@ -1257,7 +1268,7 @@ TEST_F(OffsetAllocatorTest, BinSystemPageSizeMultiples) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are multiples of common page sizes (4KB, 8KB, 16KB, 64KB)
     std::vector<uint32> page_size_multiples = {
@@ -1286,7 +1297,7 @@ TEST_F(OffsetAllocatorTest, MetricsInterface) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
-        std::make_shared<AllocatorWrapper>(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test initial metrics - should show empty allocator
     OffsetAllocatorMetrics initial_metrics = allocator->getMetrics();
@@ -1428,7 +1439,7 @@ TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
     const size_t size = 1024 * 1024;
     const uint32_t init_capacity = 10;
     const uint32_t max_capacity = 10000;
-    std::shared_ptr<AllocatorWrapper> allocator = std::make_shared<AllocatorWrapper>(base, size, init_capacity, max_capacity);
+    std::shared_ptr<AllocatorWrapper> allocator = AllocatorWrapper::create(base, size, init_capacity, max_capacity);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -1499,7 +1510,7 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
     // Test 10 times.
     for (int i = 0; i < 10; i++) {
         size_t buffer_size = buffer_size_dist(gen);
-        auto allocator = std::make_shared<AllocatorWrapper>(0, buffer_size, INIT_CAPACITY, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, buffer_size, INIT_CAPACITY, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
