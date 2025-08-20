@@ -373,6 +373,11 @@ class OffsetAllocatorTest : public ::testing::Test {
         ASSERT_NE(alloc_b, nullptr);
         assertAllocatorEQ(alloc_a, alloc_b);
 
+        //============== Begin test deserialization with corrupted buffer ==============
+        // Set the log level to fatal to avoid the log output.
+        auto log_level = FLAGS_minloglevel;
+        FLAGS_minloglevel = google::GLOG_FATAL;
+    
         // Remove the last byte from the buffer and try to deserialize
         auto corrupted_buffer = buffer;
         corrupted_buffer.pop_back();
@@ -397,6 +402,10 @@ class OffsetAllocatorTest : public ::testing::Test {
         corrupted_buffer.push_back(0);
         alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
+
+        //============== End test deserialization with corrupted buffer ==============
+        // Restore the log level.
+        FLAGS_minloglevel = log_level;
 
         // Test if the deserialized allocator can properly free allocated objects.
         alloc_b = deserialize_from<OffsetAllocator>(buffer);
