@@ -45,6 +45,8 @@ class MooncakeWorker {
     static constexpr size_t kNumTasks_ = 2;
 
     Task *tasks_, *tasks_device_;
+    bool hasCallback_[kNumTasks_]{};
+    std::function<void()> callbacks_[kNumTasks_]{};
 
     int rank_, size_;
 

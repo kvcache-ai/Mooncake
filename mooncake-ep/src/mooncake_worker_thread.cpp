@@ -143,6 +143,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
                         ++taskCount;
+                        if (hasCallback_[i]) {
+                            callbacks_[i]();
+                        }
                     }
                 }
             }
