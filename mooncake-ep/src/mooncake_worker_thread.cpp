@@ -32,10 +32,13 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                 if (task.status == IDLE) {
                     task_status[i].store(TASK_IDLE, std::memory_order_release);
                 } else if (task.status == READY) {
+                    bool skipTransfer =
+                        (task.opType == c10d::OpType::BROADCAST &&
+                         rank_ != task.broadcastRoot) ||
+                        task.opType == c10d::OpType::BARRIER;
                     if (task_status[i].load(std::memory_order_acquire) ==
                         TASK_IDLE) {
-                        if (task.opType == c10d::OpType::BROADCAST &&
-                            rank_ != task.broadcastRoot) {
+                        if (skipTransfer) {
                             task_status[i].store(TASK_TRANSFERRED_1,
                                                  std::memory_order_release);
                             continue;
@@ -92,8 +95,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         bool batch_done = true;
                         TransferStatus status;
 
-                        if (task.opType != c10d::OpType::BROADCAST ||
-                            rank_ == task.broadcastRoot) {
+                        if (!skipTransfer) {
                             for (int j = 0; j < size_; ++j) {
                                 engine_->getTransferStatus(task.batchID, j,
                                                            status);

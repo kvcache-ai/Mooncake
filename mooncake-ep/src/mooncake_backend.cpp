@@ -215,4 +215,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             }
         });
 }
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
+    const c10d::BarrierOptions& opts) {
+    TORCH_CHECK(opts.device.has_value(), "Expected opts.device");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(opts.device->index());
+    return worker_.putTask(
+        c10d::OpType::BARRIER, 0, 0, stream, [&](void*) {}, [&](void*) {});
+}
 }  // namespace mooncake
