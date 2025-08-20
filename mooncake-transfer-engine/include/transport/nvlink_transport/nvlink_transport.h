@@ -72,6 +72,8 @@ class NvlinkTransport : public Transport {
 
     const char* getName() const override { return "nvlink"; }
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
    private:
     std::atomic_bool running_;
 

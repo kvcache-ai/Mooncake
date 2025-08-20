@@ -430,6 +430,14 @@ int TransferEngine::unregisterLocalMemoryBatch(
     return 0;
 }
 
+int TransferEngine::closeSegment(Transport::SegmentHandle handle) {
+    for (auto &transport : multi_transports_->listTransports()) {
+        int ret = transport->closeSegment(handle);
+        if (ret < 0) return ret;
+    }
+    return 0;
+}
+
 #ifdef WITH_METRICS
 // Helper function to convert string to lowercase for case-insensitive
 // comparison

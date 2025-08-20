@@ -261,6 +261,10 @@ int CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
+int CxlTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 int CxlTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {

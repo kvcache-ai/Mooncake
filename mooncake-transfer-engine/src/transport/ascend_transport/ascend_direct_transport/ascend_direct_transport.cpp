@@ -432,6 +432,10 @@ void AscendDirectTransport::workerThread() {
     LOG(INFO) << "AscendDirectTransport worker thread stopped";
 }
 
+int AscendDirectTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 void AscendDirectTransport::processSliceList(
     const std::vector<Slice *> &slice_list) {
     if (slice_list.empty()) {
