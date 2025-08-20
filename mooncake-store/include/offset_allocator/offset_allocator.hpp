@@ -277,6 +277,7 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::deserialize_from(T &serializer
 
 template <typename T>
 OffsetAllocator::OffsetAllocator(T &serializer) {
+    // serializer.read() will throw an exception if the buffer is corrupted.
     try {
         serializer.read(&m_base, sizeof(m_base));
         serializer.read(&m_multiplier_bits, sizeof(m_multiplier_bits));
@@ -314,6 +315,7 @@ __Allocator::__Allocator(T &serializer) {
     m_nodes = nullptr;
     m_freeNodes = nullptr;
     
+    // serializer.read() will throw an exception if the buffer is corrupted.
     try {
         // Deserialize basic member variables
         serializer.read(&m_size, sizeof(m_size));
