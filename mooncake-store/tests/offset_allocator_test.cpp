@@ -91,7 +91,7 @@ class AllocationHandleWrapper {
 
     // Get size
     uint64_t size() const { return m_handle.size(); }
-    
+
     // Get the underlying handle
     OffsetAllocationHandle& getHandle() { return m_handle; }
 
@@ -104,16 +104,22 @@ class AllocationHandleWrapper {
 // allocation is legal.
 class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    public:
-    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size, uint32 max_capacity) {
+    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size,
+                                                    uint32 max_capacity) {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<uint32> init_capacity_dist(1, max_capacity);
+        std::uniform_int_distribution<uint32> init_capacity_dist(1,
+                                                                 max_capacity);
         uint32 init_capacity = init_capacity_dist(gen);
-        return std::shared_ptr<AllocatorWrapper>(new AllocatorWrapper(base, size, init_capacity, max_capacity));
+        return std::shared_ptr<AllocatorWrapper>(
+            new AllocatorWrapper(base, size, init_capacity, max_capacity));
     }
 
-    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity) {
-        return std::shared_ptr<AllocatorWrapper>(new AllocatorWrapper(base, size, init_capacity, max_capacity));
+    static std::shared_ptr<AllocatorWrapper> create(uint64_t base, size_t size,
+                                                    uint32 init_capacity,
+                                                    uint32 max_capacity) {
+        return std::shared_ptr<AllocatorWrapper>(
+            new AllocatorWrapper(base, size, init_capacity, max_capacity));
     }
     AllocatorWrapper(const AllocatorWrapper&) = delete;
     AllocatorWrapper& operator=(const AllocatorWrapper&) = delete;
@@ -167,23 +173,24 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
    private:
     // Constructor
     AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
-       : m_allocator(
-             OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
-         m_base(base),
-         m_buffer_size(size) {
-       // The allocator is created with the specified base and size
-       // We can now properly track the allocation bounds
-   }
+        : m_allocator(
+              OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
+          m_base(base),
+          m_buffer_size(size) {
+        // The allocator is created with the specified base and size
+        // We can now properly track the allocation bounds
+    }
 
-   // Constructor with specified init_capacity and max_capacity.
-   AllocatorWrapper(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity)
-       : m_allocator(
-             OffsetAllocator::create(base, size, init_capacity, max_capacity)),
-         m_base(base),
-         m_buffer_size(size) {
-       // The allocator is created with the specified base and size
-       // We can now properly track the allocation bounds
-   }
+    // Constructor with specified init_capacity and max_capacity.
+    AllocatorWrapper(uint64_t base, size_t size, uint32 init_capacity,
+                     uint32 max_capacity)
+        : m_allocator(
+              OffsetAllocator::create(base, size, init_capacity, max_capacity)),
+          m_base(base),
+          m_buffer_size(size) {
+        // The allocator is created with the specified base and size
+        // We can now properly track the allocation bounds
+    }
 
     // Called by AllocationHandleWrapper when it's destroyed
     void onHandleDeallocated(uint64_t address, uint64_t size) {
@@ -275,54 +282,71 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void TearDown() override {}
 
-    OffsetAllocationHandle copyHandleWithNewAllocator(const OffsetAllocationHandle& handle, const std::shared_ptr<OffsetAllocator>& new_allocator) {
-        return OffsetAllocationHandle(new_allocator, handle.m_allocation, handle.real_base, handle.requested_size);
+    OffsetAllocationHandle copyHandleWithNewAllocator(
+        const OffsetAllocationHandle& handle,
+        const std::shared_ptr<OffsetAllocator>& new_allocator) {
+        return OffsetAllocationHandle(new_allocator, handle.m_allocation,
+                                      handle.real_base, handle.requested_size);
     }
 
-    void substituteWithNewAllocator(AllocationHandleWrapper& handle, std::shared_ptr<OffsetAllocator> new_allocator) {
+    void substituteWithNewAllocator(
+        AllocationHandleWrapper& handle,
+        std::shared_ptr<OffsetAllocator> new_allocator) {
         handle.getHandle().m_allocator = new_allocator;
     }
 
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
-                      const std::shared_ptr<OffsetAllocator>& b) {
+                           const std::shared_ptr<OffsetAllocator>& b) {
         // Compare basic member variables
         ASSERT_EQ(a->m_base, b->m_base);
         ASSERT_EQ(a->m_multiplier_bits, b->m_multiplier_bits);
         ASSERT_EQ(a->m_capacity, b->m_capacity);
         ASSERT_EQ(a->m_allocated_size, b->m_allocated_size);
         ASSERT_EQ(a->m_allocated_num, b->m_allocated_num);
-        
+
         // Compare __Allocator member variables
         ASSERT_EQ(a->m_allocator->m_size, b->m_allocator->m_size);
-        ASSERT_EQ(a->m_allocator->m_current_capacity, b->m_allocator->m_current_capacity);
-        ASSERT_EQ(a->m_allocator->m_max_capacity, b->m_allocator->m_max_capacity);
+        ASSERT_EQ(a->m_allocator->m_current_capacity,
+                  b->m_allocator->m_current_capacity);
+        ASSERT_EQ(a->m_allocator->m_max_capacity,
+                  b->m_allocator->m_max_capacity);
         ASSERT_EQ(a->m_allocator->m_freeStorage, b->m_allocator->m_freeStorage);
         ASSERT_EQ(a->m_allocator->m_usedBinsTop, b->m_allocator->m_usedBinsTop);
         ASSERT_EQ(a->m_allocator->m_freeOffset, b->m_allocator->m_freeOffset);
-        
+
         // Compare arrays
         for (uint32 i = 0; i < NUM_TOP_BINS; ++i) {
-            ASSERT_EQ(a->m_allocator->m_usedBins[i], b->m_allocator->m_usedBins[i]);
+            ASSERT_EQ(a->m_allocator->m_usedBins[i],
+                      b->m_allocator->m_usedBins[i]);
         }
-        
+
         for (uint32 i = 0; i < NUM_LEAF_BINS; ++i) {
-            ASSERT_EQ(a->m_allocator->m_binIndices[i], b->m_allocator->m_binIndices[i]);
+            ASSERT_EQ(a->m_allocator->m_binIndices[i],
+                      b->m_allocator->m_binIndices[i]);
         }
-        
+
         // Compare Node arrays
         for (uint32 i = 0; i < a->m_allocator->m_current_capacity; ++i) {
-            ASSERT_EQ(a->m_allocator->m_nodes[i].dataOffset, b->m_allocator->m_nodes[i].dataOffset);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].dataSize, b->m_allocator->m_nodes[i].dataSize);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].binListPrev, b->m_allocator->m_nodes[i].binListPrev);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].binListNext, b->m_allocator->m_nodes[i].binListNext);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborPrev, b->m_allocator->m_nodes[i].neighborPrev);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborNext, b->m_allocator->m_nodes[i].neighborNext);
-            ASSERT_EQ(a->m_allocator->m_nodes[i].used, b->m_allocator->m_nodes[i].used);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].dataOffset,
+                      b->m_allocator->m_nodes[i].dataOffset);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].dataSize,
+                      b->m_allocator->m_nodes[i].dataSize);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].binListPrev,
+                      b->m_allocator->m_nodes[i].binListPrev);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].binListNext,
+                      b->m_allocator->m_nodes[i].binListNext);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborPrev,
+                      b->m_allocator->m_nodes[i].neighborPrev);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].neighborNext,
+                      b->m_allocator->m_nodes[i].neighborNext);
+            ASSERT_EQ(a->m_allocator->m_nodes[i].used,
+                      b->m_allocator->m_nodes[i].used);
         }
-        
+
         // Compare freeNodes array
         for (uint32 i = 0; i < a->m_allocator->m_current_capacity; ++i) {
-            ASSERT_EQ(a->m_allocator->m_freeNodes[i], b->m_allocator->m_freeNodes[i]);
+            ASSERT_EQ(a->m_allocator->m_freeNodes[i],
+                      b->m_allocator->m_freeNodes[i]);
         }
     }
 
@@ -330,54 +354,94 @@ class OffsetAllocatorTest : public ::testing::Test {
     bool isAllocatorEqual(const std::shared_ptr<OffsetAllocator>& a,
                           const std::shared_ptr<OffsetAllocator>& b) {
         // Compare basic member variables
-        if (memcmp(&a->m_base, &b->m_base, sizeof(a->m_base)) != 0) return false;
-        if (memcmp(&a->m_multiplier_bits, &b->m_multiplier_bits, sizeof(a->m_multiplier_bits)) != 0) return false;
-        if (memcmp(&a->m_capacity, &b->m_capacity, sizeof(a->m_capacity)) != 0) return false;
-        if (memcmp(&a->m_allocated_size, &b->m_allocated_size, sizeof(a->m_allocated_size)) != 0) return false;
-        if (memcmp(&a->m_allocated_num, &b->m_allocated_num, sizeof(a->m_allocated_num)) != 0) return false;
-        
+        if (memcmp(&a->m_base, &b->m_base, sizeof(a->m_base)) != 0)
+            return false;
+        if (memcmp(&a->m_multiplier_bits, &b->m_multiplier_bits,
+                   sizeof(a->m_multiplier_bits)) != 0)
+            return false;
+        if (memcmp(&a->m_capacity, &b->m_capacity, sizeof(a->m_capacity)) != 0)
+            return false;
+        if (memcmp(&a->m_allocated_size, &b->m_allocated_size,
+                   sizeof(a->m_allocated_size)) != 0)
+            return false;
+        if (memcmp(&a->m_allocated_num, &b->m_allocated_num,
+                   sizeof(a->m_allocated_num)) != 0)
+            return false;
+
         // Compare __Allocator member variables
-        if (memcmp(&a->m_allocator->m_size, &b->m_allocator->m_size, sizeof(a->m_allocator->m_size)) != 0) return false;
-        if (memcmp(&a->m_allocator->m_current_capacity, &b->m_allocator->m_current_capacity, sizeof(a->m_allocator->m_current_capacity)) != 0) return false;
-        if (memcmp(&a->m_allocator->m_max_capacity, &b->m_allocator->m_max_capacity, sizeof(a->m_allocator->m_max_capacity)) != 0) return false;
-        if (memcmp(&a->m_allocator->m_freeStorage, &b->m_allocator->m_freeStorage, sizeof(a->m_allocator->m_freeStorage)) != 0) return false;
-        if (memcmp(&a->m_allocator->m_usedBinsTop, &b->m_allocator->m_usedBinsTop, sizeof(a->m_allocator->m_usedBinsTop)) != 0) return false;
-        if (memcmp(&a->m_allocator->m_freeOffset, &b->m_allocator->m_freeOffset, sizeof(a->m_allocator->m_freeOffset)) != 0) return false;
-        
+        if (memcmp(&a->m_allocator->m_size, &b->m_allocator->m_size,
+                   sizeof(a->m_allocator->m_size)) != 0)
+            return false;
+        if (memcmp(&a->m_allocator->m_current_capacity,
+                   &b->m_allocator->m_current_capacity,
+                   sizeof(a->m_allocator->m_current_capacity)) != 0)
+            return false;
+        if (memcmp(&a->m_allocator->m_max_capacity,
+                   &b->m_allocator->m_max_capacity,
+                   sizeof(a->m_allocator->m_max_capacity)) != 0)
+            return false;
+        if (memcmp(&a->m_allocator->m_freeStorage,
+                   &b->m_allocator->m_freeStorage,
+                   sizeof(a->m_allocator->m_freeStorage)) != 0)
+            return false;
+        if (memcmp(&a->m_allocator->m_usedBinsTop,
+                   &b->m_allocator->m_usedBinsTop,
+                   sizeof(a->m_allocator->m_usedBinsTop)) != 0)
+            return false;
+        if (memcmp(&a->m_allocator->m_freeOffset, &b->m_allocator->m_freeOffset,
+                   sizeof(a->m_allocator->m_freeOffset)) != 0)
+            return false;
+
         // Compare arrays
-        if (memcmp(a->m_allocator->m_usedBins, b->m_allocator->m_usedBins, NUM_TOP_BINS * sizeof(a->m_allocator->m_usedBins[0])) != 0) return false;
-        
-        if (memcmp(a->m_allocator->m_binIndices, b->m_allocator->m_binIndices, NUM_LEAF_BINS * sizeof(a->m_allocator->m_binIndices[0])) != 0) return false;
-        
+        if (memcmp(a->m_allocator->m_usedBins, b->m_allocator->m_usedBins,
+                   NUM_TOP_BINS * sizeof(a->m_allocator->m_usedBins[0])) != 0)
+            return false;
+
+        if (memcmp(a->m_allocator->m_binIndices, b->m_allocator->m_binIndices,
+                   NUM_LEAF_BINS * sizeof(a->m_allocator->m_binIndices[0])) !=
+            0)
+            return false;
+
         // Compare Node arrays
-        if (memcmp(a->m_allocator->m_nodes, b->m_allocator->m_nodes, a->m_allocator->m_current_capacity * sizeof(a->m_allocator->m_nodes[0])) != 0) return false;
-        
+        if (memcmp(a->m_allocator->m_nodes, b->m_allocator->m_nodes,
+                   a->m_allocator->m_current_capacity *
+                       sizeof(a->m_allocator->m_nodes[0])) != 0)
+            return false;
+
         // Compare freeNodes array
-        if (memcmp(a->m_allocator->m_freeNodes, b->m_allocator->m_freeNodes, a->m_allocator->m_current_capacity * sizeof(a->m_allocator->m_freeNodes[0])) != 0) return false;
-        
+        if (memcmp(a->m_allocator->m_freeNodes, b->m_allocator->m_freeNodes,
+                   a->m_allocator->m_current_capacity *
+                       sizeof(a->m_allocator->m_freeNodes[0])) != 0)
+            return false;
+
         // All comparisons passed, allocators are equal
         return true;
     }
 
-    void testSerializeAllocator(const std::shared_ptr<OffsetAllocator>& alloc_a, const std::vector<OffsetAllocationHandle> &handles) {
+    void testSerializeAllocator(
+        const std::shared_ptr<OffsetAllocator>& alloc_a,
+        const std::vector<OffsetAllocationHandle>& handles) {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<uint32> size_dist(1,
-                                                        1024 * 64);  // 1B to 64KB
+        std::uniform_int_distribution<uint32> size_dist(
+            1,
+            1024 * 64);  // 1B to 64KB
         // Serialize the allocator
         std::vector<SerializedByte> buffer;
         ASSERT_EQ(serialize_to(alloc_a, buffer), ErrorCode::OK);
 
         // Deserialize the allocator and compare
-        std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+        std::shared_ptr<OffsetAllocator> alloc_b =
+            deserialize_from<OffsetAllocator>(buffer);
         ASSERT_NE(alloc_b, nullptr);
         assertAllocatorEQ(alloc_a, alloc_b);
 
-        //============== Begin test deserialization with corrupted buffer ==============
+        //============== Begin test deserialization with corrupted buffer
+        //==============
         // Set the log level to fatal to avoid the log output.
         auto log_level = FLAGS_minloglevel;
         FLAGS_minloglevel = google::GLOG_FATAL;
-    
+
         // Remove the last byte from the buffer and try to deserialize
         auto corrupted_buffer = buffer;
         corrupted_buffer.pop_back();
@@ -386,15 +450,17 @@ class OffsetAllocatorTest : public ::testing::Test {
 
         // change a random bit from the buffer and try to deserialize
         corrupted_buffer = buffer;
-        std::uniform_int_distribution<size_t> byte_index_dist(0, buffer.size() - 1);
-        std::uniform_int_distribution<int> bit_index_dist(0, 7); // 8 bits per byte
+        std::uniform_int_distribution<size_t> byte_index_dist(
+            0, buffer.size() - 1);
+        std::uniform_int_distribution<int> bit_index_dist(
+            0, 7);  // 8 bits per byte
         size_t byte_index = byte_index_dist(gen);
         int bit_index = bit_index_dist(gen);
         // Flip the random bit
         corrupted_buffer[byte_index] ^= (1 << bit_index);
         alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
-        // There are bool values whose value may not change if one bit is flipped,
-        // so the isAllocatorEqual compares variables using memcmp.
+        // There are bool values whose value may not change if one bit is
+        // flipped, so the isAllocatorEqual compares variables using memcmp.
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
 
         // Add a byte to the buffer and try to deserialize
@@ -403,17 +469,19 @@ class OffsetAllocatorTest : public ::testing::Test {
         alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
 
-        //============== End test deserialization with corrupted buffer ==============
+        //============== End test deserialization with corrupted buffer
+        //==============
         // Restore the log level.
         FLAGS_minloglevel = log_level;
 
-        // Test if the deserialized allocator can properly free allocated objects.
+        // Test if the deserialized allocator can properly free allocated
+        // objects.
         alloc_b = deserialize_from<OffsetAllocator>(buffer);
         ASSERT_TRUE(alloc_b != nullptr);
         for (const auto& handle : handles) {
-            OffsetAllocationHandle handle_copy = copyHandleWithNewAllocator(handle, alloc_b);
+            OffsetAllocationHandle handle_copy =
+                copyHandleWithNewAllocator(handle, alloc_b);
         }
-
     }
 };
 
@@ -421,8 +489,7 @@ class OffsetAllocatorTest : public ::testing::Test {
 TEST_F(OffsetAllocatorTest, BasicAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate handle
     auto handle = allocator->allocate(ALLOCATOR_SIZE);
@@ -449,8 +516,7 @@ TEST_F(OffsetAllocatorTest, BasicAllocation) {
 TEST_F(OffsetAllocatorTest, AllocationFailure) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Try to allocate more than available space
     auto handle =
@@ -462,8 +528,7 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
 TEST_F(OffsetAllocatorTest, MultipleAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -487,8 +552,7 @@ TEST_F(OffsetAllocatorTest, MultipleAllocations) {
 TEST_F(OffsetAllocatorTest, DifferentSizesNoOverlap) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
     std::vector<uint32> sizes = {100, 500, 1000, 2000, 50, 1500, 800, 300};
@@ -510,8 +574,7 @@ TEST_F(OffsetAllocatorTest, DifferentSizesNoOverlap) {
 TEST_F(OffsetAllocatorTest, StorageReports) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     OffsetAllocStorageReport report = allocator->storageReport();
     EXPECT_GT(report.totalFreeSpace, 0);
@@ -529,8 +592,7 @@ TEST_F(OffsetAllocatorTest, StorageReports) {
 TEST_F(OffsetAllocatorTest, ContinuousRandomAllocationDeallocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -558,8 +620,7 @@ TEST_F(OffsetAllocatorTest, FullSizeAllocation) {
     for (uint32 size : bin_sizes) {
         if (size == 0) continue;  // Skip 0 size
         constexpr uint32 MAX_ALLOCS = 1000;
-        auto allocator =
-            AllocatorWrapper::create(0, size, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, size, MAX_ALLOCS);
 
         auto handle = allocator->allocate(size);
         ASSERT_TRUE(handle.has_value());
@@ -571,8 +632,7 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
         uint32_t bin_size = bin_sizes[i];
         if (bin_size < 1024) continue;  // Skip small sizes
         constexpr uint32_t MAX_ALLOCS = 1000;
-        auto allocator =
-            AllocatorWrapper::create(0, bin_size + 10, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, bin_size + 10, MAX_ALLOCS);
         EXPECT_EQ(allocator->storageReport().totalFreeSpace, bin_size + 10);
 
         for (uint32_t j = 0; j < 10; j++) {
@@ -586,8 +646,7 @@ TEST_F(OffsetAllocatorTest, RepeatedLargeSizeAllocation) {
 TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
     for (uint32 i = 0; i < MAX_ALLOCS - 1; ++i) {
@@ -604,8 +663,7 @@ TEST_F(OffsetAllocatorTest, MaxNumAllocations) {
 TEST_F(OffsetAllocatorTest, FullAllocationAfterRandomAllocationAndFree) {
     const uint32 ALLOCATOR_SIZE = bin_sizes[NUM_BINS - 1];
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -629,8 +687,7 @@ TEST_F(OffsetAllocatorTest, FullAllocationAfterRandomAllocationAndFree) {
 TEST_F(OffsetAllocatorTest, AllocationSameSizeAfterFree) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(1023);
     ASSERT_TRUE(handle.has_value());
@@ -647,8 +704,7 @@ TEST_F(OffsetAllocatorTest, AllocationSameSizeAfterFree) {
 TEST_F(OffsetAllocatorTest, RandomRepeatAllocationSameSizeAfterFree) {
     const uint32 ALLOCATOR_SIZE = bin_sizes[NUM_BINS - 1];
     constexpr uint32 MAX_ALLOCS = 10000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -689,8 +745,7 @@ TEST_F(OffsetAllocatorTest, BasicLargeAllocatorSize) {
 
     for (size_t buffer_size = MIN_BUFFER_SIZE; buffer_size <= MAX_BUFFER_SIZE;
          buffer_size *= 2) {
-        auto allocator =
-            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = allocator->storageReport().largestFreeRegion;
         // The largest free region equals buffer size only in this specific
         // buffer size.
@@ -721,8 +776,7 @@ TEST_F(OffsetAllocatorTest, PowerOfTwoLargeAllocatorSize) {
     std::mt19937 gen(rd());
     for (size_t buffer_size = MIN_BUFFER_SIZE; buffer_size <= MAX_BUFFER_SIZE;
          buffer_size *= 2) {
-        auto allocator =
-            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
@@ -766,8 +820,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocSizeWithLargeAllocatorSize) {
                                                            MAX_BUFFER_SIZE);
     for (int i = 0; i < 100; i++) {
         size_t buffer_size = buffer_size_dist(gen);
-        auto allocator =
-            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = allocator->storageReport().largestFreeRegion;
         ASSERT_GT(max_alloc_size, buffer_size / 2);
 
@@ -789,8 +842,7 @@ TEST_F(OffsetAllocatorTest, RandomSmallAllocWithLargeAllocatorSize) {
                                                            MAX_BUFFER_SIZE);
     for (int i = 0; i < 100; i++) {
         size_t buffer_size = buffer_size_dist(gen);
-        auto allocator =
-            AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
+        auto allocator = AllocatorWrapper::create(0, buffer_size, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
@@ -827,8 +879,7 @@ TEST_F(OffsetAllocatorTest, RandomSmallAllocWithLargeAllocatorSize) {
 TEST_F(OffsetAllocatorTest, ZeroSizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(0);
     EXPECT_FALSE(handle.has_value()) << "Zero size allocation should fail";
@@ -838,8 +889,7 @@ TEST_F(OffsetAllocatorTest, ZeroSizeAllocation) {
 TEST_F(OffsetAllocatorTest, OneByteAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(1);
     ASSERT_TRUE(handle.has_value());
@@ -852,8 +902,7 @@ TEST_F(OffsetAllocatorTest, OneByteAllocation) {
 TEST_F(OffsetAllocatorTest, ExactCapacityAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE);
     ASSERT_TRUE(handle.has_value());
@@ -869,8 +918,7 @@ TEST_F(OffsetAllocatorTest, ExactCapacityAllocation) {
 TEST_F(OffsetAllocatorTest, OversizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE + 1);
     EXPECT_FALSE(handle.has_value())
@@ -881,8 +929,7 @@ TEST_F(OffsetAllocatorTest, OversizeAllocation) {
 TEST_F(OffsetAllocatorTest, JustBelowBinSizeAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate size just below a bin size
     auto handle = allocator->allocate(1023);
@@ -899,8 +946,7 @@ TEST_F(OffsetAllocatorTest, JustBelowBinSizeAllocation) {
 TEST_F(OffsetAllocatorTest, MaxAllocationCountEdgeCase) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 10;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -927,8 +973,7 @@ TEST_F(OffsetAllocatorTest, MaxAllocationCountEdgeCase) {
 TEST_F(OffsetAllocatorTest, VerySmallAllocatorSize) {
     constexpr uint32 ALLOCATOR_SIZE = 16;  // Very small
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(16);
     ASSERT_TRUE(handle.has_value());
@@ -943,8 +988,7 @@ TEST_F(OffsetAllocatorTest, VerySmallAllocatorSize) {
 TEST_F(OffsetAllocatorTest, AllocatorSizeMinusOne) {
     constexpr uint32 ALLOCATOR_SIZE = 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE - 1);
     ASSERT_TRUE(handle.has_value());
@@ -955,8 +999,7 @@ TEST_F(OffsetAllocatorTest, AllocatorSizeMinusOne) {
 TEST_F(OffsetAllocatorTest, PowerOfTwoAllocation) {
     constexpr uint32 ALLOCATOR_SIZE = 2048;
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test various power of 2 sizes
     std::vector<uint32> power_of_two_sizes = {1,  2,   4,   8,   16,  32,
@@ -979,8 +1022,7 @@ TEST_F(OffsetAllocatorTest, PowerOfTwoAllocation) {
 TEST_F(OffsetAllocatorTest, BinSizeCalculation) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test that allocations are placed in appropriate bins
     // SmallFloat::uintToFloatRoundUp should determine the bin
@@ -1003,8 +1045,7 @@ TEST_F(OffsetAllocatorTest, BinSizeCalculation) {
 TEST_F(OffsetAllocatorTest, BinOverflowScenarios) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Fill up a specific bin size with many small allocations
     std::vector<AllocationHandleWrapper> handles;
@@ -1031,8 +1072,7 @@ TEST_F(OffsetAllocatorTest, BinOverflowScenarios) {
 TEST_F(OffsetAllocatorTest, BinMergingBehavior) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Allocate three adjacent blocks
     auto handle1 = allocator->allocate(1024);
@@ -1062,8 +1102,7 @@ TEST_F(OffsetAllocatorTest, BinMergingBehavior) {
 TEST_F(OffsetAllocatorTest, BinSelectionEdgeCases) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are just below and above bin boundaries
     std::vector<uint32> edge_sizes = {
@@ -1100,8 +1139,7 @@ TEST_F(OffsetAllocatorTest, BinSelectionEdgeCases) {
 TEST_F(OffsetAllocatorTest, BinSystemLargeAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test large allocations that should go into high-numbered bins
     std::vector<uint32> large_sizes = {
@@ -1132,8 +1170,7 @@ TEST_F(OffsetAllocatorTest, BinSystemLargeAllocations) {
 TEST_F(OffsetAllocatorTest, BinSystemMixedPatterns) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<AllocationHandleWrapper> handles;
 
@@ -1157,8 +1194,7 @@ TEST_F(OffsetAllocatorTest, BinSystemMixedPatterns) {
 TEST_F(OffsetAllocatorTest, BinSystemRepeatedCycles) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     std::vector<uint32> test_sizes = {64, 128, 256, 512, 1024, 2048, 4096};
 
@@ -1194,8 +1230,7 @@ TEST_F(OffsetAllocatorTest, BinSystemRepeatedCycles) {
 TEST_F(OffsetAllocatorTest, BinSystemNonAlignedSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that don't align with typical bin boundaries
     std::vector<uint32> non_aligned_sizes = {
@@ -1222,8 +1257,7 @@ TEST_F(OffsetAllocatorTest, BinSystemNonAlignedSizes) {
 TEST_F(OffsetAllocatorTest, BinSystemPrimeSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are prime numbers (should be challenging for bin system)
     std::vector<uint32> prime_sizes = {
@@ -1254,8 +1288,7 @@ TEST_F(OffsetAllocatorTest, BinSystemPrimeSizes) {
 TEST_F(OffsetAllocatorTest, BinSystemFibonacciSizes) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that follow the Fibonacci sequence
     std::vector<uint32> fibonacci_sizes = {
@@ -1276,8 +1309,7 @@ TEST_F(OffsetAllocatorTest, BinSystemFibonacciSizes) {
 TEST_F(OffsetAllocatorTest, BinSystemPageSizeMultiples) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test sizes that are multiples of common page sizes (4KB, 8KB, 16KB, 64KB)
     std::vector<uint32> page_size_multiples = {
@@ -1305,8 +1337,7 @@ TEST_F(OffsetAllocatorTest, BinSystemPageSizeMultiples) {
 TEST_F(OffsetAllocatorTest, MetricsInterface) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;  // 1MB
     constexpr uint32 MAX_ALLOCS = 1000;
-    auto allocator =
-        AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
+    auto allocator = AllocatorWrapper::create(0, ALLOCATOR_SIZE, MAX_ALLOCS);
 
     // Test initial metrics - should show empty allocator
     OffsetAllocatorMetrics initial_metrics = allocator->getMetrics();
@@ -1376,7 +1407,8 @@ TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
     const size_t size = 1024 * 1024;
     const uint32_t init_capacity = 1000;
     const uint32_t max_capacity = 10000;
-    std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
+    std::shared_ptr<OffsetAllocator> alloc_a =
+        OffsetAllocator::create(base, size, init_capacity, max_capacity);
     // test
     testSerializeAllocator(alloc_a, {});
 }
@@ -1387,7 +1419,8 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     const size_t size = 1024 * 1024;
     const uint32_t init_capacity = 1;
     const uint32_t max_capacity = 10000;
-    std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
+    std::shared_ptr<OffsetAllocator> alloc_a =
+        OffsetAllocator::create(base, size, init_capacity, max_capacity);
     // Allocate one element
     auto handle = alloc_a->allocate(1024);
     ASSERT_TRUE(handle.has_value());
@@ -1448,7 +1481,8 @@ TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
     const size_t size = 1024 * 1024;
     const uint32_t init_capacity = 10;
     const uint32_t max_capacity = 10000;
-    std::shared_ptr<AllocatorWrapper> allocator = AllocatorWrapper::create(base, size, init_capacity, max_capacity);
+    std::shared_ptr<AllocatorWrapper> allocator =
+        AllocatorWrapper::create(base, size, init_capacity, max_capacity);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -1465,7 +1499,8 @@ TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
         // Free a random handle for 50% probability
         std::uniform_int_distribution<size_t> free_dist(0, 1);
         if (free_dist(gen) == 1 && !handles.empty()) {
-            std::uniform_int_distribution<size_t> index_dist(0, handles.size() - 1);
+            std::uniform_int_distribution<size_t> index_dist(
+                0, handles.size() - 1);
             size_t random_index = index_dist(gen);
             std::swap(handles[random_index], handles.back());
             handles.pop_back();
@@ -1477,7 +1512,8 @@ TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
     ASSERT_EQ(serialize_to(allocator->getAllocator(), buffer), ErrorCode::OK);
 
     // Deserialize the allocator
-    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+    std::shared_ptr<OffsetAllocator> alloc_b =
+        deserialize_from<OffsetAllocator>(buffer);
     ASSERT_NE(alloc_b, nullptr);
 
     // Substitute the allocator with the deserialized one.
@@ -1497,7 +1533,8 @@ TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
         // Free a random handle for 50% probability
         std::uniform_int_distribution<size_t> free_dist(0, 1);
         if (free_dist(gen) == 1 && !handles.empty()) {
-            std::uniform_int_distribution<size_t> index_dist(0, handles.size() - 1);
+            std::uniform_int_distribution<size_t> index_dist(
+                0, handles.size() - 1);
             size_t random_index = index_dist(gen);
             std::swap(handles[random_index], handles.back());
             handles.pop_back();
@@ -1519,7 +1556,8 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
     // Test 10 times.
     for (int i = 0; i < 10; i++) {
         size_t buffer_size = buffer_size_dist(gen);
-        auto allocator = AllocatorWrapper::create(0, buffer_size, INIT_CAPACITY, MAX_ALLOCS);
+        auto allocator =
+            AllocatorWrapper::create(0, buffer_size, INIT_CAPACITY, MAX_ALLOCS);
         size_t max_alloc_size = buffer_size / 100;
 
         std::vector<AllocationHandleWrapper> handles;
@@ -1553,10 +1591,12 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
         }
         // Serialize the allocator
         std::vector<SerializedByte> buffer;
-        ASSERT_EQ(serialize_to(allocator->getAllocator(), buffer), ErrorCode::OK);
+        ASSERT_EQ(serialize_to(allocator->getAllocator(), buffer),
+                  ErrorCode::OK);
 
         // Deserialize the allocator
-        std::shared_ptr<OffsetAllocator> new_alloc = deserialize_from<OffsetAllocator>(buffer);
+        std::shared_ptr<OffsetAllocator> new_alloc =
+            deserialize_from<OffsetAllocator>(buffer);
         ASSERT_NE(new_alloc, nullptr);
 
         // Verify the allocator is equal to the original one.
@@ -1572,7 +1612,6 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
 }
 
 }  // namespace mooncake::offset_allocator
-
 
 int main(int argc, char** argv) {
     // Initialize Google Test

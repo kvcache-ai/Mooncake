@@ -160,10 +160,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Serialize the allocator with serializer.
     template <typename T>
-    void serialize_to(T &serializer) const;
+    void serialize_to(T& serializer) const;
 
     template <typename T>
-    static std::shared_ptr<OffsetAllocator> deserialize_from(T &serializer);
+    static std::shared_ptr<OffsetAllocator> deserialize_from(T& serializer);
 
    private:
     friend class OffsetAllocationHandle;
@@ -189,11 +189,11 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
-        uint32 max_capacity);
-    
+                    uint32 max_capacity);
+
     // Private constructor - initialize from serialized data
     template <typename T>
-    OffsetAllocator(T &serializer);
+    OffsetAllocator(T& serializer);
 
     friend class OffsetAllocatorTest;  // for unit tests
 };
@@ -202,7 +202,7 @@ class __Allocator {
    public:
     __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
     template <typename T>
-    __Allocator(T &serializer) noexcept(false);
+    __Allocator(T& serializer) noexcept(false);
     __Allocator(__Allocator&& other);
     ~__Allocator();
     void reset();
@@ -216,7 +216,7 @@ class __Allocator {
 
     // Serialize the allocator with serializer.
     template <typename T>
-    void serialize_to(T &serializer) const;
+    void serialize_to(T& serializer) const;
 
    private:
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
@@ -252,7 +252,7 @@ class __Allocator {
 
 // Template method implementations
 template <typename T>
-void OffsetAllocator::serialize_to(T &serializer) const {
+void OffsetAllocator::serialize_to(T& serializer) const {
     MutexLocker guard(&m_mutex);
 
     if (!m_allocator) {
@@ -262,7 +262,7 @@ void OffsetAllocator::serialize_to(T &serializer) const {
 
     // Basic member variables
     serializer.write(&m_base, sizeof(m_base));
-    serializer.write(&m_multiplier_bits, sizeof(m_multiplier_bits)); 
+    serializer.write(&m_multiplier_bits, sizeof(m_multiplier_bits));
     serializer.write(&m_capacity, sizeof(m_capacity));
     serializer.write(&m_allocated_size, sizeof(m_allocated_size));
     serializer.write(&m_allocated_num, sizeof(m_allocated_num));
@@ -271,12 +271,13 @@ void OffsetAllocator::serialize_to(T &serializer) const {
 }
 
 template <typename T>
-std::shared_ptr<OffsetAllocator> OffsetAllocator::deserialize_from(T &serializer) {
+std::shared_ptr<OffsetAllocator> OffsetAllocator::deserialize_from(
+    T& serializer) {
     return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(serializer));
 }
 
 template <typename T>
-OffsetAllocator::OffsetAllocator(T &serializer) {
+OffsetAllocator::OffsetAllocator(T& serializer) {
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {
         serializer.read(&m_base, sizeof(m_base));
@@ -286,18 +287,19 @@ OffsetAllocator::OffsetAllocator(T &serializer) {
         serializer.read(&m_allocated_num, sizeof(m_allocated_num));
         m_allocator = std::make_unique<__Allocator>(serializer);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Deserializing OffsetAllocator failed, error=" << e.what();
+        LOG(ERROR) << "Deserializing OffsetAllocator failed, error="
+                   << e.what();
         throw std::runtime_error("Deserializing OffsetAllocator failed");
     }
 }
 
 template <typename T>
-void __Allocator::serialize_to(T &serializer) const {
+void __Allocator::serialize_to(T& serializer) const {
     if (!m_nodes || !m_freeNodes) {
         serializer.set_error("Allocator is not initialized");
         return;
-    }   
-    
+    }
+
     serializer.write(&m_size, sizeof(m_size));
     serializer.write(&m_current_capacity, sizeof(m_current_capacity));
     serializer.write(&m_max_capacity, sizeof(m_max_capacity));
@@ -311,10 +313,10 @@ void __Allocator::serialize_to(T &serializer) const {
 }
 
 template <typename T>
-__Allocator::__Allocator(T &serializer) {
+__Allocator::__Allocator(T& serializer) {
     m_nodes = nullptr;
     m_freeNodes = nullptr;
-    
+
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {
         // Deserialize basic member variables
@@ -326,11 +328,11 @@ __Allocator::__Allocator(T &serializer) {
         serializer.read(&m_usedBins, sizeof(m_usedBins));
         serializer.read(&m_binIndices, sizeof(m_binIndices));
         serializer.read(&m_freeOffset, sizeof(m_freeOffset));
-        
+
         // Allocate memory for nodes and freeNodes
         m_nodes = new Node[m_max_capacity];
         m_freeNodes = new NodeIndex[m_max_capacity];
-        
+
         // Deserialize the arrays
         serializer.read(m_nodes, m_current_capacity * sizeof(Node));
         serializer.read(m_freeNodes, m_current_capacity * sizeof(NodeIndex));

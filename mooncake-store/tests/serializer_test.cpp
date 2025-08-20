@@ -72,16 +72,18 @@ class ExampleClassWithException {
    public:
     ExampleClassWithException() : value_(0) {}
     ExampleClassWithException(int value) : value_(value) {}
-    
+
     template <typename T>
     void serialize_to(T& serializer) const {
         serializer.write(&value_, sizeof(value_));
     }
 
     template <typename T>
-    static std::shared_ptr<ExampleClassWithException> deserialize_from(T& serializer) {
+    static std::shared_ptr<ExampleClassWithException> deserialize_from(
+        T& serializer) {
         throw std::runtime_error("throw_exception");
     }
+
    private:
     int value_;
 };
@@ -115,7 +117,6 @@ TEST_F(SerializerTest, ExampleClassSerialization) {
     EXPECT_EQ(restored->getName(), original.getName());
     EXPECT_TRUE(*restored == original);
 }
-
 
 TEST_F(SerializerTest, ExampleClassSerializationWithSharedPtr) {
     // Test with shared_ptr
@@ -158,7 +159,8 @@ TEST_F(SerializerTest, ExampleClassDeserializationWithException) {
     std::vector<SerializedByte> buffer;
     ASSERT_EQ(serialize_to(original, buffer), ErrorCode::OK);
 
-    // Try to deserialize the buffer, the deserialization method will throw an exception.
+    // Try to deserialize the buffer, the deserialization method will throw an
+    // exception.
     auto restored = deserialize_from<ExampleClassWithException>(buffer);
     EXPECT_EQ(restored, nullptr);
 }
