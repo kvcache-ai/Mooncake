@@ -18,15 +18,16 @@ std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size), isCpu_(isCpu), worker_(&engine_, rank, size) {
+    : Backend(rank, size),
+      isCpu_(isCpu),
+      worker_(&engine_, rank, size,
+              options ? options->brokenRanks_
+                      : at::zeros(
+                            {size},
+                            torch::dtype(torch::kInt32).device(torch::kCUDA))) {
     // Get device data
     cudaError err = cudaGetDevice(&device_id_);
     TORCH_CHECK(!err, c10::str("Failed to get device id"));
-
-    // Store broken ranks
-    if (options) {
-        brokenRanks_ = options->brokenRanks_;
-    }
 
     // Initialize transfer engine
     engine_.init(P2PHANDSHAKE, hostIp_);
@@ -185,7 +186,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             },
             [&](void* src) {
                 cudaMemsetAsync(tensor.data_ptr(), 0, tensorSize, stream);
-                launchReduceKernel(tensor, src, size_, opts.reduceOp, stream);
+                launchReduceKernel(tensor, src, size_, opts.reduceOp,
+                                   worker_.getBrokenRanks(), stream);
             });
     }
 }

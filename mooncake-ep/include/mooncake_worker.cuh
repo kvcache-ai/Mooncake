@@ -19,14 +19,16 @@ __global__ struct Task {
 };
 
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        c10d::ReduceOp op, cudaStream_t stream);
+                        c10d::ReduceOp op, bool* brokenRanks,
+                        cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
                      c10d::ReduceOp op);
 
 class MooncakeWorker {
    public:
-    explicit MooncakeWorker(TransferEngine* engine, int rank, int size);
+    explicit MooncakeWorker(TransferEngine* engine, int rank, int size,
+                            at::Tensor brokenRanks);
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
@@ -41,14 +43,19 @@ class MooncakeWorker {
 
     void initWorker(const std::vector<std::string>& server_names);
 
+    bool* getBrokenRanks() { return brokenRanks_; }
+
    private:
     static constexpr size_t kNumTasks_ = 2;
+    static constexpr size_t kMaxNumRanks = 64;
 
     Task *tasks_, *tasks_device_;
+    bool *brokenRanks_, *brokenRanksDevice_;
     bool hasCallback_[kNumTasks_]{};
     std::function<void()> callbacks_[kNumTasks_]{};
 
     int rank_, size_;
+    at::Tensor brokenRanksTensor_;
 
     TransferEngine* engine_;
     std::vector<TransferMetadata::SegmentID> segment_ids_;

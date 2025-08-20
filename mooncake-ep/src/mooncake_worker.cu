@@ -39,7 +39,8 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, Task* tasks,
-                                  size_t taskId) {
+                                  int numRanks, const bool* brokenRanks,
+                                  int* brokenRanksTensor, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -53,35 +54,43 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     while (tasks[taskId].active) {
         __threadfence();
     }
+    for (int i = 0; i < numRanks; ++i) {
+        brokenRanksTensor[i] = brokenRanks[i] ? 1 : 0;
+    }
 }
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
-                             size_t numElements, size_t numRanks) {
+                             size_t numElements, size_t numRanks,
+                             bool* brokenRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         scalar_t sum = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
-            sum += src[rank * numElements + elem_idx];
+            if (!brokenRanks[rank]) {
+                sum += src[rank * numElements + elem_idx];
+            }
         }
         dst[elem_idx] = sum;
     }
 }
 
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        c10d::ReduceOp op, cudaStream_t stream) {
+                        c10d::ReduceOp op, bool* brokenRanks,
+                        cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only support SUM for reduction.");
     switch (dst.scalar_type()) {
         case c10::kInt:
             reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
-                                                 dst.numel(), numRanks);
+                                                 dst.numel(), numRanks,
+                                                 brokenRanks);
             break;
         case c10::kBFloat16:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<at::BFloat16>(),
-                                                 (at::BFloat16*)src,
-                                                 dst.numel(), numRanks);
+            reduceKernel<<<64, 256, 0, stream>>>(
+                dst.data_ptr<at::BFloat16>(), (at::BFloat16*)src, dst.numel(),
+                numRanks, brokenRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -136,13 +145,28 @@ void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
     }
 }
 
-MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size)
-    : engine_(engine), rank_(rank), size_(size) {
+MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size,
+                               at::Tensor brokenRanks)
+    : engine_(engine),
+      rank_(rank),
+      size_(size),
+      brokenRanksTensor_(brokenRanks) {
+    TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
+    TORCH_CHECK(brokenRanks.dtype() == at::kInt, "brokenRanks must be int.");
+
     // Pin memory for task array
     cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
     cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+    }
+
+    // Pin memory for broken ranks
+    cudaHostAlloc(&brokenRanks_, kMaxNumRanks * sizeof(bool),
+                  cudaHostAllocMapped);
+    cudaHostGetDevicePointer(&brokenRanksDevice_, brokenRanks_, 0);
+    for (size_t i = 0; i < kMaxNumRanks; ++i) {
+        brokenRanks_[i] = false;
     }
 }
 
@@ -179,9 +203,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
     tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
-                                           tasks_device_,
-                                           taskCount % kNumTasks_);
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(
+        opType, tensorSize, broadcastRoot, tasks_device_, size_,
+        brokenRanksDevice_, brokenRanksTensor_.data_ptr<int>(),
+        taskCount % kNumTasks_);
     bufferToTensor(
         (void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
     ++taskCount;

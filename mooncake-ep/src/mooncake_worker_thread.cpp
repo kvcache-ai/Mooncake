@@ -24,6 +24,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
     // Start worker thread
     std::thread([this] {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
+        using clock = std::chrono::high_resolution_clock;
+        clock::time_point activeTime[kNumTasks_];
         int taskCount = 0;
         while (true) {
             _mm_pause();
@@ -38,6 +40,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                      rank_ != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
+                    activeTime[i] = clock::now();
                     if (skipTransfer) {
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
@@ -45,6 +48,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < size_; ++j) {
+                        if (brokenRanks_[j]) {
+                            continue;
+                        }
                         uint64_t source =
                             segment_descs_[rank_]->buffers[taskCount % 2].addr;
                         switch (task.opType) {
@@ -93,12 +99,24 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     TransferStatus status;
 
                     if (!skipTransfer) {
-                        for (int j = 0; j < size_; ++j) {
-                            engine_->getTransferStatus(task.batchID, j, status);
-                            if (status.s != TransferStatusEnum::COMPLETED) {
-                                batch_done = false;
-                                break;
+                        auto now = clock::now();
+                        auto diff =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                now - activeTime[i]);
+                        if (diff.count() < 20) {
+                            for (int j = 0; j < size_; ++j) {
+                                engine_->getTransferStatus(task.batchID, j,
+                                                           status);
+                                if (status.s != TransferStatusEnum::COMPLETED &&
+                                    !brokenRanks_[j]) {
+                                    batch_done = false;
+                                    break;
+                                }
                             }
+                        } else {
+                            LOG(ERROR) << "Rank " << rank_
+                                       << " timeout during transferring op "
+                                       << (int)task.opType;
                         }
                     }
                     if (!batch_done) {
@@ -109,6 +127,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                           .addr;
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < size_; ++j) {
+                        if (brokenRanks_[j]) {
+                            continue;
+                        }
                         *source_ptr = 1;
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
@@ -130,10 +151,25 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     auto signal_ptr = (int32_t *)segment_descs_[rank_]
                                           ->buffers[6 + taskCount % 2]
                                           .addr;
-                    for (int j = 0; j < size_; ++j) {
-                        if (signal_ptr[j] != 1) {
-                            all_received = false;
-                            break;
+                    auto now = clock::now();
+                    auto diff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            now - activeTime[i]);
+                    if (diff.count() < 40) {
+                        for (int j = 0; j < size_; ++j) {
+                            if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
+                                all_received = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        LOG(ERROR)
+                            << "Rank " << rank_ << " timeout during syncing op "
+                            << (int)task.opType;
+                        for (int j = 0; j < size_; ++j) {
+                            if (signal_ptr[j] != 1) {
+                                brokenRanks_[j] = true;
+                            }
                         }
                     }
                     if (all_received) {

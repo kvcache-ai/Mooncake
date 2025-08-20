@@ -57,7 +57,6 @@ class MooncakeBackend final : public ::c10d::Backend {
    private:
     TransferEngine engine_{true};
     bool isCpu_{false};
-    at::Tensor brokenRanks_;
     static std::string hostIp_;
     int device_id_;
     void* send_buffer_[2];
