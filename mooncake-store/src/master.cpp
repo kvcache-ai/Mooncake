@@ -1,15 +1,14 @@
 #include <gflags/gflags.h>
 
-#include <chrono>      // For std::chrono
-#include <thread>      // For std::thread
-#include <cstdlib>     // For system()
-#include <unistd.h>    // For fork(), exec()
-#include <sys/wait.h>  // For waitpid()
+#include <chrono>  // For std::chrono
+#include <memory>  // For std::unique_ptr
+#include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
 #include "ha_helper.h"
+#include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -297,27 +296,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
 }
 
 // Function to start HTTP metadata server
-bool StartHttpMetadataServer(int port, const std::string& host) {
-    LOG(INFO) << "Starting HTTP metadata server on " << host << ":" << port;
+std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
+    int port, const std::string& host) {
+    LOG(INFO) << "Starting C++ HTTP metadata server on " << host << ":" << port;
 
-    // Build the command to start the Python HTTP metadata server
-    std::string command = "python3 -m mooncake.http_metadata_server";
-    command += " --port " + std::to_string(port);
-    command += " --host " + host;
-    command += " --log-level INFO";
+    try {
+        auto server =
+            std::make_unique<mooncake::HttpMetadataServer>(port, host);
+        server->start();
 
-    LOG(INFO) << "Executing command: " << command;
-
-    // Use system() to start the server in background
-    int result = system((command + " &").c_str());
-
-    if (result == 0) {
-        LOG(INFO) << "HTTP metadata server started successfully";
-        return true;
-    } else {
-        LOG(ERROR) << "Failed to start HTTP metadata server, return code: "
-                   << result;
-        return false;
+        // Check if server started successfully
+        if (server->is_running()) {
+            LOG(INFO) << "C++ HTTP metadata server started successfully";
+            return server;
+        } else {
+            LOG(ERROR) << "Failed to start C++ HTTP metadata server";
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to start C++ HTTP metadata server: " << e.what();
+        return nullptr;
     }
 }
 
@@ -391,9 +389,13 @@ int main(int argc, char* argv[]) {
               << master_config.http_metadata_server_host;
 
     // Start HTTP metadata server if enabled
+    std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
     if (master_config.enable_http_metadata_server) {
-        if (!StartHttpMetadataServer(master_config.http_metadata_server_port,
-                                     master_config.http_metadata_server_host)) {
+        http_metadata_server =
+            StartHttpMetadataServer(master_config.http_metadata_server_port,
+                                    master_config.http_metadata_server_host);
+
+        if (!http_metadata_server) {
             LOG(FATAL) << "Failed to start HTTP metadata server";
             return 1;
         }
