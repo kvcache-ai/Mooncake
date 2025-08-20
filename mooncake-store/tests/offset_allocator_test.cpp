@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <memory>
 #include <random>
 
 namespace mooncake::offset_allocator {
@@ -90,9 +91,9 @@ class AllocationHandleWrapper {
 
     // Get size
     uint64_t size() const { return m_handle.size(); }
-
+    
     // Get the underlying handle
-    const OffsetAllocationHandle& getHandle() const { return m_handle; }
+    OffsetAllocationHandle& getHandle() { return m_handle; }
 
    private:
     std::shared_ptr<AllocatorWrapper> m_allocator_wrapper;
@@ -107,6 +108,16 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
     AllocatorWrapper(uint64_t base, size_t size, uint32 maxAllocs = 128 * 1024)
         : m_allocator(
               OffsetAllocator::create(base, size, maxAllocs / 2, maxAllocs)),
+          m_base(base),
+          m_buffer_size(size) {
+        // The allocator is created with the specified base and size
+        // We can now properly track the allocation bounds
+    }
+
+    // Constructor with specified init_capacity and max_capacity.
+    AllocatorWrapper(uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity)
+        : m_allocator(
+              OffsetAllocator::create(base, size, init_capacity, max_capacity)),
           m_base(base),
           m_buffer_size(size) {
         // The allocator is created with the specified base and size
@@ -141,6 +152,15 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
             handle->address(), handle->address() + handle->size()};
 
         return AllocationHandleWrapper(shared_from_this(), std::move(*handle));
+    }
+
+    // Substitute the allocator with a new one.
+    void substituteAllocator(std::shared_ptr<OffsetAllocator> allocator) {
+        m_allocator = std::move(allocator);
+    }
+
+    std::shared_ptr<OffsetAllocator> getAllocator() const {
+        return m_allocator;
     }
 
     // Get storage report
@@ -243,6 +263,14 @@ class OffsetAllocatorTest : public ::testing::Test {
     void SetUp() override {}
 
     void TearDown() override {}
+
+    OffsetAllocationHandle copyHandleWithNewAllocator(const OffsetAllocationHandle& handle, const std::shared_ptr<OffsetAllocator>& new_allocator) {
+        return OffsetAllocationHandle(new_allocator, handle.m_allocation, handle.real_base, handle.requested_size);
+    }
+
+    void substituteWithNewAllocator(AllocationHandleWrapper& handle, std::shared_ptr<OffsetAllocator> new_allocator) {
+        handle.getHandle().m_allocator = new_allocator;
+    }
 
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
                       const std::shared_ptr<OffsetAllocator>& b) {
@@ -363,7 +391,7 @@ class OffsetAllocatorTest : public ::testing::Test {
         alloc_b = deserialize_from<OffsetAllocator>(buffer);
         ASSERT_TRUE(alloc_b != nullptr);
         for (const auto& handle : handles) {
-            OffsetAllocationHandle handle_copy(alloc_b, handle.m_allocation, handle.real_base, handle.requested_size);
+            OffsetAllocationHandle handle_copy = copyHandleWithNewAllocator(handle, alloc_b);
         }
 
     }
@@ -1337,7 +1365,7 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     // Create an empty allocator
     const uint64_t base = 1024 * 16;
     const size_t size = 1024 * 1024;
-    const uint32_t init_capacity = 1000;
+    const uint32_t init_capacity = 1;
     const uint32_t max_capacity = 10000;
     std::shared_ptr<OffsetAllocator> alloc_a = OffsetAllocator::create(base, size, init_capacity, max_capacity);
     // Allocate one element
@@ -1391,6 +1419,135 @@ TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
         }
         // test
         testSerializeAllocator(alloc_a, handles);
+    }
+}
+
+TEST_F(OffsetAllocatorTest, AllocateAfterDeserialization) {
+    // Create an empty allocator
+    const uint64_t base = 1024 * 16;
+    const size_t size = 1024 * 1024;
+    const uint32_t init_capacity = 10;
+    const uint32_t max_capacity = 10000;
+    std::shared_ptr<AllocatorWrapper> allocator = std::make_shared<AllocatorWrapper>(base, size, init_capacity, max_capacity);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // Do a serias of allocations and deallocations.
+    std::vector<AllocationHandleWrapper> handles;
+    for (int i = 0; i < 100; i++) {
+        std::uniform_int_distribution<size_t> size_dist(1, 1024);
+        size_t size = size_dist(gen);
+        auto handle = allocator->allocate(size);
+        ASSERT_TRUE(handle.has_value());
+        handles.push_back(std::move(*handle));
+
+        // Free a random handle for 50% probability
+        std::uniform_int_distribution<size_t> free_dist(0, 1);
+        if (free_dist(gen) == 1 && !handles.empty()) {
+            std::uniform_int_distribution<size_t> index_dist(0, handles.size() - 1);
+            size_t random_index = index_dist(gen);
+            std::swap(handles[random_index], handles.back());
+            handles.pop_back();
+        }
+    }
+
+    // Serialize the allocator
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(allocator->getAllocator(), buffer), ErrorCode::OK);
+
+    // Deserialize the allocator
+    std::shared_ptr<OffsetAllocator> alloc_b = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(alloc_b, nullptr);
+
+    // Substitute the allocator with the deserialized one.
+    allocator->substituteAllocator(alloc_b);
+    for (auto& handle : handles) {
+        substituteWithNewAllocator(handle, alloc_b);
+    }
+
+    // Continue to do a serias of allocations and deallocations.
+    for (int i = 0; i < 100; i++) {
+        std::uniform_int_distribution<size_t> size_dist(1, 1024);
+        size_t size = size_dist(gen);
+        auto handle = allocator->allocate(size);
+        ASSERT_TRUE(handle.has_value());
+        handles.push_back(std::move(*handle));
+
+        // Free a random handle for 50% probability
+        std::uniform_int_distribution<size_t> free_dist(0, 1);
+        if (free_dist(gen) == 1 && !handles.empty()) {
+            std::uniform_int_distribution<size_t> index_dist(0, handles.size() - 1);
+            size_t random_index = index_dist(gen);
+            std::swap(handles[random_index], handles.back());
+            handles.pop_back();
+        }
+    }
+}
+
+TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
+    // The size multiplier is larger than 1 when the allocator size is larger
+    // than MAX_BIN_SIZE.
+    constexpr size_t MIN_BUFFER_SIZE = (1ull << 31) + 1;
+    constexpr size_t MAX_BUFFER_SIZE = (1ull << 40);
+    constexpr uint32 INIT_CAPACITY = 1;
+    constexpr uint32 MAX_ALLOCS = 10000;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<size_t> buffer_size_dist(MIN_BUFFER_SIZE,
+                                                           MAX_BUFFER_SIZE);
+    // Test 10 times.
+    for (int i = 0; i < 10; i++) {
+        size_t buffer_size = buffer_size_dist(gen);
+        auto allocator = std::make_shared<AllocatorWrapper>(0, buffer_size, INIT_CAPACITY, MAX_ALLOCS);
+        size_t max_alloc_size = buffer_size / 100;
+
+        std::vector<AllocationHandleWrapper> handles;
+        std::vector<size_t> alloc_sizes;
+        std::uniform_int_distribution<size_t> size_dist(1, max_alloc_size);
+        // 10 times serilization and deserialization.
+        for (int j = 0; j < 10; j++) {
+            // 100 times allocation
+            for (int k = 0; k < 100; k++) {
+                size_t size = size_dist(gen);
+                auto handle = allocator->allocate(size);
+                if (handle.has_value()) {
+                    handles.push_back(std::move(*handle));
+                    alloc_sizes.push_back(size);
+                }
+
+                std::uniform_int_distribution<uint32> index_dist(
+                    0, handles.size() - 1);
+                uint32 index = index_dist(gen);
+                std::swap(handles[index], handles.back());
+                std::swap(alloc_sizes[index], alloc_sizes.back());
+                uint32 test_size = alloc_sizes.back();
+                handles.pop_back();
+                alloc_sizes.pop_back();
+
+                auto handle2 = allocator->allocate(test_size);
+                ASSERT_TRUE(handle2.has_value());
+                handles.push_back(std::move(*handle2));
+                alloc_sizes.push_back(test_size);
+            }
+        }
+        // Serialize the allocator
+        std::vector<SerializedByte> buffer;
+        ASSERT_EQ(serialize_to(allocator->getAllocator(), buffer), ErrorCode::OK);
+
+        // Deserialize the allocator
+        std::shared_ptr<OffsetAllocator> new_alloc = deserialize_from<OffsetAllocator>(buffer);
+        ASSERT_NE(new_alloc, nullptr);
+
+        // Verify the allocator is equal to the original one.
+        assertAllocatorEQ(allocator->getAllocator(), new_alloc);
+
+        // Substitute the allocator with the deserialized one.
+        allocator->substituteAllocator(new_alloc);
+        // Substitute the handles with the deserialized allocator.
+        for (auto& handle : handles) {
+            substituteWithNewAllocator(handle, new_alloc);
+        }
     }
 }
 
