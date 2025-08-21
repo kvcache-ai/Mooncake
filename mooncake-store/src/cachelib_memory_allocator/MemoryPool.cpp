@@ -39,8 +39,7 @@ MemoryPool::MemoryPool(PoolId id,
 
 void MemoryPool::checkState() const {
   if (id_ < 0) {
-    throw std::invalid_argument(
-        fmt::format("Invalid MemoryPool id {}", id_));
+    throw std::invalid_argument(fmt::format("Invalid MemoryPool id {}", id_));
   }
 
   const size_t currAlloc = currAllocSize_;
@@ -48,8 +47,8 @@ void MemoryPool::checkState() const {
   if (currAlloc > currSlabAlloc) {
     throw std::invalid_argument(
         fmt::format("Alloc size {} is more than total slab alloc size {}",
-                       currAlloc,
-                       currSlabAlloc));
+                    currAlloc,
+                    currSlabAlloc));
   }
 
   if (acSizes_.empty() || ac_.empty()) {
@@ -86,7 +85,8 @@ void MemoryPool::checkState() const {
 
   for (const auto slab : freeSlabs_) {
     if (!slabAllocator_.isValidSlab(slab)) {
-      throw std::invalid_argument(fmt::format("Invalid free slab {}", (void*) slab));
+      throw std::invalid_argument(
+          fmt::format("Invalid free slab {}", (void*)slab));
     }
   }
 }
@@ -261,7 +261,10 @@ void* MemoryPool::allocate(uint32_t size) {
 
 void MemoryPool::free(void* alloc) {
   auto& ac = getAllocationClassFor(alloc);
-  ac.free(alloc);
+  if (ac.free(alloc)) {
+    auto* slab = slabAllocator_.getSlabForMemory(alloc);
+    releaseSlab(SlabReleaseMode::kResize, slab, Slab::kInvalidClassId);
+  }
   currAllocSize_ -= ac.getAllocSize();
 }
 
@@ -339,7 +342,7 @@ SlabReleaseContext MemoryPool::startSlabRelease(
                      : getAllocationClassFor(victim).startSlabRelease(
                            mode, hint, shouldAbortFn);
   context.setReceiver(receiver);
-
+  auto* header = slabAllocator_.getSlabHeader(hint);
   // if the context is already in the released state, add it to the free
   // slabs. the caller should not have to call completeSlabRelease()
   if (context.isReleased()) {
@@ -379,12 +382,11 @@ void MemoryPool::completeSlabRelease(const SlabReleaseContext& context) {
   auto& allocClass = getAllocationClassFor(classId);
 
   // complete the slab release process.
-  allocClass.completeSlabRelease(context);
-
-  XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->poolId, getId());
-  XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->classId,
-             Slab::kInvalidClassId);
-  XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->allocSize, 0u);
-
-  releaseSlab(mode, slab, context.getReceiverClassId());
+  if (allocClass.completeSlabRelease(context)) {
+    XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->poolId, getId());
+    XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->classId,
+               Slab::kInvalidClassId);
+    XDCHECK_EQ(slabAllocator_.getSlabHeader(slab)->allocSize, 0u);
+    releaseSlab(mode, slab, context.getReceiverClassId());
+  }
 }
