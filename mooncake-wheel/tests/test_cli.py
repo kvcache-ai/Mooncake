@@ -46,7 +46,7 @@ def test_run_master():
     try:
         # Run mooncake_master with a non-default port to avoid conflicts
         process = subprocess.Popen(
-            ["mooncake_master", "--port=61351", "--max_threads=2","--enable_gc=false"],
+            ["mooncake_master", "--port=61351", "--max_threads=2"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )

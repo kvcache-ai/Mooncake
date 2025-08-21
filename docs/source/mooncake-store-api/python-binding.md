@@ -371,7 +371,7 @@ if buffer:
     # Use with other libraries that accept buffer protocol
     print(f"Buffer size: {len(buffer)} bytes")
 
-    # The buffer is automatically freed when garbage collected
+    # The buffer is automatically freed
 ```
 
 </details>
