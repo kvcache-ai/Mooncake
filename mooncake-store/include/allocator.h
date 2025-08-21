@@ -57,10 +57,10 @@ class AllocatedBuffer {
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
-        segment_name_(std::move(segment_name)),
-        buffer_ptr_(buffer_ptr),
-        size_(size),
-        offset_handle_(std::move(offset_handle)) {}
+          segment_name_(std::move(segment_name)),
+          buffer_ptr_(buffer_ptr),
+          size_(size),
+          offset_handle_(std::move(offset_handle)) {}
 
     ~AllocatedBuffer();
 

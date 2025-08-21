@@ -115,7 +115,7 @@ class Replica {
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
         : data_(DiskReplicaData{std::move(file_path), object_size}),
-            status_(status) {}
+          status_(status) {}
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
@@ -271,7 +271,7 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
     } else if (replica.is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
-            << ", object_size: " << disk_data.object_size;
+           << ", object_size: " << disk_data.object_size;
     }
 
     os << " }";

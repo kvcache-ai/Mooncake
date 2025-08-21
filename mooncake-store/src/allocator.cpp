@@ -28,13 +28,12 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
-std::ostream& operator<<(std::ostream& os,
-                                const AllocatedBuffer& buffer) {
+std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
     return os << "AllocatedBuffer: { "
-            << "segment_name: " << buffer.segment_name_ << ", "
-            << "size: " << buffer.size() << ", "
-            << "status: " << buffer.status << ", "
-            << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
+              << "segment_name: " << buffer.segment_name_ << ", "
+              << "size: " << buffer.size() << ", "
+              << "status: " << buffer.status << ", "
+              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
 // Removed allocated_bytes parameter and member initialization
