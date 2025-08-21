@@ -38,16 +38,15 @@ if(USE_3FS)
   set(EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
-#The cache_allocator library
-                        include_directories(${
-                            Python3_INCLUDE_DIRS}) add_library(mooncake_store ${
-                            MOONCAKE_STORE_SOURCES})
-                            target_link_libraries(
-                                mooncake_store PUBLIC transfer_engine ${
-                                    ETCD_WRAPPER_LIB} glog::glog gflags::gflags
-                                    ${EXTRA_LIBS}) if (STORE_USE_ETCD)
-                                add_dependencies(
-                                    mooncake_store build_etcd_wrapper) endif()
+# The cache_allocator library
+include_directories(${Python3_INCLUDE_DIRS})
+add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+target_link_libraries(mooncake_store PUBLIC transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
+    ${EXTRA_LIBS}
+)
+if (STORE_USE_ETCD)
+    add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
 
 # Master binary
 add_executable(mooncake_master master.cpp)
