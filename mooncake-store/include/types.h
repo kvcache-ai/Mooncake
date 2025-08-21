@@ -177,8 +177,6 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
-class BufferAllocator;
-
 /**
  * @brief Type of buffer allocator used in the system
  */
