@@ -16,8 +16,7 @@ namespace mooncake {
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : enable_gc_(config.enable_gc),
-      default_kv_lease_ttl_(config.default_kv_lease_ttl),
+    : default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
@@ -40,9 +39,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
     }
-    gc_running_ = true;
-    gc_thread_ = std::thread(&MasterService::GCThreadFunc, this);
-    VLOG(1) << "action=start_gc_thread";
+
+    eviction_running_ = true;
+    eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
+    VLOG(1) << "action=start_eviction_thread";
 
     if (enable_ha_) {
         client_monitor_running_ = true;
@@ -58,21 +58,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
 MasterService::~MasterService() {
     // Stop and join the threads
-    gc_running_ = false;
+    eviction_running_ = false;
     client_monitor_running_ = false;
-    if (gc_thread_.joinable()) {
-        gc_thread_.join();
+    if (eviction_thread_.joinable()) {
+        eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
-    }
-
-    // Clean up any remaining GC tasks
-    GCTask* task = nullptr;
-    while (gc_queue_.pop(task)) {
-        if (task) {
-            delete task;
-        }
     }
 }
 
@@ -341,15 +333,9 @@ auto MasterService::GetReplicaList(std::string_view key)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Only mark for GC if enabled
-    if (enable_gc_) {
-        MarkForGC(std::string(key),
-                  1000);  // After 1 second, the object will be removed
-    } else {
-        // Grant a lease to the object so it will not be removed
-        // when the client is reading it.
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-    }
+    // Grant a lease to the object so it will not be removed
+    // when the client is reading it.
+    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
     return replica_list;
 }
@@ -635,20 +621,6 @@ long MasterService::RemoveAll() {
     return removed_count;
 }
 
-auto MasterService::MarkForGC(const std::string& key, uint64_t delay_ms)
-    -> tl::expected<void, ErrorCode> {
-    // Create a new GC task and add it to the queue
-    GCTask* task = new GCTask(key, std::chrono::milliseconds(delay_ms));
-    if (!gc_queue_.push(task)) {
-        // Queue is full, delete the task to avoid memory leak
-        delete task;
-        LOG(ERROR) << "key=" << key << ", error=gc_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    return {};
-}
-
 bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     // Iterate through replicas and remove those with invalid allocators
     auto replica_it = metadata.replicas.begin();
@@ -710,37 +682,10 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     return root_fs_dir_ + "/" + cluster_id_;
 }
 
-void MasterService::GCThreadFunc() {
-    VLOG(1) << "action=gc_thread_started";
+void MasterService::EvictionThreadFunc() {
+    VLOG(1) << "action=eviction_thread_started";
 
-    std::priority_queue<GCTask*, std::vector<GCTask*>, GCTaskComparator>
-        local_pq;
-
-    while (gc_running_) {
-        GCTask* task = nullptr;
-        while (gc_queue_.pop(task)) {
-            if (task) {
-                local_pq.push(task);
-            }
-        }
-
-        while (!local_pq.empty()) {
-            task = local_pq.top();
-            if (!task->is_ready()) {
-                break;
-            }
-
-            local_pq.pop();
-            VLOG(1) << "key=" << task->key << ", action=gc_removing_key";
-            auto result = Remove(task->key);
-            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
-                result.error() != ErrorCode::OBJECT_HAS_LEASE) {
-                LOG(WARNING) << "key=" << task->key
-                             << ", error=gc_remove_failed, error_code="
-                             << result.error();
-            }
-            delete task;
-        }
+    while (eviction_running_) {
         double used_ratio =
             MasterMetricManager::instance().get_global_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -755,15 +700,10 @@ void MasterService::GCThreadFunc() {
         }
 
         std::this_thread::sleep_for(
-            std::chrono::milliseconds(kGCThreadSleepMs));
+            std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
-    while (!local_pq.empty()) {
-        delete local_pq.top();
-        local_pq.pop();
-    }
-
-    VLOG(1) << "action=gc_thread_stopped";
+    VLOG(1) << "action=eviction_thread_stopped";
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
