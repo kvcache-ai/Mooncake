@@ -4,8 +4,9 @@
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
-#include "client_metric.h"
 
+#include "client_metric.h"
+#include "replica.h"
 #include "types.h"
 
 namespace mooncake {

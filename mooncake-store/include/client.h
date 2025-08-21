@@ -17,6 +17,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 
