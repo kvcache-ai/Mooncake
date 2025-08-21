@@ -202,64 +202,11 @@ Status RdmaTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    const size_t kBlockSize = globalConfig().slice_size;
-    const int kMaxRetryCount = globalConfig().retry_cnt;
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
-            Slice *slice = getSliceCache().allocate();
-            slice->source_addr = (char *)request.source + offset;
-            slice->length = std::min(request.length - offset, kBlockSize);
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = 0;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->ts = 0;
-            slice->status = Slice::PENDING;
-            task.slice_list.push_back(slice);
-
-            int buffer_id = -1, device_id = -1, retry_cnt = 0;
-            while (retry_cnt < kMaxRetryCount) {
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
-                    continue;
-                auto &context = context_list_[device_id];
-                if (!context->active()) continue;
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
-                break;
-            }
-            if (device_id < 0) {
-                auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) delete s;
-                LOG(ERROR)
-                    << "RdmaTransport: Address not registered by any device(s) "
-                    << source_addr;
-                return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), "
-                    "address: " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
-            }
-        }
-    }
-    for (auto &entry : slices_to_post)
-        entry.first->submitPostSend(entry.second);
-    return Status::OK();
+    std::vector<TransferTask *> task_list;
+    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    return submitTransferTask(task_list);
 }
 
 Status RdmaTransport::submitTransferTask(
