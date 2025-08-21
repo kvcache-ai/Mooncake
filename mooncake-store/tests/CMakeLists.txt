@@ -151,4 +151,15 @@ target_link_libraries(client_metrics_test PUBLIC
 )
 add_test(NAME client_metrics_test COMMAND client_metrics_test)
 
+add_executable(serializer_test serializer_test.cpp)
+target_link_libraries(serializer_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    gtest_main
+    pthread
+)
+add_test(NAME serializer_test COMMAND serializer_test)
+
 add_subdirectory(e2e)
