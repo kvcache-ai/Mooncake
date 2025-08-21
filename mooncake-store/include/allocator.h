@@ -14,6 +14,33 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
+/**
+ * @brief Status of a buffer in the system
+ */
+enum class BufStatus {
+    INIT = 0,      // Initial state
+    COMPLETE = 1,  // Complete state (buffer has been used)
+    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
+                 // to this state)
+    UNREGISTERED = 3,  // Buffer metadata has been deleted
+};
+
+/**
+ * @brief Stream operator for BufStatus
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const BufStatus& status) noexcept {
+    static const std::unordered_map<BufStatus, std::string_view> status_strings{
+        {BufStatus::INIT, "INIT"},
+        {BufStatus::COMPLETE, "COMPLETE"},
+        {BufStatus::FAILED, "FAILED"},
+        {BufStatus::UNREGISTERED, "UNREGISTERED"}};
+
+    os << (status_strings.count(status) ? status_strings.at(status)
+                                        : "UNKNOWN");
+    return os;
+}
+
 // Forward declarations
 class BufferAllocatorBase;
 
