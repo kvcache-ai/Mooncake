@@ -35,6 +35,7 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#include <cassert>
 
 namespace mooncake {
 namespace v1 {
@@ -318,14 +319,15 @@ Scheduler::Scheduler(const std::string& shm_name, Duration default_ttl)
         PLOG(ERROR) << "Failed to create or open shared state: " << shm_name_;
         return;
     }
-    if (!need_init) return;
-    auto status = markSharedStateInited(state_);
-    if (!status.ok()) {
-        PLOG(ERROR) << "Failed to mark shared state initialized: "
-                    << status.ToString();
-        unmapSharedState(state_);
-        state_ = nullptr;
-        return;
+    if (need_init) {
+        auto status = markSharedStateInited(state_);
+        if (!status.ok()) {
+            PLOG(ERROR) << "Failed to mark shared state initialized: "
+                        << status.ToString();
+            unmapSharedState(state_);
+            state_ = nullptr;
+            return;
+        }
     }
     for (uint32_t i = 0; i < state_->device_count; ++i) {
         device_name_cache_.emplace(state_->devices[i].name, i);
