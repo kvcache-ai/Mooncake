@@ -54,6 +54,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
 MasterService::~MasterService() {
     // Stop and join the threads
+    client_monitor_running_ = false;
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
