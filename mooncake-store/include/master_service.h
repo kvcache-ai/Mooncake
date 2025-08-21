@@ -374,6 +374,9 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
 
+    // Eviction thread function
+    void EvictionThreadFunc();
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -384,6 +387,12 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+
+    // Eviction thread related members
+    std::thread eviction_thread_;
+    std::atomic<bool> eviction_running_{false};
+    static constexpr uint64_t kEvictionThreadSleepMs =
+        10;  // 10 ms sleep between eviction checks
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

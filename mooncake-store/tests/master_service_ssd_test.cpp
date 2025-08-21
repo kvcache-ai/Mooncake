@@ -228,7 +228,7 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
             success_puts++;
         } else {
             // wait for eviction to work
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
     ASSERT_GT(success_puts, 1024 * 16);

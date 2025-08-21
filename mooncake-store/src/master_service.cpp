@@ -40,6 +40,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid eviction high watermark ratio");
     }
 
+    eviction_running_ = true;
+    eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
+    VLOG(1) << "action=start_eviction_thread";
+
     if (enable_ha_) {
         client_monitor_running_ = true;
         client_monitor_thread_ =
@@ -54,7 +58,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
 MasterService::~MasterService() {
     // Stop and join the threads
+    eviction_running_ = false;
     client_monitor_running_ = false;
+    if (eviction_thread_.joinable()) {
+        eviction_thread_.join();
+    }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
@@ -672,6 +680,30 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return root_fs_dir_ + "/" + cluster_id_;
+}
+
+void MasterService::EvictionThreadFunc() {
+    VLOG(1) << "action=eviction_thread_started";
+
+    while (eviction_running_) {
+        double used_ratio =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratio > eviction_high_watermark_ratio_ ||
+            (need_eviction_ && eviction_ratio_ > 0.0)) {
+            double evict_ratio_target = std::max(
+                eviction_ratio_,
+                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_lowerbound =
+                std::max(evict_ratio_target * 0.5,
+                         used_ratio - eviction_high_watermark_ratio_);
+            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kEvictionThreadSleepMs));
+    }
+
+    VLOG(1) << "action=eviction_thread_stopped";
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
