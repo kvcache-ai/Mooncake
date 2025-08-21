@@ -959,7 +959,6 @@ TEST_F(MasterServiceTest, RemoveAll) {
 TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
-                              .set_enable_gc(true)
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -1052,102 +1051,6 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
             EXPECT_EQ(BufStatus::COMPLETE, handle.status_);
         }
     }
-
-    // Sleep for 2 seconds to ensure the object is marked for GC
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    auto remove_result = service_->Remove(key);
-    EXPECT_FALSE(remove_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
-
-    // Verify object is truly removed
-    auto get_result3 = service_->GetReplicaList(key);
-    EXPECT_FALSE(get_result3.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result3.error());
-}
-
-TEST_F(MasterServiceTest, ConcurrentGarbageCollectionTest) {
-    auto service_config =
-        MasterServiceConfig::builder().set_enable_gc(true).build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-
-    // Mount segment for testing
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size =
-        1024 * 1024 * 256;  // Larger segment for concurrent use
-    std::string segment_name = "concurrent_gc_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
-    UUID client_id = generate_uuid();
-    auto mount_result = service_->MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
-
-    constexpr size_t num_threads = 4;
-    constexpr size_t objects_per_thread = 25;
-    constexpr size_t total_objects = num_threads * objects_per_thread;
-
-    // Create a vector to track all created objects
-    std::vector<std::string> all_keys;
-    all_keys.reserve(total_objects);
-
-    // Phase 1: Create all objects
-    {
-        std::vector<std::thread> create_threads;
-        std::mutex keys_mutex;
-
-        for (size_t t = 0; t < num_threads; t++) {
-            create_threads.emplace_back([&, t]() {
-                for (size_t i = 0; i < objects_per_thread; i++) {
-                    std::string key = "concurrent_gc_key_" + std::to_string(t) +
-                                      "_" + std::to_string(i);
-                    std::vector<uint64_t> slice_lengths = {1024};
-                    ReplicateConfig config;
-                    config.replica_num = 1;
-                    std::vector<Replica::Descriptor> replica_list;
-
-                    // Create the object
-                    auto put_start_result =
-                        service_->PutStart(key, slice_lengths, config);
-                    ASSERT_TRUE(put_start_result.has_value());
-                    auto put_end_result =
-                        service_->PutEnd(key, ReplicaType::MEMORY);
-                    ASSERT_TRUE(put_end_result.has_value());
-
-                    // Add the key to the tracking list
-                    {
-                        std::lock_guard<std::mutex> lock(keys_mutex);
-                        all_keys.push_back(key);
-                    }
-                }
-            });
-        }
-
-        // Wait for all object creation to complete
-        for (auto& thread : create_threads) {
-            thread.join();
-        }
-    }
-    // Verify all objects were created
-    ASSERT_EQ(total_objects, all_keys.size());
-
-    // Check that all objects exist
-    for (const auto& key : all_keys) {
-        auto get_result = service_->GetReplicaList(key);
-        EXPECT_TRUE(get_result.has_value());
-    }
-
-    // Sleep for 2 seconds to ensure the object is marked for GC
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    // Verify all objects are gone after GC
-    size_t found_count = 0;
-    for (const auto& key : all_keys) {
-        auto get_result = service_->GetReplicaList(key);
-        if (get_result.has_value()) {
-            found_count++;
-        }
-    }
-
-    // All objects should have been garbage collected
-    EXPECT_EQ(0, found_count);
 }
 
 TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
@@ -1762,7 +1665,7 @@ TEST_F(MasterServiceTest, EvictObject) {
             ASSERT_TRUE(put_end_result.has_value());
             success_puts++;
         } else {
-            // wait for gc thread to work
+            // wait for eviction to work
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
@@ -1811,7 +1714,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     }
     ASSERT_GT(success_puts, 0);
     ASSERT_GT(failed_puts, 0);
-    // wait for gc thread to do eviction
+    // wait for eviction to do eviction
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     // All leased objects should be accessible
     for (const auto& key : leased_keys) {
@@ -1915,7 +1818,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             }
         }
         ASSERT_GT(failed_puts, 0);
-        // wait for gc thread to do eviction
+        // wait for eviction to do eviction
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kv_lease_ttl + 1000));
         // pin_key should still be accessible
@@ -1965,7 +1868,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
             ASSERT_TRUE(service_->PutEnd(key, ReplicaType::MEMORY).has_value());
             success_puts++;
         } else {
-            // wait for gc thread to work
+            // wait for eviction to work
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
@@ -2043,7 +1946,7 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         }
         ASSERT_GT(failed_puts, 0);
 
-        // wait for gc thread to do eviction
+        // wait for eviction
         std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
 
         // pin_key should still be accessible
@@ -2095,7 +1998,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
             ASSERT_TRUE(service_->PutEnd(key, ReplicaType::MEMORY).has_value());
             success_keys.push_back(key);
         } else {
-            // wait for gc thread to work
+            // wait for eviction to work
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }

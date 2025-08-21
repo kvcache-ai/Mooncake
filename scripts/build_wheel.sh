@@ -160,6 +160,8 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libruntime_common.so* \
 --exclude libqos_manager.so* \
 --exclude libascend_trace.so* \
+--exclude libmetadef*.so \
+--exclude libadxl*.so \
 -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 
