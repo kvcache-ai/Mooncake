@@ -1,17 +1,13 @@
 #pragma once
 
-#include <glog/logging.h>
-
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <variant>
 #include <vector>
 
 #include "Slab.h"
-#include "allocator.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -252,84 +248,6 @@ struct ReplicateConfig {
                   << " }";
     }
 };
-
-class AllocatedBuffer {
-   public:
-    friend class CachelibBufferAllocator;
-    friend class OffsetBufferAllocator;
-    // Forward declaration of the descriptor struct
-    struct Descriptor;
-
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, void* buffer_ptr,
-                    std::size_t size,
-                    std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
-        : allocator_(std::move(allocator)),
-          segment_name_(std::move(segment_name)),
-          buffer_ptr_(buffer_ptr),
-          size_(size),
-          offset_handle_(std::move(offset_handle)) {}
-
-    ~AllocatedBuffer();
-
-    AllocatedBuffer(const AllocatedBuffer&) = delete;
-    AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
-    AllocatedBuffer(AllocatedBuffer&&) noexcept;
-    AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
-
-    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
-
-    [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
-
-    [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
-    }
-
-    // Serialize the buffer into a descriptor for transfer
-    [[nodiscard]] Descriptor get_descriptor() const;
-
-    // Friend declaration for operator<<
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const AllocatedBuffer& buffer);
-
-    // Represents the serializable state
-    struct Descriptor {
-        std::string segment_name_;
-        uint64_t size_;
-        uintptr_t buffer_address_;
-        BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
-    };
-
-    void mark_complete() { status = BufStatus::COMPLETE; }
-
-   private:
-    std::weak_ptr<BufferAllocatorBase> allocator_;
-    std::string segment_name_;
-    BufStatus status{BufStatus::INIT};
-    void* buffer_ptr_{nullptr};
-    std::size_t size_{0};
-    // RAII handle for buffer allocated by offset allocator
-    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
-        std::nullopt};
-};
-
-// Implementation of get_descriptor
-inline AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
-}
-
-// Define operator<< using public accessors or get_descriptor if appropriate
-inline std::ostream& operator<<(std::ostream& os,
-                                const AllocatedBuffer& buffer) {
-    return os << "AllocatedBuffer: { "
-              << "segment_name: " << buffer.segment_name_ << ", "
-              << "size: " << buffer.size() << ", "
-              << "status: " << buffer.status << ", "
-              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
-}
 
 /**
  * @brief Represents a contiguous memory region

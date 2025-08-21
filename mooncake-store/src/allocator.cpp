@@ -21,6 +21,22 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+// Implementation of get_descriptor
+AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+    return {segment_name_, static_cast<uint64_t>(size()),
+            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
+}
+
+// Define operator<< using public accessors or get_descriptor if appropriate
+std::ostream& operator<<(std::ostream& os,
+                                const AllocatedBuffer& buffer) {
+    return os << "AllocatedBuffer: { "
+            << "segment_name: " << buffer.segment_name_ << ", "
+            << "size: " << buffer.size() << ", "
+            << "status: " << buffer.status << ", "
+            << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
+}
+
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size)
