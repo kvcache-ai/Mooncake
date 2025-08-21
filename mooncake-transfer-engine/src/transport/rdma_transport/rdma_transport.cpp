@@ -273,12 +273,14 @@ Status RdmaTransport::submitTransferTask(
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
-                assert(device_id >= 0 && device_id < context_list_.size());
+                assert(device_id >= 0 &&
+                       static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
                 if (!context->active()) continue;
                 assert(buffer_id >= 0 &&
-                       buffer_id < local_segment_desc->buffers.size());
+                       static_cast<size_t>(buffer_id) <
+                           local_segment_desc->buffers.size());
                 assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
                        context_list_.size());
                 found_device = true;
