@@ -89,11 +89,10 @@ PyClient::~PyClient() {
     ResourceTracker::getInstance().unregisterInstance(this);
 }
 
-tl::expected<void, ErrorCode> PyClient::setup_internal(
+tl::expected<void, ErrorCode> PyClient::common_setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
-    size_t global_segment_size, size_t local_buffer_size,
-    const std::string &protocol, const std::string &rdma_devices,
-    const std::string &master_server_addr) {
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &protocol_args, const std::string &master_server_addr) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -112,7 +111,13 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         this->local_hostname = local_hostname;
     }
 
-    void **args = (protocol == "rdma") ? rdma_args(rdma_devices) : nullptr;
+    void **args = nullptr;
+    if (protocol == "rdma") {
+        args = rdma_args(protocol_args);
+    } else if (protocol == "nvmeof_generic" && !protocol_args.empty()) {
+        args = (void **)calloc(2, sizeof(void *));
+        args[0] = (void *)protocol_args.c_str();
+    }
     auto client_opt =
         mooncake::Client::Create(this->local_hostname, metadata_server,
                                  protocol, args, master_server_addr);
@@ -137,6 +142,23 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         }
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
+    }
+
+    return {};
+}
+
+tl::expected<void, ErrorCode> PyClient::setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr) {
+    // Common setups.
+    auto result = common_setup_internal(local_hostname, metadata_server,
+                                        local_buffer_size, protocol,
+                                        rdma_devices, master_server_addr);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Failed to setup PyClient";
+        return tl::unexpected(result.error());
     }
 
     // If global_segment_size is 0, skip mount segment;
@@ -180,6 +202,45 @@ int PyClient::setup(const std::string &local_hostname,
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr));
+}
+
+tl::expected<void, ErrorCode> PyClient::setup_with_files_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    const std::vector<std::string> &files, size_t local_buffer_size,
+    const std::string &protocol, const std::string &protocol_arg,
+    const std::string &master_server_addr) {
+    // Common setups.
+    auto result = common_setup_internal(local_hostname, metadata_server,
+                                        local_buffer_size, protocol,
+                                        protocol_arg, master_server_addr);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Failed to setup PyClient";
+        return tl::unexpected(result.error());
+    }
+
+    // Mount file segments.
+    for (auto &file : files) {
+        auto result = client_->MountFileSegment(file);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to mount file " << file
+                       << ", error=" << result.error();
+            return tl::unexpected(result.error());
+        }
+    }
+
+    return {};
+}
+
+int PyClient::setup_with_files(const std::string &local_hostname,
+                               const std::string &metadata_server,
+                               const std::vector<std::string> &files,
+                               size_t local_buffer_size,
+                               const std::string &protocol,
+                               const std::string &protocol_arg,
+                               const std::string &master_server_addr) {
+    return to_py_ret(setup_with_files_internal(
+        local_hostname, metadata_server, files, local_buffer_size, protocol,
+        protocol_arg, master_server_addr));
 }
 
 tl::expected<void, ErrorCode> PyClient::initAll_internal(
