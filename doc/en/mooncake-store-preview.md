@@ -107,6 +107,23 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+Used to query the replica information for all objects whose keys match the given regular expression. This is useful for batch operations or for retrieving a group of related objects. The operation is performed on the Master and returns a map of keys to their replica lists.
+
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+Used to delete all objects from the store whose keys match the specified regular expression. This provides a powerful way to perform bulk deletions. The command returns the number of objects that were successfully removed.
+
 ### Master Service
 
 The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
@@ -150,6 +167,9 @@ service MasterService {
   // Get the list of replicas for an object
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // Get replica lists for objects matching a regex
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -158,6 +178,9 @@ service MasterService {
 
   // Delete all replicas of an object
   rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Remove objects matching a regex
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
   // Storage node (Client) registers a storage segment
   rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
@@ -309,17 +332,20 @@ Before writing an object, the Client calls PutStart to request storage space all
 ```C++
 ErrorCode GetReplicaList(const std::string& key,
                          std::vector<ReplicaInfo>& replica_list);
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+GetReplicaListByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to retrieve the replica list for a specified key, allowing the Client to select an appropriate replica for reading based on this information.
+The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.
 
 - Remove
 
 ```C++
 tl::expected<void, ErrorCode> Remove(const std::string& key);
+tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to delete all replicas corresponding to the specified key.
+The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
 ### Buffer Allocator
 

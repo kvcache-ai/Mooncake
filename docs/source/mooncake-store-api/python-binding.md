@@ -585,6 +585,29 @@ if result == 0:
 
 ---
 
+#### remove_by_regex()
+Remove objects from the storage system whose keys match a regular expression.
+
+```python
+def remove_by_regex(self, regex: str) -> int
+```
+
+**Parameters:**
+- `regex` (str): The regular expression to match against object keys.
+
+**Returns:**
+- `int`: The number of objects removed, or a negative value on error.
+
+**Example:**
+```python
+# Remove all keys starting with "user_session_"
+count = store.remove_by_regex("^user_session_.*")
+if count >= 0:
+    print(f"Removed {count} objects")
+```
+
+---
+
 #### remove_all()
 Remove all objects from the storage system.
 
