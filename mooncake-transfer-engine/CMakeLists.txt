@@ -30,7 +30,7 @@ if (USE_ASCEND)
                       )
 endif()
 
-if (USE_HETEROGENEOUS)
+if (USE_ASCEND_HETEROGENEOUS)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
   include_directories(/usr/local/include
