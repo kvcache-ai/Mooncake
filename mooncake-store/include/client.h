@@ -180,6 +180,20 @@ class Client {
                                                  size_t size);
 
     /**
+     * @brief Register a file to master for allocation
+     * @param path The file path
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> MountFileSegment(const std::string& path);
+
+    /**
+     * @brief Unregisters a file segment from master
+     * @param path File path to unregister
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> UnmountFileSegment(const std::string& path);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region

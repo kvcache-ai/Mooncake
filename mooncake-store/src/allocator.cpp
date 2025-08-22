@@ -23,7 +23,7 @@ AllocatedBuffer::~AllocatedBuffer() {
 
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, static_cast<uint64_t>(size()),
+    return {segment_name_, file_id_, static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), status};
 }
 
@@ -31,6 +31,7 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
     return os << "AllocatedBuffer: { "
               << "segment_name: " << buffer.segment_name_ << ", "
+              << "file_id: " << buffer.file_id_ << ", "
               << "size: " << buffer.size() << ", "
               << "status: " << buffer.status << ", "
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
@@ -38,14 +39,16 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
-                                                 size_t base, size_t size)
+                                                 size_t base, size_t size,
+                                                 FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      file_id_(file_id) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     // Calculate the size of the header region.
     header_region_size_ =
@@ -107,7 +110,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     cur_size_.fetch_add(size);
     MasterMetricManager::instance().inc_allocated_size(size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                             buffer, size);
+                                             file_id_, buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -133,14 +136,16 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
-                                             size_t base, size_t size)
+                                             size_t base, size_t size,
+                                             FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      file_id_(file_id) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     try {
         // 1k <= init_capacity <= 64k
@@ -196,7 +201,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), segment_name_, buffer_ptr, size,
+            shared_from_this(), segment_name_, file_id_, buffer_ptr, size,
             std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;

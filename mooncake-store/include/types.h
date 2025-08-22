@@ -45,6 +45,7 @@ class Replica;
 using ObjectKey = std::string;
 using Version = uint64_t;
 using SegmentId = int64_t;
+using FileBufferID = uint32_t;
 using TaskID = int64_t;
 using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 // using ReplicaList = std::vector<ReplicaInfo>;
@@ -164,20 +165,61 @@ const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
 /**
- * @brief Represents a contiguous memory region
+ * @brief Type of segments.
+ */
+enum class SegmentType {
+    UNKNOWN = -1,
+    MEMORY,
+    FILE,
+};
+
+/**
+ * @brief Stream operator for SegmentType
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const SegmentType& type) noexcept {
+    static const std::unordered_map<SegmentType, std::string_view> type_strings{
+        {SegmentType::UNKNOWN, "UNKNOWN"},
+        {SegmentType::MEMORY, "MEMORY"},
+        {SegmentType::FILE, "FILE"}};
+
+    os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
+    return os;
+}
+
+/**
+ * @brief Represents a contiguous storage region, could be memory or file.
  */
 struct Segment {
     UUID id{0, 0};
+    SegmentType type{SegmentType::UNKNOWN};
     std::string name{};  // The name of the segment, also might be the
                          // hostname of the server that owns the segment
     uintptr_t base{0};
     size_t size{0};
+    // For a file segment, this will be the path of the file.
+    std::string path{};
+    // For a file segment, this will be the id of the file buffer.
+    FileBufferID file_id{0};
     Segment() = default;
     Segment(const UUID& id, const std::string& name, uintptr_t base,
             size_t size)
-        : id(id), name(name), base(base), size(size) {}
+        : id(id),
+          type(SegmentType::MEMORY),
+          name(name),
+          base(base),
+          size(size) {}
+    Segment(const UUID& id, const std::string& name, uintptr_t base,
+            size_t size, const std::string& path, FileBufferID file_id)
+        : id(id),
+          type(SegmentType::FILE),
+          name(name),
+          base(base),
+          size(size),
+          path(path),
+          file_id(file_id) {}
 };
-YLT_REFL(Segment, id, name, base, size);
+YLT_REFL(Segment, id, type, name, base, size, path, file_id);
 
 /**
  * @brief Client status from the master's perspective

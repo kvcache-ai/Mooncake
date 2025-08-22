@@ -53,12 +53,13 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, void* buffer_ptr,
-                    std::size_t size,
+                    std::string segment_name, FileBufferID file_id,
+                    void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
           segment_name_(std::move(segment_name)),
+          file_id_(file_id),
           buffer_ptr_(buffer_ptr),
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
@@ -92,10 +93,12 @@ class AllocatedBuffer {
     // Represents the serializable state
     struct Descriptor {
         std::string segment_name_;
+        FileBufferID file_id_;
         uint64_t size_;
         uintptr_t buffer_address_;
         BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+        YLT_REFL(Descriptor, segment_name_, file_id_, size_, buffer_address_,
+                 status_);
     };
 
     void mark_complete() { status = BufStatus::COMPLETE; }
@@ -103,6 +106,7 @@ class AllocatedBuffer {
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
     std::string segment_name_;
+    FileBufferID file_id_;
     BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
@@ -152,7 +156,8 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size);
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            FileBufferID file_id = 0);
 
     ~CachelibBufferAllocator() override;
 
@@ -170,6 +175,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const FileBufferID file_id_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -189,7 +195,8 @@ class OffsetBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
-    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size);
+    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
+                          FileBufferID file_id = 0);
 
     ~OffsetBufferAllocator() override;
 
@@ -207,6 +214,7 @@ class OffsetBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const FileBufferID file_id_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

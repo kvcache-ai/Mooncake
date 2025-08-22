@@ -10,7 +10,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     const size_t size = segment.size;
 
     // Check if parameters are valid before allocating memory.
-    if (buffer == 0 || size == 0) {
+    if ((segment.type == SegmentType::MEMORY && buffer == 0) || size == 0) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
                    << " is invalid";
         return ErrorCode::INVALID_PARAMS;
@@ -50,11 +50,11 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.file_id);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.file_id);
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
