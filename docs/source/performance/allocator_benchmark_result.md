@@ -4,9 +4,9 @@ We evaluated the performance of [OffsetAllocator](https://github.com/sebbbi/Offs
 
 In this context, the most important metric is **memory utilization**, defined as the ratio between the amount of memory that can be successfully allocated and the total available memory. A higher utilization means that more KV tensors can be cached, thereby accelerating LLM tasks. However, due to memory fragmentation, allocation may fail even when the allocated memory is well below the total available capacity.
 
-For the same allocator, memory utilization can vary significantly under different workloads. Therefore, we evaluated the allocator’s efficiency across a range of workloads.
+For the same allocator, memory utilization can vary significantly under different workloads. Therefore, we evaluated the allocator's efficiency across a range of workloads.
 
-In particular, in the **LLM inference** scenario, once the model is fixed, the size of each KV vector is also fixed. This means memory utilization under **uniform allocation sizes** becomes especially important. However, the original OffsetAllocator has a limitation: when the allocation size is uniform but does not match any of OffsetAllocator’s predefined bin sizes, memory utilization can be suboptimal.
+In particular, in the **LLM inference** scenario, once the model is fixed, the size of each KV vector is also fixed. This means memory utilization under **uniform allocation sizes** becomes especially important. However, the original OffsetAllocator has a limitation: when the allocation size is uniform but does not match any of OffsetAllocator's predefined bin sizes, memory utilization can be suboptimal.
 
 To address this, we introduced targeted optimizations for uniform-size workloads on top of the original OffsetAllocator. As shown in our test results, the optimized version achieves **significant performance improvements** in such scenarios.
 
@@ -27,160 +27,162 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 
 **OffsetAllocator (After Optimization)**
 
-```
-Alloc size: 32, min util ratio: 1, avg util ratio: 1, time: 544 ns
-Alloc size: 128, min util ratio: 1, avg util ratio: 1, time: 417 ns
-Alloc size: 512, min util ratio: 1, avg util ratio: 1, time: 174 ns
-Alloc size: 2048, min util ratio: 1, avg util ratio: 1, time: 406 ns
-Alloc size: 8192, min util ratio: 1, avg util ratio: 1, time: 180 ns
-Alloc size: 32768, min util ratio: 1, avg util ratio: 1, time: 133 ns
-Alloc size: 131072, min util ratio: 1, avg util ratio: 1, time: 109 ns
-Alloc size: 524288, min util ratio: 1, avg util ratio: 1, time: 100 ns
-Alloc size: 2097152, min util ratio: 1, avg util ratio: 1, time: 99 ns
-Alloc size: 8388608, min util ratio: 1, avg util ratio: 1, time: 99 ns
-Alloc size: 33554432, min util ratio: 1, avg util ratio: 1, time: 98 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 32         | 1              | 1              | 544       |
+| 128        | 1              | 1              | 417       |
+| 512        | 1              | 1              | 174       |
+| 2048       | 1              | 1              | 406       |
+| 8192       | 1              | 1              | 180       |
+| 32768      | 1              | 1              | 133       |
+| 131072     | 1              | 1              | 109       |
+| 524288     | 1              | 1              | 100       |
+| 2097152    | 1              | 1              | 99        |
+| 8388608    | 1              | 1              | 99        |
+| 33554432   | 1              | 1              | 98        |
 
 **OffsetAllocator (Before Optimization)**
 
-```
-Alloc size: 32, min util ratio: 1, avg util ratio: 1, time: 539 ns
-Alloc size: 128, min util ratio: 1, avg util ratio: 1, time: 419 ns
-Alloc size: 512, min util ratio: 1, avg util ratio: 1, time: 217 ns
-Alloc size: 2048, min util ratio: 1, avg util ratio: 1, time: 408 ns
-Alloc size: 8192, min util ratio: 1, avg util ratio: 1, time: 175 ns
-Alloc size: 32768, min util ratio: 1, avg util ratio: 1, time: 130 ns
-Alloc size: 131072, min util ratio: 1, avg util ratio: 1, time: 107 ns
-Alloc size: 524288, min util ratio: 1, avg util ratio: 1, time: 99 ns
-Alloc size: 2097152, min util ratio: 1, avg util ratio: 1, time: 100 ns
-Alloc size: 8388608, min util ratio: 1, avg util ratio: 1, time: 98 ns
-Alloc size: 33554432, min util ratio: 1, avg util ratio: 1, time: 98 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 32         | 1              | 1              | 539       |
+| 128        | 1              | 1              | 419       |
+| 512        | 1              | 1              | 217       |
+| 2048       | 1              | 1              | 408       |
+| 8192       | 1              | 1              | 175       |
+| 32768      | 1              | 1              | 130       |
+| 131072     | 1              | 1              | 107       |
+| 524288     | 1              | 1              | 99        |
+| 2097152    | 1              | 1              | 100       |
+| 8388608    | 1              | 1              | 98        |
+| 33554432   | 1              | 1              | 98        |
 
 ### Uniform size, size equals power of 2 +/- 17
 
 **OffsetAllocator (After Optimization)**
 
-```
-Alloc size: 15, min util ratio: 1, avg util ratio: 1, time: 568 ns
-Alloc size: 111, min util ratio: 0.991071, avg util ratio: 0.991071, time: 441 ns
-Alloc size: 495, min util ratio: 0.966797, avg util ratio: 0.966797, time: 178 ns
-Alloc size: 2031, min util ratio: 0.991699, avg util ratio: 0.991699, time: 418 ns
-Alloc size: 8175, min util ratio: 0.997925, avg util ratio: 0.997925, time: 170 ns
-Alloc size: 32751, min util ratio: 0.999481, avg util ratio: 0.999481, time: 133 ns
-Alloc size: 131055, min util ratio: 0.99987, avg util ratio: 0.99987, time: 109 ns
-Alloc size: 524271, min util ratio: 0.999968, avg util ratio: 0.999968, time: 100 ns
-Alloc size: 2097135, min util ratio: 0.999992, avg util ratio: 0.999992, time: 99 ns
-Alloc size: 8388591, min util ratio: 0.999998, avg util ratio: 0.999998, time: 98 ns
-Alloc size: 33554415, min util ratio: 0.999999, avg util ratio: 0.999999, time: 99 ns
-Alloc size: 49, min util ratio: 0.942308, avg util ratio: 0.942308, time: 508 ns
-Alloc size: 145, min util ratio: 0.906249, avg util ratio: 0.906249, time: 372 ns
-Alloc size: 529, min util ratio: 0.918399, avg util ratio: 0.918399, time: 172 ns
-Alloc size: 2065, min util ratio: 0.896267, avg util ratio: 0.896267, time: 403 ns
-Alloc size: 8209, min util ratio: 0.89073, avg util ratio: 0.89073, time: 174 ns
-Alloc size: 32785, min util ratio: 0.889347, avg util ratio: 0.889347, time: 131 ns
-Alloc size: 131089, min util ratio: 0.88897, avg util ratio: 0.88897, time: 105 ns
-Alloc size: 524305, min util ratio: 0.888701, avg util ratio: 0.888701, time: 102 ns
-Alloc size: 2097169, min util ratio: 0.888679, avg util ratio: 0.888679, time: 100 ns
-Alloc size: 8388625, min util ratio: 0.886721, avg util ratio: 0.886721, time: 100 ns
-Alloc size: 33554449, min util ratio: 0.875, avg util ratio: 0.875, time: 100 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 15         | 1              | 1              | 568       |
+| 111        | 0.991071       | 0.991071       | 441       |
+| 495        | 0.966797       | 0.966797       | 178       |
+| 2031       | 0.991699       | 0.991699       | 418       |
+| 8175       | 0.997925       | 0.997925       | 170       |
+| 32751      | 0.999481       | 0.999481       | 133       |
+| 131055     | 0.99987        | 0.99987        | 109       |
+| 524271     | 0.999968       | 0.999968       | 100       |
+| 2097135    | 0.999992       | 0.999992       | 99        |
+| 8388591    | 0.999998       | 0.999998       | 98        |
+| 33554415   | 0.999999       | 0.999999       | 99        |
+| 49         | 0.942308       | 0.942308       | 508       |
+| 145        | 0.906249       | 0.906249       | 372       |
+| 529        | 0.918399       | 0.918399       | 172       |
+| 2065       | 0.896267       | 0.896267       | 403       |
+| 8209       | 0.89073        | 0.89073        | 174       |
+| 32785      | 0.889347       | 0.889347       | 131       |
+| 131089     | 0.88897        | 0.88897        | 105       |
+| 524305     | 0.888701       | 0.888701       | 102       |
+| 2097169    | 0.888679       | 0.888679       | 100       |
+| 8388625    | 0.886721       | 0.886721       | 100       |
+| 33554449   | 0.875          | 0.875          | 100       |
 
 **OffsetAllocator (Before Optimization)**
 
-```
-Alloc size: 15, min util ratio: 1, avg util ratio: 1, time: 566 ns
-Alloc size: 111, min util ratio: 0.669866, avg util ratio: 0.710845, time: 703 ns
-Alloc size: 495, min util ratio: 0.665779, avg util ratio: 0.676874, time: 238 ns
-Alloc size: 2031, min util ratio: 0.668333, avg util ratio: 0.705411, time: 637 ns
-Alloc size: 8175, min util ratio: 0.666175, avg util ratio: 0.676474, time: 242 ns
-Alloc size: 32751, min util ratio: 0.664435, avg util ratio: 0.669078, time: 168 ns
-Alloc size: 131055, min util ratio: 0.66062, avg util ratio: 0.667341, time: 124 ns
-Alloc size: 524271, min util ratio: 0.653055, avg util ratio: 0.666993, time: 118 ns
-Alloc size: 2097135, min util ratio: 0.64062, avg util ratio: 0.666873, time: 116 ns
-Alloc size: 8388591, min util ratio: 0.605468, avg util ratio: 0.667812, time: 115 ns
-Alloc size: 33554415, min util ratio: 0.5625, avg util ratio: 0.670944, time: 116 ns
-Alloc size: 49, min util ratio: 0.692229, avg util ratio: 0.753062, time: 1122 ns
-Alloc size: 145, min util ratio: 0.667789, avg util ratio: 0.700907, time: 572 ns
-Alloc size: 529, min util ratio: 0.66577, avg util ratio: 0.676238, time: 238 ns
-Alloc size: 2065, min util ratio: 0.667926, avg util ratio: 0.704884, time: 632 ns
-Alloc size: 8209, min util ratio: 0.665708, avg util ratio: 0.676372, time: 239 ns
-Alloc size: 32785, min util ratio: 0.664224, avg util ratio: 0.669058, time: 168 ns
-Alloc size: 131089, min util ratio: 0.659631, avg util ratio: 0.667287, time: 129 ns
-Alloc size: 524305, min util ratio: 0.652609, avg util ratio: 0.666884, time: 122 ns
-Alloc size: 2097169, min util ratio: 0.638677, avg util ratio: 0.666516, time: 120 ns
-Alloc size: 8388625, min util ratio: 0.60547, avg util ratio: 0.665131, time: 121 ns
-Alloc size: 33554449, min util ratio: 0.546875, avg util ratio: 0.660917, time: 120 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 15         | 1              | 1              | 566       |
+| 111        | 0.669866       | 0.710845       | 703       |
+| 495        | 0.665779       | 0.676874       | 238       |
+| 2031       | 0.668333       | 0.705411       | 637       |
+| 8175       | 0.666175       | 0.676474       | 242       |
+| 32751      | 0.664435       | 0.669078       | 168       |
+| 131055     | 0.66062        | 0.667341       | 124       |
+| 524271     | 0.653055       | 0.666993       | 118       |
+| 2097135    | 0.64062        | 0.666873       | 116       |
+| 8388591    | 0.605468       | 0.667812       | 115       |
+| 33554415   | 0.5625         | 0.670944       | 116       |
+| 49         | 0.692229       | 0.753062       | 1122      |
+| 145        | 0.667789       | 0.700907       | 572       |
+| 529        | 0.66577        | 0.676238       | 238       |
+| 2065       | 0.667926       | 0.704884       | 632       |
+| 8209       | 0.665708       | 0.676372       | 239       |
+| 32785      | 0.664224       | 0.669058       | 168       |
+| 131089     | 0.659631       | 0.667287       | 129       |
+| 524305     | 0.652609       | 0.666884       | 122       |
+| 2097169    | 0.638677       | 0.666516       | 120       |
+| 8388625    | 0.60547        | 0.665131       | 121       |
+| 33554449   | 0.546875       | 0.660917       | 120       |
 
 ### Uniform size, size equals power of 2 multiply 0.9 or 1.1
 
 **OffsetAllocator (After Optimization)**
 
-```
-Alloc size: 28, min util ratio: 1, avg util ratio: 1, time: 543 ns
-Alloc size: 115, min util ratio: 0.958333, avg util ratio: 0.958333, time: 418 ns
-Alloc size: 460, min util ratio: 0.958332, avg util ratio: 0.958332, time: 189 ns
-Alloc size: 1843, min util ratio: 0.959896, avg util ratio: 0.959896, time: 418 ns
-Alloc size: 7372, min util ratio: 0.959895, avg util ratio: 0.959895, time: 197 ns
-Alloc size: 29491, min util ratio: 0.959993, avg util ratio: 0.959993, time: 135 ns
-Alloc size: 117964, min util ratio: 0.959979, avg util ratio: 0.959979, time: 111 ns
-Alloc size: 471859, min util ratio: 0.959985, avg util ratio: 0.959985, time: 100 ns
-Alloc size: 1887436, min util ratio: 0.959765, avg util ratio: 0.959765, time: 99 ns
-Alloc size: 7549747, min util ratio: 0.959766, avg util ratio: 0.959766, time: 99 ns
-Alloc size: 30198988, min util ratio: 0.95625, avg util ratio: 0.95625, time: 99 ns
-Alloc size: 35, min util ratio: 0.972222, avg util ratio: 0.972222, time: 531 ns
-Alloc size: 140, min util ratio: 0.972222, avg util ratio: 0.972222, time: 397 ns
-Alloc size: 563, min util ratio: 0.977427, avg util ratio: 0.977427, time: 180 ns
-Alloc size: 2252, min util ratio: 0.97743, avg util ratio: 0.97743, time: 389 ns
-Alloc size: 9011, min util ratio: 0.977752, avg util ratio: 0.977752, time: 183 ns
-Alloc size: 36044, min util ratio: 0.977752, avg util ratio: 0.977752, time: 133 ns
-Alloc size: 144179, min util ratio: 0.977739, avg util ratio: 0.977739, time: 106 ns
-Alloc size: 576716, min util ratio: 0.977538, avg util ratio: 0.977538, time: 103 ns
-Alloc size: 2306867, min util ratio: 0.977539, avg util ratio: 0.977539, time: 99 ns
-Alloc size: 9227468, min util ratio: 0.975391, avg util ratio: 0.975391, time: 99 ns
-Alloc size: 36909875, min util ratio: 0.9625, avg util ratio: 0.9625, time: 100 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 28         | 1              | 1              | 543       |
+| 115        | 0.958333       | 0.958333       | 418       |
+| 460        | 0.958332       | 0.958332       | 189       |
+| 1843       | 0.959896       | 0.959896       | 418       |
+| 7372       | 0.959895       | 0.959895       | 197       |
+| 29491      | 0.959993       | 0.959993       | 135       |
+| 117964     | 0.959979       | 0.959979       | 111       |
+| 471859     | 0.959985       | 0.959985       | 100       |
+| 1887436    | 0.959765       | 0.959765       | 99        |
+| 7549747    | 0.959766       | 0.959766       | 99        |
+| 30198988   | 0.95625        | 0.95625        | 99        |
+| 35         | 0.972222       | 0.972222       | 531       |
+| 140        | 0.972222       | 0.972222       | 397       |
+| 563        | 0.977427       | 0.977427       | 180       |
+| 2252       | 0.97743        | 0.97743        | 389       |
+| 9011       | 0.977752       | 0.977752       | 183       |
+| 36044      | 0.977752       | 0.977752       | 133       |
+| 144179     | 0.977739       | 0.977739       | 106       |
+| 576716     | 0.977538       | 0.977538       | 103       |
+| 2306867    | 0.977539       | 0.977539       | 99        |
+| 9227468    | 0.975391       | 0.975391       | 99        |
+| 36909875   | 0.9625         | 0.9625         | 100       |
 
 **OffsetAllocator (Before Optimization)**
 
-```
-Alloc size: 28, min util ratio: 1, avg util ratio: 1, time: 539 ns
-Alloc size: 115, min util ratio: 0.669299, avg util ratio: 0.709245, time: 701 ns
-Alloc size: 460, min util ratio: 0.665825, avg util ratio: 0.677532, time: 255 ns
-Alloc size: 1843, min util ratio: 0.669352, avg util ratio: 0.709202, time: 691 ns
-Alloc size: 7372, min util ratio: 0.66619, avg util ratio: 0.677401, time: 260 ns
-Alloc size: 29491, min util ratio: 0.664311, avg util ratio: 0.669511, time: 172 ns
-Alloc size: 117964, min util ratio: 0.661812, avg util ratio: 0.667356, time: 133 ns
-Alloc size: 471859, min util ratio: 0.654345, avg util ratio: 0.667048, time: 123 ns
-Alloc size: 1887436, min util ratio: 0.640722, avg util ratio: 0.666447, time: 121 ns
-Alloc size: 7549747, min util ratio: 0.611719, avg util ratio: 0.666847, time: 119 ns
-Alloc size: 30198988, min util ratio: 0.548437, avg util ratio: 0.669799, time: 125 ns
-Alloc size: 35, min util ratio: 0.7098, avg util ratio: 0.774162, time: 1306 ns
-Alloc size: 140, min util ratio: 0.667934, avg util ratio: 0.702151, time: 599 ns
-Alloc size: 563, min util ratio: 0.665599, avg util ratio: 0.675548, time: 239 ns
-Alloc size: 2252, min util ratio: 0.667371, avg util ratio: 0.701623, time: 601 ns
-Alloc size: 9011, min util ratio: 0.665485, avg util ratio: 0.675528, time: 244 ns
-Alloc size: 36044, min util ratio: 0.663248, avg util ratio: 0.668912, time: 170 ns
-Alloc size: 144179, min util ratio: 0.660308, avg util ratio: 0.666934, time: 127 ns
-Alloc size: 576716, min util ratio: 0.654467, avg util ratio: 0.66679, time: 122 ns
-Alloc size: 2306867, min util ratio: 0.633789, avg util ratio: 0.666159, time: 121 ns
-Alloc size: 9227468, min util ratio: 0.597266, avg util ratio: 0.666037, time: 118 ns
-Alloc size: 36909875, min util ratio: 0.55, avg util ratio: 0.669564, time: 121 ns
-```
+| Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
+|------------|----------------|----------------|-----------|
+| 28         | 1              | 1              | 539       |
+| 115        | 0.669299       | 0.709245       | 701       |
+| 460        | 0.665825       | 0.677532       | 255       |
+| 1843       | 0.669352       | 0.709202       | 691       |
+| 7372       | 0.66619        | 0.677401       | 260       |
+| 29491      | 0.664311       | 0.669511       | 172       |
+| 117964     | 0.661812       | 0.667356       | 133       |
+| 471859     | 0.654345       | 0.667048       | 123       |
+| 1887436    | 0.640722       | 0.666447       | 121       |
+| 7549747    | 0.611719       | 0.666847       | 119       |
+| 30198988   | 0.548437       | 0.669799       | 125       |
+| 35         | 0.7098         | 0.774162       | 1306      |
+| 140        | 0.667934       | 0.702151       | 599       |
+| 563        | 0.665599       | 0.675548       | 239       |
+| 2252       | 0.667371       | 0.701623       | 601       |
+| 9011       | 0.665485       | 0.675528       | 244       |
+| 36044      | 0.663248       | 0.668912       | 170       |
+| 144179     | 0.660308       | 0.666934       | 127       |
+| 576716     | 0.654467       | 0.66679        | 122       |
+| 2306867    | 0.633789       | 0.666159       | 121       |
+| 9227468    | 0.597266       | 0.666037       | 118       |
+| 36909875   | 0.55           | 0.669564       | 121       |
 
 ### Random Size
 
 **OffsetAllocator (After Optimization)**
 
 ```
-util ratio (min / p99 / p90 / p50 / max / avg): 0.544250 / 0.713338 / 0.779739 / 0.847867 / 0.952591 / 0.841576
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.544250 / 0.713338 / 0.779739 / 0.847867 / 0.952591 / 0.841576
 avg alloc time: 145.575738 ns/op
 ```
 
 **OffsetAllocator (Before Optimization)**
 
 ```
-util ratio (min / p99 / p90 / p50 / max / avg): 0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
 avg alloc time: 142.508508 ns/op
 ```
