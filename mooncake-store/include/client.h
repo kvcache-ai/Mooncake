@@ -151,8 +151,8 @@ class Client {
      * @brief Removes objects from the store whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing the number of removed objects on
-    success, or an ErrorCode on failure.
-     * /
+     * success, or an ErrorCode on failure.
+     */
     tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
     /**
