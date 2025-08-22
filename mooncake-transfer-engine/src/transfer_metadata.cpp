@@ -226,6 +226,16 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+#ifdef USE_NVMEOF_GENERIC
+    } else if (segmentJSON["protocol"] == "nvmeof_generic") {
+        Json::Value tridJSON;
+        tridJSON["trtype"] = desc.nvmeof_generic_trid.trtype;
+        tridJSON["adrfam"] = desc.nvmeof_generic_trid.adrfam;
+        tridJSON["traddr"] = desc.nvmeof_generic_trid.traddr;
+        tridJSON["trsvcid"] = desc.nvmeof_generic_trid.trsvcid;
+        tridJSON["subnqn"] = desc.nvmeof_generic_trid.subnqn;
+        segmentJSON["nvmeof_generic_trid"] = tridJSON;
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -422,6 +432,29 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+#ifdef USE_NVMEOF_GENERIC
+    } else if (desc->protocol == "nvmeof_generic") {
+        if (!segmentJSON.isMember("nvmeof_generic_trid")) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+            return nullptr;
+        }
+
+        Json::Value tridJson = segmentJSON["nvmeof_generic_trid"];
+        if (!tridJson.isMember("trtype") || !tridJson.isMember("adrfam") ||
+            !tridJson.isMember("traddr") || !tridJson.isMember("trsvcid") ||
+            !tridJson.isMember("subnqn")) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+            return nullptr;
+        }
+
+        desc->nvmeof_generic_trid.trtype = tridJson["trtype"].asString();
+        desc->nvmeof_generic_trid.adrfam = tridJson["adrfam"].asString();
+        desc->nvmeof_generic_trid.traddr = tridJson["traddr"].asString();
+        desc->nvmeof_generic_trid.trsvcid = tridJson["trsvcid"].asString();
+        desc->nvmeof_generic_trid.subnqn = tridJson["subnqn"].asString();
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;

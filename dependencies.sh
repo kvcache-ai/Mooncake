@@ -121,7 +121,9 @@ SYSTEM_PACKAGES="build-essential \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   pkg-config \
-                  patchelf"
+                  patchelf \
+                  libaio-dev \
+                  libnvme-dev"
 
 apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"

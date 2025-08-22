@@ -36,6 +36,9 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#ifdef USE_NVMEOF_GENERIC
+#include "transport/nvmeof_generic_transport/nvmeof_transport.h"
+#endif
 
 #include <cassert>
 
@@ -241,6 +244,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 }
 
 bool MultiTransport::transportNeedArgs(const std::string &proto) {
+#ifdef USE_NVMEOF_GENERIC
+    if (proto == "nvmeof_generic") {
+        return true;
+    }
+#endif
     return false;
 }
 
@@ -248,7 +256,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
                                             void **args) {
     std::shared_ptr<Transport> transport = nullptr;
 
-    // Add transport creation logic here.
+#ifdef USE_NVMEOF_GENERIC
+    if (proto == "nvmeof_generic") {
+        transport = std::make_shared<NVMeoFGenericTransport>();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto

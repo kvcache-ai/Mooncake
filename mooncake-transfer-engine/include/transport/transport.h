@@ -27,6 +27,10 @@
 #include <queue>
 #include <string>
 
+#ifdef USE_NVMEOF_GENERIC
+#include <libaio.h>
+#endif
+
 #include "common/base/status.h"
 #include "transfer_metadata.h"
 
@@ -128,6 +132,12 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } ascend_direct;
+#ifdef USE_NVMEOF_GENERIC
+            struct {
+                uint64_t offset;
+                struct iocb iocb;
+            } nvmeof_generic;
+#endif
         };
 
        public:

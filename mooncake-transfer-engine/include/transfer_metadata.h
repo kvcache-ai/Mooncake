@@ -86,6 +86,17 @@ class TransferMetadata {
         uint64_t pid;
     };
 
+#ifdef USE_NVMEOF_GENERIC
+    // NVMeoF transport id.
+    struct NVMeoFGenericTrid {
+        std::string trtype;
+        std::string adrfam;
+        std::string traddr;
+        std::string trsvcid;
+        std::string subnqn;
+    };
+#endif
+
     using SegmentID = uint64_t;
 
     struct SegmentDesc {
@@ -106,6 +117,10 @@ class TransferMetadata {
         std::string timestamp;
         // this is for ascend
         RankInfoDesc rank_info;
+#ifdef USE_NVMEOF_GENERIC
+        // this is for nvmeof_generic
+        NVMeoFGenericTrid nvmeof_generic_trid;
+#endif
 
         int tcp_data_port;
 

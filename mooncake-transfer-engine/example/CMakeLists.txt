@@ -22,3 +22,8 @@ if (USE_ASCEND_DIRECT)
     add_executable(transfer_engine_ascend_direct_perf transfer_engine_ascend_direct_perf.cpp)
     target_link_libraries(transfer_engine_ascend_direct_perf PUBLIC transfer_engine)
 endif()
+
+if (USE_NVMEOF_GENERIC)
+    add_executable(transfer_engine_nvmeof_generic_bench transfer_engine_nvmeof_generic_bench.cpp)
+    target_link_libraries(transfer_engine_nvmeof_generic_bench PUBLIC transfer_engine)
+endif()

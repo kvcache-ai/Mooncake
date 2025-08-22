@@ -54,3 +54,7 @@ if (USE_ASCEND OR USE_ASCEND_DIRECT)
     target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl adxl metadef)
   endif()
 endif()
+
+if (USE_NVMEOF_GENERIC)
+  target_link_libraries(transfer_engine PUBLIC nvmeof_generic_transport aio nvme)
+endif()
