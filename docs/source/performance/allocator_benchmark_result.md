@@ -1,4 +1,14 @@
-# Allocator Memory Utilization Benchmark
+# Allocator Performance
+
+We evaluated the performance of [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), the default memory allocator in Mooncake Store. This allocator is responsible for allocating memory from mounted segments to store the KV cache.
+
+In this context, the most important metric is **memory utilization**, defined as the ratio between the amount of memory that can be successfully allocated and the total available memory. A higher utilization means that more KV tensors can be cached, thereby accelerating LLM tasks. However, due to memory fragmentation, allocation may fail even when the allocated memory is well below the total available capacity.
+
+For the same allocator, memory utilization can vary significantly under different workloads. Therefore, we evaluated the allocator’s efficiency across a range of workloads.
+
+In particular, in the **LLM inference** scenario, once the model is fixed, the size of each KV vector is also fixed. This means memory utilization under **uniform allocation sizes** becomes especially important. However, the original OffsetAllocator has a limitation: when the allocation size is uniform but does not match any of OffsetAllocator’s predefined bin sizes, memory utilization can be suboptimal.
+
+To address this, we introduced targeted optimizations for uniform-size workloads on top of the original OffsetAllocator. As shown in our test results, the optimized version achieves **significant performance improvements** in such scenarios.
 
 ## Execution
 
@@ -11,7 +21,7 @@
 - alloc size: The size of each object
 - utilization ratio: The total allocated size / total space
 - time: time in nanoseconds for each object allocation
-- OffsetAllocator optimization: whether round up the allocated size to a bin size
+- OffsetAllocator optimization: round up the allocated size to a bin size.
 
 ### Uniform size, size equals power of 2
 
