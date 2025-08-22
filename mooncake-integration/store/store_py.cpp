@@ -78,7 +78,6 @@ class MooncakeStorePyWrapper {
         }
 
         try {
-            std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
             // Query object info first
             auto query_result = store_.client_->Query(key);
             if (!query_result) {
@@ -118,8 +117,7 @@ class MooncakeStorePyWrapper {
             allocateSlices(slices, replica, buffer_handle);
 
             // Get the object data
-            std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
-            auto get_result = store_.client_->Get(key, replica_list, slices, lease_timeout);
+            auto get_result = store_.client_->Get(key, query_result.value(), slices);
             if (!get_result) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Get failed for key: " << key;

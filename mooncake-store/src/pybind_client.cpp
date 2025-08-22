@@ -489,7 +489,6 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
     }
-    std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
 
     // Query the object info
     auto query_result = client_->Query(key);
@@ -529,8 +528,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     allocateSlices(slices, replica, buffer_handle);
 
     // Get the object data
-    std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
-    auto get_result = client_->Get(key, replica_list, slices, lease_timeout);
+    auto get_result = client_->Get(key, query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -695,8 +693,6 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
-
     // Step 1: Get object info
     auto query_result = client_->Query(key);
     if (!query_result) {
@@ -749,8 +745,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     }
 
     // Step 3: Read data directly into user buffer
-    std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
-    auto get_result = client_->Get(key, replica_list, slices, lease_timeout);
+    auto get_result = client_->Get(key, query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());

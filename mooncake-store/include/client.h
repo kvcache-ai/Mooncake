@@ -23,6 +23,20 @@ namespace mooncake {
 
 class PutOperation;
 
+class QueryResult {
+   public:
+    std::vector<Replica::Descriptor> replicas;
+    std::chrono::steady_clock::time_point lease_timeout;
+
+    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
+                std::chrono::steady_clock::time_point lease_timeout_param)
+        : replicas(std::move(replicas_param)), lease_timeout(lease_timeout_param) {}
+
+    bool IsLeaseExpired() const {
+        return std::chrono::steady_clock::now() >= lease_timeout;
+    }
+};
+
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
@@ -69,9 +83,9 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @return GetReplicaListResponse containing replicas and lease TTL, or ErrorCode indicating failure
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode indicating failure
      */
-    tl::expected<GetReplicaListResponse, ErrorCode> Query(
+    tl::expected<QueryResult, ErrorCode> Query(
         const std::string& object_key);
 
     tl::expected<
@@ -98,9 +112,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(
         const std::string& object_key,
-        const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<Slice>& slices,
-        std::chrono::steady_clock::time_point& lease_timeout);
+        const QueryResult& query_result,
+        std::vector<Slice>& slices);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects

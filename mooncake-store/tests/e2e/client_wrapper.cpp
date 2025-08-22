@@ -96,7 +96,6 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
 }
 
 ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
-    std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
     auto query_result = client_->Query(key);
     if (!query_result.has_value()) {
         return query_result.error();
@@ -113,8 +112,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     SliceGuard slice_guard(descriptors, allocator_);
 
     // Perform get operation
-    std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
-    auto get_result = client_->Get(key, replica_list, slice_guard.slices_, lease_timeout);
+    auto get_result = client_->Get(key, query_result.value(), slice_guard.slices_);
     ErrorCode error_code =
         get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {

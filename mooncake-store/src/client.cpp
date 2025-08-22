@@ -301,13 +301,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
-    std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
     auto query_result = Query(object_key);
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
-    std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
-    return Get(object_key, query_result.value().replicas, slices, lease_timeout);
+    return Get(object_key, query_result.value(), slices);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
@@ -365,10 +363,14 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<GetReplicaListResponse, ErrorCode> Client::Query(
+tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
-    return result;
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return QueryResult(std::move(result.value().replicas), start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -393,12 +395,11 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
 
 tl::expected<void, ErrorCode> Client::Get(
     const std::string& object_key,
-    const std::vector<Replica::Descriptor>& replica_list,
-    std::vector<Slice>& slices,
-    std::chrono::steady_clock::time_point& lease_timeout) {
+    const QueryResult& query_result,
+    std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -419,7 +420,7 @@ tl::expected<void, ErrorCode> Client::Get(
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
-    if (std::chrono::steady_clock::now() > lease_timeout) {
+    if (query_result.IsLeaseExpired()) {
         LOG(ERROR) << "lease_expired_before_data_transfer_completed key=" << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
