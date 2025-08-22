@@ -348,7 +348,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     // Verify replica list after PutEnd
     auto final_get_result = service_->GetReplicaList(key);
     EXPECT_TRUE(final_get_result.has_value());
-    replica_list = final_get_result.value();
+    replica_list = final_get_result.value().replicas;
     EXPECT_EQ(1, replica_list.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
@@ -393,7 +393,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     // Verify replica list after PutEnd
     auto get_result2 = service_->GetReplicaList(key);
     EXPECT_TRUE(get_result2.has_value());
-    replica_list = get_result2.value();
+    replica_list = get_result2.value().replicas;
     EXPECT_EQ(random_number, replica_list.size());
     for (int i = 0; i < random_number; ++i) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[i].status);
@@ -615,7 +615,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     // Test getting existing key
     auto get_result2 = service_->GetReplicaList(key);
     EXPECT_TRUE(get_result2.has_value());
-    auto replica_list_local = get_result2.value();
+    auto replica_list_local = get_result2.value().replicas;
     EXPECT_FALSE(replica_list_local.empty());
 }
 
@@ -1033,7 +1033,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Test GetReplicaList after completion
     auto get_result2 = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result2.has_value());
-    auto retrieved_replicas = get_result2.value();
+    auto retrieved_replicas = get_result2.value().replicas;
     ASSERT_EQ(num_replicas, retrieved_replicas.size());
 
     // Verify final state of all replicas
@@ -1078,7 +1078,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     // Verify object exists
     auto get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    auto retrieved_replicas = get_result.value();
+    auto retrieved_replicas = get_result.value().replicas;
     ASSERT_EQ(1, retrieved_replicas.size());
 
     // Unmount the segment
@@ -1416,7 +1416,7 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     // Verify two replicas exist and they are on distinct segments
     auto get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    auto replicas = get_result.value();
+    auto replicas = get_result.value().replicas;
     ASSERT_EQ(2u, replicas.size());
     std::unordered_set<std::string> seg_names;
     for (const auto& rep : replicas) {

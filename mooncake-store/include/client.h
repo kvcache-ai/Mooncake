@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
+#include <chrono>
 
 #include "client_metric.h"
 #include "ha_helper.h"
@@ -68,10 +69,9 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
+     * @return GetReplicaListResponse containing replicas and lease TTL, or ErrorCode indicating failure
      */
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
+    tl::expected<GetReplicaListResponse, ErrorCode> Query(
         const std::string& object_key);
 
     tl::expected<
@@ -93,12 +93,14 @@ class Client {
      * @param object_key Key of the object
      * @param replica_list Previously queried replica list
      * @param slices Vector of slices to store the data
+     * @param lease_timeout Lease timeout, data transfer must be completed before this time
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Get(
         const std::string& object_key,
         const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<Slice>& slices);
+        std::vector<Slice>& slices,
+        std::chrono::steady_clock::time_point& lease_timeout);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects

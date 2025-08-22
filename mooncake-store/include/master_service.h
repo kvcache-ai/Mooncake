@@ -22,6 +22,7 @@
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 // Forward declarations
@@ -119,7 +120,7 @@ class MasterService {
      * ready
      */
     auto GetReplicaList(std::string_view key)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Get list of replicas for a batch of objects

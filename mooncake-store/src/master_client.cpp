@@ -273,13 +273,13 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<GetReplicaListResponse, ErrorCode>
 MasterClient::GetReplicaList(const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             std::vector<Replica::Descriptor>>(object_key);
+                             GetReplicaListResponse>(object_key);
     timer.LogResponseExpected(result);
     return result;
 }

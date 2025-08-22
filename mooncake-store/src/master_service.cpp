@@ -314,7 +314,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 }
 
 auto MasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -339,7 +339,8 @@ auto MasterService::GetReplicaList(std::string_view key)
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
-    return replica_list;
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -348,7 +349,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
         results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(GetReplicaList(key));
+        results.emplace_back(GetReplicaList(key).value().replicas);
     }
     return results;
 }

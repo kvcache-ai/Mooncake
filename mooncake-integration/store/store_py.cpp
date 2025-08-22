@@ -78,6 +78,7 @@ class MooncakeStorePyWrapper {
         }
 
         try {
+            std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
             // Query object info first
             auto query_result = store_.client_->Query(key);
             if (!query_result) {
@@ -86,7 +87,7 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
 
-            auto replica_list = query_result.value();
+            std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
             if (replica_list.empty()) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(INFO) << "No replicas found for key: " << key;
@@ -117,7 +118,8 @@ class MooncakeStorePyWrapper {
             allocateSlices(slices, replica, buffer_handle);
 
             // Get the object data
-            auto get_result = store_.client_->Get(key, replica_list, slices);
+            std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
+            auto get_result = store_.client_->Get(key, replica_list, slices, lease_timeout);
             if (!get_result) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Get failed for key: " << key;

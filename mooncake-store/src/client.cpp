@@ -301,11 +301,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
+    std::chrono::steady_clock::time_point time_before_query = std::chrono::steady_clock::now();
     auto query_result = Query(object_key);
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
-    return Get(object_key, query_result.value(), slices);
+    std::chrono::steady_clock::time_point lease_timeout = time_before_query + std::chrono::milliseconds(query_result.value().lease_ttl_ms);
+    return Get(object_key, query_result.value().replicas, slices, lease_timeout);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
@@ -363,7 +365,7 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
+tl::expected<GetReplicaListResponse, ErrorCode> Client::Query(
     const std::string& object_key) {
     auto result = master_client_.GetReplicaList(object_key);
     return result;
@@ -392,7 +394,8 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
 tl::expected<void, ErrorCode> Client::Get(
     const std::string& object_key,
     const std::vector<Replica::Descriptor>& replica_list,
-    std::vector<Slice>& slices) {
+    std::vector<Slice>& slices,
+    std::chrono::steady_clock::time_point& lease_timeout) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
@@ -415,6 +418,10 @@ tl::expected<void, ErrorCode> Client::Get(
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
+    }
+    if (std::chrono::steady_clock::now() > lease_timeout) {
+        LOG(ERROR) << "lease_expired_before_data_transfer_completed key=" << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
 }

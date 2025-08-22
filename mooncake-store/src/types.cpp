@@ -26,6 +26,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::OBJECT_NOT_FOUND, "OBJECT_NOT_FOUND"},
         {ErrorCode::OBJECT_ALREADY_EXISTS, "OBJECT_ALREADY_EXISTS"},
         {ErrorCode::OBJECT_HAS_LEASE, "OBJECT_HAS_LEASE"},
+        {ErrorCode::LEASE_EXPIRED, "LEASE_EXPIRED"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
