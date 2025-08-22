@@ -300,4 +300,3 @@ Status HeterogeneousRdmaTransport::getTransferStatus(BatchID batch_id,
 }
 
 }  // namespace mooncake
-
