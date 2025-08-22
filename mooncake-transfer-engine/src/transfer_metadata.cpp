@@ -231,6 +231,18 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                    << desc.name << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
+
+    Json::Value fileBuffersJson(Json::arrayValue);
+    for (const auto &fileBuffer : desc.file_buffers) {
+        Json::Value bufferJSON;
+        bufferJSON["id"] = fileBuffer.id;
+        bufferJSON["path"] = fileBuffer.path;
+        bufferJSON["size"] = fileBuffer.size;
+        bufferJSON["align"] = fileBuffer.align;
+        fileBuffersJson.append(bufferJSON);
+    }
+    segmentJSON["file_buffers"] = fileBuffersJson;
+
     return 0;
 }
 
@@ -415,6 +427,16 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                    << " protocol " << desc->protocol;
         return nullptr;
     }
+
+    for (const auto &bufferJSON : segmentJSON["file_buffers"]) {
+        FileBufferDesc buffer;
+        buffer.id = bufferJSON["id"].asUInt();
+        buffer.path = bufferJSON["path"].asString();
+        buffer.size = bufferJSON["size"].asUInt64();
+        buffer.align = bufferJSON["align"].asUInt64();
+        desc->file_buffers.push_back(buffer);
+    }
+
     return desc;
 }
 
@@ -599,6 +621,38 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         }
     }
     if (addr_exist) {
+        if (update_metadata) return updateLocalSegmentDesc();
+        return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int TransferMetadata::addFileBuffer(const FileBufferDesc &buffer_desc,
+                                    bool update_metadata) {
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        segment_desc->file_buffers.push_back(buffer_desc);
+    }
+    if (update_metadata) return updateLocalSegmentDesc();
+    return 0;
+}
+
+int TransferMetadata::removeFileBuffer(FileBufferID id, bool update_metadata) {
+    bool buffer_exist = false;
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        for (auto iter = segment_desc->file_buffers.begin();
+             iter != segment_desc->file_buffers.end(); ++iter) {
+            if (iter->id == id) {
+                segment_desc->file_buffers.erase(iter);
+                buffer_exist = true;
+                break;
+            }
+        }
+    }
+    if (buffer_exist) {
         if (update_metadata) return updateLocalSegmentDesc();
         return 0;
     }

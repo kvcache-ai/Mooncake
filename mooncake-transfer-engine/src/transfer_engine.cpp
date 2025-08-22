@@ -287,6 +287,15 @@ Transport *TransferEngine::installTransport(const std::string &proto,
             entry.addr, entry.length, entry.location, entry.remote_accessible);
         if (ret < 0) return nullptr;
     }
+
+    if (transport->supportFileBuffer()) {
+        for (auto &file : local_files_) {
+            int ret = transport->registerLocalFile(
+                file.second.id, file.second.path, file.second.size);
+            if (ret < 0) return nullptr;
+        }
+    }
+
     return transport;
 }
 
@@ -433,6 +442,77 @@ int TransferEngine::unregisterLocalMemoryBatch(
             }
         }
     }
+    return 0;
+}
+
+bool TransferEngine::supportFileBuffer() {
+    bool supported = false;
+    for (auto &transport : multi_transports_->listTransports()) {
+        supported = supported || transport->supportFileBuffer();
+    }
+    return supported;
+}
+
+int TransferEngine::registerLocalFile(const std::string &path, size_t size,
+                                      FileBufferID &id) {
+    if (!supportFileBuffer()) {
+        LOG(ERROR) << "File buffers not suppotred";
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (local_files_.count(path) > 0) {
+        LOG(ERROR) << "Registering an already registered file: " << path;
+        return ERR_ADDRESS_OVERLAPPED;
+    }
+
+    const auto id_ = next_file_id_.fetch_add(1);
+
+    for (auto &transport : multi_transports_->listTransports()) {
+        if (!transport->supportFileBuffer()) {
+            continue;
+        }
+
+        int ret = transport->registerLocalFile(id_, path, size);
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to register file " << path << " to transport "
+                       << transport->getName() << ", ret=" << ret;
+            return ret;
+        }
+    }
+
+    local_files_[path] = {id_, path, size};
+    id = id_;
+    return 0;
+}
+
+int TransferEngine::unregisterLocalFile(const std::string &path) {
+    if (!supportFileBuffer()) {
+        LOG(ERROR) << "File buffers not suppotred";
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto it = local_files_.find(path);
+    if (it == local_files_.end()) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+    for (auto &transport : multi_transports_->listTransports()) {
+        if (!transport->supportFileBuffer()) {
+            continue;
+        }
+
+        int ret = transport->unregisterLocalFile(it->second.id);
+        if (ret != 0 && ret != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "Failed to unregister file " << path
+                       << " from transport " << transport->getName()
+                       << ", ret=" << ret;
+            return ret;
+        }
+    }
+
+    local_files_.erase(it);
     return 0;
 }
 

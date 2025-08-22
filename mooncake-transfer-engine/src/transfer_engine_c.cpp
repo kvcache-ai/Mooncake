@@ -117,6 +117,22 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
     return native->unregisterLocalMemoryBatch(native_addr_list);
 }
 
+bool supportFileBuffer(transfer_engine_t engine) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->supportFileBuffer();
+}
+
+int registerLocalFile(transfer_engine_t engine, const char *path, size_t size,
+                      file_id_t *id) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->registerLocalFile(path, size, *id);
+}
+
+int unregisterLocalFile(transfer_engine_t engine, const char *path) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->unregisterLocalFile(path);
+}
+
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
     TransferEngine *native = (TransferEngine *)engine;
     return (batch_id_t)native->allocateBatchID(batch_size);
@@ -132,6 +148,7 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
             (Transport::TransferRequest::OpCode)entries[index].opcode;
         native_entries[index].source = entries[index].source;
         native_entries[index].target_id = entries[index].target_id;
+        native_entries[index].file_id = entries[index].file_id;
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
     }

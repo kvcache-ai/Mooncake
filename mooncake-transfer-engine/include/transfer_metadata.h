@@ -64,6 +64,16 @@ class TransferMetadata {
         std::unordered_map<std::string, std::string> local_path_map;
     };
 
+    // Identify a single file in a segment's file buffers.
+    using FileBufferID = uint32_t;
+
+    struct FileBufferDesc {
+        FileBufferID id;
+        std::string path;
+        std::size_t size;
+        std::size_t align;  // For future usage.
+    };
+
     struct RankInfoDesc {
         uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
         std::string hostIp;
@@ -87,6 +97,8 @@ class TransferMetadata {
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        // Generic file buffers.
+        std::vector<FileBufferDesc> file_buffers;
         // this is for cxl.
         std::string cxl_name;
         uint64_t cxl_base_addr;
@@ -147,6 +159,10 @@ class TransferMetadata {
                              bool update_metadata);
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    int addFileBuffer(const FileBufferDesc &buffer_desc, bool update_metadata);
+
+    int removeFileBuffer(FileBufferID id, bool update_metadata);
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
