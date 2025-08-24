@@ -71,6 +71,8 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
     // TRANSFER
 
     Status submitTransfer(BatchID batch_id,

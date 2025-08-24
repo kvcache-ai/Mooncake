@@ -55,6 +55,8 @@ class TcpTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
    private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,

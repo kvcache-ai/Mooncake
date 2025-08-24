@@ -245,6 +245,11 @@ class Transport {
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
                                      TransferStatus &status) = 0;
 
+    /// @brief Close a segment handle.
+    /// @param handle The segment handle to close.
+    /// @return 0 on success, -1 on failure.
+    virtual int closeSegment(Transport::SegmentHandle handle) = 0;
+
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
     struct BufferEntry {

@@ -239,6 +239,10 @@ int NVMeoFTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return 0;
 }
 
+int NVMeoFTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
                                      uint64_t target_start,
                                      TransferRequest::OpCode op,
