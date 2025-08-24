@@ -56,12 +56,15 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 
     LOG_ASSERT(header_region_start_);
 
+    // Add a padding to base to support zero-based buffers.
+    auto padded_base = base + facebook::cachelib::Slab::kSize;
+
     // Initialize the CacheLib MemoryAllocator.
     memory_allocator_ = std::make_unique<facebook::cachelib::MemoryAllocator>(
         facebook::cachelib::MemoryAllocator::Config(
             facebook::cachelib::MemoryAllocator::generateAllocSizes()),
         reinterpret_cast<void*>(header_region_start_.get()),
-        header_region_size_, reinterpret_cast<void*>(base), size);
+        header_region_size_, reinterpret_cast<void*>(padded_base), size);
 
     if (!memory_allocator_) {
         LOG(ERROR) << "status=failed_to_init_facebook_memory_allocator";
@@ -88,6 +91,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
                          << " current_size=" << cur_size_;
             return nullptr;
         }
+
+        // Un-padding the buffer.
+        buffer = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(buffer) -
+                                         facebook::cachelib::Slab::kSize);
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;
@@ -106,7 +113,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(handle->buffer_ptr_);
+        auto buffer = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(handle->buffer_ptr_) +
+            facebook::cachelib::Slab::kSize);
+        memory_allocator_->free(buffer);
         handle->status = BufStatus::UNREGISTERED;
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
