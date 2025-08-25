@@ -9,6 +9,15 @@
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
   | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
+  <br />
+
+  [![Docs](https://img.shields.io/badge/docs-live-brightgreen)](https://kvcache-ai.github.io/Mooncake/)
+  [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI - Downloads](https://img.shields.io/pypi/dm/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
+  [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
+
 </div>
 <br/>
 
