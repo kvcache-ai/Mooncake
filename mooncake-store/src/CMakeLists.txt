@@ -23,6 +23,7 @@ set(MOONCAKE_STORE_SOURCES
     posix_file.cpp
     client_buffer.cpp
     pybind_client.cpp
+    http_metadata_server.cpp
 )
 
 set(EXTRA_LIBS "")
