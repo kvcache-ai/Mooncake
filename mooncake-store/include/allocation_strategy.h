@@ -1,9 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
 #include "types.h"
@@ -11,127 +15,241 @@
 namespace mooncake {
 
 /**
- * @brief Abstract interface for allocation strategy, responsible for choosing
- *        among multiple BufferAllocators.
+ * @brief Abstract interface for allocation strategy, responsible for
+ *        allocating multiple slices across multiple replicas using available
+ *        BufferAllocators.
+ *
+ * The allocation strategy follows best-effort semantics: if the requested
+ * number of replicas cannot be fully satisfied due to resource constraints,
+ * it will allocate as many replicas as possible rather than failing entirely.
+ * Only returns an error if no replicas can be allocated at all.
  */
 class AllocationStrategy {
    public:
     virtual ~AllocationStrategy() = default;
 
     /**
-     * @brief Given all mounted BufferAllocators and required object size,
-     *        the strategy can freely choose a suitable BufferAllocator.
+     * @brief Allocates multiple slices across the requested number of replicas
+     *        using best-effort semantics. Each replica will contain all
+     *        requested slices.
+     *
+     * The allocation follows best-effort semantics: if the full requested
+     * replica count cannot be satisfied, the method will allocate as many
+     * replicas as possible across different segments. For each slice, replicas
+     * are guaranteed to be placed on different segments to ensure redundancy.
+     *
      * @param allocators Container of mounted allocators
      * @param allocators_by_name Container of mounted allocators, key is
-     * segment_name, value is the corresponding allocator
-     * @param objectSize Size of object to be allocated
-     * @param config Replica configuration
-     * @return Selected allocator; returns nullptr if allocation is not possible
-     *         or no suitable allocator is found
+     *                          segment_name, value is the corresponding
+     *                          allocators
+     * @param slice_sizes Sizes of slices to be allocated in each replica
+     * @param config Replica configuration containing number of replicas and
+     *               placement constraints
+     * @return tl::expected<std::vector<Replica>, ErrorCode> containing
+     *         allocated replicas.
+     *         - On success: vector of allocated replicas (may be fewer than
+     *           requested due to resource constraints, but at least 1)
+     *         - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can
+     *           be allocated, ErrorCode::INVALID_PARAMS for invalid
+     *           configuration
      */
-    virtual std::unique_ptr<AllocatedBuffer> Allocate(
+    virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+        const std::vector<size_t>& slice_sizes,
+        const ReplicateConfig& config) = 0;
 };
 
 /**
- * @brief Random allocation strategy with local preference support.
+ * @brief Random batch allocation strategy with local preference and
+ *        replication guarantees support using best-effort semantics.
  *
- * This strategy first attempts to allocate from a preferred segment if
- * specified, then falls back to random allocation among all available
- * allocators.
+ * This strategy ensures that for each slice, its replicas are placed in
+ * different segments. Different slices may use the same segments.
+ *
+ * Best-effort behavior:
+ * - Attempts to allocate the requested number of replicas
+ * - If insufficient segments are available, allocates as many replicas as
+ *   possible (limited by the number of available segments)
+ * - Only fails if no replicas can be allocated at all
+ * - Preferred segment allocation is attempted first if specified
  */
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() : rng_(std::random_device{}()) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) override {
-        // Fast path: single allocator case
-        if (allocators.size() == 1) {
-            return allocators[0]->allocate(objectSize);
+        const std::vector<size_t>& slice_sizes, const ReplicateConfig& config) {
+        if (auto validation_error =
+                validateInput(slice_sizes, config.replica_num)) {
+            return tl::make_unexpected(*validation_error);
         }
 
-        // Try preferred segment first if specified
-        if (auto preferred_buffer =
-                TryPreferredAllocate(allocators_by_name, objectSize, config)) {
-            return preferred_buffer;
+        std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
+            replica_buffers(config.replica_num);
+        for (auto& replica_buffer : replica_buffers) {
+            replica_buffer.reserve(slice_sizes.size());
         }
 
-        // Fall back to random allocation among all eligible allocators
-        return TryRandomAllocate(allocators, objectSize);
+        // Track the actual number of replicas we can allocate
+        size_t actual_replica_count = config.replica_num;
+
+        // Allocate each slice across replicas
+        for (size_t slice_idx = 0; slice_idx < slice_sizes.size();
+             ++slice_idx) {
+            auto slice_replicas = allocateSlice(allocators, allocators_by_name,
+                                                slice_sizes[slice_idx],
+                                                actual_replica_count, config);
+
+            if (slice_replicas.empty()) {
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+
+            if (slice_replicas.size() < actual_replica_count) {
+                actual_replica_count = slice_replicas.size();
+                // NOTE: replica allocation is best effort
+                LOG(WARNING)
+                    << "Failed to allocate all replicas for slice " << slice_idx
+                    << ", reducing replica count to " << actual_replica_count;
+
+                // Resize replica_buffers to match the new count
+                replica_buffers.resize(actual_replica_count);
+            }
+
+            for (size_t replica_idx = 0; replica_idx < actual_replica_count;
+                 ++replica_idx) {
+                replica_buffers[replica_idx].push_back(
+                    std::move(slice_replicas[replica_idx]));
+            }
+        }
+
+        std::vector<Replica> replicas;
+        replicas.reserve(actual_replica_count);
+        for (size_t replica_idx = 0; replica_idx < actual_replica_count;
+             ++replica_idx) {
+            replicas.emplace_back(std::move(replica_buffers[replica_idx]),
+                                  ReplicaStatus::PROCESSING);
+        }
+
+        return replicas;
     }
 
    private:
     static constexpr size_t kMaxRetryLimit = 10;
+    std::mt19937 rng_;
 
-    std::mt19937 rng_;  // Mersenne Twister random number generator
-
-    /**
-     * @brief Attempts allocation from preferred segment if available and
-     * eligible
-     */
-    std::unique_ptr<AllocatedBuffer> TryPreferredAllocate(
-        const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-            allocators,
-        size_t objectSize, const ReplicateConfig& config) {
-        if (config.preferred_segment.empty()) {
-            return nullptr;
+    std::optional<ErrorCode> validateInput(
+        const std::vector<size_t>& slice_sizes, size_t replica_num) const {
+        if (replica_num == 0 || slice_sizes.empty() ||
+            std::count(slice_sizes.begin(), slice_sizes.end(), 0) > 0) {
+            return ErrorCode::INVALID_PARAMS;
         }
 
-        auto preferred_it = allocators.find(config.preferred_segment);
-        if (preferred_it == allocators.end()) {
-            return nullptr;
-        }
-
-        auto& preferred_allocators = preferred_it->second;
-        for (auto& allocator : preferred_allocators) {
-            auto buffer = allocator->allocate(objectSize);
-            if (buffer != nullptr) {
-                return buffer;
-            }
-        }
-
-        return nullptr;
+        return std::nullopt;
     }
 
     /**
-     * @brief Attempts allocation with random selection and retry logic
+     * @brief Allocates replicas for a single slice across different segments
      */
-    std::unique_ptr<AllocatedBuffer> TryRandomAllocate(
+    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        size_t objectSize) {
-        const size_t max_tries = std::min(kMaxRetryLimit, allocators.size());
+        const std::unordered_map<
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+            allocators_by_name,
+        size_t slice_size, size_t replica_num, const ReplicateConfig& config,
+        std::unordered_set<std::string>& used_segments) {
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+        buffers.reserve(replica_num);
 
-        std::vector<size_t> allocator_indices(allocators.size());
-        std::iota(allocator_indices.begin(), allocator_indices.end(), 0);
+        for (size_t i = 0; i < replica_num; ++i) {
+            auto buffer =
+                allocateSingleBuffer(allocators, allocators_by_name, slice_size,
+                                     config, used_segments);
 
-        for (size_t try_count = 0; try_count < max_tries; ++try_count) {
-            // Randomly select an allocator
-            std::uniform_int_distribution<size_t> dist(
-                0, allocator_indices.size() - 1);
-            const size_t random_index = allocator_indices[dist(rng_)];
+            if (!buffer) {
+                break;
+            }
 
-            auto& allocator = allocators[random_index];
-            if (auto buffer = allocator->allocate(objectSize)) {
+            used_segments.insert(buffer->getSegmentName());
+            buffers.push_back(std::move(buffer));
+        }
+
+        return buffers;
+    }
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+            allocators_by_name,
+        size_t slice_size, size_t replica_num, const ReplicateConfig& config) {
+        std::unordered_set<std::string> empty_segments;
+        return allocateSlice(allocators, allocators_by_name, slice_size,
+                             replica_num, config, empty_segments);
+    }
+
+    /**
+     * @brief Allocates a single buffer respecting preferences and exclusions
+     */
+    std::unique_ptr<AllocatedBuffer> allocateSingleBuffer(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<
+            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
+            allocators_by_name,
+        size_t size, const ReplicateConfig& config,
+        const std::unordered_set<std::string>& excluded_segments) {
+        // Try preferred segment first
+        if (!config.preferred_segment.empty() &&
+            !excluded_segments.contains(config.preferred_segment)) {
+            auto preferred_it =
+                allocators_by_name.find(config.preferred_segment);
+            if (preferred_it != allocators_by_name.end()) {
+                for (auto& allocator : preferred_it->second) {
+                    if (auto buffer = allocator->allocate(size)) {
+                        return buffer;
+                    }
+                }
+            }
+        }
+
+        return tryRandomAllocate(allocators, size, excluded_segments);
+    }
+
+    /**
+     * @brief Attempts allocation with random selection
+     */
+    std::unique_ptr<AllocatedBuffer> tryRandomAllocate(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        size_t size, const std::unordered_set<std::string>& excluded_segments) {
+        std::vector<size_t> eligible_indices;
+        eligible_indices.reserve(allocators.size());
+        for (size_t i = 0; i < allocators.size(); ++i) {
+            if (!excluded_segments.contains(allocators[i]->getSegmentName())) {
+                eligible_indices.push_back(i);
+            }
+        }
+
+        if (eligible_indices.empty()) {
+            return nullptr;
+        }
+
+        std::shuffle(eligible_indices.begin(), eligible_indices.end(), rng_);
+
+        const size_t max_tries =
+            std::min(kMaxRetryLimit, eligible_indices.size());
+        for (size_t i = 0; i < max_tries; ++i) {
+            auto& allocator = allocators[eligible_indices[i]];
+            if (auto buffer = allocator->allocate(size)) {
                 return buffer;
             }
-
-            // Remove failed allocator and continue with remaining ones
-            if (random_index + 1 != allocator_indices.size()) {
-                std::swap(allocator_indices[random_index],
-                          allocator_indices[allocator_indices.size() - 1]);
-            }
-            allocator_indices.pop_back();
         }
+
         return nullptr;
     }
 };
