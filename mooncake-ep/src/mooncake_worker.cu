@@ -174,26 +174,25 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
+    TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
-    int taskId = taskCount % kNumTasks_;
+    int taskId = buffer_->cpuTaskCount_ % kNumTasks_;
     TORCH_CHECK(!tasks_[taskId].active);
 
     tasks_[taskId].opType = opType;
     tasks_[taskId].tensorSize = tensorSize;
     tasks_[taskId].broadcastRoot = broadcastRoot;
-    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
+    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
 
     hasCallback_[taskId] = true;
-    callbacks_[taskId] = [this, bufferToTensor, future] {
-        bufferToTensor(
-            (void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
-        ++taskCount;
+    callbacks_[taskId] = [this, bufferToTensor, taskId, future] {
+        bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
         future->markCompleted(c10::IValue());
     };
 
     tasks_[taskId].active = true;
+    ++buffer_->cpuTaskCount_;
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
@@ -201,15 +200,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * size_ < (1u << 29), "Too large!");
-    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskCount % 2].addr);
+    TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
+    int taskId = buffer_->cudaTaskCount_ % kNumTasks_;
+    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, tasks_device_, size_,
-        brokenRanksDevice_, brokenRanksTensor_.data_ptr<int>(),
-        taskCount % kNumTasks_);
-    bufferToTensor(
-        (void*)segment_descs_[rank_]->buffers[2 + taskCount % 2].addr);
-    ++taskCount;
+        brokenRanksDevice_, brokenRanksTensor_.data_ptr<int>(), taskId);
+    bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
+    ++buffer_->cudaTaskCount_;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     cudaEventRecord(event, stream);

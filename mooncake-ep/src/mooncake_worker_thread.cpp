@@ -26,7 +26,6 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
-        int taskCount = 0;
         while (true) {
             _mm_pause();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -52,7 +51,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             continue;
                         }
                         uint64_t source =
-                            segment_descs_[rank_]->buffers[taskCount % 2].addr;
+                            segment_descs_[rank_]->buffers[i].addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
@@ -67,7 +66,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 break;
                         }
                         uint64_t target_offset =
-                            segment_descs_[j]->buffers[2 + taskCount % 2].addr;
+                            segment_descs_[j]->buffers[2 + i].addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                                 break;
@@ -122,9 +121,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     if (!batch_done) {
                         continue;
                     }
-                    auto source_ptr = (int32_t *)segment_descs_[rank_]
-                                          ->buffers[4 + taskCount % 2]
-                                          .addr;
+                    auto source_ptr =
+                        (int32_t *)segment_descs_[rank_]->buffers[4 + i].addr;
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < size_; ++j) {
                         if (brokenRanks_[j]) {
@@ -135,10 +133,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             .opcode = TransferRequest::WRITE,
                             .source = (void *)source_ptr,
                             .target_id = segment_ids_[j],
-                            .target_offset = segment_descs_[j]
-                                                 ->buffers[6 + taskCount % 2]
-                                                 .addr +
-                                             rank_ * sizeof(int32_t),
+                            .target_offset =
+                                segment_descs_[j]->buffers[6 + i].addr +
+                                rank_ * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                     }
@@ -148,9 +145,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
-                    auto signal_ptr = (int32_t *)segment_descs_[rank_]
-                                          ->buffers[6 + taskCount % 2]
-                                          .addr;
+                    auto signal_ptr =
+                        (int32_t *)segment_descs_[rank_]->buffers[6 + i].addr;
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::seconds>(
@@ -178,7 +174,6 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         }
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
-                        ++taskCount;
                         if (hasCallback_[i]) {
                             callbacks_[i]();
                         }

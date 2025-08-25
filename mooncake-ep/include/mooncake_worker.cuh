@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mooncake_backend_buffer.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
@@ -43,11 +44,12 @@ class MooncakeWorker {
 
     void initWorker(const std::vector<std::string>& server_names);
 
+    void setBackendBuffer(BackendBuffer* buffer) { buffer_ = buffer; }
+
     bool* getBrokenRanks() { return brokenRanks_; }
 
    private:
     static constexpr size_t kNumTasks_ = 2;
-    static constexpr size_t kMaxNumRanks = 64;
 
     Task *tasks_, *tasks_device_;
     bool *brokenRanks_, *brokenRanksDevice_;
@@ -55,13 +57,12 @@ class MooncakeWorker {
     std::function<void()> callbacks_[kNumTasks_]{};
 
     int rank_, size_;
+    BackendBuffer* buffer_ = nullptr;
     at::Tensor brokenRanksTensor_;
 
     TransferEngine* engine_;
     std::vector<TransferMetadata::SegmentID> segment_ids_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segment_descs_;
-
-    int taskCount = 0;
 };
 
 }  // namespace mooncake
