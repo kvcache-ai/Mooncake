@@ -10,6 +10,7 @@
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
   | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
   <br />
+  <br />
 
   [![Docs](https://img.shields.io/badge/docs-live-brightgreen)](https://kvcache-ai.github.io/Mooncake/)
   [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
