@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <queue>
 #include <shared_mutex>
 #include <regex>
 #include <ylt/util/tl/expected.hpp>

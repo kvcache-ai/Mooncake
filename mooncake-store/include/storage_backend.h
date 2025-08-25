@@ -1,14 +1,13 @@
 #pragma once
 
+#include <glog/logging.h>
+
 #include <string>
 #include <vector>
-#include <mutex>
-#include <fstream>
-#include <types.h>
-#include <file_interface.h>
 #include <filesystem>
-#include <thread>
-#include <chrono>
+
+#include "types.h"
+#include "file_interface.h"
 
 namespace mooncake {
 /**

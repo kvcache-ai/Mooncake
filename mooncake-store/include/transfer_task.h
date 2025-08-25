@@ -16,6 +16,7 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "types.h"
+#include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 
