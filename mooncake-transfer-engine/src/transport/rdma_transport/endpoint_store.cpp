@@ -160,7 +160,7 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
     while (this->getSize() >= max_size_) evictEndpoint();
 
     endpoint->setPeerNicPath(peer_nic_path);
-    endpoint_map_[peer_nic_path] = std::make_pair(endpoint, false);
+    endpoint_map_[peer_nic_path] = std::make_pair(endpoint, true);
     fifo_list_.push_front(peer_nic_path);
     fifo_map_[peer_nic_path] = fifo_list_.begin();
     return endpoint;
