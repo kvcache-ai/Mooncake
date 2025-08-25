@@ -1,6 +1,6 @@
 #pragma once
 
-#include "configs.cuh"
+#include <mooncake_ep_configs.cuh>
 
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \

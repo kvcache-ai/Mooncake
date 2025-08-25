@@ -100,6 +100,7 @@ python -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libcurl.so* \
 --exclude libibverbs.so* \
+--exclude libmlx5.so* \
 --exclude libnuma.so* \
 --exclude libstdc++.so* \
 --exclude libgcc_s.so* \

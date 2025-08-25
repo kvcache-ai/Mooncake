@@ -1,18 +1,20 @@
+#ifndef MOONCAKE_EP_BUFFER_H
+#define MOONCAKE_EP_BUFFER_H
+
+
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <fstream>
-#include <pybind11/functional.h>
-#include <torch/python.h>
+#include <mooncake_ibgda/memheap.h>
+#include <mooncake_ibgda/mlx5gda.h>
+#include <mooncake_ep_api.cuh>
+#include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_event.h>
+#include <mooncake_ep_exception.cuh>
+#include <torch/torch.h>
 
-#include "api.cuh"
-#include "event.hpp"
-#include "exception.cuh"
-#include "memheap.h"
-#include "mlx5gda.h"
-
-#ifndef TORCH_EXTENSION_NAME
-#define TORCH_EXTENSION_NAME mxa_ep_cpp
-#endif
-
-namespace mxa_ep {
+namespace mooncake {
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
@@ -68,7 +70,7 @@ struct BufferPair {
     }
 };
 
-struct Buffer {
+struct MooncakeEpBuffer {
    private:
     // Device info and communication
     int device_id;
@@ -98,7 +100,7 @@ struct Buffer {
     void* workspace = nullptr;
 
    public:
-    Buffer(int rank, int num_ranks, int64_t num_mxa_bytes,
+    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes,
            size_t bytes_reserved)
         : rank(rank),
           num_ranks(num_ranks),
@@ -122,7 +124,7 @@ struct Buffer {
             cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
     }
 
-    ~Buffer() noexcept(false) {
+    ~MooncakeEpBuffer() noexcept(false) {
         cudaFree(gdr_buffer);
         cudaFree(raddrs);
         cudaFree(rkeys);
@@ -207,7 +209,7 @@ struct Buffer {
         auto launcher = [=](int phases) {
             cudaMemsetAsync(buffer.cuda_counter_buffer, 0,
                             num_experts * sizeof(int), launch_stream);
-            mxa_ep::dispatch(
+            mooncake::dispatch(
                 packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                 packed_recv_src_info.data_ptr<int>(),
                 packed_recv_layout_range.data_ptr<int64_t>(),
@@ -323,7 +325,7 @@ struct Buffer {
 
         // Kernel launch
         auto launcher = [=](int phases) {
-            mxa_ep::combine(
+            mooncake::combine(
                 combined_x.data_ptr(), gathered_experts.data_ptr<int32_t>(),
                 gdr_buffer, buffer.rdma_send_signal_buffer,
                 buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
@@ -390,7 +392,7 @@ struct Buffer {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         cudaMemsetAsync(mxa_buffer, 0, (1 + size) * num_ranks * sizeof(int),
                         stream);
-        mxa_ep::all_reduce_without(broken_nodes.data_ptr<int32_t>(),
+        mooncake::all_reduce_without(broken_nodes.data_ptr<int32_t>(),
                                    x.data_ptr<int>(), mxa_buffer, raddrs, rkeys,
                                    qp_devctxs, size, rank, num_ranks, stream);
     }
@@ -560,7 +562,7 @@ struct Buffer {
     }
 };
 
-size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
+inline size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
                          int num_ranks, int num_experts,
                          size_t bytes_reserved) {
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
@@ -568,27 +570,6 @@ size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
         .total_bytes;
 }
 
-}  // namespace mxa_ep
+}  // namespace mooncake
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "MXA-EP: Expert parallelism with MXA";
-
-    m.def("get_mxa_size_hint", &mxa_ep::get_mxa_size_hint);
-
-    pybind11::class_<mxa_ep::EventHandle>(m, "EventHandle")
-        .def(pybind11::init<>())
-        .def("current_stream_wait", &mxa_ep::EventHandle::current_stream_wait);
-
-    pybind11::class_<mxa_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, size_t>())
-        .def("sync", &mxa_ep::Buffer::sync)
-        .def("get_mr_info", &mxa_ep::Buffer::get_mr_info)
-        .def("get_gid", &mxa_ep::Buffer::get_gid)
-        .def("get_local_qpns", &mxa_ep::Buffer::get_local_qpns)
-        .def("get_local_lids", &mxa_ep::Buffer::get_local_lids)
-        .def("all_reduce_without", &mxa_ep::Buffer::all_reduce_without)
-        .def("dispatch", &mxa_ep::Buffer::dispatch)
-        .def("combine", &mxa_ep::Buffer::combine)
-        .def("get_next_combine_buffer",
-             &mxa_ep::Buffer::get_next_combine_buffer);
-}
+#endif //MOONCAKE_EP_BUFFER_H

@@ -1,2 +1,0 @@
-[files]
-extend-exclude = ["mooncake-ep/csrc/*.h"]

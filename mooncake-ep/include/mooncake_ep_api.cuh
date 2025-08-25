@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-namespace mxa_ep {
+namespace mooncake {
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -35,4 +35,4 @@ void all_reduce_without(const int32_t* broken_nodes, int* x, int* mxa_buffer,
                         int num_experts, int rank, int num_ranks,
                         cudaStream_t stream);
 
-}  // namespace mxa_ep
+}  // namespace mooncake

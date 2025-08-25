@@ -2,15 +2,15 @@
 #include <cstdio>
 #include <cuda/atomic>
 
-#include "configs.cuh"
-#include "exception.cuh"
-#include "launch.cuh"
-#include "mlx5gda.h"
-#include "utils.cuh"
+#include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_exception.cuh>
+#include <mooncake_ep_launch.cuh>
+#include <mooncake_ibgda/mlx5gda.h>
+#include <mooncake_ep_utils.cuh>
 
 #define TIMEOUT_TICKS 100000000000l
 
-namespace mxa_ep {
+namespace mooncake {
 
 static __device__ void device_mutex_lock_system(uint32_t *mutex) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(*mutex);
@@ -816,4 +816,4 @@ void all_reduce_without(const int32_t* broken_nodes, int* x, int* mxa_buffer,
     all_reduce_kernel_without<<<1, 256, 0, stream>>>(broken_nodes, x, mxa_buffer, raddrs, rkeys, qp_devctxs, size, rank, num_ranks);
 }
 
-}
+} // namespace mooncake

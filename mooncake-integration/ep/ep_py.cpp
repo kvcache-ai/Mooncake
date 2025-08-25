@@ -1,8 +1,10 @@
 
 #include <mooncake_backend.h>
+#include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
+#include <pybind11/functional.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
 #include <torch/torch.h>
@@ -56,6 +58,25 @@ PYBIND11_MODULE(ep, m) {
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>,
                c10d::Backend::Options>(m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("broken_ranks"));
+
+    m.def("get_mxa_size_hint", &get_mxa_size_hint);
+
+    py::class_<EventHandle>(m, "EventHandle")
+        .def(py::init<>())
+        .def("current_stream_wait", &EventHandle::current_stream_wait);
+
+    py::class_<MooncakeEpBuffer>(m, "Buffer")
+        .def(py::init<int, int, int64_t, size_t>())
+        .def("sync", &MooncakeEpBuffer::sync)
+        .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
+        .def("get_gid", &MooncakeEpBuffer::get_gid)
+        .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
+        .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
+        .def("all_reduce_without", &MooncakeEpBuffer::all_reduce_without)
+        .def("dispatch", &MooncakeEpBuffer::dispatch)
+        .def("combine", &MooncakeEpBuffer::combine)
+        .def("get_next_combine_buffer",
+             &MooncakeEpBuffer::get_next_combine_buffer);
 }
 
 }  // namespace mooncake

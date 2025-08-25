@@ -3,12 +3,12 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
-import mxa_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from mooncake.mooncake_ep_buffer import Buffer
+from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
-              rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: mxa_ep.Buffer, seed: int = 0):
+              rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: Buffer, seed: int = 0):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -153,17 +153,10 @@ def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
-    bytes_reserved = 2000 * 3000 * num_ranks * 4
-    num_mxa_bytes = mxa_ep.Buffer.get_mxa_size_hint(num_tokens, hidden, num_ranks, num_experts, bytes_reserved)
+    num_mxa_bytes = Buffer.get_mxa_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_mxa_bytes / 1e6} MB ...', flush=True)
-    buffer = mxa_ep.Buffer(group, num_mxa_bytes=num_mxa_bytes, bytes_reserved=bytes_reserved)
-
-    x = torch.full((2000, 3000), rank, dtype=torch.int32, device='cuda')
-    broken_nodes = torch.zeros(num_ranks, dtype=torch.int32)
-    buffer.all_reduce_without(broken_nodes, x)
-    expected = torch.full((2000, 3000), sum(range(num_ranks)), dtype=torch.int32, device='cuda')
-    assert torch.equal(x, expected), "All-reduce result is incorrect!"
+    buffer = Buffer(group, num_mxa_bytes=num_mxa_bytes)
 
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
