@@ -184,8 +184,8 @@ notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
         (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
     memset(notifies, 0, *size * sizeof(notify_msg_t));
     for (int i = 0; i < *size; i++) {
-        notifies[i].name = new char[notifies_desc[i].name.size() + 1];
-        notifies[i].msg = new char[notifies_desc[i].notify_msg.size() + 1];
+        notifies[i].name = malloc(notifies_desc[i].name.size() + 1);
+        notifies[i].msg = malloc(notifies_desc[i].notify_msg.size() + 1);
         if (!notifies[i].name || !notifies[i].msg) {
             freeNotifsMsgBuf(notifies, *size);
             return nullptr;
