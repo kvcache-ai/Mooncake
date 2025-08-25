@@ -57,6 +57,7 @@ echo "Running CLI entry point tests..."
 python test_cli.py
 
 killall mooncake_http_metadata_server
+killall mooncake_master
 mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
 MASTER_PID=$!
 sleep 1
