@@ -201,6 +201,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
+    printf("[%d] opType = %d, buffer_->cudaTaskCount_ = %d\n", rank_, opType, buffer_->cudaTaskCount_);
     int taskId = buffer_->cudaTaskCount_ % kNumTasks_;
     tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
     enqueueTaskKernel<<<1, 1, 0, stream>>>(

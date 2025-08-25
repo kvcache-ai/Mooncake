@@ -113,9 +113,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 }
                             }
                         } else {
-                            LOG(ERROR) << "Rank " << rank_
-                                       << " timeout during transferring op "
-                                       << (int)task.opType;
+                        printf("[%d] Timeout during transferring op %d\n", rank_, task.opType);
                         }
                     }
                     if (!batch_done) {
@@ -151,7 +149,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     auto diff =
                         std::chrono::duration_cast<std::chrono::seconds>(
                             now - activeTime[i]);
-                    if (diff.count() < 40) {
+                    if (diff.count() < 40 ||
+                        task.opType == c10d::OpType::BARRIER) {
                         for (int j = 0; j < size_; ++j) {
                             if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
                                 all_received = false;
@@ -159,9 +158,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             }
                         }
                     } else {
-                        LOG(ERROR)
-                            << "Rank " << rank_ << " timeout during syncing op "
-                            << (int)task.opType;
+                        printf("[%d] Timeout during syncing op %d\n", rank_, task.opType);
                         for (int j = 0; j < size_; ++j) {
                             if (signal_ptr[j] != 1) {
                                 brokenRanks_[j] = true;
