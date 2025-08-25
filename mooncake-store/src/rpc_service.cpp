@@ -80,10 +80,11 @@ void WrappedMasterService::init_http_server() {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             if (get_result) {
                 std::string ss = "";
-                for (size_t i = 0; i < get_result.value().size(); i++) {
-                    if (get_result.value()[i].is_memory_replica()) {
+                const std::vector<Replica::Descriptor>& replicas = get_result.value().replicas;
+                for (size_t i = 0; i < replicas.size(); i++) {
+                    if (replicas[i].is_memory_replica()) {
                         auto& memory_descriptors =
-                            get_result.value()[i].get_memory_descriptor();
+                            replicas[i].get_memory_descriptor();
                         for (const auto& handle :
                              memory_descriptors.buffer_descriptors) {
                             std::string tmp = "";
@@ -230,7 +231,7 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
         });
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key) {
     return execute_rpc(
         "GetReplicaList", [&] { return master_service_.GetReplicaList(key); },
@@ -255,7 +256,7 @@ WrappedMasterService::BatchGetReplicaList(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.GetReplicaList(key));
+        results.emplace_back(master_service_.GetReplicaList(key).value().replicas);
     }
 
     size_t failure_count = 0;

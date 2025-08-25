@@ -464,7 +464,7 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
         return tl::unexpected(query_result.error());
     }
 
-    auto replica_list = query_result.value();
+    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
@@ -501,7 +501,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
         return nullptr;
     }
 
-    auto replica_list = query_result.value();
+    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
         return nullptr;
@@ -528,7 +528,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     allocateSlices(slices, replica, buffer_handle);
 
     // Get the object data
-    auto get_result = client_->Get(key, replica_list, slices);
+    auto get_result = client_->Get(key, query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -705,7 +705,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(query_result.error());
     }
 
-    auto replica_list = query_result.value();
+    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
 
     // Calculate total size from replica list
     if (replica_list.empty()) {
@@ -745,7 +745,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     }
 
     // Step 3: Read data directly into user buffer
-    auto get_result = client_->Get(key, replica_list, slices);
+    auto get_result = client_->Get(key, query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());

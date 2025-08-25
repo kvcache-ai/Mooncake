@@ -287,7 +287,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     for (size_t i = 0; i < kNumShards; ++i) {
         MutexLocker lock(&metadata_shards_[i].mutex);
 
-        for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
+        for (auto& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 replica_list.reserve(metadata.replicas.size());
@@ -304,6 +304,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
+                metadata.GrantLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
             }
         }
     }
@@ -312,7 +314,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 }
 
 auto MasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -337,7 +339,8 @@ auto MasterService::GetReplicaList(std::string_view key)
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
-    return replica_list;
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -346,7 +349,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
         results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(GetReplicaList(key));
+        results.emplace_back(GetReplicaList(key).value().replicas);
     }
     return results;
 }

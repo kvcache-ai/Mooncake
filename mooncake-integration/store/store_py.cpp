@@ -86,7 +86,7 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
 
-            auto replica_list = query_result.value();
+            std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
             if (replica_list.empty()) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(INFO) << "No replicas found for key: " << key;
@@ -117,7 +117,7 @@ class MooncakeStorePyWrapper {
             allocateSlices(slices, replica, buffer_handle);
 
             // Get the object data
-            auto get_result = store_.client_->Get(key, replica_list, slices);
+            auto get_result = store_.client_->Get(key, query_result.value(), slices);
             if (!get_result) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Get failed for key: " << key;

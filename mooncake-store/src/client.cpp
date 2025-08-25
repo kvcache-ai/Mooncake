@@ -363,10 +363,14 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
+tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
-    return result;
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return QueryResult(std::move(result.value().replicas), start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -391,11 +395,11 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
 
 tl::expected<void, ErrorCode> Client::Get(
     const std::string& object_key,
-    const std::vector<Replica::Descriptor>& replica_list,
+    const QueryResult& query_result,
     std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -415,6 +419,10 @@ tl::expected<void, ErrorCode> Client::Get(
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
+    }
+    if (query_result.IsLeaseExpired()) {
+        LOG(ERROR) << "lease_expired_before_data_transfer_completed key=" << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
 }

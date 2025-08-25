@@ -101,7 +101,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
         return query_result.error();
     }
 
-    auto replica_list = query_result.value();
+    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
     if (replica_list.empty()) {
         return ErrorCode::OBJECT_NOT_FOUND;
     }
@@ -112,7 +112,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     SliceGuard slice_guard(descriptors, allocator_);
 
     // Perform get operation
-    auto get_result = client_->Get(key, replica_list, slice_guard.slices_);
+    auto get_result = client_->Get(key, query_result.value(), slice_guard.slices_);
     ErrorCode error_code =
         get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {

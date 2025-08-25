@@ -297,7 +297,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
         << "Query operation failed: " << toString(query_result.error());
-    auto replica_list = query_result.value();
+    auto replica_list = query_result.value().replicas;
     ASSERT_EQ(replica_list.size(), 1);
     ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(),
               1);
@@ -307,7 +307,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
                   .segment_name_,
               "localhost:17812");
 
-    auto get_result = test_client_->Get(key, replica_list, slices);
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);

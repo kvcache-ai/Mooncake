@@ -9,6 +9,7 @@
 
 #include "master_service.h"
 #include "types.h"
+#include "rpc_types.h"
 #include "master_config.h"
 
 namespace mooncake {
@@ -33,7 +34,7 @@ class WrappedMasterService {
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
