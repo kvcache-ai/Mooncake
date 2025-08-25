@@ -113,6 +113,23 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
 
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+用于删除与正则表达式匹配的所有 key 对应的对象。其余能力类似 Remove。
+
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+用于查询与正则表达式匹配的所有 key 对应的对象。
+
 ### Master Service
 
 将集群中所有可用的资源看做一个巨大的资源池，由一个中心化的 Master 进程进行空间分配，并指导实现数据复制（**注意 Master Service 不接管任何的数据流，只是提供对应的元数据信息**）。
@@ -154,6 +171,9 @@ service MasterService {
   // 获取对象的副本列表
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // 获取与正则表达式匹配的对性的副本列表
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
   // 开始 Put 操作，分配存储空间
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -162,6 +182,9 @@ service MasterService {
 
   // 删除对象的所有副本
   rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // 删除与正则表达式匹配的对性的所有副本
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
   // 存储节点(Client)注册存储段
   rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
@@ -189,7 +212,29 @@ message GetReplicaListResponse {
 
 说明: 用于获取指定 key 的所有可用副本的信息。Client 可以根据这些信息选择合适的副本进行读取。
 
-2. PutStart
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // 匹配到的对象及其副本信息
+};
+```
+
+* 请求: GetReplicaListByRegexRequest，包含需要匹配的正则表达式 key_regex。
+* 响应: GetReplicaListByRegexResponse，包含状态码 status_code 和一个 object_map，该 map 的键是匹配成功的对象 key，值是该 key 对应的副本信息列表。
+
+说明: 用于查询与指定正则表达式匹配的所有 key 及其副本信息。该接口方便进行批量查询和管理。
+
+3. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -210,7 +255,7 @@ message PutStartResponse {
 
 说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
 
-3. PutEnd
+4. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -227,7 +272,7 @@ message PutEndResponse {
 
 Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master Service` 将更新对象的元数据信息，将副本状态标记为 COMPLETE，表示该对象可以被读取。
 
-4. Remove
+5. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -244,7 +289,25 @@ message RemoveResponse {
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
-5. MountSegment
+6. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // 被删除的对象数量
+};
+```
+
+* 请求: RemoveByRegexRequest，包含需要匹配的正则表达式 key_regex。
+* 响应: RemoveByRegexResponse，包含状态码 status_code 和被删除对象的数量 removed_count。
+
+说明: 用于删除与指定正则表达式匹配的所有对象及其全部副本。与 Remove 接口类似，这是一个元数据操作，Master Service 将所有匹配对象的副本状态标记为删除。
+
+7. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -260,7 +323,7 @@ message MountSegmentResponse {
 
 存储节点(Client)自己分配一段内存，然后在调用`TransferEngine::registerLoalMemory` 完成本地挂载后，调用该接口，将分配好的一段连续的地址空间挂载到`Master Service`用于分配。
 
-6. UnmountSegment
+8. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
