@@ -537,6 +537,35 @@ struct ReplicateConfig {
 #### 3FS USRBIO 插件
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
+### 内置元数据服务器
+
+Mooncake Store 提供了内置的 HTTP 元数据服务器作为 etcd 的替代方案，用于存储集群元数据。此功能特别适用于开发环境或 etcd 不可用的场景。
+
+#### 配置参数
+
+HTTP 元数据服务器可通过以下参数进行配置：
+
+- **`enable_http_metadata_server`**（布尔值，默认值：`false`）：启用内置的 HTTP 元数据服务器以替代 etcd。当设置为 `true` 时，主服务将启动一个嵌入式 HTTP 服务器来处理元数据操作。
+
+- **`http_metadata_server_port`**（整型，默认值：`8080`）：指定 HTTP 元数据服务器监听的 TCP 端口。该端口必须可用且不能与其他服务冲突。
+
+- **`http_metadata_server_host`**（字符串，默认值：`"0.0.0.0"`）：指定 HTTP 元数据服务器绑定的主机地址。使用 `"0.0.0.0"` 可监听所有可用网络接口，或指定特定 IP 地址以提高安全性。
+
+#### 使用示例
+
+要使用启用了 HTTP 元数据服务器的主服务，请运行：
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+    --enable_http_metadata_server=true \
+    --http_metadata_server_port=8080 \
+    --http_metadata_server_host=0.0.0.0
+```
+
+启用后，HTTP 元数据服务器将自动启动并为 Mooncake Store 集群提供元数据服务。这消除了对外部 etcd 部署的需求，简化了开发和测试环境的设置过程。
+
+请注意，HTTP 元数据服务器专为单节点部署设计，不提供 etcd 所具备的高可用性功能。对于需要高可用性的生产环境，仍推荐使用 etcd。
+
 ## Mooncake Store Python API
 
 **完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)

@@ -56,5 +56,15 @@ fi
 echo "Running CLI entry point tests..."
 python test_cli.py
 
+killall mooncake_http_metadata_server
+killall mooncake_master
+mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
+MASTER_PID=$!
+sleep 1
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
+sleep 1
+kill $MASTER_PID || true
+
+
 echo "All tests completed successfully!"
 cd ../..
