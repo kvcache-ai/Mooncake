@@ -183,20 +183,26 @@ class TestInstance:
 
         # Setup store
         protocol = self.args.protocol
-        device_name = self.args.device_name
+        protocol_args = self.args.protocol_args
         local_hostname = self.args.local_hostname
         metadata_server = self.args.metadata_server
-        global_segment_size = self.args.global_segment_size * 1024 * 1024
         local_buffer_size = self.args.local_buffer_size * 1024 * 1024
         master_server_address = self.args.master_server
 
         logger.info(f"Setting up {self.args.role} instance with batch_size={self.args.batch_size}")
-        logger.info(f"  Protocol: {protocol}, Device: {device_name}")
-        logger.info(f"  Global segment: {global_segment_size // (1024*1024)} MB")
+        logger.info(f"  Protocol: {protocol}, Protocol args: {protocol_args}")
         logger.info(f"  Local buffer: {local_buffer_size // (1024*1024)} MB")
 
-        retcode = self.store.setup(local_hostname, metadata_server, global_segment_size,
-                                  local_buffer_size, protocol, device_name, master_server_address)
+        if self.args.files is None:
+            global_segment_size = self.args.global_segment_size * 1024 * 1024
+            logger.info(f"  Global segment: {global_segment_size // (1024*1024)} MB")
+            retcode = self.store.setup(local_hostname, metadata_server, global_segment_size,
+                                    local_buffer_size, protocol, protocol_args, master_server_address)
+        else:
+            files = self.args.files.split()
+            logger.info(f"  Files: {files}")
+            retcode = self.store.setup_with_files(local_hostname, metadata_server, files,
+                                    local_buffer_size, protocol, protocol_args, master_server_address)
         if retcode:
             logger.error(f"Store setup failed with return code {retcode}")
             exit(1)
@@ -428,14 +434,18 @@ def parse_arguments():
 
     # Network and connection settings
     parser.add_argument("--protocol", type=str, default="rdma", help="Communication protocol to use")
-    parser.add_argument("--device-name", type=str, default="erdma_0", help="Network device name for RDMA")
+    parser.add_argument("--protocol-args", "--device-name", dest="protocol_args", type=str,
+                        default="erdma_0", help="Protocol specific args, e.g. Network device name for RDMA")
     parser.add_argument("--local-hostname", type=str, default="localhost", help="Local hostname")
     parser.add_argument("--metadata-server", type=str, default="http://127.0.0.1:8080/metadata", help="Metadata server address")
     parser.add_argument("--master-server", type=str, default="localhost:50051", help="Master server address")
 
     # Memory and storage settings
-    parser.add_argument("--global-segment-size", type=int, default=10000, help="Global segment size in MB")
     parser.add_argument("--local-buffer-size", type=int, default=512, help="Local buffer size in MB")
+    # Only one of --global-segment-size and --files should be specified.
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--global-segment-size", type=int, default=10000, help="Global segment size in MB")
+    group.add_argument("--files", type=str, default=None, help="Files to be registered as global segments")
 
     # Test parameters
     parser.add_argument("--max-requests", type=int, default=1200, help="Maximum number of requests to process")
