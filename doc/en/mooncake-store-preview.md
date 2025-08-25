@@ -207,7 +207,28 @@ message GetReplicaListResponse {
 - **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
 - **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
 
-2. PutStart
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
+};
+```
+
+- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
+- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+
+3. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -227,7 +248,7 @@ message PutStartResponse {
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
 - **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-3. PutEnd
+4. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -243,7 +264,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-4. Remove
+5. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -259,7 +280,24 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-5. MountSegment
+6. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // The number of objects removed.
+};
+```
+
+- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
+- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
+
+7. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -275,7 +313,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-6. UnmountSegment
+8. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
