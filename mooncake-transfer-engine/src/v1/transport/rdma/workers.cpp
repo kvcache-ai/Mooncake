@@ -399,17 +399,15 @@ int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
 }
 
 bool Workers::checkAllowCrossNuma(RuoteHint &source) {
-    device_stats_.checkAndReset();
-    for (auto dev_id : source.topo_entry->device_list[0]) {
-        __sync_fetch_and_add(&device_stats_.near_path_xfer_counts[dev_id], 1);
-    }
-    for (auto dev_id : source.topo_entry->device_list[1]) {
-        __sync_fetch_and_add(&device_stats_.near_path_xfer_counts[dev_id], 1);
-    }
-    for (auto dev_id : source.topo_entry->device_list[2]) {
-        if (device_stats_.has_near_path_xfer_in_prev_epoch[dev_id])
-            return false;
-    }
+    device_stats_.tryUpdatePeriod();
+    for (auto dev_id : source.topo_entry->device_list[0])
+        device_stats_.addLocalXfer(dev_id);
+    for (auto dev_id : source.topo_entry->device_list[1])
+        device_stats_.addLocalXfer(dev_id);
+    for (auto dev_id : source.topo_entry->device_list[2])
+        if (!device_stats_.allowRemoteXfer(dev_id)) return false;
+    for (auto dev_id : source.topo_entry->device_list[2])
+        device_stats_.addRemoteXfer(dev_id);
     return true;
 }
 

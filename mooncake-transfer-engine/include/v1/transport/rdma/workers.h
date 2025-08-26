@@ -195,36 +195,58 @@ class Workers {
 
     struct DeviceStats {
         DeviceStats(size_t num_devices) : num_devices(num_devices) {
-            near_path_xfer_counts = new volatile uint64_t[num_devices];
-            has_near_path_xfer_in_prev_epoch = new volatile bool[num_devices];
-            for (size_t i = 0; i < num_devices; ++i)
-                has_near_path_xfer_in_prev_epoch[i] = false;
+            local_xfer_counts = new std::atomic<uint64_t>[num_devices];
+            total_xfer_counts = new std::atomic<uint64_t>[num_devices];
+            allow_remote_xfer = new std::atomic<bool>[num_devices];
         }
 
-        ~DeviceStats() { delete[] near_path_xfer_counts; }
+        ~DeviceStats() {
+            delete[] local_xfer_counts;
+            delete[] total_xfer_counts;
+            delete[] allow_remote_xfer;
+        }
 
-        void checkAndReset() {
+        void addLocalXfer(int dev_id) {
+            local_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
+            total_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void addRemoteXfer(int dev_id) {
+            total_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        bool allowRemoteXfer(int dev_id) {
+            return allow_remote_xfer[dev_id].load(std::memory_order_relaxed);
+        }
+
+        void tryUpdatePeriod() {
             uint64_t current_ts = getCurrentTimeInNano();
             const uint64_t kRefreshPeriod = 10 * 1000 * 1000;  // 10ms
             if (current_ts - last_ts > kRefreshPeriod) {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (current_ts - last_ts > kRefreshPeriod) {
                     for (size_t i = 0; i < num_devices; ++i) {
-                        has_near_path_xfer_in_prev_epoch[i] = 
-                            near_path_xfer_counts[i] ? true : false;
-                        near_path_xfer_counts[i] = 0;
+                        auto &allow = allow_remote_xfer[i];
+                        if (!total_xfer_counts[i])
+                            allow = true;
+                        else {
+                            allow = (local_xfer_counts[i] * 100 /
+                                     total_xfer_counts[i]) < 5;
+                        }
+                        local_xfer_counts[i] = 0;
+                        total_xfer_counts[i] = 0;
                     }
                     last_ts = current_ts;
                 }
             }
         }
 
-        std::mutex mutex;  // for clear
-        volatile uint64_t last_ts{0};
-
+        std::mutex mutex;
+        std::atomic<uint64_t> last_ts{0};
         const size_t num_devices;
-        volatile uint64_t *near_path_xfer_counts;
-        volatile bool *has_near_path_xfer_in_prev_epoch;
+        std::atomic<uint64_t> *local_xfer_counts;
+        std::atomic<uint64_t> *total_xfer_counts;
+        std::atomic<bool> *allow_remote_xfer;
     };
 
     DeviceStats device_stats_;
