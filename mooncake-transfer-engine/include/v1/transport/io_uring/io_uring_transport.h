@@ -47,6 +47,7 @@ struct IOUringSubBatch : public Transport::SubBatch {
     size_t max_size;
     std::vector<IOUringTask> task_list;
     struct io_uring ring;
+    virtual size_t size() const { return task_list.size(); }
 };
 
 class IOUringTransport : public Transport {

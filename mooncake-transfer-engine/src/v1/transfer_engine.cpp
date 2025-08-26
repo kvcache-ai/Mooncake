@@ -41,20 +41,14 @@ namespace v1 {
 struct TaskInfo {
     TransportType type;
     int sub_task_id;
-    Request request;
 };
 
 struct Batch {
-    Batch() : max_size(0) {
-        sub_batch.fill(nullptr);
-        next_sub_task_id.fill(0);
-    }
+    Batch() : max_size(0) { sub_batch.fill(nullptr); }
 
     ~Batch() {}
 
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
-    std::array<int, kSupportedTransportTypes> next_sub_task_id;
-
     std::vector<TaskInfo> task_list;
     size_t max_size;
 };
@@ -469,33 +463,105 @@ std::string printRequest(const Request &request) {
     return ss.str();
 }
 
+struct MergeResult {
+    std::vector<Request> request_list;
+    std::map<size_t, size_t> task_lookup;
+};
+
+MergeResult mergeRequests(const std::vector<Request> &requests) {
+    MergeResult result;
+    if (requests.empty()) return result;
+
+    struct Item {
+        Request req;
+        size_t orig_idx;
+    };
+
+    std::vector<Item> items;
+    items.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); i++)
+        items.push_back({requests[i], i});
+
+    std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+        if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
+        if (a.req.target_id != b.req.target_id)
+            return a.req.target_id < b.req.target_id;
+        if (a.req.target_offset != b.req.target_offset)
+            return a.req.target_offset < b.req.target_offset;
+        return a.req.source < b.req.source;
+    });
+
+    for (const auto &item : items) {
+        if (result.request_list.empty()) {
+            result.request_list.push_back(item.req);
+            result.task_lookup[item.orig_idx] = result.request_list.size() - 1;
+        } else {
+            Request &last = result.request_list.back();
+            char *last_src_end = static_cast<char *>(last.source) + last.length;
+            char *curr_src = static_cast<char *>(item.req.source);
+            uint64_t last_tgt_end = last.target_offset + last.length;
+            if (last.opcode == item.req.opcode &&
+                last.target_id == item.req.target_id &&
+                last_src_end == curr_src &&
+                last_tgt_end == item.req.target_offset) {
+                last.length += item.req.length;
+                result.task_lookup[item.orig_idx] =
+                    result.request_list.size() - 1;
+            } else {
+                result.request_list.push_back(item.req);
+                result.task_lookup[item.orig_idx] =
+                    result.request_list.size() - 1;
+            }
+        }
+    }
+
+    return result;
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request> &request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
-    std::vector<size_t> classified_task_id[kSupportedTransportTypes];
-    for (auto &request : request_list) {
-        auto transport_type = getTransportType(request);
-        if (transport_type == UNSPEC) {
-            metadata_->segmentManager().invalidateRemote(request.target_id);
-            transport_type = getTransportType(request);
+    std::vector<size_t> task_id_list[kSupportedTransportTypes];
+    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
+
+    size_t start_task_id = batch->task_list.size();
+    batch->task_list.insert(batch->task_list.end(), request_list.size(),
+                            {UNSPEC, -1});
+
+    auto merged = mergeRequests(request_list);
+    for (auto &kv : merged.task_lookup) {
+        size_t task_id = start_task_id + kv.first;
+        size_t merged_task_id = kv.second;
+        auto &task = batch->task_list[task_id];
+        auto &merged_request = merged.request_list[merged_task_id];
+        if (merged_task_id_map.count(merged_task_id)) {
+            task_id_list[task.type].push_back(task_id);
+            task = merged_task_id_map[merged_task_id];
+            continue;
         }
-        if (transport_type == UNSPEC) {
+
+        auto type = getTransportType(merged_request);
+        if (type == UNSPEC) {
+            metadata_->segmentManager().invalidateRemote(
+                merged_request.target_id);
+            type = getTransportType(merged_request);
+        }
+
+        if (type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
-                         << printRequest(request);
-            batch->task_list.emplace_back(
-                TaskInfo{transport_type, -1, request});
+                         << printRequest(merged_request);
         } else {
-            auto &sub_task_id = batch->next_sub_task_id[transport_type];
-            classified_request_list[transport_type].push_back(request);
-            classified_task_id[transport_type].push_back(
-                batch->task_list.size());
-            batch->task_list.emplace_back(
-                TaskInfo{transport_type, sub_task_id, request});
-            sub_task_id++;
+            auto sub_task_id = batch->sub_batch[type]->size();
+            classified_request_list[type].push_back(merged_request);
+            task.type = type;
+            task.sub_task_id = sub_task_id;
         }
+
+        task_id_list[type].push_back(task_id);
+        merged_task_id_map[merged_task_id] = task;
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -507,7 +573,7 @@ Status TransferEngine::submitTransfer(
                 transport->allocateSubBatch(sub_batch, batch->max_size);
             if (!status.ok()) {
                 LOG(WARNING) << status.ToString();
-                for (auto &task_id : classified_task_id[type])
+                for (auto &task_id : task_id_list[type])
                     batch->task_list[task_id].type = UNSPEC;
                 continue;
             }
@@ -517,7 +583,7 @@ Status TransferEngine::submitTransfer(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
             LOG(WARNING) << status.ToString();
-            for (auto &task_id : classified_task_id[type])
+            for (auto &task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         }
     }
@@ -571,22 +637,8 @@ Status TransferEngine::getTransferStatus(
     Batch *batch = (Batch *)(batch_id);
     status_list.clear();
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
-        auto &task = batch->task_list[task_id];
-        if (task.type == UNSPEC) {
-            TransferStatus task_status;
-            task_status.s = FAILED;
-            task_status.transferred_bytes = 0;
-            status_list.push_back(task_status);
-            continue;
-        }
-        auto &transport = transport_list_[task.type];
-        auto &sub_batch = batch->sub_batch[task.type];
-        if (!transport || !sub_batch) {
-            return Status::InvalidArgument("Transport not available" LOC_MARK);
-        }
         TransferStatus task_status;
-        CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                                  task_status));
+        CHECK_STATUS(getTransferStatus(batch_id, task_id, task_status));
         status_list.push_back(task_status);
     }
     return Status::OK();

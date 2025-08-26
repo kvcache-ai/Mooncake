@@ -38,6 +38,7 @@ struct GdsSubBatch : public Transport::SubBatch {
     CUfileBatchHandle_t handle;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
+    virtual size_t size() const { return io_params.size(); }
 };
 
 class GdsTransport : public Transport {

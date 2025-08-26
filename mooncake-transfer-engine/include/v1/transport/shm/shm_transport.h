@@ -46,6 +46,7 @@ struct ShmSubBatch : public Transport::SubBatch {
 #ifdef USE_CUDA
     cudaStream_t stream;
 #endif
+    virtual size_t size() const { return task_list.size(); }
 };
 
 class ShmTransport : public Transport {

@@ -39,6 +39,7 @@ class Transport {
     struct SubBatch {
         SubBatch() {}
         virtual ~SubBatch() {}
+        virtual size_t size() const = 0;
     };
 
     using SubBatchRef = SubBatch *;

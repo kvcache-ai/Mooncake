@@ -36,6 +36,7 @@ struct TcpTask {
 struct TcpSubBatch : public Transport::SubBatch {
     std::vector<TcpTask> task_list;
     size_t max_size;
+    virtual size_t size() const { return task_list.size(); }
 };
 
 class TcpTransport : public Transport {

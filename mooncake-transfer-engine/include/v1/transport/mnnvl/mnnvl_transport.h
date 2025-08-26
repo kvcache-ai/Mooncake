@@ -42,6 +42,7 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     std::vector<MnnvlTask> task_list;
     size_t max_size;
     cudaStream_t stream;
+    virtual size_t size() const { return task_list.size(); }
 };
 
 class MnnvlTransport : public Transport {
