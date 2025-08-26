@@ -39,7 +39,6 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                      rank_ != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
-                    activeTime[i] = clock::now();
                     if (skipTransfer) {
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
@@ -47,9 +46,6 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < size_; ++j) {
-                        if (brokenRanks_[j]) {
-                            continue;
-                        }
                         uint64_t source =
                             segment_descs_[rank_]->buffers[i].addr;
                         switch (task.opType) {
@@ -98,24 +94,22 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     TransferStatus status;
 
                     if (!skipTransfer) {
-                        auto now = clock::now();
-                        auto diff =
-                            std::chrono::duration_cast<std::chrono::seconds>(
-                                now - activeTime[i]);
-                        if (diff.count() < 20) {
-                            for (int j = 0; j < size_; ++j) {
-                                engine_->getTransferStatus(task.batchID, j,
-                                                           status);
-                                if (status.s != TransferStatusEnum::COMPLETED &&
-                                    !brokenRanks_[j]) {
+                        for (int j = 0; j < size_; ++j) {
+                            engine_->getTransferStatus(task.batchID, j, status);
+                            if (status.s != TransferStatusEnum::COMPLETED &&
+                                !brokenRanks_[j]) {
+                                if (status.s == TransferStatusEnum::FAILED) {
+                                    LOG(ERROR)
+                                        << "Rank " << rank_ << " marking peer "
+                                        << j
+                                        << " as broken during transferring op "
+                                        << (int)task.opType;
+                                    brokenRanks_[j] = true;
+                                } else {
                                     batch_done = false;
                                     break;
                                 }
                             }
-                        } else {
-                            LOG(ERROR) << "Rank " << rank_
-                                       << " timeout during transferring op "
-                                       << (int)task.opType;
                         }
                     }
                     if (!batch_done) {
@@ -141,6 +135,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     }
                     task.batchID = engine_->allocateBatchID(entries.size());
                     engine_->submitTransfer(task.batchID, entries);
+                    activeTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
@@ -151,22 +146,26 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     auto diff =
                         std::chrono::duration_cast<std::chrono::seconds>(
                             now - activeTime[i]);
-                    if (diff.count() < 40) {
-                        for (int j = 0; j < size_; ++j) {
-                            if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
+                    for (int j = 0; j < size_; ++j) {
+                        if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
+                            TransferMetadata::NotifyDesc msg{"ping", "ping"};
+                            if (diff.count() > 1 &&
+                                engine_->sendNotifyByName(
+                                    segment_descs_[j]->name, msg)) {
+                                LOG(ERROR)
+                                    << "Rank " << rank_ << " marking peer " << j
+                                    << " as broken during syncing op "
+                                    << (int)task.opType;
+                                brokenRanks_[j] = true;
+                            } else {
                                 all_received = false;
                                 break;
                             }
                         }
-                    } else {
-                        LOG(ERROR)
-                            << "Rank " << rank_ << " timeout during syncing op "
-                            << (int)task.opType;
-                        for (int j = 0; j < size_; ++j) {
-                            if (signal_ptr[j] != 1) {
-                                brokenRanks_[j] = true;
-                            }
-                        }
+                    }
+                    if (diff.count() > 1) {
+                        // reset timer
+                        activeTime[i] = clock::now();
                     }
                     if (all_received) {
                         for (int j = 0; j < size_; ++j) {
