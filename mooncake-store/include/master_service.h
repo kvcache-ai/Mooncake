@@ -22,6 +22,7 @@
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
+#include "replica.h"
 
 namespace mooncake {
 // Forward declarations
