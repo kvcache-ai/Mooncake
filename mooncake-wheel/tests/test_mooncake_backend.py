@@ -7,6 +7,7 @@ from mooncake import ep
 
 
 def worker(rank, world_size, results, collective):
+    torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="mooncake",
         rank=rank,
