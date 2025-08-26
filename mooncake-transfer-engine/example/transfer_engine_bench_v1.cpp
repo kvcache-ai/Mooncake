@@ -34,15 +34,15 @@ DEFINE_string(metadata_servers, "",
 DEFINE_string(workload, "read", "Test workload: read|write|mix");
 DEFINE_string(local_segment, "",
               "Set the custom local segment name (optional)");
-DEFINE_string(cluster_topology, "",
-              "Set the cluster topology file (optional)");
+DEFINE_string(cluster_topology, "", "Set the cluster topology file (optional)");
 DEFINE_string(remote_segment, "", "Set the remote segment name (required)");
-DEFINE_bool(integrity_check, false, "Check data integrity if workload is mix");
+DEFINE_bool(check, false, "Check data integrity if workload is mix");
 DEFINE_bool(shmfs, false, "Enable shmfs");
 DEFINE_bool(mnnvl, false, "Enable multi-node NVLink");
 
 DEFINE_int32(batch, 16, "Number of requests per batch");
 DEFINE_uint64(size, 65536, "Block size for each request");
+DEFINE_uint64(slice_size, 65536, "Slice size that Mooncake TE split");
 DEFINE_int32(duration, 10, "Test duration in seconds");
 DEFINE_int32(threads, 16, "Test threads to submit requests");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
@@ -97,7 +97,7 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 int num_sockets = 1;
 int num_buffers = 1;
 int cuda_device_count = 0;
-size_t buffer_capacity = 32 * 1024 * 1024;
+size_t buffer_capacity = 1024 * 1024 * 1024;
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
@@ -145,18 +145,14 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     }
     CHECK_FAIL(engine->submitTransfer(batch_id, requests));
     while (true) {
-        std::vector<TransferStatus> status_list;
-        CHECK_FAIL(engine->getTransferStatus(batch_id, status_list));
-        int completed_tasks = 0;
-        for (int task_id = 0; task_id < FLAGS_batch; ++task_id) {
-            if (status_list[task_id].s == TransferStatusEnum::COMPLETED) {
-                completed_tasks++;
-            } else if (status_list[task_id].s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Failed transfer detected";
-                exit(EXIT_FAILURE);
-            }
+        TransferStatus overall_status;
+        CHECK_FAIL(engine->getTransferStatus(batch_id, overall_status));
+        if (overall_status.s == TransferStatusEnum::COMPLETED) {
+            break;
+        } else if (overall_status.s == TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "Failed transfer detected";
+            exit(EXIT_FAILURE);
         }
-        if (completed_tasks == FLAGS_batch) break;
     }
     CHECK_FAIL(engine->freeBatch(batch_id));
     return Status::OK();
@@ -249,12 +245,12 @@ Status initiatorWorker(TransferEngine *engine, SegmentID handle, int thread_id,
     uint64_t remote_base = getStartAddress(engine, handle, thread_id);
     bool mixture = false;
     Request::OpCode opcode;
-    if (FLAGS_workload == "read")
+    if (FLAGS_check || FLAGS_workload == "mix")
+        mixture = true;
+    else if (FLAGS_workload == "read")
         opcode = Request::READ;
     else if (FLAGS_workload == "write")
         opcode = Request::WRITE;
-    else if (FLAGS_workload == "mix")
-        mixture = true;
     else {
         LOG(ERROR) << "Invalid args: workload only support read|write|mix";
         exit(EXIT_FAILURE);
@@ -268,7 +264,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID handle, int thread_id,
         } else {
             uint8_t seed = 0;
             seed = SimpleRandom::Get().next(UINT8_MAX);
-            if (FLAGS_integrity_check && SimpleRandom::Get().next(64) == 31) {
+            if (FLAGS_check && SimpleRandom::Get().next(64) == 31) {
                 fillData(thread_id, addr, seed);
                 CHECK_FAIL(submitRequestSync(engine, handle, thread_id, addr,
                                              remote_base, Request::WRITE));
@@ -328,6 +324,8 @@ std::shared_ptr<ConfigManager> loadConfig() {
     config->set("metadata_type", FLAGS_metadata_type);
     config->set("metadata_servers", FLAGS_metadata_servers);
     config->set("cluster_topology", FLAGS_cluster_topology);
+    config->set("transports/rdma/workers/block_size",
+                std::to_string(FLAGS_slice_size));
     return config;
 }
 

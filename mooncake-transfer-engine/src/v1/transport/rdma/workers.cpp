@@ -43,7 +43,10 @@ static inline void markSliceFailed(RdmaSlice *slice) {
 }
 
 Workers::Workers(RdmaTransport *transport)
-    : transport_(transport), num_workers_(0), running_(false) {}
+    : transport_(transport),
+      num_workers_(0),
+      running_(false),
+      device_stats_(transport_->context_set_.size()) {}
 
 Workers::~Workers() {
     if (running_) stop();
@@ -77,11 +80,22 @@ Status Workers::stop() {
     return Status::OK();
 }
 
-static std::atomic<int> g_next_tid(0);
-thread_local int tl_tid = g_next_tid.fetch_add(1);
-
-Status Workers::submit(RdmaSliceList &slice_list) {
-    auto &worker = worker_context_[tl_tid % num_workers_];
+Status Workers::submit(RdmaSliceList &slice_list, int worker_id) {
+    if (worker_id < 0 || worker_id >= (int)num_workers_) {
+        // If caller didn't specify the worker, find the least loaded one
+        long min_inflight = INT64_MAX;
+        int start_id = SimpleRandom::Get().next(num_workers_);
+        for (size_t i = start_id; i < start_id + num_workers_; ++i) {
+            auto current =
+                worker_context_[i % num_workers_].inflight_slices.load(
+                    std::memory_order_relaxed);
+            if (current < min_inflight) {
+                worker_id = i % num_workers_;
+                min_inflight = current;
+            }
+        }
+    }
+    auto &worker = worker_context_[worker_id];
     worker.queue.push(slice_list);
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         worker.notifyIfNeeded();
@@ -375,11 +389,47 @@ Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
     return Status::OK();
 }
 
+int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
+    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+        auto &list = hint.topo_entry->device_list[rank];
+        for (auto &entry : list)
+            if (entry == device_id) return rank;
+    }
+    return -1;
+}
+
+bool Workers::checkAllowCrossNuma(RuoteHint &source) {
+    device_stats_.checkAndReset();
+    for (auto dev_id : source.topo_entry->device_list[0]) {
+        __sync_fetch_and_add(&device_stats_.near_path_xfer_counts[dev_id], 1);
+    }
+    for (auto dev_id : source.topo_entry->device_list[1]) {
+        __sync_fetch_and_add(&device_stats_.near_path_xfer_counts[dev_id], 1);
+    }
+    for (auto dev_id : source.topo_entry->device_list[2]) {
+        if (device_stats_.has_near_path_xfer_in_prev_epoch[dev_id])
+            return false;
+    }
+    return true;
+}
+
 Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
-                                    RdmaSlice *slice) {
-    // Source device: select one in the preferred group
-    // If scheduler is available, use it as the guide. Otherwise random choosing
-    int seed = SimpleRandom::Get().next(32);
+                                    RdmaSlice *slice, int thread_id) {
+    bool allow_cross_numa = checkAllowCrossNuma(source);
+    thread_local int tl_next_device_id = thread_id;
+    const size_t num_devices = transport_->context_set_.size();
+    int rank = -1;
+    for (size_t i = 0; i < num_devices; ++i) {
+        tl_next_device_id = (tl_next_device_id + 1) % num_devices;
+        rank = getDeviceRank(source, tl_next_device_id);
+        if (rank >= 0 && (rank != 2 || allow_cross_numa)) break;
+    }
+    if (rank < 0) return Status::DeviceNotFound("No available device");
+
+    slice->target_dev_id = slice->source_dev_id = tl_next_device_id;
+    return Status::OK();
+
+#if 0
     slice->has_lease = false;
     for (size_t rank = 0;
          slice->source_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
@@ -434,6 +484,7 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
     return Status::OK();
+#endif
 }
 
 int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
@@ -504,9 +555,12 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
                               slice->length));
 
     if (slice->retry_count == 0)
-        return selectOptimalDevice(source, target, slice);
+        CHECK_STATUS(selectOptimalDevice(source, target, slice, thread_id));
     else
-        return selectFallbackDevice(source, target, slice);
+        CHECK_STATUS(selectFallbackDevice(source, target, slice));
+    slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
+    slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    return Status::OK();
 }
 }  // namespace v1
 }  // namespace mooncake

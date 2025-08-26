@@ -84,6 +84,8 @@ class Topology {
 
     Json::Value toJson() const;
 
+    void print() const;
+
     Status selectDevice(int &device_id, const std::string &storage_type,
                         int retry_count = 0) {
         int rand_seed = -1;

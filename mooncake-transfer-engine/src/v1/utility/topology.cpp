@@ -340,6 +340,58 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
+void Topology::print() const {
+    std::map<int, std::vector<std::string>> numa_groups;
+    for (const auto &kv : resolved_matrix_)
+        numa_groups[kv.second.numa_node].push_back(kv.first);
+
+    for (const auto &group : numa_groups) {
+        int numa = group.first;
+        LOG(INFO) << "=== Priority of NUMA " << numa << " ===";
+
+        std::set<int> all_devs;
+        for (const auto &storage_type : group.second) {
+            const auto &entry = resolved_matrix_.at(storage_type);
+            for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+                for (int dev : entry.device_list[rank]) {
+                    all_devs.insert(dev);
+                }
+            }
+        }
+
+        std::ostringstream header;
+        header << std::setw(8) << "Storage";
+        for (int dev_id : all_devs) {
+            header << std::setw(6) << ("NIC" + std::to_string(dev_id));
+        }
+        LOG(INFO) << header.str();
+
+        for (const auto &storage_type : group.second) {
+            const auto &entry = resolved_matrix_.at(storage_type);
+            std::ostringstream line;
+            line << std::setw(8) << storage_type;
+
+            for (int dev_id : all_devs) {
+                int rank_id = -1;
+                for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+                    if (std::find(entry.device_list[rank].begin(),
+                                  entry.device_list[rank].end(),
+                                  dev_id) != entry.device_list[rank].end()) {
+                        rank_id = rank;
+                        break;
+                    }
+                }
+                if (rank_id >= 0) {
+                    line << std::setw(6) << 2 - rank_id;
+                } else {
+                    line << std::setw(6) << "-";
+                }
+            }
+            LOG(INFO) << line.str();
+        }
+    }
+}
+
 Status Topology::selectDevice(int &device_id, const std::string &storage_type,
                               int retry_count, int &rand_seed) {
     if (resolved_matrix_.count(storage_type) == 0) {
@@ -376,6 +428,7 @@ Status Topology::resolve() {
     std::map<std::string, int> device_id_map;
     int next_device_map_index = 0;
     for (auto &entry : matrix_) {
+        resolved_matrix_[entry.first].numa_node = entry.second.numa_node;
         for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
             for (auto &device : entry.second.device_list[rank]) {
                 if (!device_id_map.count(device)) {
@@ -383,7 +436,7 @@ Status Topology::resolve() {
                     device_id_map[device] = next_device_map_index;
                     next_device_map_index++;
                     resolved_matrix_[kWildcardLocation]
-                        .device_list[rank]
+                        .device_list[DevicePriorityRanks - 1]
                         .push_back(device_id_map[device]);
                 }
                 resolved_matrix_[entry.first].device_list[rank].push_back(

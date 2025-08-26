@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "context.h"
+#include "v1/utility/system.h"
 
 namespace mooncake {
 namespace v1 {
@@ -91,7 +92,7 @@ class Workers {
 
     Status submit(RdmaSlice *slice);
 
-    Status submit(RdmaSliceList &slice_list);
+    Status submit(RdmaSliceList &slice_list, int worker_id = -1);
 
     Status cancel(RdmaSliceList &slice_list);
 
@@ -127,12 +128,14 @@ class Workers {
                         uint64_t length);
 
     Status selectOptimalDevice(RuoteHint &source, RuoteHint &target,
-                               RdmaSlice *slice);
+                               RdmaSlice *slice, int thread_id);
 
     Status selectFallbackDevice(RuoteHint &source, RuoteHint &target,
-                                  RdmaSlice *slice);
+                                RdmaSlice *slice);
 
     int getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx);
+
+    int getDeviceRank(const RuoteHint &hint, int device_id);
 
    private:
     RdmaTransport *transport_;
@@ -189,6 +192,44 @@ class Workers {
     };
 
     WorkerContext *worker_context_;
+
+    struct DeviceStats {
+        DeviceStats(size_t num_devices) : num_devices(num_devices) {
+            near_path_xfer_counts = new volatile uint64_t[num_devices];
+            has_near_path_xfer_in_prev_epoch = new volatile bool[num_devices];
+            for (size_t i = 0; i < num_devices; ++i)
+                has_near_path_xfer_in_prev_epoch[i] = false;
+        }
+
+        ~DeviceStats() { delete[] near_path_xfer_counts; }
+
+        void checkAndReset() {
+            uint64_t current_ts = getCurrentTimeInNano();
+            const uint64_t kRefreshPeriod = 10 * 1000 * 1000;  // 10ms
+            if (current_ts - last_ts > kRefreshPeriod) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (current_ts - last_ts > kRefreshPeriod) {
+                    for (size_t i = 0; i < num_devices; ++i) {
+                        has_near_path_xfer_in_prev_epoch[i] = 
+                            near_path_xfer_counts[i] ? true : false;
+                        near_path_xfer_counts[i] = 0;
+                    }
+                    last_ts = current_ts;
+                }
+            }
+        }
+
+        std::mutex mutex;  // for clear
+        volatile uint64_t last_ts{0};
+
+        const size_t num_devices;
+        volatile uint64_t *near_path_xfer_counts;
+        volatile bool *has_near_path_xfer_in_prev_epoch;
+    };
+
+    DeviceStats device_stats_;
+
+    bool checkAllowCrossNuma(RuoteHint &source);
 };
 }  // namespace v1
 }  // namespace mooncake
