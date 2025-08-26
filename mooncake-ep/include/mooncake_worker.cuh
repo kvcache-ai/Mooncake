@@ -44,12 +44,16 @@ class MooncakeWorker {
 
     void initWorker(const std::vector<std::string>& server_names);
 
+    void stopWorker() { running_ = false; }
+
     void setBackendBuffer(BackendBuffer* buffer) { buffer_ = buffer; }
 
     bool* getBrokenRanks() { return brokenRanks_; }
 
    private:
     static constexpr size_t kNumTasks_ = 2;
+
+    bool running_ = false;
 
     Task *tasks_, *tasks_device_;
     bool *brokenRanks_, *brokenRanksDevice_;

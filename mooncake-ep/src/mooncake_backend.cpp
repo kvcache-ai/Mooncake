@@ -121,6 +121,7 @@ MooncakeBackend::MooncakeBackend(
 }
 
 MooncakeBackend::~MooncakeBackend() {
+    worker_.stopWorker();
     if (buffer_) {
         for (size_t i = 0; i < 2; i++) {
             if (isCpu_) {

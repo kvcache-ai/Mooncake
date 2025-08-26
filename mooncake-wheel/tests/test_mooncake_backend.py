@@ -34,7 +34,7 @@ def worker(rank, world_size, results, collective):
 
 class TestMooncakeBackend(unittest.TestCase):
     def setUp(self):
-        self.world_size = 4
+        self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 

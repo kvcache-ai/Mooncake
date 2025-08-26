@@ -20,13 +20,14 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
             engine_->getMetadata()->getSegmentDescByID(segment_id);
         segment_descs_.emplace_back(segment_desc);
     }
+    running_ = true;
 
     // Start worker thread
     std::thread([this] {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
-        while (true) {
+        while (running_) {
             _mm_pause();
             for (size_t i = 0; i < kNumTasks_; ++i) {
                 auto &task = tasks_[i];
