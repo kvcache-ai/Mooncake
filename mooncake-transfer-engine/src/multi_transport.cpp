@@ -240,6 +240,32 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     return transport;
 }
 
+bool MultiTransport::transportNeedArgs(const std::string &proto) {
+    return false;
+}
+
+Transport *MultiTransport::installTransport(const std::string &proto,
+                                            void **args) {
+    std::shared_ptr<Transport> transport = nullptr;
+
+    // Add transport creation logic here.
+
+    if (!transport) {
+        LOG(ERROR) << "Unsupported transport " << proto
+                   << ", please rebuild Mooncake";
+        return nullptr;
+    }
+
+    int rc = transport->install(local_server_name_, metadata_, args);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to install transport " << proto << ", rc=" << rc;
+        return nullptr;
+    }
+
+    transport_map_[proto] = transport;
+    return transport.get();
+}
+
 Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        Transport *&transport) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);

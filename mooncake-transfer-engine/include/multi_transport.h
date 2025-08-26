@@ -49,6 +49,10 @@ class MultiTransport {
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 
+    bool transportNeedArgs(const std::string &proto);
+
+    Transport *installTransport(const std::string &proto, void **args);
+
     Transport *getTransport(const std::string &proto);
 
     std::vector<Transport *> listTransports();

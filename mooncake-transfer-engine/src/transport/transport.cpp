@@ -64,4 +64,11 @@ int Transport::install(std::string &local_server_name,
     metadata_ = meta;
     return 0;
 }
+
+int Transport::install(std::string &local_server_name,
+                       std::shared_ptr<TransferMetadata> meta, void **args) {
+    local_server_name_ = local_server_name;
+    metadata_ = meta;
+    return 0;
+}
 }  // namespace mooncake

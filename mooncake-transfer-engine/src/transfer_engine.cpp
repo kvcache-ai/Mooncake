@@ -259,16 +259,22 @@ Transport *TransferEngine::installTransport(const std::string &proto,
         return transport;
     }
 
-    if (args != nullptr && args[0] != nullptr) {
-        const std::string nic_priority_matrix = static_cast<char *>(args[0]);
-        int ret = local_topology_->parse(nic_priority_matrix);
-        if (ret) {
-            LOG(ERROR) << "Failed to parse NIC priority matrix";
-            return nullptr;
+    if (multi_transports_->transportNeedArgs(proto)) {
+        transport = multi_transports_->installTransport(proto, args);
+    } else {
+        if (args != nullptr && args[0] != nullptr) {
+            const std::string nic_priority_matrix =
+                static_cast<char *>(args[0]);
+            int ret = local_topology_->parse(nic_priority_matrix);
+            if (ret) {
+                LOG(ERROR) << "Failed to parse NIC priority matrix";
+                return nullptr;
+            }
         }
+
+        transport = multi_transports_->installTransport(proto, local_topology_);
     }
 
-    transport = multi_transports_->installTransport(proto, local_topology_);
     if (!transport) return nullptr;
 
     // Since installTransport() is only called once during initialization
