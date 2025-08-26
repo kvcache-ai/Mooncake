@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.hpp"

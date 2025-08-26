@@ -7,6 +7,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <unordered_map>
 
 #include "types.h"
 #include "allocator.h"
