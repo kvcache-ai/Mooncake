@@ -84,7 +84,7 @@ void FIFOEndpointStore::evictEndpoint() {
     std::string victim = fifo_list_.front();
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
-    // LOG(INFO) << victim << " evicted";
+    LOG(INFO) << victim << " evicted";
     waiting_list_.insert(endpoint_map_[victim]);
     endpoint_map_.erase(victim);
     return;
@@ -202,10 +202,10 @@ void SIEVEEndpointStore::evictEndpoint() {
             break;
         }
     }
-    hand_ = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
+    o == fifo_list_.begin() ? hand_ = std::nullopt : hand_ = std::prev(o);
     fifo_list_.erase(o);
     fifo_map_.erase(victim);
-    // LOG(INFO) << victim << " evicted";
+    LOG(INFO) << victim << " evicted";
     auto victim_instance = endpoint_map_[victim].first;
     victim_instance->set_active(false);
     waiting_list_len_++;

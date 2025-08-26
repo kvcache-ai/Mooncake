@@ -11,7 +11,7 @@ Mooncake Store 提供了底层的对象存储和管理能力，包括可配置�
 Mooncake Store 的主要特性包括：
 
 *   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
-*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。
+*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。保证同一对象的每个slice被放置在不同的segment中，不同对象的slice可以共享segment。采用尽力而为的副本分配策略。
 *   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
 *   **零拷贝、高带宽利用**：由 Transfer Engine 提供支持, 数据链路零拷贝，对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
@@ -95,6 +95,12 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
 用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，`Put`除了对memory pool的写入之外，还会异步发起一次向SSD的数据持久化操作）
+
+**副本保证和尽力而为行为：**
+- 保证对象的每个slice被复制到不同的segment，确保分布在不同的存储节点上
+- 不同对象的slice可能被放置在同一个segment中
+- 副本采用尽力而为的方式运行：如果没有足够的空间来分配所有请求的副本，对象仍将被写入，副本数量为实际能够分配的数量
+
 其中`ReplicateConfig` 的数据结构细节如下：
 
 ```C++
@@ -112,6 +118,23 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
+
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+用于删除与正则表达式匹配的所有 key 对应的对象。其余能力类似 Remove。
+
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+用于查询与正则表达式匹配的所有 key 对应的对象。
 
 ### Master Service
 
@@ -154,6 +177,9 @@ service MasterService {
   // 获取对象的副本列表
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // 获取与正则表达式匹配的对性的副本列表
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
   // 开始 Put 操作，分配存储空间
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -162,6 +188,9 @@ service MasterService {
 
   // 删除对象的所有副本
   rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // 删除与正则表达式匹配的对性的所有副本
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
   // 存储节点(Client)注册存储段
   rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
@@ -189,7 +218,29 @@ message GetReplicaListResponse {
 
 说明: 用于获取指定 key 的所有可用副本的信息。Client 可以根据这些信息选择合适的副本进行读取。
 
-2. PutStart
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // 匹配到的对象及其副本信息
+};
+```
+
+* 请求: GetReplicaListByRegexRequest，包含需要匹配的正则表达式 key_regex。
+* 响应: GetReplicaListByRegexResponse，包含状态码 status_code 和一个 object_map，该 map 的键是匹配成功的对象 key，值是该 key 对应的副本信息列表。
+
+说明: 用于查询与指定正则表达式匹配的所有 key 及其副本信息。该接口方便进行批量查询和管理。
+
+3. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -208,9 +259,9 @@ message PutStartResponse {
 * 请求: PutStartRequest，包含 key、数据长度和副本配置config。
 * 响应: PutStartResponse，包含状态码 status_code 和分配好的副本信息 replica_list。
 
-说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
+说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。分配策略确保对象的每个slice被放置在不同的segment中，同时采用尽力而为的方式运行——如果没有足够的空间来分配所有请求的副本，将分配尽可能多的副本。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
 
-3. PutEnd
+4. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -227,7 +278,7 @@ message PutEndResponse {
 
 Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master Service` 将更新对象的元数据信息，将副本状态标记为 COMPLETE，表示该对象可以被读取。
 
-4. Remove
+5. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -244,7 +295,25 @@ message RemoveResponse {
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
-5. MountSegment
+6. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // 被删除的对象数量
+};
+```
+
+* 请求: RemoveByRegexRequest，包含需要匹配的正则表达式 key_regex。
+* 响应: RemoveByRegexResponse，包含状态码 status_code 和被删除对象的数量 removed_count。
+
+说明: 用于删除与指定正则表达式匹配的所有对象及其全部副本。与 Remove 接口类似，这是一个元数据操作，Master Service 将所有匹配对象的副本状态标记为删除。
+
+7. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -260,7 +329,7 @@ message MountSegmentResponse {
 
 存储节点(Client)自己分配一段内存，然后在调用`TransferEngine::registerLoalMemory` 完成本地挂载后，调用该接口，将分配好的一段连续的地址空间挂载到`Master Service`用于分配。
 
-6. UnmountSegment
+8. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -473,6 +542,35 @@ struct ReplicateConfig {
 
 #### 3FS USRBIO 插件
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
+
+### 内置元数据服务器
+
+Mooncake Store 提供了内置的 HTTP 元数据服务器作为 etcd 的替代方案，用于存储集群元数据。此功能特别适用于开发环境或 etcd 不可用的场景。
+
+#### 配置参数
+
+HTTP 元数据服务器可通过以下参数进行配置：
+
+- **`enable_http_metadata_server`**（布尔值，默认值：`false`）：启用内置的 HTTP 元数据服务器以替代 etcd。当设置为 `true` 时，主服务将启动一个嵌入式 HTTP 服务器来处理元数据操作。
+
+- **`http_metadata_server_port`**（整型，默认值：`8080`）：指定 HTTP 元数据服务器监听的 TCP 端口。该端口必须可用且不能与其他服务冲突。
+
+- **`http_metadata_server_host`**（字符串，默认值：`"0.0.0.0"`）：指定 HTTP 元数据服务器绑定的主机地址。使用 `"0.0.0.0"` 可监听所有可用网络接口，或指定特定 IP 地址以提高安全性。
+
+#### 使用示例
+
+要使用启用了 HTTP 元数据服务器的主服务，请运行：
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+    --enable_http_metadata_server=true \
+    --http_metadata_server_port=8080 \
+    --http_metadata_server_host=0.0.0.0
+```
+
+启用后，HTTP 元数据服务器将自动启动并为 Mooncake Store 集群提供元数据服务。这消除了对外部 etcd 部署的需求，简化了开发和测试环境的设置过程。
+
+请注意，HTTP 元数据服务器专为单节点部署设计，不提供 etcd 所具备的高可用性功能。对于需要高可用性的生产环境，仍推荐使用 etcd。
 
 ## Mooncake Store Python API
 

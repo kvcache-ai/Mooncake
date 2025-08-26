@@ -30,6 +30,11 @@ struct MasterConfig {
     std::string cluster_id;
     std::string root_fs_dir;
     std::string memory_allocator;
+
+    // HTTP metadata server configuration
+    bool enable_http_metadata_server;
+    uint32_t http_metadata_server_port;
+    std::string http_metadata_server_host;
 };
 
 class MasterServiceSupervisorConfig {

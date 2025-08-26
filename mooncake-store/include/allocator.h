@@ -81,6 +81,10 @@ class AllocatedBuffer {
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
+    [[nodiscard]] std::string getSegmentName() const noexcept {
+        return segment_name_;
+    }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);

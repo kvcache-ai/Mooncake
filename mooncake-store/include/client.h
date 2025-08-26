@@ -75,6 +75,12 @@ class Client {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
         const std::string& object_key);
 
+    /**
+     * @brief Queries replica lists for object keys that match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
@@ -142,6 +148,12 @@ class Client {
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
+    /**
+     * @brief Removes objects from the store whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
     tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
     /**
