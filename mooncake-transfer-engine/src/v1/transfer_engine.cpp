@@ -41,6 +41,7 @@ namespace v1 {
 struct TaskInfo {
     TransportType type;
     int sub_task_id;
+    bool derived;  // merged by other tasks
 };
 
 struct Batch {
@@ -529,7 +530,7 @@ Status TransferEngine::submitTransfer(
 
     size_t start_task_id = batch->task_list.size();
     batch->task_list.insert(batch->task_list.end(), request_list.size(),
-                            {UNSPEC, -1});
+                            {UNSPEC, -1, false});
 
     auto merged = mergeRequests(request_list);
     for (auto &kv : merged.task_lookup) {
@@ -538,8 +539,9 @@ Status TransferEngine::submitTransfer(
         auto &task = batch->task_list[task_id];
         auto &merged_request = merged.request_list[merged_task_id];
         if (merged_task_id_map.count(merged_task_id)) {
-            task_id_list[task.type].push_back(task_id);
             task = merged_task_id_map[merged_task_id];
+            task.derived = true;
+            if (task.type != UNSPEC) task_id_list[task.type].push_back(task_id);
             continue;
         }
 
@@ -553,13 +555,27 @@ Status TransferEngine::submitTransfer(
         if (type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
-        } else {
-            auto sub_task_id = batch->sub_batch[type]->size();
-            classified_request_list[type].push_back(merged_request);
-            task.type = type;
-            task.sub_task_id = sub_task_id;
+            merged_task_id_map[merged_task_id] = task;
+            continue;
         }
 
+        if (!batch->sub_batch[type]) {
+            auto &transport = transport_list_[type];
+            auto status = transport->allocateSubBatch(batch->sub_batch[type],
+                                                      batch->max_size);
+            if (!status.ok()) {
+                LOG(WARNING) << "Failed to allocate SubBatch " << type << ":"
+                             << status.ToString();
+                merged_task_id_map[merged_task_id] = task;
+                continue;
+            }
+        }
+
+        auto sub_task_id = batch->sub_batch[type]->size();
+        classified_request_list[type].push_back(merged_request);
+        task.type = type;
+        task.sub_task_id = sub_task_id;
+        task.derived = false;
         task_id_list[type].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
@@ -568,21 +584,11 @@ Status TransferEngine::submitTransfer(
         if (classified_request_list[type].empty()) continue;
         auto &transport = transport_list_[type];
         auto &sub_batch = batch->sub_batch[type];
-        if (!sub_batch) {
-            auto status =
-                transport->allocateSubBatch(sub_batch, batch->max_size);
-            if (!status.ok()) {
-                LOG(WARNING) << status.ToString();
-                for (auto &task_id : task_id_list[type])
-                    batch->task_list[task_id].type = UNSPEC;
-                continue;
-            }
-        }
-        assert(sub_batch);
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            LOG(WARNING) << status.ToString();
+            LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
+                         << status.ToString();
             for (auto &task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         }
@@ -651,8 +657,11 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
     overall_status.s = WAITING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
+    size_t total_tasks = 0;
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto &task = batch->task_list[task_id];
+        if (task.derived) continue;  // This task is performed by other tasks
+        total_tasks++;
         if (task.type == UNSPEC) {
             overall_status.s = FAILED;
             continue;
@@ -672,7 +681,7 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
             overall_status.s = task_status.s;
         }
     }
-    if (success_tasks == batch->task_list.size()) overall_status.s = COMPLETED;
+    if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     return Status::OK();
 }
 
