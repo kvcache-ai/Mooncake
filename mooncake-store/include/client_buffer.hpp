@@ -5,6 +5,7 @@
 
 #include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 

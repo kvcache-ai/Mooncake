@@ -10,6 +10,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
+#include "replica.h"
 #include "types.h"
 
 namespace mooncake {
