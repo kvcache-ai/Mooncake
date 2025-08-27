@@ -434,7 +434,7 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
         slice->target_dev_id = slice->source_dev_id;
     }
 
-    if (slice->source_dev_id < 0 || slice->target_dev_id < 0)
+    if (slice->target_dev_id < 0)
         return Status::DeviceNotFound(
             "No device could access the slice memory region");
 
