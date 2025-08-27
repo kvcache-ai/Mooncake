@@ -69,7 +69,12 @@ class Buffer:
         self.group_size = group.size()
         self.group = group
         self.num_mxa_bytes = num_mxa_bytes
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_mxa_bytes)
+
+        # Get the index of the closest NIC
+        backend = self.group._get_backend(torch.device('cuda'))
+        preferred_hca = ep.get_preferred_hca(backend, f'cuda:{torch.cuda.current_device()}')
+        nic_id = int(preferred_hca.split('_')[1])
+        self.runtime = ep.Buffer(self.rank, self.group_size, num_mxa_bytes, nic_id)
 
         (raddr, rkey) = self.runtime.get_mr_info()
 

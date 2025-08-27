@@ -88,6 +88,7 @@ struct MooncakeEpBuffer {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
+    int nic_id;
     bool is_roce_ = false;
 
     // Stream for communication
@@ -97,10 +98,11 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
-    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes)
+    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes, int nic_id)
         : rank(rank),
           num_ranks(num_ranks),
           num_mxa_bytes(num_mxa_bytes),
+          nic_id(nic_id),
           comm_stream(at::cuda::getStreamFromPool(true)) {
         // Get ranks
         CUDA_CHECK(cudaGetDevice(&device_id));
@@ -382,36 +384,11 @@ struct MooncakeEpBuffer {
     }
 
     void init_ibgda() {
-        std::ifstream config("gpu_to_nic.txt");
-        if (!config)
-            throw std::runtime_error("Cannot open config file gpu_to_nic.txt");
-        std::unordered_map<int, int> gpu_to_nic;
-        std::string line;
-        for (size_t lineno = 1; std::getline(config, line); ++lineno) {
-            // Strip everything after ‘#’
-            if (auto pos = line.find('#'); pos != std::string::npos)
-                line.erase(pos);
-            std::istringstream iss(line);
-            int gpu, nic;
-            if (!(iss >> gpu >> nic)) {
-                if (iss.rdbuf()->in_avail() == 0)
-                    continue;  // blank or comment line
-                throw std::runtime_error("Parse error in gpu_to_nic.txt line " +
-                                         std::to_string(lineno));
-            }
-            if (!gpu_to_nic.emplace(gpu, nic).second)
-                throw std::runtime_error("Duplicate GPU id on line " +
-                                         std::to_string(lineno));
-        }
-
-        auto nic = gpu_to_nic.find(device_id);
-        if (nic == gpu_to_nic.end())
-            throw std::out_of_range("GPU id not found in config");
         int num_devices;
         ibv_device** dev_list = ibv_get_device_list(&num_devices);
-        printf("GPU %d uses NIC %d out of %d NIC(s)\n", device_id, nic->second,
-               num_devices);
-        ibv_context* ctx = ibv_open_device(dev_list[nic->second]);
+        LOG(INFO) << "[EP] GPU " << device_id << " uses NIC " << nic_id
+                  << " out of " << num_devices << " NIC(s)";
+        ibv_context* ctx = ibv_open_device(dev_list[nic_id]);
         if (!ctx) {
             perror("Failed to open device");
             exit(1);

@@ -49,10 +49,18 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
                      /* extended_api */ true, **kwargsCuda);
 }
 
+std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
+                            std::string location) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getPreferredHca(location);
+}
+
 PYBIND11_MODULE(ep, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
+    m.def("get_preferred_hca", &getPreferredHca);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>,
@@ -68,7 +76,7 @@ PYBIND11_MODULE(ep, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t>())
+        .def(py::init<int, int, int64_t, int>())
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)

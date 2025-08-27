@@ -55,6 +55,11 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
+    std::string getPreferredHca(std::string location) {
+        auto matrix = engine_.getLocalTopology()->getMatrix();
+        return matrix[location].preferred_hca[0];
+    }
+
    private:
     TransferEngine engine_{true};
     bool isCpu_{false};
