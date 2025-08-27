@@ -215,7 +215,6 @@ Status RdmaTransport::submitTransferTasks(
     const size_t block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
     const int num_devices = local_topology_->getDeviceList().size();
-    const uint64_t max_slices = num_workers * num_devices;
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     int start_worker_id = SimpleRandom::Get().next(num_workers);
@@ -227,6 +226,7 @@ Status RdmaTransport::submitTransferTasks(
         task.status_word = WAITING;
         task.transferred_bytes = 0;
 
+        uint64_t max_slices = num_workers * num_devices;
         uint64_t total_blocks = (request.length + block_size - 1) / block_size;
         uint64_t num_slices = std::min(max_slices, total_blocks);
         uint64_t blocks_per_slice =

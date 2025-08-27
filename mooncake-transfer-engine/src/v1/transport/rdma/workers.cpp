@@ -398,33 +398,46 @@ int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
     return -1;
 }
 
-bool Workers::checkAllowCrossNuma(RuoteHint &source) {
-    device_stats_.tryUpdatePeriod();
-    for (auto dev_id : source.topo_entry->device_list[0])
-        device_stats_.addLocalXfer(dev_id);
-    for (auto dev_id : source.topo_entry->device_list[1])
-        device_stats_.addLocalXfer(dev_id);
-    for (auto dev_id : source.topo_entry->device_list[2])
-        if (!device_stats_.allowRemoteXfer(dev_id)) return false;
-    for (auto dev_id : source.topo_entry->device_list[2])
-        device_stats_.addRemoteXfer(dev_id);
-    return true;
-}
-
 Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                                     RdmaSlice *slice, int thread_id) {
-    bool allow_cross_numa = checkAllowCrossNuma(source);
+    device_stats_.tryUpdatePeriod();
     thread_local int tl_next_device_id = thread_id;
     const size_t num_devices = transport_->context_set_.size();
     int rank = -1;
     for (size_t i = 0; i < num_devices; ++i) {
         tl_next_device_id = (tl_next_device_id + 1) % num_devices;
         rank = getDeviceRank(source, tl_next_device_id);
-        if (rank >= 0 && (rank != 2 || allow_cross_numa)) break;
+        if (rank < 0) continue;
+        if (rank == 0 || rank == 1) {
+            device_stats_.addLocalXfer(tl_next_device_id);
+            break;
+        }
+        if (device_stats_.allowRemoteXfer(tl_next_device_id)) {
+            device_stats_.addRemoteXfer(tl_next_device_id);
+            break;
+        }
     }
     if (rank < 0) return Status::DeviceNotFound("No available device");
 
-    slice->target_dev_id = slice->source_dev_id = tl_next_device_id;
+    slice->source_dev_id = tl_next_device_id;
+
+    bool same_machine =
+        (source.segment->machine_id == target.segment->machine_id);
+    if (!same_machine && slice->target_dev_id < 0 &&
+        transport_->cluster_topology_) {
+        auto source_dev = source.topo->getDeviceName(slice->source_dev_id);
+        auto target_dev = transport_->cluster_topology_->findOptimalMapping(
+            source_dev, target.segment->machine_id,
+            target.topo_entry->numa_node);
+        slice->target_dev_id = target.topo->findDeviceID(target_dev);
+    } else {
+        slice->target_dev_id = slice->source_dev_id;
+    }
+
+    if (slice->source_dev_id < 0 || slice->target_dev_id < 0)
+        return Status::DeviceNotFound(
+            "No device could access the slice memory region");
+
     return Status::OK();
 
 #if 0
@@ -455,29 +468,6 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
             slice->source_dev_id = list[seed % list.size()];
         }
     }
-
-    // Target device: first read the cluster topology and find best matching
-    bool same_machine =
-        (source.segment->machine_id == target.segment->machine_id);
-    if (!same_machine && slice->target_dev_id < 0 &&
-        transport_->cluster_topology_) {
-        auto source_dev = source.topo->getDeviceName(slice->source_dev_id);
-        auto target_dev = transport_->cluster_topology_->findOptimalMapping(
-            source_dev, target.segment->machine_id,
-            target.topo_entry->numa_node);
-        slice->target_dev_id = target.topo->findDeviceID(target_dev);
-    }
-
-    // Target device: then find the statically associated one
-    for (size_t rank = 0;
-         slice->target_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
-        auto &list = target.topo_entry->device_list[rank];
-        if (!list.empty()) slice->target_dev_id = list[seed % list.size()];
-    }
-
-    if (slice->source_dev_id < 0 || slice->target_dev_id < 0)
-        return Status::DeviceNotFound(
-            "No device could access the slice memory region");
 
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];

@@ -196,23 +196,24 @@ class Workers {
     struct DeviceStats {
         DeviceStats(size_t num_devices) : num_devices(num_devices) {
             local_xfer_counts = new std::atomic<uint64_t>[num_devices];
-            total_xfer_counts = new std::atomic<uint64_t>[num_devices];
+            remote_xfer_counts = new std::atomic<uint64_t>[num_devices];
             allow_remote_xfer = new std::atomic<bool>[num_devices];
+            for (size_t i = 0; i < num_devices; ++i)
+                allow_remote_xfer[i] = true;
         }
 
         ~DeviceStats() {
             delete[] local_xfer_counts;
-            delete[] total_xfer_counts;
+            delete[] remote_xfer_counts;
             delete[] allow_remote_xfer;
         }
 
         void addLocalXfer(int dev_id) {
             local_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
-            total_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
         }
 
         void addRemoteXfer(int dev_id) {
-            total_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
+            remote_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
         }
 
         bool allowRemoteXfer(int dev_id) {
@@ -227,14 +228,13 @@ class Workers {
                 if (current_ts - last_ts > kRefreshPeriod) {
                     for (size_t i = 0; i < num_devices; ++i) {
                         auto &allow = allow_remote_xfer[i];
-                        if (!total_xfer_counts[i])
+                        if (!local_xfer_counts[i]) {
                             allow = true;
-                        else {
-                            allow = (local_xfer_counts[i] * 100 /
-                                     total_xfer_counts[i]) < 5;
+                        } else {
+                            allow = (remote_xfer_counts[i] == 0);
                         }
                         local_xfer_counts[i] = 0;
-                        total_xfer_counts[i] = 0;
+                        remote_xfer_counts[i] = 0;
                     }
                     last_ts = current_ts;
                 }
@@ -245,13 +245,11 @@ class Workers {
         std::atomic<uint64_t> last_ts{0};
         const size_t num_devices;
         std::atomic<uint64_t> *local_xfer_counts;
-        std::atomic<uint64_t> *total_xfer_counts;
+        std::atomic<uint64_t> *remote_xfer_counts;
         std::atomic<bool> *allow_remote_xfer;
     };
 
     DeviceStats device_stats_;
-
-    bool checkAllowCrossNuma(RuoteHint &source);
 };
 }  // namespace v1
 }  // namespace mooncake
