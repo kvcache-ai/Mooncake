@@ -65,13 +65,19 @@ PYBIND11_MODULE(ep, m) {
         .def(py::init<>())
         .def("current_stream_wait", &EventHandle::current_stream_wait);
 
+    m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
+
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t>())
-        .def("sync", &MooncakeEpBuffer::sync)
+        .def("is_roce", &MooncakeEpBuffer::is_roce)
+        .def("sync_ib", &MooncakeEpBuffer::sync_ib)
+        .def("sync_roce", &MooncakeEpBuffer::sync_roce)
         .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
         .def("get_gid", &MooncakeEpBuffer::get_gid)
-        .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
-        .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
+        .def("get_local_qpns_ib", &MooncakeEpBuffer::get_local_qpns_ib)
+        .def("get_local_lids_ib", &MooncakeEpBuffer::get_local_lids_ib)
+        .def("get_local_qpns_roce", &MooncakeEpBuffer::get_local_qpns_roce)
+        .def("get_local_lids_roce", &MooncakeEpBuffer::get_local_lids_roce)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",

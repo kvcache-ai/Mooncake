@@ -8,8 +8,6 @@
 #include <mooncake_ibgda/mlx5gda.h>
 #include <mooncake_ep_utils.cuh>
 
-#define TIMEOUT_TICKS 100000000000l
-
 namespace mooncake {
 
 static __device__ void device_mutex_lock_system(uint32_t *mutex) {
@@ -195,6 +193,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -276,7 +275,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 if (dst_rank != rank) {
                     if (lane_id == 0) {
                         uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank;
+                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
                         device_mutex_lock_system(&ctx->mutex);
                         __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
                         __mlx5gda_device_post_send_db(ctx);
@@ -345,7 +344,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
             uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
             uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-            auto ctx = ctx_array + dst_rank;
+            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
             device_mutex_lock_system(&ctx->mutex);
             __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
             __mlx5gda_device_post_send_db(ctx);
@@ -531,6 +530,7 @@ combine(void* combined_x, int32_t* gathered_experts,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -585,7 +585,7 @@ combine(void* combined_x, int32_t* gathered_experts,
 
                 if (lane_id == 0) {
                     uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                    auto ctx = ctx_array + dst_rank;
+                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
                     device_mutex_lock_system(&ctx->mutex);
                     __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
                     __mlx5gda_device_post_send_db(ctx);
@@ -602,7 +602,7 @@ combine(void* combined_x, int32_t* gathered_experts,
             if (dst_rank != rank) {
                 uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
                 uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                auto ctx = ctx_array + dst_rank;
+                auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
                 device_mutex_lock_system(&ctx->mutex);
                 __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
                 __mlx5gda_device_post_send_db(ctx);
