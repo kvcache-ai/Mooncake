@@ -72,11 +72,11 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
             auto dit = devices_.find(dev_id);
             if (dit == devices_.end()) continue;
             const auto &d = dit->second;
-            double w = d.bw_gbps * rw;
+            double w = d.bw_gbps * 1e9 * rw;
             if (!allow_cross_numa_ && d.numa_id != entry.numa_node) continue;
             if (w <= 0.0) continue;
             uint64_t act = d.active_bytes.load(std::memory_order_relaxed);
-            double adj = w / (1.0 + static_cast<double>(act) / 1e9);
+            double adj = w / (1.0 + static_cast<double>(act));
             cands.push_back(Cand{dev_id, w, act, adj});
         }
     }
@@ -109,44 +109,32 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
 
     struct Tmp {
         int dev_id;
-        double share_f;
         uint64_t alloc;
         double frac;
     };
+
     std::vector<Tmp> tmp;
+    tmp.reserve(cands.size());
+
     uint64_t allocated = 0;
     for (auto &c : cands) {
         double share_f = static_cast<double>(data_size) * (c.adj_w / total_w);
-        uint64_t alloc_aligned =
-            (static_cast<uint64_t>(share_f) / slice_size_) * slice_size_;
-        tmp.push_back(Tmp{c.dev_id, share_f, alloc_aligned,
-                          share_f - static_cast<double>(alloc_aligned)});
-        allocated += alloc_aligned;
+        uint64_t alloc_i = static_cast<uint64_t>(share_f);
+        tmp.push_back(Tmp{c.dev_id, alloc_i, share_f - alloc_i});
+        allocated += alloc_i;
     }
 
-    uint64_t remaining = (data_size > allocated) ? (data_size - allocated) : 0;
-
-    if (remaining >= slice_size_) {
+    uint64_t remaining = data_size - allocated;
+    if (remaining > 0) {
         std::sort(tmp.begin(), tmp.end(),
                   [](const Tmp &a, const Tmp &b) { return a.frac > b.frac; });
         size_t idx = 0;
-        while (remaining >= slice_size_) {
-            tmp[idx % tmp.size()].alloc += slice_size_;
-            remaining -= slice_size_;
-            allocated += slice_size_;
+        while (remaining > 0) {
+            tmp[idx % tmp.size()].alloc += 1;
+            allocated += 1;
+            --remaining;
             ++idx;
         }
-    }
-
-    if (remaining > 0) {
-        auto it = std::max_element(
-            tmp.begin(), tmp.end(),
-            [](const Tmp &a, const Tmp &b) { return a.frac < b.frac; });
-        if (it != tmp.end()) {
-            it->alloc += remaining;
-            allocated += remaining;
-        }
-        remaining = 0;
     }
 
     assert(allocated == data_size);
