@@ -121,13 +121,6 @@ Status RdmaTransport::install(std::string &local_segment_name,
             cluster_topology_->load(machine_id, cluster_topology_path));
         LOG(INFO) << "Cluster topology file loaded: " << cluster_topology_path;
     }
-    if (conf_->get("transports/rdma/scheduler", false)) {
-        auto scheduler_path =
-            conf_->get("transports/rdma/scheduler_path", "/mooncake_sched");
-        scheduler_ = std::make_unique<Scheduler>(scheduler_path);
-        CHECK_STATUS(scheduler_->constructState());
-        LOG(INFO) << "Inter-process scheduler started: " << scheduler_path;
-    }
     auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
         params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getDeviceList();
@@ -148,6 +141,9 @@ Status RdmaTransport::install(std::string &local_segment_name,
         return Status::DeviceNotFound(
             "No RDMA device detected in active" LOC_MARK);
     }
+
+    device_quota_ = std::make_unique<DeviceQuota>();
+    CHECK_STATUS(device_quota_->loadTopology(local_topology_));
 
     local_topology_->print();
     setupLocalSegment();
@@ -171,7 +167,6 @@ Status RdmaTransport::uninstall() {
         context_set_.clear();
         context_name_lookup_.clear();
         cluster_topology_.reset();
-        scheduler_.reset();
         installed_ = false;
     }
     return Status::OK();
@@ -214,7 +209,6 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const int num_devices = local_topology_->getDeviceList().size();
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     int start_worker_id = SimpleRandom::Get().next(num_workers);
@@ -226,38 +220,49 @@ Status RdmaTransport::submitTransferTasks(
         task.status_word = WAITING;
         task.transferred_bytes = 0;
 
-        uint64_t max_slices = num_workers * num_devices;
-        uint64_t total_blocks = (request.length + block_size - 1) / block_size;
-        uint64_t num_slices = std::min(max_slices, total_blocks);
-        uint64_t blocks_per_slice =
-            (total_blocks + num_slices - 1) / num_slices;
-        uint64_t slice_bytes = blocks_per_slice * block_size;
+        std::vector<DeviceQuota::AllocPlan> plan_list;
+        auto buffer =
+            getBufferDesc(metadata_->segmentManager().getLocal().get(),
+                          (uint64_t)request.source, request.length);
+        CHECK_STATUS(device_quota_->allocate(
+            request.length, buffer ? buffer->location : "", plan_list));
 
-        for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
-            uint64_t offset = slice_idx * slice_bytes;
-            if (offset >= request.length) break;
-            uint64_t remaining = request.length - offset;
-            auto slice = RdmaSliceStorage::Get().allocate();
-            slice->source_addr = (char *)request.source + offset;
-            slice->target_addr = request.target_offset + offset;
-            slice->length = std::min(slice_bytes, remaining);
-            slice->task = &task;
-            slice->retry_count = 0;
-            slice->endpoint_quota = nullptr;
-            slice->next = nullptr;
-            task.num_slices++;
-            // start_worker_id ensures load balancing for each worker
-            // For large requests, we also distribute them into multiple workers
-            // so that multiple QP links can be fully utilized
-            int part_id = (slice_idx + start_worker_id) % num_workers;
-            auto &list = slice_lists[part_id];
-            auto &tail = slice_tails[part_id];
-            list.num_slices++;
-            if (list.first) {
-                tail->next = slice;
-                tail = slice;
-            } else {
-                list.first = tail = slice;
+        for (auto &plan : plan_list) {
+            uint64_t remaining = plan.length;
+
+            // 至少切成 num_workers 块，充分利用 QP
+            uint64_t blocks = (remaining + block_size - 1) / block_size;
+            uint64_t num_slices = std::min<uint64_t>(num_workers, blocks);
+            uint64_t blocks_per_slice = (blocks + num_slices - 1) / num_slices;
+            uint64_t slice_bytes = blocks_per_slice * block_size;
+            for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
+                uint64_t offset = slice_idx * slice_bytes;
+                if (offset >= remaining) break;
+                uint64_t cur_len = std::min(slice_bytes, remaining - offset);
+
+                auto slice = RdmaSliceStorage::Get().allocate();
+                slice->source_addr =
+                    (char *)request.source + plan.offset + offset;
+                slice->target_addr =
+                    request.target_offset + plan.offset + offset;
+                slice->length = cur_len;
+                slice->task = &task;
+                slice->retry_count = 0;
+                slice->endpoint_quota = nullptr;
+                slice->next = nullptr;
+                slice->source_dev_id = plan.dev_id;
+                task.num_slices++;
+
+                int part_id = (slice_idx + start_worker_id) % num_workers;
+                auto &list = slice_lists[part_id];
+                auto &tail = slice_tails[part_id];
+                list.num_slices++;
+                if (list.first) {
+                    tail->next = slice;
+                    tail = slice;
+                } else {
+                    list.first = tail = slice;
+                }
             }
         }
     }
@@ -265,7 +270,7 @@ Status RdmaTransport::submitTransferTasks(
     for (int part_id = 0; part_id < num_workers; ++part_id) {
         if (slice_lists[part_id].first) {
             rdma_batch->slice_chain.push_back(slice_lists[part_id].first);
-            workers_->submit(slice_lists[part_id], part_id % num_workers);
+            workers_->submit(slice_lists[part_id], part_id);
         }
     }
     return Status::OK();

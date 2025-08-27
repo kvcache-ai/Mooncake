@@ -31,7 +31,7 @@
 #include "buffers.h"
 #include "context.h"
 #include "slice.h"
-#include "scheduler.h"
+#include "quota.h"
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 #include "v1/utility/topology.h"
@@ -105,7 +105,7 @@ class RdmaTransport : public Transport {
     std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
     std::unique_ptr<ClusterTopology> cluster_topology_;
-    std::unique_ptr<Scheduler> scheduler_;
+    std::unique_ptr<DeviceQuota> device_quota_;
 };
 }  // namespace v1
 }  // namespace mooncake

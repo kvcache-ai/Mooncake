@@ -262,6 +262,10 @@ void Workers::asyncPollCq(int thread_id) {
                 endpoint_quota_map[slice->endpoint_quota]++;
             else
                 endpoint_quota_map[slice->endpoint_quota] = 1;
+            if (slice->retry_count == 0) {
+                transport_->device_quota_->release(slice->source_dev_id,
+                                                   slice->length);
+            }
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     LOG(ERROR)
@@ -282,9 +286,6 @@ void Workers::asyncPollCq(int thread_id) {
                     submit(slice);
                 }
             } else {
-                if (slice->has_lease) {
-                    transport_->scheduler_->closeJob(slice->lease);
-                }
                 markSliceSuccess(slice);
             }
         }
@@ -400,26 +401,10 @@ int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
 
 Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                                     RdmaSlice *slice, int thread_id) {
-    device_stats_.tryUpdatePeriod();
-    thread_local int tl_next_device_id = thread_id;
-    const size_t num_devices = transport_->context_set_.size();
-    int rank = -1;
-    for (size_t i = 0; i < num_devices; ++i) {
-        tl_next_device_id = (tl_next_device_id + 1) % num_devices;
-        rank = getDeviceRank(source, tl_next_device_id);
-        if (rank < 0) continue;
-        if (rank == 0 || rank == 1) {
-            device_stats_.addLocalXfer(tl_next_device_id);
-            break;
-        }
-        if (device_stats_.allowRemoteXfer(tl_next_device_id)) {
-            device_stats_.addRemoteXfer(tl_next_device_id);
-            break;
-        }
-    }
-    if (rank < 0) return Status::DeviceNotFound("No available device");
-
-    slice->source_dev_id = tl_next_device_id;
+    // Source DEVID has been selected in RdmaTransport::submitTransferTasks
+    if (slice->source_dev_id < 0)
+        return Status::DeviceNotFound(
+            "No device could access the slice memory region");
 
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
