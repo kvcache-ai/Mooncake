@@ -87,6 +87,11 @@ void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
                                                  dst.numel(), numRanks,
                                                  brokenRanks);
             break;
+        case c10::kFloat:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<float>(),
+                                                 (float*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
         case c10::kBFloat16:
             reduceKernel<<<64, 256, 0, stream>>>(
                 dst.data_ptr<at::BFloat16>(), (at::BFloat16*)src, dst.numel(),
