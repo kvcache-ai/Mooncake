@@ -14,15 +14,15 @@ def init_dist(local_rank: int, num_local_ranks: int):
     node_rank = int(os.getenv('RANK', 0))
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend='nccl',
+        backend='mooncake',
         init_method=f'tcp://{ip}:{port}',
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank
     )
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
