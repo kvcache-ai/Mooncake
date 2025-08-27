@@ -21,7 +21,7 @@ int DeviceQuota::findNumaIdByTopology(int dev_id) {
     int numa_id = -1;
     for (const auto &kv : local_topology_->getResolvedMatrix()) {
         const auto &entry = kv.second;
-        for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+        for (size_t rank = 0; rank < DevicePriorityRanks - 1; ++rank) {
             if (std::find(entry.device_list[rank].begin(),
                           entry.device_list[rank].end(),
                           dev_id) != entry.device_list[rank].end()) {
@@ -56,7 +56,7 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
     }
 
     const ResolvedTopologyEntry &entry = it_loc->second;
-    static constexpr double rank_weights[] = {1.0, 0.5, 0.25};
+    static constexpr double rank_weights[] = {1.0, 0.75, 0.25};
 
     struct Cand {
         int dev_id;

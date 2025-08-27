@@ -212,6 +212,7 @@ Status RdmaTransport::submitTransferTasks(
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     int start_worker_id = SimpleRandom::Get().next(num_workers);
+    auto local_segment = metadata_->segmentManager().getLocal().get();
     for (auto &request : request_list) {
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list.back();
@@ -221,9 +222,8 @@ Status RdmaTransport::submitTransferTasks(
         task.transferred_bytes = 0;
 
         std::vector<DeviceQuota::AllocPlan> plan_list;
-        auto buffer =
-            getBufferDesc(metadata_->segmentManager().getLocal().get(),
-                          (uint64_t)request.source, request.length);
+        auto buffer = getBufferDesc(local_segment, (uint64_t)request.source,
+                                    request.length);
         CHECK_STATUS(device_quota_->allocate(
             request.length, buffer ? buffer->location : "", plan_list));
 
