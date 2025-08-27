@@ -30,9 +30,4 @@ void combine(void* combined_x, int32_t* gathered_experts, void* mxa_buffer,
              cudaStream_t stream, int64_t timeout_ticks, int phases,
              bool zero_copy);
 
-void all_reduce_without(const int32_t* broken_nodes, int* x, int* mxa_buffer,
-                        void* raddrs, void* rkeys, void* qp_devctxs,
-                        int num_experts, int rank, int num_ranks,
-                        cudaStream_t stream);
-
 }  // namespace mooncake

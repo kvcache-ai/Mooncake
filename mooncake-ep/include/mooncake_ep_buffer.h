@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -38,9 +37,7 @@ struct BufferPair {
     }
 
     BufferPair(void* rdma_buffer, int num_max_dispatch_tokens_per_rank,
-               int hidden, int num_ranks, int num_experts,
-               size_t bytes_reserved) {
-        total_bytes = bytes_reserved;
+               int hidden, int num_ranks, int num_experts) {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
@@ -81,7 +78,6 @@ struct MooncakeEpBuffer {
     int buffer_idx{};
     int64_t num_mxa_bytes;
     void* gdr_buffer = nullptr;
-    size_t bytes_reserved;  // For all-reduce
 
     // IBGDA
     const size_t ctrl_buf_size = 256 * 1024 * 1024;  // 256 MiB
@@ -100,12 +96,10 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
-    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes,
-           size_t bytes_reserved)
+    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes)
         : rank(rank),
           num_ranks(num_ranks),
           num_mxa_bytes(num_mxa_bytes),
-          bytes_reserved(bytes_reserved),
           comm_stream(at::cuda::getStreamFromPool(true)) {
         // Get ranks
         CUDA_CHECK(cudaGetDevice(&device_id));
@@ -157,8 +151,8 @@ struct MooncakeEpBuffer {
 
         // Buffer control
         BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
-                          num_ranks, num_experts, bytes_reserved);
-        EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes + bytes_reserved);
+                          num_ranks, num_experts);
+        EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes);
         auto buffer = layout.buffers[buffer_idx];
         auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
@@ -293,8 +287,8 @@ struct MooncakeEpBuffer {
 
         // Buffer control
         BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
-                          num_ranks, num_experts, bytes_reserved);
-        EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes + bytes_reserved);
+                          num_ranks, num_experts);
+        EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes);
         auto buffer = layout.buffers[buffer_idx];
         auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
@@ -366,7 +360,7 @@ struct MooncakeEpBuffer {
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts) {
         BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
-                          num_ranks, num_experts, bytes_reserved);
+                          num_ranks, num_experts);
 
         auto buffer = layout.buffers[buffer_idx];
         auto dtype = torch::kBFloat16;
@@ -383,18 +377,6 @@ struct MooncakeEpBuffer {
             {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems,
              num_msg_elems, 1},
             torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
-    }
-
-    void all_reduce_without(const torch::Tensor& broken_nodes,
-                            torch::Tensor& x) {
-        auto mxa_buffer = reinterpret_cast<int*>(gdr_buffer);
-        int size = x.numel();
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        cudaMemsetAsync(mxa_buffer, 0, (1 + size) * num_ranks * sizeof(int),
-                        stream);
-        mooncake::all_reduce_without(broken_nodes.data_ptr<int32_t>(),
-                                   x.data_ptr<int>(), mxa_buffer, raddrs, rkeys,
-                                   qp_devctxs, size, rank, num_ranks, stream);
     }
 
     void init_ibgda() {
@@ -562,14 +544,13 @@ struct MooncakeEpBuffer {
     }
 };
 
-inline size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
-                         int num_ranks, int num_experts,
-                         size_t bytes_reserved) {
+inline size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank,
+                                int hidden, int num_ranks, int num_experts) {
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks, num_experts, bytes_reserved)
+                      num_ranks, num_experts)
         .total_bytes;
 }
 
 }  // namespace mooncake
 
-#endif //MOONCAKE_EP_BUFFER_H
+#endif  // MOONCAKE_EP_BUFFER_H

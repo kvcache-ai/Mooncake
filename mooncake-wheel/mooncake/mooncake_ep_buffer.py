@@ -63,13 +63,13 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_mxa_bytes: int = 0, bytes_reserved: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_mxa_bytes: int = 0):
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_mxa_bytes = num_mxa_bytes
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_mxa_bytes, bytes_reserved)
+        self.runtime = ep.Buffer(self.rank, self.group_size, num_mxa_bytes)
 
         (raddr, rkey) = self.runtime.get_mr_info()
 
@@ -103,8 +103,8 @@ class Buffer:
         self.runtime.sync(raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids)
 
     @staticmethod
-    def get_mxa_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int, bytes_reserved: int = 0) -> int:
-        return ep.get_mxa_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, bytes_reserved)
+    def get_mxa_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+        return ep.get_mxa_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, broken_nodes: torch.Tensor,
@@ -139,6 +139,3 @@ class Buffer:
     def get_next_combine_buffer(self, handle: object):
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
-
-    def all_reduce_without(self, broken_nodes: torch.Tensor, x: torch.Tensor):
-        self.runtime.all_reduce_without(broken_nodes, x)

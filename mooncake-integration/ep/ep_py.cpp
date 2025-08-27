@@ -66,13 +66,12 @@ PYBIND11_MODULE(ep, m) {
         .def("current_stream_wait", &EventHandle::current_stream_wait);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, size_t>())
+        .def(py::init<int, int, int64_t>())
         .def("sync", &MooncakeEpBuffer::sync)
         .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
         .def("get_gid", &MooncakeEpBuffer::get_gid)
         .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
         .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
-        .def("all_reduce_without", &MooncakeEpBuffer::all_reduce_without)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",
