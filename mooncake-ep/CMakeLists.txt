@@ -8,10 +8,11 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 if(NOT PYTORCH_CMAKE_PATH)
-  message(FATAL_ERROR "Could not find PyTorch CMake path! Please set Torch_DIR.")
+  message(WARNING "Could not find PyTorch CMake path! Please set Torch_DIR.")
+else ()
+  message(STATUS "Found PyTorch CMake path: ${PYTORCH_CMAKE_PATH}")
+  list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
 endif()
-message(STATUS "Found PyTorch CMake path: ${PYTORCH_CMAKE_PATH}")
-list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Torch REQUIRED)
