@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <random>
@@ -79,7 +80,7 @@ class AllocationStrategy {
  */
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
-    RandomAllocationStrategy() : rng_(std::random_device{}()) {}
+    RandomAllocationStrategy() = default;
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
@@ -140,10 +141,6 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         return replicas;
     }
-
-   private:
-    static constexpr size_t kMaxRetryLimit = 10;
-    std::mt19937 rng_;
 
     std::optional<ErrorCode> validateInput(
         const std::vector<size_t>& slice_sizes, size_t replica_num) const {
@@ -223,7 +220,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
     }
 
     /**
-     * @brief Attempts allocation with random selection
+     * @brief Attempts allocation with random selection from allocators that can
+     * fit the size
      */
     std::unique_ptr<AllocatedBuffer> tryRandomAllocate(
         const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
@@ -231,7 +229,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         std::vector<size_t> eligible_indices;
         eligible_indices.reserve(allocators.size());
         for (size_t i = 0; i < allocators.size(); ++i) {
-            if (!excluded_segments.contains(allocators[i]->getSegmentName())) {
+            if (!excluded_segments.contains(allocators[i]->getSegmentName()) &&
+                allocators[i]->getLargestFreeRegion() >= size) {
                 eligible_indices.push_back(i);
             }
         }
@@ -240,7 +239,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return nullptr;
         }
 
-        std::shuffle(eligible_indices.begin(), eligible_indices.end(), rng_);
+        // Thread-local random number generator for thread safety
+        thread_local std::mt19937 rng(std::random_device{}());
+        std::shuffle(eligible_indices.begin(), eligible_indices.end(), rng);
 
         const size_t max_tries =
             std::min(kMaxRetryLimit, eligible_indices.size());
@@ -249,10 +250,26 @@ class RandomAllocationStrategy : public AllocationStrategy {
             if (auto buffer = allocator->allocate(size)) {
                 return buffer;
             }
+            retry_counter_.fetch_add(1);  // Track allocation attempts
         }
 
         return nullptr;
     }
+
+    /**
+     * @brief Get the number of allocation retry attempts
+     */
+    uint64_t getRetryCount() const { return retry_counter_.load(); }
+
+    /**
+     * @brief Reset the retry counter
+     */
+    void resetRetryCount() { retry_counter_.store(0); }
+
+   private:
+    static constexpr size_t kMaxRetryLimit = 10;
+    // Observer for allocation retries
+    std::atomic_uint64_t retry_counter_{0};
 };
 
 }  // namespace mooncake
