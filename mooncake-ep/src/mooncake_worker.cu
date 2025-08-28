@@ -192,6 +192,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
     hasCallback_[taskId] = true;
     callbacks_[taskId] = [this, bufferToTensor, taskId, future] {
+        for (int i = 0; i < size_; ++i) {
+            brokenRanksTensor_[i] = brokenRanks_[i] ? 1 : 0;
+        }
         bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
         future->markCompleted(c10::IValue());
     };

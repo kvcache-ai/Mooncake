@@ -24,9 +24,9 @@ MooncakeBackend::MooncakeBackend(
       isCpu_(isCpu),
       worker_(&engine_, rank, size,
               options ? options->brokenRanks_
-                      : at::zeros(
-                            {size},
-                            torch::dtype(torch::kInt32).device(torch::kCUDA))) {
+                      : at::zeros({size}, torch::dtype(torch::kInt32)
+                                              .device(isCpu ? torch::kCPU
+                                                            : torch::kCUDA))) {
     // Get device data
     int deviceId_;
     cudaError err = cudaGetDevice(&deviceId_);
