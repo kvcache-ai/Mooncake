@@ -191,10 +191,8 @@ notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
             freeNotifsMsgBuf(notifies, *size);
             return nullptr;
         }
-        strncpy(notifies[i].name, notifies_desc[i].name.c_str(),
-                notifies_desc[i].name.size());
-        strncpy(notifies[i].msg, notifies_desc[i].notify_msg.c_str(),
-                notifies_desc[i].name.size());
+        strcpy(notifies[i].name, notifies_desc[i].name.c_str());
+        strcpy(notifies[i].msg, notifies_desc[i].notify_msg.c_str());
     }
     return notifies;
 }
