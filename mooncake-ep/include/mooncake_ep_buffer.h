@@ -496,10 +496,10 @@ struct MooncakeEpBuffer {
                    const std::vector<int32_t>& remote_qpns,
                    const std::vector<int64_t>& subnet_prefixes,
                    const std::vector<int64_t>& interface_ids) {
-        for (int i = 0; i < num_ranks; ++i) {
+        for (int i = 0; i < MAX_QP_COUNT; ++i) {
             ibv_gid remote_gid{};
-            remote_gid.global.subnet_prefix = subnet_prefixes[i];
-            remote_gid.global.interface_id = interface_ids[i];
+            remote_gid.global.subnet_prefix = subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
+            remote_gid.global.interface_id = interface_ids[i * num_ranks / MAX_QP_COUNT];
             ibv_ah_attr ah_attr = {};
             ah_attr.is_global = 1;
             ah_attr.grh.dgid = remote_gid;
@@ -516,17 +516,15 @@ struct MooncakeEpBuffer {
                 perror("Failed to mlx5gda_modify_rc_qp_rtr2rts");
                 exit(1);
             }
+        }
+        for (int i = 0; i < num_ranks; ++i) {
             uint64_t raddr =
                 i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
+            cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
+                       cudaMemcpyHostToDevice);
             uint32_t rkey = i == rank ? mr->lkey : (uint32_t)remote_keys[i];
-            const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
-            for (int j = 0; j < num_qp_per_rank; ++j) {
-                int idx = i * num_qp_per_rank + j;
-                cudaMemcpy(raddrs + idx * sizeof(uint64_t), &raddr,
-                           sizeof(uint64_t), cudaMemcpyHostToDevice);
-                cudaMemcpy(rkeys + idx * sizeof(uint32_t), &rkey,
-                           sizeof(uint32_t), cudaMemcpyHostToDevice);
-            }
+            cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
+                       cudaMemcpyHostToDevice);
         }
     }
 
@@ -534,7 +532,12 @@ struct MooncakeEpBuffer {
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
     }
 
-    std::vector<int32_t> get_local_qpns_ib() {
+    std::tuple<int64_t, int64_t> get_gid() {
+        return {(int64_t)gid.global.subnet_prefix,
+                (int64_t)gid.global.interface_id};
+    }
+
+    std::vector<int32_t> get_local_qpns() {
         std::vector<int32_t> local_qpns;
         for (int i = 0; i < MAX_QP_COUNT; ++i) {
             local_qpns.push_back((int32_t)qps[i]->qpn);
@@ -542,35 +545,10 @@ struct MooncakeEpBuffer {
         return local_qpns;
     }
 
-    std::vector<int32_t> get_local_lids_ib() {
+    std::vector<int32_t> get_local_lids() {
         std::vector<int32_t> local_lids;
         for (int i = 0; i < MAX_QP_COUNT; ++i) {
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
-        }
-        return local_lids;
-    }
-
-    std::tuple<int64_t, int64_t> get_gid() {
-        return {(int64_t)gid.global.subnet_prefix,
-                (int64_t)gid.global.interface_id};
-    }
-
-    std::vector<torch::Tensor> get_local_qpns_roce() {
-        std::vector<torch::Tensor> local_qpns;
-        for (int i = 0; i < num_ranks; ++i) {
-            local_qpns.push_back(
-                torch::full({1}, qps[i]->qpn,
-                            torch::dtype(torch::kInt32).device(torch::kCUDA)));
-        }
-        return local_qpns;
-    }
-
-    std::vector<torch::Tensor> get_local_lids_roce() {
-        std::vector<torch::Tensor> local_lids;
-        for (int i = 0; i < num_ranks; ++i) {
-            local_lids.push_back(
-                torch::full({1}, qps[i]->port_attr.lid,
-                            torch::dtype(torch::kInt32).device(torch::kCUDA)));
         }
         return local_lids;
     }

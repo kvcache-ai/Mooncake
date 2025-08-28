@@ -88,6 +88,14 @@ class Buffer:
         dist.all_gather(rkeys, rkey)
         rkeys = torch.cat(rkeys).tolist()
 
+        all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+
+        local_qpns = self.runtime.get_local_qpns()
+        local_qpns = list(torch.unbind(torch.tensor(local_qpns, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
+        remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+        dist.all_to_all(remote_qpns, local_qpns)
+        remote_qpns = torch.cat(remote_qpns).tolist()
+
         if self.runtime.is_roce():
             (subnet_prefix, interface_id) = self.runtime.get_gid()
 
@@ -101,22 +109,10 @@ class Buffer:
             dist.all_gather(interface_ids, interface_id)
             interface_ids = torch.cat(interface_ids).tolist()
 
-            local_qpns = self.runtime.get_local_qpns_roce()
-            remote_qpns = [torch.empty(1, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-            dist.all_to_all(remote_qpns, local_qpns)
-            remote_qpns = torch.cat(remote_qpns).tolist()
-
             self.runtime.sync_roce(raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids)
         else:
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
-            local_qpns = self.runtime.get_local_qpns_ib()
-            local_qpns = list(torch.unbind(torch.tensor(local_qpns, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
-            remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-            dist.all_to_all(remote_qpns, local_qpns)
-            remote_qpns = torch.cat(remote_qpns).tolist()
-
-            local_lids = self.runtime.get_local_lids_ib()
+            local_lids = self.runtime.get_local_lids()
             local_lids = list(torch.unbind(torch.tensor(local_lids, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
             remote_lids = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
             dist.all_to_all(remote_lids, local_lids)
