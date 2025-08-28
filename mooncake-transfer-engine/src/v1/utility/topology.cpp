@@ -458,5 +458,22 @@ Status Topology::disableDevice(const std::string &device_name) {
     }
     return resolve();
 }
+
+int Topology::findDeviceNumaID(int dev_id) const {
+    int numa_id = -1;
+    for (const auto &kv : getResolvedMatrix()) {
+        const auto &entry = kv.second;
+        for (size_t rank = 0; rank < DevicePriorityRanks - 1; ++rank) {
+            if (std::find(entry.device_list[rank].begin(),
+                          entry.device_list[rank].end(),
+                          dev_id) != entry.device_list[rank].end()) {
+                numa_id = entry.numa_node;
+                break;
+            }
+        }
+        if (numa_id != -1) break;
+    }
+    return numa_id >= 0 ? numa_id : 0;
+}
 }  // namespace v1
 }  // namespace mooncake

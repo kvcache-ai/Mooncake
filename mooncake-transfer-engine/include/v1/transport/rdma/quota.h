@@ -61,9 +61,6 @@ class DeviceQuota {
     Status release(int dev_id, uint64_t length);
 
    private:
-    int findNumaIdByTopology(int dev_id);
-
-   private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
     mutable std::shared_mutex rwlock_;

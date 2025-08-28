@@ -26,8 +26,6 @@
 #include <type_traits>
 #include <vector>
 
-#include "scheduler.h"
-
 #include "v1/transport/transport.h"
 #include "v1/memory/slab.h"
 
@@ -64,8 +62,6 @@ struct RdmaSlice {
     uint32_t target_rkey = 0;
     int source_dev_id = -1;
     int target_dev_id = -1;
-    bool has_lease = false;
-    LeaseId lease = 0;
 
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;

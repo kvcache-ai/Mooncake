@@ -14,34 +14,21 @@
 
 #include "v1/transport/rdma/quota.h"
 #include <assert.h>
+#include <unordered_set>
 
 namespace mooncake {
 namespace v1 {
-int DeviceQuota::findNumaIdByTopology(int dev_id) {
-    int numa_id = -1;
-    for (const auto &kv : local_topology_->getResolvedMatrix()) {
-        const auto &entry = kv.second;
-        for (size_t rank = 0; rank < DevicePriorityRanks - 1; ++rank) {
-            if (std::find(entry.device_list[rank].begin(),
-                          entry.device_list[rank].end(),
-                          dev_id) != entry.device_list[rank].end()) {
-                numa_id = entry.numa_node;
-                break;
-            }
-        }
-        if (numa_id != -1) break;
-    }
-    return numa_id >= 0 ? numa_id : 0;
-}
-
 Status DeviceQuota::loadTopology(std::shared_ptr<Topology> &local_topology) {
     local_topology_ = local_topology;
+    std::unordered_set<int> used_numa_id;
     for (size_t dev_id = 0; dev_id < local_topology->getDeviceList().size();
          ++dev_id) {
         devices_[dev_id].dev_id = dev_id;
-        devices_[dev_id].bw_gbps = 200;
-        devices_[dev_id].numa_id = findNumaIdByTopology(dev_id);
+        devices_[dev_id].bw_gbps = local_topology->findDeviceBandwidth(dev_id);
+        devices_[dev_id].numa_id = local_topology->findDeviceNumaID(dev_id);
+        used_numa_id.insert(devices_[dev_id].numa_id);
     }
+    if (used_numa_id.size() == 1) allow_cross_numa_ = true;
     return Status::OK();
 }
 

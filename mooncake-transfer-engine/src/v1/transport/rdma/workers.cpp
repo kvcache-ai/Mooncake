@@ -473,7 +473,6 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
                                      RdmaSlice *slice) {
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
-    slice->has_lease = false;
 
     size_t src_total = 0;
     for (size_t srank = 0; srank < DevicePriorityRanks; ++srank)

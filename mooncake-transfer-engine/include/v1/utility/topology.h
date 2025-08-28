@@ -117,6 +117,10 @@ class Topology {
         return -1;
     }
 
+    int findDeviceNumaID(int dev_id) const;
+
+    double findDeviceBandwidth(int dev_id) const { return 200; /* dummy */ }
+
     const ResolvedTopologyMatrix &getResolvedMatrix() const {
         return resolved_matrix_;
     }
