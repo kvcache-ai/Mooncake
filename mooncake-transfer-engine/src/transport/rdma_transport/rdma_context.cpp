@@ -328,6 +328,10 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
+size_t RdmaContext::getTotalQPNumber() const {
+    return endpoint_store_->getTotalQPNumber();
+}
+
 std::string RdmaContext::nicPath() const {
     return MakeNicPath(engine_.local_server_name_, device_name_);
 }

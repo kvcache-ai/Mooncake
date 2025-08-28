@@ -371,7 +371,7 @@ if buffer:
     # Use with other libraries that accept buffer protocol
     print(f"Buffer size: {len(buffer)} bytes")
 
-    # The buffer is automatically freed when garbage collected
+    # The buffer is automatically freed
 ```
 
 </details>
@@ -585,6 +585,29 @@ if result == 0:
 
 ---
 
+#### remove_by_regex()
+Remove objects from the storage system whose keys match a regular expression.
+
+```python
+def remove_by_regex(self, regex: str) -> int
+```
+
+**Parameters:**
+- `regex` (str): The regular expression to match against object keys.
+
+**Returns:**
+- `int`: The number of objects removed, or a negative value on error.
+
+**Example:**
+```python
+# Remove all keys starting with "user_session_"
+count = store.remove_by_regex("^user_session_.*")
+if count >= 0:
+    print(f"Removed {count} objects")
+```
+
+---
+
 #### remove_all()
 Remove all objects from the storage system.
 
@@ -765,9 +788,9 @@ store.close()
 
 ---
 
-## Batch Zero-Copy Operations
+### Batch Zero-Copy Operations
 
-### batch_put_from()
+#### batch_put_from()
 Store multiple objects from pre-registered buffers (zero-copy).
 
 ```python
@@ -781,11 +804,11 @@ def batch_put_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 - `config` (ReplicateConfig, optional): Replication configuration
 
 **Returns:**
-- `List[int]`: List of status codes for each operation
+- `List[int]`: List of status codes for each operation (0 = success, negative = error)
 
 ---
 
-### batch_get_into()
+#### batch_get_into()
 Retrieve multiple objects into pre-registered buffers (zero-copy).
 
 ```python

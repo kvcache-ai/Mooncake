@@ -5,9 +5,11 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -15,6 +17,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 
@@ -71,6 +74,17 @@ class Client {
      */
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
         const std::string& object_key);
+
+    /**
+     * @brief Queries replica lists for object keys that match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& str);
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -135,6 +149,14 @@ class Client {
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
     /**
+     * @brief Removes objects from the store whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+
+    /**
      * @brief Removes all objects and all its replicas
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
@@ -196,13 +218,30 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    // For human-readable metrics
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
+
+    // For Prometheus-style metrics
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::string str;
+        metrics_->serialize(str);
+        return str;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring,
-           const std::string& storage_root_dir);
+           const std::string& metadata_connstring);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -227,7 +266,8 @@ class Client {
                                const std::string& fsdir);
 
     void PutToLocalFile(const std::string& object_key,
-                        const std::vector<Slice>& slices);
+                        const std::vector<Slice>& slices,
+                        const DiskDescriptor& disk_descriptor);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -251,9 +291,11 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
-    void BatchPuttoLocalFile(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+
+    // Client-side metrics
+    std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
     TransferEngine transfer_engine_;
@@ -267,7 +309,6 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
-    const std::string storage_root_dir_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;

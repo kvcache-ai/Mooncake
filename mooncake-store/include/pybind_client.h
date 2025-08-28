@@ -7,6 +7,7 @@
 
 #include "client.h"
 #include "client_buffer.hpp"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -195,6 +196,8 @@ class PyClient {
 
     int remove(const std::string &key);
 
+    long removeByRegex(const std::string &str);
+
     long removeAll();
 
     int tearDownAll();
@@ -272,6 +275,9 @@ class PyClient {
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 
+    tl::expected<long, ErrorCode> removeByRegex_internal(
+        const std::string &str);
+
     tl::expected<int64_t, ErrorCode> removeAll_internal();
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
@@ -288,6 +294,7 @@ class PyClient {
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
+    std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
         void operator()(void *ptr) {

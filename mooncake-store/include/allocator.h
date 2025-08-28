@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.hpp"
@@ -14,8 +15,101 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
-// forward declare AllocatedBuffer
-class AllocatedBuffer;
+/**
+ * @brief Status of a buffer in the system
+ */
+enum class BufStatus {
+    INIT = 0,      // Initial state
+    COMPLETE = 1,  // Complete state (buffer has been used)
+    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
+                 // to this state)
+    UNREGISTERED = 3,  // Buffer metadata has been deleted
+};
+
+/**
+ * @brief Stream operator for BufStatus
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const BufStatus& status) noexcept {
+    static const std::unordered_map<BufStatus, std::string_view> status_strings{
+        {BufStatus::INIT, "INIT"},
+        {BufStatus::COMPLETE, "COMPLETE"},
+        {BufStatus::FAILED, "FAILED"},
+        {BufStatus::UNREGISTERED, "UNREGISTERED"}};
+
+    os << (status_strings.count(status) ? status_strings.at(status)
+                                        : "UNKNOWN");
+    return os;
+}
+
+// Forward declarations
+class BufferAllocatorBase;
+
+class AllocatedBuffer {
+   public:
+    friend class CachelibBufferAllocator;
+    friend class OffsetBufferAllocator;
+    // Forward declaration of the descriptor struct
+    struct Descriptor;
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    std::string segment_name, void* buffer_ptr,
+                    std::size_t size,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
+        : allocator_(std::move(allocator)),
+          segment_name_(std::move(segment_name)),
+          buffer_ptr_(buffer_ptr),
+          size_(size),
+          offset_handle_(std::move(offset_handle)) {}
+
+    ~AllocatedBuffer();
+
+    AllocatedBuffer(const AllocatedBuffer&) = delete;
+    AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
+    AllocatedBuffer(AllocatedBuffer&&) noexcept;
+    AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
+
+    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+
+    [[nodiscard]] bool isAllocatorValid() const {
+        return !allocator_.expired();
+    }
+
+    // Serialize the buffer into a descriptor for transfer
+    [[nodiscard]] Descriptor get_descriptor() const;
+
+    [[nodiscard]] std::string getSegmentName() const noexcept {
+        return segment_name_;
+    }
+
+    // Friend declaration for operator<<
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const AllocatedBuffer& buffer);
+
+    // Represents the serializable state
+    struct Descriptor {
+        std::string segment_name_;
+        uint64_t size_;
+        uintptr_t buffer_address_;
+        BufStatus status_;
+        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+    };
+
+    void mark_complete() { status = BufStatus::COMPLETE; }
+
+   private:
+    std::weak_ptr<BufferAllocatorBase> allocator_;
+    std::string segment_name_;
+    BufStatus status{BufStatus::INIT};
+    void* buffer_ptr_{nullptr};
+    std::size_t size_{0};
+    // RAII handle for buffer allocated by offset allocator
+    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
+        std::nullopt};
+};
 
 /**
  * Virtual base class for buffer allocators.

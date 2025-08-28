@@ -5,11 +5,9 @@
 #include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
-#include "rpc_service.h"
+#include "client_metric.h"
+#include "replica.h"
 #include "types.h"
-
-using namespace async_simple;
-using namespace coro_rpc;
 
 namespace mooncake {
 
@@ -20,7 +18,7 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient();
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {}
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -58,6 +56,18 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     GetReplicaList(const std::string& object_key);
+
+    /**
+     * @brief Retrieves replica lists for object keys that match a regex
+     * pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -99,9 +109,11 @@ class MasterClient {
     /**
      * @brief Ends a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -114,10 +126,11 @@ class MasterClient {
     /**
      * @brief Revokes a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key);
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -133,6 +146,15 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
+
+    /**
+     * @brief Removes objects from the master whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str);
 
     /**
      * @brief Removes all objects and all its replicas
@@ -219,21 +241,24 @@ class MasterClient {
      */
     class RpcClientAccessor {
        public:
-        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+        void SetClient(std::shared_ptr<coro_rpc::coro_rpc_client> client) {
             std::lock_guard<std::shared_mutex> lock(client_mutex_);
             client_ = client;
         }
 
-        std::shared_ptr<coro_rpc_client> GetClient() {
+        std::shared_ptr<coro_rpc::coro_rpc_client> GetClient() {
             std::shared_lock<std::shared_mutex> lock(client_mutex_);
             return client_;
         }
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc_client> client_;
+        std::shared_ptr<coro_rpc::coro_rpc_client> client_;
     };
     RpcClientAccessor client_accessor_;
+
+    // Metrics for tracking RPC operations
+    MasterClientMetric* metrics_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

@@ -4,13 +4,13 @@
 
 Mooncake Store is a high-performance **distributed key-value (KV) cache storage engine** designed specifically for LLM inference scenarios.
 
-Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
+Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be evicted).
 
 Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
-- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
+- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
@@ -89,7 +89,14 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, after a successful in-memory put request, an asynchronous persistence operation to SSD will be initiated.)​ The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​
+
+**Replication Guarantees and Best Effort Behavior:**
+- Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
+- Different slices from different objects may be placed in the same segment
+- Replication operates on a best-effort basis: if insufficient space is available for all requested replicas, the object will still be written with as many replicas as possible
+
+The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
 struct ReplicateConfig {
@@ -106,6 +113,23 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
+
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+Used to query the replica information for all objects whose keys match the given regular expression. This is useful for batch operations or for retrieving a group of related objects. The operation is performed on the Master and returns a map of keys to their replica lists.
+
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+Used to delete all objects from the store whose keys match the specified regular expression. This provides a powerful way to perform bulk deletions. The command returns the number of objects that were successfully removed.
 
 ### Master Service
 
@@ -150,6 +174,9 @@ service MasterService {
   // Get the list of replicas for an object
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // Get replica lists for objects matching a regex
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -158,6 +185,9 @@ service MasterService {
 
   // Delete all replicas of an object
   rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Remove objects matching a regex
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
   // Storage node (Client) registers a storage segment
   rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
@@ -184,7 +214,28 @@ message GetReplicaListResponse {
 - **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
 - **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
 
-2. PutStart
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
+};
+```
+
+- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
+- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+
+3. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -202,9 +253,9 @@ message PutStartResponse {
 
 - **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
+- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-3. PutEnd
+4. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -220,7 +271,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-4. Remove
+5. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -236,7 +287,24 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-5. MountSegment
+6. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // The number of objects removed.
+};
+```
+
+- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
+- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
+
+7. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -252,7 +320,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-6. UnmountSegment
+8. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -309,17 +377,20 @@ Before writing an object, the Client calls PutStart to request storage space all
 ```C++
 ErrorCode GetReplicaList(const std::string& key,
                          std::vector<ReplicaInfo>& replica_list);
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+GetReplicaListByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to retrieve the replica list for a specified key, allowing the Client to select an appropriate replica for reading based on this information.
+The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.
 
 - Remove
 
 ```C++
 tl::expected<void, ErrorCode> Remove(const std::string& key);
+tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to delete all replicas corresponding to the specified key.
+The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
 ### Buffer Allocator
 
@@ -455,13 +526,50 @@ This system provides support for a hierarchical cache architecture, enabling eff
 
 #### Enabling Persistence Functionality
 
-When a user specifies the environment variable `MOONCAKE_STORAGE_ROOT_DIR` at client startup, and the path is a valid existing directory, the client-side data persistence feature will be activated. During initialization, the client requests a `cluster_id` from the master. This ID can be specified when initializing the master; if not provided, the default value `mooncake_cluster` will be used. The root directory for persistence is then set to `<MOONCAKE_STORAGE_ROOT_DIR>/<cluster_id>`. Note that when using DFS, each client must specify the corresponding DFS mount directory to enable data sharing across SSDs.
+When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
+
+​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Data Access Mechanism
 
-In the current implementation, all operations on kvcache objects (e.g., read/write/query) are performed entirely on the client side, with no awareness by the master. The file system maintains the key-to-kvcache-object mapping through a fixed indexing mechanism, where each file corresponds to one kvcache object (the filename is the associated key).
+The persistence feature also follows Mooncake Store's design principle of separating control flow from data flow. The read/write operations of kvcache objects are completed on the client side, while the query and management functions of kvcache objects are handled on the master side. In the file system, the key -> kvcache object index information is maintained by a fixed indexing mechanism, with each file corresponding to one kvcache object (the filename serves as the associated key name).
 
-When persistence is enabled, every successful `Put`or`BatchPut` operation in memory triggers an asynchronous persistence write to DFS. During subsequent `Get`or `BatchGet` operations, if the requested kvcache is not found in the memory pool, the system attempts to read the corresponding file from DFS and returns the data to the user.
+After enabling the persistence feature:
+
+- For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
+- For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
+
+#### 3FS USRBIO Plugin
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](/mooncake-store/src/hf3fs/README.md).
+
+### Builtin Metadata Server
+
+Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
+
+#### Configuration Parameters
+
+The HTTP metadata server can be configured using the following parameters:
+
+- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server instead of using etcd. When set to `true`, the master service will start an embedded HTTP server that handles metadata operations.
+
+- **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
+
+- **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
+
+#### Usage Example
+
+To start the master service with the HTTP metadata server enabled:
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+    --enable_http_metadata_server=true \
+    --http_metadata_server_port=8080 \
+    --http_metadata_server_host=0.0.0.0
+```
+
+When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
+
+Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
 
 ## Mooncake Store Python API
 
@@ -565,13 +673,9 @@ retcode = store.setup(
 
 2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
    For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-   To enable the persistence feature, run:
-`ROLE=prefill MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
    For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
-   To enable the persistence feature, run:
-`ROLE=decode MOONCAKE_STORAGE_ROOT_DIR=/path/to/dir python3 ./stress_cluster_benchmark.py`
 
 The absence of error messages indicates successful data transfer.
 
