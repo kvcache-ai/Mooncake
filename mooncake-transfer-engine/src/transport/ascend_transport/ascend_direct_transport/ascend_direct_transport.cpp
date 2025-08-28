@@ -293,16 +293,26 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     mem_desc.addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr));
     mem_desc.len = length;
     adxl::MemType mem_type;
-    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
-              << ", length:" << length << ", location:" << location;
-    if (location.starts_with("cpu:")) {
+    if (location.starts_with("cpu")) {
         mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu:") || location == kWildcardLocation) {
+    } else if (location.starts_with("npu")) {
         mem_type = adxl::MEM_DEVICE;
+    } else if (location == kWildcardLocation) {
+        aclrtPtrAttributes attributes;
+        ret = aclrtPointerGetAttributes(addr, &attributes);
+        if (ret != ACL_SUCCESS) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+            return -1;
+        }
+        mem_type =
+            (attributes.location.type == 0) ? adxl::MEM_HOST : adxl::MEM_DEVICE;
     } else {
         LOG(ERROR) << "location:" << location << " is not supported.";
         return ERR_INVALID_ARGUMENT;
     }
+    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
+              << ", length:" << length << ", location:" << location
+              << ", mem type:" << mem_type;
     ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: "
