@@ -5,7 +5,7 @@
 #else
 #include <json/json.h>  // CentOS
 #endif
-#include <yaml-cpp/node/node.h>
+#include <yaml-cpp/yaml.h>
 
 #include <cstdint>
 #include <string>
