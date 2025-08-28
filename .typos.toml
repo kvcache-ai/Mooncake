@@ -1,0 +1,2 @@
+[files]
+extend-exclude = ["mooncake-ep/include/mooncake_ibgda/mlx5_ifc.h"]
