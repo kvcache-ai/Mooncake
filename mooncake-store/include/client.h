@@ -241,7 +241,7 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring, const std::string& protocol);
 
     /**
      * @brief Internal helper functions for initialization and data transfer

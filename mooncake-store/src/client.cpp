@@ -36,9 +36,9 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring, const std::string& protocol)
     : metrics_(ClientMetric::Create()),
-      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr),
+      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr, protocol),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       write_thread_pool_(2) {
@@ -259,7 +259,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, void** protocol_args,
     const std::string& master_server_entry) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, protocol));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
