@@ -121,8 +121,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             auto diff = std::chrono::duration_cast<
                                 std::chrono::microseconds>(clock::now() -
                                                            debugTime[i]);
-                            printf("[%d] transfer op %d used %lu us\n", rank_,
-                                   task.opType, diff.count());
+                            printf("[%d] transfer op %d used %lu us (%lu)\n", rank_,
+                                   task.opType, diff.count(), i);
                         }
                     }
                     if (!batch_done) {
@@ -187,8 +187,8 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(clock::now() -
                                                        debugTime[i]);
-                        printf("[%d] signal op %d used %lu us\n", rank_,
-                               task.opType, diff.count());
+                        printf("[%d] signal op %d used %lu us (%lu)\n", rank_,
+                               task.opType, diff.count(), i);
                         for (int j = 0; j < size_; ++j) {
                             signals[i][j] = false;
                         }
