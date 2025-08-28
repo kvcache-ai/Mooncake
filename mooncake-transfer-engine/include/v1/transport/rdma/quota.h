@@ -27,6 +27,8 @@
 #include "v1/common/status.h"
 #include "v1/utility/topology.h"
 
+#include "shared_quota.h"
+
 namespace mooncake {
 namespace v1 {
 class DeviceQuota {
@@ -42,6 +44,7 @@ class DeviceQuota {
         double bw_gbps;
         int numa_id;
         std::atomic<uint64_t> active_bytes{0};
+        uint64_t local_quota {0}; // if shared quota is used
     };
 
    public:
@@ -55,6 +58,8 @@ class DeviceQuota {
 
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
 
+    Status enableSharedQuota(const std::string &shm_name);
+
     Status allocate(uint64_t data_size, const std::string &location,
                     std::vector<AllocPlan> &plan_list);
 
@@ -65,7 +70,9 @@ class DeviceQuota {
     std::unordered_map<int, DeviceInfo> devices_;
     mutable std::shared_mutex rwlock_;
     uint64_t slice_size_ = 64 * 1024;
+    uint64_t alloc_units_ = 1024;
     bool allow_cross_numa_ = false;
+    std::shared_ptr<SharedQuotaManager> shared_quota_;
 };
 }  // namespace v1
 }  // namespace mooncake

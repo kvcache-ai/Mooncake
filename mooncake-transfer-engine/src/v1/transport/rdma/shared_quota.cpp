@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <v1/utility/shared_memory.h>
+#include "v1/transport/rdma/shared_quota.h"
+#include "v1/utility/system.h"
 
 namespace mooncake {
 namespace v1 {
 
-Status SharedMemoryManager::createOrAttach(
+Status SharedQuotaManager::createOrAttach(
     const std::string& shm_name, const std::shared_ptr<Topology>& topology) {
     name_ = shm_name;
     size_t sz = sizeof(SharedHeader);
@@ -65,8 +66,12 @@ Status SharedMemoryManager::createOrAttach(
     return Status::OK();
 }
 
-void SharedMemoryManager::detach() {
+void SharedQuotaManager::detach() {
     if (hdr_) {
+        if (!lock()) {
+            release(true);
+            unlock();
+        }
         munmap((void*)hdr_, size_);
         hdr_ = nullptr;
     }
@@ -76,7 +81,7 @@ void SharedMemoryManager::detach() {
     }
 }
 
-int SharedMemoryManager::lock() {
+int SharedQuotaManager::lock() {
     if (!hdr_) return EINVAL;
     int rc = pthread_mutex_lock(&hdr_->global_mutex);
     if (rc == 0) return 0;
@@ -95,13 +100,13 @@ int SharedMemoryManager::lock() {
     return rc;
 }
 
-int SharedMemoryManager::unlock() {
+int SharedQuotaManager::unlock() {
     if (!hdr_) return EINVAL;
     int rc = pthread_mutex_unlock(&hdr_->global_mutex);
     return rc;
 }
 
-Status SharedMemoryManager::initializeHeader(
+Status SharedQuotaManager::initializeHeader(
     const std::shared_ptr<Topology>& topology) {
     // called only by creator
     memset(hdr_, 0, size_);
@@ -127,7 +132,7 @@ Status SharedMemoryManager::initializeHeader(
     return Status::OK();
 }
 
-Status SharedMemoryManager::initMutex(pthread_mutex_t* m) {
+Status SharedQuotaManager::initMutex(pthread_mutex_t* m) {
     pthread_mutexattr_t attr;
     int rc = pthread_mutexattr_init(&attr);
     if (rc != 0) return Status::InternalError("pthread_mutexattr_init failed");
@@ -148,7 +153,7 @@ Status SharedMemoryManager::initMutex(pthread_mutex_t* m) {
 }
 
 // reclaim implementation: caller must hold the mutex or call via lock()
-void SharedMemoryManager::reclaimDeadPidsInternal() {
+void SharedQuotaManager::reclaimDeadPidsInternal() {
     if (!hdr_) return;
     for (int i = 0; i < hdr_->num_devices; ++i) {
         SharedDeviceEntry& dev = hdr_->devices[i];
@@ -168,6 +173,38 @@ void SharedMemoryManager::reclaimDeadPidsInternal() {
                 dev.pid_usages[s].used_bytes = 0;
             }
         }
+    }
+}
+
+bool SharedQuotaManager::allocate(int dev_id, uint64_t data_size) {
+    if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return false;
+    if (lock()) return false;
+    auto current_ts = getCurrentTimeInNano();
+    release(false);
+    SharedDeviceEntry& dev = hdr_->devices[dev_id];
+    if (dev.active_bytes > dev.bw_gbps * 1e9 / 8.0) {
+        unlock();
+        return false;
+    }
+    dev.active_bytes += data_size;
+    ttl_entries_.push(TtlEntry{dev_id, data_size, current_ts});
+    unlock();
+    return true;
+}
+
+void SharedQuotaManager::release(bool force) {
+    const int64_t kTtlNs = 1000ULL * 1000 * 1000;
+    auto current_ts = getCurrentTimeInNano();
+    while (!ttl_entries_.empty()) {
+        const TtlEntry& e = ttl_entries_.front();
+        if (!force && current_ts - e.ts < kTtlNs) break;
+        SharedDeviceEntry& old_dev = hdr_->devices[e.dev_id];
+        if (old_dev.active_bytes >= e.length) {
+            old_dev.active_bytes -= e.length;
+        } else {
+            old_dev.active_bytes = 0;
+        }
+        ttl_entries_.pop();
     }
 }
 

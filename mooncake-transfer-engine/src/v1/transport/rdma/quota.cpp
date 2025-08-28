@@ -26,10 +26,18 @@ Status DeviceQuota::loadTopology(std::shared_ptr<Topology> &local_topology) {
         devices_[dev_id].dev_id = dev_id;
         devices_[dev_id].bw_gbps = local_topology->findDeviceBandwidth(dev_id);
         devices_[dev_id].numa_id = local_topology->findDeviceNumaID(dev_id);
+        devices_[dev_id].local_quota = UINT64_MAX;
         used_numa_id.insert(devices_[dev_id].numa_id);
     }
     if (used_numa_id.size() == 1) allow_cross_numa_ = true;
     return Status::OK();
+}
+
+Status DeviceQuota::enableSharedQuota(const std::string &shm_name) {
+    shared_quota_ = std::make_shared<SharedQuotaManager>();
+    auto status = shared_quota_->createOrAttach(shm_name, local_topology_);
+    if (!status.ok()) shared_quota_.reset();
+    return status;
 }
 
 Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
@@ -47,24 +55,31 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
 
     struct Cand {
         int dev_id;
-        double base_w;
-        uint64_t active;
-        double adj_w;
+        double norm_weight;
     };
     std::vector<Cand> cands;
 
     for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
-        double rw = rank_weights[rank];
         for (int dev_id : entry.device_list[rank]) {
-            auto dit = devices_.find(dev_id);
-            if (dit == devices_.end()) continue;
-            const auto &d = dit->second;
-            double w = d.bw_gbps * 1e9 * rw;
-            if (!allow_cross_numa_ && d.numa_id != entry.numa_node) continue;
-            if (w <= 0.0) continue;
-            uint64_t act = d.active_bytes.load(std::memory_order_relaxed);
-            double adj = w / (1.0 + static_cast<double>(act));
-            cands.push_back(Cand{dev_id, w, act, adj});
+            auto &device = devices_[dev_id];
+            double weight = device.bw_gbps * 1e9 * rank_weights[rank];
+            if (!allow_cross_numa_ && device.numa_id != entry.numa_node)
+                continue;
+            if (weight <= 0.0) continue;
+            if (shared_quota_ && device.local_quota <= 0) {
+                const uint64_t acquire_size =
+                    -device.local_quota +
+                    std::max(data_size, alloc_units_ * slice_size_);
+                if (shared_quota_->allocate(dev_id, acquire_size)) {
+                    device.local_quota += acquire_size;
+                } else {
+                    continue;
+                }
+            }
+            uint64_t act = device.active_bytes.load(std::memory_order_relaxed);
+            double load_factor =
+                1.0 + static_cast<double>(act) / (weight + 1.0);
+            cands.push_back(Cand{dev_id, weight / load_factor});
         }
     }
 
@@ -72,9 +87,10 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
         return Status::DeviceNotFound("no eligible devices for " + location);
 
     if (data_size < slice_size_) {
-        auto it = std::max_element(
-            cands.begin(), cands.end(),
-            [](const Cand &a, const Cand &b) { return a.adj_w < b.adj_w; });
+        auto it = std::max_element(cands.begin(), cands.end(),
+                                   [](const Cand &a, const Cand &b) {
+                                       return a.norm_weight < b.norm_weight;
+                                   });
         assert(it != cands.end());
         devices_[it->dev_id].active_bytes.fetch_add(data_size,
                                                     std::memory_order_relaxed);
@@ -86,13 +102,15 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
     if (max_devices == 0) max_devices = 1;
     if (max_devices > cands.size()) max_devices = cands.size();
 
-    std::sort(cands.begin(), cands.end(),
-              [](const Cand &a, const Cand &b) { return a.adj_w > b.adj_w; });
+    std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
+        return a.norm_weight > b.norm_weight;
+    });
     cands.resize(max_devices);
 
-    double total_w = 0.0;
-    for (auto &c : cands) total_w += c.adj_w;
-    if (total_w <= 0.0) return Status::InternalError("invalid total weight");
+    double total_norm_weights = 0.0;
+    for (auto &c : cands) total_norm_weights += c.norm_weight;
+    if (total_norm_weights <= 0.0)
+        return Status::InternalError("invalid total weight");
 
     struct Tmp {
         int dev_id;
@@ -105,7 +123,8 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
 
     uint64_t allocated = 0;
     for (auto &c : cands) {
-        double share_f = static_cast<double>(data_size) * (c.adj_w / total_w);
+        double share_f = static_cast<double>(data_size) *
+                         (c.norm_weight / total_norm_weights);
         uint64_t alloc_i = static_cast<uint64_t>(share_f);
         tmp.push_back(Tmp{c.dev_id, alloc_i, share_f - alloc_i});
         allocated += alloc_i;
@@ -130,8 +149,9 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
         if (t.alloc == 0) continue;
         plan_list.push_back(AllocPlan{t.dev_id, offset, t.alloc});
         offset += t.alloc;
-        devices_[t.dev_id].active_bytes.fetch_add(t.alloc,
-                                                  std::memory_order_relaxed);
+        auto &device = devices_[t.dev_id];
+        device.local_quota -= t.alloc;
+        device.active_bytes.fetch_add(t.alloc, std::memory_order_relaxed);
     }
 
     return Status::OK();
@@ -141,6 +161,7 @@ Status DeviceQuota::release(int dev_id, uint64_t length) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
+    it->second.local_quota += length;
     it->second.active_bytes.fetch_sub(length, std::memory_order_relaxed);
     return Status::OK();
 }

@@ -16,7 +16,7 @@
 #define SHARED_MEMORY_H
 
 #include "v1/common/status.h"
-#include "topology.h"
+#include "v1/utility/topology.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <queue>
 
 namespace mooncake {
 namespace v1 {
@@ -70,19 +71,20 @@ struct SharedHeader {
 };
 #pragma pack(pop)
 
-class SharedMemoryManager {
+class SharedQuotaManager {
    public:
-    SharedMemoryManager() : hdr_(nullptr), fd_(-1), size_(0), created_(false) {}
+    SharedQuotaManager() : hdr_(nullptr), fd_(-1), size_(0), created_(false) {}
 
-    ~SharedMemoryManager() { detach(); }
+    ~SharedQuotaManager() { detach(); }
 
     Status createOrAttach(const std::string& shm_name,
                           const std::shared_ptr<Topology>& topology);
 
     void detach();
 
-    SharedHeader* get() const { return hdr_; }
+    bool allocate(int dev_id, uint64_t data_size);
 
+   private:
     // lock global mutex (handles robust EOWNERDEAD)
     // returns 0 on success, or errno on error
     int lock();
@@ -113,40 +115,6 @@ class SharedMemoryManager {
         return nullptr;
     }
 
-    // helpers to read/write active_bytes with atomics (can be used without
-    // holding lock)
-    uint64_t loadActiveBytes(int dev_id) const {
-        if (!hdr_) return 0;
-        if (dev_id < 0 || dev_id >= hdr_->num_devices) return 0;
-        const uint64_t v = __atomic_load_n(&hdr_->devices[dev_id].active_bytes,
-                                           __ATOMIC_SEQ_CST);
-        return v;
-    }
-    void atomicAddActiveBytes(int dev_id, uint64_t delta) {
-        if (!hdr_) return;
-        if (dev_id < 0 || dev_id >= hdr_->num_devices) return;
-        __atomic_fetch_add(&hdr_->devices[dev_id].active_bytes, delta,
-                           __ATOMIC_SEQ_CST);
-    }
-    void atomicSubActiveBytes(int dev_id, uint64_t delta) {
-        if (!hdr_) return;
-        if (dev_id < 0 || dev_id >= hdr_->num_devices) return;
-        __atomic_fetch_sub(&hdr_->devices[dev_id].active_bytes, delta,
-                           __ATOMIC_SEQ_CST);
-    }
-
-    // direct device info accessors (safe to call without lock for readonly
-    // fields)
-    int numDevices() const { return hdr_ ? hdr_->num_devices : 0; }
-    int getDeviceNuma(int dev_id) const {
-        if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return -1;
-        return hdr_->devices[dev_id].numa_id;
-    }
-    double getDeviceBW(int dev_id) const {
-        if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return 0.0;
-        return hdr_->devices[dev_id].bw_gbps;
-    }
-
    private:
     Status initializeHeader(const std::shared_ptr<Topology>& topology);
 
@@ -166,12 +134,21 @@ class SharedMemoryManager {
         return true;
     }
 
+    void release(bool force);
+
    private:
     std::string name_;
     SharedHeader* hdr_;
     int fd_;
     size_t size_;
     bool created_;
+
+    struct TtlEntry {
+        int dev_id;
+        uint64_t length;
+        int64_t ts;
+    };
+    std::queue<TtlEntry> ttl_entries_;
 };
 }  // namespace v1
 }  // namespace mooncake
