@@ -27,6 +27,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
+        clock::time_point debugTime[kNumTasks_];
         bool signals[kNumTasks_][size_]{};
         while (running_) {
             _mm_pause();
@@ -90,6 +91,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     }
                     task.batchID = engine_->allocateBatchID(entries.size());
                     engine_->submitTransfer(task.batchID, entries);
+                    debugTime[i] = clock::now();
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
@@ -115,6 +117,13 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 }
                             }
                         }
+                        if (batch_done) {
+                            auto diff = std::chrono::duration_cast<
+                                std::chrono::microseconds>(clock::now() -
+                                                           debugTime[i]);
+                            printf("[%d] transfer op %d used %lu us\n", rank_,
+                                   task.opType, diff.count());
+                        }
                     }
                     if (!batch_done) {
                         continue;
@@ -136,6 +145,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         }
                     }
                     activeTime[i] = clock::now();
+                    debugTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
@@ -174,6 +184,11 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         activeTime[i] = clock::now();
                     }
                     if (all_received) {
+                        auto diff = std::chrono::duration_cast<
+                            std::chrono::microseconds>(clock::now() -
+                                                       debugTime[i]);
+                        printf("[%d] signal op %d used %lu us\n", rank_,
+                               task.opType, diff.count());
                         for (int j = 0; j < size_; ++j) {
                             signals[i][j] = false;
                         }
