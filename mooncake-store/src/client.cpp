@@ -36,9 +36,11 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring, const std::string& protocol)
+               const std::string& metadata_connstring,
+               const std::string& protocol)
     : metrics_(ClientMetric::Create()),
-      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr, protocol),
+      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr,
+                     protocol),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       write_thread_pool_(2) {

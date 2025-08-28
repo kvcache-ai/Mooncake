@@ -426,7 +426,7 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        if(master_config.protocol == "rdma") {
+        if (master_config.protocol == "rdma") {
             server.init_ibv();
         }
         mooncake::WrappedMasterService wrapped_master_service(
