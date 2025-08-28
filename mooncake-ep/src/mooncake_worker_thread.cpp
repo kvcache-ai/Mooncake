@@ -27,7 +27,6 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
-        bool signals[kNumTasks_][size_]{};
         while (running_) {
             _mm_pause();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -119,45 +118,43 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     if (!batch_done) {
                         continue;
                     }
+                    auto source_ptr =
+                        (int32_t *)segment_descs_[rank_]->buffers[4 + i].addr;
+                    std::vector<TransferRequest> entries;
                     for (int j = 0; j < size_; ++j) {
                         if (brokenRanks_[j]) {
                             continue;
                         }
-                        static_assert(kNumTasks_ <= 10);
-                        std::string notify_msg =
-                            std::to_string(i) + std::to_string(rank_);
-                        int ret = engine_->sendNotifyByName(
-                            segment_descs_[j]->name, {"signal", notify_msg});
-                        if (ret) {
-                            LOG(ERROR) << "Rank " << rank_ << " marking peer "
-                                       << j << " as broken during notifying op "
-                                       << (int)task.opType;
-                            brokenRanks_[j] = true;
-                        }
+                        *source_ptr = 1;
+                        entries.push_back(TransferRequest{
+                            .opcode = TransferRequest::WRITE,
+                            .source = (void *)source_ptr,
+                            .target_id = segment_ids_[j],
+                            .target_offset =
+                                segment_descs_[j]->buffers[6 + i].addr +
+                                rank_ * sizeof(int32_t),
+                            .length = sizeof(int32_t),
+                        });
                     }
+                    task.batchID = engine_->allocateBatchID(entries.size());
+                    engine_->submitTransfer(task.batchID, entries);
                     activeTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
-                    std::vector<TransferMetadata::NotifyDesc> notifies;
-                    engine_->getNotifies(notifies);
-                    for (const auto &notify : notifies) {
-                        if (notify.name == "signal") {
-                            int taskId = notify.notify_msg[0] - '0';
-                            int src = std::atoi(notify.notify_msg.c_str() + 1);
-                            signals[taskId][src] = true;
-                        }
-                    }
+                    auto signal_ptr =
+                        (int32_t *)segment_descs_[rank_]->buffers[6 + i].addr;
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::seconds>(
                             now - activeTime[i]);
                     for (int j = 0; j < size_; ++j) {
-                        if (!signals[i][j] && !brokenRanks_[j]) {
-                            if (diff.count() > 1 && engine_->sendNotifyByName(
-                                                        segment_descs_[j]->name,
-                                                        {"ping", "ping"})) {
+                        if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
+                            TransferMetadata::NotifyDesc msg{"ping", "ping"};
+                            if (diff.count() > 1 &&
+                                engine_->sendNotifyByName(
+                                    segment_descs_[j]->name, msg)) {
                                 LOG(ERROR)
                                     << "Rank " << rank_ << " marking peer " << j
                                     << " as broken during syncing op "
@@ -175,7 +172,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     }
                     if (all_received) {
                         for (int j = 0; j < size_; ++j) {
-                            signals[i][j] = false;
+                            signal_ptr[j] = 0;
                         }
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
