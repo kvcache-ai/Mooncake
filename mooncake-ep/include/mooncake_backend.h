@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
-#include <mooncake_backend_buffer.h>
 #include <mooncake_worker.cuh>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
@@ -22,7 +21,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
-                    bool isCpu = false, bool isTest = false);
+                    bool isCpu = false);
 
     ~MooncakeBackend() override;
 
@@ -64,7 +63,10 @@ class MooncakeBackend final : public ::c10d::Backend {
     TransferEngine engine_{true};
     bool isCpu_{false};
     static std::string hostIp_;
-    static std::unique_ptr<BackendBuffer> buffer_;
+    void* send_buffer_[2];
+    void* recv_buffer_[2];
+    int32_t* cpu_sync_send_region_[2];
+    int32_t* cpu_sync_recv_region_[2];
     MooncakeWorker worker_;
 };
 

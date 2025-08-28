@@ -17,11 +17,9 @@ constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 
-std::unique_ptr<BackendBuffer> MooncakeBackend::buffer_ = nullptr;
-
 MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
-    c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu, bool isTest)
+    c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : Backend(rank, size),
       isCpu_(isCpu),
       worker_(&engine_, rank, size,
@@ -43,69 +41,60 @@ MooncakeBackend::MooncakeBackend(
                                   std::to_string(localRpcMeta.rpc_port);
 
     // Register buffers
-    BackendBuffer* buffer;
-    if (isTest) {
-        buffer = new BackendBuffer();
-    } else {
-        if (!buffer_) {
-            buffer_ = std::make_unique<BackendBuffer>();
-        }
-        buffer = buffer_.get();
-    }
-
     if (isCpu) {
         for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cpuSendBuffer_[i],
-                                                 kBufferSize);
+            send_buffer_[i] = malloc(kBufferSize);
+            TORCH_CHECK(send_buffer_[i],
+                        c10::str("Failed to allocate CPU send buffer"));
+
+            int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
         for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cpuRecvBuffer_[i],
-                                                 kBufferSize);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-        }
+            recv_buffer_[i] = malloc(kBufferSize);
+            TORCH_CHECK(recv_buffer_[i],
+                        c10::str("Failed to allocate CPU recv buffer"));
 
-        for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cpuSyncSendRegion_[i],
-                                                 kMaxNumRanks * sizeof(int32_t),
-                                                 kWildcardLocation);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-        }
-
-        for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cpuSyncRecvRegion_[i],
-                                                 kMaxNumRanks * sizeof(int32_t),
-                                                 kWildcardLocation);
+            int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     } else {
         std::string location = "cuda:" + std::to_string(deviceId_);
         for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cudaSendBuffer_[i],
-                                                 kBufferSize, location);
+            err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
+
+            int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
+                                                 location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
         for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cudaRecvBuffer_[i],
-                                                 kBufferSize, location);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-        }
+            err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
-        for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cudaSyncSendRegion_[i],
-                                                 kMaxNumRanks * sizeof(int32_t),
-                                                 kWildcardLocation);
+            int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
+                                                 location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
+    }
 
-        for (size_t i = 0; i < 2; i++) {
-            int rc = engine_.registerLocalMemory(buffer->cudaSyncRecvRegion_[i],
-                                                 kMaxNumRanks * sizeof(int32_t),
-                                                 kWildcardLocation);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-        }
+    // Register CPU sync regions
+    for (size_t i = 0; i < 2; i++) {
+        cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
+        int rc = engine_.registerLocalMemory(cpu_sync_send_region_[i],
+                                             kMaxNumRanks * sizeof(int32_t),
+                                             kWildcardLocation);
+        TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+    }
+
+    for (size_t i = 0; i < 2; i++) {
+        cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
+        int rc = engine_.registerLocalMemory(cpu_sync_recv_region_[i],
+                                             kMaxNumRanks * sizeof(int32_t),
+                                             kWildcardLocation);
+        TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     // Sync metadata
@@ -116,25 +105,24 @@ MooncakeBackend::MooncakeBackend(
         server_names.push_back(
             store->get_to_str({"server_name_" + std::to_string(i)}));
     }
-    worker_.setBackendBuffer(buffer);
     worker_.initWorker(server_names);
 }
 
 MooncakeBackend::~MooncakeBackend() {
     worker_.stopWorker();
-    if (buffer_) {
-        for (size_t i = 0; i < 2; i++) {
-            if (isCpu_) {
-                engine_.unregisterLocalMemory(buffer_->cpuSendBuffer_[i]);
-                engine_.unregisterLocalMemory(buffer_->cpuRecvBuffer_[i]);
-                engine_.unregisterLocalMemory(buffer_->cpuSyncSendRegion_[i]);
-                engine_.unregisterLocalMemory(buffer_->cpuSyncRecvRegion_[i]);
-            } else {
-                engine_.unregisterLocalMemory(buffer_->cudaSendBuffer_[i]);
-                engine_.unregisterLocalMemory(buffer_->cudaRecvBuffer_[i]);
-                engine_.unregisterLocalMemory(buffer_->cudaSyncSendRegion_[i]);
-                engine_.unregisterLocalMemory(buffer_->cudaSyncRecvRegion_[i]);
-            }
+    for (size_t i = 0; i < 2; i++) {
+        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
+        delete[] cpu_sync_send_region_[i];
+        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
+        delete[] cpu_sync_recv_region_[i];
+        engine_.unregisterLocalMemory(send_buffer_[i]);
+        engine_.unregisterLocalMemory(recv_buffer_[i]);
+        if (isCpu_) {
+            free(send_buffer_[i]);
+            free(recv_buffer_[i]);
+        } else {
+            cudaFree(send_buffer_[i]);
+            cudaFree(recv_buffer_[i]);
         }
     }
 }

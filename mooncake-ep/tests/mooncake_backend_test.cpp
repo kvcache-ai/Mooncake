@@ -21,8 +21,8 @@ class MooncakeBackendTest : public ::testing::Test {
                 cudaSetDevice(rank);
                 c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
                     options;
-                backends[rank].reset(new MooncakeBackend(store, rank, kNumRanks,
-                                                         options, false, true));
+                backends[rank].reset(
+                    new MooncakeBackend(store, rank, kNumRanks, options));
             });
         }
         for (size_t rank = 0; rank < kNumRanks; ++rank) {

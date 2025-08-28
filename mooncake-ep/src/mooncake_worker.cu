@@ -182,7 +182,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
-    int taskId = buffer_->cpuTaskCount_ % kNumTasks_;
+    int taskId = taskCount % kNumTasks_;
     TORCH_CHECK(!tasks_[taskId].active);
 
     tasks_[taskId].opType = opType;
@@ -197,7 +197,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     };
 
     tasks_[taskId].active = true;
-    ++buffer_->cpuTaskCount_;
+    ++taskCount;
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
@@ -206,13 +206,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
-    int taskId = buffer_->cudaTaskCount_ % kNumTasks_;
+    int taskId = taskCount % kNumTasks_;
     tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, tasks_device_, size_,
         brokenRanksDevice_, brokenRanksTensor_.data_ptr<int>(), taskId);
     bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
-    ++buffer_->cudaTaskCount_;
+    ++taskCount;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     cudaEventRecord(event, stream);
