@@ -44,6 +44,10 @@ class MooncakeBackend final : public ::c10d::Backend {
         at::Tensor& outputBuffer, at::Tensor& inputBuffer,
         const c10d::AllgatherOptions& opts) override;
 
+    c10::intrusive_ptr<c10d::Work> _reduce_scatter_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        const c10d::ReduceScatterOptions& opts) override;
+
     c10::intrusive_ptr<c10d::Work> alltoall(
         std::vector<at::Tensor>& outputTensors,
         std::vector<at::Tensor>& inputTensors,

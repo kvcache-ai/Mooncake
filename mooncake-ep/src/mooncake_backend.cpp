@@ -261,6 +261,38 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     }
 }
 
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
+    at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+    const c10d::ReduceScatterOptions& opts) {
+    size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
+    if (isCpu_) {
+        auto numRanks = size_;
+        return worker_.putTaskCpu(
+            c10d::OpType::REDUCE_SCATTER, tensorSize, 0,
+            [=](void* dst) {
+                memcpy(dst, inputBuffer.data_ptr(), tensorSize * numRanks);
+            },
+            [=](void* src) {
+                memset(outputBuffer.data_ptr(), 0, tensorSize);
+                launchReduceCpu(outputBuffer, src, numRanks, opts.reduceOp);
+            });
+    } else {
+        cudaStream_t stream =
+            at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
+        return worker_.putTaskCuda(
+            c10d::OpType::REDUCE_SCATTER, tensorSize, 0, stream,
+            [&](void* dst) {
+                cudaMemcpyAsync(dst, inputBuffer.data_ptr(), tensorSize * size_,
+                                cudaMemcpyHostToDevice, stream);
+            },
+            [&](void* src) {
+                cudaMemsetAsync(outputBuffer.data_ptr(), 0, tensorSize, stream);
+                launchReduceKernel(outputBuffer, src, size_, opts.reduceOp,
+                                   worker_.getBrokenRanks(), stream);
+            });
+    }
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllToAllOptions& opts) {
