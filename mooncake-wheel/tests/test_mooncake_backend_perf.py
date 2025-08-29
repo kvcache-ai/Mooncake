@@ -38,7 +38,7 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
 
 class TestMooncakeBackendPerf(unittest.TestCase):
     def setUp(self):
-        self.world_size = torch.cuda.device_count()
+        self.world_size = 2
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
