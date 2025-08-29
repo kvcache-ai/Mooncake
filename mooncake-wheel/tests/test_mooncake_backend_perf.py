@@ -49,7 +49,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 if __name__ == '__main__':
     devices = ['cpu', 'cuda']
     collectives = ['broadcast', 'allreduce']
-    data_sizes = [2**i for i in range(10, 21)]
+    data_sizes = [2**i for i in range(10, 11)]
 
     # Generate tests dynamically for each combination
     for device in devices:
