@@ -1,0 +1,206 @@
+// Copyright 2025 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "xfer_bench.h"
+#include "utils.h"
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+namespace mooncake {
+namespace v1 {
+
+volatile bool g_running = true;
+
+void signalHandler(int signum) {
+    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
+    g_running = false;
+}
+
+std::shared_ptr<ConfigManager> loadConfig() {
+    auto config = std::make_shared<ConfigManager>();
+    config->set("local_segment_name", XferBenchConfig::seg_name);
+    config->set("metadata_type", XferBenchConfig::metadata_type);
+    config->set("metadata_servers", XferBenchConfig::metadata_url_list);
+    return config;
+}
+
+static TransportType getTransportType(const std::string &xport_type) {
+    if (xport_type == "rdma") return RDMA;
+    if (xport_type == "shm") return SHM;
+    if (xport_type == "gds") return GDS;
+    if (xport_type == "mnnvl") return MNNVL;
+    if (xport_type == "tcp") return TCP;
+    if (xport_type == "iouring") return IOURING;
+    return UNSPEC;
+}
+
+int XferTERunner::allocateBuffers() {
+    auto total_buffer_size = XferBenchConfig::total_buffer_size;
+    if (XferBenchConfig::seg_type == "DRAM") {
+        int num_buffers = numa_num_configured_nodes();
+        pinned_buffer_list_.resize(num_buffers, nullptr);
+        for (int i = 0; i < num_buffers; ++i) {
+            MemoryOptions options;
+            if (!XferBenchConfig::xport_type.empty())
+                options.type = getTransportType(XferBenchConfig::xport_type);
+            options.location = "cpu:" + std::to_string(i);
+            CHECK_FAIL(engine_->allocateLocalMemory(
+                &pinned_buffer_list_[i], total_buffer_size, options));
+            CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                    total_buffer_size));
+        }
+#ifdef USE_CUDA
+    } else if (XferBenchConfig::seg_type == "VRAM") {
+        int num_buffers = 0;
+        cudaGetDeviceCount(&num_buffers);
+        pinned_buffer_list_.resize(num_buffers, nullptr);
+        for (int i = 0; i < num_buffers; ++i) {
+            MemoryOptions options;
+            if (!XferBenchConfig::xport_type.empty())
+                options.type = getTransportType(XferBenchConfig::xport_type);
+            options.location = "cuda:" + std::to_string(i);
+            CHECK_FAIL(engine_->allocateLocalMemory(
+                &pinned_buffer_list_[i], total_buffer_size, options));
+            CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                    total_buffer_size));
+        }
+#endif
+    } else {
+        LOG(ERROR) << "Unknown seg_type: " << XferBenchConfig::seg_type;
+    }
+    return 0;
+}
+
+int XferTERunner::freeBuffers() {
+    auto total_buffer_size = XferBenchConfig::total_buffer_size;
+    for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
+        CHECK_FAIL(engine_->unregisterLocalMemory(pinned_buffer_list_[i],
+                                                  total_buffer_size));
+        CHECK_FAIL(engine_->freeLocalMemory(pinned_buffer_list_[i]));
+    }
+    pinned_buffer_list_.clear();
+    return 0;
+}
+
+XferTERunner::XferTERunner() {
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+    engine_ = std::make_unique<TransferEngine>(loadConfig());
+    allocateBuffers();
+}
+
+XferTERunner::~XferTERunner() { freeBuffers(); }
+
+int XferTERunner::runTarget() {
+    while (g_running) sleep(1);
+    return 0;
+}
+
+int XferTERunner::startInitiator() {
+    CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
+    CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
+    // std::sort(info_.buffers.begin(), info_.buffers.end());
+    threads_.resize(XferBenchConfig::num_threads);
+    for (size_t i = 0; i < threads_.size(); ++i)
+        threads_[i] = std::thread(&XferTERunner::runner, this, i);
+    return 0;
+}
+
+int XferTERunner::stopInitiator() {
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        g_running = false;
+        has_task_ = true;
+    }
+    cv_task_.notify_all();
+    for (auto &t : threads_) {
+        if (t.joinable()) t.join();
+    }
+    return 0;
+}
+
+int XferTERunner::runner(int thread_id) {
+    bindToSocket(thread_id % numa_num_configured_nodes());
+    while (true) {
+        std::function<int(int)> task;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_task_.wait(lk, [&] { return g_running && has_task_; });
+            if (!g_running) break;
+            task = current_task_;
+        }
+        task(thread_id);
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            if (--pending_ == 0) {
+                has_task_ = false;
+                cv_done_.notify_one();
+            }
+        }
+    }
+    return 0;
+}
+
+int XferTERunner::runInitiatorTasks(
+    const std::function<int(int /* thread_id */)> &func) {
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        current_task_ = func;
+        pending_ = (int)threads_.size();
+        has_task_ = true;
+    }
+    cv_task_.notify_all();
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_done_.wait(lk, [&] { return !has_task_; });
+    }
+    return 0;
+}
+
+double XferTERunner::runSingleTransfer(uint64_t local_addr,
+                                       uint64_t target_addr,
+                                       uint64_t block_size, uint64_t batch_size,
+                                       Request::OpCode opcode) {
+    auto batch_id = engine_->allocateBatch(batch_size);
+    std::vector<Request> requests;
+    for (uint64_t i = 0; i < batch_size; ++i) {
+        Request entry;
+        entry.opcode = opcode;
+        entry.length = block_size;
+        entry.source = (void *)(local_addr + block_size * i);
+        entry.target_id = handle_;
+        entry.target_offset = target_addr + block_size * i;
+        requests.emplace_back(entry);
+    }
+    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    XferBenchTimer timer;
+    while (true) {
+        TransferStatus overall_status;
+        CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));
+        if (overall_status.s == TransferStatusEnum::COMPLETED) {
+            break;
+        } else if (overall_status.s == TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "Failed transfer detected";
+            exit(EXIT_FAILURE);
+        }
+    }
+    auto duration = timer.lap_us();
+    CHECK_FAIL(engine_->freeBatch(batch_id));
+    return duration;
+}
+
+}  // namespace v1
+}  // namespace mooncake
