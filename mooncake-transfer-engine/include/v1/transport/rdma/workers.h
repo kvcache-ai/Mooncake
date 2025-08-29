@@ -19,6 +19,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "context.h"
@@ -131,7 +132,7 @@ class Workers {
                                RdmaSlice *slice, int thread_id);
 
     Status selectFallbackDevice(RuoteHint &source, RuoteHint &target,
-                                RdmaSlice *slice);
+                                RdmaSlice *slice, int thread_id);
 
     int getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx);
 
@@ -181,6 +182,9 @@ class Workers {
         std::mutex mutex;
         std::condition_variable cv;
         bool in_suspend = false;
+
+        std::unordered_map<std::string, std::shared_ptr<RailTopology>>
+            rail_topology_map_;
 
         void notifyIfNeeded() {
             std::lock_guard<std::mutex> lock(mutex);

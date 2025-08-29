@@ -35,7 +35,6 @@
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 #include "v1/utility/topology.h"
-#include "v1/utility/cluster_topology.h"
 
 namespace mooncake {
 namespace v1 {
@@ -104,7 +103,6 @@ class RdmaTransport : public Transport {
     std::unordered_map<std::string, int> context_name_lookup_;
     std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
-    std::unique_ptr<ClusterTopology> cluster_topology_;
     std::unique_ptr<DeviceQuota> device_quota_;
 };
 }  // namespace v1

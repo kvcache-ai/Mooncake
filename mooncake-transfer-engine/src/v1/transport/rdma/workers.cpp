@@ -406,15 +406,22 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region");
 
+    slice->target_dev_id = slice->source_dev_id;
+
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
-    if (!same_machine && slice->target_dev_id < 0 &&
-        transport_->cluster_topology_) {
-        auto source_dev = source.topo->getDeviceName(slice->source_dev_id);
-        auto target_dev = transport_->cluster_topology_->findOptimalMapping(
-            source_dev, target.segment->machine_id,
-            target.topo_entry->numa_node);
-        slice->target_dev_id = target.topo->findDeviceID(target_dev);
+    if (!same_machine && slice->target_dev_id < 0) {
+        auto &ctx = worker_context_[thread_id];
+        auto &instance = ctx.rail_topology_map_[target.segment->machine_id];
+        if (!instance) {
+            instance = std::make_shared<RailTopology>();
+            instance->load(source.topo, target.topo,
+                           transport_->params_->workers.rail_topo_path,
+                           source.segment->machine_id,
+                           target.segment->machine_id);
+        }
+        slice->target_dev_id = instance->findRemoteDeviceID(
+            slice->source_dev_id, target.topo_entry->numa_node);
     } else {
         slice->target_dev_id = slice->source_dev_id;
     }
@@ -424,40 +431,6 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
             "No device could access the slice memory region");
 
     return Status::OK();
-
-#if 0
-    slice->has_lease = false;
-    for (size_t rank = 0;
-         slice->source_dev_id < 0 && rank < DevicePriorityRanks; ++rank) {
-        auto &list = source.topo_entry->device_list[rank];
-        if (!list.empty()) {
-            if (transport_->scheduler_) {
-                LeaseId lease;
-                auto &raw_list = source.topo_entry_raw->device_list[rank];
-                int select_index;
-                auto status = transport_->scheduler_->createJob(
-                    lease, select_index, slice->length, raw_list);
-                if (status.ok()) {
-                    slice->has_lease = true;
-                    slice->lease = lease;
-                    seed = select_index;
-                } else {
-                    thread_local uint64_t last_shown_ts = 0;
-                    uint64_t current_ts = getCurrentTimeInNano();
-                    if (current_ts - last_shown_ts > 500000000) {
-                        LOG(INFO) << status.ToString();
-                        last_shown_ts = current_ts;
-                    }
-                }
-            }
-            slice->source_dev_id = list[seed % list.size()];
-        }
-    }
-
-    slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
-    slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
-    return Status::OK();
-#endif
 }
 
 int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
@@ -470,7 +443,7 @@ int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
 }
 
 Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
-                                     RdmaSlice *slice) {
+                                     RdmaSlice *slice, int thread_id) {
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 
@@ -496,11 +469,17 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
 
         if (same_machine) {
             reachable = (sdev == tdev);  // loopback is safe
-        } else if (!same_machine && transport_->cluster_topology_) {
-            auto source_dev = source.topo->getDeviceName(sdev);
-            auto target_dev = target.topo->getDeviceName(tdev);
-            reachable = transport_->cluster_topology_->getEndpoint(
-                source_dev, target.segment->machine_id, target_dev);
+        } else {
+            auto &ctx = worker_context_[thread_id];
+            auto &instance = ctx.rail_topology_map_[target.segment->machine_id];
+            if (!instance) {
+                instance = std::make_shared<RailTopology>();
+                instance->load(source.topo, target.topo,
+                               transport_->params_->workers.rail_topo_path,
+                               source.segment->machine_id,
+                               target.segment->machine_id);
+            }
+            reachable = instance->connected(sdev, tdev);
         }
 
         if (reachable) {
@@ -529,7 +508,7 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
     if (slice->retry_count == 0)
         CHECK_STATUS(selectOptimalDevice(source, target, slice, thread_id));
     else
-        CHECK_STATUS(selectFallbackDevice(source, target, slice));
+        CHECK_STATUS(selectFallbackDevice(source, target, slice, thread_id));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
     return Status::OK();
