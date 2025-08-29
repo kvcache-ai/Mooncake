@@ -86,6 +86,7 @@ static void convertConfToRdmaParams(std::shared_ptr<ConfigManager> conf,
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
+    SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 }
 
 RdmaTransport::RdmaTransport() : installed_(false) {}
@@ -136,7 +137,12 @@ Status RdmaTransport::install(std::string &local_segment_name,
 
     device_quota_ = std::make_unique<DeviceQuota>();
     CHECK_STATUS(device_quota_->loadTopology(local_topology_));
-    CHECK_STATUS(device_quota_->enableSharedQuota("/mooncake-shared-quota"));
+
+    auto shared_quota_shm_path =
+        conf->get("transports/rdma/shared_quota_shm_path", "");
+    if (!shared_quota_shm_path.empty()) {
+        CHECK_STATUS(device_quota_->enableSharedQuota(shared_quota_shm_path));
+    }
 
     local_topology_->print();
     setupLocalSegment();

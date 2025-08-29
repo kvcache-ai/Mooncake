@@ -8,11 +8,11 @@
         "rdma_whitelist": ["mlx5_0", "mlx5_2"],
         "rdma_blacklist": []
     },
-    "cluster_topology": "/work/Mooncake-next/mooncake-transfer-engine/config/cluster-topology.json",
     "log_level": "warning",
     "transports": {
         "rdma": {
             "enable" : true,
+            "shared_quota_shm_path" : "mooncake_quota_shm",
             "device": {
                 "num_cq_list": 1,
                 "num_comp_channels": 1,
@@ -47,7 +47,8 @@
                 "num_workers": 1,
                 "max_retry_count": 8,
                 "block_size": 65536,
-                "grace_period_ns": 50000
+                "grace_period_ns": 50000,
+                "rail_topo_path": "/path/to/rail_topo.json"
             }
         },
         "gds": {
