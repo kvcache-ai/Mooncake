@@ -158,56 +158,56 @@ Status HeterogeneousRdmaTransport::submitTransfer(
         firstSubmit_ = false;
     }
 
-    memcpy_mutex_.lock();
-    for (auto &request : entries) {
-        aclrtPtrAttributes attributes;
-        ret = aclrtPointerGetAttributes(request.source, &attributes);
+    {
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);
+        for (auto &request : entries) {
+            aclrtPtrAttributes attributes;
+            ret = aclrtPointerGetAttributes(request.source, &attributes);
+            if (ret) {
+                LOG(ERROR) << "aclrtPointrtGetAttributes error, ret: " << ret;
+                return Status::InvalidArgument(
+                    "HeterogeneousRdmaTransport: Exceed the limitation of "
+                    "capacity, batch id: ");
+            }
+
+            if (attributes.location.type == 0) {
+                continue;
+            }
+            ret =
+                aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
+                                 request.length, request.source, request.length,
+                                 ACL_MEMCPY_DEVICE_TO_HOST, stream_);
+            if (ret) {
+                LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtMemcpyAsync "
+                              "error, ret: "
+                           << ret << ", hostAddr: " << hostAddr_
+                           << ", offset_: " << offset_
+                           << ", deviceAddr: " << request.source
+                           << "len: " << request.length;
+                return Status::InvalidArgument(
+                    "HeterogeneousRdmaTransport: Exceed the limitation of "
+                    "capacity, batch id: ");
+            }
+            new_entries[index] = request;
+            new_entries[index].source =
+                static_cast<char *>(hostAddr_) + offset_;
+            offset_ += request.length;
+            if (offset_ >= HUGE_HOST_SIZE) {
+                offset_ = 0;
+            }
+        }
+
+        ret = aclrtSynchronizeStream(stream_);
         if (ret) {
-            memcpy_mutex_.unlock();
-            LOG(ERROR) << "aclrtPointrtGetAttributes error, ret: " << ret;
+            LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSynchronizeStream "
+                          "error, ret: "
+                       << ret;
             return Status::InvalidArgument(
                 "HeterogeneousRdmaTransport: Exceed the limitation of "
-                "capacity, batch id: ");
-        }
-
-        if (attributes.location.type == 0) {
-            continue;
-        }
-        ret = aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
-                               request.length, request.source, request.length,
-                               ACL_MEMCPY_DEVICE_TO_HOST, stream_);
-        if (ret) {
-            memcpy_mutex_.unlock();
-            LOG(ERROR)
-                << "HeterogeneousRdmaTransport: aclrtMemcpyAsync error, ret: "
-                << ret << ", hostAddr: " << hostAddr_
-                << ", offset_: " << offset_
-                << ", deviceAddr: " << request.source
-                << "len: " << request.length;
-            return Status::InvalidArgument(
-                "HeterogeneousRdmaTransport: Exceed the limitation of "
-                "capacity, batch id: ");
-        }
-        new_entries[index] = request;
-        new_entries[index].source = static_cast<char *>(hostAddr_) + offset_;
-        offset_ += request.length;
-        if (offset_ >= HUGE_HOST_SIZE) {
-            offset_ = 0;
+                "capacity, "
+                "batch id: ");
         }
     }
-
-    ret = aclrtSynchronizeStream(stream_);
-    if (ret) {
-        memcpy_mutex_.unlock();
-        LOG(ERROR)
-            << "HeterogeneousRdmaTransport: aclrtSynchronizeStream error, ret: "
-            << ret;
-        return Status::InvalidArgument(
-            "HeterogeneousRdmaTransport: Exceed the limitation of capacity, "
-            "batch id: ");
-    }
-
-    memcpy_mutex_.unlock();
 
     return transport_->submitTransfer(batch_id, new_entries);
 }
@@ -232,58 +232,58 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
         firstSubmit_ = false;
     }
 
-    memcpy_mutex_.lock();
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        auto &task = *task_list[index];
-        auto &request = *task.request;
+    {
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);
+        for (size_t index = 0; index < task_list.size(); ++index) {
+            auto &task = *task_list[index];
+            auto &request = *task.request;
 
-        aclrtPtrAttributes attributes;
-        ret = aclrtPointerGetAttributes(request.source, &attributes);
+            aclrtPtrAttributes attributes;
+            ret = aclrtPointerGetAttributes(request.source, &attributes);
+            if (ret) {
+                LOG(ERROR) << "aclrtPointrtGetAttributes error, ret: " << ret;
+                return Status::InvalidArgument(
+                    "HeterogeneousRdmaTransport: Exceed the limitation of "
+                    "capacity, batch id: ");
+            }
+
+            if (attributes.location.type == 0) {
+                continue;
+            }
+
+            ret =
+                aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
+                                 request.length, request.source, request.length,
+                                 ACL_MEMCPY_DEVICE_TO_HOST, stream_);
+            if (ret) {
+                LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtMemcpyAsync "
+                              "error, ret: "
+                           << ret << ", hostAddr: " << hostAddr_
+                           << ", offset_: " << offset_
+                           << ", deviceAddr: " << request.source
+                           << ", len: " << request.length;
+                return Status::InvalidArgument(
+                    "HeterogeneousRdmaTransport: Exceed the limitation of "
+                    "capacity, batch id: ");
+            }
+            request.source = static_cast<char *>(hostAddr_) + offset_;
+            offset_ += request.length;
+            if (offset_ >= HUGE_HOST_SIZE) {
+                offset_ = 0;
+            }
+        }
+
+        ret = aclrtSynchronizeStream(stream_);
         if (ret) {
-            memcpy_mutex_.unlock();
-            LOG(ERROR) << "aclrtPointrtGetAttributes error, ret: " << ret;
+            LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSynchronizeStream "
+                          "error, ret: "
+                       << ret;
             return Status::InvalidArgument(
                 "HeterogeneousRdmaTransport: Exceed the limitation of "
-                "capacity, batch id: ");
-        }
-
-        if (attributes.location.type == 0) {
-            continue;
-        }
-
-        ret = aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
-                               request.length, request.source, request.length,
-                               ACL_MEMCPY_DEVICE_TO_HOST, stream_);
-        if (ret) {
-            memcpy_mutex_.unlock();
-            LOG(ERROR)
-                << "HeterogeneousRdmaTransport: aclrtMemcpyAsync error, ret: "
-                << ret << ", hostAddr: " << hostAddr_
-                << ", offset_: " << offset_
-                << ", deviceAddr: " << request.source
-                << ", len: " << request.length;
-            return Status::InvalidArgument(
-                "HeterogeneousRdmaTransport: Exceed the limitation of "
-                "capacity, batch id: ");
-        }
-        request.source = static_cast<char *>(hostAddr_) + offset_;
-        offset_ += request.length;
-        if (offset_ >= HUGE_HOST_SIZE) {
-            offset_ = 0;
+                "capacity, "
+                "batch id: ");
         }
     }
-
-    ret = aclrtSynchronizeStream(stream_);
-    if (ret) {
-        memcpy_mutex_.unlock();
-        LOG(ERROR)
-            << "HeterogeneousRdmaTransport: aclrtSynchronizeStream error, ret: "
-            << ret;
-        return Status::InvalidArgument(
-            "HeterogeneousRdmaTransport: Exceed the limitation of capacity, "
-            "batch id: ");
-    }
-    memcpy_mutex_.unlock();
 
     return transport_->submitTransferTask(task_list);
 }
