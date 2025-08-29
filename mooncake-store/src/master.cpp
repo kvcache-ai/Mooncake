@@ -52,9 +52,6 @@ DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
-
-DEFINE_string(protocol, "tcp", "RPC transfer protocol rdma or tcp");
-
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -106,8 +103,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
-    default_config.GetString("protocol", &master_config.protocol,
-                             FLAGS_protocol);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
                              FLAGS_default_kv_lease_ttl);
@@ -209,11 +204,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
-    }
-    if ((google::GetCommandLineFlagInfo("protocol", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.protocol = FLAGS_protocol;
     }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
@@ -364,6 +354,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    const char* value = std::getenv("RPC_PROTOCOL");
+    std::string protocol = "tcp";
+    if (value && std::string_view(value) == "rdma") {
+        protocol = "rdma";
+    }
     LOG(INFO) << "Master service started on port " << master_config.rpc_port
               << ", max_threads=" << master_config.rpc_thread_num
               << ", enable_metric_reporting="
@@ -387,7 +382,7 @@ int main(int argc, char* argv[]) {
               << master_config.rpc_conn_timeout_seconds
               << ", rpc_enable_tcp_no_delay="
               << master_config.rpc_enable_tcp_no_delay
-              << ", rpc protocol=" << master_config.protocol
+              << ", rpc protocol=" << protocol
               << ", cluster_id=" << master_config.cluster_id
               << ", root_fs_dir=" << master_config.root_fs_dir
               << ", memory_allocator=" << master_config.memory_allocator
@@ -426,7 +421,8 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        if (master_config.protocol == "rdma") {
+        const char* value = std::getenv("RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
         mooncake::WrappedMasterService wrapped_master_service(

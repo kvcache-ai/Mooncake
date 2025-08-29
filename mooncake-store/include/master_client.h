@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 
@@ -19,12 +20,11 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient(MasterClientMetric* metrics = nullptr,
-                 const std::string& protocol = "tcp")
-        : metrics_(metrics) {
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
-        if (protocol == "rdma") {
+        const char* value = std::getenv("RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
             pool_conf.client_config.socket_config =
                 coro_io::ib_socket_t::config_t{};
         }

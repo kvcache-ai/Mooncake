@@ -16,7 +16,6 @@ struct MasterConfig {
     std::string rpc_address;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
-    std::string protocol;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
@@ -56,7 +55,6 @@ class MasterServiceSupervisorConfig {
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
-    std::string protocol = "tcp";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -90,7 +88,6 @@ class MasterServiceSupervisorConfig {
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
-        protocol = config.protocol;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
 

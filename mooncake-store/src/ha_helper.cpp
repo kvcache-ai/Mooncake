@@ -101,7 +101,8 @@ int MasterServiceSupervisor::Start() {
         coro_rpc::coro_rpc_server server(
             config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
             config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
-        if (config_.protocol == "rdma") {
+        const char* value = std::getenv("RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
 
