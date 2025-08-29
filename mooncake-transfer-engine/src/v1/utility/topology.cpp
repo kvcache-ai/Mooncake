@@ -477,8 +477,8 @@ int Topology::findDeviceNumaID(int dev_id) const {
 }
 
 Status RailTopology::loadFromJson(const std::string &rail_topo_json_path,
-                                  const std::string local_machine_id,
-                                  const std::string remote_machine_id) {
+                                  const std::string &local_machine_id,
+                                  const std::string &remote_machine_id) {
     connected_set_.clear();
     for (size_t i = 0; i < kMaxNuma; ++i) best_mapping_[i].clear();
     std::ifstream ifs(rail_topo_json_path);
@@ -574,8 +574,8 @@ Status RailTopology::loadFromSelf() {
 
 Status RailTopology::load(const Topology *local, const Topology *remote,
                           const std::string &rail_topo_json_path,
-                          const std::string local_machine_id,
-                          const std::string remote_machine_id) {
+                          const std::string &local_machine_id,
+                          const std::string &remote_machine_id) {
     local_ = local;
     remote_ = remote;
     if (!rail_topo_json_path.empty() && !local_machine_id.empty() &&

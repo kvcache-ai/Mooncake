@@ -149,8 +149,8 @@ class RailTopology {
    public:
     Status load(const Topology *local, const Topology *remote,
                 const std::string &rail_topo_json_path = "",
-                const std::string local_machine_id = "",
-                const std::string remote_machine_id = "");
+                const std::string &local_machine_id = "",
+                const std::string &remote_machine_id = "");
 
     bool connected(int local_dev_id, int remote_dev_id);
 
@@ -158,8 +158,8 @@ class RailTopology {
 
    private:
     Status loadFromJson(const std::string &rail_topo_json_path,
-                        const std::string local_machine_id,
-                        const std::string remote_machine_id);
+                        const std::string &local_machine_id,
+                        const std::string &remote_machine_id);
 
     Status loadFromSelf();
 

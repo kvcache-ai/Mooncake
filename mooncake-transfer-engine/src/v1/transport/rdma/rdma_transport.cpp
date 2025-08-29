@@ -136,6 +136,7 @@ Status RdmaTransport::install(std::string &local_segment_name,
 
     device_quota_ = std::make_unique<DeviceQuota>();
     CHECK_STATUS(device_quota_->loadTopology(local_topology_));
+    CHECK_STATUS(device_quota_->enableSharedQuota("/mooncake-shared-quota"));
 
     local_topology_->print();
     setupLocalSegment();

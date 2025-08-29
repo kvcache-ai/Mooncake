@@ -83,6 +83,21 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
         }
     }
 
+    // Minimal effect fall-back: choose ONE device only without any regulation
+    if (cands.empty()) {
+        const int num_devices = (int)local_topology_->getDeviceList().size();
+        for (int dev_id = 0; dev_id < num_devices; ++dev_id) {
+            auto &device = devices_[dev_id];
+            double weight = device.bw_gbps * 1e9;
+            if (weight <= 0.0) continue;
+            uint64_t act = device.active_bytes.load(std::memory_order_relaxed);
+            double load_factor =
+                1.0 + static_cast<double>(act) / (weight + 1.0);
+            cands.push_back(Cand{dev_id, weight / load_factor});
+            break;
+        }
+    }
+
     if (cands.empty())
         return Status::DeviceNotFound("no eligible devices for " + location);
 
