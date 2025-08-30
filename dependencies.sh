@@ -156,10 +156,10 @@ check_success "Failed to clone yalantinglibs"
 cd yalantinglibs
 check_success "Failed to change to yalantinglibs directory"
 
-# Checkout version 0.5.1
-echo "Checking out yalantinglibs version 0.5.1..."
-git checkout 0.5.1
-check_success "Failed to checkout yalantinglibs version 0.5.1"
+# Checkout version 0.5.5
+echo "Checking out yalantinglibs version 0.5.5..."
+git checkout 0.5.5
+check_success "Failed to checkout yalantinglibs version 0.5.5"
 
 mkdir -p build
 check_success "Failed to create build directory"
