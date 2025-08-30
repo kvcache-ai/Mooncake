@@ -23,7 +23,7 @@ AllocatedBuffer::~AllocatedBuffer() {
 
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, static_cast<uint64_t>(size()),
+    return {segment_name_, file_id_, static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), status};
 }
 
@@ -31,6 +31,7 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
     return os << "AllocatedBuffer: { "
               << "segment_name: " << buffer.segment_name_ << ", "
+              << "file_id: " << buffer.file_id_ << ", "
               << "size: " << buffer.size() << ", "
               << "status: " << buffer.status << ", "
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
@@ -38,14 +39,16 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
-                                                 size_t base, size_t size)
+                                                 size_t base, size_t size,
+                                                 FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      file_id_(file_id) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     // Calculate the size of the header region.
     header_region_size_ =
@@ -56,12 +59,15 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 
     LOG_ASSERT(header_region_start_);
 
+    // Add a padding to base to support zero-based buffers.
+    auto padded_base = base + facebook::cachelib::Slab::kSize;
+
     // Initialize the CacheLib MemoryAllocator.
     memory_allocator_ = std::make_unique<facebook::cachelib::MemoryAllocator>(
         facebook::cachelib::MemoryAllocator::Config(
             facebook::cachelib::MemoryAllocator::generateAllocSizes()),
         reinterpret_cast<void*>(header_region_start_.get()),
-        header_region_size_, reinterpret_cast<void*>(base), size);
+        header_region_size_, reinterpret_cast<void*>(padded_base), size);
 
     if (!memory_allocator_) {
         LOG(ERROR) << "status=failed_to_init_facebook_memory_allocator";
@@ -88,6 +94,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
                          << " current_size=" << cur_size_;
             return nullptr;
         }
+
+        // Un-padding the buffer.
+        buffer = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(buffer) -
+                                         facebook::cachelib::Slab::kSize);
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;
@@ -100,13 +110,16 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     cur_size_.fetch_add(size);
     MasterMetricManager::instance().inc_allocated_size(size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                             buffer, size);
+                                             file_id_, buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(handle->buffer_ptr_);
+        auto buffer = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(handle->buffer_ptr_) +
+            facebook::cachelib::Slab::kSize);
+        memory_allocator_->free(buffer);
         handle->status = BufStatus::UNREGISTERED;
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
@@ -123,14 +136,16 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
-                                             size_t base, size_t size)
+                                             size_t base, size_t size,
+                                             FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      file_id_(file_id) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     try {
         // 1k <= init_capacity <= 64k
@@ -186,7 +201,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), segment_name_, buffer_ptr, size,
+            shared_from_this(), segment_name_, file_id_, buffer_ptr, size,
             std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;

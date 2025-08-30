@@ -495,6 +495,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
         request.target_id = seg;
+        request.file_id = handle.file_id_;
         request.target_offset = handle.buffer_address_;
         request.length = handle.size_;
 

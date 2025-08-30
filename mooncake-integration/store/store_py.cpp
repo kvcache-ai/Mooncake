@@ -343,6 +343,18 @@ PYBIND11_MODULE(store, m) {
                                           local_buffer_size, protocol,
                                           rdma_devices, master_server_addr);
              })
+        .def("setup_with_files",
+             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
+                const std::string &metadata_server,
+                const std::vector<std::string> &files,
+                size_t local_buffer_size = 1024 * 1024 * 16,
+                const std::string &protocol = "nvmeof_generic",
+                const std::string &protocol_arg = "",
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 return self.store_.setup_with_files(
+                     local_hostname, metadata_server, files, local_buffer_size,
+                     protocol, protocol_arg, master_server_addr);
+             })
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
