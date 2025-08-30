@@ -202,64 +202,11 @@ Status RdmaTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    const size_t kBlockSize = globalConfig().slice_size;
-    const int kMaxRetryCount = globalConfig().retry_cnt;
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
-            Slice *slice = getSliceCache().allocate();
-            slice->source_addr = (char *)request.source + offset;
-            slice->length = std::min(request.length - offset, kBlockSize);
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = 0;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->ts = 0;
-            slice->status = Slice::PENDING;
-            task.slice_list.push_back(slice);
-
-            int buffer_id = -1, device_id = -1, retry_cnt = 0;
-            while (retry_cnt < kMaxRetryCount) {
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
-                    continue;
-                auto &context = context_list_[device_id];
-                if (!context->active()) continue;
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
-                break;
-            }
-            if (device_id < 0) {
-                auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) delete s;
-                LOG(ERROR)
-                    << "RdmaTransport: Address not registered by any device(s) "
-                    << source_addr;
-                return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), "
-                    "address: " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
-            }
-        }
-    }
-    for (auto &entry : slices_to_post)
-        entry.first->submitPostSend(entry.second);
-    return Status::OK();
+    std::vector<TransferTask *> task_list;
+    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    return submitTransferTask(task_list);
 }
 
 Status RdmaTransport::submitTransferTask(
@@ -280,6 +227,15 @@ Status RdmaTransport::submitTransferTask(
         nr_slices = 0;
         assert(task.request);
         auto &request = *task.request;
+
+        auto request_buffer_id = -1, request_device_id = -1;
+        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
+                         request.length, request_buffer_id,
+                         request_device_id)) {
+            request_buffer_id = -1;
+            request_device_id = -1;
+        }
+
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
@@ -307,25 +263,26 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
-            while (retry_cnt < kMaxRetryCount) {
+            if (request_buffer_id >= 0 && request_device_id >= 0) {
+                found_device = true;
+                buffer_id = request_buffer_id;
+                device_id = request_device_id;
+            }
+            while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
-                assert(device_id >= 0 && device_id < context_list_.size());
+                assert(device_id >= 0 &&
+                       static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
                 if (!context->active()) continue;
                 assert(buffer_id >= 0 &&
-                       buffer_id < local_segment_desc->buffers.size());
+                       static_cast<size_t>(buffer_id) <
+                           local_segment_desc->buffers.size());
                 assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
                        context_list_.size());
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                // task.slices.push_back(slice);
-                __sync_fetch_and_add(&task.slice_count, 1);
                 found_device = true;
                 break;
             }
@@ -339,6 +296,19 @@ Status RdmaTransport::submitTransferTask(
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+            } else {
+                auto &context = context_list_[device_id];
+                if (!context->active()) {
+                    LOG(ERROR) << "Device " << device_id << " is not active";
+                    return Status::InvalidArgument("Device " +
+                                                   std::to_string(device_id) +
+                                                   " is not active");
+                }
+                slice->rdma.source_lkey =
+                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                slices_to_post[context].push_back(slice);
+                task.total_bytes += slice->length;
+                __sync_fetch_and_add(&task.slice_count, 1);
             }
 
             if (nr_slices >= kSubmitWatermark) {
