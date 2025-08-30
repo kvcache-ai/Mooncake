@@ -81,6 +81,8 @@ class AscendDirectTransport : public Transport {
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
    private:
     int InitAdxlEngine();
 

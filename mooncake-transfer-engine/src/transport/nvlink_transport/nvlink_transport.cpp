@@ -542,6 +542,20 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
+int NvlinkTransport::closeSegment(Transport::SegmentHandle handle) {
+    // close all opened ipc handles for this SegmentHandle.
+    for (auto &entry : remap_entries_) {
+        if (entry.first.first == handle) {
+            cudaError_t err = cudaIpcCloseMemHandle(entry.second.shm_addr);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "NvlinkTransport: cudaIpcCloseMemHandle failed: "
+                           << cudaGetErrorString(err);
+            }
+        }
+    }
+    return 0;
+}
+
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;

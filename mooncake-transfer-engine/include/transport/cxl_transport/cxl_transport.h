@@ -84,6 +84,8 @@ class CxlTransport : public Transport {
 
     bool validateMemoryBounds(void *dest, void *src, size_t size);
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
    private:
     void *cxl_base_addr;
     size_t cxl_dev_size;

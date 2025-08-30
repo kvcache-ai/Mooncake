@@ -143,6 +143,8 @@ class TransferEnginePy {
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
+    int markDead(const char *target_hostname);
+
     std::string getLocalTopology();
 
    private:

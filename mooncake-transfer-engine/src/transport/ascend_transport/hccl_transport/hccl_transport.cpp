@@ -495,6 +495,10 @@ Status HcclTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+int HcclTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 int HcclTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &location,
                                        bool remote_accessible,

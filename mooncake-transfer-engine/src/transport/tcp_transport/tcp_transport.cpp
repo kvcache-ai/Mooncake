@@ -318,6 +318,10 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     return 0;
 }
 
+int TcpTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 int TcpTransport::registerLocalMemory(void *addr, size_t length,
                                       const std::string &location,
                                       bool remote_accessible,
