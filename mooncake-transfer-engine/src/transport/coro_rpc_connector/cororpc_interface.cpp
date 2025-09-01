@@ -5,6 +5,7 @@
 #include <iostream>
 #include <functional>
 #include <memory>
+#include <cstring>
 
 using namespace pybind11::literals;
 
@@ -284,26 +285,90 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensorInternal() const
         auto torch = pybind11::module::import("torch");
         auto numpy = pybind11::module::import("numpy");
         
-        std::string np_dtype;
-        if (dtype.find("float32") != std::string::npos) {
-            np_dtype = "float32";
-        } else if (dtype.find("float64") != std::string::npos) {
-            np_dtype = "float64";
-        } else if (dtype.find("int32") != std::string::npos) {
-            np_dtype = "int32";
-        } else if (dtype.find("int64") != std::string::npos) {
-            np_dtype = "int64";
-        } else {
-            np_dtype = "float32";
+        // 检查数据大小是否足够包含元数据
+        if (data.size() < sizeof(TensorMetadata)) {
+            std::cerr << "Invalid data format: insufficient data for metadata" << std::endl;
+            return pybind11::none();
         }
         
-        auto np_array = numpy.attr("frombuffer")(
-            pybind11::bytes(data), 
-            "dtype"_a=np_dtype
-        ).attr("reshape")(pybind11::cast(shape));
+        // 从数据开头提取元数据
+        TensorMetadata metadata;
+        std::memcpy(&metadata, data.data(), sizeof(TensorMetadata));
         
+        // 验证元数据的有效性
+        if (metadata.ndim < 0 || metadata.ndim > 4) {
+            std::cerr << "Invalid tensor metadata: ndim=" << metadata.ndim << std::endl;
+            return pybind11::none();
+        }
+        
+        TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            std::cerr << "Unknown tensor dtype!" << std::endl;
+            return pybind11::none();
+        }
+        
+        // 计算实际 tensor 数据的大小
+        size_t tensor_size = data.size() - sizeof(TensorMetadata);
+        if (tensor_size == 0) {
+            std::cerr << "Invalid data format: no tensor data found" << std::endl;
+            return pybind11::none();
+        }
+        
+        // 获取 tensor 数据指针（跳过元数据）
+        const char* tensor_data = data.data() + sizeof(TensorMetadata);
+        
+        // 根据数据类型创建对应的 numpy 数组
+        std::string np_dtype;
+        switch (dtype_enum) {
+            case TensorDtype::FLOAT32:
+                np_dtype = "float32";
+                break;
+            case TensorDtype::FLOAT64:
+                np_dtype = "float64";
+                break;
+            case TensorDtype::INT32:
+                np_dtype = "int32";
+                break;
+            case TensorDtype::INT64:
+                np_dtype = "int64";
+                break;
+            case TensorDtype::INT8:
+                np_dtype = "int8";
+                break;
+            case TensorDtype::INT16:
+                np_dtype = "int16";
+                break;
+            case TensorDtype::UINT8:
+                np_dtype = "uint8";
+                break;
+            case TensorDtype::BOOL:
+                np_dtype = "bool";
+                break;
+            default:
+                std::cerr << "Unsupported dtype enum: " << static_cast<int>(dtype_enum) << std::endl;
+                return pybind11::none();
+        }
+        
+        // 从原始数据创建 numpy 数组
+        auto np_array = numpy.attr("frombuffer")(
+            pybind11::bytes(tensor_data, tensor_size), 
+            "dtype"_a=np_dtype
+        );
+        
+        // 重建形状
+        if (metadata.ndim > 0) {
+            std::vector<int> shape_vec;
+            for (int i = 0; i < metadata.ndim; i++) {
+                shape_vec.push_back(metadata.shape[i]);
+            }
+            pybind11::tuple shape_tuple = pybind11::cast(shape_vec);
+            np_array = np_array.attr("reshape")(shape_tuple);
+        }
+        
+        // 转换为 PyTorch tensor
         auto tensor = torch.attr("from_numpy")(np_array);
         return tensor;
+        
     } catch (const std::exception& e) {
         std::cerr << "Error rebuilding tensor: " << e.what() << std::endl;
         return pybind11::none();

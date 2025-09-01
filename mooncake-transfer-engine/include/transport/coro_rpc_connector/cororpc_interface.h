@@ -9,6 +9,27 @@ namespace mooncake {
 
 struct Config;
 
+// Tensor data type enumeration
+enum class TensorDtype : int {
+    UNKNOWN = 0,
+    FLOAT32 = 1,
+    FLOAT64 = 2,
+    INT32 = 3,
+    INT64 = 4,
+    INT8 = 5,
+    INT16 = 6,
+    UINT8 = 7,
+    BOOL = 8
+};
+
+// Tensor metadata structure for serialization
+struct TensorMetadata {
+    int ndim = 0;           // Number of dimensions
+    int shape[4] = {0};     // Shape array (max 4 dimensions)
+    int dtype = 0;          // Data type as integer
+    size_t total_size = 0;  // Total size in bytes
+};
+
 class CoroRPCInterface {
 public:
     struct ReceivedData {
