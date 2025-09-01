@@ -24,7 +24,7 @@ store = MooncakeDistributedStore()
 # Use TCP protocol by default for testing, also support rdma
 protocol = os.getenv("MC_RPC_PROTOCOL", "tcp")
 device_name = os.getenv("DEVICE_NAME", "eth0")
-local_hostname = os.getenv("LOCAL_HOSTNAME", "rdma-client1.mooncake.dc")
+local_hostname = os.getenv("LOCAL_HOSTNAME", "127.0.0.1")
 metadata_server = os.getenv("METADATA_ADDR", f"http://{master_host}:8080/metadata")
 global_segment_size = 0
 local_buffer_size = 512 * 1024 * 1024
