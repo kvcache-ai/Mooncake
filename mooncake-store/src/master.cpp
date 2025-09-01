@@ -354,7 +354,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("RPC_PROTOCOL");
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
     std::string protocol = "tcp";
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
@@ -421,7 +421,7 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("RPC_PROTOCOL");
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }

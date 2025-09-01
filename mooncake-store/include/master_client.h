@@ -23,7 +23,7 @@ class MasterClient {
     MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
-        const char* value = std::getenv("RPC_PROTOCOL");
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
             pool_conf.client_config.socket_config =
                 coro_io::ib_socket_t::config_t{};
