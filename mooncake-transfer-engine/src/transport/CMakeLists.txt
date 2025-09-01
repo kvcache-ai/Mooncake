@@ -1,7 +1,9 @@
 file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
-add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>)
+add_subdirectory(coro_rpc_connector)
+
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:coro_rpc_connector>)
 target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread)
 
 if (USE_TCP)
@@ -28,3 +30,5 @@ if (USE_MNNVL)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
+
+target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)

@@ -20,6 +20,10 @@ endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
+include_directories("../mooncake-transfer-engine/include")
+
+# Find Python for pybind11 integration
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -31,12 +35,20 @@ set(PYTHON_PACKAGE_NAME "mooncake")
 
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp 
+    ../mooncake-transfer-engine/src/transport/coro_rpc_connector/cororpc_interface.cpp
+    ../mooncake-transfer-engine/src/transport/coro_rpc_connector/cororpc_communicator.cpp
+)
+
+target_include_directories(engine PRIVATE 
+    ${Python3_INCLUDE_DIRS}
 )
 
 target_link_libraries(engine PUBLIC 
     transfer_engine 
     glog::glog
     gflags::gflags
+    yalantinglibs::yalantinglibs
+    pybind11::module
 )
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
