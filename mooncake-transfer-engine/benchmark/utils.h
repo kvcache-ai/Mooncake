@@ -109,9 +109,7 @@ class XferBenchTimer {
    public:
     XferBenchTimer() : start_ts_(getCurrentTimeNs()) {}
 
-    void reset() {
-        start_ts_ = getCurrentTimeNs();
-    }
+    void reset() { start_ts_ = getCurrentTimeNs(); }
 
     uint64_t lap_us(bool reset = true) {
         auto now_ts = getCurrentTimeNs();

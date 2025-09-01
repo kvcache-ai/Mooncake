@@ -35,7 +35,6 @@ pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
 
 target_link_libraries(engine PUBLIC 
     transfer_engine 
-    transfer_engine_v1 
     glog::glog
     gflags::gflags
 )
@@ -56,7 +55,6 @@ if (WITH_STORE)
     )
     target_link_libraries(store PUBLIC
         transfer_engine
-        transfer_engine_v1 
         glog::glog
         gflags::gflags
         mooncake_store

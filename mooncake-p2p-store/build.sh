@@ -38,7 +38,7 @@ EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/v1"
 EXT_LDFLAGS+=" -ltransfer_engine_v1 -luring"
 
 if [ -d "/usr/local/cuda/lib64" ]; then
-    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"
+    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcuda -lcudart -lrt -lcufile"
 fi
 
 if [ "$USE_ETCD" = "ON" ]; then

@@ -142,7 +142,7 @@ int XferTERunner::stopInitiator() {
     return 0;
 }
 
-int parseIndex(const std::string& loc) {
+int parseIndex(const std::string &loc) {
     auto pos = loc.find(':');
     if (pos == std::string::npos || pos + 1 >= loc.size()) {
         throw std::invalid_argument("Invalid loc format: " + loc);
@@ -151,7 +151,8 @@ int parseIndex(const std::string& loc) {
 }
 
 void XferTERunner::pinThread(int thread_id) {
-    uint64_t addr = (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
+    uint64_t addr =
+        (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = getMemoryLocation((void *)addr, 1);
     if (result[0].location.starts_with("cpu")) {
         auto socket_id = parseIndex(result[0].location);
@@ -160,7 +161,7 @@ void XferTERunner::pinThread(int thread_id) {
         auto device_id = parseIndex(result[0].location);
         auto socket_id = getCudaDeviceNumaID(device_id);
         bindToSocket(socket_id);
-    } 
+    }
 }
 
 int XferTERunner::runner(int thread_id) {
