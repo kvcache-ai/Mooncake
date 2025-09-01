@@ -21,26 +21,13 @@
 #include "mutex.h"
 #include "segment.h"
 #include "types.h"
+#include "master_config.h"
+#include "replica.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
-
-// Structure to store garbage collection tasks
-struct GCTask {
-    std::string key;
-    std::chrono::steady_clock::time_point deletion_time;
-
-    GCTask() = default;
-
-    GCTask(const std::string& k, std::chrono::milliseconds delay)
-        : key(k), deletion_time(std::chrono::steady_clock::now() + delay) {}
-
-    bool is_ready() const {
-        return std::chrono::steady_clock::now() >= deletion_time;
-    }
-};
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -50,29 +37,9 @@ struct GCTask {
  * 3. segment_mutex_
  */
 class MasterService {
-   private:
-    // Comparator for GC tasks priority queue
-    struct GCTaskComparator {
-        bool operator()(GCTask* a, GCTask* b) const {
-            return a->deletion_time > b->deletion_time;
-        }
-    };
-
    public:
-    MasterService(
-        bool enable_gc = true,
-        uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
-        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-        bool allow_evict_soft_pinned_objects =
-            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-        double eviction_ratio = DEFAULT_EVICTION_RATIO,
-        double eviction_high_watermark_ratio =
-            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        ViewVersionId view_version = 0,
-        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterService();
+    MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
     /**
@@ -142,6 +109,18 @@ class MasterService {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
     /**
+     * @brief Retrieves replica lists for object keys that match a regex
+     * pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    auto GetReplicaListByRegex(const std::string& regex_pattern)
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
@@ -159,15 +138,6 @@ class MasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
     /**
-     * @brief Mark a key for garbage collection after specified delay
-     * @param key The key to be garbage collected
-     * @param delay_ms Delay in milliseconds before removing the key
-     * @return ErrorCode::OK on success
-     */
-    auto MarkForGC(const std::string& key, uint64_t delay_ms)
-        -> tl::expected<void, ErrorCode>;
-
-    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for slices
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
@@ -180,18 +150,22 @@ class MasterService {
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
-     * @brief Complete a put operation
+     * @brief Complete a put operation, replica_type indicates the type of
+     * replica to complete (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Revoke a put operation
+     * @brief Revoke a put operation, replica_type indicates the type of
+     * replica to revoke (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -215,6 +189,14 @@ class MasterService {
      * found
      */
     auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Removes objects from the master whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
@@ -245,8 +227,9 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
    private:
-    // GC thread function
-    void GCThreadFunc();
+    // Resolve the key to a sanitized format for storage
+    std::string SanitizeKey(const std::string& key) const;
+    std::string ResolvePath(const std::string& key) const;
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -304,9 +287,10 @@ class MasterService {
         // given value. If there are, return the status of the first replica
         // that is not equal to the given value. Otherwise, return false.
         std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status) const {
+            ReplicaStatus status, ReplicaType replica_type) const {
             for (const auto& replica : replicas) {
-                if (replica.status() != status) {
+                if (replica.status() != status &&
+                    replica.type() == replica_type) {
                     return replica.status();
                 }
             }
@@ -325,6 +309,32 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
+        }
+
+        // Erase all replicas of the given type
+        void EraseReplica(ReplicaType replica_type) {
+            replicas.erase(
+                std::remove_if(replicas.begin(), replicas.end(),
+                               [replica_type](const Replica& replica) {
+                                   return replica.type() == replica_type;
+                               }),
+                replicas.end());
+        }
+
+        // Check if there is a memory replica
+        bool HasMemReplica() const {
+            return std::any_of(replicas.begin(), replicas.end(),
+                               [](const Replica& replica) {
+                                   return replica.type() == ReplicaType::MEMORY;
+                               });
+        }
+
+        // Get the count of memory replicas
+        int GetMemReplicaCount() const {
+            return std::count_if(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.type() == ReplicaType::MEMORY;
+                });
         }
 
         // Check if the lease has expired
@@ -347,6 +357,17 @@ class MasterService {
         bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
+
+        // Check if the metadata is valid
+        // Valid means it has at least one replica and size is greater than 0
+        bool IsValid() const { return !replicas.empty() && size > 0; }
+
+        bool IsAllReplicasComplete() const {
+            return std::all_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
+        }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -367,14 +388,8 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
 
-    // GC related members
-    static constexpr size_t kGCQueueSize = 10 * 1024;  // Size of the GC queue
-    boost::lockfree::queue<GCTask*> gc_queue_{kGCQueueSize};
-    std::thread gc_thread_;
-    std::atomic<bool> gc_running_{false};
-    bool enable_gc_{true};  // Flag to enable/disable garbage collection
-    static constexpr uint64_t kGCThreadSleepMs =
-        10;  // 10 ms sleep between GC and eviction checks
+    // Eviction thread function
+    void EvictionThreadFunc();
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -386,6 +401,12 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+
+    // Eviction thread related members
+    std::thread eviction_thread_;
+    std::atomic<bool> eviction_running_{false};
+    static constexpr uint64_t kEvictionThreadSleepMs =
+        10;  // 10 ms sleep between eviction checks
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
@@ -455,6 +476,10 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // root filesystem directory for persistent storage
+    const std::string root_fs_dir_;
+
+    bool use_disk_replica_{false};
 
     // Segment management
     SegmentManager segment_manager_;

@@ -9,6 +9,16 @@
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
   | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
+  <br />
+  <br />
+
+  [![Docs](https://img.shields.io/badge/docs-live-brightgreen)](https://kvcache-ai.github.io/Mooncake/)
+  [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI - Downloads](https://img.shields.io/pypi/dm/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
+  [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
+
 </div>
 <br/>
 
@@ -54,6 +64,9 @@ Both P2P Store and Mooncake Store are built on the Transfer Engine and provide k
 
 **Mooncake Integration with Leading LLM Inference Systems**  
 Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
+
+**Elastic Expert Parallelism Support (Work in Progress)**
+Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 

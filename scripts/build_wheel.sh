@@ -130,6 +130,38 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libffi.so* \
 --exclude libcuda.so* \
 --exclude libcudart.so* \
+--exclude libascendcl.so* \
+--exclude libhccl.so* \
+--exclude libmsprofiler.so* \
+--exclude libgert.so* \
+--exclude libascendcl_impl.so* \
+--exclude libge_executor.so* \
+--exclude libascend_dump.so* \
+--exclude libgraph.so* \
+--exclude libruntime.so* \
+--exclude libascend_watchdog.so* \
+--exclude libprofapi.so* \
+--exclude liberror_manager.so* \
+--exclude libascendalog.so* \
+--exclude libc_sec.so* \
+--exclude libhccl_alg.so* \
+--exclude libhccl_plf.so* \
+--exclude libascend_protobuf.so* \
+--exclude libhybrid_executor.so* \
+--exclude libdavinci_executor.so* \
+--exclude libge_common.so* \
+--exclude libge_common_base.so* \
+--exclude liblowering.so* \
+--exclude libregister.so* \
+--exclude libexe_graph.so* \
+--exclude libmmpa.so* \
+--exclude libplatform.so* \
+--exclude libgraph_base.so* \
+--exclude libruntime_common.so* \
+--exclude libqos_manager.so* \
+--exclude libascend_trace.so* \
+--exclude libmetadef*.so \
+--exclude libadxl*.so \
 -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 

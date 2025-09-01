@@ -84,7 +84,7 @@ void FIFOEndpointStore::evictEndpoint() {
     std::string victim = fifo_list_.front();
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
-    // LOG(INFO) << victim << " evicted";
+    LOG(INFO) << victim << " evicted";
     waiting_list_.insert(endpoint_map_[victim]);
     endpoint_map_.erase(victim);
     return;
@@ -112,6 +112,15 @@ int FIFOEndpointStore::disconnectQPs() {
         kv.second->disconnect();
     }
     return 0;
+}
+
+size_t FIFOEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second->getQPNumber();
+    }
+    return total_qps;
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
@@ -193,10 +202,10 @@ void SIEVEEndpointStore::evictEndpoint() {
             break;
         }
     }
-    hand_ = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
+    o == fifo_list_.begin() ? hand_ = std::nullopt : hand_ = std::prev(o);
     fifo_list_.erase(o);
     fifo_map_.erase(victim);
-    // LOG(INFO) << victim << " evicted";
+    LOG(INFO) << victim << " evicted";
     auto victim_instance = endpoint_map_[victim].first;
     victim_instance->set_active(false);
     waiting_list_len_++;
@@ -228,4 +237,22 @@ int SIEVEEndpointStore::disconnectQPs() {
 }
 
 size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+
+size_t SIEVEEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+
+    // Count QPs in active endpoints
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second.first->getQPNumber();
+    }
+
+    // Count QPs in waiting list
+    for (const auto &endpoint : waiting_list_) {
+        total_qps += endpoint->getQPNumber();
+    }
+
+    return total_qps;
+}
+
 }  // namespace mooncake

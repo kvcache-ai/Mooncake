@@ -278,10 +278,22 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
     }
     // notify
     TransferEngine *native = (TransferEngine *)engine;
-    TransferMetadata::NotifyDesc notify;
-    notify.name = notify_msg.name;
-    notify.notify_msg = notify_msg.msg;
-    return native->sendNotifyByID((SegmentID)target_id, notify);
+    std::vector<Transport::TransferRequest> native_entries;
+    native_entries.resize(count);
+    for (size_t index = 0; index < count; index++) {
+        native_entries[index].opcode =
+            (Transport::TransferRequest::OpCode)entries[index].opcode;
+        native_entries[index].source = entries[index].source;
+        native_entries[index].target_id = entries[index].target_id;
+        native_entries[index].target_offset = entries[index].target_offset;
+        native_entries[index].length = entries[index].length;
+    }
+    TransferMetadata::NotifyDesc native_notify_msg;
+    native_notify_msg.name = notify_msg.name;
+    native_notify_msg.notify_msg = notify_msg.msg;
+    Status s = native->submitTransferWithNotify(
+        (Transport::BatchID)batch_id, native_entries, native_notify_msg);
+    return (int)s.code();
 }
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
@@ -317,12 +329,28 @@ notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
     *size = notifies_desc.size();
     notify_msg_t *notifies =
         (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
+    memset(notifies, 0, *size * sizeof(notify_msg_t));
     for (int i = 0; i < *size; i++) {
-        notifies[i].name = const_cast<char *>(notifies_desc[i].name.c_str());
+        notifies[i].name = (char *)malloc(notifies_desc[i].name.size() + 1);
         notifies[i].msg =
-            const_cast<char *>(notifies_desc[i].notify_msg.c_str());
+            (char *)malloc(notifies_desc[i].notify_msg.size() + 1);
+        if (!notifies[i].name || !notifies[i].msg) {
+            freeNotifsMsgBuf(notifies, *size);
+            return nullptr;
+        }
+        strcpy(notifies[i].name, notifies_desc[i].name.c_str());
+        strcpy(notifies[i].msg, notifies_desc[i].notify_msg.c_str());
     }
     return notifies;
+}
+
+int freeNotifsMsgBuf(notify_msg_t *msg, int size) {
+    for (int i = 0; i < size; i++) {
+        if (msg[i].name) free(msg[i].name);
+        if (msg[i].msg) free(msg[i].msg);
+    }
+    free(msg);
+    return 0;
 }
 
 int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,

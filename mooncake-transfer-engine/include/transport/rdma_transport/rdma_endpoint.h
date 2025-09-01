@@ -110,6 +110,9 @@ class RdmaEndPoint {
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
 
+    // Get the number of QPs in this endpoint
+    size_t getQPNumber() const;
+
    private:
     std::vector<uint32_t> qpNum() const;
 

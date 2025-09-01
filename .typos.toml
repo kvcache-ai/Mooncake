@@ -1,0 +1,8 @@
+[default]
+extend-ignore-words = ["CANN"]
+
+[files]
+extend-exclude = ["mooncake-ep/csrc/*.h"]
+
+[default.extend-words]
+CANN = "CANN"

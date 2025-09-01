@@ -1,8 +1,3 @@
-file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
-set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
-
-link_directories(${ASCEND_LIB_DIR})
-
 add_executable(transfer_engine_bench transfer_engine_bench.cpp)
 target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 
@@ -25,3 +20,7 @@ endif()
 
 add_executable(transfer_engine_bench_v1 transfer_engine_bench_v1.cpp)
 target_link_libraries(transfer_engine_bench_v1 PUBLIC transfer_engine_v1)
+if (USE_ASCEND_DIRECT)
+    add_executable(transfer_engine_ascend_direct_perf transfer_engine_ascend_direct_perf.cpp)
+    target_link_libraries(transfer_engine_ascend_direct_perf PUBLIC transfer_engine)
+endif()

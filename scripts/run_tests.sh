@@ -28,6 +28,7 @@ mooncake_master --default_kv_lease_ttl=500 &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
 sleep 1
 
 pip install torch numpy
@@ -43,10 +44,10 @@ if [ -n "$TEST_SSD_OFFLOAD_IN_EVICT" ]; then
     echo "Running with ssd offload in evict tests..."
     # Set a small kv lease ttl to make the test faster.
     # Must be consistent with the client test parameters.
-    mooncake_master --default_kv_lease_ttl=500 &
+    mooncake_master --default_kv_lease_ttl=500 --root_fs_dir=$TEST_ROOT_DIR &
     MASTER_PID=$!
     sleep 1
-    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MOONCAKE_STORAGE_ROOT_DIR=$TEST_ROOT_DIR DEFAULT_KV_LEASE_TTL=500 python test_ssd_offload_in_evict.py
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_ssd_offload_in_evict.py
     kill $MASTER_PID || true
     rm -rf $TEST_ROOT_DIR
 else
@@ -55,6 +56,16 @@ fi
 
 echo "Running CLI entry point tests..."
 python test_cli.py
+
+killall mooncake_http_metadata_server
+killall mooncake_master
+mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
+MASTER_PID=$!
+sleep 1
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
+sleep 1
+kill $MASTER_PID || true
+
 
 echo "All tests completed successfully!"
 cd ../..
