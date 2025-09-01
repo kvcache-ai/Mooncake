@@ -273,7 +273,7 @@ std::future<int> CoroRPCCommunicator::sendTensorAsync(const std::string& target_
             }
         ).start([](auto &&) {});
     } else {
-        LOG("Client pool not available for async tensor send");
+        std::cerr << "Client pool not available for async tensor send" << std::endl;
     }
     
     return future;

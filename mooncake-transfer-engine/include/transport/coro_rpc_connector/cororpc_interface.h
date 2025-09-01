@@ -9,27 +9,6 @@ namespace mooncake {
 
 struct Config;
 
-// Tensor data type enumeration
-enum class TensorDtype : int {
-    UNKNOWN = 0,
-    FLOAT32 = 1,
-    FLOAT64 = 2,
-    INT32 = 3,
-    INT64 = 4,
-    INT8 = 5,
-    INT16 = 6,
-    UINT8 = 7,
-    BOOL = 8
-};
-
-// Tensor metadata structure for serialization
-struct TensorMetadata {
-    int ndim = 0;           // Number of dimensions
-    int shape[4] = {0};     // Shape array (max 4 dimensions)
-    int dtype = 0;          // Data type as integer
-    size_t total_size = 0;  // Total size in bytes
-};
-
 class CoroRPCInterface {
 public:
     struct ReceivedData {
@@ -98,8 +77,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<CoroRPCInterface> createRPCClient(size_t pool_size = 10, size_t timeout_seconds = 30);
-std::unique_ptr<CoroRPCInterface> createRPCServer(const std::string& listen_address, size_t thread_count = 0);
+std::unique_ptr<CoroRPCInterface> createRPCClient(uint64_t local_rank = 0, uint64_t world_size = 1);
+std::unique_ptr<CoroRPCInterface> createRPCServer(uint64_t local_rank = 0, uint64_t world_size = 1);
 
 } // namespace mooncake
 
