@@ -101,6 +101,11 @@ int MasterServiceSupervisor::Start() {
         coro_rpc::coro_rpc_server server(
             config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
             config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            server.init_ibv();
+        }
+
         LOG(INFO) << "Init leader election helper...";
         MasterViewHelper mv_helper;
         if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
