@@ -19,10 +19,10 @@ using namespace mooncake::v1;
 
 void processBatchSizes(XferTERunner &runner, size_t block_size,
                        size_t batch_size) {
-    bool mixture = false;
+    bool mixed_opcode = false;
     Request::OpCode opcode;
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
-        mixture = true;
+        mixed_opcode = true;
     else if (XferBenchConfig::op_type == "read")
         opcode = Request::READ;
     else if (XferBenchConfig::op_type == "write")
@@ -35,10 +35,12 @@ void processBatchSizes(XferTERunner &runner, size_t block_size,
     XferBenchStats stats;
     std::mutex mutex;
     runner.runInitiatorTasks([&](int thread_id) -> int {
+        runner.pinThread(thread_id);
         uint64_t local_addr =
             runner.getLocalBufferBase(thread_id, block_size, batch_size);
         uint64_t target_addr =
             runner.getTargetBufferBase(thread_id, block_size, batch_size);
+        
         XferBenchTimer timer;
         while (timer.lap_us(false) < 500000 /* 0.5s */) {
             runner.runSingleTransfer(local_addr, target_addr, block_size,
@@ -46,10 +48,32 @@ void processBatchSizes(XferTERunner &runner, size_t block_size,
         }
         timer.reset();
         std::vector<double> transfer_duration;
-        while (timer.lap_us(false) < XferBenchConfig::duration * 1000000) {
-            auto val = runner.runSingleTransfer(local_addr, target_addr,
-                                                block_size, batch_size, opcode);
-            transfer_duration.push_back(val);
+        if (mixed_opcode) {
+            while (timer.lap_us(false) <
+                   XferBenchConfig::duration * 1000000ull) {
+                uint8_t pattern = 0;
+                if (XferBenchConfig::check_consistency)
+                    pattern =
+                        fillData((void *)local_addr, block_size * batch_size);
+                auto val = runner.runSingleTransfer(local_addr, target_addr,
+                                                    block_size, batch_size,
+                                                    Request::WRITE);
+                transfer_duration.push_back(val);
+                val = runner.runSingleTransfer(local_addr, target_addr,
+                                               block_size, batch_size,
+                                               Request::READ);
+                if (XferBenchConfig::check_consistency)
+                    verifyData((void *)local_addr, block_size * batch_size,
+                               pattern);
+                transfer_duration.push_back(val);
+            }
+        } else {
+            while (timer.lap_us(false) <
+                   XferBenchConfig::duration * 1000000ull) {
+                auto val = runner.runSingleTransfer(
+                    local_addr, target_addr, block_size, batch_size, opcode);
+                transfer_duration.push_back(val);
+            }
         }
         auto total_duration = timer.lap_us();
         mutex.lock();
@@ -63,6 +87,8 @@ void processBatchSizes(XferTERunner &runner, size_t block_size,
 }
 
 int main(int argc, char *argv[]) {
+    gflags::SetUsageMessage(
+        "Transfer Engine Benchmarking Tool\nUsage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
     auto runner = std::make_unique<XferTERunner>();

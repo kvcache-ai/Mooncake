@@ -27,6 +27,9 @@
 #include <stdexcept>
 #include <chrono>
 
+#include "v1/utility/system.h"
+#include "v1/utility/random.h"
+
 #define CHECK_FAIL(call)                                        \
     do {                                                        \
         auto status_ = call;                                    \
@@ -41,7 +44,6 @@ namespace v1 {
 struct XferBenchConfig {
     static void loadFromFlags();
 
-    static std::string worker_type;
     static std::string seg_name;
     static std::string seg_type;
     static std::string target_seg_name;
@@ -131,6 +133,39 @@ class XferBenchTimer {
 void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats);
+
+static inline uint8_t fillData(void *addr, size_t length) {
+    uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
+#ifdef USE_CUDA
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> ref_data;
+        ref_data.resize(length, seed);
+        cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
+        return seed;
+    }
+#endif
+    memset(addr, seed, length);
+    return seed;
+}
+
+static inline void verifyData(void *addr, size_t length, uint8_t seed) {
+    std::vector<uint8_t> ref_data;
+    ref_data.resize(length, seed);
+#ifdef USE_CUDA
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> act_data;
+        act_data.resize(length);
+        cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
+    if (memcmp(addr, ref_data.data(), length)) {
+        LOG(FATAL) << "Inconsistent data detected";
+    }
+}
 
 }  // namespace v1
 }  // namespace mooncake

@@ -14,6 +14,8 @@
 
 #include "xfer_bench.h"
 #include "utils.h"
+#include "v1/memory/location.h"
+#include "v1/utility/topology.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -140,8 +142,28 @@ int XferTERunner::stopInitiator() {
     return 0;
 }
 
+int parseIndex(const std::string& loc) {
+    auto pos = loc.find(':');
+    if (pos == std::string::npos || pos + 1 >= loc.size()) {
+        throw std::invalid_argument("Invalid loc format: " + loc);
+    }
+    return std::stoi(loc.substr(pos + 1));
+}
+
+void XferTERunner::pinThread(int thread_id) {
+    uint64_t addr = (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
+    auto result = getMemoryLocation((void *)addr, 1);
+    if (result[0].location.starts_with("cpu")) {
+        auto socket_id = parseIndex(result[0].location);
+        bindToSocket(socket_id);
+    } else if (result[0].location.starts_with("cuda")) {
+        auto device_id = parseIndex(result[0].location);
+        auto socket_id = getCudaDeviceNumaID(device_id);
+        bindToSocket(socket_id);
+    } 
+}
+
 int XferTERunner::runner(int thread_id) {
-    bindToSocket(thread_id % numa_num_configured_nodes());
     while (g_running) {
         std::function<int(int)> task;
         {

@@ -17,8 +17,6 @@
 #include <gflags/gflags.h>
 #include <iostream>
 
-DEFINE_string(worker_type, "initiator",
-              "The role of this process: initiator|target");
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
@@ -42,7 +40,6 @@ DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
 
 namespace mooncake {
 namespace v1 {
-std::string XferBenchConfig::worker_type;
 std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
 std::string XferBenchConfig::target_seg_name;
@@ -62,7 +59,6 @@ std::string XferBenchConfig::metadata_url_list;
 std::string XferBenchConfig::xport_type;
 
 void XferBenchConfig::loadFromFlags() {
-    worker_type = FLAGS_worker_type;
     seg_type = FLAGS_seg_type;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;

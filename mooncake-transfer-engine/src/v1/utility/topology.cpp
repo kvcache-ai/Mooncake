@@ -159,6 +159,21 @@ static int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
     return numa_node;
 }
 
+int getCudaDeviceNumaID(int cuda_id) {
+#ifdef USE_CUDA
+    char pci_bus_id[20];
+    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_id);
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
+        return 0;
+    }
+    for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+#else
+    return 0;
+#endif
+}
+
 #ifdef USE_CUDA
 
 static int getPciDistance(const char *bus1, const char *bus2) {

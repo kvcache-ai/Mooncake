@@ -51,7 +51,7 @@ Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
     }
 
     const ResolvedTopologyEntry &entry = it_loc->second;
-    static constexpr double rank_weights[] = {1.0, 0.75, 0.25};
+    static constexpr double rank_weights[] = {1.0, 0.25, 0.25};
 
     struct Cand {
         int dev_id;

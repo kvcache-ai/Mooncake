@@ -39,6 +39,8 @@ class XferTERunner {
     XferTERunner(const XferTERunner &) = delete;
     XferTERunner &operator=(const XferTERunner &) = delete;
 
+    void pinThread(int thread_id);
+
     int runTarget();
 
     int startInitiator();
@@ -51,8 +53,9 @@ class XferTERunner {
 
     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
                                 uint64_t batch_size) const {
-        return (uint64_t)pinned_buffer_list_[thread_id % info_.buffers.size()] +
-               block_size * batch_size * (thread_id / info_.buffers.size());
+        const size_t num_buffers = pinned_buffer_list_.size();
+        return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
+               block_size * batch_size * (thread_id / num_buffers);
     }
 
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,

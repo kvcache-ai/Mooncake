@@ -174,6 +174,9 @@ class RailTopology {
     std::unordered_set<std::pair<int, int>, PairHash> connected_set_;
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
 };
+
+int getCudaDeviceNumaID(int cuda_id);
+
 }  // namespace v1
 }  // namespace mooncake
 
