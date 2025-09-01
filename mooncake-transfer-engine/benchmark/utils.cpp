@@ -120,8 +120,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats) {
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
     total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * XferBenchConfig::num_threads /
-                   (num_ops * batch_size));
+    avg_latency = (total_duration * XferBenchConfig::num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
 

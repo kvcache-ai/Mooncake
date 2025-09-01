@@ -23,10 +23,17 @@ namespace mooncake {
 namespace v1 {
 
 volatile bool g_running = true;
+volatile bool g_triggered_sig = false;
 
 void signalHandler(int signum) {
+    if (g_triggered_sig) {
+        LOG(ERROR) << "Received signal " << signum
+                   << " again, forcefully terminating...";
+        std::exit(EXIT_FAILURE);
+    }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
     g_running = false;
+    g_triggered_sig = true;
 }
 
 std::shared_ptr<ConfigManager> loadConfig() {
@@ -114,6 +121,7 @@ int XferTERunner::startInitiator() {
     CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
     // std::sort(info_.buffers.begin(), info_.buffers.end());
     threads_.resize(XferBenchConfig::num_threads);
+    current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&XferTERunner::runner, this, i);
     return 0;
@@ -123,32 +131,30 @@ int XferTERunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
         g_running = false;
-        has_task_ = true;
+        cv_task_.notify_all();
+        cv_done_.notify_all();
     }
-    cv_task_.notify_all();
-    for (auto &t : threads_) {
-        if (t.joinable()) t.join();
+    for (auto &thread : threads_) {
+        thread.join();
     }
     return 0;
 }
 
 int XferTERunner::runner(int thread_id) {
     bindToSocket(thread_id % numa_num_configured_nodes());
-    while (true) {
+    while (g_running) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(lk, [&] { return g_running && has_task_; });
+            cv_task_.wait(
+                lk, [&] { return !g_running || current_task_[thread_id]; });
             if (!g_running) break;
-            task = current_task_;
+            std::swap(task, current_task_[thread_id]);
         }
-        task(thread_id);
+        if (task) task(thread_id);
         {
             std::unique_lock<std::mutex> lk(mtx_);
-            if (--pending_ == 0) {
-                has_task_ = false;
-                cv_done_.notify_one();
-            }
+            if (--pending_ == 0) cv_done_.notify_all();
         }
     }
     return 0;
@@ -156,17 +162,12 @@ int XferTERunner::runner(int thread_id) {
 
 int XferTERunner::runInitiatorTasks(
     const std::function<int(int /* thread_id */)> &func) {
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        current_task_ = func;
-        pending_ = (int)threads_.size();
-        has_task_ = true;
-    }
+    std::unique_lock<std::mutex> lk(mtx_);
+    for (size_t id = 0; id < current_task_.size(); ++id)
+        current_task_[id] = func;
+    pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        cv_done_.wait(lk, [&] { return !has_task_; });
-    }
+    cv_done_.wait(lk, [&] { return g_running && pending_ == 0; });
     return 0;
 }
 

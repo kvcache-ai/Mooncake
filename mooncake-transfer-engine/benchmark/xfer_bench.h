@@ -78,12 +78,11 @@ class XferTERunner {
     SegmentID handle_;
     SegmentInfo info_;
 
-    std::function<int(int)> current_task_;
+    std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;
     std::mutex mtx_;
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
-    bool has_task_ = false;
     int pending_ = 0;
 };
 

@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
     auto runner = std::make_unique<XferTERunner>();
     if (XferBenchConfig::target_seg_name.empty()) {
         std::cout << "\033[33mTo start initiators, run " << std::endl
-                  << "  ./tebench --remote_seg_name="
+                  << "  ./tebench --target_seg_name="
                   << runner->getSegmentName() << std::endl
                   << "Press Ctrl-C to terminate\033[0m" << std::endl;
         return runner->runTarget();
