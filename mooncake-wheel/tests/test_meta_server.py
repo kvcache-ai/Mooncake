@@ -5,9 +5,10 @@ import threading
 from mooncake.store import MooncakeDistributedStore
 
 # how to test: start mooncake_master and http_metadata_server.
-# ./mooncake_master --max_threads 32 --protocol tcp/rdma
+# Default is tcp, if you want to use rdma, should set RPC_PROTOCOL=rdma and DEVICE_NAME=rdma_xxx at first.
+# ./mooncake_master
 # python mooncake-wheel/mooncake/http_metadata_server.py --port 8080
-# python mooncake-wheel/tests/test_meta_server.py 127.0.0.1 1
+# python mooncake-wheel/tests/test_meta_server.py 127.0.0.1 8
 
 import mooncake
 print(mooncake.__file__)
@@ -21,7 +22,7 @@ num_thread = 1 if len(sys.argv) < 3 else int(sys.argv[2])
 # Initialize the store
 store = MooncakeDistributedStore()
 # Use TCP protocol by default for testing, also support rdma
-protocol = os.getenv("PROTOCOL", "tcp")
+protocol = os.getenv("RPC_PROTOCOL", "tcp")
 device_name = os.getenv("DEVICE_NAME", "eth0")
 local_hostname = os.getenv("LOCAL_HOSTNAME", "rdma-client1.mooncake.dc")
 metadata_server = os.getenv("METADATA_ADDR", f"http://{master_host}:8080/metadata")
