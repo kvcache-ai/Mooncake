@@ -82,14 +82,44 @@ void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
                         cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only support SUM for reduction.");
     switch (dst.scalar_type()) {
+        case c10::kByte:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<uint8_t>(),
+                                                 (uint8_t*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
+        case c10::kChar:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int8_t>(),
+                                                 (int8_t*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
+        case c10::kShort:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int16_t>(),
+                                                 (int16_t*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
         case c10::kInt:
             reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
                                                  dst.numel(), numRanks,
                                                  brokenRanks);
             break;
+        case c10::kLong:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int64_t>(),
+                                                 (int64_t*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
         case c10::kFloat:
             reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<float>(),
                                                  (float*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
+        case c10::kDouble:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<double>(),
+                                                 (double*)src, dst.numel(),
+                                                 numRanks, brokenRanks);
+            break;
+        case c10::kBool:
+            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<bool>(),
+                                                 (bool*)src, dst.numel(),
                                                  numRanks, brokenRanks);
             break;
         case c10::kBFloat16:
@@ -136,12 +166,36 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
 void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
                      c10d::ReduceOp op) {
     switch (dst.scalar_type()) {
+        case c10::kByte:
+            reduceCpu(dst.data_ptr<uint8_t>(), (uint8_t*)src, dst.numel(),
+                      numRanks, op);
+            break;
+        case c10::kChar:
+            reduceCpu(dst.data_ptr<int8_t>(), (int8_t*)src, dst.numel(),
+                      numRanks, op);
+            break;
+        case c10::kShort:
+            reduceCpu(dst.data_ptr<int16_t>(), (int16_t*)src, dst.numel(),
+                      numRanks, op);
+            break;
         case c10::kInt:
             reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks,
                       op);
             break;
+        case c10::kLong:
+            reduceCpu(dst.data_ptr<int64_t>(), (int64_t*)src, dst.numel(),
+                      numRanks, op);
+            break;
         case c10::kFloat:
             reduceCpu(dst.data_ptr<float>(), (float*)src, dst.numel(), numRanks,
+                      op);
+            break;
+        case c10::kDouble:
+            reduceCpu(dst.data_ptr<double>(), (double*)src, dst.numel(),
+                      numRanks, op);
+            break;
+        case c10::kBool:
+            reduceCpu(dst.data_ptr<bool>(), (bool*)src, dst.numel(), numRanks,
                       op);
             break;
         default:
