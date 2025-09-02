@@ -663,6 +663,8 @@ void bind_coro_rpc_interface(py::module_ &m) {
         .def_readonly("shape", &CoroRPCInterface::ReceivedTensor::shape)
         .def_readonly("dtype", &CoroRPCInterface::ReceivedTensor::dtype)
         .def_readonly("total_bytes", &CoroRPCInterface::ReceivedTensor::total_bytes)
+        .def("get_data_size", &CoroRPCInterface::ReceivedTensor::getDataSize)
+        .def("get_data_as_bytes", &CoroRPCInterface::ReceivedTensor::getDataAsBytes)
         .def("rebuild_tensor", &CoroRPCInterface::ReceivedTensor::rebuildTensor);
     
     py::class_<CoroRPCInterface>(m, "CoroRPCInterface")

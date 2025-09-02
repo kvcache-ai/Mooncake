@@ -5,6 +5,7 @@
 #include <vector>
 #include <future>
 #include <unordered_map>
+#include <functional>
 #include <pybind11/pybind11.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -44,10 +45,10 @@ public:
         Config config;
         bool is_server_started = false;
         
-        // 真实的 coro_rpc 组件
         std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> client_pool_;
-        std::unordered_map<std::string, coro_rpc::coro_rpc_client> clients_;
+        std::unordered_map<std::string, std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>> client_pools_;
+        
+        std::function<void(const std::string&, const std::string&)> data_receive_callback;
         
         void handleDataTransfer(coro_rpc::context<void> context, std::string_view data);
         void handleTensorTransfer(coro_rpc::context<void> context);
@@ -75,6 +76,8 @@ public:
     
     int receiveData(const std::string& source_address, void* buffer, size_t buffer_size, int timeout_ms = -1);
     std::future<std::string> receiveDataAsync(const std::string& source_address, int timeout_ms = -1);
+
+    void setDataReceiveCallback(std::function<void(const std::string&, const std::string&)> callback);
 
     std::shared_ptr<Impl> getImpl() { return impl_; }
 

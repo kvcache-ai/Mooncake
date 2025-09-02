@@ -73,9 +73,15 @@ size_t get_dtype_size(TensorDtype dtype) {
 // Helper function to create numpy array from data
 pybind11::object create_numpy_array_from_data(const char* data, TensorDtype dtype, 
                                                const std::vector<int64_t>& shape) {
+    std::cout << "DEBUG: create_numpy_array_from_data called" << std::endl;
+    std::cout << "DEBUG: dtype = " << static_cast<int>(dtype) << std::endl;
+    std::cout << "DEBUG: shape size = " << shape.size() << std::endl;
+    
     pybind11::gil_scoped_acquire acquire;
     
+    std::cout << "DEBUG: About to import numpy..." << std::endl;
     pybind11::module_ np = pybind11::module_::import("numpy");
+    std::cout << "DEBUG: Successfully imported numpy" << std::endl;
     
     std::string np_dtype;
     switch (dtype) {
@@ -92,17 +98,46 @@ pybind11::object create_numpy_array_from_data(const char* data, TensorDtype dtyp
             throw std::runtime_error("Unknown tensor dtype");
     }
     
+    std::cout << "DEBUG: np_dtype = " << np_dtype << std::endl;
+    
     size_t element_size = get_dtype_size(dtype);
     size_t total_elements = 1;
     for (int64_t dim : shape) {
         total_elements *= dim;
     }
     
-    // Create a copy of the data
-    std::vector<char> data_copy(data, data + total_elements * element_size);
+    std::cout << "DEBUG: element_size = " << element_size << std::endl;
+    std::cout << "DEBUG: total_elements = " << total_elements << std::endl;
     
-    return np.attr("frombuffer")(pybind11::bytes(data_copy.data(), data_copy.size()), 
-                                 pybind11::arg("dtype")=np_dtype).attr("reshape")(shape);
+    // Create a copy of the data
+    std::cout << "DEBUG: Creating data copy..." << std::endl;
+    std::vector<char> data_copy(data, data + total_elements * element_size);
+    std::cout << "DEBUG: Data copy created, size = " << data_copy.size() << std::endl;
+    
+    std::cout << "DEBUG: About to call frombuffer..." << std::endl;
+    
+    try {
+        pybind11::bytes bytes_obj(data_copy.data(), data_copy.size());
+        std::cout << "DEBUG: Created bytes object" << std::endl;
+        
+        pybind11::object array = np.attr("frombuffer")(bytes_obj, pybind11::arg("dtype")=np_dtype);
+        std::cout << "DEBUG: Created array from buffer successfully" << std::endl;
+        
+        // Convert shape to tuple manually
+        pybind11::tuple shape_tuple = pybind11::tuple(shape.size());
+        for (size_t i = 0; i < shape.size(); ++i) {
+            shape_tuple[i] = shape[i];
+        }
+        std::cout << "DEBUG: About to create shape tuple for reshape" << std::endl;
+        
+        pybind11::object result = array.attr("reshape")(shape_tuple);
+        std::cout << "DEBUG: Reshaped array successfully" << std::endl;
+        
+        return result;
+    } catch (const std::exception& e) {
+        std::cout << "DEBUG: Exception in numpy operations: " << e.what() << std::endl;
+        throw;
+    }
 }
 
 // Constructor
@@ -364,21 +399,45 @@ pybind11::object CoroRPCInterface::sendTensorAsync(const std::string& target_add
 void CoroRPCInterface::setDataReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->data_receive_callback = callback;
+    
+    if (impl_->communicator) {
+        auto interface_ptr = this;
+        impl_->communicator->setDataReceiveCallback(
+            [interface_ptr](const std::string& source, const std::string& data) {
+                interface_ptr->handleIncomingData(source, data);
+            }
+        );
+    }
 }
 
 void CoroRPCInterface::setTensorReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->tensor_receive_callback = callback;
+    
+    if (impl_->communicator) {
+        auto interface_ptr = this;
+        impl_->communicator->setDataReceiveCallback(
+            [interface_ptr](const std::string& source, const std::string& data) {
+                interface_ptr->handleIncomingData(source, data);
+            }
+        );
+    }
 }
 
 void CoroRPCInterface::handleIncomingData(const std::string& source, const std::string& data) {
+    std::cout << "CoroRPCInterface::handleIncomingData called with " << data.size() << " bytes" << std::endl;
+    
     // Check if this is tensor data by looking for metadata signature
     if (data.size() >= sizeof(TensorMetadata)) {
         const TensorMetadata* metadata = reinterpret_cast<const TensorMetadata*>(data.data());
         
+        std::cout << "Checking tensor metadata: dtype=" << metadata->dtype << ", ndim=" << metadata->ndim << std::endl;
+        
         // Basic validation: check if dtype is in valid range
-        if (metadata->dtype >= 0 && metadata->dtype < static_cast<int32_t>(TensorDtype::UNKNOWN) && 
+        if (metadata->dtype > 0 && metadata->dtype <= static_cast<int32_t>(TensorDtype::BOOL) && 
             metadata->ndim >= 0 && metadata->ndim <= 4) {
+            
+            std::cout << "Data recognized as tensor, calling handleIncomingTensor" << std::endl;
             
             // This looks like tensor data, handle it as such
             std::vector<size_t> shape;
@@ -428,7 +487,18 @@ void CoroRPCInterface::handleIncomingTensor(const std::string& source,
                                             const std::string& data,
                                             const std::vector<size_t>& shape, 
                                             const std::string& dtype) {
-    if (!impl_->tensor_receive_callback) return;
+    std::cout << "CoroRPCInterface::handleIncomingTensor called" << std::endl;
+    std::cout << "  source: " << source << std::endl;
+    std::cout << "  data size: " << data.size() << std::endl;
+    std::cout << "  dtype: " << dtype << std::endl;
+    std::cout << "  shape size: " << shape.size() << std::endl;
+    
+    if (!impl_->tensor_receive_callback) {
+        std::cout << "No tensor receive callback set!" << std::endl;
+        return;
+    }
+    
+    std::cout << "Calling Python tensor receive callback..." << std::endl;
     
     try {
         pybind11::gil_scoped_acquire acquire;
@@ -451,6 +521,10 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensor() const {
 }
 
 pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensorInternal() const {
+    std::cout << "DEBUG: Starting rebuildTensorInternal" << std::endl;
+    std::cout << "DEBUG: Data size: " << data.size() << " bytes" << std::endl;
+    std::cout << "DEBUG: TensorMetadata size: " << sizeof(TensorMetadata) << " bytes" << std::endl;
+    
     if (data.size() < sizeof(TensorMetadata)) {
         throw std::runtime_error("Data too small to contain tensor metadata");
     }
@@ -458,6 +532,8 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensorInternal() const
     // Extract metadata
     TensorMetadata metadata;
     std::memcpy(&metadata, data.data(), sizeof(TensorMetadata));
+    
+    std::cout << "DEBUG: Extracted metadata - dtype: " << metadata.dtype << ", ndim: " << metadata.ndim << std::endl;
     
     // Validate metadata
     if (metadata.ndim < 0 || metadata.ndim > 4) {
@@ -470,28 +546,59 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensorInternal() const
         throw std::runtime_error("Unsupported tensor dtype");
     }
     
+    std::cout << "DEBUG: Element size: " << element_size << " bytes" << std::endl;
+    
     // Extract shape
     std::vector<int64_t> tensor_shape;
     size_t total_elements = 1;
     for (int i = 0; i < metadata.ndim; i++) {
         tensor_shape.push_back(metadata.shape[i]);
         total_elements *= metadata.shape[i];
+        std::cout << "DEBUG: Shape[" << i << "] = " << metadata.shape[i] << std::endl;
     }
+    
+    std::cout << "DEBUG: Total elements: " << total_elements << std::endl;
     
     // Validate data size
     size_t expected_data_size = total_elements * element_size;
     size_t actual_data_size = data.size() - sizeof(TensorMetadata);
+    
+    std::cout << "DEBUG: Expected data size: " << expected_data_size << " bytes" << std::endl;
+    std::cout << "DEBUG: Actual data size: " << actual_data_size << " bytes" << std::endl;
+    
     if (actual_data_size != expected_data_size) {
         throw std::runtime_error("Data size mismatch with tensor metadata");
     }
     
     // Create numpy array from raw data
     const char* tensor_data = data.data() + sizeof(TensorMetadata);
-    pybind11::object numpy_array = create_numpy_array_from_data(tensor_data, dtype_enum, tensor_shape);
+    std::cout << "DEBUG: About to create numpy array..." << std::endl;
+    std::cout << "DEBUG: Data pointer: " << static_cast<const void*>(tensor_data) << std::endl;
+    std::cout << "DEBUG: Base data pointer: " << static_cast<const void*>(data.data()) << std::endl;
+    std::cout << "DEBUG: Offset: " << sizeof(TensorMetadata) << std::endl;
     
-    // Convert to PyTorch tensor
-    pybind11::module_ torch = pybind11::module_::import("torch");
-    return torch.attr("from_numpy")(numpy_array);
+    // Check first few bytes of tensor data
+    std::cout << "DEBUG: First few bytes of tensor data: ";
+    for (int i = 0; i < std::min(16, static_cast<int>(actual_data_size)); ++i) {
+        std::cout << std::hex << (unsigned char)tensor_data[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
+    
+    try {
+        pybind11::object numpy_array = create_numpy_array_from_data(tensor_data, dtype_enum, tensor_shape);
+        std::cout << "DEBUG: Successfully created numpy array" << std::endl;
+        
+        // Convert to PyTorch tensor
+        std::cout << "DEBUG: About to convert to PyTorch tensor..." << std::endl;
+        pybind11::module_ torch = pybind11::module_::import("torch");
+        pybind11::object result = torch.attr("from_numpy")(numpy_array);
+        std::cout << "DEBUG: Successfully created PyTorch tensor" << std::endl;
+        
+        return result;
+    } catch (const std::exception& e) {
+        std::cout << "DEBUG: Error in tensor creation: " << e.what() << std::endl;
+        throw;
+    }
 }
 
 // Factory functions for creating RPC client and server

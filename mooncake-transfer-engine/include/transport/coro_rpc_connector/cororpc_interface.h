@@ -30,6 +30,14 @@ public:
         
         pybind11::object rebuildTensor() const;
         
+        // Safe method to get data size without triggering string decoding
+        size_t getDataSize() const { return data.size(); }
+        
+        // Safe method to get data as bytes
+        pybind11::bytes getDataAsBytes() const { 
+            return pybind11::bytes(data); 
+        }
+        
     private:
         pybind11::object rebuildTensorInternal() const;
     };
