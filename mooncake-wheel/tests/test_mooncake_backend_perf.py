@@ -46,32 +46,33 @@ class TestMooncakeBackendPerf(unittest.TestCase):
         pass
 
 
-if __name__ == '__main__':
-    devices = ['cpu', 'cuda']
-    collectives = ['broadcast', 'allreduce']
-    data_sizes = [2**i for i in range(10, 21)]
+devices = ['cpu', 'cuda']
+collectives = ['broadcast', 'allreduce']
+data_sizes = [2**i for i in range(10, 21)]
 
-    # Generate tests dynamically for each combination
-    for device in devices:
-        for collective in collectives:
-            for data_size in data_sizes:
-                def test_function(self):
-                    # Use mp.spawn to call the latency test
-                    mp_manager = mp.Manager()
-                    # Test mooncake
-                    mooncake_results = mp_manager.dict()
-                    mp.spawn(run_latency_test, args=(self.world_size, 'mooncake-cpu' if device == 'cpu' else 'mooncake', device, collective, data_size, mooncake_results), nprocs=self.world_size, join=True)
-                    # Test baseline
-                    baseline_results = mp_manager.dict()
-                    mp.spawn(run_latency_test, args=(self.world_size, 'gloo' if device == 'cpu' else 'nccl', device, collective, data_size, baseline_results), nprocs=self.world_size, join=True)
+# Generate tests dynamically for each combination
+for device in devices:
+    for collective in collectives:
+        for data_size in data_sizes:
+            def test_function(self):
+                # Use mp.spawn to call the latency test
+                mp_manager = mp.Manager()
+                # Test mooncake
+                mooncake_results = mp_manager.dict()
+                mp.spawn(run_latency_test, args=(self.world_size, 'mooncake-cpu' if device == 'cpu' else 'mooncake', device, collective, data_size, mooncake_results), nprocs=self.world_size, join=True)
+                # Test baseline
+                baseline_results = mp_manager.dict()
+                mp.spawn(run_latency_test, args=(self.world_size, 'gloo' if device == 'cpu' else 'nccl', device, collective, data_size, baseline_results), nprocs=self.world_size, join=True)
 
-                    # After all processes have completed, check the results
-                    mooncake_latency = max(mooncake_results[r] for r in mooncake_results)
-                    baseline_latency = max(baseline_results[r] for r in baseline_results)
-                    self.assertLessEqual(mooncake_latency, 2 * baseline_latency,
-                                         f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded twice the baseline.")
+                # After all processes have completed, check the results
+                mooncake_latency = max(mooncake_results[r] for r in mooncake_results)
+                baseline_latency = max(baseline_results[r] for r in baseline_results)
+                self.assertLessEqual(mooncake_latency, 2 * baseline_latency,
+                                     f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded twice the baseline.")
 
-                test_name = f"test_{device}_{collective}_{data_size}"
-                setattr(TestMooncakeBackendPerf, test_name, test_function)
+            test_name = f"test_{device}_{collective}_{data_size}"
+            setattr(TestMooncakeBackendPerf, test_name, test_function)
 
+
+if __name__ == "__main__":
     unittest.main()

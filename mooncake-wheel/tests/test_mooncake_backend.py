@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 import torch
 import torch.distributed as dist
@@ -28,6 +29,9 @@ def worker(rank, world_size, results, collective):
 
     else:
         raise ValueError(f"Unsupported collective: {collective}")
+
+    while len(results) < world_size:
+        time.sleep(1)
 
     dist.destroy_process_group()
 
