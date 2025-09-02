@@ -71,7 +71,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
-    MooncakeWorker worker_;
+    static MooncakeWorker worker_;
+    TransferGroupMeta meta_;
 };
 
 }  // namespace mooncake

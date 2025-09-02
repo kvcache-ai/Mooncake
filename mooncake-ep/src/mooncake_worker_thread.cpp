@@ -11,18 +11,8 @@ enum WorkerTaskStatus {
     DONE = 3,
 };
 
-void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
-    // Sync metadata
-    for (int i = 0; i < size_; ++i) {
-        auto segment_id = engine_->openSegment(server_names[i]);
-        segment_ids_.emplace_back(segment_id);
-        auto segment_desc =
-            engine_->getMetadata()->getSegmentDescByID(segment_id);
-        segment_descs_.emplace_back(segment_desc);
-    }
+void MooncakeWorker::startWorker() {
     running_ = true;
-
-    // Start worker thread
     std::thread([this] {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
@@ -36,8 +26,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     continue;
                 }
 
+                auto group = (TransferGroupMeta *)task.transferGroupMeta;
                 bool skipTransfer = (task.opType == c10d::OpType::BROADCAST &&
-                                     rank_ != task.broadcastRoot) ||
+                                     group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     if (skipTransfer) {
@@ -46,9 +37,9 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         continue;
                     }
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < size_; ++j) {
+                    for (int j = 0; j < group->size; ++j) {
                         uint64_t source =
-                            segment_descs_[rank_]->buffers[i].addr;
+                            group->segmentDescs[group->rank]->buffers[i].addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
@@ -64,7 +55,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                                 break;
                         }
                         uint64_t target_offset =
-                            segment_descs_[j]->buffers[2 + i].addr;
+                            group->segmentDescs[j]->buffers[2 + i].addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                                 break;
@@ -74,7 +65,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                             case c10d::OpType::REDUCE_SCATTER:
                             case c10d::OpType::ALLTOALL_BASE:
                             case c10d::OpType::ALLTOALL:
-                                target_offset += rank_ * task.tensorSize;
+                                target_offset += group->rank * task.tensorSize;
                                 break;
                             default:
                                 break;
@@ -82,13 +73,14 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void *)source,
-                            .target_id = segment_ids_[j],
+                            .target_id = group->segmentIDs[j],
                             .target_offset = target_offset,
                             .length = task.tensorSize,
                         });
                     }
-                    task.batchID = engine_->allocateBatchID(entries.size());
-                    engine_->submitTransfer(task.batchID, entries);
+                    task.batchID =
+                        group->engine->allocateBatchID(entries.size());
+                    group->engine->submitTransfer(task.batchID, entries);
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
@@ -97,17 +89,18 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                     TransferStatus status;
 
                     if (!skipTransfer) {
-                        for (int j = 0; j < size_; ++j) {
-                            engine_->getTransferStatus(task.batchID, j, status);
+                        for (int j = 0; j < group->size; ++j) {
+                            group->engine->getTransferStatus(task.batchID, j,
+                                                             status);
                             if (status.s != TransferStatusEnum::COMPLETED &&
-                                !brokenRanks_[j]) {
+                                !group->brokenRanks[j]) {
                                 if (status.s == TransferStatusEnum::FAILED) {
                                     LOG(ERROR)
-                                        << "Rank " << rank_ << " marking peer "
-                                        << j
+                                        << "Rank " << group->rank
+                                        << " marking peer " << j
                                         << " as broken during transferring op "
                                         << (int)task.opType;
-                                    brokenRanks_[j] = true;
+                                    group->brokenRanks[j] = true;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -119,47 +112,52 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         continue;
                     }
                     auto source_ptr =
-                        (int32_t *)segment_descs_[rank_]->buffers[4 + i].addr;
+                        (int32_t *)group->segmentDescs[group->rank]
+                            ->buffers[4 + i]
+                            .addr;
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < size_; ++j) {
-                        if (brokenRanks_[j]) {
+                    for (int j = 0; j < group->size; ++j) {
+                        if (group->brokenRanks[j]) {
                             continue;
                         }
                         *source_ptr = 1;
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void *)source_ptr,
-                            .target_id = segment_ids_[j],
+                            .target_id = group->segmentIDs[j],
                             .target_offset =
-                                segment_descs_[j]->buffers[6 + i].addr +
-                                rank_ * sizeof(int32_t),
+                                group->segmentDescs[j]->buffers[6 + i].addr +
+                                group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                     }
-                    task.batchID = engine_->allocateBatchID(entries.size());
-                    engine_->submitTransfer(task.batchID, entries);
+                    task.batchID =
+                        group->engine->allocateBatchID(entries.size());
+                    group->engine->submitTransfer(task.batchID, entries);
                     activeTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
                     auto signal_ptr =
-                        (int32_t *)segment_descs_[rank_]->buffers[6 + i].addr;
+                        (int32_t *)group->segmentDescs[group->rank]
+                            ->buffers[6 + i]
+                            .addr;
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::seconds>(
                             now - activeTime[i]);
-                    for (int j = 0; j < size_; ++j) {
-                        if (signal_ptr[j] != 1 && !brokenRanks_[j]) {
+                    for (int j = 0; j < group->size; ++j) {
+                        if (signal_ptr[j] != 1 && !group->brokenRanks[j]) {
                             TransferMetadata::NotifyDesc msg{"ping", "ping"};
                             if (diff.count() > 1 &&
-                                engine_->sendNotifyByName(
-                                    segment_descs_[j]->name, msg)) {
-                                LOG(ERROR)
-                                    << "Rank " << rank_ << " marking peer " << j
-                                    << " as broken during syncing op "
-                                    << (int)task.opType;
-                                brokenRanks_[j] = true;
+                                group->engine->sendNotifyByName(
+                                    group->segmentDescs[j]->name, msg)) {
+                                LOG(ERROR) << "Rank " << group->rank
+                                           << " marking peer " << j
+                                           << " as broken during syncing op "
+                                           << (int)task.opType;
+                                group->brokenRanks[j] = true;
                             } else {
                                 all_received = false;
                                 break;
@@ -171,7 +169,7 @@ void MooncakeWorker::initWorker(const std::vector<std::string> &server_names) {
                         activeTime[i] = clock::now();
                     }
                     if (all_received) {
-                        for (int j = 0; j < size_; ++j) {
+                        for (int j = 0; j < group->size; ++j) {
                             signal_ptr[j] = 0;
                         }
                         task_status[i].store(DONE, std::memory_order_release);

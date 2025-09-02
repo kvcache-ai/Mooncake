@@ -16,17 +16,12 @@ constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
+MooncakeWorker MooncakeBackend::worker_;
 
 MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size),
-      isCpu_(isCpu),
-      worker_(&engine_, rank, size,
-              options ? options->brokenRanks_
-                      : at::zeros({size}, torch::dtype(torch::kInt32)
-                                              .device(isCpu ? torch::kCPU
-                                                            : torch::kCUDA))) {
+    : Backend(rank, size), isCpu_(isCpu) {
     // Get device data
     int deviceId_;
     cudaError err = cudaGetDevice(&deviceId_);
@@ -81,6 +76,7 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Register CPU sync regions
+    TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
         int rc = engine_.registerLocalMemory(cpu_sync_send_region_[i],
@@ -105,11 +101,42 @@ MooncakeBackend::MooncakeBackend(
         server_names.push_back(
             store->get_to_str({"server_name_" + std::to_string(i)}));
     }
-    worker_.initWorker(server_names);
+
+    meta_.rank = rank;
+    meta_.size = size;
+    cudaHostAlloc(&meta_.brokenRanks, kMaxNumRanks * sizeof(bool),
+                  cudaHostAllocMapped);
+    cudaHostGetDevicePointer(&meta_.brokenRanksDevice, meta_.brokenRanks, 0);
+    for (size_t i = 0; i < kMaxNumRanks; ++i) {
+        meta_.brokenRanks[i] = false;
+    }
+    if (options) {
+        TORCH_CHECK(options->brokenRanks_.dtype() == at::kInt,
+                    "brokenRanks must be int.");
+        if (isCpu) {
+            TORCH_CHECK(options->brokenRanks_.device().is_cpu(),
+                        "brokenRanks must be on CPU.");
+        } else {
+            TORCH_CHECK(options->brokenRanks_.device().is_cuda(),
+                        "brokenRanks must be on CUDA.");
+        }
+        meta_.brokenRanksTensor = options->brokenRanks_;
+    } else {
+        meta_.brokenRanksTensor =
+            at::zeros({size}, torch::dtype(torch::kInt32)
+                                  .device(isCpu ? torch::kCPU : torch::kCUDA));
+    }
+    meta_.engine = &engine_;
+    for (int i = 0; i < size_; ++i) {
+        auto segment_id = engine_.openSegment(server_names[i]);
+        meta_.segmentIDs.emplace_back(segment_id);
+        auto segment_desc =
+            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
+        meta_.segmentDescs.emplace_back(segment_desc);
+    }
 }
 
 MooncakeBackend::~MooncakeBackend() {
-    worker_.stopWorker();
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         delete[] cpu_sync_send_region_[i];
@@ -138,7 +165,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     bool isRoot = (root == rank_);
     if (isCpu_) {
         return worker_.putTaskCpu(
-            c10d::OpType::BROADCAST, tensorSize, root,
+            c10d::OpType::BROADCAST, tensorSize, root, &meta_,
             [=](void* dst) {
                 if (isRoot) {
                     memcpy(dst, tensor.data_ptr(), tensorSize);
@@ -149,7 +176,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::BROADCAST, tensorSize, root, stream,
+            c10d::OpType::BROADCAST, tensorSize, root, &meta_, stream,
             [&](void* dst) {
                 if (isRoot) {
                     cudaMemcpyAsync(dst, tensor.data_ptr(), tensorSize,
@@ -172,7 +199,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     if (isCpu_) {
         auto numRanks = size_;
         return worker_.putTaskCpu(
-            c10d::OpType::ALLREDUCE, tensorSize, 0,
+            c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
             [=](void* dst) { memcpy(dst, tensor.data_ptr(), tensorSize); },
             [=](void* src) {
                 memset(tensor.data_ptr(), 0, tensorSize);
@@ -182,7 +209,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::ALLREDUCE, tensorSize, 0, stream,
+            c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
                 cudaMemcpyAsync(dst, tensor.data_ptr(), tensorSize,
                                 cudaMemcpyHostToDevice, stream);
@@ -190,7 +217,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             [&](void* src) {
                 cudaMemsetAsync(tensor.data_ptr(), 0, tensorSize, stream);
                 launchReduceKernel(tensor, src, size_, opts.reduceOp,
-                                   worker_.getBrokenRanks(), stream);
+                                   meta_.brokenRanksDevice, stream);
             });
     }
 }
@@ -205,7 +232,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
         return worker_.putTaskCpu(
-            c10d::OpType::ALLGATHER, tensorSize, 0,
+            c10d::OpType::ALLGATHER, tensorSize, 0, &meta_,
             [=](void* dst) { memcpy(dst, inputTensor.data_ptr(), tensorSize); },
             [=](void* src) {
                 for (const auto j : c10::irange(outputTensors_.size())) {
@@ -217,7 +244,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::ALLGATHER, tensorSize, 0, stream,
+            c10d::OpType::ALLGATHER, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
                 cudaMemcpyAsync(dst, inputTensor.data_ptr(), tensorSize,
                                 cudaMemcpyHostToDevice, stream);
@@ -239,7 +266,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     if (isCpu_) {
         auto numRanks = size_;
         return worker_.putTaskCpu(
-            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0,
+            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_,
             [=](void* dst) { memcpy(dst, inputBuffer.data_ptr(), tensorSize); },
             [=](void* src) {
                 memcpy(outputBuffer.data_ptr(), src, tensorSize * numRanks);
@@ -248,7 +275,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, stream,
+            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
                 cudaMemcpyAsync(dst, inputBuffer.data_ptr(), tensorSize,
                                 cudaMemcpyHostToDevice, stream);
@@ -268,7 +295,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     if (isCpu_) {
         auto numRanks = size_;
         return worker_.putTaskCpu(
-            c10d::OpType::REDUCE_SCATTER, tensorSize, 0,
+            c10d::OpType::REDUCE_SCATTER, tensorSize, 0, &meta_,
             [=](void* dst) {
                 memcpy(dst, inputBuffer.data_ptr(), tensorSize * numRanks);
             },
@@ -280,7 +307,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::REDUCE_SCATTER, tensorSize, 0, stream,
+            c10d::OpType::REDUCE_SCATTER, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
                 cudaMemcpyAsync(dst, inputBuffer.data_ptr(), tensorSize * size_,
                                 cudaMemcpyHostToDevice, stream);
@@ -288,7 +315,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             [&](void* src) {
                 cudaMemsetAsync(outputBuffer.data_ptr(), 0, tensorSize, stream);
                 launchReduceKernel(outputBuffer, src, size_, opts.reduceOp,
-                                   worker_.getBrokenRanks(), stream);
+                                   meta_.brokenRanksDevice, stream);
             });
     }
 }
@@ -300,7 +327,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         inputTensors[0].numel() * inputTensors[0].element_size();
     if (isCpu_) {
         return worker_.putTaskCpu(
-            c10d::OpType::ALLTOALL, tensorSize, 0,
+            c10d::OpType::ALLTOALL, tensorSize, 0, &meta_,
             [=](void* dst) {
                 for (const auto j : c10::irange(inputTensors.size())) {
                     memcpy(dst + j * tensorSize, inputTensors[j].data_ptr(),
@@ -317,7 +344,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         cudaStream_t stream =
             at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::ALLTOALL, tensorSize, 0, stream,
+            c10d::OpType::ALLTOALL, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
                 for (const auto j : c10::irange(inputTensors.size())) {
                     cudaMemcpyAsync(dst + j * tensorSize,
@@ -338,6 +365,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
-        c10d::OpType::BARRIER, 0, 0, [=](void*) {}, [=](void*) {});
+        c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*) {}, [=](void*) {});
 }
 }  // namespace mooncake

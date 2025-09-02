@@ -38,13 +38,15 @@ class MooncakeWorkCuda : public ::c10d::Work {
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
-                                  int64_t broadcastRoot, Task* tasks,
-                                  int numRanks, const bool* brokenRanks,
+                                  int64_t broadcastRoot, void* meta,
+                                  Task* tasks, int numRanks,
+                                  const bool* brokenRanks,
                                   int* brokenRanksTensor, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
+    tasks[taskId].transferGroupMeta = meta;
 
     // Mark active
     __threadfence();  // Ensure writes visible to host
@@ -204,15 +206,7 @@ void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
     }
 }
 
-MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size,
-                               at::Tensor brokenRanks)
-    : engine_(engine),
-      rank_(rank),
-      size_(size),
-      brokenRanksTensor_(brokenRanks) {
-    TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
-    TORCH_CHECK(brokenRanks.dtype() == at::kInt, "brokenRanks must be int.");
-
+MooncakeWorker::MooncakeWorker() {
     // Pin memory for task array
     cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
     cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
@@ -220,20 +214,16 @@ MooncakeWorker::MooncakeWorker(TransferEngine* engine, int rank, int size,
         tasks_[i].active = false;
     }
 
-    // Pin memory for broken ranks
-    cudaHostAlloc(&brokenRanks_, kMaxNumRanks * sizeof(bool),
-                  cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&brokenRanksDevice_, brokenRanks_, 0);
-    for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        brokenRanks_[i] = false;
-    }
+    // Start worker
+    startWorker();
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    TransferGroupMeta* meta,
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
+    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
     int taskId = taskCount % kNumTasks_;
@@ -242,14 +232,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     tasks_[taskId].opType = opType;
     tasks_[taskId].tensorSize = tensorSize;
     tasks_[taskId].broadcastRoot = broadcastRoot;
-    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
+    tasks_[taskId].transferGroupMeta = meta;
+    tensorToBuffer((void*)meta->segmentDescs[meta->rank]->buffers[taskId].addr);
 
     hasCallback_[taskId] = true;
-    callbacks_[taskId] = [this, bufferToTensor, taskId, future] {
-        for (int i = 0; i < size_; ++i) {
-            brokenRanksTensor_[i] = brokenRanks_[i] ? 1 : 0;
+    callbacks_[taskId] = [this, meta, bufferToTensor, taskId, future] {
+        for (int i = 0; i < meta->size; ++i) {
+            meta->brokenRanksTensor[i] = meta->brokenRanks[i] ? 1 : 0;
         }
-        bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
+        bufferToTensor(
+            (void*)meta->segmentDescs[meta->rank]->buffers[2 + taskId].addr);
         future->markCompleted(c10::IValue());
     };
 
@@ -260,15 +252,20 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    cudaStream_t stream, const std::function<void(void* dst)>& tensorToBuffer,
+    TransferGroupMeta* meta, cudaStream_t stream,
+    const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * size_ < kBufferSize, "Too large!");
+    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     int taskId = taskCount % kNumTasks_;
-    tensorToBuffer((void*)segment_descs_[rank_]->buffers[taskId].addr);
+    tensorToBuffer((void*)meta->segmentDescs[meta->rank]->buffers[taskId].addr);
+
+    hasCallback_[taskId] = false;
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, tasks_device_, size_,
-        brokenRanksDevice_, brokenRanksTensor_.data_ptr<int>(), taskId);
-    bufferToTensor((void*)segment_descs_[rank_]->buffers[2 + taskId].addr);
+        opType, tensorSize, broadcastRoot, meta, tasks_device_, meta->size,
+        meta->brokenRanksDevice, meta->brokenRanksTensor.data_ptr<int>(),
+        taskId);
+    bufferToTensor(
+        (void*)meta->segmentDescs[meta->rank]->buffers[2 + taskId].addr);
     ++taskCount;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
