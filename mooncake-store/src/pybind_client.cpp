@@ -1125,6 +1125,7 @@ tl::expected<char*, ErrorCode> PyClient::get_allocated_internal(
         reinterpret_cast<void *>(data_ptr), total_length);
     if (!register_result) {
         LOG(ERROR) << "Failed to register buffer";
+        delete[] data_ptr;
         return tl::unexpected(register_result.error());
     }
 
