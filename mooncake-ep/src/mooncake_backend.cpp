@@ -42,13 +42,15 @@ MooncakeBackend::MooncakeBackend(
                                   std::to_string(localRpcMeta.rpc_port);
 
     // Register buffers
+    std::string location = "cuda:" + std::to_string(deviceId_);
     if (isCpu) {
         for (size_t i = 0; i < 2; i++) {
             send_buffer_[i] = malloc(kBufferSize);
             TORCH_CHECK(send_buffer_[i],
                         c10::str("Failed to allocate CPU send buffer"));
 
-            int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize);
+            int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
+                                                 location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -57,11 +59,11 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(recv_buffer_[i],
                         c10::str("Failed to allocate CPU recv buffer"));
 
-            int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize);
+            int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
+                                                 location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     } else {
-        std::string location = "cuda:" + std::to_string(deviceId_);
         for (size_t i = 0; i < 2; i++) {
             err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
@@ -85,17 +87,15 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_.registerLocalMemory(cpu_sync_send_region_[i],
-                                             kMaxNumRanks * sizeof(int32_t),
-                                             kWildcardLocation);
+        int rc = engine_.registerLocalMemory(
+            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_.registerLocalMemory(cpu_sync_recv_region_[i],
-                                             kMaxNumRanks * sizeof(int32_t),
-                                             kWildcardLocation);
+        int rc = engine_.registerLocalMemory(
+            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
