@@ -1140,7 +1140,7 @@ tl::expected<char *, ErrorCode> PyClient::get_allocated_internal(
     auto unregister_result =
         unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
     if (!unregister_result) {
-        LOG(WARNING) << "Failed to unregister buffer after put_tensor";
+        LOG(WARNING) << "Failed to unregister buffer";
     }
 
     if (!get_result) {
