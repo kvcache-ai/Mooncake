@@ -20,7 +20,11 @@ HeterogeneousRdmaTransport::HeterogeneousRdmaTransport() {
     transport_ = new RdmaTransport();
 }
 
-HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() { delete transport_; }
+HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
+    running_ = false;
+    free(hostAddr_);
+    delete transport_;
+}
 
 int HeterogeneousRdmaTransport::install(std::string &local_server_name,
                                         std::shared_ptr<TransferMetadata> meta,
@@ -107,10 +111,9 @@ int HeterogeneousRdmaTransport::unregisterLocalMemory(void *addr,
 int HeterogeneousRdmaTransport::registerLocalMemoryBatch(
     const std::vector<HeterogeneousRdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-    int ret;
     for (auto &buffer : buffer_list) {
-        ret = registerLocalMemory(buffer.addr, buffer.length, location, true,
-                                  false);
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
         if (ret) {
             LOG(ERROR) << "HeterogeneousRdmaTransport registerLocalMemoryBatch "
                           "error, ret: "
@@ -173,6 +176,10 @@ Status HeterogeneousRdmaTransport::submitTransfer(
             if (attributes.location.type == 0) {
                 continue;
             }
+
+            if (offset_ + request.length > HUGE_HOST_SIZE) {
+                offset_ = 0;
+            }
             ret =
                 aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
                                  request.length, request.source, request.length,
@@ -192,9 +199,6 @@ Status HeterogeneousRdmaTransport::submitTransfer(
             new_entries[index].source =
                 static_cast<char *>(hostAddr_) + offset_;
             offset_ += request.length;
-            if (offset_ >= HUGE_HOST_SIZE) {
-                offset_ = 0;
-            }
         }
 
         ret = aclrtSynchronizeStream(stream_);
@@ -251,6 +255,10 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
                 continue;
             }
 
+            if (offset_ + request.length > HUGE_HOST_SIZE) {
+                offset_ = 0;
+            }
+
             ret =
                 aclrtMemcpyAsync(static_cast<char *>(hostAddr_) + offset_,
                                  request.length, request.source, request.length,
@@ -268,9 +276,6 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
             }
             request.source = static_cast<char *>(hostAddr_) + offset_;
             offset_ += request.length;
-            if (offset_ >= HUGE_HOST_SIZE) {
-                offset_ = 0;
-            }
         }
 
         ret = aclrtSynchronizeStream(stream_);
