@@ -78,8 +78,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 }
 
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   char* buffer) {
+                   const Replica::Descriptor& replica, char* buffer) {
     uint64_t offset = 0;
     if (replica.is_memory_replica() == false) {
         // For disk-based replica, split into slices based on file size
@@ -106,8 +105,8 @@ int allocateSlices(std::vector<Slice>& slices,
 int allocateSlices(std::vector<Slice>& slices,
                    const Replica::Descriptor& replica,
                    BufferHandle& buffer_handle) {
-    return allocateSlices(
-        slices, replica, static_cast<char*>(buffer_handle.ptr()));
+    return allocateSlices(slices, replica,
+                          static_cast<char*>(buffer_handle.ptr()));
 }
 
 }  // namespace mooncake

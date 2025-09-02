@@ -273,8 +273,8 @@ class PyClient {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{});
 
-    tl::expected<char*, ErrorCode> get_allocated_internal(
-        const std::string &key, uint64_t& data_length);
+    tl::expected<char *, ErrorCode> get_allocated_internal(
+        const std::string &key, uint64_t &data_length);
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key);
 

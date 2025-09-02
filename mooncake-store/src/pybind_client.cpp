@@ -1091,8 +1091,8 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     return 0;
 }
 
-tl::expected<char*, ErrorCode> PyClient::get_allocated_internal(
-    const std::string &key, uint64_t& data_length) {
+tl::expected<char *, ErrorCode> PyClient::get_allocated_internal(
+    const std::string &key, uint64_t &data_length) {
     // Query object info first
     auto query_result = client_->Query(key);
     if (!query_result) {
@@ -1138,7 +1138,7 @@ tl::expected<char*, ErrorCode> PyClient::get_allocated_internal(
 
     // unregister the buffer for whatever cases
     auto unregister_result =
-            unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
+        unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
     if (!unregister_result) {
         LOG(WARNING) << "Failed to unregister buffer after put_tensor";
     }
