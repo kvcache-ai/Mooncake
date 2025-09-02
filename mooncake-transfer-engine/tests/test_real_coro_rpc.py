@@ -67,7 +67,7 @@ def test_enhanced_tensor_rebuilding():
             received_tensors.append(rebuilt_tensor)
             callback_info['success_count'] += 1
 
-            print("✅ Successfully rebuilt tensor:")
+            print("SUCCESS: Successfully rebuilt tensor:")
             print(f"  - Shape: {rebuilt_tensor.shape}")
             print(f"  - Dtype: {rebuilt_tensor.dtype}")
             print(f"  - Device: {rebuilt_tensor.device}")
@@ -76,7 +76,7 @@ def test_enhanced_tensor_rebuilding():
         except Exception as e:
             callback_info['error_count'] += 1
             callback_info['errors'].append(str(e))
-            print(f"❌ Failed to rebuild tensor: {e}")
+            print(f"FAILED: Failed to rebuild tensor: {e}")
             import traceback
             traceback.print_exc()
         
@@ -142,11 +142,11 @@ def test_enhanced_tensor_rebuilding():
             # Check if callback was triggered for this tensor
             expected_callbacks = test_cases.index((test_name, original_tensor)) + 1
             if callback_info['called_count'] < expected_callbacks:
-                print(f"❌ No callback received for {test_name}")
+                print(f"FAILED: No callback received for {test_name}")
                 continue
 
             if len(received_tensors) == 0:
-                print(f"❌ No tensor received for {test_name}")
+                print(f"FAILED: No tensor received for {test_name}")
                 continue
 
             # Validate the rebuilt tensor
@@ -154,24 +154,24 @@ def test_enhanced_tensor_rebuilding():
 
             # Check shape
             if tuple(rebuilt_tensor.shape) != tuple(original_tensor.shape):
-                print(f"❌ Shape mismatch: {rebuilt_tensor.shape} vs {original_tensor.shape}")
+                print(f"FAILED: Shape mismatch: {rebuilt_tensor.shape} vs {original_tensor.shape}")
                 continue
 
             # Check data type
             if rebuilt_tensor.dtype != original_tensor.dtype:
-                print(f"❌ Dtype mismatch: {rebuilt_tensor.dtype} vs {original_tensor.dtype}")
+                print(f"FAILED: Dtype mismatch: {rebuilt_tensor.dtype} vs {original_tensor.dtype}")
                 continue
 
             # Check data content (move to CPU for comparison)
             try:
                 if torch.allclose(rebuilt_tensor.cpu(), original_tensor.cpu(), atol=1e-6):
-                    print(f"✅ {test_name} passed - data integrity verified")
+                    print(f"SUCCESS: {test_name} passed - data integrity verified")
                 else:
-                    print(f"❌ {test_name} failed - data content mismatch")
+                    print(f"FAILED: {test_name} failed - data content mismatch")
                     print(f"  Original: {original_tensor.flatten()[:5]}")
                     print(f"  Rebuilt:  {rebuilt_tensor.flatten()[:5]}")
             except Exception as e:
-                print(f"❌ {test_name} failed - comparison error: {e}")
+                print(f"FAILED: {test_name} failed - comparison error: {e}")
 
         # Print summary
         print(f"\n=== TEST SUMMARY ===")
@@ -189,7 +189,7 @@ def test_enhanced_tensor_rebuilding():
                   callback_info['success_count'] == len(test_cases) and
                   len(received_tensors) == len(test_cases))
         
-        print(f"Enhanced tensor rebuilding test {'✅ PASSED' if success else '❌ FAILED'}")
+        print(f"Enhanced tensor rebuilding test {'PASSED' if success else 'FAILED'}")
         return success
 
     except Exception as e:
@@ -204,7 +204,8 @@ def test_enhanced_tensor_rebuilding():
         except:
             pass
 
+
 if __name__ == "__main__":
     success = test_enhanced_tensor_rebuilding()
-    print(f"\nFinal result: {'✅ SUCCESS' if success else '❌ FAILURE'}")
+    print(f"\nFinal result: {'SUCCESS' if success else 'FAILURE'}")
     sys.exit(0 if success else 1)
