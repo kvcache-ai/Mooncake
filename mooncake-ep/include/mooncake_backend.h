@@ -64,7 +64,9 @@ class MooncakeBackend final : public ::c10d::Backend {
     }
 
    private:
-    TransferEngine engine_{true};
+    static TransferEngine engine_;
+    static Transport* transport_;
+    static int backendIndex_;
     bool isCpu_{false};
     static std::string hostIp_;
     void* send_buffer_[2];

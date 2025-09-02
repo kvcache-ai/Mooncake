@@ -16,6 +16,9 @@ constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
+TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
+Transport* MooncakeBackend::transport_ = nullptr;
+int MooncakeBackend::backendIndex_ = 0;
 MooncakeWorker MooncakeBackend::worker_;
 
 MooncakeBackend::MooncakeBackend(
@@ -28,10 +31,13 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(!err, c10::str("Failed to get device id"));
 
     // Initialize transfer engine
-    engine_.init(P2PHANDSHAKE, hostIp_);
-    auto transport = engine_.installTransport("rdma", nullptr);
-    TORCH_CHECK(transport != nullptr, c10::str("Failed to install transport"));
-    auto localRpcMeta = transport->meta()->localRpcMeta();
+    if (!transport_) {
+        engine_.init(P2PHANDSHAKE, hostIp_);
+        transport_ = engine_.installTransport("rdma", nullptr);
+        TORCH_CHECK(transport_ != nullptr,
+                    c10::str("Failed to install transport"));
+    }
+    auto localRpcMeta = transport_->meta()->localRpcMeta();
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
 
@@ -127,6 +133,7 @@ MooncakeBackend::MooncakeBackend(
                                   .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
+    meta_.bufferBaseIndex = backendIndex_ * 8;
     for (int i = 0; i < size_; ++i) {
         auto segment_id = engine_.openSegment(server_names[i]);
         meta_.segmentIDs.emplace_back(segment_id);
@@ -134,16 +141,13 @@ MooncakeBackend::MooncakeBackend(
             engine_.getMetadata()->getSegmentDescByID(segment_id, true);
         meta_.segmentDescs.emplace_back(segment_desc);
     }
+    ++backendIndex_;
 }
 
 MooncakeBackend::~MooncakeBackend() {
     for (size_t i = 0; i < 2; i++) {
-        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         delete[] cpu_sync_send_region_[i];
-        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
         delete[] cpu_sync_recv_region_[i];
-        engine_.unregisterLocalMemory(send_buffer_[i]);
-        engine_.unregisterLocalMemory(recv_buffer_[i]);
         if (isCpu_) {
             free(send_buffer_[i]);
             free(recv_buffer_[i]);

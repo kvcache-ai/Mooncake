@@ -233,15 +233,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     tasks_[taskId].tensorSize = tensorSize;
     tasks_[taskId].broadcastRoot = broadcastRoot;
     tasks_[taskId].transferGroupMeta = meta;
-    tensorToBuffer((void*)meta->segmentDescs[meta->rank]->buffers[taskId].addr);
+    tensorToBuffer((void*)meta->segmentDescs[meta->rank]
+                       ->buffers[meta->bufferBaseIndex + taskId]
+                       .addr);
 
     hasCallback_[taskId] = true;
     callbacks_[taskId] = [this, meta, bufferToTensor, taskId, future] {
         for (int i = 0; i < meta->size; ++i) {
             meta->brokenRanksTensor[i] = meta->brokenRanks[i] ? 1 : 0;
         }
-        bufferToTensor(
-            (void*)meta->segmentDescs[meta->rank]->buffers[2 + taskId].addr);
+        bufferToTensor((void*)meta->segmentDescs[meta->rank]
+                           ->buffers[meta->bufferBaseIndex + 2 + taskId]
+                           .addr);
         future->markCompleted(c10::IValue());
     };
 
@@ -257,15 +260,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     int taskId = taskCount % kNumTasks_;
-    tensorToBuffer((void*)meta->segmentDescs[meta->rank]->buffers[taskId].addr);
+    tensorToBuffer((void*)meta->segmentDescs[meta->rank]
+                       ->buffers[meta->bufferBaseIndex + taskId]
+                       .addr);
 
     hasCallback_[taskId] = false;
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, meta, tasks_device_, meta->size,
         meta->brokenRanksDevice, meta->brokenRanksTensor.data_ptr<int>(),
         taskId);
-    bufferToTensor(
-        (void*)meta->segmentDescs[meta->rank]->buffers[2 + taskId].addr);
+    bufferToTensor((void*)meta->segmentDescs[meta->rank]
+                       ->buffers[meta->bufferBaseIndex + 2 + taskId]
+                       .addr);
     ++taskCount;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);

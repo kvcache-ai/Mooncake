@@ -39,7 +39,9 @@ void MooncakeWorker::startWorker() {
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         uint64_t source =
-                            group->segmentDescs[group->rank]->buffers[i].addr;
+                            group->segmentDescs[group->rank]
+                                ->buffers[group->bufferBaseIndex + i]
+                                .addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
@@ -55,7 +57,9 @@ void MooncakeWorker::startWorker() {
                                 break;
                         }
                         uint64_t target_offset =
-                            group->segmentDescs[j]->buffers[2 + i].addr;
+                            group->segmentDescs[j]
+                                ->buffers[group->bufferBaseIndex + 2 + i]
+                                .addr;
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                                 break;
@@ -113,7 +117,7 @@ void MooncakeWorker::startWorker() {
                     }
                     auto source_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[4 + i]
+                            ->buffers[group->bufferBaseIndex + 4 + i]
                             .addr;
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
@@ -126,7 +130,9 @@ void MooncakeWorker::startWorker() {
                             .source = (void *)source_ptr,
                             .target_id = group->segmentIDs[j],
                             .target_offset =
-                                group->segmentDescs[j]->buffers[6 + i].addr +
+                                group->segmentDescs[j]
+                                    ->buffers[group->bufferBaseIndex + 6 + i]
+                                    .addr +
                                 group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
@@ -141,7 +147,7 @@ void MooncakeWorker::startWorker() {
                     bool all_received = true;
                     auto signal_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[6 + i]
+                            ->buffers[group->bufferBaseIndex + 6 + i]
                             .addr;
                     auto now = clock::now();
                     auto diff =

@@ -17,6 +17,7 @@ struct TransferGroupMeta {
     bool* brokenRanksDevice;
     at::Tensor brokenRanksTensor;
     TransferEngine* engine;
+    int bufferBaseIndex;
     std::vector<TransferMetadata::SegmentID> segmentIDs;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segmentDescs;
 };
