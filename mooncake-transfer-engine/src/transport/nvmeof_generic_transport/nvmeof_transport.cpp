@@ -146,10 +146,10 @@ Status NVMeoFGenericTransport::submitTransfer(
     return this->submitTransferTask(task_list);
 }
 
-int NVMeoFGenericTransport::install(std::string &local_server_name,
-                                    std::shared_ptr<TransferMetadata> meta,
-                                    void **args) {
-    int rc = Transport::install(local_server_name, meta, args);
+int NVMeoFGenericTransport::installWithArgs(
+    std::string &local_server_name, std::shared_ptr<TransferMetadata> meta,
+    void **args) {
+    int rc = Transport::installWithArgs(local_server_name, meta, args);
     if (rc != 0) {
         LOG(ERROR) << "Transport::install failed, rc=" << rc;
         return rc;

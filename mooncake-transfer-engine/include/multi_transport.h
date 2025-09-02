@@ -51,7 +51,7 @@ class MultiTransport {
 
     bool transportNeedArgs(const std::string &proto);
 
-    Transport *installTransport(const std::string &proto, void **args);
+    Transport *installTransportWithArgs(const std::string &proto, void **args);
 
     Transport *getTransport(const std::string &proto);
 

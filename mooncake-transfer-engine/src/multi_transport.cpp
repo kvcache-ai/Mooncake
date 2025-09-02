@@ -252,8 +252,8 @@ bool MultiTransport::transportNeedArgs(const std::string &proto) {
     return false;
 }
 
-Transport *MultiTransport::installTransport(const std::string &proto,
-                                            void **args) {
+Transport *MultiTransport::installTransportWithArgs(const std::string &proto,
+                                                    void **args) {
     std::shared_ptr<Transport> transport = nullptr;
 
 #ifdef USE_NVMEOF_GENERIC
@@ -268,7 +268,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    int rc = transport->install(local_server_name_, metadata_, args);
+    int rc = transport->installWithArgs(local_server_name_, metadata_, args);
     if (rc != 0) {
         LOG(ERROR) << "Failed to install transport " << proto << ", rc=" << rc;
         return nullptr;

@@ -54,8 +54,9 @@ class NVMeoFGenericTransport : public Transport {
                              TransferStatus &status) override;
 
    private:
-    int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta, void **args) override;
+    int installWithArgs(std::string &local_server_name,
+                        std::shared_ptr<TransferMetadata> meta,
+                        void **args) override;
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,

@@ -260,7 +260,7 @@ Transport *TransferEngine::installTransport(const std::string &proto,
     }
 
     if (multi_transports_->transportNeedArgs(proto)) {
-        transport = multi_transports_->installTransport(proto, args);
+        transport = multi_transports_->installTransportWithArgs(proto, args);
     } else {
         if (args != nullptr && args[0] != nullptr) {
             const std::string nic_priority_matrix =
