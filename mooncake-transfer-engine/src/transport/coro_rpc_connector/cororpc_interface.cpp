@@ -5,6 +5,7 @@
 #include <thread>
 #include <future>
 #include <vector>
+#include "async_simple/coro/SyncAwait.h"
 
 namespace mooncake {
 
@@ -374,8 +375,8 @@ pybind11::object CoroRPCInterface::sendTensorAsync(const std::string& target_add
 
     auto task_func = std::make_shared<std::function<void()>>(
         [communicator, target_addr, tensor_info, future_ptr, loop_ptr]() {
-        auto std_future = communicator->sendTensorAsync(*target_addr, *tensor_info);
-        int result = std_future.get();
+        auto lazy_result = communicator->sendTensorAsync(*target_addr, *tensor_info);
+        int result = async_simple::coro::syncAwait(lazy_result);
         
         auto call_soon_threadsafe = [future_ptr, loop_ptr, result]() {
             pybind11::gil_scoped_acquire acquire;

@@ -10,6 +10,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
 
@@ -69,13 +70,13 @@ public:
     bool isConnected(const std::string& remote_address);
     
     int sendData(const std::string& target_address, const void* data, size_t data_size);
-    std::future<result> sendDataAsync(const std::string& target_address, const void* data, size_t data_size);
+    async_simple::coro::Lazy<result> sendDataAsync(const std::string& target_address, const void* data, size_t data_size);
     
     int sendTensor(const std::string& target_address, const pybind11::object& tensor);
-    std::future<int> sendTensorAsync(const std::string& target_address, const TensorInfo& tensor);
+    async_simple::coro::Lazy<int> sendTensorAsync(const std::string& target_address, const TensorInfo& tensor);
     
     int receiveData(const std::string& source_address, void* buffer, size_t buffer_size, int timeout_ms = -1);
-    std::future<std::string> receiveDataAsync(const std::string& source_address, int timeout_ms = -1);
+    async_simple::coro::Lazy<std::string> receiveDataAsync(const std::string& source_address, int timeout_ms = -1);
 
     void setDataReceiveCallback(std::function<void(const std::string&, const std::string&)> callback);
 
