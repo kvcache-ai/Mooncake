@@ -1091,4 +1091,66 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     return 0;
 }
 
+tl::expected<char*, ErrorCode> PyClient::get_allocated_internal(
+    const std::string &key, uint64_t& data_length) {
+    // Query object info first
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        LOG(ERROR) << "Query failed: " << query_result.error();
+        return tl::unexpected(query_result.error());
+    }
+
+    auto replica_list = query_result.value();
+    if (replica_list.empty()) {
+        LOG(INFO) << "No replicas found for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    const auto &replica = replica_list[0];
+    uint64_t total_length = calculate_total_size(replica);
+    if (total_length == 0) {
+        LOG(ERROR) << "Zero length value for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    // Create contiguous buffer to read data
+    char *data_ptr = new char[total_length];
+    if (!data_ptr) {
+        LOG(ERROR) << "Failed to allocate memory for length: " << total_length;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // register the buffer
+    auto register_result = register_buffer_internal(
+        reinterpret_cast<void *>(data_ptr), total_length);
+    if (!register_result) {
+        LOG(ERROR) << "Failed to register buffer";
+        return tl::unexpected(register_result.error());
+    }
+
+    // Create slices for the allocated buffer
+    std::vector<Slice> slices;
+    allocateSlices(slices, replica, data_ptr);
+
+    // Get the object data
+    auto get_result = client_->Get(key, replica_list, slices);
+
+    // unregister the buffer for whatever cases
+    auto unregister_result =
+            unregister_buffer_internal(reinterpret_cast<void *>(data_ptr));
+    if (!unregister_result) {
+        LOG(WARNING) << "Failed to unregister buffer after put_tensor";
+    }
+
+    if (!get_result) {
+        delete[] data_ptr;
+        LOG(ERROR) << "Get failed for key: " << key;
+        return tl::unexpected(get_result.error());
+    }
+
+    // return the data ptr transferring the ownership to the caller
+    data_length = total_length;
+    return data_ptr;
+}
+
 }  // namespace mooncake

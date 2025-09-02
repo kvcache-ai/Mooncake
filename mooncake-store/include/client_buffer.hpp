@@ -98,6 +98,17 @@ std::vector<Slice> split_into_slices(BufferHandle& handle);
 uint64_t calculate_total_size(const Replica::Descriptor& replica);
 
 /**
+ * @brief Allocate slices from a buffer pointer based on replica descriptor
+ * @param slices Output vector to store the allocated slices
+ * @param replica The replica descriptor defining the slice structure
+ * @param buffer The buffer pointer to allocate slices from
+ * @return 0 on success, non-zero on error
+ */
+int allocateSlices(std::vector<Slice>& slices,
+                   const Replica::Descriptor& replica,
+                   char* buffer);
+
+/**
  * @brief Allocate slices from a buffer handle based on replica descriptor
  * @param slices Output vector to store the allocated slices
  * @param replica The replica descriptor defining the slice structure
