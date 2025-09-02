@@ -141,6 +141,46 @@ MooncakeBackend::MooncakeBackend(
             engine_.getMetadata()->getSegmentDescByID(segment_id, true);
         meta_.segmentDescs.emplace_back(segment_desc);
     }
+
+    // Let the default process group warm up the transfer engine
+    if (backendIndex_ == 0) {
+        std::vector<TransferRequest> entries;
+        for (int i = rank_; i < size_; ++i) {
+            entries.push_back(TransferRequest{
+                .opcode = TransferRequest::READ,
+                .source =
+                    (int32_t*)meta_.segmentDescs[rank_]->buffers[4].addr + 1,
+                .target_id = meta_.segmentIDs[i],
+                .target_offset = meta_.segmentDescs[i]->buffers[6].addr,
+                .length = sizeof(int32_t),
+            });
+        }
+        auto batchID = engine_.allocateBatchID(entries.size());
+        engine_.submitTransfer(batchID, entries);
+
+        while (true) {
+            bool batch_done = true;
+            TransferStatus status;
+            for (int i = 0; i < size_ - rank_; ++i) {
+                engine_.getTransferStatus(batchID, i, status);
+                if (status.s != TransferStatusEnum::COMPLETED &&
+                    status.s != TransferStatusEnum::FAILED) {
+                    batch_done = false;
+                    break;
+                }
+            }
+            if (batch_done) {
+                break;
+            }
+        }
+
+        store->set("warmup_done_" + std::to_string(rank_), "1");
+        for (int i = 0; i < size_; i++) {
+            store->get_to_str("warmup_done_" + std::to_string(i));
+        }
+    }
+
+    // Increment backend index
     ++backendIndex_;
 }
 
