@@ -28,8 +28,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        event_->synchronize();
-        return event_->query();
+        return true;  // This should be a no-op
     }
 
    private:
