@@ -42,7 +42,7 @@ void processBatchSizes(XferTERunner &runner, size_t block_size,
             runner.getTargetBufferBase(thread_id, block_size, batch_size);
 
         XferBenchTimer timer;
-        while (timer.lap_us(false) < 500000 /* 0.5s */) {
+        while (timer.lap_us(false) < 1000000ull) {
             runner.runSingleTransfer(local_addr, target_addr, block_size,
                                      batch_size, opcode);
         }

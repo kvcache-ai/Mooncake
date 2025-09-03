@@ -66,6 +66,7 @@ struct RdmaSlice {
     int retry_count = 0;
     volatile int *endpoint_quota = nullptr;
     bool failed = false;
+    uint64_t enqueue_ts = 0, submit_ts = 0;
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;

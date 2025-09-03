@@ -43,10 +43,7 @@ static inline void markSliceFailed(RdmaSlice *slice) {
 }
 
 Workers::Workers(RdmaTransport *transport)
-    : transport_(transport),
-      num_workers_(0),
-      running_(false),
-      device_stats_(transport_->context_set_.size()) {}
+    : transport_(transport), num_workers_(0), running_(false) {}
 
 Workers::~Workers() {
     if (running_) stop();
@@ -192,6 +189,8 @@ void Workers::asyncPostSend(int thread_id) {
                 } else {
                     submit(slice);
                 }
+            } else {
+                slice->submit_ts = getCurrentTimeInNano();
             }
         }
 
@@ -263,8 +262,8 @@ void Workers::asyncPollCq(int thread_id) {
             else
                 endpoint_quota_map[slice->endpoint_quota] = 1;
             if (slice->retry_count == 0) {
-                transport_->device_quota_->release(slice->source_dev_id,
-                                                   slice->length);
+                worker_context_[thread_id].device_quota->release(
+                    slice->source_dev_id, slice->length);
             }
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
@@ -287,6 +286,12 @@ void Workers::asyncPollCq(int thread_id) {
                 }
             } else {
                 markSliceSuccess(slice);
+                auto poll_ts = getCurrentTimeInNano();
+                auto &worker = worker_context_[thread_id];
+                worker.perf.inflight_lat.add((poll_ts - slice->submit_ts) /
+                                             1000.0);
+                worker.perf.enqueue_lat.add(
+                    (slice->submit_ts - slice->enqueue_ts) / 1000.0);
             }
         }
         if (nr_poll > 0) {
@@ -303,7 +308,16 @@ void Workers::asyncPollCq(int thread_id) {
 
 void Workers::workerThread(int thread_id) {
     auto &worker = worker_context_[thread_id];
+    worker.device_quota = std::make_unique<DeviceQuota>();
+    worker.device_quota->loadTopology(transport_->local_topology_);
+
+    auto shared_quota_shm_path =
+        transport_->conf_->get("transports/rdma/shared_quota_shm_path", "");
+    if (!shared_quota_shm_path.empty())
+        worker.device_quota->enableSharedQuota(shared_quota_shm_path);
+
     uint64_t grace_ts = 0;
+    uint64_t last_perf_logging_ts = 0;
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
         auto inflight_slices =
@@ -314,6 +328,22 @@ void Workers::workerThread(int thread_id) {
             asyncPostSend(thread_id);
             asyncPollCq(thread_id);
             if (inflight_slices) grace_ts = current_ts;
+            const static uint64_t ONE_SECOND = 1000000000;
+            if (current_ts - last_perf_logging_ts > ONE_SECOND) {
+                LOG(INFO) << "[W" << thread_id << "] enqueue count "
+                          << worker.perf.enqueue_lat.count() << " avg "
+                          << worker.perf.enqueue_lat.avg() << " p95 "
+                          << worker.perf.enqueue_lat.p95() << " p99 "
+                          << worker.perf.enqueue_lat.p99();
+                LOG(INFO) << "[W" << thread_id << "] submit count "
+                          << worker.perf.inflight_lat.count() << " avg "
+                          << worker.perf.inflight_lat.avg() << " p95 "
+                          << worker.perf.inflight_lat.p95() << " p99 "
+                          << worker.perf.inflight_lat.p99();
+                worker.perf.enqueue_lat.clear();
+                worker.perf.inflight_lat.clear();
+                last_perf_logging_ts = current_ts;
+            }
         } else {
             std::unique_lock<std::mutex> lock(worker.mutex);
             if (worker.inflight_slices.load(std::memory_order_relaxed) ||
@@ -401,7 +431,10 @@ int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
 
 Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                                     RdmaSlice *slice, int thread_id) {
-    // Source DEVID has been selected in RdmaTransport::submitTransferTasks
+    if (slice->source_dev_id < 0)
+        CHECK_STATUS(worker_context_[thread_id].device_quota->allocate(
+            slice->length, source.buffer->location, slice->source_dev_id));
+
     if (slice->source_dev_id < 0)
         return Status::DeviceNotFound(
             "No device could access the slice memory region");

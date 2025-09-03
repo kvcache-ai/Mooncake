@@ -21,6 +21,8 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <numeric>
 
 #include "context.h"
 #include "v1/utility/system.h"
@@ -173,6 +175,54 @@ class Workers {
     using GroupedRequests =
         std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;
 
+    struct PerfMetric {
+        void add(double val) { samples.push_back(val); }
+        size_t count() { return samples.size(); }
+        void clear() { samples.clear(); }
+        double p50() { return percentile(50); }
+        double p95() { return percentile(95); }
+        double p99() { return percentile(99); }
+
+        double avg() const {
+            if (samples.empty()) return 0.0;
+            double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+            return sum / samples.size();
+        }
+
+        double min() const {
+            if (samples.empty()) return 0.0;
+            return *std::min_element(samples.begin(), samples.end());
+        }
+
+        double max() const {
+            if (samples.empty()) return 0.0;
+            return *std::max_element(samples.begin(), samples.end());
+        }
+
+        double percentile(int p) {
+            if (samples.empty()) return 0.0;
+            if (p <= 0) return min();
+            if (p >= 100) return max();
+            std::vector<double> sorted = samples;
+            std::sort(sorted.begin(), sorted.end());
+            double rank = (p / 100.0) * (sorted.size() - 1);
+            size_t idx = static_cast<size_t>(rank);
+            double frac = rank - idx;
+            if (idx + 1 < sorted.size()) {
+                return sorted[idx] * (1.0 - frac) + sorted[idx + 1] * frac;
+            } else {
+                return sorted[idx];
+            }
+        }
+
+        std::vector<double> samples;
+    };
+
+    struct PerfMetricSummary {
+        PerfMetric enqueue_lat;
+        PerfMetric inflight_lat;
+    };
+
     struct WorkerContext {
         std::thread thread;
         BoundedSliceQueue queue;
@@ -183,8 +233,10 @@ class Workers {
         std::condition_variable cv;
         bool in_suspend = false;
 
+        std::unique_ptr<DeviceQuota> device_quota;
         std::unordered_map<std::string, std::shared_ptr<RailTopology>>
             rail_topology_map_;
+        PerfMetricSummary perf;
 
         void notifyIfNeeded() {
             std::lock_guard<std::mutex> lock(mutex);
@@ -196,64 +248,6 @@ class Workers {
     };
 
     WorkerContext *worker_context_;
-
-    struct DeviceStats {
-        DeviceStats(size_t num_devices) : num_devices(num_devices) {
-            local_xfer_counts = new std::atomic<uint64_t>[num_devices];
-            remote_xfer_counts = new std::atomic<uint64_t>[num_devices];
-            allow_remote_xfer = new std::atomic<bool>[num_devices];
-            for (size_t i = 0; i < num_devices; ++i)
-                allow_remote_xfer[i] = true;
-        }
-
-        ~DeviceStats() {
-            delete[] local_xfer_counts;
-            delete[] remote_xfer_counts;
-            delete[] allow_remote_xfer;
-        }
-
-        void addLocalXfer(int dev_id) {
-            local_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
-        }
-
-        void addRemoteXfer(int dev_id) {
-            remote_xfer_counts[dev_id].fetch_add(1, std::memory_order_relaxed);
-        }
-
-        bool allowRemoteXfer(int dev_id) {
-            return allow_remote_xfer[dev_id].load(std::memory_order_relaxed);
-        }
-
-        void tryUpdatePeriod() {
-            uint64_t current_ts = getCurrentTimeInNano();
-            const uint64_t kRefreshPeriod = 10 * 1000 * 1000;  // 10ms
-            if (current_ts - last_ts > kRefreshPeriod) {
-                std::lock_guard<std::mutex> lock(mutex);
-                if (current_ts - last_ts > kRefreshPeriod) {
-                    for (size_t i = 0; i < num_devices; ++i) {
-                        auto &allow = allow_remote_xfer[i];
-                        if (!local_xfer_counts[i]) {
-                            allow = true;
-                        } else {
-                            allow = (remote_xfer_counts[i] == 0);
-                        }
-                        local_xfer_counts[i] = 0;
-                        remote_xfer_counts[i] = 0;
-                    }
-                    last_ts = current_ts;
-                }
-            }
-        }
-
-        std::mutex mutex;
-        std::atomic<uint64_t> last_ts{0};
-        const size_t num_devices;
-        std::atomic<uint64_t> *local_xfer_counts;
-        std::atomic<uint64_t> *remote_xfer_counts;
-        std::atomic<bool> *allow_remote_xfer;
-    };
-
-    DeviceStats device_stats_;
 };
 }  // namespace v1
 }  // namespace mooncake

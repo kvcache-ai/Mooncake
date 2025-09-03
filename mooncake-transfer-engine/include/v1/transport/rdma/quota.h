@@ -33,18 +33,12 @@ namespace mooncake {
 namespace v1 {
 class DeviceQuota {
    public:
-    struct AllocPlan {
-        int dev_id;
-        uint64_t offset;
-        uint64_t length;
-    };
-
     struct DeviceInfo {
         int dev_id;
         double bw_gbps;
         int numa_id;
         std::atomic<uint64_t> active_bytes{0};
-        uint64_t local_quota {0}; // if shared quota is used
+        uint64_t local_quota{0};  // if shared quota is used
     };
 
    public:
@@ -60,8 +54,8 @@ class DeviceQuota {
 
     Status enableSharedQuota(const std::string &shm_name);
 
-    Status allocate(uint64_t data_size, const std::string &location,
-                    std::vector<AllocPlan> &plan_list);
+    Status allocate(uint64_t length, const std::string &location,
+                    int &chosen_dev_id);
 
     Status release(int dev_id, uint64_t length);
 

@@ -103,7 +103,6 @@ class RdmaTransport : public Transport {
     std::unordered_map<std::string, int> context_name_lookup_;
     std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
-    std::unique_ptr<DeviceQuota> device_quota_;
 };
 }  // namespace v1
 }  // namespace mooncake

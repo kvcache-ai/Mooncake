@@ -135,15 +135,6 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "No RDMA device detected in active" LOC_MARK);
     }
 
-    device_quota_ = std::make_unique<DeviceQuota>();
-    CHECK_STATUS(device_quota_->loadTopology(local_topology_));
-
-    auto shared_quota_shm_path =
-        conf->get("transports/rdma/shared_quota_shm_path", "");
-    if (!shared_quota_shm_path.empty()) {
-        CHECK_STATUS(device_quota_->enableSharedQuota(shared_quota_shm_path));
-    }
-
     local_topology_->print();
     setupLocalSegment();
 
@@ -196,6 +187,10 @@ Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
+static inline uint64_t roundup(uint64_t a, uint64_t b) {
+    return (a % b == 0) ? a : (a / b + 1) * b;
+}
+
 Status RdmaTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
@@ -205,12 +200,13 @@ Status RdmaTransport::submitTransferTasks(
         rdma_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
 
-    const size_t block_size = params_->workers.block_size;
+    const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
+    const int max_slice_count = 16;
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
-    int start_worker_id = SimpleRandom::Get().next(num_workers);
-    auto local_segment = metadata_->segmentManager().getLocal().get();
+    auto enqueue_ts = getCurrentTimeInNano();
+
     for (auto &request : request_list) {
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list.back();
@@ -219,48 +215,35 @@ Status RdmaTransport::submitTransferTasks(
         task.status_word = WAITING;
         task.transferred_bytes = 0;
 
-        std::vector<DeviceQuota::AllocPlan> plan_list;
-        auto buffer = getBufferDesc(local_segment, (uint64_t)request.source,
-                                    request.length);
-        CHECK_STATUS(device_quota_->allocate(
-            request.length, buffer ? buffer->location : "", plan_list));
+        uint64_t num_slices = std::min<uint64_t>(
+            max_slice_count,
+            (request.length + default_block_size - 1) / default_block_size);
+        uint64_t block_size = roundup(
+            (request.length + num_slices - 1) / num_slices, default_block_size);
+        uint64_t offset = 0;
+        for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
+            uint64_t length = std::min(request.length - offset, block_size);
+            auto slice = RdmaSliceStorage::Get().allocate();
+            slice->source_addr = (char *)request.source + offset;
+            slice->target_addr = request.target_offset + offset;
+            slice->length = length;
+            slice->task = &task;
+            slice->retry_count = 0;
+            slice->endpoint_quota = nullptr;
+            slice->next = nullptr;
+            slice->enqueue_ts = enqueue_ts;
+            task.num_slices++;
+            offset += length;
 
-        for (auto &plan : plan_list) {
-            uint64_t remaining = plan.length;
-
-            // 至少切成 num_workers 块，充分利用 QP
-            uint64_t blocks = (remaining + block_size - 1) / block_size;
-            uint64_t num_slices = std::min<uint64_t>(num_workers, blocks);
-            uint64_t blocks_per_slice = (blocks + num_slices - 1) / num_slices;
-            uint64_t slice_bytes = blocks_per_slice * block_size;
-            for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
-                uint64_t offset = slice_idx * slice_bytes;
-                if (offset >= remaining) break;
-                uint64_t cur_len = std::min(slice_bytes, remaining - offset);
-
-                auto slice = RdmaSliceStorage::Get().allocate();
-                slice->source_addr =
-                    (char *)request.source + plan.offset + offset;
-                slice->target_addr =
-                    request.target_offset + plan.offset + offset;
-                slice->length = cur_len;
-                slice->task = &task;
-                slice->retry_count = 0;
-                slice->endpoint_quota = nullptr;
-                slice->next = nullptr;
-                slice->source_dev_id = plan.dev_id;
-                task.num_slices++;
-
-                int part_id = (slice_idx + start_worker_id) % num_workers;
-                auto &list = slice_lists[part_id];
-                auto &tail = slice_tails[part_id];
-                list.num_slices++;
-                if (list.first) {
-                    tail->next = slice;
-                    tail = slice;
-                } else {
-                    list.first = tail = slice;
-                }
+            int part_id = slice_idx % num_workers;
+            auto &list = slice_lists[part_id];
+            auto &tail = slice_tails[part_id];
+            list.num_slices++;
+            if (list.first) {
+                tail->next = slice;
+                tail = slice;
+            } else {
+                list.first = tail = slice;
             }
         }
     }

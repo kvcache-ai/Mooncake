@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "v1/transport/rdma/quota.h"
+#include "v1/utility/random.h"
+
 #include <assert.h>
 #include <unordered_set>
 
@@ -40,135 +42,68 @@ Status DeviceQuota::enableSharedQuota(const std::string &shm_name) {
     return status;
 }
 
-Status DeviceQuota::allocate(uint64_t data_size, const std::string &location,
-                             std::vector<AllocPlan> &plan_list) {
-    plan_list.clear();
-    if (data_size == 0) return Status::OK();
-
+Status DeviceQuota::allocate(uint64_t length, const std::string &location,
+                             int &chosen_dev_id) {
     auto it_loc = local_topology_->getResolvedMatrix().find(location);
-    if (it_loc == local_topology_->getResolvedMatrix().end()) {
+    if (it_loc == local_topology_->getResolvedMatrix().end())
         return Status::InvalidArgument("Unknown location: " + location);
-    }
 
     const ResolvedTopologyEntry &entry = it_loc->second;
-    static constexpr double rank_weights[] = {1.0, 0.25, 0.25};
-
-    struct Cand {
-        int dev_id;
-        double norm_weight;
-    };
-    std::vector<Cand> cands;
-
+    static constexpr double penalty[] = {1.0, 10.0, 10.0};
+    std::unordered_map<int, double> score_map;
     for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
         for (int dev_id : entry.device_list[rank]) {
             auto &device = devices_[dev_id];
-            double weight = device.bw_gbps * 1e9 * rank_weights[rank];
             if (!allow_cross_numa_ && device.numa_id != entry.numa_node)
                 continue;
-            if (weight <= 0.0) continue;
             if (shared_quota_ && device.local_quota <= 0) {
                 const uint64_t acquire_size =
                     -device.local_quota +
-                    std::max(data_size, alloc_units_ * slice_size_);
+                    std::max(length, alloc_units_ * slice_size_);
                 if (shared_quota_->allocate(dev_id, acquire_size)) {
                     device.local_quota += acquire_size;
                 } else {
                     continue;
                 }
             }
-            uint64_t act = device.active_bytes.load(std::memory_order_relaxed);
-            double load_factor =
-                1.0 + static_cast<double>(act) / (weight + 1.0);
-            cands.push_back(Cand{dev_id, weight / load_factor});
+            uint64_t active_bytes =
+                device.active_bytes.load(std::memory_order_relaxed) + length;
+            double bandwidth = device.bw_gbps * 1e9 / 8;
+            double score =
+                1.0 / (1.0 + ((active_bytes * penalty[rank]) / bandwidth));
+            score_map[dev_id] = score;
         }
     }
 
-    // Minimal effect fall-back: choose ONE device only without any regulation
-    if (cands.empty()) {
+    if (score_map.empty()) {
         const int num_devices = (int)local_topology_->getDeviceList().size();
         for (int dev_id = 0; dev_id < num_devices; ++dev_id) {
-            auto &device = devices_[dev_id];
-            double weight = device.bw_gbps * 1e9;
-            if (weight <= 0.0) continue;
-            uint64_t act = device.active_bytes.load(std::memory_order_relaxed);
-            double load_factor =
-                1.0 + static_cast<double>(act) / (weight + 1.0);
-            cands.push_back(Cand{dev_id, weight / load_factor});
-            break;
+            if (devices_[dev_id].bw_gbps) {
+                score_map[dev_id] = 1.0;
+                break;
+            }
         }
     }
 
-    if (cands.empty())
+    if (score_map.empty())
         return Status::DeviceNotFound("no eligible devices for " + location);
 
-    if (data_size < slice_size_) {
-        auto it = std::max_element(cands.begin(), cands.end(),
-                                   [](const Cand &a, const Cand &b) {
-                                       return a.norm_weight < b.norm_weight;
-                                   });
-        assert(it != cands.end());
-        devices_[it->dev_id].active_bytes.fetch_add(data_size,
-                                                    std::memory_order_relaxed);
-        plan_list.push_back(AllocPlan{it->dev_id, 0, data_size});
-        return Status::OK();
+    double max_score = -1.0;
+    for (auto &item : score_map) {
+        max_score = std::max(max_score, item.second);
     }
-
-    size_t max_devices = static_cast<size_t>(data_size / slice_size_);
-    if (max_devices == 0) max_devices = 1;
-    if (max_devices > cands.size()) max_devices = cands.size();
-
-    std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
-        return a.norm_weight > b.norm_weight;
-    });
-    cands.resize(max_devices);
-
-    double total_norm_weights = 0.0;
-    for (auto &c : cands) total_norm_weights += c.norm_weight;
-    if (total_norm_weights <= 0.0)
-        return Status::InternalError("invalid total weight");
-
-    struct Tmp {
-        int dev_id;
-        uint64_t alloc;
-        double frac;
-    };
-
-    std::vector<Tmp> tmp;
-    tmp.reserve(cands.size());
-
-    uint64_t allocated = 0;
-    for (auto &c : cands) {
-        double share_f = static_cast<double>(data_size) *
-                         (c.norm_weight / total_norm_weights);
-        uint64_t alloc_i = static_cast<uint64_t>(share_f);
-        tmp.push_back(Tmp{c.dev_id, alloc_i, share_f - alloc_i});
-        allocated += alloc_i;
-    }
-
-    uint64_t remaining = data_size - allocated;
-    if (remaining > 0) {
-        std::sort(tmp.begin(), tmp.end(),
-                  [](const Tmp &a, const Tmp &b) { return a.frac > b.frac; });
-        size_t idx = 0;
-        while (remaining > 0) {
-            tmp[idx % tmp.size()].alloc += 1;
-            allocated += 1;
-            --remaining;
-            ++idx;
+    std::vector<int> candidates;
+    for (auto &item : score_map) {
+        if (item.second == max_score) {
+            candidates.push_back(item.first);
         }
     }
-
-    assert(allocated == data_size);
-    uint64_t offset = 0;
-    for (auto &t : tmp) {
-        if (t.alloc == 0) continue;
-        plan_list.push_back(AllocPlan{t.dev_id, offset, t.alloc});
-        offset += t.alloc;
-        auto &device = devices_[t.dev_id];
-        device.local_quota -= t.alloc;
-        device.active_bytes.fetch_add(t.alloc, std::memory_order_relaxed);
-    }
-
+    thread_local size_t rr_index = 0;
+    chosen_dev_id = candidates[rr_index % candidates.size()];
+    rr_index++;
+    devices_[chosen_dev_id].local_quota -= length;
+    devices_[chosen_dev_id].active_bytes.fetch_add(length,
+                                                   std::memory_order_relaxed);
     return Status::OK();
 }
 
