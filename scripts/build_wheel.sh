@@ -179,6 +179,9 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         done
     done
 
+    # Manually fix for libcuda since it needs libcuda.so.1 but I didn't get it.
+    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude libcuda.so.1 "
+
     echo "Running auditwheel with exclude options: $EXCLUDE_OPTS"
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
