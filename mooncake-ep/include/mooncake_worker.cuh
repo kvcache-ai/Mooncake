@@ -64,7 +64,7 @@ class MooncakeWorker {
     void stopWorker() { running_ = false; }
 
    private:
-    static constexpr size_t kNumTasks_ = 2;
+    static constexpr size_t kNumTasks_ = 4;
 
     bool running_ = false;
 
@@ -72,7 +72,8 @@ class MooncakeWorker {
     bool hasCallback_[kNumTasks_]{};
     std::function<void()> callbacks_[kNumTasks_]{};
 
-    int taskCount = 0;
+    int cpuTaskCount = 0;
+    int cudaTaskCount = 0;
 };
 
 }  // namespace mooncake
