@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+    branches: [ "fix_py38" ]
 
 env:
   SCCACHE_GHA_ENABLED: "true"
