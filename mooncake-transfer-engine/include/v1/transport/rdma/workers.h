@@ -140,6 +140,8 @@ class Workers {
 
     int getDeviceRank(const RuoteHint &hint, int device_id);
 
+    void showLatencyInfo(int thread_id);
+
    private:
     RdmaTransport *transport_;
     size_t num_workers_;
@@ -179,9 +181,10 @@ class Workers {
         void add(double val) { samples.push_back(val); }
         size_t count() { return samples.size(); }
         void clear() { samples.clear(); }
-        double p50() { return percentile(50); }
-        double p95() { return percentile(95); }
-        double p99() { return percentile(99); }
+        double p50() { return percentile(50.0); }
+        double p95() { return percentile(95.0); }
+        double p99() { return percentile(99.0); }
+        double p999() { return percentile(99.9); }
 
         double avg() const {
             if (samples.empty()) return 0.0;
@@ -199,7 +202,7 @@ class Workers {
             return *std::max_element(samples.begin(), samples.end());
         }
 
-        double percentile(int p) {
+        double percentile(double p) {
             if (samples.empty()) return 0.0;
             if (p <= 0) return min();
             if (p >= 100) return max();

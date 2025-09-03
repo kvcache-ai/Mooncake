@@ -209,8 +209,8 @@ double XferTERunner::runSingleTransfer(uint64_t local_addr,
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
     XferBenchTimer timer;
+    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
     while (true) {
         TransferStatus overall_status;
         CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));

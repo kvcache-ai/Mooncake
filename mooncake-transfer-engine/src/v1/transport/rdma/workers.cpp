@@ -306,7 +306,24 @@ void Workers::asyncPollCq(int thread_id) {
     }
 }
 
+void Workers::showLatencyInfo(int thread_id) {
+    auto &worker = worker_context_[thread_id];
+    LOG(INFO) << "[W" << thread_id << "] enqueue count "
+              << worker.perf.enqueue_lat.count() << " avg "
+              << worker.perf.enqueue_lat.avg() << " p99 "
+              << worker.perf.enqueue_lat.p99() << " p999 "
+              << worker.perf.enqueue_lat.p999();
+    LOG(INFO) << "[W" << thread_id << "] submit count "
+              << worker.perf.inflight_lat.count() << " avg "
+              << worker.perf.inflight_lat.avg() << " p99 "
+              << worker.perf.inflight_lat.p99() << " p999 "
+              << worker.perf.inflight_lat.p999();
+    worker.perf.enqueue_lat.clear();
+    worker.perf.inflight_lat.clear();
+}
+
 void Workers::workerThread(int thread_id) {
+    bindToSocket(thread_id % numa_num_configured_nodes());
     auto &worker = worker_context_[thread_id];
     worker.device_quota = std::make_unique<DeviceQuota>();
     worker.device_quota->loadTopology(transport_->local_topology_);
@@ -329,19 +346,9 @@ void Workers::workerThread(int thread_id) {
             asyncPollCq(thread_id);
             if (inflight_slices) grace_ts = current_ts;
             const static uint64_t ONE_SECOND = 1000000000;
-            if (current_ts - last_perf_logging_ts > ONE_SECOND) {
-                LOG(INFO) << "[W" << thread_id << "] enqueue count "
-                          << worker.perf.enqueue_lat.count() << " avg "
-                          << worker.perf.enqueue_lat.avg() << " p95 "
-                          << worker.perf.enqueue_lat.p95() << " p99 "
-                          << worker.perf.enqueue_lat.p99();
-                LOG(INFO) << "[W" << thread_id << "] submit count "
-                          << worker.perf.inflight_lat.count() << " avg "
-                          << worker.perf.inflight_lat.avg() << " p95 "
-                          << worker.perf.inflight_lat.p95() << " p99 "
-                          << worker.perf.inflight_lat.p99();
-                worker.perf.enqueue_lat.clear();
-                worker.perf.inflight_lat.clear();
+            if (transport_->params_->workers.show_latency_info &&
+                current_ts - last_perf_logging_ts > ONE_SECOND) {
+                showLatencyInfo(thread_id);
                 last_perf_logging_ts = current_ts;
             }
         } else {
@@ -350,7 +357,7 @@ void Workers::workerThread(int thread_id) {
                 !running_)
                 continue;
             worker.in_suspend = true;
-            worker.cv.wait_for(lock, std::chrono::milliseconds(1));
+            worker.cv.wait_for(lock, std::chrono::milliseconds(5));
         }
     }
 }

@@ -202,7 +202,7 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const int max_slice_count = 16;
+    const int max_slice_count = 32;
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
@@ -248,10 +248,13 @@ Status RdmaTransport::submitTransferTasks(
         }
     }
 
-    for (int part_id = 0; part_id < num_workers; ++part_id) {
-        if (slice_lists[part_id].first) {
-            rdma_batch->slice_chain.push_back(slice_lists[part_id].first);
-            workers_->submit(slice_lists[part_id], part_id);
+    thread_local int next_part_id = SimpleRandom::Get().next(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
+        int part_id = next_part_id;
+        next_part_id = (next_part_id + 1) % num_workers;
+        if (slice_lists[i].first) {
+            rdma_batch->slice_chain.push_back(slice_lists[i].first);
+            workers_->submit(slice_lists[i], part_id);
         }
     }
     return Status::OK();

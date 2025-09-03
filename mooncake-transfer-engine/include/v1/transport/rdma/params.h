@@ -62,8 +62,9 @@ struct WorkerParams {
     int num_workers = 4;
     int max_retry_count = 8;
     int block_size = 65536;
-    uint64_t grace_period_ns = 50000;  // 50us
+    uint64_t grace_period_ns = 5000000;  // 5ms
     std::string rail_topo_path;
+    bool show_latency_info = false;
 };
 
 struct RdmaParams {

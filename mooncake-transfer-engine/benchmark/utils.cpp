@@ -103,8 +103,8 @@ void printStatsHeader() {
                 << std::setw(15) << "B/W (GB/Sec)"
                 << std::setw(15) << "Avg Lat. (us)"
                 << std::setw(15) << "Avg Tx (us)"
-                << std::setw(15) << "P95 Tx (us)"
                 << std::setw(15) << "P99 Tx (us)"
+                << std::setw(15) << "P999 Tx (us)"
                 << std::endl;
     std::cout << std::string(160, '-') << std::endl;
     // clang-format on
@@ -130,7 +130,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats) {
               << std::setw(15) << avg_latency
               << std::setw(15) << stats.transfer_duration.avg()
               << std::setw(15) << stats.transfer_duration.p99()
-              << std::setw(15) << stats.transfer_duration.max()
+              << std::setw(15) << stats.transfer_duration.p999()
               << std::endl;
     // clang-format on
 }

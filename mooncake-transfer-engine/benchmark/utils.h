@@ -87,6 +87,8 @@ struct XferMetricStats {
 
     double p99() { return percentile(99.0); }
 
+    double p999() { return percentile(99.9); }
+
     void add(double value) { samples.push_back(value); }
 
     void clear() { samples.clear(); }

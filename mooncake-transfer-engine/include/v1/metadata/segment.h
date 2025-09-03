@@ -141,7 +141,7 @@ class SegmentManager {
     std::unique_ptr<MetadataStore> store_;
 
     std::string file_desc_basepath_;
-    uint64_t ttl_ms_ = 500;
+    uint64_t ttl_ms_ = 10 * 1000; // N.B. Frequent TTL harms p999
 };
 
 class LocalSegmentTracker {
