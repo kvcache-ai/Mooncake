@@ -759,11 +759,6 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
-    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
-    if (rc != 0) {
-        return rc;
-    }
-
     handshake_plugin_->registerOnConnectionCallBack(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
@@ -780,6 +775,11 @@ int TransferMetadata::startHandshakeDaemon(
         [this](const Json::Value &peer, Json::Value &local) -> int {
             return receivePeerNotify(peer, local);
         });
+
+    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
+    if (rc != 0) {
+        return rc;
+    }
     return 0;
 }
 

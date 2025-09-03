@@ -52,7 +52,7 @@ AscendDirectTransport::~AscendDirectTransport() {
         for (auto &connected_segment : connected_segments_) {
             auto status =
                 adxl_->Disconnect(connected_segment.c_str(), connect_timeout_);
-            if (status != adxl::ADXL_SUCCESS) {
+            if (status != adxl::SUCCESS) {
                 LOG(ERROR) << "Failed to disconnect AdxlEngine:"
                            << connected_segment;
             } else {
@@ -67,7 +67,7 @@ AscendDirectTransport::~AscendDirectTransport() {
     std::lock_guard<std::mutex> mem_handle_lock(mem_handle_mutex_);
     for (const auto &[addr, mem_handle] : addr_to_mem_handle_) {
         auto status = adxl_->DeregisterMem(mem_handle);
-        if (status != adxl::ADXL_SUCCESS) {
+        if (status != adxl::SUCCESS) {
             LOG(ERROR) << "Failed to deregister memory at address " << addr;
         } else {
             LOG(INFO) << "Deregistered memory at address " << addr;
@@ -120,9 +120,7 @@ int AscendDirectTransport::InitAdxlEngine() {
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     std::string host_ip = local_segment_desc->rank_info.hostIp;
     uint16_t host_port = local_segment_desc->rank_info.hostPort;
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
-    adxl_ = std::make_unique<adxl::AdxlEngine>(adxl_engine_name);
+    adxl_ = std::make_unique<adxl::AdxlEngine>();
     if (!adxl_) return ERR_MEMORY;
     std::map<adxl::AscendString, adxl::AscendString> options;
     char *rdma_tc = std::getenv("ASCEND_RDMA_TC");
@@ -147,8 +145,10 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
         }
     }
-    auto status = adxl_->Initialize(options);
-    if (status != adxl::ADXL_SUCCESS) {
+    auto adxl_engine_name =
+        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    auto status = adxl_->Initialize(adxl_engine_name, options);
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
         return -1;
     }
@@ -293,16 +293,26 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     mem_desc.addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr));
     mem_desc.len = length;
     adxl::MemType mem_type;
-    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
-              << ", length:" << length << ", location:" << location;
-    if (location.starts_with("cpu:")) {
+    if (location.starts_with("cpu")) {
         mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu:") || location == kWildcardLocation) {
+    } else if (location.starts_with("npu")) {
         mem_type = adxl::MEM_DEVICE;
+    } else if (location == kWildcardLocation) {
+        aclrtPtrAttributes attributes;
+        ret = aclrtPointerGetAttributes(addr, &attributes);
+        if (ret != ACL_SUCCESS) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+            return -1;
+        }
+        mem_type =
+            (attributes.location.type == 0) ? adxl::MEM_HOST : adxl::MEM_DEVICE;
     } else {
         LOG(ERROR) << "location:" << location << " is not supported.";
         return ERR_INVALID_ARGUMENT;
     }
+    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
+              << ", length:" << length << ", location:" << location
+              << ", mem type:" << mem_type;
     ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: "
@@ -311,7 +321,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
     adxl::MemHandle mem_handle;
     auto adxl_ret = adxl_->RegisterMem(mem_desc, mem_type, mem_handle);
-    if (adxl_ret != adxl::ADXL_SUCCESS) {
+    if (adxl_ret != adxl::SUCCESS) {
         LOG(ERROR) << "adxl_ret:" << adxl_ret << ".";
         return -1;
     }
@@ -483,7 +493,7 @@ void AscendDirectTransport::processSliceList(
     }
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
-    if (status == adxl::ADXL_SUCCESS) {
+    if (status == adxl::SUCCESS) {
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
@@ -509,7 +519,7 @@ int AscendDirectTransport::checkAndConnect(
     }
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
-    if (status != adxl::ADXL_SUCCESS) {
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to connect to target: " << target_adxl_engine_name
                    << ", status: " << status;
         return -1;
@@ -530,7 +540,7 @@ int AscendDirectTransport::disconnect(
     }
     auto status =
         adxl_->Disconnect(target_adxl_engine_name.c_str(), timeout_in_millis);
-    if (status != adxl::ADXL_SUCCESS) {
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
                    << ", status: " << status;
         connected_segments_.erase(target_adxl_engine_name);
