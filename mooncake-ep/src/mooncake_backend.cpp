@@ -218,7 +218,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
             },
             [=](void* src) { memcpy(tensor.data_ptr(), src, tensorSize); });
     } else {
-        cudaStream_t stream =
+        at::cuda::CUDAStream stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_.putTaskCuda(
             c10d::OpType::BROADCAST, tensorSize, root, &meta_, stream,
@@ -251,8 +251,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                 launchReduceCpu(tensor, src, numRanks, opts.reduceOp);
             });
     } else {
-        cudaStream_t stream =
-            at::cuda::getCurrentCUDAStream(tensor.device().index());
+        auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_.putTaskCuda(
             c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_, stream,
             [&](void* dst) {
@@ -286,7 +285,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                 }
             });
     } else {
-        cudaStream_t stream =
+        auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
         return worker_.putTaskCuda(
             c10d::OpType::ALLGATHER, tensorSize, 0, &meta_, stream,
@@ -317,7 +316,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 memcpy(outputBuffer.data_ptr(), src, tensorSize * numRanks);
             });
     } else {
-        cudaStream_t stream =
+        auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_.putTaskCuda(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_, stream,
@@ -349,7 +348,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 launchReduceCpu(outputBuffer, src, numRanks, opts.reduceOp);
             });
     } else {
-        cudaStream_t stream =
+        auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_.putTaskCuda(
             c10d::OpType::REDUCE_SCATTER, tensorSize, 0, &meta_, stream,
@@ -386,7 +385,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                 }
             });
     } else {
-        cudaStream_t stream =
+        auto stream =
             at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
         return worker_.putTaskCuda(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_, stream,

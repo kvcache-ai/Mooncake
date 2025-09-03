@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -55,7 +56,7 @@ class MooncakeWorker {
 
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-        TransferGroupMeta* meta, cudaStream_t stream,
+        TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
         const std::function<void(void* dst)>& tensorToBuffer,
         const std::function<void(void* src)>& bufferToTensor);
 

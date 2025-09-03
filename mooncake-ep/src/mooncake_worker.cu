@@ -22,19 +22,18 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
-    MooncakeWorkCuda(c10d::OpType opType, cudaEvent_t event)
+    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event)
         : Work(-1, opType), event_(event) {}
 
-    bool isCompleted() override {
-        return cudaEventQuery(event_) == cudaSuccess;
-    }
+    bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        return cudaEventSynchronize(event_) == cudaSuccess;
+        event_->synchronize();
+        return event_->query();
     }
 
    private:
-    cudaEvent_t event_;
+    std::shared_ptr<torch::Event> event_;
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
@@ -258,7 +257,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    TransferGroupMeta* meta, cudaStream_t stream,
+    TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
@@ -276,9 +275,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset + 2].addr);
     ++cudaTaskCount;
     ++meta->taskCount;
-    cudaEvent_t event;
-    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-    cudaEventRecord(event, stream);
+    auto event = std::make_shared<torch::Event>(torch::kCUDA);
+    event->record(stream);
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event);
 }
 
