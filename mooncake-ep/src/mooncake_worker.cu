@@ -38,14 +38,15 @@ class MooncakeWorkCuda : public ::c10d::Work {
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
-                                  int64_t broadcastRoot, void* meta,
-                                  Task* tasks, int numRanks,
+                                  int64_t broadcastRoot, int bufferOffset,
+                                  void* meta, Task* tasks, int numRanks,
                                   const bool* brokenRanks,
                                   int* brokenRanksTensor, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
+    tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].transferGroupMeta = meta;
 
     // Mark active
@@ -228,28 +229,30 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         c10::ListType::create(c10::TensorType::get()));
     int taskId = taskCount % kNumTasks_;
     TORCH_CHECK(!tasks_[taskId].active);
+    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
 
     tasks_[taskId].opType = opType;
     tasks_[taskId].tensorSize = tensorSize;
     tasks_[taskId].broadcastRoot = broadcastRoot;
+    tasks_[taskId].bufferOffset = bufferOffset;
     tasks_[taskId].transferGroupMeta = meta;
-    tensorToBuffer((void*)meta->segmentDescs[meta->rank]
-                       ->buffers[meta->bufferBaseIndex + taskId]
-                       .addr);
+    tensorToBuffer(
+        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
 
     hasCallback_[taskId] = true;
-    callbacks_[taskId] = [this, meta, bufferToTensor, taskId, future] {
+    callbacks_[taskId] = [this, meta, bufferToTensor, bufferOffset, future] {
         for (int i = 0; i < meta->size; ++i) {
             meta->brokenRanksTensor[i] = meta->brokenRanks[i] ? 1 : 0;
         }
         bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                           ->buffers[meta->bufferBaseIndex + 2 + taskId]
+                           ->buffers[bufferOffset + 2]
                            .addr);
         future->markCompleted(c10::IValue());
     };
 
     tasks_[taskId].active = true;
     ++taskCount;
+    ++meta->taskCount;
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
@@ -260,19 +263,19 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     int taskId = taskCount % kNumTasks_;
-    tensorToBuffer((void*)meta->segmentDescs[meta->rank]
-                       ->buffers[meta->bufferBaseIndex + taskId]
-                       .addr);
+    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+    tensorToBuffer(
+        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
 
     hasCallback_[taskId] = false;
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, meta, tasks_device_, meta->size,
-        meta->brokenRanksDevice, meta->brokenRanksTensor.data_ptr<int>(),
-        taskId);
-    bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                       ->buffers[meta->bufferBaseIndex + 2 + taskId]
-                       .addr);
+        opType, tensorSize, broadcastRoot, bufferOffset, meta, tasks_device_,
+        meta->size, meta->brokenRanksDevice,
+        meta->brokenRanksTensor.data_ptr<int>(), taskId);
+    bufferToTensor(
+        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset + 2].addr);
     ++taskCount;
+    ++meta->taskCount;
     cudaEvent_t event;
     cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     cudaEventRecord(event, stream);

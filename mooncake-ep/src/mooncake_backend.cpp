@@ -110,6 +110,7 @@ MooncakeBackend::MooncakeBackend(
 
     meta_.rank = rank;
     meta_.size = size;
+    meta_.taskCount = 0;
     cudaHostAlloc(&meta_.brokenRanks, kMaxNumRanks * sizeof(bool),
                   cudaHostAllocMapped);
     cudaHostGetDevicePointer(&meta_.brokenRanksDevice, meta_.brokenRanks, 0);

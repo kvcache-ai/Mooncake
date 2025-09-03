@@ -13,6 +13,7 @@ namespace mooncake {
 struct TransferGroupMeta {
     int rank;
     int size;
+    int taskCount;
     bool* brokenRanks;
     bool* brokenRanksDevice;
     at::Tensor brokenRanksTensor;
@@ -27,6 +28,7 @@ __global__ struct Task {
     c10d::OpType opType = c10d::OpType::UNKNOWN;
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
+    int bufferOffset;
     BatchID batchID;
     void* transferGroupMeta;
 };
