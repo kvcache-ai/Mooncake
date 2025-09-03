@@ -20,9 +20,6 @@ struct BufferLayout {
     int* rdma_recv_signal_buffer;
     void* rdma_send_data_buffer;
     void* rdma_recv_data_buffer;
-
-    void* cuda_counter_buffer;
-    void* cuda_data_buffer;
 };
 
 struct BufferPair {
@@ -44,8 +41,8 @@ struct BufferPair {
             (2 * sizeof(int4) + hidden * sizeof(nv_bfloat16));
         for (int i = 0; i < 2; ++i) {
             size_t rdma_base_offset = total_bytes +
-                                      3 * i * signaling_buffer_bytes +
-                                      3 * i * send_recv_buffer_bytes;
+                                      2 * i * signaling_buffer_bytes +
+                                      2 * i * send_recv_buffer_bytes;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
                 advance<int*>(rdma_buffer,
@@ -55,15 +52,9 @@ struct BufferPair {
                 advance<int*>(rdma_buffer, rdma_base_offset +
                                                2 * signaling_buffer_bytes +
                                                send_recv_buffer_bytes),
-                advance<void*>(rdma_buffer, rdma_base_offset +
-                                                2 * signaling_buffer_bytes +
-                                                2 * send_recv_buffer_bytes),
-                advance<void*>(rdma_buffer, rdma_base_offset +
-                                                3 * signaling_buffer_bytes +
-                                                2 * send_recv_buffer_bytes),
             };
         }
-        total_bytes += 6 * signaling_buffer_bytes + 6 * send_recv_buffer_bytes;
+        total_bytes += 4 * signaling_buffer_bytes + 4 * send_recv_buffer_bytes;
     }
 };
 
@@ -205,8 +196,6 @@ struct MooncakeEpBuffer {
                 : (int64_t)clock_rate_khz * (int64_t)timeout_us / 1000;
 
         auto launcher = [=](int phases) {
-            cudaMemsetAsync(buffer.cuda_counter_buffer, 0,
-                            num_experts * sizeof(int), launch_stream);
             mooncake::dispatch(
                 packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                 packed_recv_src_info.data_ptr<int>(),
@@ -215,8 +204,8 @@ struct MooncakeEpBuffer {
                 broken_nodes.data_ptr<int32_t>(), gdr_buffer,
                 buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
                 buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
-                buffer.cuda_counter_buffer, buffer.cuda_data_buffer, raddrs,
-                rkeys, qp_devctxs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                nullptr, nullptr, raddrs, rkeys, qp_devctxs, x.data_ptr(),
+                topk_idx.data_ptr<int64_t>(),
                 next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
                 num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
                 num_ranks, use_fp8, workspace, launch_stream, timeout_ticks,
@@ -327,9 +316,8 @@ struct MooncakeEpBuffer {
                 combined_x.data_ptr(), gathered_experts.data_ptr<int32_t>(),
                 gdr_buffer, buffer.rdma_send_signal_buffer,
                 buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
-                buffer.rdma_recv_data_buffer, buffer.cuda_counter_buffer,
-                buffer.cuda_data_buffer, raddrs, rkeys, qp_devctxs,
-                x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs, rkeys,
+                qp_devctxs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
                 topk_weights.data_ptr<float>(), src_info.data_ptr<int>(),
                 layout_range.data_ptr<int64_t>(),
                 next_buffer.rdma_recv_signal_buffer, num_combined_tokens,
@@ -498,8 +486,10 @@ struct MooncakeEpBuffer {
                    const std::vector<int64_t>& interface_ids) {
         for (int i = 0; i < MAX_QP_COUNT; ++i) {
             ibv_gid remote_gid{};
-            remote_gid.global.subnet_prefix = subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
-            remote_gid.global.interface_id = interface_ids[i * num_ranks / MAX_QP_COUNT];
+            remote_gid.global.subnet_prefix =
+                subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
+            remote_gid.global.interface_id =
+                interface_ids[i * num_ranks / MAX_QP_COUNT];
             ibv_ah_attr ah_attr = {};
             ah_attr.is_global = 1;
             ah_attr.grh.dgid = remote_gid;
