@@ -44,8 +44,8 @@ struct BufferPair {
             (2 * sizeof(int4) + hidden * sizeof(nv_bfloat16));
         for (int i = 0; i < 2; ++i) {
             size_t rdma_base_offset = total_bytes +
-                                      2 * i * signaling_buffer_bytes +
-                                      2 * i * send_recv_buffer_bytes;
+                                      3 * i * signaling_buffer_bytes +
+                                      3 * i * send_recv_buffer_bytes;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
                 advance<int*>(rdma_buffer,
@@ -63,7 +63,7 @@ struct BufferPair {
                                                 2 * send_recv_buffer_bytes),
             };
         }
-        total_bytes += 4 * signaling_buffer_bytes + 4 * send_recv_buffer_bytes;
+        total_bytes += 6 * signaling_buffer_bytes + 6 * send_recv_buffer_bytes;
     }
 };
 
