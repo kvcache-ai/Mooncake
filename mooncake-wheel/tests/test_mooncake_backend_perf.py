@@ -32,15 +32,20 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
 
+    torch.cuda.synchronize()
+
     end = time.perf_counter()
 
     # Calculate average time
     avg_time = (end - start) / num_iterations
 
-    dist.destroy_process_group()  # Destroy the process group after testing
-
     # Store the result
     results[rank] = avg_time
+
+    while len(results) < world_size:
+        time.sleep(1)
+
+    dist.destroy_process_group()  # Destroy the process group after testing
 
 class TestMooncakeBackendPerf(unittest.TestCase):
     def setUp(self):
