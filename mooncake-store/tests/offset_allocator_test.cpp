@@ -1,4 +1,5 @@
 #include "offset_allocator/offset_allocator.hpp"
+#include "mutex.h"
 #include "serializer.h"
 #include "types.h"
 
@@ -297,6 +298,8 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
                            const std::shared_ptr<OffsetAllocator>& b) {
+        MutexLocker lock_a(&a->m_mutex);
+        MutexLocker lock_b(&b->m_mutex);
         // Compare basic member variables
         ASSERT_EQ(a->m_base, b->m_base);
         ASSERT_EQ(a->m_multiplier_bits, b->m_multiplier_bits);
@@ -353,6 +356,8 @@ class OffsetAllocatorTest : public ::testing::Test {
     // Compare two allocators bytes by bytes to detect one bit difference.
     bool isAllocatorEqual(const std::shared_ptr<OffsetAllocator>& a,
                           const std::shared_ptr<OffsetAllocator>& b) {
+        MutexLocker lock_a(&a->m_mutex);
+        MutexLocker lock_b(&b->m_mutex);
         // Compare basic member variables
         if (memcmp(&a->m_base, &b->m_base, sizeof(a->m_base)) != 0)
             return false;
