@@ -10,8 +10,7 @@
 
 namespace mooncake {
 
-CoroRPCCommunicator::CoroRPCCommunicator() : impl_(std::make_shared<Impl>()) {
-}
+CoroRPCCommunicator::CoroRPCCommunicator() : impl_(std::make_shared<Impl>()) {}
 
 CoroRPCCommunicator::~CoroRPCCommunicator() { stopServer(); }
 
