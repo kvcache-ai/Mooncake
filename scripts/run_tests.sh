@@ -15,6 +15,12 @@ TARGET_PID=$!
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_initiator_test.py
 kill $TARGET_PID || true
 
+echo "Running CoroRPC performance tests..."
+cd ../mooncake-transfer-engine/tests
+pip install torch numpy
+python test_coro_rpc_performance.py
+cd ../../mooncake-wheel/tests
+
 echo "Running master tests..."
 
 which mooncake_master 2>/dev/null | grep -q '/usr/local/bin/mooncake_master' && \
