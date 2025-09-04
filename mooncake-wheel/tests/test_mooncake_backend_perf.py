@@ -40,11 +40,11 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
 
     dist.destroy_process_group()  # Destroy the process group after testing
 
-    while len(results) < world_size:
-        time.sleep(1)
-
     # Store the result
     results[rank] = avg_time
+
+    while len(results) < world_size:
+        time.sleep(1)
 
 class TestMooncakeBackendPerf(unittest.TestCase):
     def setUp(self):
