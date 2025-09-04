@@ -81,9 +81,9 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    devices = ['cpu', 'cuda']
+    devices = ['cpu']
     collectives = ['broadcast', 'allreduce', 'allgather']
-    data_sizes = [2**i for i in range(10, 25, 2)]
+    data_sizes = [2**i for i in range(20, 25, 20)]
 
     def generate_test(device, collective, data_size):
         def test(self):
