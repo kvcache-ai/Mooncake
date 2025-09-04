@@ -173,7 +173,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Internal method to get metrics without locking (caller must hold m_mutex)
     [[nodiscard]]
-    OffsetAllocatorMetrics get_metrics_internal() const;
+    OffsetAllocatorMetrics get_metrics_internal() const REQUIRES(m_mutex);
 
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     uint64_t m_base;
