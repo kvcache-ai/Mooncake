@@ -24,8 +24,14 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
-#ifdef USE_ASCEND
+#ifdef USE_ASCEND_DIRECT
+#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
+#endif
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
 #include "transport/ascend_transport/hccl_transport/hccl_transport.h"
+#endif
+#ifdef USE_ASCEND_HETEROGENEOUS
+#include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -95,7 +101,11 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest *>(&request);
+#else
         task.request = &request;
+#endif
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
@@ -202,9 +212,19 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new NVMeoFTransport();
     }
 #endif
+#ifdef USE_ASCEND_DIRECT
+    else if (std::string(proto) == "ascend") {
+        transport = new AscendDirectTransport();
+    }
+#endif
 #ifdef USE_ASCEND
     else if (std::string(proto) == "ascend") {
         transport = new HcclTransport();
+    }
+#endif
+#ifdef USE_ASCEND_HETEROGENEOUS
+    else if (std::string(proto) == "ascend") {
+        transport = new HeterogeneousRdmaTransport();
     }
 #endif
 #ifdef USE_MNNVL
@@ -240,6 +260,14 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+#ifdef USE_ASCEND_HETEROGENEOUS
+    // When USE_ASCEND_HETEROGENEOUS is enabled:
+    // - Target side directly reuses RDMA Transport
+    // - Initiator side uses heterogeneous_rdma_transport
+    if (target_segment_desc->protocol == "rdma") {
+        proto = "ascend";
+    }
+#endif
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");

@@ -22,7 +22,8 @@ Use a prefixed PR title to indicate the type of changes. Please use one of the f
 - ``[CI/Build]`` for build or continuous integration improvements.
 - ``[Doc]`` for documentation fixes and improvements.
 - ``[Integration]`` for changes in the ``mooncake-integration``.
-- ``[P2PStore]`` for changes in the ``mooncake-tp2p-store``.
+- ``[P2PStore]`` for changes in the ``mooncake-p2p-store``.
+- ``[Store]`` for changes in the ``mooncake-store``.
 - ``[TransferEngine]`` for changes in the ``mooncake-transfer-engine``.
 - ``[Misc]`` for PRs that do not fit the above categories. Please use this
   sparingly.
@@ -35,9 +36,7 @@ For major architectural changes (>500 LOC excluding tests), we would expect a Gi
 
 The PR needs to meet the following code quality standards:
 
-- We adhere to `Google Python style guide
-  <https://google.github.io/styleguide/pyguide.html>`_ and `Google C++ style guide
-  <https://google.github.io/styleguide/cppguide.html>`_.
+- We adhere to [Google Python style guide](https://google.github.io/styleguide/pyguide.html) and [Google C++ style guide](https://google.github.io/styleguide/cppguide.html).
 - The code needs to be well-documented to ensure future contributors can easily understand the code.
 - Include sufficient tests to ensure the project stays correct and robust. This includes both unit tests and integration tests.
 - Please add documentation to ``doc/`` if the PR modifies the user-facing behaviors of Mooncake. It helps Mooncake users understand and utilize the new features or changes.

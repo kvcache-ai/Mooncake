@@ -59,6 +59,15 @@ bool printEnabled() {
     return env != nullptr && std::string(env) == "1";
 }
 
+size_t getMaxRegMemoryNum() {
+    static const size_t g_default_max_reg_memory_num = 8192;
+    static char *env = getenv("ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM");
+    if (env != nullptr) {
+        return std::stoi(env);
+    }
+    return g_default_max_reg_memory_num;
+}
+
 uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
     static std::random_device rand_gen;
     std::mt19937 gen(rand_gen());
@@ -646,14 +655,26 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
             }
         }
     }
+
+    size_t max_m_num = getMaxRegMemoryNum();
+    if (m_num >= max_m_num) {
+        LOG(ERROR) << "The number of registered memory exceeds the expected "
+                      "maximum size "
+                   << max_m_num
+                   << ". To resolve this issue, you can increase the maximum "
+                      "size by setting the environment variable "
+                      "ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM.";
+        return -1;
+    }
     hccl::TransportMem::RmaMemDescs localRmaMemDescs;
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(m_num);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
+        max_m_num);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = m_num;
+    remoteRmaMemDescs.arrayLength = max_m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
@@ -662,8 +683,9 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
                    << ", remote_rank: " << remote_rank_info->devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
-    for (uint32_t i = 0; i < m_num; ++i) {
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(
+        actualNumOfRemote);
+    for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
         if (ret) {
@@ -1021,14 +1043,26 @@ int transportMemAccept(RankInfo *local_rank_info) {
             }
         }
     }
+
+    size_t max_m_num = getMaxRegMemoryNum();
+    if (m_num >= max_m_num) {
+        LOG(ERROR) << "The number of registered memory exceeds the expected "
+                      "maximum size "
+                   << max_m_num
+                   << ". To resolve this issue, you can increase the maximum "
+                      "size by setting the environment variable "
+                      "ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM.";
+        return -1;
+    }
     hccl::TransportMem::RmaMemDescs localRmaMemDescs;
     localRmaMemDescs.array = rmaMemDescs.data();
     localRmaMemDescs.arrayLength = rmaMemDescs.size();
     uint32_t actualNumOfRemote = 0;
-    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(m_num);
+    std::vector<hccl::TransportMem::RmaMemDesc> remoteRmaMemDescArray(
+        max_m_num);
     hccl::TransportMem::RmaMemDescs remoteRmaMemDescs;
     remoteRmaMemDescs.array = remoteRmaMemDescArray.data();
-    remoteRmaMemDescs.arrayLength = m_num;
+    remoteRmaMemDescs.arrayLength = max_m_num;
     ret = transport_mem->ExchangeMemDesc(localRmaMemDescs, remoteRmaMemDescs,
                                          actualNumOfRemote);
     if (ret) {
@@ -1037,8 +1071,9 @@ int transportMemAccept(RankInfo *local_rank_info) {
                    << ", remote_rank: " << remote_control_info.devicePhyId;
         return ret;
     }
-    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(m_num);
-    for (uint32_t i = 0; i < m_num; ++i) {
+    std::vector<hccl::TransportMem::RmaMem> remoteRmaMemArray(
+        actualNumOfRemote);
+    for (uint32_t i = 0; i < actualNumOfRemote; ++i) {
         ret = transport_mem->EnableMemAccess(remoteRmaMemDescArray[i],
                                              remoteRmaMemArray[i]);
         if (ret) {

@@ -130,7 +130,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
-#ifndef USE_ASCEND
+#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
+    !defined(USE_ASCEND_HETEROGENEOUS)
     doBuddyAllocate(kMaxClassId);
 #endif
     return 0;

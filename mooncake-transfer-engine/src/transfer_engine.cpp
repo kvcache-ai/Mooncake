@@ -63,11 +63,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                          const std::string &local_server_name,
                          const std::string &ip_or_host_name,
                          uint64_t rpc_port) {
-    LOG(INFO) << "Transfer Engine starting. Server: " << local_server_name
-              << ", Metadata: " << metadata_conn_string
-              << ", ip_or_host_name: " << ip_or_host_name
-              << ", rpc_port: " << rpc_port;
-
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -112,7 +107,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;
             }
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND)
             // The current version of Ascend Transport does not support IPv6,
             // but it will be added in a future release.
             local_server_name_ =
@@ -165,7 +160,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport *ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
     if (!ascend_transport) {
@@ -174,7 +169,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     }
 #else
 
-#if defined(USE_CXL) && !defined(USE_ASCEND)
+#if defined(USE_CXL) && !defined(USE_ASCEND) && \
+    !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport *cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -204,7 +200,14 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
-#ifdef USE_MNNVL
+#ifdef USE_ASCEND_HETEROGENEOUS
+        Transport *ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+#elif defined(USE_MNNVL)
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_MNNVL")) {
             Transport *rdma_transport =

@@ -318,6 +318,8 @@ int RdmaEndPoint::submitPostSend(
     return 0;
 }
 
+size_t RdmaEndPoint::getQPNumber() const { return qp_list_.size(); }
+
 std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     std::vector<uint32_t> ret;
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index)

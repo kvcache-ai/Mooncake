@@ -1,11 +1,8 @@
-#include <string>
-#include <vector>
-#include <sys/uio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/file.h>
 #include <cerrno>
-#include <limits>
+#include <string>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <glog/logging.h>
 
 #include "file_interface.h"
 
@@ -50,11 +47,6 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    auto lock = acquire_write_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
-
     size_t remaining = length;
     size_t written_bytes = 0;
     const char *ptr = data.data();
@@ -84,11 +76,6 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer,
 
     if (length == 0) {
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
-    }
-
-    auto lock = acquire_read_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
 
     buffer.resize(length);
@@ -121,11 +108,6 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
 
-    auto lock = acquire_write_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
-    }
-
     ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
     if (ret < 0) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -139,11 +121,6 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
                                                        off_t offset) {
     if (fd_ < 0) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
-    }
-
-    auto lock = acquire_read_lock();
-    if (!lock.is_locked()) {
-        return make_error<size_t>(ErrorCode::FILE_LOCK_FAIL);
     }
 
     ssize_t ret = ::preadv(fd_, iov, iovcnt, offset);

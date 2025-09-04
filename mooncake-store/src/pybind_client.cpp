@@ -100,13 +100,13 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     std::string hostname = local_hostname;
     size_t colon_pos = hostname.find(":");
     if (colon_pos == std::string::npos) {
-        // Get a random available port
-        int port = getRandomAvailablePort();
+        // Create port binder to hold a port
+        port_binder_ = std::make_unique<AutoPortBinder>();
+        int port = port_binder_->getPort();
         if (port < 0) {
-            LOG(ERROR) << "Failed to find available port";
+            LOG(ERROR) << "Failed to bind available port";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        // Combine hostname with port
         this->local_hostname = hostname + ":" + std::to_string(port);
     } else {
         this->local_hostname = local_hostname;
@@ -210,6 +210,7 @@ tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
     // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
+    port_binder_.reset();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -390,6 +391,19 @@ tl::expected<void, ErrorCode> PyClient::remove_internal(
 
 int PyClient::remove(const std::string &key) {
     return to_py_ret(remove_internal(key));
+}
+
+tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
+    const std::string &str) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->RemoveByRegex(str);
+}
+
+long PyClient::removeByRegex(const std::string &str) {
+    return to_py_ret(removeByRegex_internal(str));
 }
 
 tl::expected<int64_t, ErrorCode> PyClient::removeAll_internal() {

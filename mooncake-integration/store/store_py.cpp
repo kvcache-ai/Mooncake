@@ -78,53 +78,15 @@ class MooncakeStorePyWrapper {
         }
 
         try {
-            // Query object info first
-            auto query_result = store_.client_->Query(key);
-            if (!query_result) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Query failed: " << query_result.error();
-                return pybind11::none();
-            }
-
-            auto replica_list = query_result.value();
-            if (replica_list.empty()) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(INFO) << "No replicas found for key: " << key;
-                return pybind11::none();
-            }
-
-            const auto &replica = replica_list[0];
-            uint64_t total_length = calculate_total_size(replica);
-
-            if (total_length == 0) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Failed to allocate slices for key: " << key;
-                return pybind11::none();
-            }
-
-            // Allocate buffer using the new allocator
-            auto alloc_result =
-                store_.client_buffer_allocator_->allocate(total_length);
-            if (!alloc_result) {
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
+            auto buffer_handle = store_.get_buffer(key);
+            if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
                 return pybind11::none();
             }
-
-            auto &buffer_handle = *alloc_result;
-
-            // Create slices for the allocated buffer
-            std::vector<Slice> slices;
-            allocateSlices(slices, replica, buffer_handle);
-
-            // Get the object data
-            auto get_result = store_.client_->Get(key, replica_list, slices);
-            if (!get_result) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Get failed for key: " << key;
-                return pybind11::none();
-            }
-
             // Create contiguous buffer and copy data
+            auto total_length = buffer_handle->size();
             char *exported_data = new char[total_length];
             if (!exported_data) {
                 py::gil_scoped_acquire acquire_gil;
@@ -133,9 +95,8 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
             TensorMetadata metadata;
-
             // Copy data from buffer to contiguous memory
-            memcpy(exported_data, buffer_handle.ptr(), total_length);
+            memcpy(exported_data, buffer_handle->ptr(), total_length);
             memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
             if (metadata.ndim < 0 || metadata.ndim > 4) {
@@ -161,6 +122,7 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
 
+            py::gil_scoped_acquire acquire_gil;
             // Convert bytes to tensor using torch.from_numpy
             pybind11::object np_array;
             int dtype_index = static_cast<int>(dtype_enum);
@@ -169,7 +131,6 @@ class MooncakeStorePyWrapper {
                 np_array = array_creators[dtype_index](
                     exported_data, sizeof(TensorMetadata), tensor_size);
             } else {
-                py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
                 return pybind11::none();
             }
@@ -182,12 +143,10 @@ class MooncakeStorePyWrapper {
                 py::tuple shape_tuple = py::cast(shape_vec);
                 np_array = np_array.attr("reshape")(shape_tuple);
             }
-            py::gil_scoped_acquire acquire_gil;
             pybind11::object tensor = torch.attr("from_numpy")(np_array);
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
-            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Failed to get tensor data: " << e.what();
             return pybind11::none();
         }
@@ -241,6 +200,8 @@ class MooncakeStorePyWrapper {
                 }
             }
 
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
             char *buffer = reinterpret_cast<char *>(data_ptr);
             char *metadata_buffer = reinterpret_cast<char *>(&metadata);
             std::vector<std::span<const char>> values;
@@ -372,6 +333,15 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_.remove(key);
              })
+        .def(
+            "remove_by_regex",
+            [](MooncakeStorePyWrapper &self, const std::string &str) {
+                py::gil_scoped_release release;
+                return self.store_.removeByRegex(str);
+            },
+            py::arg("regex_pattern"),
+            "Removes objects from the store whose keys match the given "
+            "regular expression.")
         .def("remove_all",
              [](MooncakeStorePyWrapper &self) {
                  py::gil_scoped_release release;

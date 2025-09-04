@@ -1,4 +1,6 @@
 #include "ha_helper.h"
+#include "etcd_helper.h"
+#include "rpc_service.h"
 
 namespace mooncake {
 
@@ -90,52 +92,33 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
 }
 
 MasterServiceSupervisor::MasterServiceSupervisor(
-    const MasterConfig& master_config)
-    : enable_gc_(master_config.enable_gc),
-      enable_metric_reporting_(master_config.enable_metric_reporting),
-      metrics_port_(master_config.metrics_port),
-      default_kv_lease_ttl_(master_config.default_kv_lease_ttl),
-      default_kv_soft_pin_ttl_(master_config.default_kv_soft_pin_ttl),
-      allow_evict_soft_pinned_objects_(
-          master_config.allow_evict_soft_pinned_objects),
-      eviction_ratio_(master_config.eviction_ratio),
-      eviction_high_watermark_ratio_(
-          master_config.eviction_high_watermark_ratio),
-      client_live_ttl_sec_(master_config.client_live_ttl_sec),
-      rpc_port_(master_config.rpc_port),
-      rpc_thread_num_(master_config.rpc_thread_num),
-      rpc_address_(master_config.rpc_address),
-      rpc_conn_timeout_(
-          std::chrono::seconds(master_config.rpc_conn_timeout_seconds)),
-      rpc_enable_tcp_no_delay_(master_config.rpc_enable_tcp_no_delay),
-      etcd_endpoints_(master_config.etcd_endpoints),
-      local_hostname_(master_config.rpc_address + ":" +
-                      std::to_string(master_config.rpc_port)),
-      cluster_id_(master_config.cluster_id) {
-    if (master_config.memory_allocator == "cachelib") {
-        memory_allocator_ = BufferAllocatorType::CACHELIB;
-    } else {
-        memory_allocator_ = BufferAllocatorType::OFFSET;
-    }
-}
+    const MasterServiceSupervisorConfig& config)
+    : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
         LOG(INFO) << "Init master service...";
-        coro_rpc::coro_rpc_server server(rpc_thread_num_, rpc_port_,
-                                         rpc_address_, rpc_conn_timeout_,
-                                         rpc_enable_tcp_no_delay_);
+        coro_rpc::coro_rpc_server server(
+            config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
+            config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            server.init_ibv();
+        }
+
         LOG(INFO) << "Init leader election helper...";
         MasterViewHelper mv_helper;
-        if (mv_helper.ConnectToEtcd(etcd_endpoints_) != ErrorCode::OK) {
+        if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to etcd endpoints: "
-                       << etcd_endpoints_;
+                       << config_.etcd_endpoints;
             return -1;
         }
         LOG(INFO) << "Trying to elect self as leader...";
-        ViewVersionId version = 0;
         EtcdLeaseId lease_id = 0;
-        mv_helper.ElectLeader(local_hostname_, version, lease_id);
+        // view_version will be updated by ElectLeader and then used in
+        // WrappedMasterService
+        ViewVersionId view_version = 0;
+        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
@@ -151,13 +134,8 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
-        bool enable_ha = true;
         mooncake::WrappedMasterService wrapped_master_service(
-            enable_gc_, default_kv_lease_ttl_, default_kv_soft_pin_ttl_,
-            allow_evict_soft_pinned_objects_, enable_metric_reporting_,
-            metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version, client_live_ttl_sec_, enable_ha, cluster_id_,
-            memory_allocator_);
+            mooncake::WrappedMasterServiceConfig(config_, view_version));
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

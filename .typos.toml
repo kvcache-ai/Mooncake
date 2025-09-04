@@ -1,2 +1,7 @@
-[files]
-extend-exclude = ["mooncake-ep/include/mooncake_ibgda/mlx5_ifc.h"]
+[default]
+extend-ignore-words = ["CANN", "ASO", "fre"]
+
+[default.extend-words]
+CANN = "CANN"
+ASO = "ASO"
+fre = "fre"

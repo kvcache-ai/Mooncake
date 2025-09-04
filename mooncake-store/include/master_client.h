@@ -3,13 +3,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_io/client_pool.hpp>
 
-#include "rpc_service.h"
+#include "client_metric.h"
+#include "replica.h"
 #include "types.h"
-
-using namespace async_simple;
-using namespace coro_rpc;
 
 namespace mooncake {
 
@@ -20,7 +20,18 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient();
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {
+        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
+            pool_conf{};
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            pool_conf.client_config.socket_config =
+                coro_io::ib_socket_t::config_t{};
+        }
+        client_pools_ =
+            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+                pool_conf);
+    }
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -60,13 +71,25 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
 
     /**
+     * @brief Retrieves replica lists for object keys that match a regex
+     * pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]]
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
@@ -99,9 +122,11 @@ class MasterClient {
     /**
      * @brief Ends a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -114,10 +139,11 @@ class MasterClient {
     /**
      * @brief Revokes a put operation
      * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key);
+        const std::string& key, ReplicaType replica_type);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -133,6 +159,15 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
+
+    /**
+     * @brief Removes objects from the master whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str);
 
     /**
      * @brief Removes all objects and all its replicas
@@ -213,27 +248,36 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     /**
-     * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
-     * reconnect to a different address, a new coro_rpc_client is created if
-     * the address is different from the current one.
+     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
+     * cannot reconnect to a different address, a new coro_rpc_client pool is
+     * created if the address is different from the current one.
      */
     class RpcClientAccessor {
        public:
-        void SetClient(std::shared_ptr<coro_rpc_client> client) {
+        void SetClientPool(
+            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+                client_pool) {
             std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_ = client;
+            client_pool_ = client_pool;
         }
 
-        std::shared_ptr<coro_rpc_client> GetClient() {
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+        GetClientPool() {
             std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_;
+            return client_pool_;
         }
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc_client> client_;
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+            client_pool_;
     };
     RpcClientAccessor client_accessor_;
+
+    // Metrics for tracking RPC operations
+    MasterClientMetric* metrics_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

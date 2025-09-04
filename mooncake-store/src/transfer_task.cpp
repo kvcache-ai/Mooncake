@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <cstdlib>
 
-#include "utils.h"
-
 namespace mooncake {
 
 // ============================================================================
@@ -95,7 +93,7 @@ void FilereadWorkerPool::workerThread() {
                 }
 
                 auto load_result = backend_->LoadObject(
-                    task.file_path, task.slices, task.file_size);
+                    task.file_path, task.slices, task.object_size);
                 if (load_result) {
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;
@@ -356,11 +354,13 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      const std::string& local_hostname,
-                                     std::shared_ptr<StorageBackend>& backend)
+                                     std::shared_ptr<StorageBackend>& backend,
+                                     TransferMetric* transfer_metric)
     : engine_(engine),
       local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
-      fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)) {
+      fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
+      transfer_metric_(transfer_metric) {
     if (local_hostname_.empty()) {
         LOG(ERROR) << "Local hostname cannot be empty";
         throw std::invalid_argument("Local hostname cannot be empty");
@@ -395,6 +395,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     Transport::TransferRequest::OpCode op_code) {
+    std::optional<TransferFuture> future;
+
     if (replica.is_memory_replica()) {
         std::vector<AllocatedBuffer::Descriptor> handles;
         auto& mem_desc = replica.get_memory_descriptor();
@@ -408,16 +410,26 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
-                return submitMemcpyOperation(handles, slices, op_code);
+                future = submitMemcpyOperation(handles, slices, op_code);
+                break;
             case TransferStrategy::TRANSFER_ENGINE:
-                return submitTransferEngineOperation(handles, slices, op_code);
+                future =
+                    submitTransferEngineOperation(handles, slices, op_code);
+                break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
     } else {
-        return submitFileReadOperation(replica, slices, op_code);
+        future = submitFileReadOperation(replica, slices, op_code);
     }
+
+    // Update metrics on successful submission
+    if (future.has_value()) {
+        updateTransferMetrics(slices, op_code);
+    }
+
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -509,6 +521,11 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         return std::nullopt;
     }
 
+    if (batch_id == Transport::INVALID_BATCH_ID) {
+        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
+        return std::nullopt;
+    }
+
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
@@ -523,7 +540,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
-    size_t file_length = disk_replica.file_size;
+    size_t file_length = disk_replica.object_size;
 
     // Submit memcpy operations to worker pool for async execution
     FilereadTask task(file_path, file_length, slices, state);
@@ -585,6 +602,26 @@ bool TransferSubmitter::validateTransferParams(
     }
 
     return true;
+}
+
+void TransferSubmitter::updateTransferMetrics(
+    const std::vector<Slice>& slices,
+    Transport::TransferRequest::OpCode op_code) {
+    size_t total_bytes = 0;
+    for (const auto& slice : slices) {
+        total_bytes += slice.size;
+    }
+
+    if (transfer_metric_ == nullptr) {
+        return;
+    }
+
+    if (op_code == Transport::TransferRequest::READ) {
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+
+    } else if (op_code == Transport::TransferRequest::WRITE) {
+        transfer_metric_->total_write_bytes.inc(total_bytes);
+    }
 }
 
 }  // namespace mooncake
