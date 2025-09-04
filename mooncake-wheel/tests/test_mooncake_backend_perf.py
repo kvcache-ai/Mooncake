@@ -67,22 +67,6 @@ class TestMooncakeBackendPerf(unittest.TestCase):
         self.assertLessEqual(mooncake_latency, 10 * baseline_latency,
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
-    # cpu + allreduce
-    def test_cpu_allreduce_1024(self):
-        self.do_test("cpu", "allreduce", 1024)
-
-    # cpu + broadcast
-    def test_cpu_broadcast_1024(self):
-        self.do_test("cpu", "broadcast", 1024)
-
-    # cuda + allreduce
-    def test_cuda_allreduce_1024(self):
-        self.do_test("cuda", "allreduce", 1024)
-
-    # cuda + broadcast
-    def test_cuda_broadcast_1024(self):
-        self.do_test("cuda", "broadcast", 1024)
-
 
 if __name__ == "__main__":
     devices = ['cpu', 'cuda']
