@@ -125,6 +125,7 @@ jobs:
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
