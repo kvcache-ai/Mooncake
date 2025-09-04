@@ -32,11 +32,11 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
     start = time.perf_counter()
     for _ in range(num_iterations):
         if collective == 'broadcast':
-            dist.broadcast(tensor, src=0)
+            dist.broadcast(tensor, src=0, async_op=(backend == "gloo"))
         elif collective == 'allreduce':
-            dist.all_reduce(tensor)
+            dist.all_reduce(tensor, async_op=(backend == "gloo"))
         elif collective == 'allgather':
-            dist.all_gather(gathered, tensor)
+            dist.all_gather(gathered, tensor, async_op=(backend == "gloo"))
 
     torch.cuda.synchronize()
 
