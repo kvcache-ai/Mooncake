@@ -67,7 +67,7 @@ struct MooncakeEpBuffer {
 
     // MXA Buffer
     int buffer_idx{};
-    int64_t num_mxa_bytes;
+    int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
     // IBGDA
@@ -89,7 +89,7 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
-    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_mxa_bytes,
+    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
                      int nic_id);
 
     ~MooncakeEpBuffer() noexcept(false);
@@ -155,8 +155,9 @@ struct MooncakeEpBuffer {
     }
 };
 
-inline size_t get_mxa_size_hint(int num_max_dispatch_tokens_per_rank,
-                                int hidden, int num_ranks, int num_experts) {
+inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
+                                      int hidden, int num_ranks,
+                                      int num_experts) {
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts)
         .total_bytes;

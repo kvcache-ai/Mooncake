@@ -20,7 +20,7 @@ The API is largely consistent with DeepEP's, with only minor differences in a fe
 
 ```python
 @staticmethod
-def get_mxa_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int
+def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int
 ```
 
 Calculates the number of bytes to pre-allocate for data transfer.
@@ -30,13 +30,13 @@ Calculates the number of bytes to pre-allocate for data transfer.
 **Signature:**
 
 ```python
-def __init__(self, group: dist.ProcessGroup, num_mxa_bytes: int = 0)
+def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0)
 ```
 
 The constructor. Ensure that only one instance is created.
 
 - **group**: Must be a Mooncake Backend process group.
-- **num_mxa_bytes**: The number of bytes acquired with `Buffer.get_buffer_size_hint()`
+- **num_ep_buffer_bytes**: The number of bytes acquired with `Buffer.get_buffer_size_hint()`
 
 #### Buffer.dispatch/Buffer.combine
 

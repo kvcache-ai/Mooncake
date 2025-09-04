@@ -63,18 +63,18 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_mxa_bytes: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
-        self.num_mxa_bytes = num_mxa_bytes
+        self.num_ep_buffer_bytes = num_ep_buffer_bytes
 
         # Get the index of the closest NIC
         backend = self.group._get_backend(torch.device('cuda'))
         preferred_hca = ep.get_preferred_hca(backend, f'cuda:{torch.cuda.current_device()}')
         nic_id = int(preferred_hca.split('_')[1])
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_mxa_bytes, nic_id)
+        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, nic_id)
 
         (raddr, rkey) = self.runtime.get_mr_info()
 
@@ -121,8 +121,8 @@ class Buffer:
             self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
     @staticmethod
-    def get_mxa_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
-        return ep.get_mxa_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+    def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+        return ep.get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, broken_ranks: torch.Tensor,

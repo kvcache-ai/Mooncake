@@ -67,7 +67,7 @@ PYBIND11_MODULE(ep, m) {
                c10d::Backend::Options>(m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("broken_ranks"));
 
-    m.def("get_mxa_size_hint", &get_mxa_size_hint);
+    m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<>())

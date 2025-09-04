@@ -3,17 +3,17 @@
 namespace mooncake {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
-                                   int64_t num_mxa_bytes, int nic_id)
+                                   int64_t num_ep_buffer_bytes, int nic_id)
     : rank(rank),
       num_ranks(num_ranks),
-      num_mxa_bytes(num_mxa_bytes),
+      num_ep_buffer_bytes(num_ep_buffer_bytes),
       nic_id(nic_id),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
-    CUDA_CHECK(cudaMalloc(&gdr_buffer, num_mxa_bytes));
+    CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
     CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
@@ -62,7 +62,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes);
+    EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
@@ -191,7 +191,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_mxa_bytes);
+    EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
@@ -305,7 +305,7 @@ void MooncakeEpBuffer::init_ibgda() {
     if (mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_PD)) {
         perror("Failed to initialize mlx5dv object");
     }
-    mr = ibv_reg_mr(pd, gdr_buffer, num_mxa_bytes,
+    mr = ibv_reg_mr(pd, gdr_buffer, num_ep_buffer_bytes,
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
     if (!mr) {
