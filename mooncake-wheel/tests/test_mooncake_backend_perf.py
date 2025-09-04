@@ -15,12 +15,16 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
     # Create a tensor for the collective operation
     tensor = torch.rand(data_size, device=device)
 
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+
     # Warm up
     for _ in range(num_iterations):
         if collective == 'broadcast':
             dist.broadcast(tensor, src=0)
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
+        elif collective == 'allgather':
+            dist.all_gather(gathered, tensor)
 
     # Synchronize before starting the test
     torch.cuda.synchronize()
@@ -31,6 +35,8 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
             dist.broadcast(tensor, src=0)
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
+        elif collective == 'allgather':
+            dist.all_gather(gathered, tensor)
 
     torch.cuda.synchronize()
 
@@ -72,6 +78,10 @@ class TestMooncakeBackendPerf(unittest.TestCase):
         self.assertLessEqual(mooncake_latency, 10 * baseline_latency,
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
+    # cpu + allgather
+    def test_cpu_allgather_1024(self):
+        self.do_test("cpu", "allgather", 1024)
+
     # cpu + allreduce
     def test_cpu_allreduce_1024(self):
         self.do_test("cpu", "allreduce", 1024)
@@ -79,6 +89,10 @@ class TestMooncakeBackendPerf(unittest.TestCase):
     # cpu + broadcast
     def test_cpu_broadcast_1024(self):
         self.do_test("cpu", "broadcast", 1024)
+
+    # cuda + allgather
+    def test_cuda_allgather_1024(self):
+        self.do_test("cuda", "allgather", 1024)
 
     # cuda + allreduce
     def test_cuda_allreduce_1024(self):
