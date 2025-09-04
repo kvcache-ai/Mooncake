@@ -650,45 +650,53 @@ void bind_coro_rpc_interface(py::module_ &m);
 // Implementation of coro_rpc_interface binding function
 void bind_coro_rpc_interface(py::module_ &m) {
     using namespace mooncake;
-    
+
     py::class_<CoroRPCInterface::ReceivedData>(m, "ReceivedData")
         .def(py::init<>())
-        .def_readonly("source_address", &CoroRPCInterface::ReceivedData::source_address)
+        .def_readonly("source_address",
+                      &CoroRPCInterface::ReceivedData::source_address)
         .def_readonly("data_size", &CoroRPCInterface::ReceivedData::data_size)
         .def("get_bytes", &CoroRPCInterface::ReceivedData::getBytes);
-    
+
     py::class_<CoroRPCInterface::ReceivedTensor>(m, "ReceivedTensor")
         .def(py::init<>())
-        .def_readonly("source_address", &CoroRPCInterface::ReceivedTensor::source_address)
+        .def_readonly("source_address",
+                      &CoroRPCInterface::ReceivedTensor::source_address)
         .def_readonly("shape", &CoroRPCInterface::ReceivedTensor::shape)
         .def_readonly("dtype", &CoroRPCInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes", &CoroRPCInterface::ReceivedTensor::total_bytes)
+        .def_readonly("total_bytes",
+                      &CoroRPCInterface::ReceivedTensor::total_bytes)
         .def("get_data_size", &CoroRPCInterface::ReceivedTensor::getDataSize)
-        .def("get_data_as_bytes", &CoroRPCInterface::ReceivedTensor::getDataAsBytes)
-        .def("rebuild_tensor", &CoroRPCInterface::ReceivedTensor::rebuildTensor);
-    
+        .def("get_data_as_bytes",
+             &CoroRPCInterface::ReceivedTensor::getDataAsBytes)
+        .def("rebuild_tensor",
+             &CoroRPCInterface::ReceivedTensor::rebuildTensor);
+
     py::class_<CoroRPCInterface>(m, "CoroRPCInterface")
         .def(py::init<>())
         .def("initialize", &CoroRPCInterface::initialize,
-             "listen_address"_a="", "thread_count"_a=0, 
-             "timeout_seconds"_a=30, "pool_size"_a=10)
+             "listen_address"_a = "", "thread_count"_a = 0,
+             "timeout_seconds"_a = 30, "pool_size"_a = 10)
         .def("start_server", &CoroRPCInterface::startServer)
         .def("start_server_async", &CoroRPCInterface::startServerAsync)
         .def("stop_server", &CoroRPCInterface::stopServer)
         .def("add_remote_connection", &CoroRPCInterface::addRemoteConnection)
-        .def("remove_remote_connection", &CoroRPCInterface::removeRemoteConnection)
+        .def("remove_remote_connection",
+             &CoroRPCInterface::removeRemoteConnection)
         .def("is_connected", &CoroRPCInterface::isConnected)
         .def("send_data", &CoroRPCInterface::sendData)
         .def("send_data_async", &CoroRPCInterface::sendDataAsync)
         .def("send_tensor", &CoroRPCInterface::sendTensor)
         .def("send_tensor_async", &CoroRPCInterface::sendTensorAsync)
-        .def("set_data_receive_callback", &CoroRPCInterface::setDataReceiveCallback)
-        .def("set_tensor_receive_callback", &CoroRPCInterface::setTensorReceiveCallback);
-    
-    m.def("create_rpc_client", &createRPCClient, 
-          "pool_size"_a=10, "timeout_seconds"_a=30);
-    m.def("create_rpc_server", &createRPCServer,
-          "listen_address"_a, "thread_count"_a=0);
+        .def("set_data_receive_callback",
+             &CoroRPCInterface::setDataReceiveCallback)
+        .def("set_tensor_receive_callback",
+             &CoroRPCInterface::setTensorReceiveCallback);
+
+    m.def("create_rpc_client", &createRPCClient, "pool_size"_a = 10,
+          "timeout_seconds"_a = 30);
+    m.def("create_rpc_server", &createRPCServer, "listen_address"_a,
+          "thread_count"_a = 0);
 }
 
 PYBIND11_MODULE(engine, m) {
@@ -742,6 +750,7 @@ PYBIND11_MODULE(engine, m) {
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
     // Add coro_rpc_interface as a submodule
-    auto coro_rpc_submodule = m.def_submodule("coro_rpc_interface", "CoroRPC interface for communication");
+    auto coro_rpc_submodule = m.def_submodule(
+        "coro_rpc_interface", "CoroRPC interface for communication");
     bind_coro_rpc_interface(coro_rpc_submodule);
 }

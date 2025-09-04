@@ -213,8 +213,6 @@ void CoroRPCInterface::stopServer() {
     }
 }
 
-
-
 int CoroRPCInterface::sendData(const std::string& target_address,
                                pybind11::bytes data) {
     if (!impl_->communicator) return -1;
