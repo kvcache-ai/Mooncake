@@ -5,6 +5,7 @@ import mooncake.ep
 import time
 import unittest
 import torch.multiprocessing as mp
+from functools import partial
 
 
 def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=100):
