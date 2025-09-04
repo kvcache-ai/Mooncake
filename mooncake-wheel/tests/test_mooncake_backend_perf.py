@@ -5,7 +5,6 @@ import mooncake.ep
 import time
 import unittest
 import torch.multiprocessing as mp
-from functools import partial
 
 
 def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=100):
@@ -16,12 +15,16 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
     # Create a tensor for the collective operation
     tensor = torch.rand(data_size, device=device)
 
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+
     # Warm up
     for _ in range(num_iterations):
         if collective == 'broadcast':
             dist.broadcast(tensor, src=0)
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
+        elif collective == 'allgather':
+            dist.all_gather(gathered, tensor)
 
     # Synchronize before starting the test
     torch.cuda.synchronize()
@@ -32,6 +35,8 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
             dist.broadcast(tensor, src=0)
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
+        elif collective == 'allgather':
+            dist.all_gather(gathered, tensor)
 
     torch.cuda.synchronize()
 
@@ -77,7 +82,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
 if __name__ == "__main__":
     devices = ['cpu', 'cuda']
-    collectives = ['broadcast', 'allreduce']
+    collectives = ['broadcast', 'allreduce', 'allgather']
     data_sizes = [2**i for i in range(10, 21, 10)]
 
     def generate_test(device, collective, data_size):
