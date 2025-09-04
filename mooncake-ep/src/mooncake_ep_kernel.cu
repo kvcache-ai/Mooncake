@@ -152,7 +152,7 @@ template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-         int* packed_recv_count, int32_t* broken_nodes,
+         int* packed_recv_count, int32_t* broken_ranks,
          void* mxa_buffer,
          int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -396,9 +396,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             unsigned long long start_time = clock64();
             while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
-                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_nodes[src_rank]) {
+                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_ranks[src_rank]) {
                     num_recv_tokens = -1;
-                    broken_nodes[src_rank] = 1;
+                    broken_ranks[src_rank] = 1;
                     break;
                 }
             }
@@ -443,7 +443,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-              int* packed_recv_count, int32_t* broken_nodes,
+              int* packed_recv_count, int32_t* broken_ranks,
               void* mxa_buffer,
               int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -474,7 +474,7 @@ auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup,
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
-              packed_recv_count, broken_nodes, \
+              packed_recv_count, broken_ranks, \
               mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
@@ -493,7 +493,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
-combine(void* combined_x, int32_t* broken_nodes,
+combine(void* combined_x, int32_t* broken_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -628,8 +628,8 @@ combine(void* combined_x, int32_t* broken_nodes,
             unsigned long long start_time = clock64();
             while (ld_acquire_sys_global(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();
-                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_nodes[src_rank]) {
-                    broken_nodes[src_rank] = 1;
+                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_ranks[src_rank]) {
+                    broken_ranks[src_rank] = 1;
                     break;
                 }
             }
@@ -677,7 +677,7 @@ combine(void* combined_x, int32_t* broken_nodes,
     }
 }
 
-void combine(void* combined_x, int32_t* broken_nodes,
+void combine(void* combined_x, int32_t* broken_ranks,
              void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -705,7 +705,7 @@ void combine(void* combined_x, int32_t* broken_nodes,
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, \
-              combined_x, broken_nodes, \
+              combined_x, broken_ranks, \
               mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
