@@ -65,6 +65,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
         # After all processes have completed, check the results
         mooncake_latency = max(mooncake_results[r] for r in mooncake_results)
         baseline_latency = max(baseline_results[r] for r in baseline_results)
+        print(f"test_{device}_{collective}_{data_size}: {mooncake_latency * 1e6} v.s. {baseline_latency * 1e6}")
         self.assertLessEqual(mooncake_latency, 10 * baseline_latency,
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
