@@ -179,35 +179,32 @@ void CoroRPCInterface::stopServer() {
 }
 
 bool CoroRPCInterface::addRemoteConnection(const std::string& remote_address) {
-    if (!impl_->communicator) return false;
-    return impl_->communicator->addRemoteConnection(remote_address);
+    // client_pools 自动管理连接，不需要手动添加
+    std::cout << "Remote connection for " << remote_address << " will be managed automatically" << std::endl;
+    return true;
 }
 
 void CoroRPCInterface::removeRemoteConnection(const std::string& remote_address) {
-    if (impl_->communicator) {
-        impl_->communicator->removeRemoteConnection(remote_address);
-    }
+    // client_pools 自动管理连接，不需要手动移除
+    std::cout << "Remote connection for " << remote_address << " is managed automatically" << std::endl;
 }
 
 bool CoroRPCInterface::isConnected(const std::string& remote_address) {
-    if (!impl_->communicator) return false;
-    return impl_->communicator->isConnected(remote_address);
+    // client_pools 会自动建立连接，总是返回 true
+    return true;
 }
 
 int CoroRPCInterface::sendData(const std::string& target_address, pybind11::bytes data) {
     if (!impl_->communicator) return -1;
     
-    std::string data_str;
-    {
-        pybind11::gil_scoped_acquire acquire;
-        data_str = data;
-    }
-
+    pybind11::gil_scoped_acquire acquire;
+    
+    std::string_view data_view = data;
     pybind11::gil_scoped_release release;
-    return impl_->communicator->sendData(target_address, data_str.data(), data_str.size());
+    return impl_->communicator->sendData(target_address, data_view.data(), data_view.size());
 }
 
-pybind11::object CoroRPCInterface::sendDataAsync(const std::string& target_address, 
+pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address, 
                                                   pybind11::bytes data, 
                                                   pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
@@ -222,30 +219,48 @@ pybind11::object CoroRPCInterface::sendDataAsync(const std::string& target_addre
     }
 
     auto communicator = impl_->communicator.get();
-    auto target_addr = std::make_shared<std::string>(target_address);
-    auto data_holder = std::make_shared<std::string>(data);
+    auto target_addr = std::move(target_address);
+    
+    std::string data_str = data;
+    
     auto future_ptr = std::make_shared<pybind11::object>(future_obj);
-    auto loop_ptr = std::make_shared<pybind11::object>(pybind11::reinterpret_borrow<pybind11::object>(loop));
+    pybind11::object loop_obj = pybind11::reinterpret_borrow<pybind11::object>(loop);
 
-    auto task_func = std::make_shared<std::function<void()>>(
-        [communicator, target_addr, data_holder, future_ptr, loop_ptr]() {
-        int result = communicator->sendData(*target_addr, data_holder->data(), data_holder->size());
-        
-        auto call_soon_threadsafe = [future_ptr, loop_ptr, result]() {
-            pybind11::gil_scoped_acquire acquire;
-            if (result >= 0) {
-                future_ptr->attr("set_result")(result);
-            } else {
+    auto coro_lambda = [communicator, target_addr, data_str, future_ptr, loop_obj]() -> async_simple::coro::Lazy<void> {
+        try {
+            auto result_struct = co_await communicator->sendDataAsync(target_addr, data_str.data(), data_str.size());
+            int result = result_struct.code;
+
+            auto call_soon_threadsafe = [future_ptr, loop_obj, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                if (result >= 0) {
+                    future_ptr->attr("set_result")(result);
+                } else {
+                    future_ptr->attr("set_exception")(pybind11::make_tuple(
+                        pybind11::str("Send data failed")));
+                }
+            };
+
+            auto callback = pybind11::cpp_function(call_soon_threadsafe);
+            loop_obj.attr("call_soon_threadsafe")(callback);
+        } catch (const std::exception& e) {
+            auto call_soon_threadsafe = [future_ptr, loop_obj, e]() {
+                pybind11::gil_scoped_acquire acquire;
                 future_ptr->attr("set_exception")(pybind11::make_tuple(
-                    pybind11::str("Send data failed")));
-            }
-        };
+                    pybind11::str(std::string("Send data error: ") + e.what())));
+            };
 
-        auto callback = pybind11::cpp_function(call_soon_threadsafe);
-        loop_ptr->attr("call_soon_threadsafe")(callback);
+            auto callback = pybind11::cpp_function(call_soon_threadsafe);
+            loop_obj.attr("call_soon_threadsafe")(callback);
+        }
+    };
+
+    auto lazy = coro_lambda();
+    lazy.start([](auto &&result) {
+       if (result.hasError()) {
+            std::cerr << "Coroutine completed with error" << std::endl;
+        }
     });
-
-    std::thread([task_func]() { (*task_func)(); }).detach();
     
     return future_obj;
 }
@@ -254,13 +269,11 @@ int CoroRPCInterface::sendTensor(const std::string& target_address, pybind11::ha
     if (!impl_->communicator) return -1;
     
     try {
-        pybind11::object tensor_obj;
-        TensorMetadata metadata = {};
-        std::vector<char> combined_data;
+        TensorInfo tensor_info;
         
         {
             pybind11::gil_scoped_acquire acquire;
-            tensor_obj = pybind11::reinterpret_borrow<pybind11::object>(tensor);
+            pybind11::object tensor_obj = pybind11::reinterpret_borrow<pybind11::object>(tensor);
             
             // Validate tensor type
             if (!(tensor_obj.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
@@ -268,60 +281,42 @@ int CoroRPCInterface::sendTensor(const std::string& target_address, pybind11::ha
                 return -1;
             }
             
-            // Extract tensor properties
+            // Extract tensor properties - zero copy, just get pointers and metadata
             uintptr_t data_ptr = tensor_obj.attr("data_ptr")().cast<uintptr_t>();
             size_t numel = tensor_obj.attr("numel")().cast<size_t>();
             size_t element_size = tensor_obj.attr("element_size")().cast<size_t>();
             size_t tensor_size = numel * element_size;
             
-            // Get tensor dtype
-            pybind11::object dtype_obj = tensor_obj.attr("dtype");
-            TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-            if (dtype_enum == TensorDtype::UNKNOWN) {
-                std::cerr << "Unsupported tensor dtype" << std::endl;
-                return -1;
-            }
-            
             // Get tensor shape
             pybind11::object shape_obj = tensor_obj.attr("shape");
             pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
-            int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-            if (ndim > 4) {
-                std::cerr << "Tensor has too many dimensions (max 4 supported)" << std::endl;
-                return -1;
+            std::vector<size_t> shape;
+            for (size_t i = 0; i < shape_tuple.size(); i++) {
+                shape.push_back(shape_tuple[i].cast<size_t>());
             }
             
-            // Fill metadata
-            metadata.dtype = static_cast<int32_t>(dtype_enum);
-            metadata.ndim = ndim;
-            for (int i = 0; i < 4; i++) {
-                if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<int64_t>();
-                } else {
-                    metadata.shape[i] = 0;
-                }
-            }
+            // Get tensor dtype string
+            pybind11::object dtype_obj = tensor_obj.attr("dtype");
+            std::string dtype = dtype_obj.attr("__str__")().cast<std::string>();
             
-            // Create combined data: metadata + tensor data
-            combined_data.resize(sizeof(TensorMetadata) + tensor_size);
-            
-            // Copy metadata
-            std::memcpy(combined_data.data(), &metadata, sizeof(TensorMetadata));
-            
-            // Copy tensor data
-            const char* tensor_data = reinterpret_cast<const char*>(data_ptr);
-            std::memcpy(combined_data.data() + sizeof(TensorMetadata), tensor_data, tensor_size);
+            // Fill TensorInfo structure (no data copying, just metadata)
+            tensor_info.data_ptr = reinterpret_cast<void*>(data_ptr);
+            tensor_info.total_bytes = tensor_size;
+            tensor_info.shape = std::move(shape);
+            tensor_info.dtype = std::move(dtype);
             
             std::cout << "Sending tensor with shape: [";
-            for (int i = 0; i < ndim; i++) {
-                std::cout << metadata.shape[i];
-                if (i < ndim - 1) std::cout << ", ";
+            for (size_t i = 0; i < tensor_info.shape.size(); i++) {
+                std::cout << tensor_info.shape[i];
+                if (i < tensor_info.shape.size() - 1) std::cout << ", ";
             }
-            std::cout << "] and dtype: " << metadata.dtype << ", total size: " << combined_data.size() << " bytes" << std::endl;
+            std::cout << "] and dtype: " << tensor_info.dtype << ", tensor size: " << tensor_info.total_bytes << " bytes" << std::endl;
         }
 
+        // Use the async version which supports zero-copy via attachments
         pybind11::gil_scoped_release release;
-        return impl_->communicator->sendData(target_address, combined_data.data(), combined_data.size());
+        auto result = async_simple::coro::syncAwait(impl_->communicator->sendTensorAsync(target_address, tensor_info));
+        return result;
         
     } catch (const std::exception& e) {
         std::cerr << "Send tensor error: " << e.what() << std::endl;
@@ -329,7 +324,7 @@ int CoroRPCInterface::sendTensor(const std::string& target_address, pybind11::ha
     }
 }
 
-pybind11::object CoroRPCInterface::sendTensorAsync(const std::string& target_address, 
+pybind11::object CoroRPCInterface::sendTensorAsync(std::string& target_address, 
                                                     pybind11::handle tensor, 
                                                     pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
@@ -344,7 +339,7 @@ pybind11::object CoroRPCInterface::sendTensorAsync(const std::string& target_add
     }
 
     auto communicator = impl_->communicator.get();
-    auto target_addr = std::make_shared<std::string>(target_address);
+    std::string target_addr = std::move(target_address);
     
     // Extract tensor info
     pybind11::object tensor_obj = pybind11::reinterpret_borrow<pybind11::object>(tensor);
@@ -364,35 +359,56 @@ pybind11::object CoroRPCInterface::sendTensorAsync(const std::string& target_add
     pybind11::object dtype_obj = tensor_obj.attr("dtype");
     std::string dtype = dtype_obj.attr("__str__")().cast<std::string>();
     
-    auto tensor_info = std::make_shared<TensorInfo>();
-    tensor_info->data_ptr = reinterpret_cast<void*>(data_ptr);
-    tensor_info->total_bytes = tensor_size;
-    tensor_info->shape = shape;
-    tensor_info->dtype = dtype;
+    // Create TensorInfo on stack (no need for shared_ptr)
+    TensorInfo tensor_info;
+    tensor_info.data_ptr = reinterpret_cast<void*>(data_ptr);
+    tensor_info.total_bytes = tensor_size;
+    tensor_info.shape = std::move(shape);
+    tensor_info.dtype = std::move(dtype);
     
     auto future_ptr = std::make_shared<pybind11::object>(future_obj);
-    auto loop_ptr = std::make_shared<pybind11::object>(pybind11::reinterpret_borrow<pybind11::object>(loop));
+    pybind11::object loop_obj = pybind11::reinterpret_borrow<pybind11::object>(loop);
 
-    auto task_func = std::make_shared<std::function<void()>>(
-        [communicator, target_addr, tensor_info, future_ptr, loop_ptr]() {
-        auto lazy_result = communicator->sendTensorAsync(*target_addr, *tensor_info);
-        int result = async_simple::coro::syncAwait(lazy_result);
-        
-        auto call_soon_threadsafe = [future_ptr, loop_ptr, result]() {
-            pybind11::gil_scoped_acquire acquire;
-            if (result >= 0) {
-                future_ptr->attr("set_result")(result);
-            } else {
+    // Schedule coroutine to run asynchronously
+    auto coro_lambda = [communicator, target_addr, tensor_info, future_ptr, loop_obj]() -> async_simple::coro::Lazy<void> {
+        try {
+            // Call the async version which returns a coroutine
+            auto result = co_await communicator->sendTensorAsync(target_addr, tensor_info);
+
+            auto call_soon_threadsafe = [future_ptr, loop_obj, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                if (result >= 0) {
+                    future_ptr->attr("set_result")(result);
+                } else {
+                    future_ptr->attr("set_exception")(pybind11::make_tuple(
+                        pybind11::str("Send tensor failed")));
+                }
+            };
+
+            auto callback = pybind11::cpp_function(call_soon_threadsafe);
+            loop_obj.attr("call_soon_threadsafe")(callback);
+        } catch (const std::exception& e) {
+            auto call_soon_threadsafe = [future_ptr, loop_obj, e]() {
+                pybind11::gil_scoped_acquire acquire;
                 future_ptr->attr("set_exception")(pybind11::make_tuple(
-                    pybind11::str("Send tensor failed")));
-            }
-        };
+                    pybind11::str(std::string("Send tensor error: ") + e.what())));
+            };
 
-        auto callback = pybind11::cpp_function(call_soon_threadsafe);
-        loop_ptr->attr("call_soon_threadsafe")(callback);
+            auto callback = pybind11::cpp_function(call_soon_threadsafe);
+            loop_obj.attr("call_soon_threadsafe")(callback);
+        }
+    };
+
+    // Start the coroutine in a detached manner (fire and forget)
+    auto lazy = coro_lambda();
+    lazy.start([](auto &&result) {
+        // This callback will be called when the coroutine completes
+        // We don't need to do anything here since the result is handled in the coroutine itself
+        if (result.hasError()) {
+            // Log error if needed
+            std::cerr << "Tensor coroutine completed with error" << std::endl;
+        }
     });
-
-    std::thread([task_func]() { (*task_func)(); }).detach();
     
     return future_obj;
 }

@@ -62,12 +62,12 @@ public:
     bool isConnected(const std::string& remote_address);
 
     int sendData(const std::string& target_address, pybind11::bytes data);
-    pybind11::object sendDataAsync(const std::string& target_address,
+    pybind11::object sendDataAsync(std::string& target_address,
                                    pybind11::bytes data,
                                    pybind11::handle loop);
 
     int sendTensor(const std::string& target_address, pybind11::handle tensor);
-    pybind11::object sendTensorAsync(const std::string& target_address,
+    pybind11::object sendTensorAsync(std::string& target_address,
                                      pybind11::handle tensor,
                                      pybind11::handle loop);
 

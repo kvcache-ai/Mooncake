@@ -10,6 +10,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
@@ -47,7 +48,6 @@ public:
         bool is_server_started = false;
         
         std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-        std::unordered_map<std::string, std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>> client_pools_;
         
         std::function<void(const std::string&, const std::string&)> data_receive_callback;
         
@@ -65,10 +65,6 @@ public:
     bool startServerAsync();
     void stopServer();
     
-    bool addRemoteConnection(const std::string& remote_address);
-    void removeRemoteConnection(const std::string& remote_address);
-    bool isConnected(const std::string& remote_address);
-    
     int sendData(const std::string& target_address, const void* data, size_t data_size);
     async_simple::coro::Lazy<result> sendDataAsync(const std::string& target_address, const void* data, size_t data_size);
     
@@ -83,6 +79,7 @@ public:
     std::shared_ptr<Impl> getImpl() { return impl_; }
 
 private:
+    coro_io::client_pools<coro_rpc::coro_rpc_client> client_pools_;
     std::shared_ptr<Impl> impl_;
 };
 

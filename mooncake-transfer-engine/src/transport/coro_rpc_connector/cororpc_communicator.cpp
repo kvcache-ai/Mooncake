@@ -5,11 +5,15 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#include <ylt/coro_io/coro_io.hpp>
 #include "async_simple/coro/SyncAwait.h"
 
 namespace mooncake {
 
-CoroRPCCommunicator::CoroRPCCommunicator() : impl_(std::make_shared<Impl>()) {}
+CoroRPCCommunicator::CoroRPCCommunicator() 
+    : impl_(std::make_shared<Impl>()) {
+    // 可以设置默认的 pool_config 如果需要的话
+}
 
 CoroRPCCommunicator::~CoroRPCCommunicator() {
     stopServer();
@@ -86,53 +90,6 @@ void CoroRPCCommunicator::stopServer() {
     }
 }
 
-bool CoroRPCCommunicator::addRemoteConnection(const std::string& remote_address) {
-    try {
-        // Check if client pool already exists for this address
-        auto it = impl_->client_pools_.find(remote_address);
-        if (it != impl_->client_pools_.end()) {
-            std::cout << "Client pool for " << remote_address << " already exists" << std::endl;
-            return true;
-        }
-        
-        // Create new client pool for this remote address
-        auto client_pool = coro_io::client_pool<coro_rpc::coro_rpc_client>::create(remote_address);
-        
-        if (!client_pool) {
-            std::cerr << "Failed to create client pool for " << remote_address << std::endl;
-            return false;
-        }
-        
-        impl_->client_pools_[remote_address] = client_pool;
-        std::cout << "Successfully created client pool for " << remote_address 
-                  << " with pool size: " << impl_->config.pool_size << std::endl;
-        return true;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Exception while creating client pool for " << remote_address << ": " << e.what() << std::endl;
-        return false;
-    }
-}
-
-void CoroRPCCommunicator::removeRemoteConnection(const std::string& remote_address) {
-    auto it = impl_->client_pools_.find(remote_address);
-    if (it != impl_->client_pools_.end()) {
-        impl_->client_pools_.erase(it);
-        std::cout << "Removed client pool for " << remote_address << std::endl;
-    } else {
-        std::cout << "No client pool found for " << remote_address << std::endl;
-    }
-}
-
-bool CoroRPCCommunicator::isConnected(const std::string& remote_address) {
-    auto it = impl_->client_pools_.find(remote_address);
-    if (it != impl_->client_pools_.end()) {
-        // Client pool exists, assume it can provide connections
-        return true;
-    }
-    return false;
-}
-
 int CoroRPCCommunicator::sendData(const std::string& target_address,
                                   const void* data,
                                   size_t data_size) {
@@ -143,41 +100,31 @@ int CoroRPCCommunicator::sendData(const std::string& target_address,
 async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(const std::string& target_address,
                                                        const void* data,
                                                        size_t data_size) {
-    // Ensure client pool exists for this target
-    if (impl_->client_pools_.find(target_address) == impl_->client_pools_.end()) {
-        if (!addRemoteConnection(target_address)) {
-            result res;
-            res.code = -1;
-            res.err_msg = "Failed to create client pool for " + target_address;
-            co_return res;
-        }
-    }
-    
-    auto& client_pool = impl_->client_pools_[target_address];
-    
-    auto promise = std::make_shared<std::promise<result>>();
-    auto future = promise->get_future();
-    
-    client_pool->send_request(
-        [data, data_size, promise](coro_rpc::coro_rpc_client &client) 
-            -> async_simple::coro::Lazy<void> {
-            
-            std::string_view data_view(static_cast<const char*>(data), data_size);
-            auto rpc_result = co_await client.call<&CoroRPCCommunicator::Impl::handleDataTransfer>(data_view);
-            
-            result res;
-            if (rpc_result.has_value()) {
-                res.code = 0;
-            } else {
-                res.code = rpc_result.error().val();
-                res.err_msg = rpc_result.error().msg;
+    try {
+        std::string_view data_view(static_cast<const char*>(data), data_size);
+        
+        auto rpc_result = co_await client_pools_.send_request(
+            target_address,
+            [data_view](coro_rpc::coro_rpc_client &client) 
+                -> async_simple::coro::Lazy<void> {
+                auto result = co_await client.call<&CoroRPCCommunicator::Impl::handleDataTransfer>(data_view);
+                if (!result.has_value()) {
+                    std::cerr << "RPC call failed: " << result.error().msg << std::endl;
+                }
             }
-            
-            promise->set_value(res);
-        }
-    ).start([](auto &&) {});
-    
-    co_return future.get();
+        );
+        
+        result res;
+        res.code = 0;
+        co_return res;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in sendDataAsync: " << e.what() << std::endl;
+        result res;
+        res.code = -1;
+        res.err_msg = e.what();
+        co_return res;
+    }
 }
 
 int CoroRPCCommunicator::sendTensor(const std::string& target_address, const pybind11::object& tensor) {
@@ -189,36 +136,28 @@ int CoroRPCCommunicator::sendTensor(const std::string& target_address, const pyb
 }
 
 async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(const std::string& target_address, const TensorInfo& tensor) {
-    // Ensure client pool exists for this target
-    if (impl_->client_pools_.find(target_address) == impl_->client_pools_.end()) {
-        if (!addRemoteConnection(target_address)) {
-            co_return -1;
-        }
-    }
-    
-    auto& client_pool = impl_->client_pools_[target_address];
-    
-    auto promise = std::make_shared<std::promise<int>>();
-    auto future = promise->get_future();
-    
-    client_pool->send_request(
-        [tensor, promise](coro_rpc::coro_rpc_client &client) 
-            -> async_simple::coro::Lazy<void> {
-            
-            client.set_req_attachment(std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
-            
-            auto result = co_await client.call<&CoroRPCCommunicator::Impl::handleTensorTransfer>();
-            
-            if (result.has_value()) {
-                promise->set_value(0);
-            } else {
-                std::cerr << "Async tensor RPC call failed: " << result.error().msg << std::endl;
-                promise->set_value(-1);
+    try {
+        auto rpc_result = co_await client_pools_.send_request(
+            target_address,
+            [&tensor](coro_rpc::coro_rpc_client &client) 
+                -> async_simple::coro::Lazy<void> {
+                
+                client.set_req_attachment(std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
+                
+                auto result = co_await client.call<&CoroRPCCommunicator::Impl::handleTensorTransfer>();
+                
+                if (!result.has_value()) {
+                    std::cerr << "Tensor RPC call failed: " << result.error().msg << std::endl;
+                }
             }
-        }
-    ).start([](auto &&) {});
-    
-    co_return future.get();
+        );
+        
+        co_return 0;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in sendTensorAsync: " << e.what() << std::endl;
+        co_return -1;
+    }
 }
 
 int CoroRPCCommunicator::receiveData(const std::string& source_address, void* buffer, size_t buffer_size, int timeout_ms) {
