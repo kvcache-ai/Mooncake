@@ -33,6 +33,8 @@ def run_latency_test(rank, world_size, backend, device, collective, data_size, r
         elif collective == 'allreduce':
             dist.all_reduce(tensor)
 
+    torch.cuda.synchronize()
+
     end = time.perf_counter()
 
     # Calculate average time
@@ -74,7 +76,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    devices = ['cuda']
+    devices = ['cpu', 'cuda']
     collectives = ['broadcast', 'allreduce']
     data_sizes = [2**i for i in range(10, 21, 10)]
 
