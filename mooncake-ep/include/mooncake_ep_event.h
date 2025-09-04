@@ -39,7 +39,8 @@ inline void stream_wait(const at::cuda::CUDAStream& s_0,
     s_0.unwrap().wait(create_event(s_1));
 }
 
-inline void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
+inline void stream_wait(const at::cuda::CUDAStream& s,
+                        const EventHandle& event) {
     s.unwrap().wait(*event.event);
 }
 
