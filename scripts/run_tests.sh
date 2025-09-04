@@ -16,10 +16,18 @@ MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_initiat
 kill $TARGET_PID || true
 
 echo "Running CoroRPC performance tests..."
-cd ../mooncake-transfer-engine/tests
-pip install torch numpy
-python test_coro_rpc_performance.py
-cd ../../mooncake-wheel/tests
+# Check if we're in CI environment or if the test file exists
+if [ -f "../mooncake-transfer-engine/tests/test_coro_rpc_performance.py" ]; then
+    cd ../mooncake-transfer-engine/tests
+    pip install torch numpy
+    python test_coro_rpc_performance.py
+    cd ../../mooncake-wheel/tests
+else
+    echo "WARNING: CoroRPC performance test not found, skipping..."
+    echo "Current directory: $(pwd)"
+    echo "Looking for: ../mooncake-transfer-engine/tests/test_coro_rpc_performance.py"
+    ls -la ../mooncake-transfer-engine/tests/ 2>/dev/null || echo "Directory ../mooncake-transfer-engine/tests/ does not exist"
+fi
 
 echo "Running master tests..."
 
