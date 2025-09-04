@@ -680,10 +680,6 @@ void bind_coro_rpc_interface(py::module_ &m) {
         .def("start_server", &CoroRPCInterface::startServer)
         .def("start_server_async", &CoroRPCInterface::startServerAsync)
         .def("stop_server", &CoroRPCInterface::stopServer)
-        .def("add_remote_connection", &CoroRPCInterface::addRemoteConnection)
-        .def("remove_remote_connection",
-             &CoroRPCInterface::removeRemoteConnection)
-        .def("is_connected", &CoroRPCInterface::isConnected)
         .def("send_data", &CoroRPCInterface::sendData)
         .def("send_data_async", &CoroRPCInterface::sendDataAsync)
         .def("send_tensor", &CoroRPCInterface::sendTensor)
