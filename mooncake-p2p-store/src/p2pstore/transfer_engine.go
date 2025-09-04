@@ -58,7 +58,11 @@ func (engine *TransferEngine) installTransport(protocol string, topologyMatrix s
 	defer C.free(unsafe.Pointer(protocolCStr))
 	defer C.free(unsafe.Pointer(topologyMatrixCStr))
 	var args [2]unsafe.Pointer
-	args[0] = unsafe.Pointer(topologyMatrixCStr)
+	if len(topologyMatrix) == 0 {
+		args[0] = nil
+	} else {
+		args[0] = unsafe.Pointer(topologyMatrixCStr)
+	}
 	args[1] = nil
 	xport := C.installTransport(engine.engine, protocolCStr, &args[0])
 	if xport == nil {
