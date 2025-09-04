@@ -626,7 +626,6 @@ OffsetAllocStorageReportFull OffsetAllocator::storageReportFull() const {
 }
 
 OffsetAllocatorMetrics OffsetAllocator::get_metrics_internal() const {
-    MutexLocker lock(&m_mutex);
     if (!m_allocator) {
         return {0, 0, 0, 0, m_capacity};
     }
