@@ -65,6 +65,7 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        pip install pybind11
         mkdir build
         cd build
         cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
@@ -226,6 +227,7 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        pip install pybind11
       shell: bash
 
     - name: Build transfer engine only
