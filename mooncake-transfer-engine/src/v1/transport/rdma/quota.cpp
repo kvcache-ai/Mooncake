@@ -51,6 +51,21 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
     const ResolvedTopologyEntry &entry = it_loc->second;
     static constexpr double penalty[] = {1.0, 10.0, 10.0};
     std::unordered_map<int, double> score_map;
+
+    double min_latency = std::numeric_limits<double>::max();
+    double max_latency = 0.0;
+    for (auto &device : devices_) {
+        double l = device.second.avg_latency;
+        if (l > 0) {
+            min_latency = std::min(min_latency, l);
+            max_latency = std::max(max_latency, l);
+        }
+    }
+    if (min_latency == std::numeric_limits<double>::max() || max_latency == 0) {
+        min_latency = 1.0;
+        max_latency = 1.0;
+    }
+
     for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
         for (int dev_id : entry.device_list[rank]) {
             auto &device = devices_[dev_id];
@@ -66,11 +81,17 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
                     continue;
                 }
             }
-            uint64_t active_bytes =
-                device.active_bytes.load(std::memory_order_relaxed) + length;
+            uint64_t active_bytes = device.active_bytes + length;
             double bandwidth = device.bw_gbps * 1e9 / 8;
-            double score =
-                1.0 / (1.0 + ((active_bytes * penalty[rank]) / bandwidth));
+            double load_factor = (active_bytes * penalty[rank]) / bandwidth;
+            double norm_latency = 0.0;
+            if (max_latency > min_latency) {
+                norm_latency = (device.avg_latency - min_latency) /
+                               (max_latency - min_latency + 1e-6);
+            }
+            norm_latency = std::clamp(norm_latency, 0.0, 1.0);
+            double latency_factor = 1.0 + 0.2 * norm_latency;
+            double score = 1.0 / (1.0 + load_factor * latency_factor);
             score_map[dev_id] = score;
         }
     }
@@ -98,21 +119,25 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
             candidates.push_back(item.first);
         }
     }
-    thread_local size_t rr_index = 0;
-    chosen_dev_id = candidates[rr_index % candidates.size()];
-    rr_index++;
+    static std::atomic<int> next_prefer_id(0);
+    thread_local size_t prefer_id = next_prefer_id.fetch_add(1);
+    chosen_dev_id = candidates[prefer_id % candidates.size()];
     devices_[chosen_dev_id].local_quota -= length;
-    devices_[chosen_dev_id].active_bytes.fetch_add(length,
-                                                   std::memory_order_relaxed);
+    devices_[chosen_dev_id].active_bytes += length;
     return Status::OK();
 }
 
-Status DeviceQuota::release(int dev_id, uint64_t length) {
+Status DeviceQuota::release(int dev_id, uint64_t length, double latency) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
     it->second.local_quota += length;
-    it->second.active_bytes.fetch_sub(length, std::memory_order_relaxed);
+    it->second.active_bytes -= length;
+    if (it->second.avg_latency == 0) {
+        it->second.avg_latency = latency;
+    } else {
+        it->second.avg_latency = it->second.avg_latency * 0.9 + latency * 0.1;
+    }
     return Status::OK();
 }
 

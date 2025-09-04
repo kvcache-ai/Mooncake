@@ -68,7 +68,10 @@ Status Workers::stop() {
     running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
         auto &worker = worker_context_[id];
-        worker.notifyIfNeeded();
+        {
+            std::lock_guard<std::mutex> lock(worker.mutex);
+            worker.cv.notify_all();
+        }
         worker.thread.join();
     }
     monitor_.join();
@@ -95,7 +98,8 @@ Status Workers::submit(RdmaSliceList &slice_list, int worker_id) {
     auto &worker = worker_context_[worker_id];
     worker.queue.push(slice_list);
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
-        worker.notifyIfNeeded();
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
     }
     return Status::OK();
 }
@@ -245,25 +249,28 @@ void Workers::asyncPollCq(int thread_id) {
     int num_cq_list = transport_->params_->device.num_cq_list;
     int nr_poll_total = 0;
     std::unordered_map<volatile int *, int> endpoint_quota_map;
-    for (int index = thread_id; index < num_contexts * num_cq_list;
-         index += num_workers_) {
-        auto &context = transport_->context_set_[index / num_cq_list];
-        auto cq = context->cq(index % num_cq_list);
+    for (int index = 0; index < num_contexts; index++) {
+        auto &context = transport_->context_set_[index];
+        auto cq = context->cq(thread_id % num_cq_list);
         ibv_wc wc[kPollCount];
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) {
             LOG(ERROR) << "[TE Worker] Failed to poll completion queue";
             continue;
         }
+        auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice *)wc[i].wr_id;
+            double enqueue_lat =
+                (slice->submit_ts - slice->enqueue_ts) / 1000.0;
+            double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
             if (endpoint_quota_map.count(slice->endpoint_quota))
                 endpoint_quota_map[slice->endpoint_quota]++;
             else
                 endpoint_quota_map[slice->endpoint_quota] = 1;
             if (slice->retry_count == 0) {
                 worker_context_[thread_id].device_quota->release(
-                    slice->source_dev_id, slice->length);
+                    slice->source_dev_id, slice->length, inflight_lat);
             }
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
@@ -286,12 +293,9 @@ void Workers::asyncPollCq(int thread_id) {
                 }
             } else {
                 markSliceSuccess(slice);
-                auto poll_ts = getCurrentTimeInNano();
                 auto &worker = worker_context_[thread_id];
-                worker.perf.inflight_lat.add((poll_ts - slice->submit_ts) /
-                                             1000.0);
-                worker.perf.enqueue_lat.add(
-                    (slice->submit_ts - slice->enqueue_ts) / 1000.0);
+                worker.perf.inflight_lat.add(inflight_lat);
+                worker.perf.enqueue_lat.add(enqueue_lat);
             }
         }
         if (nr_poll > 0) {
@@ -346,18 +350,19 @@ void Workers::workerThread(int thread_id) {
             asyncPollCq(thread_id);
             if (inflight_slices) grace_ts = current_ts;
             const static uint64_t ONE_SECOND = 1000000000;
-            if (transport_->params_->workers.show_latency_info &&
+            if (/*transport_->params_->workers.show_latency_info &&*/
                 current_ts - last_perf_logging_ts > ONE_SECOND) {
                 showLatencyInfo(thread_id);
                 last_perf_logging_ts = current_ts;
             }
         } else {
             std::unique_lock<std::mutex> lock(worker.mutex);
-            if (worker.inflight_slices.load(std::memory_order_relaxed) ||
-                !running_)
-                continue;
             worker.in_suspend = true;
-            worker.cv.wait_for(lock, std::chrono::milliseconds(5));
+            worker.cv.wait(lock, [&]() -> bool {
+                return !running_ || worker.inflight_slices.load(
+                                        std::memory_order_acquire) > 0;
+            });
+            worker.in_suspend = false;
         }
     }
 }

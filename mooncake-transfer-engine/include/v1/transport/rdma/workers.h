@@ -234,20 +234,12 @@ class Workers {
 
         std::mutex mutex;
         std::condition_variable cv;
-        bool in_suspend = false;
+        volatile bool in_suspend = false;
 
         std::unique_ptr<DeviceQuota> device_quota;
         std::unordered_map<std::string, std::shared_ptr<RailTopology>>
             rail_topology_map_;
         PerfMetricSummary perf;
-
-        void notifyIfNeeded() {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (in_suspend) {
-                in_suspend = false;
-                cv.notify_all();
-            }
-        }
     };
 
     WorkerContext *worker_context_;

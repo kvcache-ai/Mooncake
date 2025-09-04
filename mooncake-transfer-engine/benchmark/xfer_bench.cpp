@@ -142,7 +142,7 @@ int XferTERunner::stopInitiator() {
     return 0;
 }
 
-int parseIndex(const std::string &loc) {
+static int parseIndex(const std::string &loc) {
     auto pos = loc.find(':');
     if (pos == std::string::npos || pos + 1 >= loc.size()) {
         throw std::invalid_argument("Invalid loc format: " + loc);

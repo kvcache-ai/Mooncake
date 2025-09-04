@@ -37,8 +37,9 @@ class DeviceQuota {
         int dev_id;
         double bw_gbps;
         int numa_id;
-        std::atomic<uint64_t> active_bytes{0};
+        uint64_t active_bytes{0};
         uint64_t local_quota{0};  // if shared quota is used
+        double avg_latency = 0;
     };
 
    public:
@@ -57,7 +58,7 @@ class DeviceQuota {
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
 
-    Status release(int dev_id, uint64_t length);
+    Status release(int dev_id, uint64_t length, double latency);
 
    private:
     std::shared_ptr<Topology> local_topology_;

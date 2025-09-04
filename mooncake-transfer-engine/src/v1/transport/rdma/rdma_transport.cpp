@@ -202,7 +202,8 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const int max_slice_count = 32;
+    const int num_devices = (size_t)local_topology_->getDeviceList().size();
+    const int max_slice_count = 64;  // N.B. should be carefully tuned
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
@@ -235,7 +236,7 @@ Status RdmaTransport::submitTransferTasks(
             task.num_slices++;
             offset += length;
 
-            int part_id = slice_idx % num_workers;
+            int part_id = (slice_idx / num_devices) % num_workers;
             auto &list = slice_lists[part_id];
             auto &tail = slice_tails[part_id];
             list.num_slices++;
@@ -248,13 +249,10 @@ Status RdmaTransport::submitTransferTasks(
         }
     }
 
-    thread_local int next_part_id = SimpleRandom::Get().next(num_workers);
     for (int i = 0; i < num_workers; ++i) {
-        int part_id = next_part_id;
-        next_part_id = (next_part_id + 1) % num_workers;
         if (slice_lists[i].first) {
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            workers_->submit(slice_lists[i], part_id);
+            workers_->submit(slice_lists[i], i);
         }
     }
     return Status::OK();
