@@ -106,7 +106,7 @@ struct MooncakeEpBuffer {
                std::optional<std::function<void()>>>
     combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             const torch::Tensor& topk_weights, const torch::Tensor& src_info,
-            const torch::Tensor& layout_range, torch::Tensor& gathered_experts,
+            const torch::Tensor& layout_range, torch::Tensor& broken_nodes,
             int num_max_dispatch_tokens_per_rank, int num_experts,
             int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
             const std::optional<torch::Tensor>& out);

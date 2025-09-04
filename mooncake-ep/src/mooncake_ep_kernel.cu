@@ -493,7 +493,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
-combine(void* combined_x, int32_t* gathered_experts,
+combine(void* combined_x, int32_t* broken_nodes,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -622,19 +622,17 @@ combine(void* combined_x, int32_t* gathered_experts,
 
     // Wait all ranks to arrive
     if (responsible_expert_idx < num_experts) {
+        const auto src_rank = responsible_expert_idx / num_local_experts;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            bool timeout = false;
             while (ld_acquire_sys_global(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();
-                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || gathered_experts[responsible_expert_idx]) {
-                    timeout = true;
+                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_nodes[src_rank]) {
+                    broken_nodes[src_rank] = 1;
                     break;
                 }
             }
-            if (!timeout)
-                gathered_experts[responsible_expert_idx] = 1;
         }
     }
     cooperative_groups::this_grid().sync();
@@ -655,7 +653,7 @@ combine(void* combined_x, int32_t* gathered_experts,
 
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
-            for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0 && ld_acquire_global(gathered_experts + reg_topk_idx[i])) {
+            for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
                 // Read from sources
                 auto rdma_buffer_type = reinterpret_cast<const int*>(reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
                 auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
@@ -679,7 +677,7 @@ combine(void* combined_x, int32_t* gathered_experts,
     }
 }
 
-void combine(void* combined_x, int32_t* gathered_experts,
+void combine(void* combined_x, int32_t* broken_nodes,
              void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -707,7 +705,7 @@ void combine(void* combined_x, int32_t* gathered_experts,
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, \
-              combined_x, gathered_experts, \
+              combined_x, broken_nodes, \
               mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \

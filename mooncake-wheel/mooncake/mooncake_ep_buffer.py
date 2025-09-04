@@ -142,13 +142,13 @@ class Buffer:
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                gathered_experts: torch.Tensor, timeout_us: int,
+                broken_nodes: torch.Tensor, timeout_us: int,
                 handle: tuple, zero_copy: bool = False, async_finish: bool = False,
                 return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         combined_x, event, hook = self.runtime.combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                       gathered_experts,
+                                                       broken_nodes,
                                                        num_max_dispatch_tokens_per_rank, num_experts, timeout_us,
                                                        zero_copy, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)

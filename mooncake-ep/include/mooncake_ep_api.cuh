@@ -17,7 +17,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
-void combine(void* combined_x, int32_t* gathered_experts, void* mxa_buffer,
+void combine(void* combined_x, int32_t* broken_nodes, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
              void* cuda_counter_buffer, void* cuda_data_buffer, void* raddrs,

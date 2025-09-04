@@ -78,8 +78,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 if zero_copy:
                     buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                 out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                gathered_experts = torch.zeros((num_experts, ), dtype=torch.int32, device='cuda')
-                combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, gathered_experts, -1, handle,
+                combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, broken_nodes, -1, handle,
                                                          async_finish=not return_recv_hook, zero_copy=zero_copy,
                                                          return_recv_hook=return_recv_hook, out=out)
                 hook() if return_recv_hook else event.current_stream_wait()
@@ -114,8 +113,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-        gathered_experts = torch.zeros((num_experts, ), dtype=torch.int32, device='cuda')
-        combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, gathered_experts, -1, handle,
+        combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, broken_nodes, -1, handle,
                                                  zero_copy=zero_copy, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
