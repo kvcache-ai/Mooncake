@@ -7,7 +7,7 @@ import unittest
 import torch.multiprocessing as mp
 
 
-def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=100):
+def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=1000):
     # Initialize the process group in each spawned process
     torch.cuda.set_device(rank)
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -83,7 +83,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 if __name__ == "__main__":
     devices = ['cpu']
     collectives = ['broadcast', 'allreduce', 'allgather']
-    data_sizes = [2**i for i in range(20, 25, 20)]
+    data_sizes = [2**i for i in range(10, 23, 2)]
 
     def generate_test(device, collective, data_size):
         def test(self):
