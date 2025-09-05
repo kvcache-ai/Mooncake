@@ -50,6 +50,7 @@ This repository also hosts its technical report and the open sourced traces.
 :maxdepth: 2
 
 getting_started/build
+getting_started/quick-start
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1

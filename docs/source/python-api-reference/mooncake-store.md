@@ -21,6 +21,7 @@ The following services need to be started separately:
 ## Quick Start
 
 ### Start Required Services
+
 Before using the store, start the master and metadata services:
 
 ```bash
