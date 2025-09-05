@@ -72,10 +72,11 @@ performance/allocator_benchmark_result.md
 % API Documentation
 
 :::{toctree}
-:caption: Mooncake Store API
+:caption: Python API Reference
 :maxdepth: 1
 
-mooncake-store-api/python-binding
+python-api-reference/mooncake-store
+python-api-reference/transfer-engine
 :::
 
 % Explanation of Mooncake internals
