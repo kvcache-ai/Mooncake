@@ -79,6 +79,14 @@ class PyClient {
               const std::string &rdma_devices = "",
               const std::string &master_server_addr = "127.0.0.1:50051");
 
+    int setup_with_files(
+        const std::string &local_hostname, const std::string &metadata_server,
+        const std::vector<std::string> &files,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "nvmeof_generic",
+        const std::string &protocol_arg = "",
+        const std::string &master_server_addr = "127.0.0.1:50051");
+
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
@@ -226,12 +234,27 @@ class PyClient {
     int64_t getSize(const std::string &key);
 
     // Internal versions that return tl::expected
+
+    tl::expected<void, ErrorCode> common_setup_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t local_buffer_size, const std::string &protocol,
+        const std::string &protocol_args,
+        const std::string &master_server_addr);
+
     tl::expected<void, ErrorCode> setup_internal(
         const std::string &local_hostname, const std::string &metadata_server,
         size_t global_segment_size = 1024 * 1024 * 16,
         size_t local_buffer_size = 1024 * 1024 * 16,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051");
+
+    tl::expected<void, ErrorCode> setup_with_files_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        const std::vector<std::string> &files,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "nvmeof_generic",
+        const std::string &protocol_arg = "",
         const std::string &master_server_addr = "127.0.0.1:50051");
 
     tl::expected<void, ErrorCode> initAll_internal(
