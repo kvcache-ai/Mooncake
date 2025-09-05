@@ -85,22 +85,53 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    std::vector<iovec> iovs;
-    for (const auto& slice : slices) {
-        iovec io{slice.ptr, slice.size};
-        iovs.push_back(io);
+    off_t current_offset = 0;
+    size_t total_bytes_processed = 0;
+
+    for (size_t i = 0; i < slices.size();) {
+        if (slices[i].ptr == nullptr) {
+            current_offset += slices[i].size;
+            total_bytes_processed += slices[i].size;
+            i++;
+            continue;
+        }
+
+        std::vector<iovec> iovs;
+        size_t chunk_length = 0;
+        size_t start_of_chunk_index = i;
+
+        while (i < slices.size() && slices[i].ptr != nullptr) {
+            iovec io{slices[i].ptr, slices[i].size};
+            iovs.push_back(io);
+            chunk_length += slices[i].size;
+            i++;
+        }
+
+        if (!iovs.empty()) {
+            auto read_result = file->vector_read(
+                iovs.data(), static_cast<int>(iovs.size()), current_offset);
+            if (!read_result) {
+                LOG(INFO) << "vector_read failed for chunk starting at slice "
+                          << start_of_chunk_index << " for path: " << path
+                          << ", error: " << read_result.error();
+                return tl::make_unexpected(read_result.error());
+            }
+            if (*read_result != chunk_length) {
+                LOG(INFO) << "Read size mismatch for chunk in path: " << path
+                          << ", expected: " << chunk_length
+                          << ", got: " << *read_result;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+
+            current_offset += chunk_length;
+            total_bytes_processed += chunk_length;
+        }
     }
 
-    auto read_result =
-        file->vector_read(iovs.data(), static_cast<int>(iovs.size()), 0);
-    if (!read_result) {
-        LOG(INFO) << "vector_read failed for: " << path
-                  << ", error: " << read_result.error();
-        return tl::make_unexpected(read_result.error());
-    }
-    if (*read_result != length) {
-        LOG(INFO) << "Read size mismatch for: " << path
-                  << ", expected: " << length << ", got: " << *read_result;
+    if (total_bytes_processed != length) {
+        LOG(INFO) << "Total read size mismatch for: " << path
+                  << ", expected: " << length
+                  << ", got: " << total_bytes_processed;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
