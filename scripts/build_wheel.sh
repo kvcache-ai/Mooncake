@@ -102,6 +102,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libibverbs.so* \
 --exclude libmlx5.so* \
 --exclude libnuma.so* \
+--exclude libunwind.so* \
 --exclude libstdc++.so* \
 --exclude libgcc_s.so* \
 --exclude libc.so* \
