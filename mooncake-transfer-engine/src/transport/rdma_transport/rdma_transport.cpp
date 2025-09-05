@@ -377,6 +377,10 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+int RdmaTransport::closeSegment(Transport::SegmentHandle handle) {
+    return 0;
+}
+
 RdmaTransport::SegmentID RdmaTransport::getSegmentID(
     const std::string &segment_name) {
     return metadata_->getSegmentID(segment_name);

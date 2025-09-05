@@ -208,6 +208,15 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     return 0;
 }
 
+int TransferEnginePy::freeRemoteSegment(const char *target_hostname) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (handle_map_.count(target_hostname)) {
+        engine_->closeSegment(handle_map_[target_hostname]);
+        handle_map_.erase(target_hostname);
+    }
+    return 0;
+}
+
 int TransferEnginePy::transferSyncWrite(const char *target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
@@ -685,6 +694,7 @@ PYBIND11_MODULE(engine, m) {
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
             .def("get_local_topology", &TransferEnginePy::getLocalTopology)
+            .def("free_remote_segment", &TransferEnginePy::freeRemoteSegment)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress);
 

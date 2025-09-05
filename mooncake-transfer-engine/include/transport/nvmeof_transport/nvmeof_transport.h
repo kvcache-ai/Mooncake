@@ -59,6 +59,8 @@ class NVMeoFTransport : public Transport {
                         uint64_t target_start, TransferRequest::OpCode op,
                         TransferTask &task, const char *file_path);
 
+    int closeSegment(Transport::SegmentHandle handle) override;
+
    private:
     void startTransfer(Slice *slice);
 
