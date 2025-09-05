@@ -283,10 +283,10 @@ int NVMeoFQueue::submitRequest(Slice *slice) {
     struct iocb *iocb = &slice->nvmeof_generic.iocb;
     if (slice->opcode == Transport::TransferRequest::READ) {
         io_prep_pread(iocb, fd, slice->source_addr, slice->length,
-                      slice->nvmeof.offset);
+                      slice->nvmeof_generic.offset);
     } else {
         io_prep_pwrite(iocb, fd, slice->source_addr, slice->length,
-                       slice->nvmeof.offset);
+                       slice->nvmeof_generic.offset);
     }
     iocb->data = slice;
 
