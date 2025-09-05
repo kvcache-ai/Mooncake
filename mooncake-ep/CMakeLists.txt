@@ -14,6 +14,8 @@ else ()
   list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
 endif()
 
+set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+
 find_package(CUDAToolkit REQUIRED)
 find_package(Torch REQUIRED)
 include_directories(${TORCH_INCLUDE_DIRS})
