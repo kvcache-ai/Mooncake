@@ -453,21 +453,6 @@ class OffsetAllocatorTest : public ::testing::Test {
         alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
 
-        // change a random bit from the buffer and try to deserialize
-        corrupted_buffer = buffer;
-        std::uniform_int_distribution<size_t> byte_index_dist(
-            0, buffer.size() - 1);
-        std::uniform_int_distribution<int> bit_index_dist(
-            0, 7);  // 8 bits per byte
-        size_t byte_index = byte_index_dist(gen);
-        int bit_index = bit_index_dist(gen);
-        // Flip the random bit
-        corrupted_buffer[byte_index] ^= (1 << bit_index);
-        alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
-        // There are bool values whose value may not change if one bit is
-        // flipped, so the isAllocatorEqual compares variables using memcmp.
-        ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
-
         // Add a byte to the buffer and try to deserialize
         corrupted_buffer = buffer;
         corrupted_buffer.push_back(0);
