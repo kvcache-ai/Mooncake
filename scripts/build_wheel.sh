@@ -36,6 +36,14 @@ else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy ep.so to mooncake directory
+if [ -f build/mooncake-integration/ep.*.so ]; then
+    echo "Copying ep.so..."
+    cp build/mooncake-integration/ep.*.so mooncake-wheel/mooncake/ep.so
+else
+    echo "Skipping ep.so (not built - likely WITH_EP is set to OFF)"
+fi
+
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
 if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
     echo "Copying CUDA nvlink_allocator.so..."
@@ -190,8 +198,10 @@ else
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
+    --exclude libmlx5.so* \
     --exclude libnuma.so* \
     --exclude libstdc++.so* \
+    --exclude libunwind.so* \
     --exclude libgcc_s.so* \
     --exclude libc.so* \
     --exclude libnghttp2.so* \
@@ -226,6 +236,14 @@ else
     --exclude libkeyutils.so* \
     --exclude libresolv.so* \
     --exclude libffi.so* \
+    --exclude libcuda.so* \
+    --exclude libcudart.so* \
+    --exclude libc10.so* \
+    --exclude libc10_cuda.so* \
+    --exclude libtorch.so* \
+    --exclude libtorch_cpu.so* \
+    --exclude libtorch_cuda.so* \
+    --exclude libtorch_python.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
     --exclude libascendcl.so* \

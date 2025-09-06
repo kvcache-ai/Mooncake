@@ -1,6 +1,6 @@
 #pragma once
 
-#include "exception.cuh"
+#include <mooncake_ep_exception.cuh>
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC,      \
                            ST_FUNC)                                           \
@@ -22,7 +22,7 @@
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                       \
     }
 
-namespace mxa_ep {
+namespace mooncake {
 
 template <int kBytes>
 struct VecInt {};
@@ -535,4 +535,4 @@ __forceinline__ __device__ void barrier_device(int **task_fifo_ptrs, int head,
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
-}  // namespace mxa_ep
+}  // namespace mooncake
