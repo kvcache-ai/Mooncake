@@ -51,8 +51,8 @@ extra_config:
   protocol: "rdma"
   device_name: "mlx5_0" # Multiple RDMA devices can be specified as comma-separated list
   master_server_address: "{IP of Machine A}:50052"
-  global_segment_size: 3355443200
-  local_buffer_size: 1073741824
+  global_segment_size: 32212254720 # 30GB
+  local_buffer_size: 1073741824 # 1GB
   transfer_timeout: 1
   save_chunk_meta: False
 ```
@@ -91,8 +91,8 @@ extra_config:
   protocol: "rdma"
   device_name: "mlx5_0" # Multiple RDMA devices can be specified as comma-separated list
   master_server_address: "{IP of Machine A}:50052"
-  global_segment_size: 3355443200
-  local_buffer_size: 1073741824
+  global_segment_size: 32212254720 # 30GB
+  local_buffer_size: 1073741824 # 1GB
   transfer_timeout: 1
   save_chunk_meta: False
 ```
