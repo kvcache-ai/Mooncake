@@ -7,7 +7,7 @@ This document describes how to quickly start using Mooncake Transfer Engine and 
 Install the Mooncake Transfer Engine package from PyPI, which includes both Mooncake Transfer Engine and Mooncake Store Python bindings:
 
 ```bash
-pip install mooncake-transfer-engine
+pip install mooncake-transfer-engine==0.3.5
 ```
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)

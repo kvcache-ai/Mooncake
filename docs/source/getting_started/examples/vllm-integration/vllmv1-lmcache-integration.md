@@ -49,7 +49,7 @@ extra_config:
   local_hostname: "{IP of Machine A}"
   metadata_server: "http://{IP of Machine A}:8080/metadata"
   protocol: "rdma"
-  device_name: "erdma_0"
+  device_name: "mlx5_0" # Multiple RDMA devices can be specified as comma-separated list
   master_server_address: "{IP of Machine A}:50052"
   global_segment_size: 3355443200
   local_buffer_size: 1073741824
@@ -89,7 +89,7 @@ extra_config:
   local_hostname: "{IP of Machine B}"
   metadata_server: "http://{IP of Machine A}:8080/metadata"
   protocol: "rdma"
-  device_name: "erdma_0"
+  device_name: "mlx5_0" # Multiple RDMA devices can be specified as comma-separated list
   master_server_address: "{IP of Machine A}:50052"
   global_segment_size: 3355443200
   local_buffer_size: 1073741824
