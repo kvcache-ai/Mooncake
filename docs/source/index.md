@@ -50,11 +50,11 @@ This repository also hosts its technical report and the open sourced traces.
 :maxdepth: 2
 
 getting_started/build
+getting_started/quick-start
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
-getting_started/examples/vllm-integration-v0.2
-getting_started/examples/vllm-integration-v1
+getting_started/examples/vllm-integration/index
 :::
 
 % Making the most out of Mooncake
@@ -72,10 +72,11 @@ performance/allocator_benchmark_result.md
 % API Documentation
 
 :::{toctree}
-:caption: Mooncake Store API
+:caption: Python API Reference
 :maxdepth: 1
 
-mooncake-store-api/python-binding
+python-api-reference/mooncake-store
+python-api-reference/transfer-engine
 :::
 
 % Explanation of Mooncake internals
