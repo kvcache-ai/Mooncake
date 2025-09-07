@@ -102,7 +102,7 @@ class TrainGroup:
                                    512*1024*1024, 
                                    128*1024*1024, 
                                    "rdma", 
-                                   "mlx5_0", 
+                                   "erdma_1", # or other NIC like mlx5_1
                                    "localhost:50051")
 
 
@@ -139,7 +139,7 @@ class TrainGroup:
         3. Each actor performs one training step.
         4. Print aggregated average loss.
         """
-        samples = self.training_client.get(rollout_key)
+        samples = self.training_client.get_tensor(rollout_key)
         if samples is None:
             print(f"[TrainGroup] Rollout {rollout_id} not found in store")
             return
@@ -186,7 +186,7 @@ class RolloutEngine:
         """
         Mock rollout generating
         """
-        data = torch.randint(0, 100, (4,), dtype=torch.int32).tolist() # TODO: change size
+        data = torch.randint(0, 100, (4,), dtype=torch.int32).tolist()
         action = random.randint(0, 9)
         reward = random.uniform(-1.0, 1.0)
 
@@ -236,7 +236,7 @@ class RolloutController:
                                   512*1024*1024, 
                                   128*1024*1024, 
                                   "rdma", 
-                                  "mlx5_0", 
+                                  "erdma_0", # or other NIC like mlx5_0 
                                   "localhost:50051")
 
     def load(self, rollout_id=None):
@@ -303,7 +303,7 @@ class RolloutManager:
             rollout_samples.append(sample)
         
         key = str(rollout_id)
-        self.controller.rollout_client.put(key, rollout_samples)
+        self.controller.rollout_client.put_tensor(key, rollout_samples)
 
         print(f"[RolloutManager] Generated rollout {rollout_id}: {rollout_samples}")
         return key
@@ -312,7 +312,7 @@ class RolloutManager:
         """
         Perform dummy evaluation.
         """
-        samples = self.controller.rollout_client.get(str(rollout_id))
+        samples = self.controller.rollout_client.get_tensor(str(rollout_id))
 
         for engine in self.rollout_engines:
             engine.eval(rollout_id, samples)
@@ -343,7 +343,7 @@ def train(args):
     # create the rollout manager, with engines inside.
     rollout_manager = create_rollout_manager(args)
 
-    # sync the initialization (model initalization, load checkpoint, etc.)
+    # sync the initialization (model initialization, load checkpoint, etc.)
     start_rollout_ids = actor_model.init_actors(args)
     
     assert len(set(start_rollout_ids)) == 1
@@ -358,6 +358,13 @@ def train(args):
 
     # always update weight first so that sglang has the loaded weights from training.
     actor_model.update_weights()
+
+    # warm up eval if needed
+    if args.eval_interval is not None:
+        warmup_id = args.start_rollout_id
+        rollout_data_ref = rollout_manager.generate(warmup_id)
+        actor_model.train(warmup_id, rollout_data_ref)
+        rollout_manager.eval(warmup_id)
 
     # train loop.
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
