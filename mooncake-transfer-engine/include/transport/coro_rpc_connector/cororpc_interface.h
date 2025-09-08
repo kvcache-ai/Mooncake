@@ -17,8 +17,9 @@ class CoroRPCInterface {
         size_t data_size = 0;
 
         pybind11::bytes getBytes() const { return pybind11::bytes(data); }
-        pybind11::memoryview getMemoryView() const { 
-            return pybind11::memoryview::from_memory(const_cast<char*>(data.data()), data.size(), true);
+        pybind11::memoryview getMemoryView() const {
+            return pybind11::memoryview::from_memory(
+                const_cast<char*>(data.data()), data.size(), true);
         }
     };
 
@@ -30,8 +31,9 @@ class CoroRPCInterface {
         size_t total_bytes = 0;
         size_t getDataSize() const { return data.size(); }
         pybind11::bytes getDataAsBytes() const { return pybind11::bytes(data); }
-        pybind11::memoryview getMemoryView() const { 
-            return pybind11::memoryview::from_memory(const_cast<char*>(data.data()), data.size(), true);
+        pybind11::memoryview getMemoryView() const {
+            return pybind11::memoryview::from_memory(
+                const_cast<char*>(data.data()), data.size(), true);
         }
         pybind11::object rebuildTensor() const;
     };
@@ -49,9 +51,10 @@ class CoroRPCInterface {
     bool startServerAsync();
     void stopServer();
 
-    int sendData(const std::string& target_address, pybind11::bytes data);
+    int sendData(const std::string& target_address, pybind11::handle data);
     pybind11::object sendDataAsync(std::string& target_address,
-                                   pybind11::bytes data, pybind11::handle loop);
+                                   pybind11::handle data,
+                                   pybind11::handle loop);
 
     int sendTensor(const std::string& target_address, pybind11::handle tensor);
     pybind11::object sendTensorAsync(std::string& target_address,

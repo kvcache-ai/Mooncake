@@ -42,11 +42,11 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
     return true;
 }
 
-bool CoroRPCCommunicator::startServerImpl(bool is_async){
-    if(is_async){
-        return this -> startServerAsync();
+bool CoroRPCCommunicator::startServerImpl(bool is_async) {
+    if (is_async) {
+        return this->startServerAsync();
     } else {
-        return this -> startServer();
+        return this->startServer();
     }
 }
 
@@ -111,36 +111,37 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
     std::string_view data_view(static_cast<const char*>(data), data_size);
 
     // For large data, use attachment to avoid copying
-    const size_t ATTACHMENT_THRESHOLD = 1024; // Use attachment for data > 1KB
-    
+    const size_t ATTACHMENT_THRESHOLD = 1024;  // Use attachment for data > 1KB
+
     auto rpc_result = co_await client_pools_.send_request(
         target_address,
         [data_view, data_size](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            
             if (data_size > ATTACHMENT_THRESHOLD) {
                 // Use attachment for large data - zero copy
                 client.set_req_attachment(data_view);
                 // Send empty data parameter, actual data in attachment
-                auto result = co_await client
-                    .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
-                        std::string_view{});
+                auto result =
+                    co_await client
+                        .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
+                            std::string_view{});
                 if (!result.has_value()) {
                     std::cerr << "RPC call failed: " << result.error().msg
                               << std::endl;
                 }
             } else {
                 // Use regular parameter for small data
-                auto result = co_await client
-                    .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
-                        data_view);
+                auto result =
+                    co_await client
+                        .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
+                            data_view);
                 if (!result.has_value()) {
                     std::cerr << "RPC call failed: " << result.error().msg
                               << std::endl;
                 }
             }
         });
-        
+
     if (!rpc_result.has_value()) {
         std::cout << "RPC send request failed" << std::endl;
         co_return result{-1, "RPC call failed"};
@@ -162,26 +163,26 @@ int CoroRPCCommunicator::sendTensor(const std::string& target_address,
 
 async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
     const std::string& target_address, const TensorInfo& tensor) {
-        auto rpc_result = co_await client_pools_.send_request(
-            target_address,
+    auto rpc_result = co_await client_pools_.send_request(
+        target_address,
         [&tensor](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(std::string_view(
-                (char*)tensor.data_ptr, tensor.total_bytes));
+            client.set_req_attachment(
+                std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
 
-            auto result = co_await client.call<
-                &CoroRPCCommunicator::Impl::handleTensorTransfer>();
+            auto result =
+                co_await client
+                    .call<&CoroRPCCommunicator::Impl::handleTensorTransfer>();
 
             if (!result.has_value()) {
-                std::cerr
-                    << "Tensor RPC call failed: " << result.error().msg
-                    << std::endl;
+                std::cerr << "Tensor RPC call failed: " << result.error().msg
+                          << std::endl;
             }
         });
-        if (!rpc_result.has_value()) {
-            std::cout << "Tensor RPC send request failed" << std::endl;
-            co_return -1;
-        }
+    if (!rpc_result.has_value()) {
+        std::cout << "Tensor RPC send request failed" << std::endl;
+        co_return -1;
+    }
     co_return 0;
 }
 
@@ -199,23 +200,26 @@ async_simple::coro::Lazy<std::string> CoroRPCCommunicator::receiveDataAsync(
     // This method is typically called from the handler when data is received
     // The actual data reception is handled by the registered handlers
     co_return std::string();
-} // Data reception is handled via context and attachment in handlers
+}  // Data reception is handled via context and attachment in handlers
 
 void CoroRPCCommunicator::Impl::handleDataTransfer(
     coro_rpc::context<void> context, std::string_view data) {
     // Check if there's an attachment for large data
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
-    
-    std::cout << "Handling data transfer - Data: " << data.size() 
-              << " bytes, Attachment: " << attachment.size() << " bytes" << std::endl;
+
+    std::cout << "Handling data transfer - Data: " << data.size()
+              << " bytes, Attachment: " << attachment.size() << " bytes"
+              << std::endl;
 
     // Call the data receive callback if set
     if (data_receive_callback) {
         std::cout << "Calling data receive callback..." << std::endl;
-        std::string_view source_address = "unknown"; // Could extract from context if needed
-        
-        // Use attachment if available (for large data), otherwise use data parameter
+        std::string_view source_address =
+            "unknown";  // Could extract from context if needed
+
+        // Use attachment if available (for large data), otherwise use data
+        // parameter
         if (!attachment.empty()) {
             // Use attachment data directly without copying - zero copy approach
             std::string_view attachment_view = attachment;
@@ -232,7 +236,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     if (!attachment.empty()) {
         ctx_info->set_response_attachment(attachment);
     }
-    
+
     context.response_msg();
 }
 

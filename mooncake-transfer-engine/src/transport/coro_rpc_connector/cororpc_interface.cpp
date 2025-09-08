@@ -146,7 +146,8 @@ pybind11::object create_numpy_array_from_data(
     size_t data_size = total_elements * element_size;
     std::cout << "DEBUG: Data size = " << data_size << std::endl;
 
-    std::cout << "DEBUG: About to call frombuffer with memoryview..." << std::endl;
+    std::cout << "DEBUG: About to call frombuffer with memoryview..."
+              << std::endl;
 
     try {
         // Create a memoryview directly from the data pointer without copying
@@ -215,22 +216,34 @@ void CoroRPCInterface::stopServer() {
 }
 
 int CoroRPCInterface::sendData(const std::string& target_address,
-                               pybind11::bytes data) {
+                               pybind11::handle data) {
     if (!impl_->communicator) return -1;
 
     pybind11::gil_scoped_acquire acquire;
 
-    std::string_view data_view = data;
+    // Extract data from handle directly
+    std::string_view data_view;
+    try {
+        // Try to get direct string view from bytes object
+        pybind11::bytes data_bytes =
+            pybind11::reinterpret_borrow<pybind11::bytes>(data);
+        data_view = data_bytes;
+    } catch (...) {
+        // Fallback: convert to bytes and then get view
+        pybind11::bytes data_bytes = pybind11::cast<pybind11::bytes>(data);
+        data_view = data_bytes;
+    }
+
     pybind11::gil_scoped_release release;
     return impl_->communicator->sendData(target_address, data_view.data(),
                                          data_view.size());
 }
 
 pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
-                                                 pybind11::bytes data,
+                                                 pybind11::handle data,
                                                  pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
-    
+
     auto future_module = pybind11::module_::import("asyncio");
     auto future_obj = future_module.attr("Future")();
 
@@ -242,7 +255,25 @@ pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
 
     auto communicator = impl_->communicator.get();
     auto target_addr = std::move(target_address);
-    std::string data_str = data;
+
+    // Extract data from handle directly without creating intermediate bytes
+    // object
+    std::string_view data_view;
+    std::string data_str;  // Only used if we can't get direct view
+
+    try {
+        // Try to get direct string view from bytes object
+        pybind11::bytes data_bytes =
+            pybind11::reinterpret_borrow<pybind11::bytes>(data);
+        data_view = data_bytes;
+        // Store a copy for lambda capture since string_view might not be valid
+        // after GIL release
+        data_str = std::string(data_view);
+    } catch (...) {
+        // Fallback: convert to bytes and then to string
+        pybind11::bytes data_bytes = pybind11::cast<pybind11::bytes>(data);
+        data_str = data_bytes;
+    }
 
     auto future_ptr = std::make_shared<pybind11::object>(future_obj);
     pybind11::object loop_obj =
@@ -466,8 +497,7 @@ void CoroRPCInterface::setDataReceiveCallback(pybind11::function callback) {
     if (impl_->communicator) {
         auto interface_ptr = this;
         impl_->communicator->setDataReceiveCallback(
-            [interface_ptr](std::string_view source,
-                            std::string_view data) {
+            [interface_ptr](std::string_view source, std::string_view data) {
                 interface_ptr->handleIncomingData(source, data);
             });
     }
@@ -476,9 +506,9 @@ void CoroRPCInterface::setDataReceiveCallback(pybind11::function callback) {
 void CoroRPCInterface::setTensorReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->tensor_receive_callback = callback;
-    
+
     // Note: Tensor data is received through the regular data callback
-    // The handleIncomingData function will detect tensor data and route it 
+    // The handleIncomingData function will detect tensor data and route it
     // to handleIncomingTensor automatically
 }
 
@@ -558,8 +588,10 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
     try {
         pybind11::gil_scoped_acquire acquire;
         pybind11::dict received;
-        received["source"] = std::string(source);  // Convert to string for Python
-        received["data"] = pybind11::bytes(std::string(data));  // Convert to string for pybind11::bytes
+        received["source"] =
+            std::string(source);  // Convert to string for Python
+        received["data"] = pybind11::bytes(
+            std::string(data));  // Convert to string for pybind11::bytes
 
         impl_->data_receive_callback(received);
     } catch (const std::exception& e) {
@@ -589,7 +621,8 @@ void CoroRPCInterface::handleIncomingTensor(std::string_view source,
         pybind11::gil_scoped_acquire acquire;
 
         ReceivedTensor received;
-        received.source_address = std::string(source);  // Convert to string for storage
+        received.source_address =
+            std::string(source);            // Convert to string for storage
         received.data = std::string(data);  // Convert to string for storage
         received.shape = shape;
         received.dtype = std::string(dtype);  // Convert to string for storage
@@ -629,11 +662,11 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensor() const {
         if (metadata->dtype > 0 &&
             metadata->dtype <= static_cast<int32_t>(TensorDtype::BOOL) &&
             metadata->ndim >= 0 && metadata->ndim <= 4) {
-            
             // Extract tensor data (skip metadata)
             const char* tensor_data = data.data() + sizeof(TensorMetadata);
-            // size_t tensor_data_size = data.size() - sizeof(TensorMetadata); // Not used currently
-            
+            // size_t tensor_data_size = data.size() - sizeof(TensorMetadata);
+            // // Not used currently
+
             // Convert shape from metadata
             std::vector<int64_t> tensor_shape;
             for (int i = 0; i < metadata->ndim; i++) {
@@ -641,13 +674,15 @@ pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensor() const {
                     tensor_shape.push_back(metadata->shape[i]);
                 }
             }
-            
+
             // Create numpy array from tensor data
-            TensorDtype tensor_dtype = static_cast<TensorDtype>(metadata->dtype);
-            return create_numpy_array_from_data(tensor_data, tensor_dtype, tensor_shape);
+            TensorDtype tensor_dtype =
+                static_cast<TensorDtype>(metadata->dtype);
+            return create_numpy_array_from_data(tensor_data, tensor_dtype,
+                                                tensor_shape);
         }
     }
-    
+
     // If not tensor data or invalid, return None
     return pybind11::none();
 }
