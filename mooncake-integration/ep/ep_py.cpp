@@ -63,8 +63,8 @@ PYBIND11_MODULE(ep, m) {
     m.def("get_preferred_hca", &getPreferredHca);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
-               c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>,
-               c10d::Backend::Options>(m, "MooncakeBackendOptions")
+               c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
+        m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("broken_ranks"));
 
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
