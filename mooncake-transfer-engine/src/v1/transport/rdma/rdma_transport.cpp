@@ -203,12 +203,14 @@ Status RdmaTransport::submitTransferTasks(
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
     const int num_devices = (size_t)local_topology_->getDeviceList().size();
-    const int max_slice_count = 64;  // N.B. should be carefully tuned
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
 
     for (auto &request : request_list) {
+        auto opcode = request.opcode;
+        // N.B. max_slice_count should be carefully tuned
+        const size_t max_slice_count = opcode == Request::WRITE ? 32 : 64;
         rdma_batch->task_list.push_back(RdmaTask{});
         auto &task = rdma_batch->task_list.back();
         task.request = request;

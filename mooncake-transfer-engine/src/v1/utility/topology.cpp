@@ -407,34 +407,12 @@ void Topology::print() const {
     }
 }
 
-Status Topology::selectDevice(int &device_id, const std::string &storage_type,
-                              int retry_count, int &rand_seed) {
-    if (resolved_matrix_.count(storage_type) == 0) {
-        auto msg = "No device found in storage type " + storage_type + LOC_MARK;
-        return Status::DeviceNotFound(msg);
+static int parseIndex(const std::string &loc) {
+    auto pos = loc.find(':');
+    if (pos == std::string::npos || pos + 1 >= loc.size()) {
+        throw std::invalid_argument("Invalid loc format: " + loc);
     }
-    auto &entry = resolved_matrix_[storage_type];
-    if (retry_count == 0) {
-        for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
-            auto &list = entry.device_list[rank];
-            if (list.empty()) continue;
-            if (rand_seed < 0) rand_seed = SimpleRandom::Get().next(32);
-            device_id = list[rand_seed % list.size()];
-            return Status::OK();
-        }
-    }
-    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
-        auto &list = entry.device_list[rank];
-        if (list.empty()) continue;
-        if (retry_count >= (int)list.size())
-            retry_count -= list.size();
-        else {
-            device_id = list[retry_count];
-            return Status::OK();
-        }
-    }
-    device_id = 0;
-    return Status::OK();
+    return std::stoi(loc.substr(pos + 1));
 }
 
 Status Topology::resolve() {
@@ -457,6 +435,14 @@ Status Topology::resolve() {
                 resolved_matrix_[entry.first].device_list[rank].push_back(
                     device_id_map[device]);
             }
+        }
+
+        auto &optimized_device_list =
+            resolved_matrix_[entry.first].device_list[0];
+        if (entry.first.starts_with("cuda") && !optimized_device_list.empty()) {
+            auto cuda_dev_id = parseIndex(entry.first);
+            auto rdma_dev_id = optimized_device_list[0];
+            cuda_to_rdma_dev_map_[cuda_dev_id] = rdma_dev_id;
         }
     }
     return Status::OK();
@@ -489,6 +475,16 @@ int Topology::findDeviceNumaID(int dev_id) const {
         if (numa_id != -1) break;
     }
     return numa_id >= 0 ? numa_id : 0;
+}
+
+int Topology::getCudaDeviceCount() const {
+    return cuda_to_rdma_dev_map_.size();
+}
+
+int Topology::getBestRdmaDeviceID(int cuda_dev_id) const {
+    if (cuda_to_rdma_dev_map_.count(cuda_dev_id))
+        return cuda_to_rdma_dev_map_.at(cuda_dev_id);
+    return -1;
 }
 
 Status RailTopology::loadFromJson(const std::string &rail_topo_json_path,
@@ -579,6 +575,7 @@ Status RailTopology::loadFromSelf() {
             auto &mapping = best_mapping_[dst_numa];
             size_t local_cnt = local_dev_numa_id[src_numa].size();
             size_t remote_cnt = remote_dev_numa_id[dst_numa].size();
+            if (!local_cnt || !remote_cnt) continue;
             for (size_t i = 0; i < local_cnt; i++)
                 mapping[local_dev_numa_id[src_numa][i]] =
                     remote_dev_numa_id[dst_numa][i % remote_cnt];

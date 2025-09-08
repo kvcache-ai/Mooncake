@@ -99,9 +99,6 @@ class LocalBufferManager {
 
     Status clear();
 
-    Status query(const AddressRange &range,
-                 std::vector<BufferQueryResult> &result, int retry_count = 0);
-
     const std::string deviceName(int id);
 
    private:

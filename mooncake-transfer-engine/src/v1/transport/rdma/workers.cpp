@@ -350,7 +350,7 @@ void Workers::workerThread(int thread_id) {
             asyncPollCq(thread_id);
             if (inflight_slices) grace_ts = current_ts;
             const static uint64_t ONE_SECOND = 1000000000;
-            if (/*transport_->params_->workers.show_latency_info &&*/
+            if (transport_->params_->workers.show_latency_info &&
                 current_ts - last_perf_logging_ts > ONE_SECOND) {
                 showLatencyInfo(thread_id);
                 last_perf_logging_ts = current_ts;
@@ -463,9 +463,20 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
                            source.segment->machine_id,
                            target.segment->machine_id);
         }
-        slice->target_dev_id = instance->findRemoteDeviceID(
+        int mapped_dev_id = instance->findRemoteDeviceID(
             slice->source_dev_id, target.topo_entry->numa_node);
-    } else {
+        for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+            auto &list = target.topo_entry->device_list[rank];
+            if (list.empty()) continue;
+            auto it = std::find(list.begin(), list.end(), mapped_dev_id);
+            if (it != list.end()) {
+                slice->target_dev_id = mapped_dev_id;
+                break;
+            }
+            slice->target_dev_id = list[SimpleRandom::Get().next(list.size())];
+            break;
+        }
+    } else if (slice->target_dev_id < 0) {
         slice->target_dev_id = slice->source_dev_id;
     }
 

@@ -87,15 +87,6 @@ class Topology {
 
     void print() const;
 
-    Status selectDevice(int &device_id, const std::string &storage_type,
-                        int retry_count = 0) {
-        int rand_seed = -1;
-        return selectDevice(device_id, storage_type, retry_count, rand_seed);
-    }
-
-    Status selectDevice(int &device_id, const std::string &storage_type,
-                        int retry_count, int &rand_seed);
-
     const TopologyMatrix &getMatrix() const { return matrix_; }
 
     const std::vector<std::string> &getDeviceList() const {
@@ -126,6 +117,10 @@ class Topology {
         return resolved_matrix_;
     }
 
+    int getCudaDeviceCount() const;
+
+    int getBestRdmaDeviceID(int cuda_dev_id) const;
+
    private:
     Status resolve();
 
@@ -133,6 +128,7 @@ class Topology {
     TopologyMatrix matrix_;
     std::vector<std::string> rdma_device_list_;
     ResolvedTopologyMatrix resolved_matrix_;
+    std::map<int, int> cuda_to_rdma_dev_map_;
 };
 
 class RailTopology {

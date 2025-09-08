@@ -26,10 +26,10 @@ DEFINE_bool(check_consistency, false,
             "Enable data consistency check after transfer.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
               "Total buffer size for testing (in bytes).");
-DEFINE_uint64(start_block_size, 8192, "Start block size (in bytes).");
-DEFINE_uint64(max_block_size, 1UL << 20, "Maximum block size (in bytes).");
-DEFINE_uint64(start_batch_size, 8, "Start batch size (number of requests).");
-DEFINE_uint64(max_batch_size, 32, "Maximum batch size (number of requests).");
+DEFINE_uint64(start_block_size, 4096, "Start block size (in bytes).");
+DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
+DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
+DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
 DEFINE_int32(num_threads, 2, "Number of concurrent worker threads.");
 DEFINE_string(metadata_type, "p2p",

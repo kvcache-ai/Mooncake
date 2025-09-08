@@ -132,70 +132,10 @@ Status LocalBufferManager::clear() {
     return Status::OK();
 }
 
-Status LocalBufferManager::query(const AddressRange &range,
-                                 std::vector<BufferQueryResult> &result,
-                                 int retry_count) {
-    // TODO Read-friendly lock
-    result.clear();
-    auto lower = buffer_list_.begin();
-    auto upper = buffer_list_.end();
-    for (auto it = lower; it != upper; ++it) {
-        const auto &buffer = *it;
-        auto intersect = buffer.first.intersect(range);
-        if (intersect.empty()) continue;
-        int device_id;
-        auto status = topology_->selectDevice(
-            device_id, buffer.second.options.location, retry_count);
-        if (!status.ok())
-            status = topology_->selectDevice(device_id, kWildcardLocation,
-                                             retry_count);
-        if (!status.ok()) return status;
-        auto context = context_list_[device_id];
-        assert(context);
-        auto mem_reg_id = buffer.second.mem_reg_map.at(context);
-        auto keys = context->queryMemRegKey(mem_reg_id);
-        result.push_back(BufferQueryResult{intersect.addr, intersect.length,
-                                           keys.first, keys.second, device_id});
-    }
-    if (result.empty()) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-    return Status::OK();
-}
-
 const std::string LocalBufferManager::deviceName(int id) {
     RWSpinlock::ReadGuard guard(lock_);
     assert(id >= 0 && id < (int)context_list_.size());
     return context_list_[id] ? context_list_[id]->name() : "unknown";
-}
-
-Status queryRemoteSegment(SegmentDesc *desc, const AddressRange &range,
-                          std::vector<BufferQueryResult> &result,
-                          int retry_count) {
-    if (desc->type != SegmentType::Memory)
-        return Status::InvalidArgument("Invalid remote segment type");
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    auto &topo = detail.topology;
-    result.clear();
-    for (auto &entry : detail.buffers) {
-        auto query_range = AddressRange{(void *)entry.addr, entry.length};
-        auto intersect = query_range.intersect(range);
-        if (intersect.empty()) continue;
-        int device_id;
-        auto status = topo.selectDevice(device_id, entry.location, retry_count);
-        if (!status.ok())
-            status =
-                topo.selectDevice(device_id, kWildcardLocation, retry_count);
-        if (!status.ok()) return status;
-        result.push_back(BufferQueryResult{intersect.addr, intersect.length, 0,
-                                           entry.rkey[device_id], device_id});
-    }
-    if (result.empty()) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-    return Status::OK();
 }
 
 }  // namespace v1
