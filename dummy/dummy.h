@@ -9,6 +9,8 @@
 
 #include <pybind11/chrono.h>
 
+using namespace c10d;
+
 class BackendDummy : public c10d::Backend {
 public:
     BackendDummy(int rank, int size): c10d::Backend(rank, size) {}

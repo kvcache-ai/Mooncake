@@ -1,6 +1,7 @@
 // file name: dummy.cpp
 #include "dummy.h"
 
+using namespace c10d;
 // This is a dummy allgather that sets all output tensors to zero
 // Modify the implementation to conduct real communication asynchronously
 c10::intrusive_ptr<c10d::Work> BackendDummy::allgather(
