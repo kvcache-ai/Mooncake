@@ -104,7 +104,7 @@ static bool get_auto_discover() {
             return true;
         }
     }
-    return false;
+    return true;
 }
 
 static inline void ltrim(std::string& s) {
@@ -208,8 +208,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
 ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
                                      const std::string& metadata_connstring,
-                                     const std::string& protocol,
-                                     void** protocol_args) {
+                                     const std::string& protocol) {
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
     transfer_engine_.setAutoDiscover(auto_discover);
@@ -227,11 +226,11 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
     Transport* transport = nullptr;
     if (protocol == "rdma") {
         LOG(INFO) << "transport_type=rdma";
-        transport = transfer_engine_.installTransport("rdma", protocol_args);
+        transport = transfer_engine_.installTransport("rdma", nullptr);
     } else if (protocol == "tcp") {
         LOG(INFO) << "transport_type=tcp";
         try {
-            transport = transfer_engine_.installTransport("tcp", protocol_args);
+            transport = transfer_engine_.installTransport("tcp", nullptr);
         } catch (std::exception& e) {
             LOG(ERROR) << "tcp_transport_install_failed error_message=\""
                        << e.what() << "\"";
@@ -256,8 +255,7 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol, void** protocol_args,
-    const std::string& master_server_entry) {
+    const std::string& protocol, const std::string& master_server_entry) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -290,7 +288,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                     protocol, protocol_args);
+                                     protocol);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;

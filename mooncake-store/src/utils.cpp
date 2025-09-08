@@ -91,17 +91,4 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
-static std::string loadNicPriorityMatrix(const std::string &device_name) {
-    auto device_names = formatDeviceNames(device_name);
-    return "{\"cpu:0\": [[" + device_names + "], []]}";
-}
-
-void **rdma_args(const std::string &device_name) {
-    static auto nic_priority_matrix = loadNicPriorityMatrix(device_name);
-    void **args = (void **)malloc(2 * sizeof(void *));
-    args[0] = (void *)nic_priority_matrix.c_str();
-    args[1] = nullptr;
-    return args;
-}
-
 }  // namespace mooncake

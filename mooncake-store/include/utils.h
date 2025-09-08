@@ -98,8 +98,6 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 */
 void* allocate_buffer_allocator_memory(size_t total_size);
 
-void** rdma_args(const std::string& device_name);
-
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;
     const double MB = KB * 1024.0;
