@@ -110,21 +110,39 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
     const std::string& target_address, const void* data, size_t data_size) {
     std::string_view data_view(static_cast<const char*>(data), data_size);
 
+    // For large data, use attachment to avoid copying
+    const size_t ATTACHMENT_THRESHOLD = 1024; // Use attachment for data > 1KB
+    
     auto rpc_result = co_await client_pools_.send_request(
         target_address,
-        [data_view](coro_rpc::coro_rpc_client& client)
+        [data_view, data_size](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            auto result =
-                co_await client
+            
+            if (data_size > ATTACHMENT_THRESHOLD) {
+                // Use attachment for large data - zero copy
+                client.set_req_attachment(data_view);
+                // Send empty data parameter, actual data in attachment
+                auto result = co_await client
+                    .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
+                        std::string_view{});
+                if (!result.has_value()) {
+                    std::cerr << "RPC call failed: " << result.error().msg
+                              << std::endl;
+                }
+            } else {
+                // Use regular parameter for small data
+                auto result = co_await client
                     .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
                         data_view);
-            if (!result.has_value()) {
-                std::cerr << "RPC call failed: " << result.error().msg
-                          << std::endl;
+                if (!result.has_value()) {
+                    std::cerr << "RPC call failed: " << result.error().msg
+                              << std::endl;
+                }
             }
         });
+        
     if (!rpc_result.has_value()) {
-        std::cout << std::make_error_code(ec.error()).message() << std::endl;
+        std::cout << "RPC send request failed" << std::endl;
         co_return result{-1, "RPC call failed"};
     }
     result res;
@@ -161,8 +179,7 @@ async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
             }
         });
         if (!rpc_result.has_value()) {
-            std::cout << std::make_error_code(ec.error()).message()
-                      << std::endl;
+            std::cout << "Tensor RPC send request failed" << std::endl;
             co_return -1;
         }
     co_return 0;
@@ -178,25 +195,46 @@ int CoroRPCCommunicator::receiveData(const std::string& source_address,
 
 async_simple::coro::Lazy<std::string> CoroRPCCommunicator::receiveDataAsync(
     const std::string& source_address, int timeout_ms) {
+    // For attachment-based data reception, we should use a different approach
+    // This method is typically called from the handler when data is received
+    // The actual data reception is handled by the registered handlers
     co_return std::string();
-} // if big string should use attachment
+} // Data reception is handled via context and attachment in handlers
 
 void CoroRPCCommunicator::Impl::handleDataTransfer(
     coro_rpc::context<void> context, std::string_view data) {
-    std::cout << "Handling data transfer: " << data.size() << " bytes"
-              << std::endl;
+    // Check if there's an attachment for large data
+    auto ctx_info = context.get_context_info();
+    auto attachment = ctx_info->get_request_attachment();
+    
+    std::cout << "Handling data transfer - Data: " << data.size() 
+              << " bytes, Attachment: " << attachment.size() << " bytes" << std::endl;
 
     // Call the data receive callback if set
     if (data_receive_callback) {
         std::cout << "Calling data receive callback..." << std::endl;
-        std::string source_address =
-            "unknown"; 
-        std::string data_str(data);
-        data_receive_callback(source_address, data_str);
+        std::string source_address = "unknown"; // Could extract from context if needed
+        
+        // Use attachment if available (for large data), otherwise use data parameter
+        if (!attachment.empty()) {
+            // Use attachment data directly without copying - zero copy approach
+            std::string_view attachment_view = attachment;
+            std::string data_str(attachment_view); // Only copy when necessary for callback
+            data_receive_callback(source_address, data_str);
+        } else {
+            // For small data, use the regular data parameter
+            std::string data_str(data);
+            data_receive_callback(source_address, data_str);
+        }
     } else {
         std::cout << "No data receive callback set!" << std::endl;
     }
 
+    // Echo back the attachment for response (zero-copy)
+    if (!attachment.empty()) {
+        ctx_info->set_response_attachment(attachment);
+    }
+    
     context.response_msg();
 }
 

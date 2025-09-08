@@ -86,7 +86,7 @@ class CoroRPCCommunicator {
         const std::string& source_address, int timeout_ms = -1);
 
     void setDataReceiveCallback(
-        std::function<void(size_t len)> callback);
+        std::function<void(const std::string&, const std::string&)> callback);
 
     std::shared_ptr<Impl> getImpl() { return impl_; }
 
