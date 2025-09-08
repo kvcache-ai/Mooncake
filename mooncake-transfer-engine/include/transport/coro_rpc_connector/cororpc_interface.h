@@ -33,6 +33,7 @@ class CoroRPCInterface {
         pybind11::memoryview getMemoryView() const { 
             return pybind11::memoryview::from_memory(const_cast<char*>(data.data()), data.size(), true);
         }
+        pybind11::object rebuildTensor() const;
     };
 
     class Impl;
@@ -60,12 +61,12 @@ class CoroRPCInterface {
     void setDataReceiveCallback(pybind11::function callback);
     void setTensorReceiveCallback(pybind11::function callback);
 
-    void handleIncomingData(const std::string& source_address,
-                            const std::string& data);
-    void handleIncomingTensor(const std::string& source_address,
-                              const std::string& data,
+    void handleIncomingData(std::string_view source_address,
+                            std::string_view data);
+    void handleIncomingTensor(std::string_view source_address,
+                              std::string_view data,
                               const std::vector<size_t>& shape,
-                              const std::string& dtype);
+                              std::string_view dtype);
 
    private:
     std::unique_ptr<Impl> impl_;

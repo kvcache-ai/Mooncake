@@ -49,7 +49,7 @@ class CoroRPCCommunicator {
 
         std::unique_ptr<coro_rpc::coro_rpc_server> server_;
 
-        std::function<void(const std::string&, const std::string&)>
+        std::function<void(std::string_view, std::string_view)>
             data_receive_callback;
 
         void handleDataTransfer(coro_rpc::context<void> context,
@@ -86,7 +86,7 @@ class CoroRPCCommunicator {
         const std::string& source_address, int timeout_ms = -1);
 
     void setDataReceiveCallback(
-        std::function<void(const std::string&, const std::string&)> callback);
+        std::function<void(std::string_view, std::string_view)> callback);
 
     std::shared_ptr<Impl> getImpl() { return impl_; }
 

@@ -15,7 +15,7 @@ CoroRPCCommunicator::CoroRPCCommunicator() : impl_(std::make_shared<Impl>()) {}
 CoroRPCCommunicator::~CoroRPCCommunicator() { stopServer(); }
 
 void CoroRPCCommunicator::setDataReceiveCallback(
-    std::function<void(const std::string&, const std::string&)> callback) {
+    std::function<void(std::string_view, std::string_view)> callback) {
     std::cout << "Setting data receive callback..." << std::endl;
     impl_->data_receive_callback = callback;
     std::cout << "Data receive callback set successfully" << std::endl;
@@ -213,18 +213,16 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     // Call the data receive callback if set
     if (data_receive_callback) {
         std::cout << "Calling data receive callback..." << std::endl;
-        std::string source_address = "unknown"; // Could extract from context if needed
+        std::string_view source_address = "unknown"; // Could extract from context if needed
         
         // Use attachment if available (for large data), otherwise use data parameter
         if (!attachment.empty()) {
             // Use attachment data directly without copying - zero copy approach
             std::string_view attachment_view = attachment;
-            std::string data_str(attachment_view); // Only copy when necessary for callback
-            data_receive_callback(source_address, data_str);
+            data_receive_callback(source_address, attachment_view);
         } else {
             // For small data, use the regular data parameter
-            std::string data_str(data);
-            data_receive_callback(source_address, data_str);
+            data_receive_callback(source_address, data);
         }
     } else {
         std::cout << "No data receive callback set!" << std::endl;
