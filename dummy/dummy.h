@@ -13,7 +13,7 @@ namespace c10d {
 
 class BackendDummy : public Backend {
 public:
-    BackendDummy(int rank, int size);
+    BackendDummy(int rank, int size): Backend(rank, size) {}
 
     c10::intrusive_ptr<Work> allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
