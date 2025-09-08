@@ -35,15 +35,6 @@ c10::intrusive_ptr<c10d::Work> BackendDummy::allreduce(
     return c10::make_intrusive<WorkDummy>(OpType::ALLGATHER, std::move(future));
 }
 
-// file name: dummy.cpp
-c10::intrusive_ptr<c10d::Backend> BackendDummy::createBackendDummy(
-        const c10::intrusive_ptr<::c10d::Store>& /* unused */,
-        int rank,
-        int size,
-        const std::chrono::duration<float>& /* unused */) {
-    return c10::make_intrusive<BackendDummy>(rank, size);
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createBackendDummy", &BackendDummy::createBackendDummy);
 }

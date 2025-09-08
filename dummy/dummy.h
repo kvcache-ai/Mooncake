@@ -27,10 +27,11 @@ public:
     // The collective communication APIs without a custom implementation
     // will error out if invoked by application code.
     static c10::intrusive_ptr<c10d::Backend> createBackendDummy(
-        const c10::intrusive_ptr<::c10d::Store>& store,
-        int rank,
-        int size,
-        const std::chrono::duration<float>& timeout);
+    c10d::DistributedBackendOptions distBackendOpts,
+    c10::intrusive_ptr<c10d::Backend::Options>
+        backendOptions) {
+        return c10::make_intrusive<BackendDummy>(distBackendOpts.group_rank, distBackendOpts.group_size);
+    }
 
     static void BackendDummyConstructor() __attribute__((constructor)) {
         py::object module = py::module::import("torch.distributed");
@@ -38,7 +39,7 @@ public:
             module.attr("Backend").attr("register_backend");
         // torch.distributed.Backend.register_backend will add `dummy` as a
         // new valid backend.
-        register_backend("dummy", py::cpp_function(createBackendDummy));
+        register_backend("dummy", py::cpp_function(createBackendDummy), true);
     }
 
 };
