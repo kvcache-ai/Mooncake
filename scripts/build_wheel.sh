@@ -202,9 +202,93 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
     python -m build --wheel --outdir ${OUTPUT_DIR}
+    auditwheel repair ${OUTPUT_DIR}/*.whl \
+    --exclude libcurl.so* \
+    --exclude libibverbs.so* \
+    --exclude libmlx5.so* \
+    --exclude libnuma.so* \
+    --exclude libstdc++.so* \
+    --exclude libgcc_s.so* \
+    --exclude libc.so* \
+    --exclude libnghttp2.so* \
+    --exclude libidn2.so* \
+    --exclude librtmp.so* \
+    --exclude libssh.so* \
+    --exclude libpsl.so* \
+    --exclude libssl.so* \
+    --exclude libcrypto.so* \
+    --exclude libgssapi_krb5.so* \
+    --exclude libldap.so* \
+    --exclude liblber.so* \
+    --exclude libbrotlidec.so* \
+    --exclude libz.so* \
+    --exclude libnl-route-3.so* \
+    --exclude libnl-3.so* \
+    --exclude libm.so* \
+    --exclude liblzma.so* \
+    --exclude libunistring.so* \
+    --exclude libgnutls.so* \
+    --exclude libhogweed.so* \
+    --exclude libnettle.so* \
+    --exclude libgmp.so* \
+    --exclude libkrb5.so* \
+    --exclude libk5crypto.so* \
+    --exclude libcom_err.so* \
+    --exclude libkrb5support.so* \
+    --exclude libsasl2.so* \
+    --exclude libbrotlicommon.so* \
+    --exclude libp11-kit.so* \
+    --exclude libtasn1.so* \
+    --exclude libkeyutils.so* \
+    --exclude libresolv.so* \
+    --exclude libffi.so* \
+    --exclude libcuda.so* \
+    --exclude libcudart.so* \
+    --exclude libc10.so* \
+    --exclude libc10_cuda.so* \
+    --exclude libtorch.so* \
+    --exclude libtorch_cpu.so* \
+    --exclude libtorch_cuda.so* \
+    --exclude libtorch_python.so* \
+    --exclude libascendcl.so* \
+    --exclude libhccl.so* \
+    --exclude libmsprofiler.so* \
+    --exclude libgert.so* \
+    --exclude libascendcl_impl.so* \
+    --exclude libge_executor.so* \
+    --exclude libascend_dump.so* \
+    --exclude libgraph.so* \
+    --exclude libruntime.so* \
+    --exclude libascend_watchdog.so* \
+    --exclude libprofapi.so* \
+    --exclude liberror_manager.so* \
+    --exclude libascendalog.so* \
+    --exclude libc_sec.so* \
+    --exclude libhccl_alg.so* \
+    --exclude libhccl_plf.so* \
+    --exclude libascend_protobuf.so* \
+    --exclude libhybrid_executor.so* \
+    --exclude libdavinci_executor.so* \
+    --exclude libge_common.so* \
+    --exclude libge_common_base.so* \
+    --exclude liblowering.so* \
+    --exclude libregister.so* \
+    --exclude libexe_graph.so* \
+    --exclude libmmpa.so* \
+    --exclude libplatform.so* \
+    --exclude libgraph_base.so* \
+    --exclude libruntime_common.so* \
+    --exclude libqos_manager.so* \
+    --exclude libascend_trace.so* \
+    --exclude libmetadef*.so \
+    --exclude libadxl*.so \
+    -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 
 
+# Replace original wheel with repaired wheel
+rm -f ${OUTPUT_DIR}/*.whl
+mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
 
 cd ..
 
