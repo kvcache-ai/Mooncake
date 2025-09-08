@@ -17,8 +17,6 @@
 
 namespace py = pybind11;
 
-#define PYBIND11_DETAILED_ERROR_MESSAGES
-
 namespace mooncake {
 
 c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
