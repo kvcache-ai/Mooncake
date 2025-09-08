@@ -141,21 +141,22 @@ pybind11::object create_numpy_array_from_data(
     std::cout << "DEBUG: element_size = " << element_size << std::endl;
     std::cout << "DEBUG: total_elements = " << total_elements << std::endl;
 
-    // Create a copy of the data
-    std::cout << "DEBUG: Creating data copy..." << std::endl;
-    std::vector<char> data_copy(data, data + total_elements * element_size);
-    std::cout << "DEBUG: Data copy created, size = " << data_copy.size()
-              << std::endl;
+    // Use memoryview to avoid data copy
+    std::cout << "DEBUG: Creating memory view without copying..." << std::endl;
+    size_t data_size = total_elements * element_size;
+    std::cout << "DEBUG: Data size = " << data_size << std::endl;
 
-    std::cout << "DEBUG: About to call frombuffer..." << std::endl;
+    std::cout << "DEBUG: About to call frombuffer with memoryview..." << std::endl;
 
     try {
-        pybind11::bytes bytes_obj(data_copy.data(), data_copy.size());
-        std::cout << "DEBUG: Created bytes object" << std::endl;
+        // Create a memoryview directly from the data pointer without copying
+        pybind11::memoryview mv = pybind11::memoryview::from_memory(
+            const_cast<char*>(data), data_size, true);  // read-only
+        std::cout << "DEBUG: Created memoryview without copying" << std::endl;
 
         pybind11::object array =
-            np.attr("frombuffer")(bytes_obj, pybind11::arg("dtype") = np_dtype);
-        std::cout << "DEBUG: Created array from buffer successfully"
+            np.attr("frombuffer")(mv, pybind11::arg("dtype") = np_dtype);
+        std::cout << "DEBUG: Created array from memoryview successfully"
                   << std::endl;
 
         // Convert shape to tuple manually
