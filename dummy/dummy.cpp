@@ -1,5 +1,5 @@
 // file name: dummy.cpp
-#include "dummy.hpp"
+#include "dummy.h"
 
 namespace c10d {
 
