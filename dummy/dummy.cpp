@@ -3,7 +3,7 @@
 
 // This is a dummy allgather that sets all output tensors to zero
 // Modify the implementation to conduct real communication asynchronously
-c10::intrusive_ptr<Work> BackendDummy::allgather(
+c10::intrusive_ptr<c10d::Work> BackendDummy::allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
         std::vector<at::Tensor>& inputTensors,
         const AllgatherOptions& /* unused */) {
@@ -21,7 +21,7 @@ c10::intrusive_ptr<Work> BackendDummy::allgather(
 
 // This is a dummy allreduce that sets all output tensors to zero
 // Modify the implementation to conduct real communication asynchronously
-c10::intrusive_ptr<Work> BackendDummy::allreduce(
+c10::intrusive_ptr<c10d::Work> BackendDummy::allreduce(
         std::vector<at::Tensor>& tensors,
         const AllreduceOptions& opts) {
     for (auto& tensor : tensors) {

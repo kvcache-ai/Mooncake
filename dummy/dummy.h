@@ -13,12 +13,12 @@ class BackendDummy : public c10d::Backend {
 public:
     BackendDummy(int rank, int size): c10d::Backend(rank, size) {}
 
-    c10::intrusive_ptr<Work> allgather(
+    c10::intrusive_ptr<c10d::Work> allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
         std::vector<at::Tensor>& inputTensors,
         const AllgatherOptions& opts = AllgatherOptions()) override;
 
-    c10::intrusive_ptr<Work> allreduce(
+    c10::intrusive_ptr<c10d::Work> allreduce(
         std::vector<at::Tensor>& tensors,
         const AllreduceOptions& opts = AllreduceOptions()) override;
 
@@ -41,12 +41,12 @@ public:
 
 };
 
-class WorkDummy : public Work {
+class WorkDummy : public c10d::Work {
 public:
     WorkDummy(
       OpType opType,
       c10::intrusive_ptr<c10::ivalue::Future> future) // future of the output
-      : Work(
+      : c10d::Work(
           -1, // rank, only used by recvAnySource, irrelevant in this demo
           opType),
       future_(std::move(future)) {}
