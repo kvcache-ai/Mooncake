@@ -41,9 +41,6 @@ AutoPortBinder::AutoPortBinder(int min_port, int max_port)
         socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd_ < 0) continue;
 
-        int opt = 1;
-        setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
         sockaddr_in addr = {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
