@@ -18,14 +18,6 @@ if (WITH_STORE)
     include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
 endif()
 
-if (WITH_EP)
-    include_directories("../mooncake-ep/include")
-
-    find_package(Torch REQUIRED)
-    # https://github.com/pytorch/pytorch/issues/108041
-    find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
-endif()
-
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
 
@@ -70,14 +62,6 @@ if (WITH_STORE)
     )
 endif()
 
-if (WITH_EP)
-    pybind11_add_module(ep ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        ep/ep_py.cpp
-        integration_utils.h
-    )
-    target_link_libraries(ep PUBLIC mooncake_ep ${TORCH_PYTHON_LIBRARY} ibverbs mlx5)
-endif ()
-
 message("${PYTHON_SYS_PATH}")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
@@ -108,10 +92,6 @@ install(
 
 if (WITH_STORE)
     install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-endif()
-
-if (WITH_EP)
-    install(TARGETS ep DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
