@@ -52,10 +52,6 @@ public:
           -1, // rank, only used by recvAnySource, irrelevant in this demo
           opType),
       future_(std::move(future)) {}
-    bool isCompleted() override;
-    bool isSuccess() const override;
-    bool wait(std::chrono::milliseconds timeout = kUnsetTimeout) override;
-    virtual c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
 
 private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
