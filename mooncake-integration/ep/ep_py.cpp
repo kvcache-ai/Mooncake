@@ -17,8 +17,7 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-void testBinding1(
-    c10::intrusive_ptr<c10d::DistributedBackendOptions> distBackendOpts) {}
+void testBinding1(py::object distBackendOpts) {}
 
 void testBinding2(c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
                       backendOptions) {}
