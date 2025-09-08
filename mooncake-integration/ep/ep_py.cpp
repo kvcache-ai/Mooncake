@@ -20,25 +20,23 @@ namespace py = pybind11;
 namespace mooncake {
 
 c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
-    py::object distBackendOptsObj,
+    py::object distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
-    auto distBackendOpts =
-        distBackendOptsObj.cast<c10d::DistributedBackendOptions>();
     return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions);
+        distBackendOpts.attr("store").cast<c10::intrusive_ptr<::c10d::Store>>(),
+        distBackendOpts.attr("group_rank").cast<int>(),
+        distBackendOpts.attr("group_size").cast<int>(), backendOptions);
 }
 
 c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
-    py::object distBackendOptsObj,
+    py::object distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
-    auto distBackendOpts =
-        distBackendOptsObj.cast<c10d::DistributedBackendOptions>();
     return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions, true);
+        distBackendOpts.attr("store").cast<c10::intrusive_ptr<::c10d::Store>>(),
+        distBackendOpts.attr("group_rank").cast<int>(),
+        distBackendOpts.attr("group_size").cast<int>(), backendOptions, true);
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
