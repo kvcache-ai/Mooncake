@@ -42,6 +42,14 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
     return true;
 }
 
+bool CoroRPCCommunicator::startServerImpl(bool is_async){
+    if(is_async){
+        return this -> startServerAsync();
+    } else {
+        return this -> startServer();
+    }
+}
+
 bool CoroRPCCommunicator::startServer() {
     if (!impl_->server_ || impl_->config.listen_address.empty()) return false;
 
@@ -100,34 +108,28 @@ int CoroRPCCommunicator::sendData(const std::string& target_address,
 
 async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
     const std::string& target_address, const void* data, size_t data_size) {
-    try {
-        std::string_view data_view(static_cast<const char*>(data), data_size);
+    std::string_view data_view(static_cast<const char*>(data), data_size);
 
-        auto rpc_result = co_await client_pools_.send_request(
-            target_address,
-            [data_view](coro_rpc::coro_rpc_client& client)
-                -> async_simple::coro::Lazy<void> {
-                auto result =
-                    co_await client
-                        .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
-                            data_view);
-                if (!result.has_value()) {
-                    std::cerr << "RPC call failed: " << result.error().msg
-                              << std::endl;
-                }
-            });
-
-        result res;
-        res.code = 0;
-        co_return res;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Exception in sendDataAsync: " << e.what() << std::endl;
-        result res;
-        res.code = -1;
-        res.err_msg = e.what();
-        co_return res;
+    auto rpc_result = co_await client_pools_.send_request(
+        target_address,
+        [data_view](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<void> {
+            auto result =
+                co_await client
+                    .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
+                        data_view);
+            if (!result.has_value()) {
+                std::cerr << "RPC call failed: " << result.error().msg
+                          << std::endl;
+            }
+        });
+    if (!rpc_result.has_value()) {
+        std::cout << std::make_error_code(ec.error()).message() << std::endl;
+        co_return result{-1, "RPC call failed"};
     }
+    result res;
+    res.code = 0;
+    co_return res;
 }
 
 int CoroRPCCommunicator::sendTensor(const std::string& target_address,
@@ -142,30 +144,28 @@ int CoroRPCCommunicator::sendTensor(const std::string& target_address,
 
 async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
     const std::string& target_address, const TensorInfo& tensor) {
-    try {
         auto rpc_result = co_await client_pools_.send_request(
             target_address,
-            [&tensor](coro_rpc::coro_rpc_client& client)
-                -> async_simple::coro::Lazy<void> {
-                client.set_req_attachment(std::string_view(
-                    (char*)tensor.data_ptr, tensor.total_bytes));
+        [&tensor](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<void> {
+            client.set_req_attachment(std::string_view(
+                (char*)tensor.data_ptr, tensor.total_bytes));
 
-                auto result = co_await client.call<
-                    &CoroRPCCommunicator::Impl::handleTensorTransfer>();
+            auto result = co_await client.call<
+                &CoroRPCCommunicator::Impl::handleTensorTransfer>();
 
-                if (!result.has_value()) {
-                    std::cerr
-                        << "Tensor RPC call failed: " << result.error().msg
-                        << std::endl;
-                }
-            });
-
-        co_return 0;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Exception in sendTensorAsync: " << e.what() << std::endl;
-        co_return -1;
-    }
+            if (!result.has_value()) {
+                std::cerr
+                    << "Tensor RPC call failed: " << result.error().msg
+                    << std::endl;
+            }
+        });
+        if (!rpc_result.has_value()) {
+            std::cout << std::make_error_code(ec.error()).message()
+                      << std::endl;
+            co_return -1;
+        }
+    co_return 0;
 }
 
 int CoroRPCCommunicator::receiveData(const std::string& source_address,
@@ -173,15 +173,13 @@ int CoroRPCCommunicator::receiveData(const std::string& source_address,
                                      int timeout_ms) {
     auto result = async_simple::coro::syncAwait(
         receiveDataAsync(source_address, timeout_ms));
-    // TODO: Copy result to buffer and return size
     return 0;
 }
 
 async_simple::coro::Lazy<std::string> CoroRPCCommunicator::receiveDataAsync(
     const std::string& source_address, int timeout_ms) {
-    // TODO: Implement actual receive logic
     co_return std::string();
-}
+} // if big string should use attachment
 
 void CoroRPCCommunicator::Impl::handleDataTransfer(
     coro_rpc::context<void> context, std::string_view data) {
@@ -192,7 +190,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     if (data_receive_callback) {
         std::cout << "Calling data receive callback..." << std::endl;
         std::string source_address =
-            "unknown";  // You may want to extract this from context
+            "unknown"; 
         std::string data_str(data);
         data_receive_callback(source_address, data_str);
     } else {
@@ -236,21 +234,6 @@ void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
 
     ctx_info->set_response_attachment(attachment);
     context.response_msg();
-}
-
-std::unique_ptr<CoroRPCCommunicator> createClientPool(size_t pool_size,
-                                                      size_t timeout_seconds) {
-    Config config;
-    config.pool_size = pool_size;
-    config.timeout_seconds = timeout_seconds;
-
-    auto communicator = std::make_unique<CoroRPCCommunicator>();
-    if (communicator->initialize(config)) {
-        std::cout << "Created communicator with default pool size: "
-                  << pool_size << std::endl;
-        return communicator;
-    }
-    return nullptr;
 }
 
 std::unique_ptr<CoroRPCCommunicator> createServer(

@@ -17,6 +17,7 @@ class CoroRPCInterface {
         size_t data_size = 0;
 
         pybind11::bytes getBytes() const { return pybind11::bytes(data); }
+        pybind11::memoryview getMemoryView() const { return pybind11::memoryview(data); }
     };
 
     struct ReceivedTensor {
@@ -25,13 +26,9 @@ class CoroRPCInterface {
         std::vector<size_t> shape;
         std::string dtype;
         size_t total_bytes = 0;
-
-        pybind11::object rebuildTensor() const;
         size_t getDataSize() const { return data.size(); }
         pybind11::bytes getDataAsBytes() const { return pybind11::bytes(data); }
-
-       private:
-        pybind11::object rebuildTensorInternal() const;
+        pybind11::memoryview getMemoryView() const { return pybind11::memoryview(data); }
     };
 
     class Impl;

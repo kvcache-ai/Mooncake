@@ -65,6 +65,7 @@ class CoroRPCCommunicator {
     ~CoroRPCCommunicator();
 
     bool initialize(const Config& config);
+    bool startServerImpl(bool is_async = true);
     bool startServer();
     bool startServerAsync();
     void stopServer();
@@ -85,7 +86,7 @@ class CoroRPCCommunicator {
         const std::string& source_address, int timeout_ms = -1);
 
     void setDataReceiveCallback(
-        std::function<void(const std::string&, const std::string&)> callback);
+        std::function<void(size_t len)> callback);
 
     std::shared_ptr<Impl> getImpl() { return impl_; }
 
@@ -94,8 +95,6 @@ class CoroRPCCommunicator {
     std::shared_ptr<Impl> impl_;
 };
 
-std::unique_ptr<CoroRPCCommunicator> createClientPool(
-    size_t pool_size = 10, size_t timeout_seconds = 30);
 std::unique_ptr<CoroRPCCommunicator> createServer(
     const std::string& listen_address, size_t thread_count = 0);
 
