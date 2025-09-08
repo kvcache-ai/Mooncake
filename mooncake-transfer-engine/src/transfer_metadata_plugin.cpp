@@ -195,7 +195,10 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         CURL *h = nullptr;
         ThreadLocalCurl() {
             h = curl_easy_init();
-            if (!h) throw std::runtime_error("HTTPStoragePlugin: curl_easy_init failed; cannot initialize HTTP storage plugin functionality.");
+            if (!h)
+                throw std::runtime_error(
+                    "HTTPStoragePlugin: curl_easy_init failed; cannot "
+                    "initialize HTTP storage plugin functionality.");
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
