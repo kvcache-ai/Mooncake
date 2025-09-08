@@ -19,11 +19,6 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-void testBinding1(c10d::DistributedBackendOptions distBackendOpts) {}
-
-void testBinding2(c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
-                      backendOptions) {}
-
 c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
@@ -64,8 +59,6 @@ std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
 }
 
 PYBIND11_MODULE(ep, m) {
-    m.def("test_binding_1", &testBinding1);
-    m.def("test_binding_2", &testBinding2);
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
