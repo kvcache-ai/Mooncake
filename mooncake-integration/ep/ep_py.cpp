@@ -1,6 +1,9 @@
 
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <mooncake_backend.h>
 #include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>  // For GIL management
