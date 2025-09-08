@@ -230,7 +230,7 @@ pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
                                                  pybind11::bytes data,
                                                  pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
-
+    
     auto future_module = pybind11::module_::import("asyncio");
     auto future_obj = future_module.attr("Future")();
 
@@ -242,12 +242,14 @@ pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
 
     auto communicator = impl_->communicator.get();
     auto target_addr = std::move(target_address);
-
     std::string data_str = data;
 
     auto future_ptr = std::make_shared<pybind11::object>(future_obj);
     pybind11::object loop_obj =
         pybind11::reinterpret_borrow<pybind11::object>(loop);
+
+    // Release GIL before starting coroutine
+    pybind11::gil_scoped_release release;
 
     auto coro_lambda = [communicator, target_addr, data_str, future_ptr,
                         loop_obj]() -> async_simple::coro::Lazy<void> {
@@ -408,6 +410,9 @@ pybind11::object CoroRPCInterface::sendTensorAsync(std::string& target_address,
     auto future_ptr = std::make_shared<pybind11::object>(future_obj);
     pybind11::object loop_obj =
         pybind11::reinterpret_borrow<pybind11::object>(loop);
+
+    // Release GIL before starting coroutine
+    pybind11::gil_scoped_release release;
 
     // Schedule coroutine to run asynchronously
     auto coro_lambda = [communicator, target_addr, tensor_info, future_ptr,
