@@ -9,9 +9,9 @@
 
 #include <pybind11/chrono.h>
 
-class BackendDummy : public Backend {
+class BackendDummy : public c10d::Backend {
 public:
-    BackendDummy(int rank, int size): Backend(rank, size) {}
+    BackendDummy(int rank, int size): c10d::Backend(rank, size) {}
 
     c10::intrusive_ptr<Work> allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
@@ -24,7 +24,7 @@ public:
 
     // The collective communication APIs without a custom implementation
     // will error out if invoked by application code.
-    static c10::intrusive_ptr<Backend> createBackendDummy(
+    static c10::intrusive_ptr<c10d::Backend> createBackendDummy(
         const c10::intrusive_ptr<::c10d::Store>& store,
         int rank,
         int size,

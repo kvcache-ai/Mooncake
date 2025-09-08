@@ -35,7 +35,7 @@ c10::intrusive_ptr<Work> BackendDummy::allreduce(
 }
 
 // file name: dummy.cpp
-c10::intrusive_ptr<Backend> BackendDummy::createBackendDummy(
+c10::intrusive_ptr<c10d::Backend> BackendDummy::createBackendDummy(
         const c10::intrusive_ptr<::c10d::Store>& /* unused */,
         int rank,
         int size,
