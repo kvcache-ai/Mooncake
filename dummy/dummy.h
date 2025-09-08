@@ -9,8 +9,6 @@
 
 #include <pybind11/chrono.h>
 
-namespace c10d {
-
 class BackendDummy : public Backend {
 public:
     BackendDummy(int rank, int size): Backend(rank, size) {}
@@ -56,4 +54,3 @@ public:
 private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
 };
-} // namespace c10d

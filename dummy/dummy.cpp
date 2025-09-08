@@ -1,8 +1,6 @@
 // file name: dummy.cpp
 #include "dummy.h"
 
-namespace c10d {
-
 // This is a dummy allgather that sets all output tensors to zero
 // Modify the implementation to conduct real communication asynchronously
 c10::intrusive_ptr<Work> BackendDummy::allgather(
@@ -48,4 +46,3 @@ c10::intrusive_ptr<Backend> BackendDummy::createBackendDummy(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createBackendDummy", &BackendDummy::createBackendDummy);
 }
-} // namespace c10d
