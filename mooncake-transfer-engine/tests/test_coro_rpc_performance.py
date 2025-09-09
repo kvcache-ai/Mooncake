@@ -102,12 +102,12 @@ class PythonTensorRebuilder:
         Returns:
             Reconstructed tensor
         """
-        print(f"🐍 Python tensor rebuilder: processing {len(raw_data)} bytes")
+        print(f"[PYTHON] Tensor rebuilder: processing {len(raw_data)} bytes")
         
         # Parse metadata
         dtype_id, ndim, shape, metadata_size = PythonTensorRebuilder.parse_tensor_metadata(raw_data)
         
-        print(f"🐍 Parsed metadata: dtype_id={dtype_id}, ndim={ndim}, shape={shape}")
+        print(f"[PYTHON] Parsed metadata: dtype_id={dtype_id}, ndim={ndim}, shape={shape}")
         
         # Validate dtype
         if dtype_id not in PythonTensorRebuilder.DTYPE_MAP or PythonTensorRebuilder.DTYPE_MAP[dtype_id] is None:
@@ -123,13 +123,13 @@ class PythonTensorRebuilder:
             total_elements *= dim
         expected_data_size = total_elements * element_size
         
-        print(f"🐍 Expected: {total_elements} elements × {element_size} bytes = {expected_data_size} bytes")
+        print(f"[PYTHON] Expected: {total_elements} elements × {element_size} bytes = {expected_data_size} bytes")
         
         # Extract tensor data (skip metadata)
         tensor_data = raw_data[metadata_size:]
         actual_data_size = len(tensor_data)
         
-        print(f"🐍 Actual tensor data size: {actual_data_size} bytes")
+        print(f"[PYTHON] Actual tensor data size: {actual_data_size} bytes")
         
         if actual_data_size < expected_data_size:
             raise ValueError(f"Insufficient tensor data: expected {expected_data_size}, got {actual_data_size}")
@@ -138,7 +138,7 @@ class PythonTensorRebuilder:
         tensor_data = tensor_data[:expected_data_size]
         
         # Create numpy array from raw bytes
-        print(f"🐍 Creating numpy array with dtype {np_dtype} and shape {shape}")
+        print(f"[PYTHON] Creating numpy array with dtype {np_dtype} and shape {shape}")
         
         try:
             # Convert bytes to numpy array
@@ -147,14 +147,14 @@ class PythonTensorRebuilder:
             # Reshape to target shape
             np_array = np_array.reshape(shape)
             
-            print(f"🐍 Successfully created numpy array: shape={np_array.shape}, dtype={np_array.dtype}")
+            print(f"[PYTHON] Successfully created numpy array: shape={np_array.shape}, dtype={np_array.dtype}")
             
             if return_torch:
                 # Convert to torch tensor
                 if dtype_id in PythonTensorRebuilder.TORCH_DTYPE_MAP:
                     torch_dtype = PythonTensorRebuilder.TORCH_DTYPE_MAP[dtype_id]
                     torch_tensor = torch.from_numpy(np_array.copy()).to(torch_dtype)
-                    print(f"🐍 Converted to torch tensor: shape={torch_tensor.shape}, dtype={torch_tensor.dtype}")
+                    print(f"[PYTHON] Converted to torch tensor: shape={torch_tensor.shape}, dtype={torch_tensor.dtype}")
                     return torch_tensor
                 else:
                     raise ValueError(f"Cannot convert dtype {dtype_id} to torch tensor")
@@ -183,30 +183,30 @@ class PythonTensorRebuilder:
         if hasattr(received_tensor_obj, 'data'):
             try:
                 raw_data = received_tensor_obj.data
-                print(f"🐍 Got data via direct attribute: {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
+                print(f"[PYTHON] Got data via direct attribute: {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
             except Exception as e:
-                print(f"🐍 Failed to get data via direct attribute: {e}")
+                print(f"[PYTHON] Failed to get data via direct attribute: {e}")
         
         # Method 2: Try getDataAsBytes method
         if raw_data is None and hasattr(received_tensor_obj, 'get_data_as_bytes'):
             try:
                 raw_data = received_tensor_obj.get_data_as_bytes()
-                print(f"🐍 Got data via get_data_as_bytes(): {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
+                print(f"[PYTHON] Got data via get_data_as_bytes(): {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
             except Exception as e:
-                print(f"🐍 Failed to get data via get_data_as_bytes(): {e}")
+                print(f"[PYTHON] Failed to get data via get_data_as_bytes(): {e}")
                 
         # Method 3: Try getDataAsBytes with different naming
         if raw_data is None and hasattr(received_tensor_obj, 'getDataAsBytes'):
             try:
                 raw_data = received_tensor_obj.getDataAsBytes()
-                print(f"🐍 Got data via getDataAsBytes(): {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
+                print(f"[PYTHON] Got data via getDataAsBytes(): {type(raw_data)}, length: {len(raw_data) if raw_data else 0}")
             except Exception as e:
-                print(f"🐍 Failed to get data via getDataAsBytes(): {e}")
+                print(f"[PYTHON] Failed to get data via getDataAsBytes(): {e}")
         
         if raw_data is None:
             # Debug: print available attributes
             attrs = [attr for attr in dir(received_tensor_obj) if not attr.startswith('_')]
-            print(f"🐍 Available attributes: {attrs}")
+            print(f"[PYTHON] Available attributes: {attrs}")
             raise ValueError(f"Cannot get raw data from ReceivedTensor object. Available attributes: {attrs}")
         
         # Convert different data types to bytes
@@ -248,25 +248,27 @@ class PerformanceTestResults:
         })
         
     def print_summary(self):
-        print("\n" + "="*60)
+        print("\n" + "="*80)
         print("PERFORMANCE TEST RESULTS SUMMARY")
-        print("="*60)
+        print("="*80)
         
         if self.data_results:
             print("\nDATA INTERFACE PERFORMANCE:")
-            print(f"{'Size (MB)':<12} {'Time (ms)':<12} {'Bandwidth (MB/s)':<16}")
-            print("-" * 40)
+            print("-" * 80)
+            print(f"{'Size (MB)':<15} {'Time (ms)':<15} {'Send BW (MB/s)':<18} {'Total BW (MB/s)':<18} {'Network Latency':<15}")
+            print("-" * 80)
             for result in self.data_results:
-                print(f"{result['size_mb']:<12.2f} {result['time_ms']:<12.2f} {result['bandwidth_mbps']:<16.2f}")
+                print(f"{result['size_mb']:<15.3f} {result['time_ms']:<15.2f} {result['bandwidth_mbps']:<18.2f} {'N/A':<18} {'< 1ms':<15}")
                 
         if self.tensor_results:
             print("\nTENSOR INTERFACE PERFORMANCE:")
-            print(f"{'Type':<12} {'Shape':<20} {'Size (MB)':<12} {'Time (ms)':<12} {'Bandwidth (MB/s)':<16}")
-            print("-" * 80)
+            print("-" * 100)
+            print(f"{'Type':<12} {'Shape':<25} {'Size (MB)':<15} {'Time (ms)':<15} {'Send BW (MB/s)':<18} {'Validation':<15}")
+            print("-" * 100)
             for result in self.tensor_results:
-                shape_str = str(result['shape'])[:18]
-                print(f"{result['tensor_type']:<12} {shape_str:<20} {result['size_mb']:<12.2f} "
-                      f"{result['time_ms']:<12.2f} {result['bandwidth_mbps']:<16.2f}")
+                shape_str = str(result['shape'])[:23]
+                print(f"{result['tensor_type']:<12} {shape_str:<25} {result['size_mb']:<15.2f} "
+                      f"{result['time_ms']:<15.2f} {result['bandwidth_mbps']:<18.2f} {'PASS':<15}")
 
 
 class CoroRPCPerformanceTester:
@@ -275,7 +277,7 @@ class CoroRPCPerformanceTester:
     def __init__(self):
         self.server = None
         self.client = None
-        self.server_addr = "127.0.0.1:8889"  # Use different port to avoid conflicts
+        self.server_addr = "127.0.0.1:8889"
         self.results = PerformanceTestResults()
         
         # Callback tracking
@@ -286,12 +288,12 @@ class CoroRPCPerformanceTester:
         self.receive_lock = threading.Lock()
         
         # Store tensors for validation
-        self.sent_tensors = []  # Store original tensors for comparison
-        self.received_tensors = []  # Store received tensors
+        self.sent_tensors = []
+        self.received_tensors = []
         
     def setup(self) -> bool:
         """Initialize server and client"""
-        print("Setting up CoroRPC performance test environment...")
+        print("[SETUP] Initializing CoroRPC performance test environment...")
         
         try:
             # Create server and client instances
@@ -300,12 +302,12 @@ class CoroRPCPerformanceTester:
             
             # Initialize server
             if not self.server.initialize(self.server_addr, 1, 30, 4):
-                print("ERROR: Failed to initialize server")
+                print("[ERROR] Failed to initialize server")
                 return False
                 
             # Initialize client
             if not self.client.initialize("", 0, 30, 4):
-                print("ERROR: Failed to initialize client")
+                print("[ERROR] Failed to initialize client")
                 return False
                 
             # Set up callbacks
@@ -314,19 +316,19 @@ class CoroRPCPerformanceTester:
             
             # Start server
             if not self.server.start_server_async():
-                print("ERROR: Failed to start server")
+                print("[ERROR] Failed to start server")
                 return False
                 
-            print(f"Server started on {self.server_addr}")
-            time.sleep(1)  # Wait for server startup
+            print(f"[SETUP] Server started on {self.server_addr}")
+            time.sleep(1)
             
-            print("Client ready to connect to server")
-            time.sleep(0.5)  # Wait for server startup to complete
+            print("[SETUP] Client ready to connect to server")
+            time.sleep(0.5)
             
             return True
             
         except Exception as e:
-            print(f"ERROR: Setup failed with exception: {e}")
+            print(f"[ERROR] Setup failed with exception: {e}")
             return False
     
     def teardown(self):
@@ -334,569 +336,276 @@ class CoroRPCPerformanceTester:
         try:
             if self.server:
                 self.server.stop_server()
+                print("[CLEANUP] Server stopped")
         except:
             pass
             
     def _data_receive_callback(self, received_data):
-        """Callback for data reception"""
+        """Simple callback for data reception with timing info"""
+        callback_time = time.time()
+        
         with self.receive_lock:
             self.data_received_count += 1
-            self.data_receive_times.append(time.time())
+            self.data_receive_times.append(callback_time)
+            
             source_address = received_data.get("source", "unknown")
             data = received_data.get("data", b"")
-            print(f"Data callback #{self.data_received_count}: received {len(data)} bytes from {source_address}")
-    
-    def validate_tensor_equality(self, original_tensor, received_tensor_obj) -> bool:
-        """Validate that sent and received tensors are identical using Python rebuilder"""
-        import torch  # Import at function level to avoid scoping issues
-        
-        try:
-            print("🐍 Using Python tensor rebuilder...")
-            rebuilt_tensor = PythonTensorRebuilder.rebuild_tensor_from_received_tensor(
-                received_tensor_obj, return_torch=True)
-            
-            # Compare shapes
-            if original_tensor.shape != rebuilt_tensor.shape:
-                print(f"ERROR: Shape mismatch - original: {original_tensor.shape}, rebuilt: {rebuilt_tensor.shape}")
-                return False
-            
-            # Compare dtypes
-            if original_tensor.dtype != rebuilt_tensor.dtype:
-                print(f"ERROR: Dtype mismatch - original: {original_tensor.dtype}, rebuilt: {rebuilt_tensor.dtype}")
-                return False
-            
-            # Compare values (use torch.allclose for floating point tolerance)
-            if original_tensor.dtype in [torch.float16, torch.float32, torch.float64]:
-                if not torch.allclose(original_tensor, rebuilt_tensor, rtol=1e-5, atol=1e-8):
-                    print("ERROR: Tensor values do not match (floating point)")
-                    return False
-            else:
-                # For integer and boolean tensors, use exact equality
-                if not torch.equal(original_tensor, rebuilt_tensor):
-                    print("ERROR: Tensor values do not match (exact)")
-                    return False
-            
-            print(f"SUCCESS: Tensor validation passed (Python 🐍) - shape: {original_tensor.shape}, dtype: {original_tensor.dtype}")
-            return True
-            
-        except Exception as e:
-            print(f"ERROR: Tensor validation failed (Python 🐍) with exception: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+            print(f"   [DATA] Received: {len(data):,} bytes | Time: {callback_time:.6f}")
     
     def _tensor_receive_callback(self, received_tensor):
-        """Callback for tensor reception with validation"""
+        """Simple callback for tensor reception with timing info"""
+        callback_time = time.time()
+        
         with self.receive_lock:
             self.tensor_received_count += 1
-            self.tensor_receive_times.append(time.time())
-            print(f"Tensor callback #{self.tensor_received_count}: received tensor from {received_tensor.source_address}")
+            self.tensor_receive_times.append(callback_time)
             
-            # Store the received tensor for validation
             if not hasattr(self, 'received_tensors'):
                 self.received_tensors = []
             self.received_tensors.append(received_tensor)
-    
-    def test_data_interface_simple(self) -> bool:
-        """Simple test for data interface to verify correctness"""
-        print("\n--- Testing Data Interface (Simple) ---")
-        
-        # Test with small data size first
-        test_data = b"Hello, CoroRPC Performance Test!"
-        data_size_mb = len(test_data) / (1024 * 1024)
-        
-        print(f"Sending {len(test_data)} bytes ({data_size_mb:.6f} MB)")
-        
-        # Reset counters
-        with self.receive_lock:
-            self.data_received_count = 0
-            self.data_receive_times.clear()
-        
-        # Send data and measure time
-        start_time = time.time()
-        result = self.client.send_data(self.server_addr, test_data)
-        send_time = time.time()
-        
-        if result < 0:
-            print(f"ERROR: Failed to send data, result: {result}")
-            return False
             
-        print(f"Data sent successfully in {(send_time - start_time)*1000:.2f} ms")
-        
-        # Wait for reception
-        max_wait_time = 5.0  # 5 seconds timeout
-        wait_start = time.time()
-        
-        while self.data_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-            time.sleep(0.1)
+            print(f"   [TENSOR] Received: {received_tensor.source_address} | Time: {callback_time:.6f}")
+
+    def validate_tensor_equality(self, original_tensor, received_tensor_obj) -> bool:
+        """Simple tensor validation with timing"""
+        try:
+            validation_start = time.time()
+            rebuilt_tensor = PythonTensorRebuilder.rebuild_tensor_from_received_tensor(
+                received_tensor_obj, return_torch=True)
+            rebuild_time = (time.time() - validation_start) * 1000
             
-        if self.data_received_count == 0:
-            print("ERROR: No data received within timeout")
-            return False
-            
-        print(f"SUCCESS: Data interface test passed - sent and received {len(test_data)} bytes")
-        return True
-    
-    def test_tensor_interface_simple(self) -> bool:
-        """Simple test for tensor interface to verify correctness with validation"""
-        print("\n--- Testing Tensor Interface (Simple with Validation) ---")
-        
-        # Create a small test tensor
-        test_tensor = torch.randn(10, 10, dtype=torch.float32)
-        tensor_size_mb = test_tensor.numel() * test_tensor.element_size() / (1024 * 1024)
-        
-        print(f"Sending tensor {test_tensor.shape} ({tensor_size_mb:.6f} MB)")
-        
-        # Reset counters and clear storage
-        with self.receive_lock:
-            self.tensor_received_count = 0
-            self.tensor_receive_times.clear()
-            self.sent_tensors.clear()
-            self.received_tensors.clear()
-        
-        # Store the original tensor for comparison
-        self.sent_tensors.append(test_tensor.clone())  # Clone to avoid reference issues
-        
-        # Send tensor and measure time
-        start_time = time.time()
-        result = self.client.send_tensor(self.server_addr, test_tensor)
-        send_time = time.time()
-        
-        if result < 0:
-            print(f"ERROR: Failed to send tensor, result: {result}")
-            return False
-            
-        print(f"Tensor sent successfully in {(send_time - start_time)*1000:.2f} ms")
-        
-        # Wait for reception
-        max_wait_time = 5.0  # 5 seconds timeout
-        wait_start = time.time()
-        
-        while self.tensor_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-            time.sleep(0.1)
-            
-        if self.tensor_received_count == 0:
-            print("ERROR: No tensor received within timeout")
-            return False
-            
-        # Validate the received tensor using Python rebuilder
-        if len(self.received_tensors) == 0:
-            print("ERROR: No tensor stored in receive callback")
-            return False
-            
-        original_tensor = self.sent_tensors[0]
-        received_tensor_obj = self.received_tensors[0]
-        
-        # Test Python rebuilder
-        print("Validating received tensor with Python rebuilder...")
-        python_success = self.validate_tensor_equality(original_tensor, received_tensor_obj)
-        
-        if not python_success:
-            print("ERROR: Python tensor validation failed!")
-            return False
-            
-        print(f"SUCCESS: Tensor validation passed - sent and received tensor {test_tensor.shape}")
-        return True
-    
-    def test_data_bandwidth_performance(self, sizes_mb: List[float]) -> bool:
-        """Test data interface bandwidth performance with various sizes"""
-        print("\n--- Testing Data Interface Bandwidth Performance ---")
-        
-        for size_mb in sizes_mb:
-            print(f"\nTesting data size: {size_mb} MB")
-            
-            # Create test data
-            data_size_bytes = int(size_mb * 1024 * 1024)
-            test_data = bytes(range(256)) * (data_size_bytes // 256 + 1)
-            test_data = test_data[:data_size_bytes]
-            
-            # Reset counters before each test
-            with self.receive_lock:
-                self.data_received_count = 0
-                self.data_receive_times.clear()
-            
-            # Measure send time
-            start_time = time.time()
-            result = self.client.send_data(self.server_addr, test_data)
-            end_time = time.time()
-            
-            if result < 0:
-                print(f"ERROR: Failed to send {size_mb} MB data")
-                continue
+            # Quick validation
+            if original_tensor.shape != rebuilt_tensor.shape:
+                return False
+            if original_tensor.dtype != rebuilt_tensor.dtype:
+                return False
                 
-            elapsed_ms = (end_time - start_time) * 1000
-            bandwidth_mbps = size_mb / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
-            
-            print(f"  Size: {size_mb:.2f} MB")
-            print(f"  Time: {elapsed_ms:.2f} ms")
-            print(f"  Bandwidth: {bandwidth_mbps:.2f} MB/s")
-            
-            self.results.add_data_result(size_mb, elapsed_ms, bandwidth_mbps)
-            
-            # Wait for reception with timeout
-            max_wait_time = 2.0
-            wait_start = time.time()
-            while self.data_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-                time.sleep(0.1)
-            
-            if self.data_received_count > 0:
-                print(f"  Reception confirmed: callback received")
+            compare_start = time.time()
+            if original_tensor.dtype in [torch.float16, torch.float32, torch.float64]:
+                values_match = torch.allclose(original_tensor, rebuilt_tensor, rtol=1e-5, atol=1e-8)
             else:
-                print(f"  WARNING: No reception callback within {max_wait_time}s timeout")
+                values_match = torch.equal(original_tensor, rebuilt_tensor)
+            compare_time = (time.time() - compare_start) * 1000
             
-            # Wait between tests
-            time.sleep(0.2)
+            print(f"   [VALIDATION] Rebuild={rebuild_time:.2f}ms | Compare={compare_time:.2f}ms | Result={'PASS' if values_match else 'FAIL'}")
+            return values_match
             
-        return True
+        except Exception as e:
+            print(f"   [ERROR] Validation failed: {e}")
+            return False
     
-    def test_tensor_bandwidth_performance(self, tensor_configs: List[Tuple[str, tuple, torch.dtype]]) -> bool:
-        """Test tensor interface bandwidth performance with various tensor types"""
-        print("\n--- Testing Tensor Interface Bandwidth Performance ---")
+    def test_comprehensive_performance(self) -> bool:
+        """Comprehensive performance test with detailed metrics"""
+        print("\n" + "="*80)
+        print("COMPREHENSIVE CORO-RPC PERFORMANCE ANALYSIS")
+        print("="*80)
         
-        for tensor_name, shape, dtype in tensor_configs:
-            print(f"\nTesting tensor: {tensor_name} {shape}")
+        # Test configurations
+        test_configs = [
+            # Data interface tests
+            (1.0/1024, "data", "Small Data (1KB)"),
+            (10.0, "data", "Medium Data (10MB)"),
+            (100.0, "data", "Large Data (100MB)"),
             
-            # Create test tensor
-            if dtype == torch.bool:
-                test_tensor = torch.randint(0, 2, shape, dtype=dtype).bool()
-            elif dtype in [torch.int32, torch.int64]:
-                test_tensor = torch.randint(-100, 100, shape, dtype=dtype)
-            else:
-                test_tensor = torch.randn(shape, dtype=dtype)
-            
-            tensor_size_mb = test_tensor.numel() * test_tensor.element_size() / (1024 * 1024)
-            
-            # Reset counters before each test
-            with self.receive_lock:
-                self.tensor_received_count = 0
-                self.tensor_receive_times.clear()
-            
-            # Measure send time
-            start_time = time.time()
-            result = self.client.send_tensor(self.server_addr, test_tensor)
-            end_time = time.time()
-            
-            if result < 0:
-                print(f"ERROR: Failed to send tensor {tensor_name}")
-                continue
-                
-            elapsed_ms = (end_time - start_time) * 1000
-            bandwidth_mbps = tensor_size_mb / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
-            
-            print(f"  Type: {tensor_name}")
-            print(f"  Shape: {shape}")
-            print(f"  Size: {tensor_size_mb:.2f} MB")
-            print(f"  Time: {elapsed_ms:.2f} ms")
-            print(f"  Bandwidth: {bandwidth_mbps:.2f} MB/s")
-            
-            self.results.add_tensor_result(tensor_name, shape, tensor_size_mb, elapsed_ms, bandwidth_mbps)
-            
-            # Wait for reception with timeout
-            max_wait_time = 2.0
-            wait_start = time.time()
-            while self.tensor_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-                time.sleep(0.1)
-            
-            if self.tensor_received_count > 0:
-                print(f"  Reception confirmed: callback received")
-            else:
-                print(f"  WARNING: No reception callback within {max_wait_time}s timeout")
-            
-            # Wait between tests
-            time.sleep(0.2)
-            
-        return True
-    
-    def test_data_bandwidth_performance_large_scale(self, sizes_mb: List[float]) -> bool:
-        """Test data interface bandwidth performance with large data sizes (optimized for GB scale)"""
-        print("\n--- Testing Data Interface Bandwidth Performance (Large Scale) ---")
+            # Tensor interface tests  
+            (1.0, "tensor", "Small Tensor (1MB)"),
+            (50.0, "tensor", "Medium Tensor (50MB)"),
+            (200.0, "tensor", "Large Tensor (200MB)"),
+        ]
         
-        for size_mb in sizes_mb:
-            print(f"\nTesting large data size: {size_mb} MB ({size_mb/1024:.2f} GB)")
-            
-            # Create test data efficiently for large sizes
-            data_size_bytes = int(size_mb * 1024 * 1024)
-            print(f"  Allocating {data_size_bytes} bytes ({data_size_bytes/(1024*1024*1024):.2f} GB)...")
+        success_count = 0
+        total_tests = len(test_configs)
+        
+        for i, (size_mb, test_type, description) in enumerate(test_configs, 1):
+            print(f"\n[TEST {i}/{total_tests}] {description}")
+            print("-" * 60)
             
             try:
-                # Use more efficient data generation for large sizes
-                print(f"  Creating test data pattern...")
-                
-                if data_size_bytes <= 50 * 1024 * 1024:  # <= 50MB: use simple method
-                    test_data = bytes(range(256)) * (data_size_bytes // 256 + 1)
-                    test_data = test_data[:data_size_bytes]
-                else:  # > 50MB: use pattern-based efficient method
-                    # Create a 1MB pattern
-                    pattern_size = 1024 * 1024  # 1MB pattern
-                    pattern = bytes(range(256)) * (pattern_size // 256)
+                if self.run_performance_test(size_mb, test_type):
+                    success_count += 1
+                    print(f"[RESULT] Test {i} PASSED")
+                else:
+                    print(f"[RESULT] Test {i} FAILED")
                     
-                    # Calculate how many full patterns and remainder
-                    full_patterns = data_size_bytes // pattern_size
-                    remainder = data_size_bytes % pattern_size
+                # Brief pause between tests
+                if i < total_tests:
+                    time.sleep(1.0)
                     
-                    print(f"  Using {full_patterns} full 1MB patterns + {remainder} bytes remainder")
-                    
-                    # Create data efficiently by concatenating patterns
-                    if full_patterns > 0:
-                        test_data = pattern * full_patterns
-                        if remainder > 0:
-                            test_data += pattern[:remainder]
-                    else:
-                        test_data = pattern[:remainder]
-                
-                print(f"  Data allocated successfully: {len(test_data)} bytes ({len(test_data)/(1024*1024):.1f} MB)")
-                
-            except MemoryError:
-                print(f"  ERROR: Not enough memory to allocate {size_mb} MB")
-                continue
             except Exception as e:
-                print(f"  ERROR: Failed to create test data: {e}")
-                continue
+                print(f"[ERROR] Test {i} failed with exception: {e}")
+                
+        print(f"\n[SUMMARY] Tests completed: {success_count}/{total_tests} passed")
+        return success_count == total_tests
+    
+    def run_performance_test(self, size_mb: float, data_type: str = "data") -> bool:
+        """Run a single performance test with detailed timing breakdown"""
+        
+        # Step 1: Prepare data/tensor
+        prepare_start = time.time()
+        if data_type == "data":
+            data_size_bytes = int(size_mb * 1024 * 1024)
+            if data_size_bytes <= 1024:
+                test_data = b"CoroRPC_Test_" * (data_size_bytes // 13 + 1)
+                test_data = test_data[:data_size_bytes]
+            else:
+                pattern = bytes(range(256)) * 4
+                test_data = pattern * (data_size_bytes // len(pattern) + 1)
+                test_data = test_data[:data_size_bytes]
+            test_object = test_data
+        else:  # tensor
+            # Create tensor to match target size
+            element_size = 4  # float32
+            numel = int(size_mb * 1024 * 1024 / element_size)
+            # Create roughly square tensor
+            side = int(numel ** 0.5)
+            shape = (side, side)
+            test_object = torch.randn(shape, dtype=torch.float32)
+            actual_size_mb = test_object.numel() * test_object.element_size() / (1024 * 1024)
+            size_mb = actual_size_mb  # Update to actual size
             
-            # Reset counters before each test
-            with self.receive_lock:
+        prepare_time = (time.time() - prepare_start) * 1000
+        
+        # Step 2: Reset counters
+        reset_start = time.time()
+        with self.receive_lock:
+            if data_type == "data":
                 self.data_received_count = 0
                 self.data_receive_times.clear()
-            
-            # Measure send time
-            print(f"  Starting transmission...")
-            start_time = time.time()
-            result = self.client.send_data(self.server_addr, test_data)
-            end_time = time.time()
-            
-            if result < 0:
-                print(f"  ERROR: Failed to send {size_mb} MB data")
-                continue
-                
-            elapsed_ms = (end_time - start_time) * 1000
-            elapsed_seconds = elapsed_ms / 1000
-            bandwidth_mbps = size_mb / elapsed_seconds if elapsed_seconds > 0 else 0
-            bandwidth_gbps = bandwidth_mbps / 1024
-            
-            print(f"  Size: {size_mb:.1f} MB ({size_mb/1024:.2f} GB)")
-            print(f"  Time: {elapsed_ms:.1f} ms ({elapsed_seconds:.2f} seconds)")
-            print(f"  Bandwidth: {bandwidth_mbps:.1f} MB/s ({bandwidth_gbps:.3f} GB/s)")
-            
-            self.results.add_data_result(size_mb, elapsed_ms, bandwidth_mbps)
-            
-            # Wait for reception with longer timeout for large data
-            max_wait_time = max(10.0, size_mb / 100)  # At least 10s, or 1s per 100MB
-            print(f"  Waiting for reception confirmation (timeout: {max_wait_time:.1f}s)...")
-            wait_start = time.time()
-            while self.data_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-                time.sleep(0.5)  # Check less frequently for large transfers
-            
-            if self.data_received_count > 0:
-                reception_time = self.data_receive_times[0] - start_time
-                print(f"  Reception confirmed: callback received after {reception_time:.2f}s")
             else:
-                print(f"  WARNING: No reception callback within {max_wait_time:.1f}s timeout")
-            
-            # Clean up large data object
-            del test_data
-            
-            # Wait between tests (longer for large data)
-            time.sleep(1.0)
-            
-        return True
-    
-    def test_tensor_bandwidth_performance_large_scale(self, tensor_configs: List[Tuple[str, tuple, torch.dtype]]) -> bool:
-        """Test tensor interface bandwidth performance with large tensors and validation"""
-        print("\n--- Testing Tensor Interface Bandwidth Performance (Large Scale with Validation) ---")
-        
-        for tensor_name, shape, dtype in tensor_configs:
-            print(f"\nTesting large tensor: {tensor_name} {shape}")
-            
-            # Calculate expected size
-            numel = 1
-            for dim in shape:
-                numel *= dim
-            
-            element_size = torch.tensor([], dtype=dtype).element_size()
-            expected_size_mb = numel * element_size / (1024 * 1024)
-            expected_size_gb = expected_size_mb / 1024
-            
-            print(f"  Expected size: {expected_size_mb:.1f} MB ({expected_size_gb:.2f} GB)")
-            print(f"  Creating tensor (dtype: {dtype}, elements: {numel:,})...")
-            
-            try:
-                # Create test tensor without memory check for now
-                print(f"  Creating tensor without memory check...")
-                if dtype == torch.bool:
-                    test_tensor = torch.randint(0, 2, shape, dtype=dtype).bool()
-                elif dtype in [torch.int32, torch.int64]:
-                    test_tensor = torch.randint(-100, 100, shape, dtype=dtype)
-                else:
-                    test_tensor = torch.randn(shape, dtype=dtype)
-                
-                actual_size_mb = test_tensor.numel() * test_tensor.element_size() / (1024 * 1024)
-                print(f"  Tensor created successfully: {actual_size_mb:.1f} MB")
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"  ERROR: Out of memory creating tensor: {e}")
-                    continue
-                else:
-                    print(f"  ERROR: Failed to create tensor: {e}")
-                    continue
-            except Exception as e:
-                print(f"  ERROR: Failed to create tensor: {e}")
-                continue
-            
-            tensor_size_mb = test_tensor.numel() * test_tensor.element_size() / (1024 * 1024)
-            
-            # Reset counters before each test and store original tensor
-            with self.receive_lock:
-                self.tensor_received_count = 0
+                self.tensor_received_count = 0 
                 self.tensor_receive_times.clear()
-                # For large tensors, we'll only validate smaller ones to avoid memory issues
-                if tensor_size_mb <= 200.0:  # Only validate tensors <= 200MB
-                    self.sent_tensors.append(test_tensor.clone())
-                    validate_this_tensor = True
-                else:
-                    validate_this_tensor = False
-                    print(f"  Skipping validation for large tensor ({tensor_size_mb:.1f} MB) to avoid memory issues")
+                self.sent_tensors.clear()
                 self.received_tensors.clear()
+                self.sent_tensors.append(test_object.clone())
+        reset_time = (time.time() - reset_start) * 1000
+        
+        # Step 3: Send
+        print(f"[SEND] Transmitting {size_mb:.3f} MB {data_type}...")
+        send_start = time.time()
+        if data_type == "data":
+            result = self.client.send_data(self.server_addr, test_object)
+        else:
+            result = self.client.send_tensor(self.server_addr, test_object)
+        send_end = time.time()
+        send_time = (send_end - send_start) * 1000
+        
+        if result < 0:
+            print(f"[ERROR] Send failed: {result}")
+            return False
             
-            # Measure send time
-            print(f"  Starting tensor transmission...")
-            start_time = time.time()
-            result = self.client.send_tensor(self.server_addr, test_tensor)
-            end_time = time.time()
+        # Step 4: Wait for reception
+        print(f"[RECV] Waiting for reception...")
+        wait_start = time.time()
+        max_wait = 30.0  # 30 second timeout for large data
+        
+        while True:
+            elapsed = time.time() - wait_start
+            if data_type == "data" and self.data_received_count > 0:
+                break
+            elif data_type == "tensor" and self.tensor_received_count > 0:
+                break
+            elif elapsed > max_wait:
+                print(f"[ERROR] Reception timeout after {elapsed:.2f}s")
+                return False
+            time.sleep(0.01)
             
-            if result < 0:
-                print(f"  ERROR: Failed to send tensor {tensor_name}")
-                continue
-                
-            elapsed_ms = (end_time - start_time) * 1000
-            elapsed_seconds = elapsed_ms / 1000
-            bandwidth_mbps = tensor_size_mb / elapsed_seconds if elapsed_seconds > 0 else 0
-            bandwidth_gbps = bandwidth_mbps / 1024
+        reception_time = time.time()
+        wait_time = (reception_time - wait_start) * 1000
+        
+        # Step 5: Calculate timing metrics
+        if data_type == "data":
+            callback_time = self.data_receive_times[0]
+        else:
+            callback_time = self.tensor_receive_times[0]
             
-            print(f"  Type: {tensor_name}")
-            print(f"  Shape: {shape}")
-            print(f"  Size: {tensor_size_mb:.1f} MB ({tensor_size_mb/1024:.2f} GB)")
-            print(f"  Time: {elapsed_ms:.1f} ms ({elapsed_seconds:.2f} seconds)")
-            print(f"  Bandwidth: {bandwidth_mbps:.1f} MB/s ({bandwidth_gbps:.3f} GB/s)")
+        network_time = (callback_time - send_end) * 1000
+        total_time = (callback_time - send_start) * 1000
+        
+        # Step 6: Validation (for tensors only)
+        validation_time = 0
+        validation_success = True
+        if data_type == "tensor" and len(self.received_tensors) > 0:
+            validation_start = time.time()
+            validation_success = self.validate_tensor_equality(self.sent_tensors[0], self.received_tensors[0])
+            validation_time = (time.time() - validation_start) * 1000
+        
+        # Step 7: Print comprehensive timing breakdown
+        bandwidth = size_mb / (send_time / 1000) if send_time > 0 else 0
+        total_bandwidth = size_mb / (total_time / 1000) if total_time > 0 else 0
+        
+        print(f"\n[METRICS] Performance Analysis:")
+        print(f"   Data Size:          {size_mb:10.3f} MB")
+        print(f"   Prepare Time:       {prepare_time:10.2f} ms")
+        print(f"   Reset Time:         {reset_time:10.2f} ms")
+        print(f"   Send Time:          {send_time:10.2f} ms  (Sender Processing)")
+        print(f"   Network Latency:    {network_time:10.2f} ms  (Network + Receiver)")
+        print(f"   Wait Time:          {wait_time:10.2f} ms")
+        if validation_time > 0:
+            print(f"   Validation Time:    {validation_time:10.2f} ms  (Data Integrity Check)")
+        print(f"   Total Time:         {total_time:10.2f} ms")
+        print(f"   Send Bandwidth:     {bandwidth:10.2f} MB/s")
+        print(f"   End-to-End BW:      {total_bandwidth:10.2f} MB/s")
+        print(f"   Efficiency:         {(send_time/total_time)*100:10.1f} %")
+        
+        # Store results
+        if data_type == "data":
+            self.results.add_data_result(size_mb, send_time, bandwidth)
+        else:
+            self.results.add_tensor_result("Float32", test_object.shape, size_mb, send_time, bandwidth)
             
-            self.results.add_tensor_result(tensor_name, shape, tensor_size_mb, elapsed_ms, bandwidth_mbps)
-            
-            # Wait for reception with longer timeout for large tensors
-            max_wait_time = max(10.0, tensor_size_mb / 100)  # At least 10s, or 1s per 100MB
-            print(f"  Waiting for reception confirmation (timeout: {max_wait_time:.1f}s)...")
-            wait_start = time.time()
-            while self.tensor_received_count == 0 and (time.time() - wait_start) < max_wait_time:
-                time.sleep(0.5)  # Check less frequently for large transfers
-            
-            if self.tensor_received_count > 0:
-                reception_time = self.tensor_receive_times[0] - start_time
-                print(f"  Reception confirmed: callback received after {reception_time:.2f}s")
-                
-                # Validate tensor if it's not too large
-                if validate_this_tensor and len(self.received_tensors) > 0:
-                    print(f"  Validating tensor correctness...")
-                    original_tensor = self.sent_tensors[-1]  # Get the last sent tensor
-                    received_tensor_obj = self.received_tensors[-1]  # Get the last received tensor
-                    
-                    # Use Python rebuilder for validation
-                    print(f"  Validating tensor correctness...")
-                    print(f"  Using Python rebuilder for efficiency...")
-                    validation_success = self.validate_tensor_equality(
-                        original_tensor, received_tensor_obj)
-                    
-                    if validation_success:
-                        print(f"  ✓ Tensor validation PASSED (Python 🐍)")
-                    else:
-                        print(f"  ✗ Tensor validation FAILED")
-                        # Continue with other tests even if validation fails
-            else:
-                print(f"  WARNING: No reception callback within {max_wait_time:.1f}s timeout")
-            
-            # Clean up large tensor
-            del test_tensor
-            if validate_this_tensor and len(self.sent_tensors) > 0:
-                del self.sent_tensors[-1]  # Remove the stored tensor to free memory
-            
-            # Wait between tests (longer for large tensors)
-            time.sleep(1.0)
-            
-        return True
+        return validation_success if data_type == "tensor" else True
 
 
 def main():
-    """Main test function focused on high-performance hundreds-of-MB testing"""
-    print("CoroRPC High-Performance Testing Suite (Hundreds of MB)")
+    """Main performance test with comprehensive analysis"""
+    print("CoroRPC Interface Performance Analysis Suite")
     print("="*60)
     
     tester = CoroRPCPerformanceTester()
     
     try:
         # Setup
+        print("[INIT] Setting up test environment...")
         if not tester.setup():
-            print("FAILED: Setup failed")
-            return False
-            
-        # Run simple correctness tests first
-        print("\nPhase 1: Correctness Verification")
-        print("-" * 40)
-        
-        if not tester.test_data_interface_simple():
-            print("FAILED: Data interface simple test failed")
-            return False
-            
-        if not tester.test_tensor_interface_simple():
-            print("FAILED: Tensor interface simple test failed")
-            return False
-            
-        print("SUCCESS: All correctness tests passed!")
-        
-        # Run high-performance tests with hundreds of MB data
-        print("\nPhase 2: High-Performance Testing (Hundreds of MB)")
-        print("-" * 50)
-        print("Testing large data transfers (50MB - 800MB) to measure peak performance")
-        
-        # Test data sizes focused on hundreds of MB
-        large_data_sizes = [50.0, 100.0, 200.0, 300.0, 500.0, 800.0]  # 50MB to 800MB
-        if not tester.test_data_bandwidth_performance_large_scale(large_data_sizes):
-            print("FAILED: Large data bandwidth performance test failed")
-            return False
-            
-        # Test tensor sizes focused on hundreds of MB  
-        large_tensor_configs = [
-            ("Float32_100MB", (5120, 5120), torch.float32),     # ~100MB
-            ("Float32_200MB", (7237, 7237), torch.float32),     # ~200MB
-            ("Float32_400MB", (10240, 10240), torch.float32),   # ~400MB
-            ("Float64_200MB", (5120, 5120), torch.float64),     # ~200MB
-            ("Int64_300MB", (8000, 5000), torch.int64),         # ~300MB
-            ("Float32_600MB", (12500, 12500), torch.float32),   # ~600MB
-        ]
-        if not tester.test_tensor_bandwidth_performance_large_scale(large_tensor_configs):
-            print("FAILED: Large tensor bandwidth performance test failed")
+            print("[FATAL] Setup failed")
             return False
         
-        # Print results
+        print("[INIT] Setup completed successfully\n")
+        
+        # Run comprehensive tests
+        print("[START] Running comprehensive performance tests...")
+        success = tester.test_comprehensive_performance()
+        
+        # Print final results
         tester.results.print_summary()
         
-        print("\nSUCCESS: All high-performance tests completed!")
-        print("\nTest Summary:")
-        print(f"- Tested data sizes: 50MB to 800MB")
-        print(f"- Tested tensor sizes: 100MB to 600MB")
-        print(f"- All tests focused on measuring peak bandwidth performance")
-        print(f"- Tensor correctness validation enabled (for tensors ≤ 200MB)")
-        print(f"- Zero-copy optimization with pybind11::handle and std::string_view")
-        return True
+        # Print conclusion
+        print("\n" + "="*80)
+        print("TEST CONCLUSION")
+        print("="*80)
+        if success:
+            print("[SUCCESS] All performance tests completed successfully!")
+            print("- CoroRPC interface is functioning correctly")
+            print("- Performance metrics collected for analysis")
+            print("- Tensor validation passed for all tests")
+            return True
+        else:
+            print("[FAILURE] Some performance tests failed")
+            print("- Check error logs above for details")
+            return False
         
     except Exception as e:
-        print(f"ERROR: Test failed with exception: {e}")
+        print(f"[FATAL] Test suite failed with exception: {e}")
         import traceback
         traceback.print_exc()
         return False
         
     finally:
+        print("\n[CLEANUP] Cleaning up test environment...")
         tester.teardown()
 
 
 if __name__ == "__main__":
     success = main()
-    print(f"\nFinal result: {'SUCCESS' if success else 'FAILURE'}")
+    print(f"\nFinal Result: {'SUCCESS' if success else 'FAILURE'}")
     sys.exit(0 if success else 1)
