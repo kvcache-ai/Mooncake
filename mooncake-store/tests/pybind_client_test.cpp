@@ -65,6 +65,20 @@ TEST_F(PyClientTest, ConstructorAndSetup) {
     // Verify hostname
     std::string hostname = py_client_->get_hostname();
     EXPECT_EQ(hostname, "localhost:17813");
+
+    // Same local hostname should fail
+    auto new_client = std::make_unique<PyClient>();
+    int second_setup_result = new_client->setup(
+        "localhost:17813",                   // local_hostname
+        FLAGS_transfer_engine_metadata_url,  // metadata_server
+        16 * 1024 * 1024,                    // global_segment_size (16MB)
+        16 * 1024 * 1024,                    // local_buffer_size (16MB)
+        FLAGS_protocol,                      // protocol
+        FLAGS_device_name,                   // rdma_devices
+        "localhost:50051"                    // master_server_addr
+    );
+    EXPECT_NE(second_setup_result, 0)
+        << "Second setup should fail due to already initialized client";
 }
 
 // Test basic Put and Get operations
