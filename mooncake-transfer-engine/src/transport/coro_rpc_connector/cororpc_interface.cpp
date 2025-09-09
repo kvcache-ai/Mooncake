@@ -347,15 +347,16 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
     std::cout << "CoroRPCInterface::handleIncomingData called with "
               << data.size() << " bytes" << std::endl;
 
-    // For tensor data detection, we'll use a simple heuristic based on data size and patterns
-    // If data size is large enough and has a specific pattern, treat as tensor
-    // This is a simplified approach since we removed C++ tensor rebuilding
+    // For tensor data detection, we'll use a simple heuristic based on data
+    // size and patterns If data size is large enough and has a specific
+    // pattern, treat as tensor This is a simplified approach since we removed
+    // C++ tensor rebuilding
     if (data.size() >= 72) {  // 72 bytes is our metadata size
         // Read the first few bytes to check if it looks like tensor metadata
         const uint32_t* header = reinterpret_cast<const uint32_t*>(data.data());
         uint32_t dtype = header[0];
         uint32_t ndim = header[1];
-        
+
         std::cout << "Checking tensor metadata: dtype=" << dtype
                   << ", ndim=" << ndim << std::endl;
 
@@ -367,7 +368,8 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
 
             // This looks like tensor data, handle it as such
             std::vector<size_t> shape;
-            const int64_t* shape_data = reinterpret_cast<const int64_t*>(data.data() + 8);
+            const int64_t* shape_data =
+                reinterpret_cast<const int64_t*>(data.data() + 8);
             for (int i = 0; i < static_cast<int>(ndim); i++) {
                 if (shape_data[i] > 0) {
                     shape.push_back(static_cast<size_t>(shape_data[i]));
@@ -377,16 +379,36 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
             // Get dtype name based on dtype ID
             std::string_view dtype_name;
             switch (dtype) {
-                case 1: dtype_name = "float16"; break;
-                case 2: dtype_name = "float32"; break;
-                case 3: dtype_name = "float64"; break;
-                case 4: dtype_name = "int8"; break;
-                case 5: dtype_name = "int16"; break;
-                case 6: dtype_name = "int32"; break;
-                case 7: dtype_name = "int64"; break;
-                case 8: dtype_name = "uint8"; break;
-                case 9: dtype_name = "bool"; break;
-                default: dtype_name = "unknown"; break;
+                case 1:
+                    dtype_name = "float16";
+                    break;
+                case 2:
+                    dtype_name = "float32";
+                    break;
+                case 3:
+                    dtype_name = "float64";
+                    break;
+                case 4:
+                    dtype_name = "int8";
+                    break;
+                case 5:
+                    dtype_name = "int16";
+                    break;
+                case 6:
+                    dtype_name = "int32";
+                    break;
+                case 7:
+                    dtype_name = "int64";
+                    break;
+                case 8:
+                    dtype_name = "uint8";
+                    break;
+                case 9:
+                    dtype_name = "bool";
+                    break;
+                default:
+                    dtype_name = "unknown";
+                    break;
             }
 
             // Call tensor handler instead of data handler
