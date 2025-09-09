@@ -117,7 +117,15 @@ ext_modules = [
     CUDAExtension(
         name="mooncake.ep",
         include_dirs=[os.path.join(current_dir, "../mooncake-ep/include"), os.path.join(current_dir, "../mooncake-transfer-engine/include")],
-        sources=["../mooncake-integration/ep/ep_py.cpp"],
+        sources=[
+            "../mooncake-integration/ep/ep_py.cpp",
+            "../mooncake-ep/src/mooncake_backend.cpp",
+            "../mooncake-ep/src/mooncake_worker.cu",
+            "../mooncake-ep/src/mooncake_ep_buffer.cpp",
+            "../mooncake-ep/src/mooncake_ep_kernel.cu",
+            "../mooncake-ep/src/mooncake_worker_thread.cpp",
+            "../mooncake-ep/src/mooncake_ibgda/mlx5gda.cpp",
+        ],
         extra_compile_args={
             "cxx": ["-DTORCH_USE_CUDA_DSA", f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
             "nvcc": ["-DTORCH_USE_CUDA_DSA", f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
@@ -125,7 +133,6 @@ ext_modules = [
         extra_link_args=["-libverbs", "-Wl,--no-as-needed", "-L/usr/lib/aarch64-linux-gnu", "-lcuda"],
         libraries=["ibverbs", "mlx5"],
         extra_objects=[
-            os.path.join(current_dir, "../build/mooncake-ep/src/libmooncake_ep.a"),
             os.path.join(current_dir, "mooncake/engine.so"),
         ],
     )
