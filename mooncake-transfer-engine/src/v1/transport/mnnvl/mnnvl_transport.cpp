@@ -205,19 +205,20 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
     else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeHost)
         kind = cudaMemcpyHostToHost;
 
-    // Select copy method
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    if (err != cudaSuccess) {
+        task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+
     if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
-        if (err != cudaSuccess)
+        err = cudaStreamSynchronize(batch->stream);
+        if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
-        else {
+        } else {
             task->transferred_bytes = task->request.length;
             task->status_word = TransferStatusEnum::COMPLETED;
         }
-    } else {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->stream);
-        if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
     }
 }
 
@@ -245,7 +246,13 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
     auto location = parseLocation(desc.location);
-    if (location.first != "cuda") return Status::OK();
+    if (location.first == "cpu") {
+        CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
+                                    cudaHostRegisterDefault));
+        return Status::OK();
+    } else if (location.first != "cuda")
+        return Status::InvalidArgument(
+            "Unrecognized location - neither cpu or cuda");
 
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
@@ -272,7 +279,9 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
 Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     desc.mnnvl_handle.clear();
-    // desc.mnnvl_offset = 0;
+    if (parseLocation(desc.location).first == "cpu") {
+        CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
+    }
     return Status::OK();
 }
 
