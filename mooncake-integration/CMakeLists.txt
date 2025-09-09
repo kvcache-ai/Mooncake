@@ -71,6 +71,7 @@ if (WITH_STORE)
 endif()
 
 if (WITH_EP)
+    message(STATUS "TORCH_LIBRARIES is ${TORCH_LIBRARIES}")
     pybind11_add_module(ep ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
         ep/ep_py.cpp
         integration_utils.h
