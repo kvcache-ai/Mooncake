@@ -75,7 +75,7 @@ if (WITH_EP)
         ep/ep_py.cpp
         integration_utils.h
     )
-    target_link_libraries(ep PUBLIC ${TORCH_PYTHON_LIBRARY} mooncake_ep ibverbs mlx5)
+    target_link_libraries(ep PUBLIC ${TORCH_PYTHON_LIBRARY} mooncake_ep ${TORCH_LIBRARIES} ibverbs mlx5)
 endif ()
 
 message("${PYTHON_SYS_PATH}")
