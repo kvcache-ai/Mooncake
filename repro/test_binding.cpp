@@ -1,4 +1,4 @@
-#include <torch/csrc/distributed/c10d/DistributedBackend.hpp>
+#include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
