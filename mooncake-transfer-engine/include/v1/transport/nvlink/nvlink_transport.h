@@ -12,38 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SHM_TRANSPORT_H_
-#define SHM_TRANSPORT_H_
+#ifndef NVLINK_TRANSPORT_H_
+#define NVLINK_TRANSPORT_H_
 
 #include <functional>
 #include <iostream>
 #include <queue>
 #include <string>
 
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 
 namespace mooncake {
 namespace v1 {
 
-struct ShmTask {
+struct NVLinkTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
+    bool is_cuda_ipc;
+    int cuda_id = 0;
 };
 
-struct ShmSubBatch : public Transport::SubBatch {
-    std::vector<ShmTask> task_list;
+struct NVLinkSubBatch : public Transport::SubBatch {
+    std::vector<NVLinkTask> task_list;
     size_t max_size;
+    cudaStream_t stream;
     virtual size_t size() const { return task_list.size(); }
 };
 
-class ShmTransport : public Transport {
+class NVLinkTransport : public Transport {
    public:
-    ShmTransport();
+    NVLinkTransport();
 
-    ~ShmTransport();
+    ~NVLinkTransport();
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<MetadataService> metadata,
@@ -67,20 +72,17 @@ class ShmTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    virtual const char *getName() const { return "shm"; }
-
-    virtual Status allocateLocalMemory(void **addr, size_t size,
-                                       MemoryOptions &options);
-
-    virtual Status freeLocalMemory(void *addr, size_t size);
+    virtual const char *getName() const { return "nvlink"; }
 
    private:
-    void startTransfer(ShmTask *task, ShmSubBatch *batch);
+    void startTransfer(NVLinkTask *task, NVLinkSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
+
+    Status setPeerAccess();
 
    private:
     bool installed_;
@@ -89,9 +91,9 @@ class ShmTransport : public Transport {
     std::shared_ptr<MetadataService> metadata_;
 
     struct OpenedShmEntry {
-        int shm_fd;
         void *shm_addr;
         uint64_t length;
+        int cuda_id;
     };
 
     using HashMap =
@@ -103,13 +105,9 @@ class ShmTransport : public Transport {
     std::shared_ptr<ConfigManager> conf_;
 
     std::string machine_id_;
-
-    std::mutex shm_path_mutex_;
-    std::unordered_map<void *, std::string> shm_path_map_;
-
-    std::string cxl_mount_path_;
+    uint64_t async_memcpy_threshold_;
 };
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // SHM_TRANSPORT_H_
+#endif  // NVLINK_TRANSPORT_H_

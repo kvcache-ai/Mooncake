@@ -48,10 +48,10 @@ struct BufferDesc {
     uint64_t addr;
     uint64_t length;
     std::string location;
-
     std::vector<uint32_t> rkey;
     std::string shm_path;
     std::string mnnvl_handle;
+    std::vector<TransportType> transports;
 
     int ref_count;
     std::vector<uint32_t> lkey;  // not uploaded, available in local only
@@ -141,7 +141,7 @@ class SegmentManager {
     std::unique_ptr<MetadataStore> store_;
 
     std::string file_desc_basepath_;
-    uint64_t ttl_ms_ = 10 * 1000; // N.B. Frequent TTL harms p999
+    uint64_t ttl_ms_ = 10 * 1000;  // N.B. Frequent TTL harms p999
 };
 
 class LocalSegmentTracker {

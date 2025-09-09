@@ -26,6 +26,7 @@
 #include "v1/transport/tcp/tcp_transport.h"
 #include "v1/transport/transport.h"
 #ifdef USE_CUDA
+#include "v1/transport/nvlink/nvlink_transport.h"
 #include "v1/transport/mnnvl/mnnvl_transport.h"
 #endif
 #ifdef USE_GDS
@@ -163,6 +164,9 @@ Status TransferEngine::construct() {
         transport_list_[IOURING] = std::make_unique<IOUringTransport>();
 
 #ifdef USE_CUDA
+    if (conf_->get("transports/nvlink/enable", true))
+        transport_list_[NVLINK] = std::make_unique<NVLinkTransport>();
+
     if (conf_->get("transports/mnnvl/enable", false))
         transport_list_[MNNVL] = std::make_unique<MnnvlTransport>();
 #endif
@@ -293,10 +297,10 @@ Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
     MemoryOptions options;
     options.location = location;
     if (location == kWildcardLocation || location.starts_with("cpu")) {
-        if (transport_list_[RDMA])
-            options.type = RDMA;
-        else if (transport_list_[SHM])
+        if (transport_list_[SHM])
             options.type = SHM;
+        else if (transport_list_[RDMA])
+            options.type = RDMA;
         else
             options.type = TCP;
     } else {
@@ -312,7 +316,6 @@ Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
 
 Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
-    if (!transport_list_[options.type]) options.type = TCP;
     auto &transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
@@ -359,12 +362,42 @@ Status TransferEngine::registerLocalMemory(void *addr, size_t size,
     return registerLocalMemory(addr, size, options);
 }
 
+std::vector<TransportType> TransferEngine::getSupportedTransports(
+    TransportType request_type) {
+    std::vector<TransportType> result;
+    switch (request_type) {
+        case RDMA:
+        case NVLINK:
+            if (transport_list_[NVLINK]) result.push_back(NVLINK);
+            if (transport_list_[RDMA]) result.push_back(RDMA);
+            if (transport_list_[TCP]) result.push_back(TCP);
+            break;
+        case SHM:
+            if (transport_list_[RDMA]) result.push_back(RDMA);
+            if (transport_list_[SHM]) result.push_back(SHM);
+            if (transport_list_[TCP]) result.push_back(TCP);
+            break;
+        case MNNVL:
+            if (transport_list_[MNNVL]) result.push_back(MNNVL);
+            if (transport_list_[RDMA]) result.push_back(RDMA);
+            if (transport_list_[TCP]) result.push_back(TCP);
+            break;
+        case TCP:
+            if (transport_list_[NVLINK]) result.push_back(NVLINK);
+            if (transport_list_[TCP]) result.push_back(TCP);
+            break;
+        default:
+            break;
+    }
+    return result;
+}
+
 Status TransferEngine::registerLocalMemory(void *addr, size_t size,
                                            MemoryOptions &options) {
     return local_segment_tracker_->add(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                if (!transport_list_[type]) continue;
+            auto transports = getSupportedTransports(options.type);
+            for (auto type : transports) {
                 CHECK_STATUS(
                     transport_list_[type]->addMemoryBuffer(desc, options));
             }
@@ -377,8 +410,7 @@ Status TransferEngine::registerLocalMemory(void *addr, size_t size,
 Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
     return local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                if (!transport_list_[type]) continue;
+            for (auto type : desc.transports) {
                 CHECK_STATUS(transport_list_[type]->removeMemoryBuffer(desc));
             }
             return Status::OK();
@@ -436,24 +468,17 @@ TransportType TransferEngine::getTransportType(const Request &request) {
     } else {
         auto entry =
             getBufferDesc(remote_desc, request.target_offset, request.length);
-        if (!entry) return UNSPEC;
-        if (!entry->mnnvl_handle.empty() && transport_list_[MNNVL])
-            return MNNVL;
-        if (remote_desc->machine_id ==
-            metadata_->segmentManager().getLocal()->machine_id) {
-            if (entry->location.starts_with("cuda")) {
-                if (entry->shm_path.empty() && transport_list_[SHM]) return SHM;
-                if (transport_list_[RDMA]) return RDMA;
-            } else {
-                if (transport_list_[RDMA]) return RDMA;
-                if (transport_list_[SHM]) return SHM;
-            }
-            return TCP;
+        bool same_machine =
+            (remote_desc->machine_id ==
+             metadata_->segmentManager().getLocal()->machine_id);
+        bool cuda_device = entry->location.starts_with("cuda");
+        for (auto type : entry->transports) {
+            if ((type == NVLINK || type == SHM) && !same_machine) continue;
+            if ((type == NVLINK || type == MNNVL) && !cuda_device) continue;
+            if (transport_list_[type]) return type;
         }
-        if (transport_list_[RDMA]) return RDMA;
-        return TCP;
+        return UNSPEC;
     }
-    return UNSPEC;
 }
 
 std::string printRequest(const Request &request) {

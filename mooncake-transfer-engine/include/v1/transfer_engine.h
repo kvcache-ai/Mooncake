@@ -124,6 +124,9 @@ class TransferEngine {
 
     TransportType getTransportType(const Request &request);
 
+    std::vector<TransportType> getSupportedTransports(
+        TransportType request_type);
+
    private:
     struct AllocatedMemory {
         void *addr;

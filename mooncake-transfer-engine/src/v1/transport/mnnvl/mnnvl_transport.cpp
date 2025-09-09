@@ -24,10 +24,8 @@
 #include <iomanip>
 #include <memory>
 
-#ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
-#endif
 
 #include "v1/common/status.h"
 #include "v1/memory/slab.h"
@@ -109,7 +107,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
 
     async_memcpy_threshold_ =
-        conf_->get("transports/mnnvl/async_memcpy_threshold", 4) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 4) * 1024;
 
     installed_ = true;
     return setPeerAccess();
@@ -268,6 +266,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     desc.mnnvl_handle =
         serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
 
+    desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
 }
 

@@ -273,7 +273,9 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status RdmaTransport::addMemoryBuffer(BufferDesc &desc,
                                       const MemoryOptions &options) {
-    return local_buffer_manager_.addBuffer(desc, options);
+    CHECK_STATUS(local_buffer_manager_.addBuffer(desc, options));
+    desc.transports.push_back(TransportType::RDMA);
+    return Status::OK();
 }
 
 Status RdmaTransport::removeMemoryBuffer(BufferDesc &desc) {

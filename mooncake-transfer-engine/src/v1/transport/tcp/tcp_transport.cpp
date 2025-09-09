@@ -114,6 +114,7 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status TcpTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
+    desc.transports.push_back(TransportType::TCP);
     return Status::OK();
 }
 
