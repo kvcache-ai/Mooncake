@@ -316,6 +316,15 @@ Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
 
 Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
+    if (options.type == UNSPEC) {
+        if (transport_list_[RDMA])
+            options.type = RDMA;
+        else if (transport_list_[TCP])
+            options.type = TCP;
+        else
+            return Status::InvalidArgument(
+                "Not supported type in memory options" LOC_MARK);
+    }
     auto &transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(

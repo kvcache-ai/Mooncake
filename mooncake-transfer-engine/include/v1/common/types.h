@@ -84,7 +84,7 @@ const static int kSupportedTransportTypes = 7;
 struct MemoryOptions {
     Location location = kWildcardLocation;
     Permission perm = kGlobalReadWrite;
-    TransportType type = RDMA;
+    TransportType type = UNSPEC;
     std::string shm_path = "";
     size_t shm_offset = 0;
 };
