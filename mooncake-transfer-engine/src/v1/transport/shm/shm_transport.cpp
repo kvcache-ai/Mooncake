@@ -116,14 +116,19 @@ Status ShmTransport::submitTransferTasks(
 }
 
 void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
+    bool success;
     if (task->request.opcode == Request::READ)
-        memcpy(task->request.source, (void *)task->target_addr,
-               task->request.length);
+        success = genericMemcpy(task->request.source, (void *)task->target_addr,
+                                task->request.length);
     else
-        memcpy((void *)task->target_addr, task->request.source,
-               task->request.length);
-    task->transferred_bytes = task->request.length;
-    task->status_word = TransferStatusEnum::COMPLETED;
+        success = genericMemcpy((void *)task->target_addr, task->request.source,
+                                task->request.length);
+    if (success) {
+        task->transferred_bytes = task->request.length;
+        task->status_word = TransferStatusEnum::COMPLETED;
+    } else {
+        task->status_word = TransferStatusEnum::FAILED;
+    }
 }
 
 Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,

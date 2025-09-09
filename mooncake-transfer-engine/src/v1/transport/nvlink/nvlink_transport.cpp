@@ -127,8 +127,8 @@ void NVLinkTransport::startTransfer(NVLinkTask *task, NVLinkSubBatch *batch) {
         dst = task->request.source;       // read into source buffer
         src = (void *)task->target_addr;  // from remote
     } else {
-        src = task->request.source;  // write from source buffer
-        dst = (void *)task->target_addr;
+        src = task->request.source;       // write from source buffer
+        dst = (void *)task->target_addr;  // from remote
     }
 
     bool is_async = (task->request.length >= async_memcpy_threshold_);
@@ -153,23 +153,27 @@ void NVLinkTransport::startTransfer(NVLinkTask *task, NVLinkSubBatch *batch) {
     else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeHost)
         kind = cudaMemcpyHostToHost;
 
-    // Select copy method
     if (kind == cudaMemcpyDefault) {
         memcpy(dst, src, task->request.length);
         task->transferred_bytes = task->request.length;
         task->status_word = TransferStatusEnum::COMPLETED;
-    } else if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
-        if (err != cudaSuccess)
+        return;
+    }
+
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    if (err != cudaSuccess) {
+        task->status_word = TransferStatusEnum::FAILED;
+        return;
+    }
+
+    if (!is_async) {
+        err = cudaStreamSynchronize(batch->stream);
+        if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
-        else {
+        } else {
             task->transferred_bytes = task->request.length;
             task->status_word = TransferStatusEnum::COMPLETED;
         }
-    } else {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->stream);
-        if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
     }
 }
 
@@ -208,7 +212,9 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
     } else if (location.first == "cpu") {
         CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                     cudaHostRegisterDefault));
-    }
+    } else
+        return Status::InvalidArgument(
+            "Unrecognized location - neither cpu or cuda");
     desc.transports.push_back(TransportType::NVLINK);
     return Status::OK();
 }
