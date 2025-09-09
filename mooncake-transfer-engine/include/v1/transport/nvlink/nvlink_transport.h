@@ -22,6 +22,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "v1/concurrency/ticket_lock.h"
 #include "v1/metadata/metadata.h"
 #include "v1/transport/transport.h"
 

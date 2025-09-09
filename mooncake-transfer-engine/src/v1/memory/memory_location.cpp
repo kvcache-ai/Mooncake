@@ -70,8 +70,8 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {
-        PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
-                      << ", len: " << len;
+        // PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
+        //               << ", len: " << len;
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         free(pages);
         free(status);

@@ -167,12 +167,12 @@ Status TransferEngine::construct() {
     if (conf_->get("transports/nvlink/enable", true))
         transport_list_[NVLINK] = std::make_unique<NVLinkTransport>();
 
-    if (conf_->get("transports/mnnvl/enable", false))
+    if (conf_->get("transports/mnnvl/enable", true))
         transport_list_[MNNVL] = std::make_unique<MnnvlTransport>();
 #endif
 
 #ifdef USE_GDS
-    if (conf_->get("transports/gds/enable", false))
+    if (conf_->get("transports/gds/enable", true))
         transport_list_[GDS] = std::make_unique<GdsTransport>();
 #endif
 

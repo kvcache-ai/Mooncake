@@ -54,7 +54,7 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 4) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
     return setPeerAccess();
 }
 
@@ -160,20 +160,22 @@ void NVLinkTransport::startTransfer(NVLinkTask *task, NVLinkSubBatch *batch) {
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
-    if (err != cudaSuccess) {
-        task->status_word = TransferStatusEnum::FAILED;
-        return;
-    }
-
     if (!is_async) {
-        err = cudaStreamSynchronize(batch->stream);
+        // Sync fast copy is better when one thread used
+        err = cudaMemcpy(dst, src, task->request.length, kind);
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
         } else {
             task->transferred_bytes = task->request.length;
             task->status_word = TransferStatusEnum::COMPLETED;
         }
+        return;
+    }
+
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    if (err != cudaSuccess) {
+        task->status_word = TransferStatusEnum::FAILED;
+        return;
     }
 }
 
