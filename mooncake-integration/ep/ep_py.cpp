@@ -14,6 +14,10 @@
 #include <torch/python.h>
 #include <torch/torch.h>
 
+#include "pybind_client.h"
+
+#include "integration_utils.h"
+
 namespace py = pybind11;
 
 namespace mooncake {
