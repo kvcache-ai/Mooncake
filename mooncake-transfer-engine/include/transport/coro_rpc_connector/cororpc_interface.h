@@ -35,7 +35,6 @@ class CoroRPCInterface {
             return pybind11::memoryview::from_memory(
                 const_cast<char*>(data.data()), data.size(), true);
         }
-        pybind11::object rebuildTensor() const;
     };
 
     class Impl;

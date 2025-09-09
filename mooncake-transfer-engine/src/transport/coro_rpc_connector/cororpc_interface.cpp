@@ -9,28 +9,6 @@
 
 namespace mooncake {
 
-// Tensor dtype enumeration
-enum class TensorDtype : int32_t {
-    UNKNOWN = 0,
-    FLOAT16 = 1,
-    FLOAT32 = 2,
-    FLOAT64 = 3,
-    INT8 = 4,
-    INT16 = 5,
-    INT32 = 6,
-    INT64 = 7,
-    UINT8 = 8,
-    BOOL = 9
-};
-
-// Tensor metadata structure
-struct TensorMetadata {
-    int32_t dtype;     // TensorDtype enum value
-    int32_t ndim;      // Number of dimensions
-    int64_t shape[4];  // Shape array (max 4D)
-    char padding[32];  // For future extensions
-};
-
 // Implementation class
 class CoroRPCInterface::Impl {
    public:
@@ -38,146 +16,6 @@ class CoroRPCInterface::Impl {
     pybind11::function data_receive_callback;
     pybind11::function tensor_receive_callback;
 };
-
-// Helper function to get tensor dtype from Python tensor
-TensorDtype get_tensor_dtype(const pybind11::object& dtype_obj) {
-    std::string dtype_str = dtype_obj.attr("__str__")().cast<std::string>();
-
-    if (dtype_str.find("float16") != std::string::npos)
-        return TensorDtype::FLOAT16;
-    if (dtype_str.find("float32") != std::string::npos)
-        return TensorDtype::FLOAT32;
-    if (dtype_str.find("float64") != std::string::npos)
-        return TensorDtype::FLOAT64;
-    if (dtype_str.find("int8") != std::string::npos) return TensorDtype::INT8;
-    if (dtype_str.find("int16") != std::string::npos) return TensorDtype::INT16;
-    if (dtype_str.find("int32") != std::string::npos) return TensorDtype::INT32;
-    if (dtype_str.find("int64") != std::string::npos) return TensorDtype::INT64;
-    if (dtype_str.find("uint8") != std::string::npos) return TensorDtype::UINT8;
-    if (dtype_str.find("bool") != std::string::npos) return TensorDtype::BOOL;
-
-    return TensorDtype::UNKNOWN;
-}
-
-size_t get_dtype_size(TensorDtype dtype) {
-    switch (dtype) {
-        case TensorDtype::FLOAT32:
-            return 4;
-        case TensorDtype::FLOAT64:
-            return 8;
-        case TensorDtype::INT32:
-            return 4;
-        case TensorDtype::INT64:
-            return 8;
-        case TensorDtype::INT8:
-            return 1;
-        case TensorDtype::UINT8:
-            return 1;
-        case TensorDtype::FLOAT16:
-            return 2;
-        case TensorDtype::INT16:
-            return 2;
-        case TensorDtype::BOOL:
-            return 1;
-        default:
-            return 0;
-    }
-}
-
-// Helper function to create numpy array from data
-pybind11::object create_numpy_array_from_data(
-    const char* data, TensorDtype dtype, const std::vector<int64_t>& shape) {
-    std::cout << "DEBUG: create_numpy_array_from_data called" << std::endl;
-    std::cout << "DEBUG: dtype = " << static_cast<int>(dtype) << std::endl;
-    std::cout << "DEBUG: shape size = " << shape.size() << std::endl;
-
-    pybind11::gil_scoped_acquire acquire;
-
-    std::cout << "DEBUG: About to import numpy..." << std::endl;
-    pybind11::module_ np = pybind11::module_::import("numpy");
-    std::cout << "DEBUG: Successfully imported numpy" << std::endl;
-
-    std::string np_dtype;
-    switch (dtype) {
-        case TensorDtype::FLOAT32:
-            np_dtype = "float32";
-            break;
-        case TensorDtype::FLOAT64:
-            np_dtype = "float64";
-            break;
-        case TensorDtype::INT32:
-            np_dtype = "int32";
-            break;
-        case TensorDtype::INT64:
-            np_dtype = "int64";
-            break;
-        case TensorDtype::INT8:
-            np_dtype = "int8";
-            break;
-        case TensorDtype::UINT8:
-            np_dtype = "uint8";
-            break;
-        case TensorDtype::FLOAT16:
-            np_dtype = "float16";
-            break;
-        case TensorDtype::INT16:
-            np_dtype = "int16";
-            break;
-        case TensorDtype::BOOL:
-            np_dtype = "bool";
-            break;
-        default:
-            throw std::runtime_error("Unknown tensor dtype");
-    }
-
-    std::cout << "DEBUG: np_dtype = " << np_dtype << std::endl;
-
-    size_t element_size = get_dtype_size(dtype);
-    size_t total_elements = 1;
-    for (int64_t dim : shape) {
-        total_elements *= dim;
-    }
-
-    std::cout << "DEBUG: element_size = " << element_size << std::endl;
-    std::cout << "DEBUG: total_elements = " << total_elements << std::endl;
-
-    // Use memoryview to avoid data copy
-    std::cout << "DEBUG: Creating memory view without copying..." << std::endl;
-    size_t data_size = total_elements * element_size;
-    std::cout << "DEBUG: Data size = " << data_size << std::endl;
-
-    std::cout << "DEBUG: About to call frombuffer with memoryview..."
-              << std::endl;
-
-    try {
-        // Create a memoryview directly from the data pointer without copying
-        pybind11::memoryview mv = pybind11::memoryview::from_memory(
-            const_cast<char*>(data), data_size, true);  // read-only
-        std::cout << "DEBUG: Created memoryview without copying" << std::endl;
-
-        pybind11::object array =
-            np.attr("frombuffer")(mv, pybind11::arg("dtype") = np_dtype);
-        std::cout << "DEBUG: Created array from memoryview successfully"
-                  << std::endl;
-
-        // Convert shape to tuple manually
-        pybind11::tuple shape_tuple = pybind11::tuple(shape.size());
-        for (size_t i = 0; i < shape.size(); ++i) {
-            shape_tuple[i] = shape[i];
-        }
-        std::cout << "DEBUG: About to create shape tuple for reshape"
-                  << std::endl;
-
-        pybind11::object result = array.attr("reshape")(shape_tuple);
-        std::cout << "DEBUG: Reshaped array successfully" << std::endl;
-
-        return result;
-    } catch (const std::exception& e) {
-        std::cout << "DEBUG: Exception in numpy operations: " << e.what()
-                  << std::endl;
-        throw;
-    }
-}
 
 // Constructor
 CoroRPCInterface::CoroRPCInterface() : impl_(std::make_unique<Impl>()) {}
@@ -275,42 +113,38 @@ pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
         data_str = data_bytes;
     }
 
-    auto future_ptr = std::make_shared<pybind11::object>(future_obj);
-    pybind11::object loop_obj =
-        pybind11::reinterpret_borrow<pybind11::object>(loop);
-
     // Release GIL before starting coroutine
     pybind11::gil_scoped_release release;
 
-    auto coro_lambda = [communicator, target_addr, data_str, future_ptr,
-                        loop_obj]() -> async_simple::coro::Lazy<void> {
+    auto coro_lambda = [communicator, target_addr, data_str, future_obj,
+                        loop]() -> async_simple::coro::Lazy<void> {
         try {
             auto result_struct = co_await communicator->sendDataAsync(
                 target_addr, data_str.data(), data_str.size());
             int result = result_struct.code;
 
-            auto call_soon_threadsafe = [future_ptr, loop_obj, result]() {
+            auto call_soon_threadsafe = [future_obj, loop, result]() {
                 pybind11::gil_scoped_acquire acquire;
                 if (result >= 0) {
-                    future_ptr->attr("set_result")(result);
+                    future_obj.attr("set_result")(result);
                 } else {
-                    future_ptr->attr("set_exception")(pybind11::make_tuple(
+                    future_obj.attr("set_exception")(pybind11::make_tuple(
                         pybind11::str("Send data failed")));
                 }
             };
 
             auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop_obj.attr("call_soon_threadsafe")(callback);
+            loop.attr("call_soon_threadsafe")(callback);
         } catch (const std::exception& e) {
-            auto call_soon_threadsafe = [future_ptr, loop_obj, e]() {
+            auto call_soon_threadsafe = [future_obj, loop, e]() {
                 pybind11::gil_scoped_acquire acquire;
-                future_ptr->attr("set_exception")(
+                future_obj.attr("set_exception")(
                     pybind11::make_tuple(pybind11::str(
                         std::string("Send data error: ") + e.what())));
             };
 
             auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop_obj.attr("call_soon_threadsafe")(callback);
+            loop.attr("call_soon_threadsafe")(callback);
         }
     };
 
@@ -438,41 +272,37 @@ pybind11::object CoroRPCInterface::sendTensorAsync(std::string& target_address,
     tensor_info.shape = std::move(shape);
     tensor_info.dtype = std::move(dtype);
 
-    auto future_ptr = std::make_shared<pybind11::object>(future_obj);
-    pybind11::object loop_obj =
-        pybind11::reinterpret_borrow<pybind11::object>(loop);
-
     pybind11::gil_scoped_release release;
 
     // Schedule coroutine to run asynchronously
-    auto coro_lambda = [communicator, target_addr, tensor_info, future_ptr,
-                        loop_obj]() -> async_simple::coro::Lazy<void> {
+    auto coro_lambda = [communicator, target_addr, tensor_info, future_obj,
+                        loop]() -> async_simple::coro::Lazy<void> {
         try {
             auto result = co_await communicator->sendTensorAsync(target_addr,
                                                                  tensor_info);
 
-            auto call_soon_threadsafe = [future_ptr, loop_obj, result]() {
+            auto call_soon_threadsafe = [future_obj, loop, result]() {
                 pybind11::gil_scoped_acquire acquire;
                 if (result >= 0) {
-                    future_ptr->attr("set_result")(result);
+                    future_obj.attr("set_result")(result);
                 } else {
-                    future_ptr->attr("set_exception")(pybind11::make_tuple(
+                    future_obj.attr("set_exception")(pybind11::make_tuple(
                         pybind11::str("Send tensor failed")));
                 }
             };
 
             auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop_obj.attr("call_soon_threadsafe")(callback);
+            loop.attr("call_soon_threadsafe")(callback);
         } catch (const std::exception& e) {
-            auto call_soon_threadsafe = [future_ptr, loop_obj, e]() {
+            auto call_soon_threadsafe = [future_obj, loop, e]() {
                 pybind11::gil_scoped_acquire acquire;
-                future_ptr->attr("set_exception")(
+                future_obj.attr("set_exception")(
                     pybind11::make_tuple(pybind11::str(
                         std::string("Send tensor error: ") + e.what())));
             };
 
             auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop_obj.attr("call_soon_threadsafe")(callback);
+            loop.attr("call_soon_threadsafe")(callback);
         }
     };
 
@@ -517,63 +347,46 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
     std::cout << "CoroRPCInterface::handleIncomingData called with "
               << data.size() << " bytes" << std::endl;
 
-    // Check if this is tensor data by looking for metadata signature
-    if (data.size() >= sizeof(TensorMetadata)) {
-        const TensorMetadata* metadata =
-            reinterpret_cast<const TensorMetadata*>(data.data());
+    // For tensor data detection, we'll use a simple heuristic based on data size and patterns
+    // If data size is large enough and has a specific pattern, treat as tensor
+    // This is a simplified approach since we removed C++ tensor rebuilding
+    if (data.size() >= 72) {  // 72 bytes is our metadata size
+        // Read the first few bytes to check if it looks like tensor metadata
+        const uint32_t* header = reinterpret_cast<const uint32_t*>(data.data());
+        uint32_t dtype = header[0];
+        uint32_t ndim = header[1];
+        
+        std::cout << "Checking tensor metadata: dtype=" << dtype
+                  << ", ndim=" << ndim << std::endl;
 
-        std::cout << "Checking tensor metadata: dtype=" << metadata->dtype
-                  << ", ndim=" << metadata->ndim << std::endl;
-
-        // Basic validation: check if dtype is in valid range
-        if (metadata->dtype > 0 &&
-            metadata->dtype <= static_cast<int32_t>(TensorDtype::BOOL) &&
-            metadata->ndim >= 0 && metadata->ndim <= 4) {
+        // Basic validation: check if dtype and ndim are in reasonable ranges
+        if (dtype > 0 && dtype <= 9 && ndim >= 0 && ndim <= 4) {
             std::cout
                 << "Data recognized as tensor, calling handleIncomingTensor"
                 << std::endl;
 
             // This looks like tensor data, handle it as such
             std::vector<size_t> shape;
-            for (int i = 0; i < metadata->ndim; i++) {
-                if (metadata->shape[i] > 0) {
-                    shape.push_back(static_cast<size_t>(metadata->shape[i]));
+            const int64_t* shape_data = reinterpret_cast<const int64_t*>(data.data() + 8);
+            for (int i = 0; i < static_cast<int>(ndim); i++) {
+                if (shape_data[i] > 0) {
+                    shape.push_back(static_cast<size_t>(shape_data[i]));
                 }
             }
 
-            // Get dtype name
+            // Get dtype name based on dtype ID
             std::string_view dtype_name;
-            switch (static_cast<TensorDtype>(metadata->dtype)) {
-                case TensorDtype::FLOAT16:
-                    dtype_name = "float16";
-                    break;
-                case TensorDtype::FLOAT32:
-                    dtype_name = "float32";
-                    break;
-                case TensorDtype::FLOAT64:
-                    dtype_name = "float64";
-                    break;
-                case TensorDtype::INT8:
-                    dtype_name = "int8";
-                    break;
-                case TensorDtype::INT16:
-                    dtype_name = "int16";
-                    break;
-                case TensorDtype::INT32:
-                    dtype_name = "int32";
-                    break;
-                case TensorDtype::INT64:
-                    dtype_name = "int64";
-                    break;
-                case TensorDtype::UINT8:
-                    dtype_name = "uint8";
-                    break;
-                case TensorDtype::BOOL:
-                    dtype_name = "bool";
-                    break;
-                default:
-                    dtype_name = "unknown";
-                    break;
+            switch (dtype) {
+                case 1: dtype_name = "float16"; break;
+                case 2: dtype_name = "float32"; break;
+                case 3: dtype_name = "float64"; break;
+                case 4: dtype_name = "int8"; break;
+                case 5: dtype_name = "int16"; break;
+                case 6: dtype_name = "int32"; break;
+                case 7: dtype_name = "int64"; break;
+                case 8: dtype_name = "uint8"; break;
+                case 9: dtype_name = "bool"; break;
+                default: dtype_name = "unknown"; break;
             }
 
             // Call tensor handler instead of data handler
@@ -649,42 +462,6 @@ std::unique_ptr<CoroRPCInterface> createRPCServer(uint64_t local_rank,
     // Initialize server with default settings
     server->initialize("0.0.0.0:8080", 0, 30, 10);
     return server;
-}
-
-// Implementation of ReceivedTensor::rebuildTensor
-pybind11::object CoroRPCInterface::ReceivedTensor::rebuildTensor() const {
-    // Check if this is tensor data by looking for metadata signature
-    if (data.size() >= sizeof(TensorMetadata)) {
-        const TensorMetadata* metadata =
-            reinterpret_cast<const TensorMetadata*>(data.data());
-
-        // Basic validation: check if dtype is in valid range
-        if (metadata->dtype > 0 &&
-            metadata->dtype <= static_cast<int32_t>(TensorDtype::BOOL) &&
-            metadata->ndim >= 0 && metadata->ndim <= 4) {
-            // Extract tensor data (skip metadata)
-            const char* tensor_data = data.data() + sizeof(TensorMetadata);
-            // size_t tensor_data_size = data.size() - sizeof(TensorMetadata);
-            // // Not used currently
-
-            // Convert shape from metadata
-            std::vector<int64_t> tensor_shape;
-            for (int i = 0; i < metadata->ndim; i++) {
-                if (metadata->shape[i] > 0) {
-                    tensor_shape.push_back(metadata->shape[i]);
-                }
-            }
-
-            // Create numpy array from tensor data
-            TensorDtype tensor_dtype =
-                static_cast<TensorDtype>(metadata->dtype);
-            return create_numpy_array_from_data(tensor_data, tensor_dtype,
-                                                tensor_shape);
-        }
-    }
-
-    // If not tensor data or invalid, return None
-    return pybind11::none();
 }
 
 }  // namespace mooncake
