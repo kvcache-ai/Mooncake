@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <boost/algorithm/string.hpp>
 
 #include <random>
 
@@ -89,6 +90,23 @@ std::string formatDeviceNames(const std::string &device_names) {
         }
     }
     return formatted;
+}
+
+std::vector<std::string> splitString(const std::string &str, char delimiter,
+                                     bool trim_spaces, bool keep_empty) {
+    std::vector<std::string> result;
+
+    boost::split(
+        result, str, boost::is_any_of(std::string(1, delimiter)),
+        keep_empty ? boost::token_compress_off : boost::token_compress_on);
+
+    if (trim_spaces) {
+        for (auto &token : result) {
+            boost::trim(token);
+        }
+    }
+
+    return result;
 }
 
 }  // namespace mooncake

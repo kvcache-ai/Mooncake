@@ -112,8 +112,13 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         this->local_hostname = local_hostname;
     }
 
-    auto client_opt = mooncake::Client::Create(
-        this->local_hostname, metadata_server, protocol, master_server_addr);
+    std::optional<std::string> device_name =
+        (rdma_devices.empty() ? std::nullopt
+                              : std::make_optional(rdma_devices));
+
+    auto client_opt =
+        mooncake::Client::Create(this->local_hostname, metadata_server,
+                                 protocol, device_name, master_server_addr);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

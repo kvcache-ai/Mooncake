@@ -121,6 +121,17 @@ TEST(UtilsTest, AutoPortBinderMultipleInstances) {
     EXPECT_NE(port1, port2);
 }
 
+TEST(UtilsTest, SplitStringBasic) {
+    std::string input = "a, b ,c, d";
+    auto tokens = splitString(input, ',', true, false);
+
+    ASSERT_EQ(tokens.size(), 4);
+    EXPECT_EQ(tokens[0], "a");
+    EXPECT_EQ(tokens[1], "b");
+    EXPECT_EQ(tokens[2], "c");
+    EXPECT_EQ(tokens[3], "d");
+}
+
 TEST(UtilsTest, AutoPortBinderRAII) {
     // Test RAII behavior - port should be released when binder is destroyed
     int port;

@@ -125,6 +125,21 @@ void* allocate_buffer_allocator_memory(size_t total_size);
     return oss.str();
 }
 
+// String utility functions
+
+/**
+ * @brief Split a string by delimiter into a vector of strings
+ * @param str The string to split
+ * @param delimiter The delimiter to split by (default is comma)
+ * @param trim_spaces Whether to trim leading/trailing spaces from each token
+ * @param keep_empty Whether to keep empty tokens in the result
+ * @return Vector of split strings
+ */
+std::vector<std::string> splitString(const std::string& str,
+                                     char delimiter = ',',
+                                     bool trim_spaces = true,
+                                     bool keep_empty = false);
+
 // Network utility functions
 
 /**
