@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <boost/algorithm/string.hpp>
 
 #include <random>
 
@@ -91,17 +92,21 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
-static std::string loadNicPriorityMatrix(const std::string &device_name) {
-    auto device_names = formatDeviceNames(device_name);
-    return "{\"cpu:0\": [[" + device_names + "], []]}";
-}
+std::vector<std::string> splitString(const std::string &str, char delimiter,
+                                     bool trim_spaces, bool keep_empty) {
+    std::vector<std::string> result;
 
-void **rdma_args(const std::string &device_name) {
-    static auto nic_priority_matrix = loadNicPriorityMatrix(device_name);
-    void **args = (void **)malloc(2 * sizeof(void *));
-    args[0] = (void *)nic_priority_matrix.c_str();
-    args[1] = nullptr;
-    return args;
+    boost::split(
+        result, str, boost::is_any_of(std::string(1, delimiter)),
+        keep_empty ? boost::token_compress_off : boost::token_compress_on);
+
+    if (trim_spaces) {
+        for (auto &token : result) {
+            boost::trim(token);
+        }
+    }
+
+    return result;
 }
 
 }  // namespace mooncake
