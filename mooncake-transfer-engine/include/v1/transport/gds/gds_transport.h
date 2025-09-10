@@ -74,6 +74,8 @@ class GdsTransport : public Transport {
    private:
     std::string getGdsFilePath(SegmentID handle);
 
+    GdsFileContext *findFileContext(SegmentID target_id);
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -82,8 +84,9 @@ class GdsTransport : public Transport {
     std::shared_ptr<ConfigManager> conf_;
 
     RWSpinlock file_context_lock_;
-    std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>
-        file_context_map_;
+    using FileContextMap =
+        std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
+    FileContextMap file_context_map_;
 };
 }  // namespace v1
 }  // namespace mooncake

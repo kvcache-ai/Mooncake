@@ -154,6 +154,23 @@ std::string GdsTransport::getGdsFilePath(SegmentID target_id) {
     return detail.buffers[0].path;
 }
 
+GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
+    thread_local FileContextMap tl_file_context_map;
+    if (tl_file_context_map.count(target_id))
+        return tl_file_context_map[target_id].get();
+
+    RWSpinlock::WriteGuard guard(file_context_lock_);
+    if (!file_context_map_.count(target_id)) {
+        std::string path = getGdsFilePath(target_id);
+        if (path.empty()) return nullptr;
+        file_context_map_[target_id] =
+            std::make_shared<IOUringFileContext>(path);
+    }
+
+    tl_file_context_map = file_context_map_;
+    return tl_file_context_map[target_id].get();
+}
+
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
@@ -162,27 +179,8 @@ Status GdsTransport::submitTransferTasks(
     if (request_list.size() + gds_batch->io_params.size() > gds_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto &request : request_list) {
-        GdsFileContext *context = nullptr;
-        {
-            RWSpinlock::ReadGuard guard(file_context_lock_);
-            if (file_context_map_.count(request.target_id))
-                context = file_context_map_[request.target_id].get();
-        }
-
-        if (!context) {
-            RWSpinlock::WriteGuard guard(file_context_lock_);
-            if (!file_context_map_.count(request.target_id)) {
-                std::string path = getGdsFilePath(request.target_id);
-                if (path.empty())
-                    return Status::InvalidArgument(
-                        "Invalid remote segment" LOC_MARK);
-                file_context_map_[request.target_id] =
-                    std::make_shared<GdsFileContext>(path);
-            }
-            context = file_context_map_[request.target_id].get();
-        }
-
-        if (!context->ready())
+        GdsFileContext *context = findFileContext(request.target_id);
+        if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
 
         CUfileIOParams_t params;
@@ -228,15 +226,20 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
+    auto location = parseLocation(options.location);
+    if (location.first != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void *)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to register GDS buffer: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    desc.transports.push_back(GDS);
     return Status::OK();
 }
 
 Status GdsTransport::removeMemoryBuffer(BufferDesc &desc) {
+    auto location = parseLocation(desc.location);
+    if (location.first != "cuda") return Status::OK();
     auto result = cuFileBufDeregister((void *)desc.addr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(

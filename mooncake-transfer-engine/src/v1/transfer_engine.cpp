@@ -382,20 +382,24 @@ std::vector<TransportType> TransferEngine::getSupportedTransports(
             if (transport_list_[NVLINK]) result.push_back(NVLINK);
             if (transport_list_[RDMA]) result.push_back(RDMA);
             if (transport_list_[TCP]) result.push_back(TCP);
+            if (transport_list_[GDS]) result.push_back(GDS);
             break;
         case SHM:
             if (transport_list_[RDMA]) result.push_back(RDMA);
             if (transport_list_[SHM]) result.push_back(SHM);
             if (transport_list_[TCP]) result.push_back(TCP);
+            if (transport_list_[GDS]) result.push_back(GDS);
             break;
         case MNNVL:
             if (transport_list_[MNNVL]) result.push_back(MNNVL);
             if (transport_list_[RDMA]) result.push_back(RDMA);
             if (transport_list_[TCP]) result.push_back(TCP);
+            if (transport_list_[GDS]) result.push_back(GDS);
             break;
         case TCP:
             if (transport_list_[NVLINK]) result.push_back(NVLINK);
             if (transport_list_[TCP]) result.push_back(TCP);
+            if (transport_list_[GDS]) result.push_back(GDS);
             break;
         default:
             break;

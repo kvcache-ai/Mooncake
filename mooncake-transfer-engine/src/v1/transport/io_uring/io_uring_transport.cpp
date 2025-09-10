@@ -214,7 +214,7 @@ Status IOUringTransport::submitTransferTasks(
         task.status_word = TransferStatusEnum::PENDING;
 
         IOUringFileContext *context = findFileContext(request.target_id);
-        if (!context->ready())
+        if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
 
         struct io_uring_sqe *sqe = io_uring_get_sqe(&io_uring_batch->ring);
