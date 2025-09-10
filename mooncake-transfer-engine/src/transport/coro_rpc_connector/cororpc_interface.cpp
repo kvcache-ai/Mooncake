@@ -347,9 +347,6 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
     std::cout << "CoroRPCInterface::handleIncomingData called with "
               << data.size() << " bytes" << std::endl;
 
-    // For tensor data detection, we'll use a simple heuristic based on data
-    // size and patterns If data size is large enough and has a specific
-    // pattern, treat as tensor This is a simplified approach since we removed
     // C++ tensor rebuilding
     if (data.size() >= 72) {  // 72 bytes is our metadata size
         // Read the first few bytes to check if it looks like tensor metadata
@@ -430,8 +427,8 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
 
         impl_->data_receive_callback(received);
     } catch (const std::exception& e) {
-        std::cerr << "Error in data receive callback: " << e.what()
-                  << std::endl;
+        LOG(ERROR) << "Error in data receive callback: " << e.what()
+                   << std::endl;
     }
 }
 
@@ -457,10 +454,10 @@ void CoroRPCInterface::handleIncomingTensor(std::string_view source,
 
         ReceivedTensor received;
         received.source_address =
-            std::string(source);            // Convert to string for storage
-        received.data = std::string(data);  // Convert to string for storage
+            std::string(source);
+        received.data = std::string(data);  
         received.shape = shape;
-        received.dtype = std::string(dtype);  // Convert to string for storage
+        received.dtype = std::string(dtype);  
 
         impl_->tensor_receive_callback(received);
     } catch (const std::exception& e) {

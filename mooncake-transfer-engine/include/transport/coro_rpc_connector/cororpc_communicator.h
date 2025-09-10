@@ -55,7 +55,7 @@ class CoroRPCCommunicator {
         void handleDataTransfer(coro_rpc::context<void> context,
                                 std::string_view data);
         void handleTensorTransfer(coro_rpc::context<void> context);
-        void handleDataTransferWithAttachment(coro_rpc::context<void> context,
+        size_t handleDataTransferWithAttachment(coro_rpc::context<size_t> context,
                                               std::string_view data);
         void handleTensorTransferWithAttachment(
             coro_rpc::context<void> context);

@@ -252,8 +252,8 @@ void CoroRPCCommunicator::Impl::handleTensorTransfer(
     context.response_msg();
 }
 
-void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
-    coro_rpc::context<void> context, std::string_view data) {
+size_t CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
+    coro_rpc::context<size_t> context, std::string_view data) {
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
@@ -261,7 +261,11 @@ void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
               << data.size() << " bytes, Attachment: " << attachment.size()
               << " bytes" << std::endl;
 
-    context.response_msg();
+    // Calculate total data length (data parameter + attachment)
+    size_t total_length = data.size() + attachment.size();
+    
+    context.response_msg(total_length);
+    return total_length;
 }
 
 void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
