@@ -8,6 +8,10 @@ add_subdirectory(utility)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+if (USE_GDS)
+  add_compile_definitions(USE_GDS)
+endif()
+
 add_library(transfer_engine_v1 ${TEV1_ENGINE_SOURCES} $<TARGET_OBJECTS:transport_v1> $<TARGET_OBJECTS:metadata_v1>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine_v1 DESTINATION lib)
