@@ -167,8 +167,12 @@ Status IOUringTransport::submitTransferTasks(
         if (!sqe)
             return Status::InternalError("io_uring_get_sqe failed" LOC_MARK);
 
-        if (isCudaMemory(request.source)) {
-            task.buffer = malloc(request.length);
+        const size_t kPageSize = 4096;
+        if (isCudaMemory(request.source) ||
+            (uint64_t)request.source % kPageSize) {
+            int rc = posix_memalign(&task.buffer, kPageSize, request.length);
+            if (rc)
+                return Status::InternalError("posix_memalign failed" LOC_MARK);
             if (request.opcode == Request::READ)
                 io_uring_prep_read(sqe, context->getHandle(), task.buffer,
                                    request.length, request.target_offset);

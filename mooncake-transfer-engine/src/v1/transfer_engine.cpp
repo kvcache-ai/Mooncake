@@ -695,7 +695,10 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto &task = batch->task_list[task_id];
     if (task.type == UNSPEC) {
-        task_status.s = FAILED;
+        if (resubmitTransferTask(batch, task_id).ok())
+            task_status.s = PENDING;
+        else
+            task_status.s = FAILED;
         task_status.transferred_bytes = 0;
         return Status::OK();
     }
@@ -739,7 +742,8 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
         if (task.type == UNSPEC) {
-            overall_status.s = FAILED;
+            if (!resubmitTransferTask(batch, task_id).ok())
+                overall_status.s = FAILED;
             continue;
         }
         auto &transport = transport_list_[task.type];
