@@ -48,6 +48,7 @@ void CoroRPCCommunicator::setDataReceiveCallback(
 
 bool CoroRPCCommunicator::initialize(const Config& config) {
     impl_->config = config;
+    //`easylog::set_min_severity(easylog::Serverity::WARNING);  // Set log level to WARNING
 
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
@@ -249,7 +250,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
 
     // Echo back the attachment for response (zero-copy)
     if (!attachment.empty()) {
-        ctx_info->set_response_attachment(attachment);
+        ctx_info->set_response_attachment(std::string_view("ok"));
     }
 
     context.response_msg();
