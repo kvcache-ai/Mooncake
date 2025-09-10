@@ -359,7 +359,7 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
                   << ", ndim=" << ndim;
 
         // Basic validation: check if dtype and ndim are in reasonable ranges
-        if (dtype > 0 && dtype <= 9 && ndim >= 0 && ndim <= 4) {
+        if (dtype > 0 && dtype <= 9 && ndim <= 4) {
             std::cout
                 << "Data recognized as tensor, calling handleIncomingTensor";
 
