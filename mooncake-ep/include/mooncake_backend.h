@@ -58,6 +58,10 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
+    static void setDeviceFilter(std::vector<std::string> filters) {
+        engine_.setWhitelistFilters(std::move(filters));
+    }
+
     std::string getPreferredHca(std::string location) {
         auto matrix = engine_.getLocalTopology()->getMatrix();
         return matrix[location].preferred_hca[0];

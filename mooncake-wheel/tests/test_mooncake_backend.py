@@ -8,6 +8,7 @@ from mooncake import ep
 
 
 def worker(rank, world_size, results, collective):
+    ep.set_device_filter(["mlx5_0", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_9", "mlx5_10", "mlx5_11"])
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="mooncake",
