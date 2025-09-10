@@ -84,12 +84,19 @@ jobs:
         bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
+    - name: Start Metadata Server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+      shell: bash
+
     - name: Start Mooncake Master
       run: |
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         # Set a small kv lease ttl to make the test faster.
         # Must be consistent with the client test parameters.
-        mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=1 &
+        mooncake_master --default_kv_lease_ttl=500 &
       shell: bash
 
     - name: Test (in build env)
