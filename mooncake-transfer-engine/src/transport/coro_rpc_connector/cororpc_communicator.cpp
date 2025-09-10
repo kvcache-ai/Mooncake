@@ -16,16 +16,16 @@ CoroRPCCommunicator::~CoroRPCCommunicator() { stopServer(); }
 
 void CoroRPCCommunicator::setDataReceiveCallback(
     std::function<void(std::string_view, std::string_view)> callback) {
-    std::cout << "Setting data receive callback..." << std::endl;
+    LOG(INFO) << "Setting data receive callback..." << std::endl;
     impl_->data_receive_callback = callback;
-    std::cout << "Data receive callback set successfully" << std::endl;
+    LOG(INFO) << "Data receive callback set successfully" << std::endl;
 }
 
 bool CoroRPCCommunicator::initialize(const Config& config) {
     impl_->config = config;
 
     if (!config.listen_address.empty()) {
-        std::cout << "Initializing server on " << config.listen_address
+        LOG(INFO) << "Initializing server on " << config.listen_address
                   << std::endl;
 
         impl_->server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -37,7 +37,7 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
             &CoroRPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
     }
 
-    std::cout << "Communicator initialized with client pool support"
+    LOG(INFO) << "Communicator initialized with client pool support"
               << std::endl;
     return true;
 }
@@ -57,16 +57,16 @@ bool CoroRPCCommunicator::startServer() {
         auto ec = impl_->server_->start();
         if (ec.val() == 0) {
             impl_->is_server_started = true;
-            std::cout << "Server started on " << impl_->config.listen_address
+            LOG(INFO) << "Server started on " << impl_->config.listen_address
                       << std::endl;
             return true;
         } else {
-            std::cerr << "Failed to start server: " << ec.message()
+            LOG(ERROR) << "Failed to start server: " << ec.message()
                       << std::endl;
             return false;
         }
     } catch (const std::exception& e) {
-        std::cerr << "Failed to start server: " << e.what() << std::endl;
+        LOG(ERROR) << "Failed to start server: " << e.what() << std::endl;
         return false;
     }
 }
@@ -78,15 +78,15 @@ bool CoroRPCCommunicator::startServerAsync() {
         auto ec = impl_->server_->async_start();
         if (!ec.hasResult()) {
             impl_->is_server_started = true;
-            std::cout << "Server started asynchronously on "
+            LOG(INFO) << "Server started asynchronously on "
                       << impl_->config.listen_address << std::endl;
             return true;
         } else {
-            std::cerr << "Failed to start server asynchronously" << std::endl;
+            LOG(ERROR) << "Failed to start server asynchronously" << std::endl;
             return false;
         }
     } catch (const std::exception& e) {
-        std::cerr << "Failed to start server asynchronously: " << e.what()
+        LOG(ERROR) << "Failed to start server asynchronously: " << e.what()
                   << std::endl;
         return false;
     }
@@ -95,7 +95,7 @@ bool CoroRPCCommunicator::startServerAsync() {
 void CoroRPCCommunicator::stopServer() {
     if (impl_->is_server_started) {
         impl_->is_server_started = false;
-        std::cout << "Server stopped" << std::endl;
+        LOG(INFO) << "Server stopped" << std::endl;
     }
 }
 
@@ -126,7 +126,7 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
                         .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
                             std::string_view{});
                 if (!result.has_value()) {
-                    std::cerr << "RPC call failed: " << result.error().msg
+                    LOG(ERROR) << "RPC call failed: " << result.error().msg
                               << std::endl;
                 }
             } else {
@@ -136,14 +136,14 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
                         .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
                             data_view);
                 if (!result.has_value()) {
-                    std::cerr << "RPC call failed: " << result.error().msg
+                    LOG(ERROR) << "RPC call failed: " << result.error().msg
                               << std::endl;
                 }
             }
         });
 
     if (!rpc_result.has_value()) {
-        std::cout << "RPC send request failed" << std::endl;
+        LOG(INFO) << "RPC send request failed" << std::endl;
         co_return result{-1, "RPC call failed"};
     }
     result res;
@@ -175,12 +175,12 @@ async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
                     .call<&CoroRPCCommunicator::Impl::handleTensorTransfer>();
 
             if (!result.has_value()) {
-                std::cerr << "Tensor RPC call failed: " << result.error().msg
+                LOG(ERROR) << "Tensor RPC call failed: " << result.error().msg
                           << std::endl;
             }
         });
     if (!rpc_result.has_value()) {
-        std::cout << "Tensor RPC send request failed" << std::endl;
+        LOG(INFO) << "Tensor RPC send request failed" << std::endl;
         co_return -1;
     }
     co_return 0;
@@ -208,13 +208,13 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
-    std::cout << "Handling data transfer - Data: " << data.size()
+    LOG(INFO) << "Handling data transfer - Data: " << data.size()
               << " bytes, Attachment: " << attachment.size() << " bytes"
               << std::endl;
 
     // Call the data receive callback if set
     if (data_receive_callback) {
-        std::cout << "Calling data receive callback..." << std::endl;
+        LOG(INFO) << "Calling data receive callback..." << std::endl;
         std::string_view source_address =
             "unknown";  // Could extract from context if needed
 
@@ -229,7 +229,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
             data_receive_callback(source_address, data);
         }
     } else {
-        std::cout << "No data receive callback set!" << std::endl;
+        LOG(INFO) << "No data receive callback set!" << std::endl;
     }
 
     // Echo back the attachment for response (zero-copy)
@@ -245,7 +245,7 @@ void CoroRPCCommunicator::Impl::handleTensorTransfer(
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
-    std::cout << "Handling tensor transfer: " << attachment.size() << " bytes"
+    LOG(INFO) << "Handling tensor transfer: " << attachment.size() << " bytes"
               << std::endl;
 
     ctx_info->set_response_attachment(attachment);
@@ -257,7 +257,7 @@ void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
-    std::cout << "Handling data transfer with attachment - Data: "
+    LOG(INFO) << "Handling data transfer with attachment - Data: "
               << data.size() << " bytes, Attachment: " << attachment.size()
               << " bytes" << std::endl;
 
@@ -269,7 +269,7 @@ void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
-    std::cout << "Handling tensor transfer with attachment: "
+    LOG(INFO) << "Handling tensor transfer with attachment: "
               << attachment.size() << " bytes" << std::endl;
 
     ctx_info->set_response_attachment(attachment);
@@ -285,7 +285,7 @@ std::unique_ptr<CoroRPCCommunicator> createServer(
 
     auto communicator = std::make_unique<CoroRPCCommunicator>();
     if (communicator->initialize(config)) {
-        std::cout << "Created server communicator with pool size: "
+        LOG(INFO) << "Created server communicator with pool size: "
                   << config.pool_size << std::endl;
         return communicator;
     }
