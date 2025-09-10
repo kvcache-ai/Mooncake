@@ -83,6 +83,10 @@ class IOUringTransport : public Transport {
    private:
     std::string getIOUringFilePath(SegmentID handle);
 
+    IOUringFileContext *findFileContext(SegmentID handle);
+
+    Status localTransfer(void *dst, void *src, size_t length);
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -91,8 +95,10 @@ class IOUringTransport : public Transport {
     std::shared_ptr<ConfigManager> conf_;
 
     RWSpinlock file_context_lock_;
-    std::unordered_map<SegmentID, std::shared_ptr<IOUringFileContext>>
-        file_context_map_;
+    using FileContextMap =
+        std::unordered_map<SegmentID, std::shared_ptr<IOUringFileContext>>;
+    FileContextMap file_context_map_;
+    uint64_t async_memcpy_threshold_;
 };
 }  // namespace v1
 }  // namespace mooncake

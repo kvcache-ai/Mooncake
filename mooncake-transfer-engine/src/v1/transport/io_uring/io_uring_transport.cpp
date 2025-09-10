@@ -27,6 +27,11 @@
 #include "v1/memory/slab.h"
 #include "v1/utility/system.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 namespace v1 {
 class IOUringFileContext {
@@ -82,6 +87,8 @@ Status IOUringTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     installed_ = true;
+    async_memcpy_threshold_ =
+        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
     return Status::OK();
 }
 
@@ -103,7 +110,8 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
     if (rc)
         return Status::InternalError(
-            "io_uring_queue_init failed: " + std::to_string(rc) + LOC_MARK);
+            std::string("io_uring_queue_init failed: ") + strerror(-rc) +
+            LOC_MARK);
     return Status::OK();
 }
 
@@ -126,6 +134,70 @@ std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
     return detail.buffers[0].path;
 }
 
+IOUringFileContext *IOUringTransport::findFileContext(SegmentID target_id) {
+    thread_local FileContextMap tl_file_context_map;
+    if (tl_file_context_map.count(target_id))
+        return tl_file_context_map[target_id].get();
+
+    RWSpinlock::WriteGuard guard(file_context_lock_);
+    if (!file_context_map_.count(target_id)) {
+        std::string path = getIOUringFilePath(target_id);
+        if (path.empty()) return nullptr;
+        file_context_map_[target_id] =
+            std::make_shared<IOUringFileContext>(path);
+    }
+
+    tl_file_context_map = file_context_map_;
+    return tl_file_context_map[target_id].get();
+}
+
+Status IOUringTransport::localTransfer(void *dst, void *src, size_t length) {
+#ifdef USE_CUDA
+    bool is_async = (length >= async_memcpy_threshold_);
+
+    // Determine memory types
+    cudaPointerAttributes src_attr, dst_attr;
+    cudaMemoryType src_type = cudaMemoryTypeHost;
+    cudaMemoryType dst_type = cudaMemoryTypeHost;
+    if (cudaPointerGetAttributes(&src_attr, src) == cudaSuccess)
+        src_type = src_attr.type;
+    if (cudaPointerGetAttributes(&dst_attr, dst) == cudaSuccess)
+        dst_type = dst_attr.type;
+
+    cudaMemcpyKind kind = cudaMemcpyDefault;  // let CUDA infer if possible
+    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost)
+        kind = cudaMemcpyDeviceToHost;
+    else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeDevice)
+        kind = cudaMemcpyHostToDevice;
+    else if (src_type == cudaMemoryTypeDevice &&
+             dst_type == cudaMemoryTypeDevice)
+        kind = cudaMemcpyDeviceToDevice;
+    else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeHost)
+        kind = cudaMemcpyHostToHost;
+
+    if (kind == cudaMemcpyDefault) {
+        memcpy(dst, src, length);
+        return Status::OK();
+    }
+
+    if (!is_async) {
+        // Sync fast copy is better when one thread used
+        CHECK_CUDA(cudaMemcpy(dst, src, length, kind));
+        return Status::OK();
+    }
+
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreate(&stream));
+    CHECK_CUDA(cudaMemcpyAsync(dst, src, length, kind, stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    return Status::OK();
+#else
+    memcpy(dst, src, length);
+    return Status::OK();
+#endif
+}
+
 Status IOUringTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch *>(batch);
@@ -140,26 +212,8 @@ Status IOUringTransport::submitTransferTasks(
             io_uring_batch->task_list[io_uring_batch->task_list.size() - 1];
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        IOUringFileContext *context = nullptr;
-        {
-            RWSpinlock::ReadGuard guard(file_context_lock_);
-            if (file_context_map_.count(request.target_id))
-                context = file_context_map_[request.target_id].get();
-        }
 
-        if (!context) {
-            RWSpinlock::WriteGuard guard(file_context_lock_);
-            if (!file_context_map_.count(request.target_id)) {
-                std::string path = getIOUringFilePath(request.target_id);
-                if (path.empty())
-                    return Status::InvalidArgument(
-                        "Invalid remote segment" LOC_MARK);
-                file_context_map_[request.target_id] =
-                    std::make_shared<IOUringFileContext>(path);
-            }
-            context = file_context_map_[request.target_id].get();
-        }
-
+        IOUringFileContext *context = findFileContext(request.target_id);
         if (!context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
 
@@ -173,11 +227,15 @@ Status IOUringTransport::submitTransferTasks(
             int rc = posix_memalign(&task.buffer, kPageSize, request.length);
             if (rc)
                 return Status::InternalError("posix_memalign failed" LOC_MARK);
+#ifdef USE_CUDA
+            CHECK_CUDA(cudaHostRegister(task.buffer, request.length,
+                                        cudaHostRegisterDefault));
+#endif
             if (request.opcode == Request::READ)
                 io_uring_prep_read(sqe, context->getHandle(), task.buffer,
                                    request.length, request.target_offset);
             else if (request.opcode == Request::WRITE) {
-                genericMemcpy(task.buffer, request.source, request.length);
+                localTransfer(task.buffer, request.source, request.length);
                 io_uring_prep_write(sqe, context->getHandle(), task.buffer,
                                     request.length, request.target_offset);
             }
@@ -194,9 +252,8 @@ Status IOUringTransport::submitTransferTasks(
 
     int rc = io_uring_submit(&io_uring_batch->ring);
     if (rc != (int32_t)request_list.size())
-        return Status::InternalError(
-            std::string("io_uring_submit failed: Code ") + std::to_string(rc) +
-            LOC_MARK);
+        return Status::InternalError(std::string("io_uring_submit failed: ") +
+                                     strerror(-rc) + LOC_MARK);
 
     return Status::OK();
 }
@@ -210,26 +267,33 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
         struct io_uring_cqe *cqe = nullptr;
-        io_uring_peek_cqe(&io_uring_batch->ring, &cqe);
-        if (cqe) {
-            auto task = (IOUringTask *)cqe->user_data;
-            if (task) {
-                if (cqe->res < 0)
-                    task->status_word = TransferStatusEnum::FAILED;
-                else {
-                    if (task->buffer) {
-                        if (task->request.opcode == Request::READ)
-                            genericMemcpy(task->request.source, task->buffer,
-                                          task->request.length);
-                        free(task->buffer);
-                        task->buffer = nullptr;
-                    }
-                    task->status_word = TransferStatusEnum::COMPLETED;
-                    task->transferred_bytes = task->request.length;
-                }
-            }
-            io_uring_cqe_seen(&io_uring_batch->ring, cqe);
+        int err = io_uring_peek_cqe(&io_uring_batch->ring, &cqe);
+        if (err) {
+            return Status::InternalError(
+                std::string("io_uring_peek_cqe failed: ") + strerror(-err));
         }
+        if (!cqe) return Status::OK();
+        auto task = (IOUringTask *)cqe->user_data;
+        if (task) {
+            if (cqe->res < 0) {
+                LOG(INFO) << "Received an event with error code " << cqe->res;
+                task->status_word = TransferStatusEnum::FAILED;
+            } else {
+                if (task->buffer) {
+                    if (task->request.opcode == Request::READ)
+                        localTransfer(task->request.source, task->buffer,
+                                      task->request.length);
+#ifdef USE_CUDA
+                    CHECK_CUDA(cudaHostUnregister(task->buffer));
+#endif
+                    free(task->buffer);
+                    task->buffer = nullptr;
+                }
+                task->status_word = TransferStatusEnum::COMPLETED;
+                task->transferred_bytes = task->request.length;
+            }
+        }
+        io_uring_cqe_seen(&io_uring_batch->ring, cqe);
     }
     return Status::OK();
 }
