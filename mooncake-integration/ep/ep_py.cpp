@@ -60,6 +60,7 @@ PYBIND11_MODULE(ep, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
+    m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("get_preferred_hca", &getPreferredHca);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
