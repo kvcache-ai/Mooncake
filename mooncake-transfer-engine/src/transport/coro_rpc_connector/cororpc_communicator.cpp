@@ -252,32 +252,42 @@ void CoroRPCCommunicator::Impl::handleTensorTransfer(
     context.response_msg();
 }
 
-size_t CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
-    coro_rpc::context<size_t> context, std::string_view data) {
-    auto ctx_info = context.get_context_info();
-    auto attachment = ctx_info->get_request_attachment();
+void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
+    coro_rpc::context<void> context, std::string_view data) {
+    py_rpc_context t{};
+    t.context_ = std::move(context);
+    py::gil_scoped_acquire acquire;
+    //auto ctx_info = context.get_context_info();
+    //auto attachment = ctx_info->get_request_attachment();
+    auto view = py::memoryview::from_buffer(data.data(), {data.size()+}, {sizeof(char)});
 
-    LOG(INFO) << "Handling data transfer with attachment - Data: "
-              << data.size() << " bytes, Attachment: " << attachment.size()
-              << " bytes" << std::endl;
-
-    // Calculate total data length (data parameter + attachment)
-    size_t total_length = data.size() + attachment.size();
-    
-    context.response_msg(total_length);
-    return total_length;
+    // LOG(INFO) << "Handling data transfer with attachment - Data: "
+    //          << data.size() << " bytes, Attachment: " << attachment.size()
+    //          << " bytes" << std::endl;
+    py_callback(std::move(t), view);
+    //context.response_msg();
 }
 
 void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
     coro_rpc::context<void> context) {
-    auto ctx_info = context.get_context_info();
-    auto attachment = ctx_info->get_request_attachment();
+    py_rpc_context t{};
+    t.context_ = std::move(context);
+    py::gil_scoped_acquire acquire;
 
-    LOG(INFO) << "Handling tensor transfer with attachment: "
-              << attachment.size() << " bytes" << std::endl;
+    auto view = py::memoryview::from_buffer(
+        ctx_info->get_request_attachment().data(),
+        {ctx_info->get_request_attachment().size()},
+        {sizeof(int8_t)});
 
-    ctx_info->set_response_attachment(attachment);
-    context.response_msg();
+    py_callback(std::move(t), view);
+    // auto ctx_info = context.get_context_info();
+    // auto attachment = ctx_info->get_request_attachment();
+
+    // LOG(INFO) << "Handling tensor transfer with attachment: "
+    //           << attachment.size() << " bytes" << std::endl;
+
+    // ctx_info->set_response_attachment(attachment);
+    // context.response_msg();
 }
 
 std::unique_ptr<CoroRPCCommunicator> createServer(
