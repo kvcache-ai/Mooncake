@@ -5,6 +5,7 @@
 #include <thread>
 #include <future>
 #include <vector>
+#include <glog/logging.h>
 #include "async_simple/coro/SyncAwait.h"
 
 namespace mooncake {
@@ -151,7 +152,7 @@ pybind11::object CoroRPCInterface::sendDataAsync(std::string& target_address,
     auto lazy = coro_lambda();
     lazy.start([](auto&& result) {
         if (result.hasError()) {
-            std::cerr << "Coroutine completed with error" << std::endl;
+            std::cerr << "Coroutine completed with error";
         }
     });
 
@@ -175,7 +176,7 @@ int CoroRPCInterface::sendTensor(const std::string& target_address,
                       .attr("__name__")
                       .cast<std::string>()
                       .find("Tensor") != std::string::npos)) {
-                std::cerr << "Input is not a tensor" << std::endl;
+                std::cerr << "Input is not a tensor";
                 return -1;
             }
 
@@ -214,7 +215,7 @@ int CoroRPCInterface::sendTensor(const std::string& target_address,
             }
             std::cout << "] and dtype: " << tensor_info.dtype
                       << ", tensor size: " << tensor_info.total_bytes
-                      << " bytes" << std::endl;
+                      << " bytes";
         }
 
         // Use the async version which supports zero-copy via attachments
@@ -224,7 +225,7 @@ int CoroRPCInterface::sendTensor(const std::string& target_address,
         return result;
 
     } catch (const std::exception& e) {
-        std::cerr << "Send tensor error: " << e.what() << std::endl;
+        std::cerr << "Send tensor error: " << e.what();
         return -1;
     }
 }
@@ -314,7 +315,7 @@ pybind11::object CoroRPCInterface::sendTensorAsync(std::string& target_address,
         // coroutine itself
         if (result.hasError()) {
             // Log error if needed
-            std::cerr << "Tensor coroutine completed with error" << std::endl;
+            std::cerr << "Tensor coroutine completed with error";
         }
     });
 
@@ -345,7 +346,7 @@ void CoroRPCInterface::setTensorReceiveCallback(pybind11::function callback) {
 void CoroRPCInterface::handleIncomingData(std::string_view source,
                                           std::string_view data) {
     std::cout << "CoroRPCInterface::handleIncomingData called with "
-              << data.size() << " bytes" << std::endl;
+              << data.size() << " bytes";
 
     // C++ tensor rebuilding
     if (data.size() >= 72) {  // 72 bytes is our metadata size
@@ -355,13 +356,12 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
         uint32_t ndim = header[1];
 
         std::cout << "Checking tensor metadata: dtype=" << dtype
-                  << ", ndim=" << ndim << std::endl;
+                  << ", ndim=" << ndim;
 
         // Basic validation: check if dtype and ndim are in reasonable ranges
         if (dtype > 0 && dtype <= 9 && ndim >= 0 && ndim <= 4) {
             std::cout
-                << "Data recognized as tensor, calling handleIncomingTensor"
-                << std::endl;
+                << "Data recognized as tensor, calling handleIncomingTensor";
 
             // This looks like tensor data, handle it as such
             std::vector<size_t> shape;
@@ -427,8 +427,7 @@ void CoroRPCInterface::handleIncomingData(std::string_view source,
 
         impl_->data_receive_callback(received);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Error in data receive callback: " << e.what()
-                   << std::endl;
+        LOG(ERROR) << "Error in data receive callback: " << e.what();
     }
 }
 
@@ -436,33 +435,31 @@ void CoroRPCInterface::handleIncomingTensor(std::string_view source,
                                             std::string_view data,
                                             const std::vector<size_t>& shape,
                                             std::string_view dtype) {
-    std::cout << "CoroRPCInterface::handleIncomingTensor called" << std::endl;
-    std::cout << "  source: " << source << std::endl;
-    std::cout << "  data size: " << data.size() << std::endl;
-    std::cout << "  dtype: " << dtype << std::endl;
-    std::cout << "  shape size: " << shape.size() << std::endl;
+    std::cout << "CoroRPCInterface::handleIncomingTensor called";
+    std::cout << "  source: " << source;
+    std::cout << "  data size: " << data.size();
+    std::cout << "  dtype: " << dtype;
+    std::cout << "  shape size: " << shape.size();
 
     if (!impl_->tensor_receive_callback) {
-        std::cout << "No tensor receive callback set!" << std::endl;
+        std::cout << "No tensor receive callback set!";
         return;
     }
 
-    std::cout << "Calling Python tensor receive callback..." << std::endl;
+    std::cout << "Calling Python tensor receive callback...";
 
     try {
         pybind11::gil_scoped_acquire acquire;
 
         ReceivedTensor received;
-        received.source_address =
-            std::string(source);
-        received.data = std::string(data);  
+        received.source_address = std::string(source);
+        received.data = std::string(data);
         received.shape = shape;
-        received.dtype = std::string(dtype);  
+        received.dtype = std::string(dtype);
 
         impl_->tensor_receive_callback(received);
     } catch (const std::exception& e) {
-        std::cerr << "Error in tensor receive callback: " << e.what()
-                  << std::endl;
+        std::cerr << "Error in tensor receive callback: " << e.what();
     }
 }
 

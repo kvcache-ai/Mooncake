@@ -2,13 +2,38 @@
 #include <iostream>
 #include <thread>
 #include <functional>
+#include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/coro_io.hpp>
+#include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
 
+namespace py = pybind11;
+
 namespace mooncake {
+
+class py_rpc_context {
+   public:
+    void response_msg(py::buffer msg, py::handle done) {
+        py::buffer_info info = msg.request();
+        const char* data = static_cast<char*>(info.ptr);
+        context_.get_context_info()->set_response_attachment(
+            std::string_view(data, info.size));
+        done.inc_ref();
+        context_.get_context_info()->set_complete_handler(
+            [done](const std::error_code& ec, std::size_t) {
+                py::gil_scoped_acquire acquire;
+                done(!ec);
+                done.dec_ref();
+            });
+        context_.response_msg();
+    }
+
+    coro_rpc::context<void> context_;
+};
 
 CoroRPCCommunicator::CoroRPCCommunicator() : impl_(std::make_shared<Impl>()) {}
 
@@ -16,17 +41,16 @@ CoroRPCCommunicator::~CoroRPCCommunicator() { stopServer(); }
 
 void CoroRPCCommunicator::setDataReceiveCallback(
     std::function<void(std::string_view, std::string_view)> callback) {
-    LOG(INFO) << "Setting data receive callback..." << std::endl;
+    LOG(INFO) << "Setting data receive callback...";
     impl_->data_receive_callback = callback;
-    LOG(INFO) << "Data receive callback set successfully" << std::endl;
+    LOG(INFO) << "Data receive callback set successfully";
 }
 
 bool CoroRPCCommunicator::initialize(const Config& config) {
     impl_->config = config;
 
     if (!config.listen_address.empty()) {
-        LOG(INFO) << "Initializing server on " << config.listen_address
-                  << std::endl;
+        LOG(INFO) << "Initializing server on " << config.listen_address;
 
         impl_->server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             config.thread_count, config.listen_address,
@@ -37,8 +61,7 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
             &CoroRPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
     }
 
-    LOG(INFO) << "Communicator initialized with client pool support"
-              << std::endl;
+    LOG(INFO) << "Communicator initialized with client pool support";
     return true;
 }
 
@@ -57,16 +80,14 @@ bool CoroRPCCommunicator::startServer() {
         auto ec = impl_->server_->start();
         if (ec.val() == 0) {
             impl_->is_server_started = true;
-            LOG(INFO) << "Server started on " << impl_->config.listen_address
-                      << std::endl;
+            LOG(INFO) << "Server started on " << impl_->config.listen_address;
             return true;
         } else {
-            LOG(ERROR) << "Failed to start server: " << ec.message()
-                      << std::endl;
+            LOG(ERROR) << "Failed to start server: " << ec.message();
             return false;
         }
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to start server: " << e.what() << std::endl;
+        LOG(ERROR) << "Failed to start server: " << e.what();
         return false;
     }
 }
@@ -79,15 +100,14 @@ bool CoroRPCCommunicator::startServerAsync() {
         if (!ec.hasResult()) {
             impl_->is_server_started = true;
             LOG(INFO) << "Server started asynchronously on "
-                      << impl_->config.listen_address << std::endl;
+                      << impl_->config.listen_address;
             return true;
         } else {
-            LOG(ERROR) << "Failed to start server asynchronously" << std::endl;
+            LOG(ERROR) << "Failed to start server asynchronously";
             return false;
         }
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to start server asynchronously: " << e.what()
-                  << std::endl;
+        LOG(ERROR) << "Failed to start server asynchronously: " << e.what();
         return false;
     }
 }
@@ -95,7 +115,7 @@ bool CoroRPCCommunicator::startServerAsync() {
 void CoroRPCCommunicator::stopServer() {
     if (impl_->is_server_started) {
         impl_->is_server_started = false;
-        LOG(INFO) << "Server stopped" << std::endl;
+        LOG(INFO) << "Server stopped";
     }
 }
 
@@ -126,8 +146,7 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
                         .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
                             std::string_view{});
                 if (!result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg
-                              << std::endl;
+                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 }
             } else {
                 // Use regular parameter for small data
@@ -136,14 +155,13 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
                         .call<&CoroRPCCommunicator::Impl::handleDataTransfer>(
                             data_view);
                 if (!result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg
-                              << std::endl;
+                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 }
             }
         });
 
     if (!rpc_result.has_value()) {
-        LOG(INFO) << "RPC send request failed" << std::endl;
+        LOG(INFO) << "RPC send request failed";
         co_return result{-1, "RPC call failed"};
     }
     result res;
@@ -175,12 +193,11 @@ async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
                     .call<&CoroRPCCommunicator::Impl::handleTensorTransfer>();
 
             if (!result.has_value()) {
-                LOG(ERROR) << "Tensor RPC call failed: " << result.error().msg
-                          << std::endl;
+                LOG(ERROR) << "Tensor RPC call failed: " << result.error().msg;
             }
         });
     if (!rpc_result.has_value()) {
-        LOG(INFO) << "Tensor RPC send request failed" << std::endl;
+        LOG(INFO) << "Tensor RPC send request failed";
         co_return -1;
     }
     co_return 0;
@@ -209,12 +226,10 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     auto attachment = ctx_info->get_request_attachment();
 
     LOG(INFO) << "Handling data transfer - Data: " << data.size()
-              << " bytes, Attachment: " << attachment.size() << " bytes"
-              << std::endl;
-
+              << " bytes, Attachment: " << attachment.size() << " bytes";
     // Call the data receive callback if set
     if (data_receive_callback) {
-        LOG(INFO) << "Calling data receive callback..." << std::endl;
+        LOG(INFO) << "Calling data receive callback...";
         std::string_view source_address =
             "unknown";  // Could extract from context if needed
 
@@ -229,7 +244,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
             data_receive_callback(source_address, data);
         }
     } else {
-        LOG(INFO) << "No data receive callback set!" << std::endl;
+        LOG(INFO) << "No data receive callback set!";
     }
 
     // Echo back the attachment for response (zero-copy)
@@ -245,8 +260,20 @@ void CoroRPCCommunicator::Impl::handleTensorTransfer(
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
-    LOG(INFO) << "Handling tensor transfer: " << attachment.size() << " bytes"
-              << std::endl;
+    LOG(INFO) << "Handling tensor transfer: " << attachment.size() << " bytes";
+
+    // Call the data receive callback if set (tensor data is received via
+    // attachment)
+    if (data_receive_callback) {
+        LOG(INFO) << "Calling data receive callback for tensor...";
+        std::string_view source_address =
+            "unknown";  // Could extract from context if needed
+
+        // Pass the attachment data to the callback
+        data_receive_callback(source_address, attachment);
+    } else {
+        LOG(INFO) << "No data receive callback set for tensor!";
+    }
 
     ctx_info->set_response_attachment(attachment);
     context.response_msg();
@@ -257,27 +284,31 @@ void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
     py_rpc_context t{};
     t.context_ = std::move(context);
     py::gil_scoped_acquire acquire;
-    //auto ctx_info = context.get_context_info();
-    //auto attachment = ctx_info->get_request_attachment();
-    auto view = py::memoryview::from_buffer(data.data(), {data.size()+}, {sizeof(char)});
+    // auto ctx_info = context.get_context_info();
+    // auto attachment = ctx_info->get_request_attachment();
+    auto view =
+        py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
     // LOG(INFO) << "Handling data transfer with attachment - Data: "
     //          << data.size() << " bytes, Attachment: " << attachment.size()
     //          << " bytes" << std::endl;
     py_callback(std::move(t), view);
-    //context.response_msg();
+    // context.response_msg();
 }
 
 void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
     coro_rpc::context<void> context) {
     py_rpc_context t{};
+
+    // Get the attachment before moving the context
+    auto ctx_info = context.get_context_info();
+    auto attachment = ctx_info->get_request_attachment();
+
     t.context_ = std::move(context);
     py::gil_scoped_acquire acquire;
 
     auto view = py::memoryview::from_buffer(
-        ctx_info->get_request_attachment().data(),
-        {ctx_info->get_request_attachment().size()},
-        {sizeof(int8_t)});
+        attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
     py_callback(std::move(t), view);
     // auto ctx_info = context.get_context_info();

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <functional>
 #include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
@@ -51,6 +52,8 @@ class CoroRPCCommunicator {
 
         std::function<void(std::string_view, std::string_view)>
             data_receive_callback;
+
+        pybind11::handle py_callback;
 
         void handleDataTransfer(coro_rpc::context<void> context,
                                 std::string_view data);
