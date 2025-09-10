@@ -122,10 +122,15 @@ class TransferEngine {
 
     Status lazyFreeBatch();
 
-    TransportType getTransportType(const Request &request);
+    TransportType getTransportType(const Request &request, int priority = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
+
+    Status resubmitTransferTask(Batch *batch, size_t task_id);
+
+    TransportType resolveTransport(const Request &req, int priority,
+                                   bool invalidate_on_fail = true);
 
    private:
     struct AllocatedMemory {

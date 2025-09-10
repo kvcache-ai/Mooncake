@@ -43,6 +43,8 @@ struct TaskInfo {
     TransportType type;
     int sub_task_id;
     bool derived;  // merged by other tasks
+    int xport_priority;
+    Request request;
 };
 
 struct Batch {
@@ -465,14 +467,19 @@ Status TransferEngine::lazyFreeBatch() {
     return Status::OK();
 }
 
-TransportType TransferEngine::getTransportType(const Request &request) {
+TransportType TransferEngine::getTransportType(const Request &request,
+                                               int priority) {
     SegmentDesc *remote_desc;
     auto status = metadata_->segmentManager().getRemoteCached(
         remote_desc, request.target_id);
     if (!status.ok()) return UNSPEC;
     if (remote_desc->type == SegmentType::File) {
-        if (isCudaMemory(request.source) && transport_list_[GDS]) return GDS;
-        if (transport_list_[IOURING]) return IOURING;
+        if (isCudaMemory(request.source) && transport_list_[GDS]) {
+            if (priority-- == 0) return GDS;
+        }
+        if (transport_list_[IOURING]) {
+            if (priority-- == 0) return IOURING;
+        }
         return UNSPEC;
     } else {
         auto entry =
@@ -484,7 +491,9 @@ TransportType TransferEngine::getTransportType(const Request &request) {
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
             if ((type == NVLINK || type == MNNVL) && !cuda_device) continue;
-            if (transport_list_[type]) return type;
+            if (transport_list_[type]) {
+                if (priority-- == 0) return type;
+            }
         }
         return UNSPEC;
     }
@@ -553,6 +562,16 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
     return result;
 }
 
+TransportType TransferEngine::resolveTransport(const Request &req, int priority,
+                                               bool invalidate_on_fail) {
+    auto type = getTransportType(req, priority);
+    if (type == UNSPEC && invalidate_on_fail) {
+        metadata_->segmentManager().invalidateRemote(req.target_id);
+        type = getTransportType(req, priority);
+    }
+    return type;
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request> &request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
@@ -564,9 +583,10 @@ Status TransferEngine::submitTransfer(
 
     size_t start_task_id = batch->task_list.size();
     batch->task_list.insert(batch->task_list.end(), request_list.size(),
-                            {UNSPEC, -1, false});
+                            {UNSPEC, -1, false, 0, Request{}});
 
     auto merged = mergeRequests(request_list);
+    std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto &kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;
         size_t merged_task_id = kv.second;
@@ -579,38 +599,37 @@ Status TransferEngine::submitTransfer(
             continue;
         }
 
-        auto type = getTransportType(merged_request);
-        if (type == UNSPEC) {
-            metadata_->segmentManager().invalidateRemote(
-                merged_request.target_id);
-            type = getTransportType(merged_request);
-        }
-
-        if (type == UNSPEC) {
+        task.xport_priority = 0;
+        task.request = merged_request;
+        task.type = resolveTransport(merged_request, 0);
+        if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
             merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
-        if (!batch->sub_batch[type]) {
-            auto &transport = transport_list_[type];
-            auto status = transport->allocateSubBatch(batch->sub_batch[type],
-                                                      batch->max_size);
+        if (!batch->sub_batch[task.type]) {
+            auto &transport = transport_list_[task.type];
+            auto status = transport->allocateSubBatch(
+                batch->sub_batch[task.type], batch->max_size);
             if (!status.ok()) {
-                LOG(WARNING) << "Failed to allocate SubBatch " << type << ":"
-                             << status.ToString();
+                LOG(WARNING) << "Failed to allocate SubBatch " << task.type
+                             << ":" << status.ToString();
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
         }
 
-        auto sub_task_id = batch->sub_batch[type]->size();
-        classified_request_list[type].push_back(merged_request);
-        task.type = type;
+        if (!next_sub_task_id.count(task.type))
+            next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
+        size_t sub_task_id = next_sub_task_id[task.type];
+        next_sub_task_id[task.type]++;
+
+        classified_request_list[task.type].push_back(merged_request);
         task.sub_task_id = sub_task_id;
         task.derived = false;
-        task_id_list[type].push_back(task_id);
+        task_id_list[task.type].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
 
@@ -629,6 +648,23 @@ Status TransferEngine::submitTransfer(
     }
 
     return Status::OK();
+}
+
+Status TransferEngine::resubmitTransferTask(Batch *batch, size_t task_id) {
+    auto &task = batch->task_list[task_id];
+    task.xport_priority++;
+    auto type = resolveTransport(task.request, task.xport_priority);
+    if (type == UNSPEC)
+        return Status::InvalidEntry("All available transports are failed");
+
+    auto &transport = transport_list_[type];
+    if (!batch->sub_batch[type])
+        CHECK_STATUS(transport->allocateSubBatch(batch->sub_batch[type],
+                                                 batch->max_size));
+    auto &sub_batch = batch->sub_batch[type];
+    task.sub_task_id = sub_batch->size();
+    task.type = type;
+    return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
 Status TransferEngine::sendNotification(SegmentID target_id,
@@ -652,15 +688,15 @@ Status TransferEngine::receiveNotification(
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
-                                         TransferStatus &status) {
+                                         TransferStatus &task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto &task = batch->task_list[task_id];
     if (task.type == UNSPEC) {
-        status.s = FAILED;
-        status.transferred_bytes = 0;
+        task_status.s = FAILED;
+        task_status.transferred_bytes = 0;
         return Status::OK();
     }
     auto &transport = transport_list_[task.type];
@@ -668,7 +704,13 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    return transport->getTransferStatus(sub_batch, task.sub_task_id, status);
+    CHECK_STATUS(
+        transport->getTransferStatus(sub_batch, task.sub_task_id, task_status));
+    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        task_status.transferred_bytes = 0;
+    }
+    return Status::OK();
 }
 
 Status TransferEngine::getTransferStatus(
@@ -708,6 +750,11 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
         TransferStatus task_status;
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
+        if (task_status.s == FAILED &&
+            resubmitTransferTask(batch, task_id).ok()) {
+            task_status.s = PENDING;
+            task_status.transferred_bytes = 0;
+        }
         if (task_status.s == COMPLETED) {
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;

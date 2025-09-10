@@ -267,6 +267,11 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
     auto &task = rdma_batch->task_list[task_id];
+    // failure injection
+    // if (task.status_word == COMPLETED && SimpleRandom::Get().next(100) == 0)
+    // {
+    //     task.status_word = FAILED;
+    // }
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
