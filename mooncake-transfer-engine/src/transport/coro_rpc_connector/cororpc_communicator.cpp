@@ -51,6 +51,15 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
     easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
     // to WARNING
 
+    // Initialize client pools with proper configuration
+    coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        pool_conf.client_config.socket_config = coro_io::ib_socket_t::config_t{};
+        impl_->server_->init_ibv();
+    }
+    client_pools_ = std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(pool_conf);
+
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
 
@@ -135,7 +144,7 @@ async_simple::coro::Lazy<result> CoroRPCCommunicator::sendDataAsync(
     // For large data, use attachment to avoid copying
     const size_t ATTACHMENT_THRESHOLD = 1024;  // Use attachment for data > 1KB
 
-    auto rpc_result = co_await client_pools_.send_request(
+    auto rpc_result = co_await client_pools_->send_request(
         target_address,
         [data_view, data_size](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
@@ -183,7 +192,7 @@ int CoroRPCCommunicator::sendTensor(const std::string& target_address,
 
 async_simple::coro::Lazy<int> CoroRPCCommunicator::sendTensorAsync(
     const std::string& target_address, const TensorInfo& tensor) {
-    auto rpc_result = co_await client_pools_.send_request(
+    auto rpc_result = co_await client_pools_->send_request(
         target_address,
         [&tensor](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {

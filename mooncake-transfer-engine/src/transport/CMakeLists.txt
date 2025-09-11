@@ -20,7 +20,7 @@ endif()
 add_subdirectory(rdma_transport)
 
 add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>)
-target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread pybind11::module)
+target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread pybind11::module ${Python3_LIBRARIES})
 
 if (USE_TCP)
   add_subdirectory(tcp_transport)
