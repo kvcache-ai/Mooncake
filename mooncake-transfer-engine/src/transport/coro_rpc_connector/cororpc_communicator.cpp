@@ -48,7 +48,7 @@ void CoroRPCCommunicator::setDataReceiveCallback(
 
 bool CoroRPCCommunicator::initialize(const Config& config) {
     impl_->config = config;
-    //`easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
+    easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
     // to WARNING
 
     if (!config.listen_address.empty()) {
