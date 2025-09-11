@@ -61,11 +61,11 @@ thread = threading.Thread(target=print_qps)
 thread.start()
 
 for i in range(64):
-thread1 = threading.Thread(target=send_data, args=(client,))
-thread1.start()
-# while True:
-# result = client.send_data(url, test_data)
-# counter.inc()
+    thread1 = threading.Thread(target=send_data, args=(client,))
+    thread1.start()
+    # while True:
+    # result = client.send_data(url, test_data)
+    # counter.inc()
 
 thread.join()
 # print(f"Send result: {result}")
