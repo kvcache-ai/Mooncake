@@ -93,6 +93,7 @@ class GdsTransport : public Transport {
     using FileContextMap =
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
+    size_t io_batch_depth_;
 };
 }  // namespace v1
 }  // namespace mooncake

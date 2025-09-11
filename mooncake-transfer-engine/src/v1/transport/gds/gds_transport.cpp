@@ -108,6 +108,7 @@ Status GdsTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     installed_ = true;
+    io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 1024);
     return Status::OK();
 }
 
@@ -125,9 +126,9 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::InternalError("Unable to allocate GDS sub-batch");
     batch = gds_batch;
     gds_batch->max_size = max_size;
-    gds_batch->io_params.reserve(max_size);
-    gds_batch->io_events.resize(max_size);
-    auto result = cuFileBatchIOSetUp(&gds_batch->handle, max_size);
+    gds_batch->io_params.reserve(io_batch_depth_);
+    gds_batch->io_events.resize(io_batch_depth_);
+    auto result = cuFileBatchIOSetUp(&gds_batch->handle, io_batch_depth_);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to setup GDS batch IO: Code ") +
@@ -180,7 +181,7 @@ Status GdsTransport::submitTransferTasks(
     size_t first_param_index = gds_batch->io_params.size();
     for (auto &request : request_list)
         num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
-    if (first_param_index + num_params > gds_batch->max_size)
+    if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto &request : request_list) {
         GdsFileContext *context = findFileContext(request.target_id);
