@@ -4,6 +4,7 @@ import time
 import sys
 import threading
 import struct
+import argparse
 from typing import List, Tuple, Dict, Any
 
 import mooncake.engine as engine
@@ -33,39 +34,87 @@ counter = AtomicCounter()
 
 size_1mb = 1024 * 1024
 test_data = b'\x00' * size_1mb
-url = "127.0.0.1:9004"
 
 def print_qps():
-    while(True):
+    while True:
         time.sleep(1)
         val = counter.get()
-        if(val == 0):   
+        if val == 0:   
             continue
-
         print("qps:", val)
 
-def send_data(client):
+def send_data(client, target_url):
     while True:
-        result = client.send_data(url, test_data)
+        result = client.send_data(target_url, test_data)
         counter.inc()
 
-CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
+def run_server(bind_url):
+    """Run server mode"""
+    print(f"Starting server on {bind_url}")
+    
+    CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
+    server = CoroRPCInterface()
+    server.initialize(bind_url, 8, 30, 4)
+    server.start_server()
+    
+    # Start QPS statistics thread
+    thread = threading.Thread(target=print_qps)
+    thread.daemon = True
+    thread.start()
+    
+    print(f"Server started on {bind_url}, press Ctrl+C to stop")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nServer stopping...")
 
-server = CoroRPCInterface()
-# client = CoroRPCInterface()
-server.initialize("0.0.0.0:9004", 8, 30, 4)
-server.start_server()
-# client.initialize("", 0, 30, 100)
+def run_client(target_url, num_threads=64):
+    """Run client mode"""
+    print(f"Starting client, connecting to {target_url} with {num_threads} threads")
+    
+    CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
+    client = CoroRPCInterface()
+    client.initialize("", 0, 30, 100)
+    
+    # Start QPS statistics thread
+    qps_thread = threading.Thread(target=print_qps)
+    qps_thread.daemon = True
+    qps_thread.start()
+    
+    # Start multiple sending threads
+    threads = []
+    for i in range(num_threads):
+        thread = threading.Thread(target=send_data, args=(client, target_url))
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+    
+    print(f"Client started with {num_threads} threads, press Ctrl+C to stop")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nClient stopping...")
 
-thread = threading.Thread(target=print_qps)
-thread.start()
+def main():
+    parser = argparse.ArgumentParser(description='Mooncake Communication Bandwidth Test Tool')
+    parser.add_argument('mode', choices=['server', 'client'], 
+                       help='Run mode: server or client')
+    parser.add_argument('--url', default='127.0.0.1:9004',
+                       help='URL address (default: 127.0.0.1:9004)')
+    parser.add_argument('--threads', type=int, default=64,
+                       help='Number of client threads (default: 64)')
+    
+    args = parser.parse_args()
+    
+    if args.mode == 'server':
+        # Server mode, URL as bind address
+        bind_url = f"0.0.0.0:{args.url.split(':')[-1]}" if ':' in args.url else f"0.0.0.0:{args.url}"
+        run_server(bind_url)
+    else:
+        # Client mode, URL as target address
+        run_client(args.url, args.threads)
 
-for i in range(64):
-    thread1 = threading.Thread(target=send_data, args=(client,))
-    thread1.start()
-    # while True:
-    # result = client.send_data(url, test_data)
-    # counter.inc()
-
-thread.join()
-# print(f"Send result: {result}")
+if __name__ == "__main__":
+    main()
