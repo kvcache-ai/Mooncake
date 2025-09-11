@@ -40,17 +40,11 @@ struct IOParamRange {
 
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
-    int poller_id;
-    std::vector<IOParamRange> io_param_ranges;
-    virtual size_t size() const { return io_param_ranges.size(); }
-};
-
-struct GdsEventPoller {
-    bool active = false;
     CUfileBatchHandle_t handle;
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
+    virtual size_t size() const { return io_param_ranges.size(); }
 };
 
 class GdsTransport : public Transport {
@@ -88,10 +82,6 @@ class GdsTransport : public Transport {
 
     GdsFileContext *findFileContext(SegmentID target_id);
 
-    Status allocatePoller(int &index);
-
-    Status releasePoller(int index);
-
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -104,9 +94,6 @@ class GdsTransport : public Transport {
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
-
-    std::mutex pollers_mutex_;
-    std::vector<GdsEventPoller> pollers_;
 };
 }  // namespace v1
 }  // namespace mooncake
