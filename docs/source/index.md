@@ -28,6 +28,10 @@ This repository also hosts its technical report and the open sourced traces.
 <h2 id="updates">🔄 Updates</h2>
 
  - **Sept 10, 2025**: SGLang officially supports Mooncake Store as a [hierarchical KV caching storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+ - **Sept 10, 2025**: The official & high-performance version of Mooncake P2P Store is open-sourced as [MoonshotAI/checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine/), successfully applied in K1.5 and K2 production training. Updates Kimi-K2 model (1T parameters) across thousands of GPUs in ~20s.
+ - **Aug 23, 2025**: [xLLM](https://github.com/jd-opensource/xllm) high-performance inference engine builds hybrid KV cache management based on Mooncake, supporting global KV cache management with intelligent offloading and prefetching.
+ - **Aug 18, 2025**: vLLM-Ascend integrates Mooncake Transfer Engine for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
+ - **Jul 20, 2025**: Mooncake powers [the deployment of Kimi K2](https://lmsys.org/blog/2025-07-20-k2-large-scale-ep/) on 128 H200 GPUs with PD disaggregation and large-scale expert parallelism, achieving 224k tokens/sec prefill throughput and 288k tokens/sec decode throughput.
  - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmdeploy-integration-v0.9.md) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
  - **May 8, 2025**: Mooncake x LMCache <a href="https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmcache-integration.md" target="_blank">unite</a> to pioneer KVCache-centric LLM serving system.
