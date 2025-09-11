@@ -268,11 +268,11 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task.status_word == TransferStatusEnum::PENDING) {
         struct io_uring_cqe *cqe = nullptr;
         int err = io_uring_peek_cqe(&io_uring_batch->ring, &cqe);
-        if (err) {
+        if (err == -EAGAIN) return Status::OK();
+        if (err || !cqe) {
             return Status::InternalError(
                 std::string("io_uring_peek_cqe failed: ") + strerror(-err));
         }
-        if (!cqe) return Status::OK();
         auto task = (IOUringTask *)cqe->user_data;
         if (task) {
             if (cqe->res < 0) {
