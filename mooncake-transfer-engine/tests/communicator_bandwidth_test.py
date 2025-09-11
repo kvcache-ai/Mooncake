@@ -52,10 +52,10 @@ def send_data(client):
 CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
 
 server = CoroRPCInterface()
-client = CoroRPCInterface()
+# client = CoroRPCInterface()
 server.initialize("0.0.0.0:9004", 8, 30, 4)
 server.start_server()
-client.initialize("", 0, 30, 100)
+# client.initialize("", 0, 30, 100)
 
 thread = threading.Thread(target=print_qps)
 thread.start()
