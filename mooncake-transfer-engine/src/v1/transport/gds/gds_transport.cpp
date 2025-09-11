@@ -180,7 +180,7 @@ Status GdsTransport::submitTransferTasks(
     size_t first_param_index = gds_batch->io_params.size();
     for (auto &request : request_list)
         num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
-    if (request_list.size() + num_params > gds_batch->max_size)
+    if (first_param_index + num_params > gds_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto &request : request_list) {
         GdsFileContext *context = findFileContext(request.target_id);
