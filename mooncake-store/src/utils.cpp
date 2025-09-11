@@ -8,6 +8,9 @@
 #include <boost/algorithm/string.hpp>
 
 #include <random>
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
+#endif
 
 namespace mooncake {
 
@@ -63,15 +66,28 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-void *allocate_buffer_allocator_memory(size_t total_size) {
-    const size_t alignment = facebook::cachelib::Slab::kSize;
+void *allocate_buffer_allocator_memory(size_t total_size, size_t alignment) {
     // Ensure total_size is a multiple of alignment
     if (total_size < alignment) {
         LOG(ERROR) << "Total size must be at least " << alignment;
         return nullptr;
     }
+#ifdef USE_ASCEND_DIRECT
+    void *buffer = nullptr;
+    aclrtMallocHost(&buffer, total_size);
+    return buffer;
+#else
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
+#endif
+}
+
+void free_memory(void *ptr) {
+#ifdef USE_ASCEND_DIRECT
+    aclrtFreeHost( ptr);
+#else
+    free(ptr);
+#endif
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
