@@ -34,10 +34,7 @@ message("${PYTHON_SYS_PATH}")
 set(PYTHON_PACKAGE_NAME "mooncake")
 
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp 
-    ../mooncake-transfer-engine/src/transport/coro_rpc_connector/cororpc_interface.cpp
-    ../mooncake-transfer-engine/src/transport/coro_rpc_connector/cororpc_communicator.cpp
-)
+    transfer_engine/transfer_engine_py.cpp )
 
 target_include_directories(engine PRIVATE 
     ${Python3_INCLUDE_DIRS}
