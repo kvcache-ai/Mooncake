@@ -55,10 +55,13 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
-        pool_conf.client_config.socket_config = coro_io::ib_socket_t::config_t{};
+        pool_conf.client_config.socket_config =
+            coro_io::ib_socket_t::config_t{};
         impl_->server_->init_ibv();
     }
-    client_pools_ = std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(pool_conf);
+    client_pools_ =
+        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+            pool_conf);
 
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
