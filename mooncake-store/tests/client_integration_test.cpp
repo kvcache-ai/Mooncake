@@ -27,13 +27,10 @@ namespace testing {
 class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        void** args =
-            (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-
         auto client_opt = Client::Create(
             host_name,                           // Local hostname
             FLAGS_transfer_engine_metadata_url,  // Metadata connection string
-            FLAGS_protocol, args,
+            FLAGS_protocol,
             "localhost:50051"  // Master server address
         );
 

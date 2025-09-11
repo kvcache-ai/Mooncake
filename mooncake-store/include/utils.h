@@ -98,8 +98,6 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 */
 void* allocate_buffer_allocator_memory(size_t total_size);
 
-void** rdma_args(const std::string& device_name);
-
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;
     const double MB = KB * 1024.0;
@@ -126,6 +124,21 @@ void** rdma_args(const std::string& device_name);
 
     return oss.str();
 }
+
+// String utility functions
+
+/**
+ * @brief Split a string by delimiter into a vector of strings
+ * @param str The string to split
+ * @param delimiter The delimiter to split by (default is comma)
+ * @param trim_spaces Whether to trim leading/trailing spaces from each token
+ * @param keep_empty Whether to keep empty tokens in the result
+ * @return Vector of split strings
+ */
+std::vector<std::string> splitString(const std::string& str,
+                                     char delimiter = ',',
+                                     bool trim_spaces = true,
+                                     bool keep_empty = false);
 
 // Network utility functions
 

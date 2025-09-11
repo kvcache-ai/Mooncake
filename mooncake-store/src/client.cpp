@@ -102,9 +102,16 @@ static bool get_auto_discover() {
         if (iv == 1) {
             LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
             return true;
+        } else if (iv == 0) {
+            LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
+            return false;
+        } else {
+            LOG(WARNING)
+                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+                << ", should be 0 or 1, using default: auto discovery not set";
         }
     }
-    return false;
+    return true;
 }
 
 static inline void ltrim(std::string& s) {
@@ -206,15 +213,13 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
     }
 }
 
-ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
-                                     const std::string& metadata_connstring,
-                                     const std::string& protocol,
-                                     void** protocol_args) {
+ErrorCode Client::InitTransferEngine(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol,
+    const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
     transfer_engine_.setAutoDiscover(auto_discover);
-    transfer_engine_.setWhitelistFilters(
-        get_auto_discover_filters(auto_discover));
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_.init(metadata_connstring, local_hostname,
@@ -224,26 +229,67 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    Transport* transport = nullptr;
-    if (protocol == "rdma") {
-        LOG(INFO) << "transport_type=rdma";
-        transport = transfer_engine_.installTransport("rdma", protocol_args);
-    } else if (protocol == "tcp") {
-        LOG(INFO) << "transport_type=tcp";
-        try {
-            transport = transfer_engine_.installTransport("tcp", protocol_args);
-        } catch (std::exception& e) {
-            LOG(ERROR) << "tcp_transport_install_failed error_message=\""
-                       << e.what() << "\"";
-            return ErrorCode::INTERNAL_ERROR;
-        }
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters(auto_discover);
+        transfer_engine_.setWhitelistFilters(std::move(filters));
     } else {
-        LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
-        return ErrorCode::INVALID_PARAMS;
-    }
-    if (!transport) {
-        LOG(ERROR) << "Failed to install transport";
-        return ErrorCode::INTERNAL_ERROR;
+        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
+                  << protocol;
+
+        Transport* transport = nullptr;
+
+        if (protocol == "rdma") {
+            if (!device_names.has_value() || device_names->empty()) {
+                LOG(ERROR) << "RDMA protocol requires device names when auto "
+                              "discovery is disabled";
+                return ErrorCode::INVALID_PARAMS;
+            }
+
+            LOG(INFO) << "Using specified RDMA devices: "
+                      << device_names.value();
+
+            std::vector<std::string> devices =
+                splitString(device_names.value(), ',', /*skip_empty=*/true);
+
+            // Manually discover topology with specified devices only
+            auto topology = transfer_engine_.getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
+
+            transport = transfer_engine_.installTransport("rdma", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install RDMA transport with specified "
+                              "devices";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "tcp") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "TCP protocol does not use device names, ignoring";
+            }
+
+            try {
+                transport = transfer_engine_.installTransport("tcp", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "tcp_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else {
+            LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
+            return ErrorCode::INVALID_PARAMS;
+        }
     }
 
     // Initialize TransferSubmitter after transfer engine is ready
@@ -256,7 +302,7 @@ ErrorCode Client::InitTransferEngine(const std::string& local_hostname,
 
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol, void** protocol_args,
+    const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
@@ -290,7 +336,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                     protocol, protocol_args);
+                                     protocol, device_names);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;

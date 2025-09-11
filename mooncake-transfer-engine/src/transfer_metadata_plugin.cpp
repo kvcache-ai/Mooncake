@@ -179,145 +179,190 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
 #ifdef USE_HTTP
 struct HTTPStoragePlugin : public MetadataStoragePlugin {
-    HTTPStoragePlugin(const std::string &metadata_uri)
-        : client_(nullptr), metadata_uri_(metadata_uri) {
-        curl_global_init(CURL_GLOBAL_ALL);
-        client_ = curl_easy_init();
-        if (!client_) {
-            LOG(ERROR) << "Cannot allocate CURL objects";
-            exit(EXIT_FAILURE);
-        }
+    explicit HTTPStoragePlugin(const std::string &metadata_uri)
+        : metadata_uri_(metadata_uri) {
+        global_init_once();
     }
 
-    virtual ~HTTPStoragePlugin() {
-        curl_easy_cleanup(client_);
-        curl_global_cleanup();
+    ~HTTPStoragePlugin() override = default;
+
+    static void global_init_once() {
+        static std::once_flag once;
+        std::call_once(once, [] { curl_global_init(CURL_GLOBAL_ALL); });
+    }
+
+    struct ThreadLocalCurl {
+        CURL *h = nullptr;
+        ThreadLocalCurl() {
+            h = curl_easy_init();
+            if (!h)
+                throw std::runtime_error(
+                    "HTTPStoragePlugin: curl_easy_init failed; cannot "
+                    "initialize HTTP storage plugin functionality.");
+            curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
+        }
+        ~ThreadLocalCurl() {
+            if (h) curl_easy_cleanup(h);
+        }
+        ThreadLocalCurl(const ThreadLocalCurl &) = delete;
+        ThreadLocalCurl &operator=(const ThreadLocalCurl &) = delete;
+    };
+
+    static CURL *tl_easy() {
+        thread_local ThreadLocalCurl tls;
+        return tls.h;
     }
 
     static size_t writeCallback(void *contents, size_t size, size_t nmemb,
-                                std::string *userp) {
-        userp->append(static_cast<char *>(contents), size * nmemb);
+                                void *userp) {
+        auto *out = static_cast<std::string *>(userp);
+        out->append(static_cast<const char *>(contents), size * nmemb);
         return size * nmemb;
     }
 
-    std::string encodeUrl(const std::string &key) {
-        char *newkey = curl_easy_escape(client_, key.c_str(), key.size());
-        std::string encodedKey(newkey);
-        std::string url = metadata_uri_ + "?key=" + encodedKey;
-        curl_free(newkey);
+    std::string encodeUrl(const std::string &key) const {
+        CURL *h = tl_easy();
+        char *esc =
+            curl_easy_escape(h, key.c_str(), static_cast<int>(key.size()));
+        std::string url = metadata_uri_ + "?key=" + (esc ? esc : "");
+        if (esc) curl_free(esc);
         return url;
     }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+    static inline bool is_200(long code) { return code == 200; }
 
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
+    bool get(const std::string &key, Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
 
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
-        CURLcode res = curl_easy_perform(client_);
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, GET " << url
-                       << " error: " << curl_easy_strerror(res);
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
             return false;
         }
 
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, GET " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "GET " << url << " http=" << code
+                       << " body: " << readBody;
             return false;
         }
 
-        Json::Reader reader;
-        if (!reader.parse(readBuffer, value)) return false;
+        Json::CharReaderBuilder b;
+        std::string errs;
+        std::unique_ptr<Json::CharReader> r(b.newCharReader());
+        if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
+                      &value, &errs)) {
+            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
-    virtual bool set(const std::string &key, const Json::Value &value) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+    bool set(const std::string &key, const Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
 
-        Json::FastWriter writer;
-        const std::string json_file = writer.write(value);
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        const std::string payload = Json::writeString(wb, value);
 
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(client_, CURLOPT_POSTFIELDS, json_file.c_str());
-        curl_easy_setopt(client_, CURLOPT_POSTFIELDSIZE, json_file.size());
-        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "PUT");
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
 
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
 
-        // set content-type to application/json
-        struct curl_slist *headers = NULL;
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, payload.size());
+
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(client_, CURLOPT_HTTPHEADER, headers);
-        CURLcode res = curl_easy_perform(client_);
-        curl_slist_free_all(headers);  // Free headers
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, PUT " << url
-                       << " error: " << curl_easy_strerror(res);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+
+        CURLcode rc = curl_easy_perform(h);
+        curl_slist_free_all(headers);
+
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "PUT " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
             return false;
         }
 
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, PUT " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
-            return false;
-        }
-
-        return true;
-    }
-
-    virtual bool remove(const std::string &key) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
-
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "DELETE");
-
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
-        CURLcode res = curl_easy_perform(client_);
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, DELETE " << url
-                       << " error: " << curl_easy_strerror(res);
-            return false;
-        }
-
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, DELETE " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "PUT " << url << " http=" << code
+                       << " body: " << readBody;
             return false;
         }
         return true;
     }
 
-    CURL *client_;
+    // ---- DELETE ----
+    bool remove(const std::string &key) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
+
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "DELETE");
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "DELETE " << url
+                       << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
+            return false;
+        }
+
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "DELETE " << url << " http=" << code
+                       << " body: " << readBody;
+            return false;
+        }
+        return true;
+    }
+
+   private:
     const std::string metadata_uri_;
 };
+
 #endif  // USE_HTTP
 
 #ifdef USE_ETCD
