@@ -113,6 +113,9 @@ class RdmaTransport : public Transport {
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0);
 
+    // Get the total number of QPs across all RDMA contexts
+    size_t getTotalQpNum() const;
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
