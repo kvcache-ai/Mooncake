@@ -108,15 +108,49 @@ Status GdsTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     installed_ = true;
+    pollers_.reserve(128);
     io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 32);
     return Status::OK();
 }
 
 Status GdsTransport::uninstall() {
     if (installed_) {
+        for (auto &entry : pollers_) {
+            cuFileBatchIODestroy(entry.handle);
+        }
+        pollers_.clear();
         metadata_.reset();
         installed_ = false;
     }
+    return Status::OK();
+}
+
+Status GdsTransport::allocatePoller(int &index) {
+    std::unique_lock<std::mutex> lk(pollers_mutex_);
+    for (size_t i = 0; i < pollers_.size(); ++i) {
+        if (pollers_[i].active) continue;
+        pollers_[i].active = true;
+        index = i;
+        return Status::OK();
+    }
+    index = pollers_.size();
+    pollers_.resize(pollers_.size() + 1);
+    auto &entry = pollers_.back();
+    entry.active = true;
+    entry.io_params.reserve(io_batch_depth_);
+    entry.io_events.resize(io_batch_depth_);
+    auto result = cuFileBatchIOSetUp(&entry.handle, io_batch_depth_);
+    if (result.err != CU_FILE_SUCCESS)
+        return Status::InternalError(
+            std::string("Failed to setup GDS batch IO: Code ") +
+            std::to_string(result.err) + LOC_MARK);
+    return Status::OK();
+}
+
+Status GdsTransport::releasePoller(int index) {
+    std::unique_lock<std::mutex> lk(pollers_mutex_);
+    pollers_[index].active = false;
+    pollers_[index].io_params.clear();
     return Status::OK();
 }
 
@@ -126,23 +160,14 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::InternalError("Unable to allocate GDS sub-batch");
     batch = gds_batch;
     gds_batch->max_size = max_size;
-    gds_batch->io_params.reserve(io_batch_depth_);
-    gds_batch->io_events.resize(io_batch_depth_);
-    // TODO cuFileBatchIOSetUp is time-costly. Make it running asynchronous
-    // using seperate threads
-    auto result = cuFileBatchIOSetUp(&gds_batch->handle, io_batch_depth_);
-    if (result.err != CU_FILE_SUCCESS)
-        return Status::InternalError(
-            std::string("Failed to setup GDS batch IO: Code ") +
-            std::to_string(result.err) + LOC_MARK);
-    return Status::OK();
+    return allocatePoller(gds_batch->poller_id);
 }
 
 Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
-    cuFileBatchIODestroy(gds_batch->handle);
+    releasePoller(gds_batch->poller_id);
     Slab<GdsSubBatch>::Get().deallocate(gds_batch);
     batch = nullptr;
     return Status::OK();
@@ -180,7 +205,8 @@ Status GdsTransport::submitTransferTasks(
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
     size_t num_params = 0;
-    size_t first_param_index = gds_batch->io_params.size();
+    auto &poller = pollers_[gds_batch->poller_id];
+    size_t first_param_index = poller.io_params.size();
     for (auto &request : request_list)
         num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
     if (first_param_index + num_params > io_batch_depth_)
@@ -189,7 +215,7 @@ Status GdsTransport::submitTransferTasks(
         GdsFileContext *context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
-        IOParamRange range{gds_batch->io_params.size(), 0};
+        IOParamRange range{poller.io_params.size(), 0};
         for (size_t offset = 0; offset < request.length;
              offset += kMaxSliceSize) {
             size_t length = std::min(kMaxSliceSize, request.length - offset);
@@ -203,15 +229,15 @@ Status GdsTransport::submitTransferTasks(
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();
-            gds_batch->io_params.push_back(params);
+            poller.io_params.push_back(params);
             range.count++;
         }
         gds_batch->io_param_ranges.push_back(range);
     }
 
     auto result =
-        cuFileBatchIOSubmit(gds_batch->handle, num_params,
-                            &gds_batch->io_params[first_param_index], 0);
+        cuFileBatchIOSubmit(poller.handle, num_params,
+                            &poller.io_params[first_param_index], 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to submit GDS batch IO: Code ") +
@@ -226,8 +252,9 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
     auto range = gds_batch->io_param_ranges[task_id];
-    auto result = cuFileBatchIOGetStatus(gds_batch->handle, 0, &num_tasks,
-                                         gds_batch->io_events.data(), nullptr);
+    auto &poller = pollers_[gds_batch->poller_id];
+    auto result = cuFileBatchIOGetStatus(poller.handle, 0, &num_tasks,
+                                         poller.io_events.data(), nullptr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to get GDS batch status: Code ") +
@@ -235,7 +262,7 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = WAITING;
     size_t complete_count = 0;
     for (size_t index = range.base; index < range.base + range.count; ++index) {
-        auto &event = gds_batch->io_events[index];
+        auto &event = poller.io_events[index];
         auto s = parseTransferStatus(event.status);
         if (s == COMPLETED)
             complete_count++;
