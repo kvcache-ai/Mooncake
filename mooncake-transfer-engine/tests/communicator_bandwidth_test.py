@@ -32,8 +32,9 @@ class AtomicCounter:
 
 counter = AtomicCounter()
 
-size_1mb = 1024 * 1024
-test_data = b'\x00' * size_1mb
+# Global variable to store data size
+data_size = 1024 * 1024  # Default 1MB
+test_data = None
 
 def print_qps():
     while True:
@@ -41,16 +42,20 @@ def print_qps():
         val = counter.get()
         if val == 0:   
             continue
-        print("qps:", val)
+        print("bandwidth:", 8 * val * data_size / (1000 * 1000 * 1000), "Gb/s")
 
 def send_data(client, target_url):
     while True:
         result = client.send_data(target_url, test_data)
         counter.inc()
 
-def run_server(bind_url):
+def run_server(bind_url, data_size_mb=1):
     """Run server mode"""
-    print(f"Starting server on {bind_url}")
+    global data_size, test_data
+    data_size = data_size_mb * 1024 * 1024
+    test_data = b'\x00' * data_size
+    
+    print(f"Starting server on {bind_url} with {data_size_mb}MB data packets")
     
     CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
     server = CoroRPCInterface()
@@ -69,9 +74,13 @@ def run_server(bind_url):
     except KeyboardInterrupt:
         print("\nServer stopping...")
 
-def run_client(target_url, num_threads=64):
+def run_client(target_url, num_threads=8, data_size_mb=1):
     """Run client mode"""
-    print(f"Starting client, connecting to {target_url} with {num_threads} threads")
+    global data_size, test_data
+    data_size = data_size_mb * 1024 * 1024
+    test_data = b'\x00' * data_size
+    
+    print(f"Starting client, connecting to {target_url} with {num_threads} threads, {data_size_mb}MB data packets")
     
     CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
     client = CoroRPCInterface()
@@ -103,18 +112,20 @@ def main():
                        help='Run mode: server or client')
     parser.add_argument('--url', default='127.0.0.1:9004',
                        help='URL address (default: 127.0.0.1:9004)')
-    parser.add_argument('--threads', type=int, default=64,
-                       help='Number of client threads (default: 64)')
-    
+    parser.add_argument('--threads', type=int, default=8,
+                       help='Number of client threads (default: 8)')
+    parser.add_argument('--data-size', type=int, default=1,
+                       help='Data packet size in MB (default: 1)')
+
     args = parser.parse_args()
     
     if args.mode == 'server':
         # Server mode, URL as bind address
         bind_url = f"0.0.0.0:{args.url.split(':')[-1]}" if ':' in args.url else f"0.0.0.0:{args.url}"
-        run_server(bind_url)
+        run_server(bind_url, args.data_size)
     else:
         # Client mode, URL as target address
-        run_client(args.url, args.threads)
+        run_client(args.url, args.threads, args.data_size)
 
 if __name__ == "__main__":
     main()
