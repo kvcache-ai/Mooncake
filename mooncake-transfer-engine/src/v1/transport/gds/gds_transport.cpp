@@ -164,7 +164,7 @@ GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
         std::string path = getGdsFilePath(target_id);
         if (path.empty()) return nullptr;
         file_context_map_[target_id] =
-            std::make_shared<IOUringFileContext>(path);
+            std::make_shared<GdsFileContext>(path);
     }
 
     tl_file_context_map = file_context_map_;
