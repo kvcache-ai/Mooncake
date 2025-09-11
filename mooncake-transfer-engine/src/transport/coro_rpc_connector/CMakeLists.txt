@@ -34,5 +34,4 @@ target_include_directories(coro_rpc_connector PRIVATE
 target_link_libraries(coro_rpc_connector PRIVATE 
     yalantinglibs::yalantinglibs
     pthread
-    pybind11::module
 )
