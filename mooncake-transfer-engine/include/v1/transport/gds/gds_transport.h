@@ -36,7 +36,7 @@ class GdsFileContext;
 struct IOParamRange {
     size_t base;
     size_t count;
-}
+};
 
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
