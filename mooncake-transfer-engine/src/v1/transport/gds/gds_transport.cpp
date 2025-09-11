@@ -108,7 +108,7 @@ Status GdsTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     installed_ = true;
-    io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 1024);
+    io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 32);
     return Status::OK();
 }
 
@@ -128,6 +128,8 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     gds_batch->max_size = max_size;
     gds_batch->io_params.reserve(io_batch_depth_);
     gds_batch->io_events.resize(io_batch_depth_);
+    // TODO cuFileBatchIOSetUp is time-costly. Make it running asynchronous
+    // using seperate threads
     auto result = cuFileBatchIOSetUp(&gds_batch->handle, io_batch_depth_);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
