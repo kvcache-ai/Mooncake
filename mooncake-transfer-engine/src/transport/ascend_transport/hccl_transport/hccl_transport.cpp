@@ -31,12 +31,14 @@ HcclTransport::HcclTransport() : running_(-1) {
 HcclTransport::~HcclTransport() {
     if (running_) {
         running_ = false;
+        initiator_cond_.notify_all();
 
         for (size_t i = 0; i < THREAD_NUM; ++i) {
             allInitiatorThreads_[i].join();
             allAcceptThreads_[i].join();
         }
     }
+    freeTransportMem();
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
@@ -57,6 +59,9 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         std::unique_lock<std::mutex> lock(initiator_mutex_);
         if (allReqQueues_[selfIdx].empty()) {
             initiator_cond_.wait(lock);
+        }
+        if (!running_ && allReqQueues_[selfIdx].empty()) {
+            return;
         }
         auto start = std::chrono::high_resolution_clock::now();
         auto slice_list = std::move(allReqQueues_[selfIdx].front());

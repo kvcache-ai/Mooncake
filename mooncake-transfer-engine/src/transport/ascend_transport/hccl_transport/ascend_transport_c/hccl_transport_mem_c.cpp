@@ -68,6 +68,15 @@ size_t getMaxRegMemoryNum() {
     return g_default_max_reg_memory_num;
 }
 
+int getEpollWaitTimeoutMs() {
+    static const int g_default_epoll_wait_timeout_ms = 3000;
+    static char *env = getenv("ASCEND_TRANSPORT_EPOLL_WAIT_TIMEOUT");
+    if (env != nullptr) {
+        return std::stoi(env);
+    }
+    return g_default_epoll_wait_timeout_ms;
+}
+
 uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
     static std::random_device rand_gen;
     std::mt19937 gen(rand_gen());
@@ -288,6 +297,27 @@ int initTransportMem(RankInfo *local_rank_info) {
     g_localMergeMem.reserve(VECTOR_RESERVE_SIZE);
 
     return 0;
+}
+
+void freeTransportMem() {
+    target_key_to_connection_map_.clear();
+    g_localMergeMem.clear();
+
+    if (vnicServerSocket_) {
+        HcclNetCloseDev(vnicNetDevCtx_);
+        HcclDispatcherDestroy(dispatcher_);
+        vnicServerSocket_.reset();
+    }
+    if (nicServerSocket_) {
+        HcclNetCloseDev(nicNetDevCtx_);
+        nicServerSocket_.reset();
+    }
+    if (notifyPool_) {
+        notifyPool_.reset();
+    }
+    if (g_server_socket_ > 0) {
+        close(g_server_socket_);
+    }
 }
 
 static int connectToTarget(std::string target_ip, int target_port) {
@@ -818,10 +848,11 @@ int acceptSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket,
 }
 
 int transportMemAccept(RankInfo *local_rank_info) {
+    static int epoll_wait_timeout = getEpollWaitTimeoutMs();
     // Self-built out-of-band, host socket for receiving control plane
     int ret = 0;
-    int nfds = epoll_wait(g_epoll_fd, g_events, MAX_EVENTS, -1);
-    if (nfds == -1) {
+    int nfds = epoll_wait(g_epoll_fd, g_events, MAX_EVENTS, epoll_wait_timeout);
+    if (nfds <= 0) {
         return 0;
     }
     int client_socket = acceptFromTarget();
