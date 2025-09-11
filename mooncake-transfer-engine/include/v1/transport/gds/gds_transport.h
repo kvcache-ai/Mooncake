@@ -33,12 +33,18 @@ namespace v1 {
 
 class GdsFileContext;
 
+struct IOParamRange {
+    size_t base;
+    size_t count;
+}
+
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUfileBatchHandle_t handle;
+    std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
-    virtual size_t size() const { return io_params.size(); }
+    virtual size_t size() const { return io_param_ranges.size(); }
 };
 
 class GdsTransport : public Transport {

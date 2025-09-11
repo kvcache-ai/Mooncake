@@ -163,8 +163,7 @@ GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
     if (!file_context_map_.count(target_id)) {
         std::string path = getGdsFilePath(target_id);
         if (path.empty()) return nullptr;
-        file_context_map_[target_id] =
-            std::make_shared<GdsFileContext>(path);
+        file_context_map_[target_id] = std::make_shared<GdsFileContext>(path);
     }
 
     tl_file_context_map = file_context_map_;
@@ -173,32 +172,43 @@ GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
 
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
+    const static size_t kMaxSliceSize = 16ull << 20;
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
-    if (request_list.size() + gds_batch->io_params.size() > gds_batch->max_size)
+    size_t num_params = 0;
+    size_t first_param_index = gds_batch->io_params.size();
+    for (auto &request : request_list)
+        num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
+    if (request_list.size() + num_params > gds_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto &request : request_list) {
         GdsFileContext *context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
-
-        CUfileIOParams_t params;
-        params.mode = CUFILE_BATCH;
-        params.opcode =
-            (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
-        params.cookie = (void *)0;
-        params.u.batch.devPtr_base = request.source;
-        params.u.batch.devPtr_offset = 0;
-        params.u.batch.file_offset = request.target_offset;
-        params.u.batch.size = request.length;
-        params.fh = context->getHandle();
-        gds_batch->io_params.push_back(params);
+        IOParamRange range{gds_batch->io_params.size(), 0};
+        for (size_t offset = 0; offset < request.length;
+             offset += kMaxSliceSize) {
+            size_t length = std::min(kMaxSliceSize, request.length - offset);
+            CUfileIOParams_t params;
+            params.mode = CUFILE_BATCH;
+            params.opcode =
+                (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
+            params.cookie = (void *)0;
+            params.u.batch.devPtr_base = request.source;
+            params.u.batch.devPtr_offset = offset;
+            params.u.batch.file_offset = request.target_offset + offset;
+            params.u.batch.size = length;
+            params.fh = context->getHandle();
+            gds_batch->io_params.push_back(params);
+            range.count++;
+        }
+        gds_batch->io_param_ranges.push_back(range);
     }
 
     auto result =
-        cuFileBatchIOSubmit(gds_batch->handle, gds_batch->io_params.size(),
-                            gds_batch->io_params.data(), 0);
+        cuFileBatchIOSubmit(gds_batch->handle, num_params,
+                            &gds_batch->io_params[first_param_index], 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to submit GDS batch IO: Code ") +
@@ -209,18 +219,28 @@ Status GdsTransport::submitTransferTasks(
 Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
-    unsigned num_tasks = gds_batch->io_params.size();
+    unsigned num_tasks = gds_batch->io_param_ranges.size();
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
+    auto range = gds_batch->io_param_ranges[task_id];
     auto result = cuFileBatchIOGetStatus(gds_batch->handle, 0, &num_tasks,
                                          gds_batch->io_events.data(), nullptr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to get GDS batch status: Code ") +
             std::to_string(result.err) + LOC_MARK);
-    auto &event = gds_batch->io_events[task_id];
-    status.s = parseTransferStatus(event.status);
-    status.transferred_bytes += event.ret;
+    status.s = WAITING;
+    size_t complete_count = 0;
+    for (size_t index = range.base; index < range.base + range.count; ++index) {
+        auto &event = gds_batch->io_events[index];
+        auto s = parseTransferStatus(event.status);
+        if (s == COMPLETED)
+            complete_count++;
+        else if (s != WAITING)
+            status.s = s;
+        status.transferred_bytes += event.ret;
+    }
+    if (complete_count == range.count) status.s = COMPLETED;
     return Status::OK();
 }
 
