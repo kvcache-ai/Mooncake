@@ -48,6 +48,11 @@ bool CoroRPCInterface::startServerAsync() {
     return impl_->communicator->startServerAsync();
 }
 
+bool CoroRPCInterface::startServerImpl(bool is_async) {
+    if (!impl_->communicator) return false;
+    return impl_->communicator->startServerImpl(is_async);
+}
+
 void CoroRPCInterface::stopServer() {
     if (impl_->communicator) {
         impl_->communicator->stopServer();

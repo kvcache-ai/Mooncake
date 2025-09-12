@@ -99,7 +99,4 @@ class CoroRPCCommunicator {
     std::shared_ptr<Impl> impl_;
 };
 
-std::unique_ptr<CoroRPCCommunicator> createServer(
-    const std::string& listen_address, size_t thread_count = 0);
-
 }  // namespace mooncake

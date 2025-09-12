@@ -62,6 +62,8 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf);
 
+    LOG(INFO) << "create coro_rpc_client_pool with " << config.pool_size
+              << " threads";
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
 
@@ -70,14 +72,31 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
             std::chrono::seconds(config.timeout_seconds));
 
         if (value && std::string_view(value) == "rdma") {
-            impl_->server_->init_ibv();
+            if (impl_->server_) {
+                try {
+                    impl_->server_->init_ibv();
+                    LOG(INFO) << "RDMA initialized successfully";
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "RDMA initialization failed: " << e.what();
+                    LOG(WARNING) << "Falling back to TCP mode";
+                    // Continue without RDMA - the server will use TCP
+                } catch (...) {
+                    LOG(ERROR)
+                        << "RDMA initialization failed with unknown error";
+                    LOG(WARNING) << "Falling back to TCP mode";
+                    // Continue without RDMA - the server will use TCP
+                }
+            } else {
+                LOG(ERROR) << "Server pointer is null, cannot initialize RDMA";
+                LOG(WARNING) << "Falling back to TCP mode";
+            }
         }
 
         impl_->server_->register_handler<
             &CoroRPCCommunicator::Impl::handleDataTransfer,
             &CoroRPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
     }
-    LOG(INFO) << "Environment variable MOONCAKE_TRANSFER_PROTOCOL is set to "
+    LOG(INFO) << "Environment variable MC_TRANSFER_PROTOCOL is set to "
               << (value ? value : "not set");
     if (value && std::string_view(value) == "rdma") {
         LOG(INFO) << "Using RDMA transport for RPC communication";
@@ -343,22 +362,6 @@ void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
 
     // ctx_info->set_response_attachment(attachment);
     // context.response_msg();
-}
-
-std::unique_ptr<CoroRPCCommunicator> createServer(
-    const std::string& listen_address, size_t thread_count) {
-    Config config;
-    config.listen_address = listen_address;
-    config.thread_count = thread_count;
-    config.pool_size = 10;  // Default pool size for server-side client pools
-
-    auto communicator = std::make_unique<CoroRPCCommunicator>();
-    if (communicator->initialize(config)) {
-        LOG(INFO) << "Created server communicator with pool size: "
-                  << config.pool_size << std::endl;
-        return communicator;
-    }
-    return nullptr;
 }
 
 }  // namespace mooncake

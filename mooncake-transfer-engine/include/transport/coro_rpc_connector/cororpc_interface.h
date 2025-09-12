@@ -49,6 +49,7 @@ class CoroRPCInterface {
 
     bool startServer();
     bool startServerAsync();
+    bool startServerImpl(bool is_async = true);
     void stopServer();
 
     int sendData(const std::string& target_address, pybind11::handle data);
