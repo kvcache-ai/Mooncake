@@ -73,7 +73,7 @@ getting_started/examples/vllm-integration/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
-performance/sglang-hicache_-benchmark-results-v1
+performance/sglang-hicache-benchmark-results-v1
 performance/allocator_benchmark_result.md
 :::
 
