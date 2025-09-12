@@ -94,7 +94,8 @@ class CoroRPCCommunicator {
     std::shared_ptr<Impl> getImpl() { return impl_; }
 
    private:
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>> client_pools_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
     std::shared_ptr<Impl> impl_;
 };
 

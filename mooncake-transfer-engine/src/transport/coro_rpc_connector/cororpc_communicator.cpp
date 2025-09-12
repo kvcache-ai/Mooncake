@@ -57,7 +57,6 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
-        impl_->server_->init_ibv();
     }
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
@@ -69,6 +68,10 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
         impl_->server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             config.thread_count, config.listen_address,
             std::chrono::seconds(config.timeout_seconds));
+
+        if (value && std::string_view(value) == "rdma") {
+            impl_->server_->init_ibv();
+        }
 
         impl_->server_->register_handler<
             &CoroRPCCommunicator::Impl::handleDataTransfer,
