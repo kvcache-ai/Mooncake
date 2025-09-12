@@ -11,28 +11,24 @@ pip install mooncake-transfer-engine
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
-### Required Services
-The following services need to be started separately:
+### Required Service
+Only one service is required now:
 
-- **`mooncake_master`** - Central coordination service managing cluster state and data distribution
-- **`mooncake_http_metadata_server`** - HTTP-based metadata server for Transfer Engine coordination
-- **`mooncake_store_service.py`** - Python service for running Mooncake Store as standalone process with REST API
+- `mooncake_master` — Master service which now embeds the HTTP metadata server
 
 ## Quick Start
 
-### Start Required Services
+### Start Master (with HTTP enabled)
 
-Before using the store, start the master and metadata services:
+Enable the built-in HTTP metadata server when starting the master:
 
 ```bash
-# Start master service (default port 50051)
-mooncake_master
+mooncake_master \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
 ```
-Start the HTTP metadata server (default port 8080) for transfer engine metadata:
-```bash
-# Start HTTP metadata server (default port 8080) 
-mooncake_http_metadata_server
-```
+This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
 ### Hello World Example
 
@@ -350,6 +346,32 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ---
 
+## Topology & Devices
+
+- Auto-discovery: Enabled by default. You do not need to specify RDMA devices.
+- Manual control (optional):
+  - `MC_MS_AUTO_DISC=0` disables auto-discovery; then pass `rdma_devices` (comma-separated) in `setup(...)`, e.g. `"mlx5_0,mlx5_1"`.
+  - `MC_MS_AUTO_DISC=1` (default) keeps auto-discovery on; optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+
+Examples:
+
+```bash
+# Use default auto-discovery (no device list needed)
+export MC_MS_AUTO_DISC=1
+
+# Or manually select RDMA devices (auto-discovery off)
+export MC_MS_AUTO_DISC=0
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
+PY
+
+# Keep auto-discovery but limit to specific NICs
+export MC_MS_AUTO_DISC=1
+export MC_MS_FILTERS=mlx5_0,mlx5_2
+```
+
 ## get_buffer Buffer Protocol
 
 The `get_buffer` method returns a `BufferHandle` object that implements the Python buffer protocol:
@@ -415,7 +437,7 @@ def setup(
 - `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
 - `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
 - `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): Hardware device identifier for RDMA (e.g., "mlx5_0", "ib0"). Leave empty for TCP.
+- `rdma_devices` (str): Hardware device identifier(s) for RDMA (e.g., "mlx5_0" or "mlx5_0,mlx5_1"). Optional with default auto-discovery; required only if `MC_MS_AUTO_DISC=0`. Leave empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
 
 **Returns:**
@@ -430,8 +452,8 @@ def setup(
 # TCP initialization
 store.setup("localhost:12345", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA initialization
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0", "localhost:50051")
+# RDMA initialization (devices optional; auto-discovery is default)
+store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
 ```
 
 </details>

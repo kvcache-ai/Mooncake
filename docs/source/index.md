@@ -116,3 +116,12 @@ design/v1/metrics
 troubleshooting/error-code
 troubleshooting/troubleshooting
 :::
+
+% Deployment docs
+
+:::{toctree}
+:caption: Deployment
+:maxdepth: 1
+
+deployment/mooncake-store-deployment-guide
+:::
