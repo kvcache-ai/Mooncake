@@ -51,8 +51,13 @@ endif()
 target_link_libraries(
     transfer_engine
     PUBLIC
-    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs pybind11::module ${Python3_LIBRARIES}
+    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs ${Python3_LIBRARIES}
     )
+
+# Add pybind11 headers if pybind11 is available
+if(TARGET pybind11::headers)
+    target_link_libraries(transfer_engine PUBLIC pybind11::headers)
+endif()
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
