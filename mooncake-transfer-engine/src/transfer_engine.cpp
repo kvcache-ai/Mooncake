@@ -27,7 +27,8 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-
+__attribute__ ((visibility ("default"))) std::shared_ptr<TransferEngine> g_transfer_engine = nullptr;
+__attribute__ ((visibility ("default"))) bool g_separate_pool = false;
 static bool setFilesLimit() {
     struct rlimit filesLimit;
     if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
@@ -107,10 +108,12 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-            if (desc.rpc_port == 0) {
-                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
-                return -1;
+            if (!g_separate_pool) {
+                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+                if (desc.rpc_port == 0) {
+                    LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                    return -1;
+                }
             }
 #ifdef USE_ASCEND
             // The current version of Ascend Transport does not support IPv6,
@@ -263,6 +266,7 @@ Transport *TransferEngine::installTransport(const std::string &proto,
         LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
     }
+    LOG(WARNING) << "Transport not used";
 
     if (args != nullptr && args[0] != nullptr) {
         const std::string nic_priority_matrix = static_cast<char *>(args[0]);

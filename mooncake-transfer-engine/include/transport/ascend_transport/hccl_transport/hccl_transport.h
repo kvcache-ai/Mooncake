@@ -30,6 +30,7 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 #include "hccl_transport_mem_c.h"
+#include "hccl_aggTransport_c.h"
 
 #define THREAD_NUM 1
 #define ASCEND_DEFAULT_HOST_PORT 10000
@@ -79,24 +80,41 @@ class HcclTransport : public Transport {
 
    private:
     int allocateLocalSegmentID();
-
-    int initPdThread();
-
-    void initiatorLoop(int deviceLogicId, int selfIdx);
-
-    void acceptLoop(int deviceLogicId);
-
     int getDevIdAndIpPortFromServerName(std::string &local_server_name,
                                         std::string &ip, int &ip_port,
                                         int &devicePhyId);
-
     int rankInfoParse(int devicePhyId, std::string hostIp);
+    int prepareTransport(std::vector<Slice *> &slice_list);
 
+    int startNonAggThreads();
+    int nonAggTransport(std::vector<Slice *> &slice_list, aclrtStream stream);
+    void initiatorLoop(int deviceLogicId);     // Thread logic for initiator
+    void targetAcceptLoop(int deviceLogicId);  // Thread logic for target
+
+    int startAggThreads();
+    int aggTransport(std::vector<Slice *> &slice_list, aclrtStream stream);
+    void aggInitiatorLoop(
+        int deviceLogicId);  // Thread logic for initiator aggregation/splitting
+    void aggInitiatorTransferLoop(
+        int deviceLogicId);  // Thread logic for initiator data transfer
+    void aggTargetAcceptLoop(
+        int deviceLogicId);  // Thread logic for target connection acceptance
+    void aggTargetLoop(
+        int deviceLogicId);  // Thread logic for target aggregation/splitting
+    void targetLoop(int deviceLogicId);
    private:
+    bool aggregateEnabled_;
     std::atomic_bool running_;
-    std::thread allInitiatorThreads_[THREAD_NUM];
-    std::thread allAcceptThreads_[THREAD_NUM];
-    std::queue<std::vector<Slice *>> allReqQueues_[THREAD_NUM];
+
+    std::thread initiatorThread_;
+    std::thread targetAcceptThread_;
+    std::thread targetThread_;
+
+    std::thread aggInitiatorThread_;
+    std::thread aggInitiatorTransferThread_;
+    std::thread aggTargetAcceptThread_;
+    std::thread aggTargetThread_;
+    std::queue<std::vector<Slice *>> allReqQueues_;
     std::mutex initiator_mutex_;
     std::condition_variable initiator_cond_;
     RankInfo local_rank_info_;

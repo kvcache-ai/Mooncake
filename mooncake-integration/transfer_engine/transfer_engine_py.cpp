@@ -116,7 +116,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_shared<TransferEngine>(true, device_filter);
+    LOG(INFO) << "TransferEnginePy InitTransferEngine";
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -129,6 +130,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         if (ret) return -1;
     }
 
+    g_transfer_engine = engine_;
+    LOG(INFO) << "TransferEnginePy InitTransferEngine end: " << g_transfer_engine;
     free_list_.resize(kSlabSizeKBTabLen);
 #ifndef USE_ASCEND
     doBuddyAllocate(kMaxClassId);
@@ -291,6 +294,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.target_id = handle;
         entry.target_offset = peer_buffer_address;
         entry.advise_retry_cnt = retry;
+        entry.target_offset_type = 1;
 
         Status s = engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) return -1;
@@ -367,6 +371,7 @@ int TransferEnginePy::batchTransferSync(
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
+        entry.target_offset_type = 1;
         entries.push_back(entry);
     }
 
@@ -454,6 +459,9 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
+#ifndef USE_ASCEND
+        entry.target_offset_type = 1;
+#endif
         entries.push_back(entry);
     }
 

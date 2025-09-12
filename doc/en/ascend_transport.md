@@ -25,11 +25,6 @@ apt-get install -y mpich libmpich-dev
 
 **Ascend Compute Architecture for Neural Networks**
 Updated to Ascend Compute Architecture for Neural Networks 8.2.RC1. pkg packages are no longer required.
-If the toolkit is installed in a non-default location, you can override the path by setting the environment variable:
-
-```bash
-export ASCEND_TOOLKIT_PATH=/your/path/to/ascend-toolkit
-```
 
 ## One-Step Compilation Script
 

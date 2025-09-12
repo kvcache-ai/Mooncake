@@ -1,14 +1,3 @@
-if("$ENV{ASCEND_TOOLKIT_PATH}" STREQUAL "")
-    set(ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
-else()
-set(ASCEND_TOOLKIT_ROOT $ENV{ASCEND_TOOLKIT_PATH})
-endif()
-
-file(GLOB ASCEND_TOOLKIT_ROOT "${ASCEND_TOOLKIT_ROOT}")
-set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
-
-link_directories(${ASCEND_LIB_DIR})
-
 add_executable(transfer_engine_bench transfer_engine_bench.cpp)
 target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 
@@ -22,9 +11,15 @@ add_executable(memory_pool memory_pool.cpp)
 target_link_libraries(memory_pool PUBLIC transfer_engine)
 
 if (USE_ASCEND)
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+    set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+    link_directories(${ASCEND_LIB_DIR})
     add_executable(transfer_engine_ascend_one_sided transfer_engine_ascend_one_sided.cpp)
     target_link_libraries(transfer_engine_ascend_one_sided PUBLIC transfer_engine)
 
     add_executable(transfer_engine_ascend_perf transfer_engine_ascend_perf.cpp)
     target_link_libraries(transfer_engine_ascend_perf PUBLIC transfer_engine)
+
+    add_executable(transfer_engine_ascend_memcpy transfer_engine_ascend_memcpy.cpp)
+    target_link_libraries(transfer_engine_ascend_memcpy PUBLIC transfer_engine)
 endif()
