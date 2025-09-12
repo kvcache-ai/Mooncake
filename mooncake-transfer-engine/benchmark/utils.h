@@ -61,6 +61,7 @@ struct XferBenchConfig {
     static std::string metadata_type;
     static std::string metadata_url_list;
     static std::string xport_type;
+    static std::string backend;
 };
 
 struct XferMetricStats {
@@ -166,6 +167,8 @@ static inline void verifyData(void *addr, size_t length, uint8_t seed) {
         LOG(FATAL) << "Inconsistent data detected";
     }
 }
+
+enum OpCode { READ, WRITE };
 
 }  // namespace v1
 }  // namespace mooncake

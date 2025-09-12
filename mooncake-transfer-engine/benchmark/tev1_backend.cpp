@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "xfer_bench.h"
+#include "tev1_backend.h"
 #include "utils.h"
 #include "v1/memory/location.h"
 #include "v1/utility/topology.h"
@@ -24,18 +24,18 @@
 namespace mooncake {
 namespace v1 {
 
-volatile bool g_running = true;
-volatile bool g_triggered_sig = false;
+volatile bool g_tev1_running = true;
+volatile bool g_tev1_triggered_sig = false;
 
-void signalHandler(int signum) {
-    if (g_triggered_sig) {
+void signalHandlerV1(int signum) {
+    if (g_tev1_triggered_sig) {
         LOG(ERROR) << "Received signal " << signum
                    << " again, forcefully terminating...";
         std::exit(EXIT_FAILURE);
     }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_running = false;
-    g_triggered_sig = true;
+    g_tev1_running = false;
+    g_tev1_triggered_sig = true;
 }
 
 std::shared_ptr<ConfigManager> loadConfig() {
@@ -56,7 +56,7 @@ static TransportType getTransportType(const std::string &xport_type) {
     return UNSPEC;
 }
 
-int XferTERunner::allocateBuffers() {
+int TEv1BenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
@@ -93,7 +93,7 @@ int XferTERunner::allocateBuffers() {
     return 0;
 }
 
-int XferTERunner::freeBuffers() {
+int TEv1BenchRunner::freeBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         CHECK_FAIL(engine_->unregisterLocalMemory(pinned_buffer_list_[i],
@@ -104,35 +104,35 @@ int XferTERunner::freeBuffers() {
     return 0;
 }
 
-XferTERunner::XferTERunner() {
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+TEv1BenchRunner::TEv1BenchRunner() {
+    signal(SIGINT, signalHandlerV1);
+    signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     allocateBuffers();
 }
 
-XferTERunner::~XferTERunner() { freeBuffers(); }
+TEv1BenchRunner::~TEv1BenchRunner() { freeBuffers(); }
 
-int XferTERunner::runTarget() {
-    while (g_running) sleep(1);
+int TEv1BenchRunner::runTarget() {
+    while (g_tev1_running) sleep(1);
     return 0;
 }
 
-int XferTERunner::startInitiator() {
+int TEv1BenchRunner::startInitiator() {
     CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
     CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
     // std::sort(info_.buffers.begin(), info_.buffers.end());
     threads_.resize(XferBenchConfig::num_threads);
     current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&XferTERunner::runner, this, i);
+        threads_[i] = std::thread(&TEv1BenchRunner::runner, this, i);
     return 0;
 }
 
-int XferTERunner::stopInitiator() {
+int TEv1BenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_running = false;
+        g_tev1_running = false;
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -150,7 +150,7 @@ static int parseIndex(const std::string &loc) {
     return std::stoi(loc.substr(pos + 1));
 }
 
-void XferTERunner::pinThread(int thread_id) {
+void TEv1BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = getMemoryLocation((void *)addr, 1);
@@ -164,14 +164,15 @@ void XferTERunner::pinThread(int thread_id) {
     }
 }
 
-int XferTERunner::runner(int thread_id) {
-    while (g_running) {
+int TEv1BenchRunner::runner(int thread_id) {
+    while (g_tev1_running) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(
-                lk, [&] { return !g_running || current_task_[thread_id]; });
-            if (!g_running) break;
+            cv_task_.wait(lk, [&] {
+                return !g_tev1_running || current_task_[thread_id];
+            });
+            if (!g_tev1_running) break;
             std::swap(task, current_task_[thread_id]);
         }
         if (task) task(thread_id);
@@ -183,26 +184,26 @@ int XferTERunner::runner(int thread_id) {
     return 0;
 }
 
-int XferTERunner::runInitiatorTasks(
+int TEv1BenchRunner::runInitiatorTasks(
     const std::function<int(int /* thread_id */)> &func) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id = 0; id < current_task_.size(); ++id)
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return g_running && pending_ == 0; });
+    cv_done_.wait(lk, [&] { return g_tev1_running && pending_ == 0; });
     return 0;
 }
 
-double XferTERunner::runSingleTransfer(uint64_t local_addr,
-                                       uint64_t target_addr,
-                                       uint64_t block_size, uint64_t batch_size,
-                                       Request::OpCode opcode) {
+double TEv1BenchRunner::runSingleTransfer(uint64_t local_addr,
+                                          uint64_t target_addr,
+                                          uint64_t block_size,
+                                          uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
-        entry.opcode = opcode;
+        entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
         entry.length = block_size;
         entry.source = (void *)(local_addr + block_size * i);
         entry.target_id = handle_;

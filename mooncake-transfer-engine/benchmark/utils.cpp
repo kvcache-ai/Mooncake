@@ -37,6 +37,7 @@ DEFINE_string(metadata_type, "p2p",
 DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
+DEFINE_string(backend, "v1", "Transport backend: v0|v1|nixl");
 
 namespace mooncake {
 namespace v1 {
@@ -57,6 +58,7 @@ int XferBenchConfig::num_threads = 0;
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
 std::string XferBenchConfig::xport_type;
+std::string XferBenchConfig::backend;
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
@@ -77,6 +79,7 @@ void XferBenchConfig::loadFromFlags() {
     metadata_url_list = FLAGS_metadata_url_list;
 
     xport_type = FLAGS_xport_type;
+    backend = FLAGS_backend;
 }
 
 double XferMetricStats::percentile(double p) {

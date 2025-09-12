@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XFER_BENCH_H
-#define XFER_BENCH_H
+#ifndef TEV0_BACKEND_H
+#define TEV0_BACKEND_H
 
+#include "bench_runner.h"
 #include "utils.h"
 
 #include <string>
@@ -25,19 +26,17 @@
 #include <signal.h>
 #include <sys/time.h>
 
-#include "v1/transfer_engine.h"
-#include "v1/utility/random.h"
-#include "v1/utility/system.h"
+#include "transfer_engine.h"
 
 namespace mooncake {
 namespace v1 {
-class XferTERunner {
+class TEv0BenchRunner : public BenchRunner {
    public:
-    XferTERunner();
-    ~XferTERunner();
+    TEv0BenchRunner();
+    ~TEv0BenchRunner();
 
-    XferTERunner(const XferTERunner &) = delete;
-    XferTERunner &operator=(const XferTERunner &) = delete;
+    TEv0BenchRunner(const TEv0BenchRunner &) = delete;
+    TEv0BenchRunner &operator=(const TEv0BenchRunner &) = delete;
 
     void pinThread(int thread_id);
 
@@ -49,7 +48,7 @@ class XferTERunner {
 
     int runInitiatorTasks(const std::function<int(int /* thread_id */)> &func);
 
-    std::string getSegmentName() const { return engine_->getSegmentName(); }
+    std::string getSegmentName() const { return engine_->getLocalIpAndPort(); }
 
     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
                                 uint64_t batch_size) const {
@@ -60,13 +59,13 @@ class XferTERunner {
 
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                  uint64_t batch_size) const {
-        return info_.buffers[thread_id % info_.buffers.size()].base +
-               block_size * batch_size * (thread_id / info_.buffers.size());
+        return info_->buffers[thread_id % info_->buffers.size()].addr +
+               block_size * batch_size * (thread_id / info_->buffers.size());
     }
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                              uint64_t block_size, uint64_t batch_size,
-                             Request::OpCode opcode);
+                             OpCode opcode);
 
    private:
     int allocateBuffers();
@@ -79,7 +78,7 @@ class XferTERunner {
     std::unique_ptr<TransferEngine> engine_;
     std::vector<void *> pinned_buffer_list_;
     SegmentID handle_;
-    SegmentInfo info_;
+    std::shared_ptr<TransferMetadata::SegmentDesc> info_;
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;
@@ -92,4 +91,4 @@ class XferTERunner {
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // XFER_BENCH_H
+#endif  // TEV0_BACKEND_H

@@ -13,20 +13,23 @@
 // limitations under the License.
 
 #include "utils.h"
-#include "xfer_bench.h"
+
+#include "bench_runner.h"
+#include "tev0_backend.h"
+#include "tev1_backend.h"
 
 using namespace mooncake::v1;
 
-void processBatchSizes(XferTERunner &runner, size_t block_size,
+void processBatchSizes(BenchRunner &runner, size_t block_size,
                        size_t batch_size) {
     bool mixed_opcode = false;
-    Request::OpCode opcode;
+    OpCode opcode;
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
         mixed_opcode = true;
     else if (XferBenchConfig::op_type == "read")
-        opcode = Request::READ;
+        opcode = READ;
     else if (XferBenchConfig::op_type == "write")
-        opcode = Request::WRITE;
+        opcode = WRITE;
     else {
         LOG(ERROR) << "Invalid args: workload only support read|write|mix";
         exit(EXIT_FAILURE);
@@ -57,11 +60,11 @@ void processBatchSizes(XferTERunner &runner, size_t block_size,
                         fillData((void *)local_addr, block_size * batch_size);
                 auto val = runner.runSingleTransfer(local_addr, target_addr,
                                                     block_size, batch_size,
-                                                    Request::WRITE);
+                                                    WRITE);
                 transfer_duration.push_back(val);
                 val = runner.runSingleTransfer(local_addr, target_addr,
                                                block_size, batch_size,
-                                               Request::READ);
+                                               READ);
                 if (XferBenchConfig::check_consistency)
                     verifyData((void *)local_addr, block_size * batch_size,
                                pattern);
@@ -91,7 +94,11 @@ int main(int argc, char *argv[]) {
         "Transfer Engine Benchmarking Tool\nUsage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
-    auto runner = std::make_unique<XferTERunner>();
+    std::unique_ptr<BenchRunner> runner;
+    if (XferBenchConfig::backend == "v0")
+        runner = std::make_unique<TEv0BenchRunner>();
+    else
+        runner = std::make_unique<TEv1BenchRunner>();
     if (XferBenchConfig::target_seg_name.empty()) {
         std::cout << "\033[33mTo start initiators, run " << std::endl
                   << "  ./tebench --target_seg_name="
