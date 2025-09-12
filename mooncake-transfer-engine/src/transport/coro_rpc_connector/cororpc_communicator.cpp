@@ -77,6 +77,13 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
             &CoroRPCCommunicator::Impl::handleDataTransfer,
             &CoroRPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
     }
+    LOG(INFO) << "Environment variable MOONCAKE_TRANSFER_PROTOCOL is set to "
+              << (value ? value : "not set");
+    if (value && std::string_view(value) == "rdma") {
+        LOG(INFO) << "Using RDMA transport for RPC communication";
+    } else {
+        LOG(INFO) << "Using TCP transport for RPC communication";
+    }
 
     LOG(INFO) << "Communicator initialized with client pool support";
     return true;
