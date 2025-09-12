@@ -299,7 +299,7 @@ class PyClient {
     struct SegmentDeleter {
         void operator()(void *ptr) {
             if (ptr) {
-                free(ptr);
+                free_memory(ptr);
             }
         }
     };
