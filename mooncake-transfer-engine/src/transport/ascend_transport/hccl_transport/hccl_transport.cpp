@@ -38,7 +38,8 @@ HcclTransport::~HcclTransport() {
             allAcceptThreads_[i].join();
         }
     }
-    freeTransportMem();
+    freeTransportMem(/*free_control_socket=*/true);
+    unregLocalRmaMems();
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
@@ -53,6 +54,10 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
     if (ret) {
         LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret: " << ret;
     }
+
+    int transfer_failed_cnt = 0;
+    int transfer_max_failed_cnt = 1;
+    int transfer_timeout_ms = 10000;
 
     while (1) {
         auto waitlock = std::chrono::high_resolution_clock::now();
@@ -125,7 +130,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         }
         auto addOpfence = std::chrono::high_resolution_clock::now();
 
-        ret = aclrtSynchronizeStream(stream);
+        ret = aclrtSynchronizeStreamWithTimeout(stream, transfer_timeout_ms);
         if (ret) {
             LOG(ERROR) << "aclrtSynchronizeStream failed, local devicePhyId: "
                        << local_rank_info_.devicePhyId
@@ -133,6 +138,26 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                        << remote_rank_info_.devicePhyId << ", ret: " << ret;
             for (auto slice : slice_list) {
                 slice->markFailed();
+            }
+            transfer_failed_cnt += 1;
+        } else {
+            transfer_failed_cnt = 0;
+        }
+        LOG(INFO) << "transfer_failed_cnt = " << transfer_failed_cnt;
+        if (transfer_failed_cnt >= transfer_max_failed_cnt) {
+            ret = aclrtStreamAbort(stream);
+            if (ret) {
+                LOG(ERROR) << "aclrtStreamAbort failed, ret: " << ret;
+            }
+            aclrtSynchronizeStream(stream);
+
+            LOG(INFO)
+                << "reinit transport mem to trigger reconnect to remote target";
+            ret = reinitTransportMem(&local_rank_info_);
+            if (ret) {
+                LOG(ERROR) << "HcclTransport: reinitTransportMem failed, ret: "
+                           << ret;
+                return;
             }
         }
         for (auto slice : slice_list) {
