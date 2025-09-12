@@ -96,7 +96,7 @@ bool CoroRPCCommunicator::initialize(const Config& config) {
             &CoroRPCCommunicator::Impl::handleDataTransfer,
             &CoroRPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
     }
-    LOG(INFO) << "Environment variable MC_TRANSFER_PROTOCOL is set to "
+    LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
     if (value && std::string_view(value) == "rdma") {
         LOG(INFO) << "Using RDMA transport for RPC communication";

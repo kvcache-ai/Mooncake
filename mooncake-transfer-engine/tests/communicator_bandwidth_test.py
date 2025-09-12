@@ -60,7 +60,7 @@ def run_server(bind_url, data_size_mb=1):
     CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
     server = CoroRPCInterface()
     server.initialize(bind_url, 8, 30, 4)
-    server.start_server()
+    server.start_server_async()  # 使用异步启动，立即返回
     
     # Start QPS statistics thread
     thread = threading.Thread(target=print_qps)
@@ -73,6 +73,7 @@ def run_server(bind_url, data_size_mb=1):
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nServer stopping...")
+        server.stop_server()  # 显式停止服务器
 
 def run_client(target_url, num_threads=8, data_size_mb=1):
     """Run client mode"""
