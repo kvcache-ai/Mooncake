@@ -57,6 +57,7 @@ This repository also hosts its technical report and the open sourced traces.
 
 getting_started/build
 getting_started/quick-start
+getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
@@ -97,15 +98,6 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine
-:::
-
-:::{toctree}
-:caption: V1 Design Documents
-:maxdepth: 2
-
-design/v1/torch_compile
-design/v1/prefix_caching
-design/v1/metrics
 :::
 
 % Q&A for Mooncake
