@@ -80,23 +80,16 @@ class MooncakeStorePyWrapper {
         try {
             // Section with GIL released
             py::gil_scoped_release release_gil;
-            auto buffer_handle = store_.get_buffer(key);
-            if (!buffer_handle) {
+            uint64_t total_length = 0;
+            auto get_result = store_.get_allocated_internal(key, total_length);
+            if (!get_result) {
                 py::gil_scoped_acquire acquire_gil;
                 return pybind11::none();
             }
-            // Create contiguous buffer and copy data
-            auto total_length = buffer_handle->size();
-            char *exported_data = new char[total_length];
-            if (!exported_data) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid data format: insufficient data for "
-                              "metadata";
-                return pybind11::none();
-            }
+            auto exported_data = *get_result;
+
+            // Copy metadata from buffer
             TensorMetadata metadata;
-            // Copy data from buffer to contiguous memory
-            memcpy(exported_data, buffer_handle->ptr(), total_length);
             memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
             if (metadata.ndim < 0 || metadata.ndim > 4) {
