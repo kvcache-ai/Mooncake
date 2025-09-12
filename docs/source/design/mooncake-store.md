@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## Introduction
 

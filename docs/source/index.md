@@ -93,7 +93,7 @@ python-api-reference/transfer-engine
 :maxdepth: 1
 
 design/architecture
-design/mooncake-store-preview
+design/mooncake-store
 design/p2p-store
 design/transfer-engine
 :::

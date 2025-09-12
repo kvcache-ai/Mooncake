@@ -216,4 +216,4 @@ store.close()
 
 ### More Examples and Documentation
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md) and [Mooncake Store](../design/mooncake-store-preview.md) for more examples and documentation.
+Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md) and [Mooncake Store](../design/mooncake-store.md) for more examples and documentation.
