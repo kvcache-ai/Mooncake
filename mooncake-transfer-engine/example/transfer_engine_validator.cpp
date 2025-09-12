@@ -306,12 +306,7 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
 Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
                        int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
-    TransferRequest::OpCode opcode;
-    if (FLAGS_operation == "read")
-        opcode = TransferRequest::READ;
-    else if (FLAGS_operation == "write")
-        opcode = TransferRequest::WRITE;
-    else {
+    if (FLAGS_operation != "read" && FLAGS_operation != "write") {
         LOG(ERROR) << "Unsupported operation: must be 'read' or 'write'";
         exit(EXIT_FAILURE);
     }
