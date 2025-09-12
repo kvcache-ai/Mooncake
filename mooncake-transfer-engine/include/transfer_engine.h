@@ -188,7 +188,8 @@ class TransferEngine {
             auto value = notifies_to_send_[batch_id];
             auto rc = sendNotifyByID(value.first, value.second);
             if (rc) {
-                LOG(ERROR) << "Failed to send notify message, error code: " << rc;
+                LOG(ERROR) << "Failed to send notify message, error code: "
+                           << rc;
             }
             notifies_to_send_.erase(batch_id);
         }
