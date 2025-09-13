@@ -37,12 +37,10 @@ class RdmaEndPoint {
     int construct(RdmaContext *context, EndPointParams *params,
                   const std::string &endpoint_name);
 
+    int deconstruct();
+
    public:
-    enum EndPointStatus { EP_UNINIT, EP_DISABLED, EP_INPROGRESS, EP_READY };
-
-    int enable();
-
-    int disable();
+    enum EndPointStatus { EP_UNINIT, EP_HANDSHAKING, EP_READY, EP_RESET };
 
     int reset();
 
@@ -54,7 +52,7 @@ class RdmaEndPoint {
 
     std::vector<uint32_t> qpNum();
 
-    int outstandingSlices() const;
+    int getInflightSlices() const;
 
     RdmaContext &context() const { return *context_; }
 
@@ -91,6 +89,10 @@ class RdmaEndPoint {
 
     void cancelQuota(int qp_index, int num_entries);
 
+    void waitForAllInflightSlices();
+
+    int resetUnlocked();
+
    private:
     std::atomic<EndPointStatus> status_;
     RWSpinlock ep_lock_;
@@ -101,6 +103,7 @@ class RdmaEndPoint {
 
     std::vector<ibv_qp *> qp_list_;
     WrDepthBlock *wr_depth_list_;
+    volatile int inflight_slices_;
 };
 }  // namespace v1
 }  // namespace mooncake

@@ -153,12 +153,12 @@ RdmaContext::~RdmaContext() {
 }
 
 int RdmaContext::construct(const std::string &device_name,
-                           std::shared_ptr<EndpointStore> endpoint_store,
                            std::shared_ptr<RdmaParams> params) {
     ASSERT_STATUS(DEVICE_UNINIT);
     device_name_ = device_name;
-    endpoint_store_ = endpoint_store;
     params_ = params;
+    endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
+        *this, params_->endpoint.endpoint_store_cap);
     status_ = DEVICE_DISABLED;
     return enable();
 }
@@ -228,7 +228,7 @@ int RdmaContext::enable() {
 
 int RdmaContext::disable() {
     ASSERT_STATUS_NOT(DEVICE_UNINIT);
-    endpoint_store_->clearEndpoints(device_name_);
+    endpoint_store_->clear();
 
     for (auto &entry : mr_set_) {
         int ret = ibv_dereg_mr(entry);
@@ -313,37 +313,6 @@ RdmaCQ *RdmaContext::cq(int index) {
     ASSERT_STATUS(DEVICE_ENABLED);
     if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
     return cq_list_[index];
-}
-
-std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
-    const std::string &key, EndPointOperation operation) {
-    ASSERT_STATUS(DEVICE_ENABLED);
-    if (device_name_.empty() || key.empty()) {
-        LOG(ERROR) << "Invalid argument for endpoint operation";
-        return nullptr;
-    }
-
-    auto full_key = device_name_ + "|" + key;
-    std::shared_ptr<RdmaEndPoint> endpoint = nullptr;
-    switch (operation) {
-        case EP_GET_OR_CREATE:
-            endpoint = endpoint_store_->getEndpoint(full_key);
-            if (!endpoint)
-                endpoint = endpoint_store_->insertEndpoint(full_key, this);
-            return endpoint;
-        case EP_GET:
-            endpoint = endpoint_store_->getEndpoint(full_key);
-            return endpoint;
-        case EP_DELETE:
-            endpoint = endpoint_store_->getEndpoint(full_key);
-            endpoint_store_->deleteEndpoint(full_key);
-            return endpoint;
-        case EP_RECREATE:
-            endpoint_store_->deleteEndpoint(full_key);
-            return endpoint_store_->insertEndpoint(full_key, this);
-        default:
-            return nullptr;
-    }
 }
 
 int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {

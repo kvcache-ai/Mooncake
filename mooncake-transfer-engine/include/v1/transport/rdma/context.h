@@ -52,7 +52,6 @@ class RdmaContext {
     ~RdmaContext();
 
     int construct(const std::string &device_name,
-                  std::shared_ptr<EndpointStore> endpoint_store,
                   std::shared_ptr<RdmaParams> params);
 
    public:
@@ -76,9 +75,7 @@ class RdmaContext {
         return {entry->lkey, entry->rkey};
     }
 
-    enum EndPointOperation { EP_GET_OR_CREATE, EP_GET, EP_DELETE, EP_RECREATE };
-    std::shared_ptr<RdmaEndPoint> endpoint(
-        const std::string &key, EndPointOperation operation = EP_GET_OR_CREATE);
+    std::shared_ptr<EndpointStore> endpointStore() { return endpoint_store_; }
 
     const std::string name() const { return device_name_; }
 

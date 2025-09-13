@@ -183,6 +183,24 @@ static inline BufferDesc *getBufferDesc(SegmentDesc *desc, uint64_t base,
     return nullptr;
 }
 
+static inline std::string getRpcServerAddr(SegmentDesc *desc) {
+    if (desc->type != SegmentType::Memory) return "";
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    return detail.rpc_server_addr;
+}
+
+static inline DeviceDesc *getDeviceDesc(SegmentDesc *desc,
+                                        const std::string &device_name) {
+    if (desc->type != SegmentType::Memory) return nullptr;
+    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
+    for (auto &entry : detail.devices) {
+        if (entry.name == device_name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace v1
 }  // namespace mooncake
 

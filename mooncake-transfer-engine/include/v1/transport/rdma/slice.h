@@ -64,7 +64,8 @@ struct RdmaSlice {
     int target_dev_id = -1;
 
     int retry_count = 0;
-    volatile int *endpoint_quota = nullptr;
+    volatile int *qp_inflight = nullptr;
+    volatile int *ep_inflight = nullptr;
     bool failed = false;
     uint64_t enqueue_ts = 0, submit_ts = 0;
 };

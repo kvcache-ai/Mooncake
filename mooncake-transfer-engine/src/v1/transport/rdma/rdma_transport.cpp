@@ -114,12 +114,10 @@ Status RdmaTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
-    auto endpoint_store = std::make_shared<SIEVEEndpointStore>(
-        params_->endpoint.endpoint_store_cap);
     auto hca_list = local_topology_->getDeviceList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>();
-        int ret = context->construct(device_name, endpoint_store, params_);
+        int ret = context->construct(device_name, params_);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
@@ -232,7 +230,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = &task;
             slice->retry_count = 0;
-            slice->endpoint_quota = nullptr;
+            slice->qp_inflight = nullptr;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
             task.num_slices++;
@@ -313,7 +311,8 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
 
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
-    auto endpoint = context->endpoint(peer_desc.local_nic_path);
+    auto endpointStore = context->endpointStore();
+    auto endpoint = endpointStore->getOrInsert(peer_desc.local_nic_path);
     if (!endpoint) {
         local_desc.reply_msg = "Unable to create endpoint object";
         return ERR_ENDPOINT;
@@ -334,12 +333,12 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
     SegmentDescRef segment_desc;
     auto status =
         metadata_->segmentManager().getRemote(segment_desc, peer_server_name);
-    if (status.ok() && segment_desc->type == SegmentType::Memory) {
-        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
-        for (auto &nic : detail.devices)
-            if (nic.name == peer_nic_name)
-                return endpoint->configurePeer(
-                    nic.gid, nic.lid, peer_desc.qp_num, &local_desc.reply_msg);
+    if (status.ok()) {
+        auto device_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+        if (device_desc)
+            return endpoint->configurePeer(device_desc->gid, device_desc->lid,
+                                           peer_desc.qp_num,
+                                           &local_desc.reply_msg);
     }
     local_desc.reply_msg = "Unable to find RDMA device " + peer_nic_path_ +
                            ": " + status.ToString();

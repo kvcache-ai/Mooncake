@@ -116,10 +116,12 @@ class Workers {
 
     int handleContextEvents(std::shared_ptr<RdmaContext> &context);
 
-    Status generatePostPath(int thread_id, RdmaSlice *slice);
+    Status generatePostPath(int thread_id, RdmaSlice *slice,
+                            std::string &target_seg_name,
+                            std::string &target_dev_name);
 
    private:
-    struct RuoteHint {
+    struct RouteHint {
         SegmentDesc *segment;
         BufferDesc *buffer;
         const TopologyEntry *topo_entry_raw;
@@ -127,18 +129,18 @@ class Workers {
         const Topology *topo;
     };
 
-    Status getRouteHint(RuoteHint &hint, SegmentID segment_id, uint64_t addr,
+    Status getRouteHint(RouteHint &hint, SegmentID segment_id, uint64_t addr,
                         uint64_t length);
 
-    Status selectOptimalDevice(RuoteHint &source, RuoteHint &target,
+    Status selectOptimalDevice(RouteHint &source, RouteHint &target,
                                RdmaSlice *slice, int thread_id);
 
-    Status selectFallbackDevice(RuoteHint &source, RuoteHint &target,
+    Status selectFallbackDevice(RouteHint &source, RouteHint &target,
                                 RdmaSlice *slice, int thread_id);
 
-    int getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx);
+    int getDeviceByFlatIndex(const RouteHint &hint, size_t flat_idx);
 
-    int getDeviceRank(const RuoteHint &hint, int device_id);
+    int getDeviceRank(const RouteHint &hint, int device_id);
 
     void showLatencyInfo(int thread_id);
 
@@ -171,8 +173,11 @@ class Workers {
         }
     };
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(int thread_id,
-                                              Workers::PostPath path);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(
+        int local_device_id, const std::string &target_seg_name,
+        const std::string &target_dev_name);
+
+    Status resetEndpoint(RdmaSlice *slice);
 
     using GroupedRequests =
         std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;

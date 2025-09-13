@@ -115,42 +115,53 @@ Status Workers::cancel(RdmaSliceList &slice_list) {
     return Status::NotImplemented("cancel not implemented" LOC_MARK);
 }
 
-std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(int thread_id,
-                                                   Workers::PostPath path) {
-    auto context = transport_->context_set_[path.local_device_id].get();
+std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(
+    int local_device_id, const std::string &target_seg_name,
+    const std::string &target_dev_name) {
+    auto context = transport_->context_set_[local_device_id].get();
     std::shared_ptr<RdmaEndPoint> endpoint;
-    SegmentDesc *desc = nullptr;
-    auto status = transport_->metadata_->segmentManager().getRemoteCached(
-        desc, path.remote_segment_id);
-    if (!status.ok() || desc->type != SegmentType::Memory) {
-        LOG(ERROR) << "Failed to get remote segment: " << status.ToString();
-        return nullptr;
-    }
-    auto peer_segment_name = desc->name;
-    auto peer_device_name = std::get<MemorySegmentDesc>(desc->detail)
-                                .devices[path.remote_device_id]
-                                .name;
-    auto peer_name = MakeNicPath(peer_segment_name, peer_device_name);
-    endpoint = context->endpoint(peer_name);
+    auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
+    endpoint = context->endpointStore()->getOrInsert(peer_name);
+    if (!endpoint) return nullptr;
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         std::lock_guard<std::mutex> lock(ep_mutex_);
         if (endpoint->status() != RdmaEndPoint::EP_READY &&
-            doHandshake(endpoint, peer_segment_name, peer_device_name)) {
+            doHandshake(endpoint, target_seg_name, target_dev_name)) {
             return nullptr;
         }
     }
     return endpoint;
 }
 
+Status Workers::resetEndpoint(RdmaSlice *slice) {
+    RouteHint target;
+    auto target_id = slice->task->request.target_id;
+    CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
+                              slice->length));
+    auto target_dev_name = target.topo->getDeviceName(slice->target_dev_id);
+    auto context = transport_->context_set_[slice->source_dev_id].get();
+    auto peer_name = MakeNicPath(target.segment->name, target_dev_name);
+    auto endpoint = context->endpointStore()->get(peer_name);
+    if (endpoint) {
+        std::lock_guard<std::mutex> lock(ep_mutex_);
+        endpoint->reset();
+    }
+    return Status::OK();
+}
+
 void Workers::asyncPostSend(int thread_id) {
     auto &worker = worker_context_[thread_id];
     std::vector<RdmaSliceList> result;
+    std::unordered_map<int, std::string> target_seg_name_map;
+    std::unordered_map<int, std::string> target_dev_name_map;
     worker.queue.pop(result);
     for (auto &slice_list : result) {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
-            auto status = generatePostPath(thread_id, slice);
+            std::string target_seg_name, target_dev_name;
+            auto status = generatePostPath(thread_id, slice, target_seg_name,
+                                           target_dev_name);
             if (!status.ok()) {
                 LOG(ERROR) << "[TE Worker] Detected asynchronous error: "
                            << status.ToString();
@@ -160,6 +171,8 @@ void Workers::asyncPostSend(int thread_id) {
                     .local_device_id = slice->source_dev_id,
                     .remote_segment_id = slice->task->request.target_id,
                     .remote_device_id = slice->target_dev_id};
+                target_seg_name_map[path.remote_segment_id] = target_seg_name;
+                target_dev_name_map[path.remote_device_id] = target_dev_name;
                 worker.requests[path].push_back(slice);
             }
             slice = slice->next;
@@ -170,8 +183,10 @@ void Workers::asyncPostSend(int thread_id) {
         auto &path = entry.first;
         auto &slices = entry.second;
         if (slices.empty()) continue;
-
-        auto endpoint = getEndpoint(thread_id, path);
+        auto &target_seg_name = target_seg_name_map[path.remote_segment_id];
+        auto &target_dev_name = target_dev_name_map[path.remote_device_id];
+        auto endpoint =
+            getEndpoint(path.local_device_id, target_seg_name, target_dev_name);
         if (!endpoint) {
             LOG(ERROR) << "[TE Worker] Unable to allocate endpoint: "
                        << path.local_device_id << " -> "
@@ -220,24 +235,20 @@ int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
     } else {
         auto &manager = transport_->metadata_->segmentManager();
         auto status = manager.getRemote(segment_desc, peer_server_name);
-        if (!status.ok() || segment_desc->type != SegmentType::Memory)
-            return ERR_ENDPOINT;
-        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
-        status =
-            RpcClient::bootstrap(detail.rpc_server_addr, local_desc, peer_desc);
         if (!status.ok()) return ERR_ENDPOINT;
-
+        auto rpc_server_addr = getRpcServerAddr(segment_desc.get());
+        if (rpc_server_addr.empty()) return ERR_ENDPOINT;
+        status = RpcClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
+        if (!status.ok()) return ERR_ENDPOINT;
         qp_num = peer_desc.qp_num;
     }
 
     assert(qp_num.size());
     if (segment_desc) {
-        auto &detail = std::get<MemorySegmentDesc>(segment_desc->detail);
-        for (auto &nic : detail.devices) {
-            if (nic.name == peer_nic_name) {
-                return endpoint->configurePeer(nic.gid, nic.lid, qp_num);
-            }
-        }
+        auto device_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+        if (device_desc)
+            return endpoint->configurePeer(device_desc->gid, device_desc->lid,
+                                           qp_num);
     }
 
     return ERR_ENDPOINT;
@@ -248,7 +259,7 @@ void Workers::asyncPollCq(int thread_id) {
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
     int nr_poll_total = 0;
-    std::unordered_map<volatile int *, int> endpoint_quota_map;
+    std::unordered_map<volatile int *, int> counter_map;
     for (int index = 0; index < num_contexts; index++) {
         auto &context = transport_->context_set_[index];
         auto cq = context->cq(thread_id % num_cq_list);
@@ -264,10 +275,14 @@ void Workers::asyncPollCq(int thread_id) {
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
-            if (endpoint_quota_map.count(slice->endpoint_quota))
-                endpoint_quota_map[slice->endpoint_quota]++;
+            if (counter_map.count(slice->qp_inflight))
+                counter_map[slice->qp_inflight]++;
             else
-                endpoint_quota_map[slice->endpoint_quota] = 1;
+                counter_map[slice->qp_inflight] = 1;
+            if (counter_map.count(slice->ep_inflight))
+                counter_map[slice->ep_inflight]++;
+            else
+                counter_map[slice->ep_inflight] = 1;
             if (slice->retry_count == 0) {
                 worker_context_[thread_id].device_quota->release(
                     slice->source_dev_id, slice->length, inflight_lat);
@@ -291,6 +306,7 @@ void Workers::asyncPollCq(int thread_id) {
                 } else {
                     submit(slice);
                 }
+                resetEndpoint(slice);
             } else {
                 markSliceSuccess(slice);
                 auto &worker = worker_context_[thread_id];
@@ -302,7 +318,7 @@ void Workers::asyncPollCq(int thread_id) {
             nr_poll_total += nr_poll;
         }
     }
-    for (auto &entry : endpoint_quota_map) {
+    for (auto &entry : counter_map) {
         __sync_fetch_and_sub(entry.first, entry.second);
     }
     if (nr_poll_total) {
@@ -406,7 +422,7 @@ void Workers::monitorThread() {
     }
 }
 
-Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
+Status Workers::getRouteHint(RouteHint &hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto &segment_manager = transport_->metadata_->segmentManager();
     if (segment_id == LOCAL_SEGMENT_ID) {
@@ -419,6 +435,8 @@ Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
         return Status::AddressNotRegistered(
             "No matched buffer in given address range" LOC_MARK);
     }
+    if (hint.segment->type != SegmentType::Memory)
+        return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
     auto &matrix = hint.topo->getResolvedMatrix();
     auto &raw_matrix = hint.topo->getMatrix();
@@ -432,7 +450,7 @@ Status Workers::getRouteHint(RuoteHint &hint, SegmentID segment_id,
     return Status::OK();
 }
 
-int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
+int Workers::getDeviceRank(const RouteHint &hint, int device_id) {
     for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
         auto &list = hint.topo_entry->device_list[rank];
         for (auto &entry : list)
@@ -441,7 +459,7 @@ int Workers::getDeviceRank(const RuoteHint &hint, int device_id) {
     return -1;
 }
 
-Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
+Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
                                     RdmaSlice *slice, int thread_id) {
     if (slice->source_dev_id < 0)
         CHECK_STATUS(worker_context_[thread_id].device_quota->allocate(
@@ -487,7 +505,7 @@ Status Workers::selectOptimalDevice(RuoteHint &source, RuoteHint &target,
     return Status::OK();
 }
 
-int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
+int Workers::getDeviceByFlatIndex(const RouteHint &hint, size_t flat_idx) {
     for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
         auto &list = hint.topo_entry->device_list[rank];
         if (flat_idx < list.size()) return list[flat_idx];
@@ -496,7 +514,7 @@ int Workers::getDeviceByFlatIndex(const RuoteHint &hint, size_t flat_idx) {
     return -1;
 }
 
-Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
+Status Workers::selectFallbackDevice(RouteHint &source, RouteHint &target,
                                      RdmaSlice *slice, int thread_id) {
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
@@ -550,8 +568,10 @@ Status Workers::selectFallbackDevice(RuoteHint &source, RuoteHint &target,
     return Status::DeviceNotFound("All devices are tried but failed");
 }
 
-Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
-    RuoteHint source, target;
+Status Workers::generatePostPath(int thread_id, RdmaSlice *slice,
+                                 std::string &target_seg_name,
+                                 std::string &target_dev_name) {
+    RouteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
                               (uint64_t)slice->source_addr, slice->length));
 
@@ -565,6 +585,8 @@ Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {
         CHECK_STATUS(selectFallbackDevice(source, target, slice, thread_id));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    target_seg_name = target.segment->name;
+    target_dev_name = target.topo->getDeviceName(slice->target_dev_id);
     return Status::OK();
 }
 }  // namespace v1

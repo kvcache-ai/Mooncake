@@ -155,11 +155,10 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
     auto buffer = getBufferDesc(desc, dest_addr, length);
-    if (!buffer)
+    rpc_server_addr = getRpcServerAddr(desc);
+    if (!buffer || rpc_server_addr.empty())
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    rpc_server_addr = detail.rpc_server_addr;
     return Status::OK();
 }
 
@@ -169,10 +168,9 @@ Status TcpTransport::sendNotification(SegmentID target_id,
     SegmentDesc *desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
-    if (desc->type != SegmentType::Memory)
-        return Status::InvalidArgument("Not memory-kind segment" LOC_MARK);
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    rpc_server_addr = detail.rpc_server_addr;
+    rpc_server_addr = getRpcServerAddr(desc);
+    if (rpc_server_addr.empty())
+        return Status::InvalidArgument("Requested segment type error" LOC_MARK);
     return RpcClient::notify(rpc_server_addr, message);
 }
 

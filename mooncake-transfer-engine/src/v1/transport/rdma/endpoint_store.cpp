@@ -28,32 +28,24 @@
 
 namespace mooncake {
 namespace v1 {
-std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
-    const std::string &key) {
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::get(const std::string &key) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
     if (iter != endpoint_map_.end()) return iter->second;
     return nullptr;
 }
 
-std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
-    const std::string &key, RdmaContext *context) {
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getOrInsert(
+    const std::string &key) {
+    auto endpoint = get(key);
+    if (endpoint) return endpoint;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    if (endpoint_map_.find(key) != endpoint_map_.end()) {
-        LOG(INFO) << "Endpoint " << key
-                  << " already exists in FIFOEndpointStore";
+    if (endpoint_map_.find(key) != endpoint_map_.end())
         return endpoint_map_[key];
-    }
-    auto endpoint = std::make_shared<RdmaEndPoint>();
-    if (!endpoint) {
-        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
-        return nullptr;
-    }
-    int ret = endpoint->construct(context, &context->params().endpoint, key);
+    endpoint = std::make_shared<RdmaEndPoint>();
+    int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
     if (ret) return nullptr;
-
-    while (this->getSize() >= max_size_) evictEndpoint();
-
+    while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = endpoint;
     fifo_list_.push_back(key);
     auto it = fifo_list_.end();
@@ -61,7 +53,7 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
     return endpoint;
 }
 
-int FIFOEndpointStore::deleteEndpoint(const std::string &key) {
+int FIFOEndpointStore::remove(const std::string &key) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
     if (iter != endpoint_map_.end()) {
@@ -74,34 +66,30 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &key) {
     return 0;
 }
 
-void FIFOEndpointStore::evictEndpoint() {
+void FIFOEndpointStore::evictOne() {
     if (fifo_list_.empty()) return;
     std::string victim = fifo_list_.front();
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
     waiting_list_.insert(endpoint_map_[victim]);
     endpoint_map_.erase(victim);
-    return;
 }
 
-void FIFOEndpointStore::reclaimEndpoint() {
+void FIFOEndpointStore::reclaim() {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_) {
-        if (!endpoint->outstandingSlices()) to_delete.push_back(endpoint);
+        if (!endpoint->getInflightSlices()) to_delete.push_back(endpoint);
     }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
 }
 
-size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
+size_t FIFOEndpointStore::size() { return endpoint_map_.size(); }
 
-void FIFOEndpointStore::clearEndpoints(const std::string &prefix) {
+void FIFOEndpointStore::clear() {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::string> to_delete;
-    for (auto &entry : endpoint_map_) {
-        if (entry.first.substr(0, prefix.length()) == prefix)
-            to_delete.push_back(entry.first);
-    }
+    for (auto &entry : endpoint_map_) to_delete.push_back(entry.first);
     for (auto &key : to_delete) {
         endpoint_map_.erase(key);
         auto fifo_iter = fifo_map_[key];
@@ -110,43 +98,35 @@ void FIFOEndpointStore::clearEndpoints(const std::string &prefix) {
     }
 }
 
-std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
-    const std::string &key) {
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::get(const std::string &key) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
     if (iter != endpoint_map_.end()) {
-        iter->second.second.store(
-            true, std::memory_order_relaxed);  // This is safe within read lock
-                                               // because of idempotence
+        iter->second.second.store(true, std::memory_order_relaxed);
         return iter->second.first;
     }
     return nullptr;
 }
 
-std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
-    const std::string &key, RdmaContext *context) {
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getOrInsert(
+    const std::string &key) {
+    auto endpoint = get(key);
+    if (endpoint) return endpoint;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(key) != endpoint_map_.end()) {
-        LOG(INFO) << "Endpoint " << key
-                  << " already exists in SIEVEEndpointStore";
         return endpoint_map_[key].first;
     }
-    auto endpoint = std::make_shared<RdmaEndPoint>();
-    if (!endpoint) {
-        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
-        return nullptr;
-    }
-    int ret = endpoint->construct(context, &context->params().endpoint, key);
+    endpoint = std::make_shared<RdmaEndPoint>();
+    int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
     if (ret) return nullptr;
-
-    while (this->getSize() >= max_size_) evictEndpoint();
+    while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = std::make_pair(endpoint, false);
     fifo_list_.push_front(key);
     fifo_map_[key] = fifo_list_.begin();
     return endpoint;
 }
 
-int SIEVEEndpointStore::deleteEndpoint(const std::string &key) {
+int SIEVEEndpointStore::remove(const std::string &key) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
     if (iter != endpoint_map_.end()) {
@@ -164,7 +144,7 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &key) {
     return 0;
 }
 
-void SIEVEEndpointStore::evictEndpoint() {
+void SIEVEEndpointStore::evictOne() {
     if (fifo_list_.empty()) {
         return;
     }
@@ -190,26 +170,23 @@ void SIEVEEndpointStore::evictEndpoint() {
     return;
 }
 
-void SIEVEEndpointStore::reclaimEndpoint() {
+void SIEVEEndpointStore::reclaim() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_) {
-        if (!endpoint->outstandingSlices()) to_delete.push_back(endpoint);
+        if (!endpoint->getInflightSlices()) to_delete.push_back(endpoint);
     }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
 }
 
-size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+size_t SIEVEEndpointStore::size() { return endpoint_map_.size(); }
 
-void SIEVEEndpointStore::clearEndpoints(const std::string &prefix) {
+void SIEVEEndpointStore::clear() {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::string> to_delete;
-    for (auto &entry : endpoint_map_) {
-        if (entry.first.substr(0, prefix.length()) == prefix)
-            to_delete.push_back(entry.first);
-    }
+    for (auto &entry : endpoint_map_) to_delete.push_back(entry.first);
     for (auto &key : to_delete) {
         endpoint_map_.erase(key);
         auto fifo_iter = fifo_map_[key];

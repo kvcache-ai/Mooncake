@@ -30,31 +30,42 @@ namespace mooncake {
 namespace v1 {
 class EndpointStore {
    public:
-    virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
+    virtual std::shared_ptr<RdmaEndPoint> get(const std::string &key) = 0;
+
+    virtual std::shared_ptr<RdmaEndPoint> getOrInsert(
         const std::string &key) = 0;
-    virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &key, RdmaContext *context) = 0;
-    virtual int deleteEndpoint(const std::string &key) = 0;
-    virtual void evictEndpoint() = 0;
-    virtual void reclaimEndpoint() = 0;
-    virtual void clearEndpoints(const std::string &prefix) = 0;
-    virtual size_t getSize() = 0;
+
+    virtual int remove(const std::string &key) = 0;
+
+    virtual void clear() = 0;
+
+    virtual size_t size() = 0;
+
+    virtual void evictOne() = 0;
+    virtual void reclaim() = 0;
 };
 
 // FIFO
 class FIFOEndpointStore : public EndpointStore {
    public:
-    FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
-    std::shared_ptr<RdmaEndPoint> getEndpoint(const std::string &key) override;
-    std::shared_ptr<RdmaEndPoint> insertEndpoint(const std::string &key,
-                                                 RdmaContext *context) override;
-    int deleteEndpoint(const std::string &key) override;
-    void evictEndpoint() override;
-    void reclaimEndpoint() override;
-    void clearEndpoints(const std::string &prefix);
-    size_t getSize() override;
+    FIFOEndpointStore(RdmaContext &context, size_t max_size)
+        : context_(context), max_size_(max_size) {}
+
+    std::shared_ptr<RdmaEndPoint> get(const std::string &key) override;
+
+    std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
+
+    int remove(const std::string &key) override;
+
+    void clear();
+
+    size_t size() override;
+
+    void evictOne() override;
+    void reclaim() override;
 
    private:
+    RdmaContext &context_;
     RWSpinlock endpoint_map_lock_;
     std::unordered_map<std::string, std::shared_ptr<RdmaEndPoint>>
         endpoint_map_;
@@ -69,18 +80,23 @@ class FIFOEndpointStore : public EndpointStore {
 // NSDI 24, similar to clock with quick demotion
 class SIEVEEndpointStore : public EndpointStore {
    public:
-    SIEVEEndpointStore(size_t max_size)
-        : waiting_list_len_(0), max_size_(max_size) {}
-    std::shared_ptr<RdmaEndPoint> getEndpoint(const std::string &key) override;
-    std::shared_ptr<RdmaEndPoint> insertEndpoint(const std::string &key,
-                                                 RdmaContext *context) override;
-    int deleteEndpoint(const std::string &key) override;
-    void evictEndpoint() override;
-    void reclaimEndpoint() override;
-    void clearEndpoints(const std::string &prefix);
-    size_t getSize() override;
+    SIEVEEndpointStore(RdmaContext &context, size_t max_size)
+        : context_(context), waiting_list_len_(0), max_size_(max_size) {}
+
+    std::shared_ptr<RdmaEndPoint> get(const std::string &key) override;
+
+    std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
+
+    void clear();
+
+    size_t size() override;
+
+    int remove(const std::string &key) override;
+    void evictOne() override;
+    void reclaim() override;
 
    private:
+    RdmaContext &context_;
     RWSpinlock endpoint_map_lock_;
     // The bool represents visited
     std::unordered_map<
