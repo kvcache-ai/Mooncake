@@ -76,6 +76,17 @@ if (USE_MNNVL)
     )
 endif()
 
+# Install Python scripts from mooncake-wheel/mooncake/ directory
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
+    DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+)
+
 install(
     DIRECTORY
         ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
