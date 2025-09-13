@@ -95,26 +95,27 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     PATTERNS=(
         "libcurl.so*"
         "libibverbs.so*"
+        "libmlx5.so*"
         "libnuma.so*"
         "libstdc++.so*"
         "libgcc_s.so*"
         "libc.so*"
         "libnghttp2.so*"
         "libidn2.so*"
-        "librtmp.so*" 
+        "librtmp.so*"
         "libssh.so*"
         "libpsl.so*"
         "libssl.so*"
         "libcrypto.so*"
-        "libgssapi_krb5.so*" 
+        "libgssapi_krb5.so*"
         "libldap.so*"
         "liblber.so*"
         "libbrotlidec.so*"
-        "libz.so*" 
+        "libz.so*"
         "libnl-route-3.so*"
         "libnl-3.so*"
         "libm.so*"
-        "liblzma.so*" 
+        "liblzma.so*"
         "libunistring.so*"
         "libgnutls.so*"
         "libhogweed.so*"
@@ -124,7 +125,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libk5crypto.so*"
         "libcom_err.so*"
         "libkrb5support.so*"
-        "libsasl2.so*" 
+        "libsasl2.so*"
         "libbrotlicommon.so*"
         "libp11-kit.so*"
         "libtasn1.so*"
@@ -133,6 +134,12 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libffi.so*"
         "libcuda.so*"
         "libcudart.so*"
+        "libc10.so*"
+        "libc10_cuda.so*"
+        "libtorch.so*"
+        "libtorch_cpu.so*"
+        "libtorch_cuda.so*"
+        "libtorch_python.so*"
         "libascendcl.so*"
         "libhccl.so*"
         "libmsprofiler.so*"
@@ -153,11 +160,11 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libhybrid_executor.so*"
         "libdavinci_executor.so*"
         "libge_common.so*"
-        "libge_common_base.so*" 
+        "libge_common_base.so*"
         "liblowering.so*"
         "libregister.so*"
         "libexe_graph.so*"
-        "libmmpa.so*" 
+        "libmmpa.so*"
         "libplatform.so*"
         "libgraph_base.so*"
         "libruntime_common.so*"
@@ -186,10 +193,15 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
+    if [ "$BUILD_WITH_EP" = "1" ]; then
+        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
+    else
+        python -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
+    --exclude libmlx5.so* \
     --exclude libnuma.so* \
     --exclude libstdc++.so* \
     --exclude libgcc_s.so* \
@@ -228,6 +240,12 @@ else
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libc10.so* \
+    --exclude libc10_cuda.so* \
+    --exclude libtorch.so* \
+    --exclude libtorch_cpu.so* \
+    --exclude libtorch_cuda.so* \
+    --exclude libtorch_python.so* \
     --exclude libascendcl.so* \
     --exclude libhccl.so* \
     --exclude libmsprofiler.so* \
