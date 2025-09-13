@@ -97,6 +97,9 @@ struct ConnectionInfo {
     } while (0)
 
 extern int initTransportMem(RankInfo *local_rank_info);
+extern void freeTransportMem();
+
+extern int clearTransportMem(RankInfo *remote_rank_info);
 
 extern int transportMemTask(RankInfo *local_rank_info,
                             RankInfo *remote_rank_info, int op_code,
@@ -106,6 +109,7 @@ extern int transportMemTask(RankInfo *local_rank_info,
 extern int transportMemAccept(RankInfo *local_rank_info);
 
 extern int regLocalRmaMem(void *addr, uint64_t length);
+extern int unregLocalRmaMems();
 
 extern bool printEnabled();
 
