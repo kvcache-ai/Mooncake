@@ -59,7 +59,7 @@ bool printEnabled() {
     return env != nullptr && std::string(env) == "1";
 }
 
-size_t getMaxRegMemoryNum() {
+static size_t getMaxRegMemoryNum() {
     static const size_t g_default_max_reg_memory_num = 8192;
     static char *env = getenv("ASCEND_TRANSPORT_MAX_REG_MEMORY_NUM");
     if (env != nullptr) {
@@ -68,7 +68,7 @@ size_t getMaxRegMemoryNum() {
     return g_default_max_reg_memory_num;
 }
 
-int getEpollWaitTimeoutMs() {
+static int getEpollWaitTimeoutMs() {
     static const int g_default_epoll_wait_timeout_ms = 3000;
     static char *env = getenv("ASCEND_TRANSPORT_EPOLL_WAIT_TIMEOUT");
     if (env != nullptr) {
@@ -299,7 +299,7 @@ int initTransportMem(RankInfo *local_rank_info) {
     return 0;
 }
 
-void freeTransportMem(bool free_control_socket) {
+void freeTransportMem() {
     for (auto &it : target_key_to_connection_map_) {
         auto &hccl_ctrl_socket = it.second.hccl_ctrl_socket;
         if (hccl_ctrl_socket) {
@@ -325,19 +325,9 @@ void freeTransportMem(bool free_control_socket) {
         notifyPool_.reset();
     }
 
-    if (free_control_socket && g_server_socket_ > 0) {
+    if (g_server_socket_ > 0) {
         close(g_server_socket_);
     }
-}
-
-int reinitTransportMem(RankInfo *local_rank_info) {
-    freeTransportMem(/*free_control_socket=*/false);
-    int ret = initServerNetSocket(local_rank_info);
-    if (ret) {
-        LOG(ERROR) << "initServerNetSocket failed, ret: " << ret;
-        return ret;
-    }
-    return 0;
 }
 
 static int connectToTarget(std::string target_ip, int target_port) {
@@ -752,6 +742,24 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     return 0;
 }
 
+int clearTransportMem(RankInfo *remote_rank_info) {
+    std::string key_str = inet_ntoa(remote_rank_info->hostIp) +
+                          std::to_string(remote_rank_info->devicePhyId);
+    const auto &it = target_key_to_connection_map_.find(key_str);
+    if (it != target_key_to_connection_map_.end()) {
+        auto &hccl_ctrl_socket = it->second.hccl_ctrl_socket;
+        if (hccl_ctrl_socket) {
+            hccl_ctrl_socket->Close();
+        }
+        auto &hccl_data_socket = it->second.hccl_data_socket;
+        if (hccl_data_socket) {
+            hccl_data_socket->Close();
+        }
+        target_key_to_connection_map_.erase(key_str);
+    }
+    return 0;
+}
+
 int transportMemAddOpFence(RankInfo *remote_rank_info, aclrtStream stream) {
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) +
                           std::to_string(remote_rank_info->devicePhyId);
@@ -774,7 +782,6 @@ int transportMemTask(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     // information to the peer
     std::string key_str = inet_ntoa(remote_rank_info->hostIp) +
                           std::to_string(remote_rank_info->devicePhyId);
-    LOG(INFO) << "transportMemTask with key: " << key_str;
     auto iter = target_key_to_connection_map_.find(key_str);
     if (iter == target_key_to_connection_map_.end()) {
         ret = controlInfoSend(local_rank_info, remote_rank_info);
@@ -871,18 +878,15 @@ int acceptSocket(std::shared_ptr<hccl::HcclSocket> &hccl_socket,
 int transportMemAccept(RankInfo *local_rank_info) {
     static int epoll_wait_timeout = getEpollWaitTimeoutMs();
     // Self-built out-of-band, host socket for receiving control plane
-    // LOG(INFO) << "start epoll_wait ...";
     int ret = 0;
     int nfds = epoll_wait(g_epoll_fd, g_events, MAX_EVENTS, epoll_wait_timeout);
     if (nfds <= 0) {
         return 0;
     }
-    LOG(INFO) << "start acceptFromTarget ...";
     int client_socket = acceptFromTarget();
     if (client_socket < 0) {
         return client_socket;
     }
-    LOG(INFO) << "start recv remote_control_info ...";
     RankControlInfo remote_control_info;
     ret = recv(client_socket, &remote_control_info, sizeof(RankControlInfo), 0);
     if (ret <= 0) {
