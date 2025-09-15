@@ -60,7 +60,7 @@ def run_server(bind_url, data_size_mb=1):
     CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
     server = CoroRPCInterface()
     server.initialize(bind_url, 8, 30, 4)
-    server.start_server_async()
+    server.start_server_async() #start the server asynchronously
     
     # Start QPS statistics thread
     thread = threading.Thread(target=print_qps)
