@@ -675,6 +675,11 @@ void bind_coro_rpc_interface(py::module_ &m) {
         .def("initialize", &CoroRPCInterface::initialize,
              "listen_address"_a = "", "thread_count"_a = 0,
              "timeout_seconds"_a = 30, "pool_size"_a = 10)
+        .def("initialize_client", &CoroRPCInterface::initializeClient,
+             "pool_size"_a = 10, "timeout_seconds"_a = 30)
+        .def("initialize_server", &CoroRPCInterface::initializeServer,
+             "listen_address"_a, "thread_count"_a = 8,
+             "timeout_seconds"_a = 30, "pool_size"_a = 4)
         .def("start_server", &CoroRPCInterface::startServer)
         .def("start_server_async", &CoroRPCInterface::startServerAsync)
         .def("stop_server", &CoroRPCInterface::stopServer)

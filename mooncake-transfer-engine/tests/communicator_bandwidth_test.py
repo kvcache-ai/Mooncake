@@ -59,7 +59,8 @@ def run_server(bind_url, data_size_mb=1):
     
     CoroRPCInterface = engine.CoroRPCInterface
     server = CoroRPCInterface()
-    server.initialize(bind_url, 8, 30, 4)
+    # Server使用专门的初始化方法
+    server.initialize_server(bind_url, thread_count=8)
     server.start_server_async() #start the server asynchronously
     
     # Start QPS statistics thread
@@ -85,7 +86,8 @@ def run_client(target_url, num_threads=8, data_size_mb=1):
     
     CoroRPCInterface = engine.CoroRPCInterface
     client = CoroRPCInterface()
-    client.initialize("", 0, 30, 100)
+    # Client使用专门的初始化方法，只需要提供pool_size
+    client.initialize_client(pool_size=100)
     
     # Start QPS statistics thread
     qps_thread = threading.Thread(target=print_qps)

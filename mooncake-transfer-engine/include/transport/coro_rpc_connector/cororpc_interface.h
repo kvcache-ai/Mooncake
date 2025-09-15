@@ -47,6 +47,12 @@ class CoroRPCInterface {
                     size_t thread_count = 0, size_t timeout_seconds = 30,
                     size_t pool_size = 10);
 
+    // Convenience methods for common use cases
+    bool initializeClient(size_t pool_size = 10, size_t timeout_seconds = 30);
+    bool initializeServer(const std::string& listen_address, 
+                         size_t thread_count = 8, size_t timeout_seconds = 30,
+                         size_t pool_size = 4);
+
     bool startServer();
     bool startServerAsync();
     bool startServerImpl(bool is_async = true);
