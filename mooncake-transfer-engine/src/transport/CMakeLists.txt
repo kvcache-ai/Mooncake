@@ -38,5 +38,3 @@ if (USE_MNNVL)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
-
-target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)

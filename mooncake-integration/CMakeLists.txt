@@ -44,8 +44,6 @@ target_link_libraries(engine PUBLIC
     transfer_engine 
     glog::glog
     gflags::gflags
-    yalantinglibs::yalantinglibs
-    pybind11::module
 )
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")

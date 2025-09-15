@@ -743,8 +743,6 @@ PYBIND11_MODULE(engine, m) {
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
-    // Add coro_rpc_interface as a submodule
-    auto coro_rpc_submodule = m.def_submodule(
-        "coro_rpc_interface", "CoroRPC interface for communication");
-    bind_coro_rpc_interface(coro_rpc_submodule);
+    // Bind coro_rpc_interface directly to the main module
+    bind_coro_rpc_interface(m);
 }

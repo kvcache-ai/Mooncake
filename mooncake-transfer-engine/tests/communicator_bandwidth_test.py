@@ -57,7 +57,7 @@ def run_server(bind_url, data_size_mb=1):
     
     print(f"Starting server on {bind_url} with {data_size_mb}MB data packets")
     
-    CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
+    CoroRPCInterface = engine.CoroRPCInterface
     server = CoroRPCInterface()
     server.initialize(bind_url, 8, 30, 4)
     server.start_server_async() #start the server asynchronously
@@ -83,7 +83,7 @@ def run_client(target_url, num_threads=8, data_size_mb=1):
     
     print(f"Starting client, connecting to {target_url} with {num_threads} threads, {data_size_mb}MB data packets")
     
-    CoroRPCInterface = engine.coro_rpc_interface.CoroRPCInterface
+    CoroRPCInterface = engine.CoroRPCInterface
     client = CoroRPCInterface()
     client.initialize("", 0, 30, 100)
     
