@@ -71,6 +71,9 @@ class PyClient {
     PyClient();
     ~PyClient();
 
+    // Bind current thread and allocation preference to a NUMA node.
+    // If NUMA is unavailable or the node id is invalid, the call is ignored
+    // with a warning.
     void bind_to_numa_node(int node);
 
     int setup(const std::string &local_hostname,

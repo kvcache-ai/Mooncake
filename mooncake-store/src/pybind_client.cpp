@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <numa.h>
 
 #include <cstdlib>  // for atexit
 #include <optional>
@@ -93,6 +94,12 @@ void PyClient::bind_to_numa_node(int node) {
     if (numa_available() < 0) {
         LOG(WARNING) << "NUMA is not available on this system; binding skipped";
         return;
+    }
+
+    int max_node = numa_max_node();
+    if (node < 0 || node > max_node) {
+        LOG(WARNING) << "Invalid NUMA node: " << node << ". Valid range: 0-"
+                     << max_node;
     }
 
     // Bind current thread to CPUs of the NUMA node
