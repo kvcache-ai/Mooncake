@@ -79,13 +79,19 @@ endif()
 # Install Python scripts from mooncake-wheel/mooncake/ directory
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
 )
+
+if (WITH_STORE)
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
 
 install(
     DIRECTORY
@@ -96,7 +102,7 @@ install(
 
 install(
     CODE "
-        execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}\")
+        execute_process(COMMAND chmod 767 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}\")
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
     "
 )
