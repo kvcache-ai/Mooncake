@@ -12,7 +12,7 @@ Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gl
 
 > **Note:** Mooncake EP currently supports only the low-latency transfer mode.
 
-The API is largely consistent with DeepEP's, with only minor differences in a few parameters. Mooncake EP exposes a `Buffer` that can be imported from `mooncake.mooncake_ep_buffer`. For an example, refer to `mooncake-wheel/tests/test_mooncake_ep.py`.
+The API is largely consistent with DeepEP's, with only minor differences in a few parameters. Mooncake EP exposes a `Buffer` that can be imported from `mooncake.mooncake_ep_buffer`. For example, refer to `mooncake-wheel/tests/test_mooncake_ep.py`.
 
 #### Buffer.get_buffer_size_hint()
 
