@@ -277,25 +277,25 @@ Follow the instructions in [transfer-engine.md](./transfer-engine.md#example-tra
 #### Start Prefill Instance
 
 ```bash
-python3 ../mooncake-store/tests/stress_cluster_benchmark.py \
-        --local-hostname=127.0.0.1:8081 \
-        --role=prefill \
-        --protocol=nvmeof_generic \
-        --protocol-args="trtype=tcp adrfam=ipv4 traddr=127.0.0.1 trsvcid=4420" \
-        --local-buffer-size=1024 \
-        --files="/path/to/file0 /path/to/file1 ..."
+MC_MS_AUTO_DISC=0 python3 ../mooncake-store/tests/stress_cluster_benchmark.py \
+                          --local-hostname=127.0.0.1:8081 \
+                          --role=prefill \
+                          --protocol=nvmeof_generic \
+                          --protocol-args="trtype=tcp adrfam=ipv4 traddr=127.0.0.1 trsvcid=4420" \
+                          --local-buffer-size=1024 \
+                          --files="/path/to/file0 /path/to/file1 ..."
 ```
 
 #### Start Decode Instance
 
 ```bash
-python3 ../mooncake-store/tests/stress_cluster_benchmark.py \
-        --local-hostname=127.0.0.1:8082 \
-        --role=decode \
-        --protocol=nvmeof_generic \
-        --protocol-args="" \
-        --local-buffer-size=1024 \
-        --files=""
+MC_MS_AUTO_DISC=0 python3 ../mooncake-store/tests/stress_cluster_benchmark.py \
+                          --local-hostname=127.0.0.1:8082 \
+                          --role=decode \
+                          --protocol=nvmeof_generic \
+                          --protocol-args="" \
+                          --local-buffer-size=1024 \
+                          --files=""
 ```
 
 #### Performance Tuning
