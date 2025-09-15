@@ -2,6 +2,7 @@
 
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
+#include <numa.h>
 
 #include "pybind_client.h"
 
@@ -537,14 +538,35 @@ PYBIND11_MODULE(store, m) {
              [](MooncakeStorePyWrapper &self) {
                  return self.store_.get_hostname();
              })
-        .def(
-            "bind_to_numa_node",
-            [](MooncakeStorePyWrapper &self, int node) {
-                self.store_.bind_to_numa_node(node);
-            },
-            py::arg("node"),
-            "Bind the client's memory allocations and thread to the specified "
-            "NUMA node");
+        ;
+
+    // Expose NUMA binding as a module-level function (no self required)
+    m.def(
+        "bind_to_numa_node",
+        [](int node) {
+            if (numa_available() < 0) {
+                LOG(WARNING)
+                    << "NUMA is not available on this system; binding skipped";
+                return;
+            }
+
+            int max_node = numa_max_node();
+            if (node < 0 || node > max_node) {
+                LOG(WARNING) << "Invalid NUMA node: " << node
+                             << ". Valid range: 0-" << max_node;
+            }
+
+            if (numa_run_on_node(node) != 0) {
+                LOG(WARNING) << "numa_run_on_node failed for node " << node;
+            }
+
+            // Prefer this NUMA node for future allocations but allow fallback
+            numa_set_bind_policy(0);  // non-strict binding
+            numa_set_preferred(node);
+        },
+        py::arg("node"),
+        "Bind the current thread and memory allocation preference to the "
+        "specified NUMA node");
 }
 
 }  // namespace mooncake

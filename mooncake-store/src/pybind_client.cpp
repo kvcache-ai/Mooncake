@@ -90,28 +90,6 @@ PyClient::~PyClient() {
     ResourceTracker::getInstance().unregisterInstance(this);
 }
 
-void PyClient::bind_to_numa_node(int node) {
-    if (numa_available() < 0) {
-        LOG(WARNING) << "NUMA is not available on this system; binding skipped";
-        return;
-    }
-
-    int max_node = numa_max_node();
-    if (node < 0 || node > max_node) {
-        LOG(WARNING) << "Invalid NUMA node: " << node << ". Valid range: 0-"
-                     << max_node;
-    }
-
-    // Bind current thread to CPUs of the NUMA node
-    if (numa_run_on_node(node) != 0) {
-        LOG(WARNING) << "numa_run_on_node failed for node " << node;
-    }
-
-    // Prefer this NUMA node for future allocations but allow fallback
-    numa_set_bind_policy(0);  // non-strict binding
-    numa_set_preferred(node);
-}
-
 tl::expected<void, ErrorCode> PyClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
