@@ -128,7 +128,7 @@ class Buffer:
     def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, broken_ranks: torch.Tensor,
                  num_max_dispatch_tokens_per_rank: int, num_experts: int, timeout_us: int,
                  use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
-            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.dispatch(x, topk_idx, broken_ranks,
                                   num_max_dispatch_tokens_per_rank, num_experts, timeout_us,
@@ -145,7 +145,7 @@ class Buffer:
                 broken_ranks: torch.Tensor, timeout_us: int,
                 handle: tuple, zero_copy: bool = False, async_finish: bool = False,
                 return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
-            Tuple[torch.Tensor, torch.Tensor, EventOverlap, Callable]:
+            Tuple[torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         combined_x, event, hook = self.runtime.combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                        broken_ranks,
