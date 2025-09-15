@@ -445,6 +445,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const auto& handle = handles[i];
         const auto& slice = slices[i];
 
+        if (slice.ptr == nullptr) continue;
+
         void* dest;
         const void* src;
 
@@ -483,6 +485,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     for (size_t i = 0; i < handles.size(); ++i) {
         const auto& handle = handles[i];
         const auto& slice = slices[i];
+
+        if (slice.ptr == nullptr) continue;
 
         Transport::SegmentHandle seg =
             engine_.openSegment(handle.segment_name_);

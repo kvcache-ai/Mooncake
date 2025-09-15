@@ -209,21 +209,8 @@ class MooncakeStorePyWrapper {
                 std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
             values.emplace_back(std::span<const char>(buffer, tensor_size));
 
-            auto register_result = store_.register_buffer_internal(
-                reinterpret_cast<void *>(data_ptr), tensor_size);
-            if (!register_result) {
-                return -static_cast<int>(register_result.error());
-            }
-
             // Use put_parts to put metadata and tensor together
             auto put_result = store_.put_parts_internal(key, values);
-
-            auto unregister_result = store_.unregister_buffer_internal(
-                reinterpret_cast<void *>(data_ptr));
-            if (!unregister_result) {
-                LOG(WARNING) << "Failed to unregister buffer after put_tensor";
-            }
-
             if (!put_result) {
                 return -static_cast<int>(put_result.error());
             }

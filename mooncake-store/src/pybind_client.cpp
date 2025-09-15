@@ -111,16 +111,13 @@ tl::expected<void, ErrorCode> PyClient::common_setup_internal(
         this->local_hostname = local_hostname;
     }
 
-    void **args = nullptr;
-    if (protocol == "rdma") {
-        args = rdma_args(protocol_args);
-    } else if (protocol == "nvmeof_generic" && !protocol_args.empty()) {
-        args = (void **)calloc(2, sizeof(void *));
-        args[0] = (void *)protocol_args.c_str();
-    }
-    auto client_opt =
-        mooncake::Client::Create(this->local_hostname, metadata_server,
-                                 protocol, args, master_server_addr);
+    std::optional<std::string> protocol_args_opt =
+        (protocol_args.empty() ? std::nullopt
+                               : std::make_optional(protocol_args));
+
+    auto client_opt = mooncake::Client::Create(
+        this->local_hostname, metadata_server, protocol, protocol_args_opt,
+        master_server_addr);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

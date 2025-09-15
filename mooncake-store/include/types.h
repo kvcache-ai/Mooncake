@@ -27,8 +27,8 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
-static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
+static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";

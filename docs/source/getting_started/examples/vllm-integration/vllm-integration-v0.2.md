@@ -1,13 +1,16 @@
-# vLLM Disaggregated Serving Demo
+# vLLM V0 Disaggregated Serving Demo
 
 ## Overview
-This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated serving scenario. We have run some experiments to obtain some [preview benchmark results](vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
+This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated serving scenario. We have run some experiments to obtain some [preview benchmark results](../../../performance/vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
 
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
  - **Update(Apr 10, 2025)**: We are working on the vLLM v1 integration now. Stay tuned.
+ - **Update(Sep 5, 2025)**: We have released the vLLM v1 integration with Mooncake Store and LMCache. Please refer to [vllmv1-lmcache-integration](vllmv1-lmcache-integration.md) for more details.
 
 ## Installation
+
 ### Prerequisite
+
 ```bash
 pip3 install mooncake-transfer-engine
 ```

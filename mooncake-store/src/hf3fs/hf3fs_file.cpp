@@ -1,9 +1,9 @@
+#include <glog/logging.h>
+
 #include "file_interface.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/file.h>
-#include <cstring>
-#include <stdexcept>
 
 namespace mooncake {
 

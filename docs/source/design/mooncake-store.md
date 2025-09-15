@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## Introduction
 
@@ -15,12 +15,12 @@ Key features of Mooncake Store include:
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
-- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.​
+- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
 - **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
 
-![architecture](../../image/mooncake-store-preview.png)
+![architecture](../image/mooncake-store-preview.png)
 
 As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
 
@@ -72,7 +72,7 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
-![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
+![mooncake-store-simple-get](../image/mooncake-store-simple-get.png)
 
 
 Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.​​(When persistence is enabled, if a query request fails in memory, the system will attempt to locate and load the corresponding data from SSD.)​
@@ -87,9 +87,9 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                   const ReplicateConfig& config);
 ```
 
-![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
+![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​
 
 **Replication Guarantees and Best Effort Behavior:**
 - Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
@@ -464,15 +464,9 @@ The strategy automatically handles cases where the preferred segment is unavaila
 
 ### Eviction Policy
 
-When the mounted segments are full, i.e., when a `PutStart` request fails due to insufficient memory, an eviction task will be launched to free up space by evicting some objects. Just like `Remove`, evicted objects are simply marked as deleted. No data transfer is needed.
+When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark (95% by default, configurable via `-eviction_high_watermark_ratio`), an eviction task is triggered to free up space by evicting a portion of objects (5% by default, configurable via `-eviction_ratio`). Similar to `Remove`, evicted objects are simply marked as deleted, with no data transfer required.
 
 Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
-
-Each time the eviction task is triggered, in default it will try to evict about 10% of objects. This ratio is configurable via a startup parameter of `master_service`.
-
-To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `-eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
-it initiates evict operations. The eviction target is to clean an additional `-eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
-
 ### Lease
 
 To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
@@ -540,36 +534,7 @@ After enabling the persistence feature:
 - For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
 
 #### 3FS USRBIO Plugin
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](/mooncake-store/src/hf3fs/README.md).
-
-### Builtin Metadata Server
-
-Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
-
-#### Configuration Parameters
-
-The HTTP metadata server can be configured using the following parameters:
-
-- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server instead of using etcd. When set to `true`, the master service will start an embedded HTTP server that handles metadata operations.
-
-- **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
-
-- **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
-
-#### Usage Example
-
-To start the master service with the HTTP metadata server enabled:
-
-```bash
-./build/mooncake-store/src/mooncake_master \
-    --enable_http_metadata_server=true \
-    --http_metadata_server_port=8080 \
-    --http_metadata_server_host=0.0.0.0
-```
-
-When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
-
-Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](https://kvcache-ai.github.io/Mooncake/getting_started/plugin-usage/3FS-USRBIO-Plugin.html).
 
 ## Mooncake Store Python API
 

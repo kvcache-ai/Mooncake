@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## 概述
 
@@ -469,14 +469,9 @@ virtual std::unique_ptr<AllocatedBuffer> Allocate(
 
 ### 替换策略
 
-当挂载的空间已满，即由于内存不足而导致 `PutStart` 请求失败时，系统将启动替换任务以释放空间。与 `Remove` 操作类似，被换出的对象仅被标记为已删除，无需进行数据传输。
+当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 95%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
 
 目前采用的是一种近似的 LRU 策略，即尽可能优先换出最近最少被访问的对象。为了避免数据竞争和数据损坏，正在被客户端读取或写入的对象不会被换出。因此，拥有租约或尚未被 `PutEnd` 请求标记为 complete 的对象不会被换出。
-
-每次替换任务被触发时，会尝试换出大约 10% 的对象，这个比例可通过 `master_service` 的启动参数进行配置。
-
-为了尽力避免 Put 失败，还可以通过 `master_service` 的启动参数 `-eviction_high_watermark_ratio=<RATIO>`(默认为 1) 来设定 eviction 的高水位触发条件。当清理线程发现当前空间使用量达到了设定的高水位，
-则开始进行清理工作，清理的目标在高水位基础上再多清理 `-eviction_ratio` 指定的清理比例，从而达到空间低水位。
 
 ### 租约机制
 
