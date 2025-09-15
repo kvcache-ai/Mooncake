@@ -118,6 +118,8 @@ python3 -m sglang.launch_server \
 
 **Benchmark Script:**
 
+We used SGLang's [multiturn benchmark](https://github.com/sgl-project/sglang/blob/main/benchmark/hicache/bench_multiturn.py) for the evaluation.
+
 ```bash
 python3 benchmark/hicache/bench_multiturn.py \
     --model-path $MODEL_PATH \

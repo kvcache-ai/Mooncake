@@ -18,7 +18,7 @@ HiCache introduces a **HiRadixTree** that acts as a page table for referencing K
 
 The system includes an intelligent cache controller that automatically manages data movement between tiers, implementing optimized prefetching strategies and multiple write policies (write-through, write-through-selective, and write-back).
 
-For more details about SGLang HiCache, please refer to [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+For more details about SGLang HiCache, please refer to [SGLang project](https://github.com/sgl-project/sglang) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
 
 ### Mooncake & SGLang HiCache
 
