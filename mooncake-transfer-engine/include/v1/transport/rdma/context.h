@@ -41,13 +41,14 @@ namespace v1 {
 class RdmaCQ;
 class RdmaEndPoint;
 class EndpointStore;
+class RdmaTransport;
 
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
 
    public:
-    RdmaContext();
+    RdmaContext(RdmaTransport &transport);
 
     ~RdmaContext();
 
@@ -106,6 +107,7 @@ class RdmaContext {
    private:
     // initialized during ctor, will never be changed during the context's
     // lifecycle
+    RdmaTransport &transport_;
     std::string device_name_;
     std::shared_ptr<RdmaParams> params_;
     std::atomic<DeviceStatus> status_;

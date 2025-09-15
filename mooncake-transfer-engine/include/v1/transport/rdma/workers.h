@@ -108,10 +108,6 @@ class Workers {
 
     void asyncPollCq(int thread_id);
 
-    int doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
-                    const std::string &peer_server_name,
-                    const std::string &peer_nic_name);
-
     void monitorThread();
 
     int handleContextEvents(std::shared_ptr<RdmaContext> &context);
@@ -150,7 +146,6 @@ class Workers {
     std::thread monitor_;
 
     std::atomic<bool> running_;
-    std::mutex ep_mutex_;
 
     struct PostPath {
         int local_device_id;

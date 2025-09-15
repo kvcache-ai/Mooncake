@@ -21,6 +21,7 @@
 
 #include "v1/common/status.h"
 #include "v1/transport/rdma/context.h"
+#include "v1/utility/string_builder.h"
 
 namespace mooncake {
 namespace v1 {
@@ -100,8 +101,77 @@ int RdmaEndPoint::deconstruct() {
     return 0;
 }
 
+Status RdmaEndPoint::connect(const std::string &peer_server_name,
+                             const std::string &peer_nic_name) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (status_ == EP_READY) return Status::OK();
+    if (status_ != EP_HANDSHAKING)
+        return Status::InvalidArgument("Endpoint not in HANDSHAKING state");
+    auto &transport = context_->transport_;
+    auto &manager = transport.metadata_->segmentManager();
+    auto qp_num = qpNum();
+    BootstrapDesc local_desc, peer_desc;
+    local_desc.local_nic_path =
+        MakeNicPath(transport.local_segment_name_, context_->name());
+    local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
+    local_desc.qp_num = qp_num;
+    std::shared_ptr<SegmentDesc> segment_desc;
+    if (local_desc.local_nic_path == local_desc.peer_nic_path) {
+        segment_desc = manager.getLocal();
+    } else {
+        CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
+        auto rpc_server_addr = getRpcServerAddr(segment_desc.get());
+        assert(!rpc_server_addr.empty());
+        CHECK_STATUS(
+            RpcClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
+        qp_num = peer_desc.qp_num;
+    }
+    assert(qp_num.size() && segment_desc);
+    auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+    if (!dev_desc)
+        return Status::InvalidArgument("Unable to find RDMA device" LOC_MARK);
+    int rc = setupAllQPs(dev_desc->gid, dev_desc->lid, qp_num);
+    if (rc) {
+        return Status::InternalError(
+            "Failed to configure RDMA endpoint" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status RdmaEndPoint::accept(const BootstrapDesc &peer_desc,
+                            BootstrapDesc &local_desc) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (status_ == EP_READY) {
+        LOG(WARNING) << "EndPoint in READY state, convert to RESET state";
+        resetUnlocked();
+    } else if (status_ != EP_HANDSHAKING)
+        return Status::InvalidArgument("Endpoint not in HANDSHAKING state");
+    auto &transport = context_->transport_;
+    auto &manager = transport.metadata_->segmentManager();
+    auto peer_nic_path = peer_desc.local_nic_path;
+    auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
+    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path);
+    if (peer_server_name.empty() || peer_nic_name.empty())
+        return Status::InvalidArgument("Invalid peer_nic_path in request");
+    local_desc.local_nic_path =
+        MakeNicPath(transport.local_segment_name_, context_->name());
+    local_desc.peer_nic_path = peer_nic_path;
+    local_desc.qp_num = qpNum();
+    SegmentDescRef segment_desc;
+    CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
+    auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+    if (!dev_desc)
+        return Status::InvalidArgument("Unable to find RDMA device" LOC_MARK);
+    int rc = setupAllQPs(dev_desc->gid, dev_desc->lid, peer_desc.qp_num);
+    if (rc) {
+        return Status::InternalError(
+            "Failed to configure RDMA endpoint" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 int RdmaEndPoint::reset() {
-    RWSpinlock::WriteGuard guard(ep_lock_);
+    RWSpinlock::WriteGuard guard(lock_);
     return resetUnlocked();
 }
 
@@ -125,20 +195,13 @@ int RdmaEndPoint::resetUnlocked() {
     return 0;
 }
 
-int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
-                                std::vector<uint32_t> peer_qp_num_list,
-                                std::string *reply_msg) {
+int RdmaEndPoint::setupAllQPs(const std::string &peer_gid, uint16_t peer_lid,
+                              std::vector<uint32_t> peer_qp_num_list,
+                              std::string *reply_msg) {
     if (status_ == EP_READY) {
         LOG(WARNING) << "Reconfigure an already READY endpoint ["
                      << endpoint_name_ << "]";
         if (reset()) return ERR_ENDPOINT;
-    }
-
-    RWSpinlock::WriteGuard guard(ep_lock_);
-    if (status_ == EP_READY) {
-        LOG(WARNING) << "Reconfigure an already READY endpoint ["
-                     << endpoint_name_ << "]";
-        if (resetUnlocked()) return ERR_ENDPOINT;
     }
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
@@ -152,8 +215,8 @@ int RdmaEndPoint::configurePeer(const std::string &peer_gid, uint16_t peer_lid,
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = setupSingleQueuePair(qp_index, peer_gid, peer_lid,
-                                       peer_qp_num_list[qp_index], reply_msg);
+        int ret = setupOneQP(qp_index, peer_gid, peer_lid,
+                             peer_qp_num_list[qp_index], reply_msg);
         if (ret) return ret;
     }
 
@@ -174,7 +237,7 @@ static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
                                int qp_index) {
-    // RWSpinlock::ReadGuard guard(ep_lock_);
+    RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     const static int kSgeEntries = 1;
     if (status_ != EP_READY) return 0;
     if (qp_index < 0) qp_index = 0;
@@ -231,7 +294,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
 }
 
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
-    // RWSpinlock::ReadGuard guard(ep_lock_);
+    RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     if (status_ != EP_READY) return 0;
     if (qp_index < 0 || qp_index >= (int)qp_list_.size()) return 0;
     ibv_recv_wr wr, *bad_wr;
@@ -248,7 +311,6 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() {
-    // RWSpinlock::ReadGuard guard(ep_lock_);
     std::vector<uint32_t> ret;
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index)
         ret.push_back(qp_list_[qp_index]->qp_num);
@@ -278,10 +340,9 @@ void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     cq->cancelQuota(num_entries);
 }
 
-int RdmaEndPoint::setupSingleQueuePair(int qp_index,
-                                       const std::string &peer_gid,
-                                       uint16_t peer_lid, uint32_t peer_qp_num,
-                                       std::string *reply_msg) {
+int RdmaEndPoint::setupOneQP(int qp_index, const std::string &peer_gid,
+                             uint16_t peer_lid, uint32_t peer_qp_num,
+                             std::string *reply_msg) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto &qp = qp_list_[qp_index];
 

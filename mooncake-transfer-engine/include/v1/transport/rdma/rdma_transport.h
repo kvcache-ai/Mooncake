@@ -55,6 +55,7 @@ struct RdmaSubBatch : public Transport::SubBatch {
 
 class RdmaTransport : public Transport {
     friend class Workers;
+    friend class RdmaEndPoint;
 
    public:
     RdmaTransport();

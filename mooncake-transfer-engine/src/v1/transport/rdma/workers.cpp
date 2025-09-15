@@ -124,11 +124,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) return nullptr;
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        std::lock_guard<std::mutex> lock(ep_mutex_);
-        if (endpoint->status() != RdmaEndPoint::EP_READY &&
-            doHandshake(endpoint, target_seg_name, target_dev_name)) {
-            return nullptr;
-        }
+        auto status = endpoint->connect(target_seg_name, target_dev_name);
+        if (!status.ok()) return nullptr;
     }
     return endpoint;
 }
@@ -142,10 +139,7 @@ Status Workers::resetEndpoint(RdmaSlice *slice) {
     auto context = transport_->context_set_[slice->source_dev_id].get();
     auto peer_name = MakeNicPath(target.segment->name, target_dev_name);
     auto endpoint = context->endpointStore()->get(peer_name);
-    if (endpoint) {
-        std::lock_guard<std::mutex> lock(ep_mutex_);
-        endpoint->reset();
-    }
+    if (endpoint) endpoint->reset();
     return Status::OK();
 }
 
@@ -216,42 +210,6 @@ void Workers::asyncPostSend(int thread_id) {
         if (num_submitted)
             slices.erase(slices.begin(), slices.begin() + num_submitted);
     }
-}
-
-int Workers::doHandshake(std::shared_ptr<RdmaEndPoint> &endpoint,
-                         const std::string &peer_server_name,
-                         const std::string &peer_nic_name) {
-    auto qp_num = endpoint->qpNum();
-
-    BootstrapDesc local_desc, peer_desc;
-    local_desc.local_nic_path = MakeNicPath(transport_->local_segment_name_,
-                                            endpoint->context().name());
-    local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
-    local_desc.qp_num = qp_num;
-
-    std::shared_ptr<SegmentDesc> segment_desc;
-    if (local_desc.local_nic_path == local_desc.peer_nic_path) {
-        segment_desc = transport_->metadata_->segmentManager().getLocal();
-    } else {
-        auto &manager = transport_->metadata_->segmentManager();
-        auto status = manager.getRemote(segment_desc, peer_server_name);
-        if (!status.ok()) return ERR_ENDPOINT;
-        auto rpc_server_addr = getRpcServerAddr(segment_desc.get());
-        if (rpc_server_addr.empty()) return ERR_ENDPOINT;
-        status = RpcClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
-        if (!status.ok()) return ERR_ENDPOINT;
-        qp_num = peer_desc.qp_num;
-    }
-
-    assert(qp_num.size());
-    if (segment_desc) {
-        auto device_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
-        if (device_desc)
-            return endpoint->configurePeer(device_desc->gid, device_desc->lid,
-                                           qp_num);
-    }
-
-    return ERR_ENDPOINT;
 }
 
 void Workers::asyncPollCq(int thread_id) {

@@ -34,19 +34,20 @@ class RdmaEndPoint {
 
     ~RdmaEndPoint();
 
-    int construct(RdmaContext *context, EndPointParams *params,
-                  const std::string &endpoint_name);
-
-    int deconstruct();
-
    public:
     enum EndPointStatus { EP_UNINIT, EP_HANDSHAKING, EP_READY, EP_RESET };
 
     int reset();
 
-    int configurePeer(const std::string &peer_gid, uint16_t peer_lid,
-                      std::vector<uint32_t> peer_qp_num_list,
-                      std::string *reply_msg = nullptr);
+    int construct(RdmaContext *context, EndPointParams *params,
+                  const std::string &endpoint_name);
+
+    int deconstruct();
+
+    Status connect(const std::string &peer_server_name,
+                   const std::string &peer_nic_name);
+
+    Status accept(const BootstrapDesc &peer_desc, BootstrapDesc &local_desc);
 
     EndPointStatus status() const { return status_; }
 
@@ -72,6 +73,8 @@ class RdmaEndPoint {
         bool failed;
     };
 
+    int resetUnlocked();
+
     int submitSlices(std::vector<RdmaSlice *> &slice_list, int qp_index);
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
@@ -81,9 +84,12 @@ class RdmaEndPoint {
     }
 
    private:
-    int setupSingleQueuePair(int qp_index, const std::string &peer_gid,
-                             uint16_t peer_lid, uint32_t peer_qp_num,
-                             std::string *reply_msg = nullptr);
+    int setupAllQPs(const std::string &peer_gid, uint16_t peer_lid,
+                    std::vector<uint32_t> peer_qp_num_list,
+                    std::string *reply_msg = nullptr);
+
+    int setupOneQP(int qp_index, const std::string &peer_gid, uint16_t peer_lid,
+                   uint32_t peer_qp_num, std::string *reply_msg = nullptr);
 
     bool reserveQuota(int qp_index, int num_entries);
 
@@ -91,12 +97,8 @@ class RdmaEndPoint {
 
     void waitForAllInflightSlices();
 
-    int resetUnlocked();
-
    private:
     std::atomic<EndPointStatus> status_;
-    RWSpinlock ep_lock_;
-
     RdmaContext *context_;
     EndPointParams *params_;
     std::string endpoint_name_;
@@ -104,6 +106,8 @@ class RdmaEndPoint {
     std::vector<ibv_qp *> qp_list_;
     WrDepthBlock *wr_depth_list_;
     volatile int inflight_slices_;
+    uint32_t padding_[7];
+    RWSpinlock lock_;
 };
 }  // namespace v1
 }  // namespace mooncake

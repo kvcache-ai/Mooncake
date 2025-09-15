@@ -139,7 +139,8 @@ static inline const std::string statusToString(
     return "UNKNOWN";
 }
 
-RdmaContext::RdmaContext() : status_(DEVICE_UNINIT) {
+RdmaContext::RdmaContext(RdmaTransport &transport)
+    : transport_(transport), status_(DEVICE_UNINIT) {
     static std::once_flag g_once_flag;
     auto fork_init = []() {
         int ret = ibv_fork_init();
