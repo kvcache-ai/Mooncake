@@ -39,13 +39,15 @@ bool CoroRPCInterface::initialize(const std::string& local_address,
 }
 
 // Convenience method for client initialization
-bool CoroRPCInterface::initializeClient(size_t pool_size, size_t timeout_seconds) {
+bool CoroRPCInterface::initializeClient(size_t pool_size,
+                                        size_t timeout_seconds) {
     return initialize("", 0, timeout_seconds, pool_size);
 }
 
-// Convenience method for server initialization  
+// Convenience method for server initialization
 bool CoroRPCInterface::initializeServer(const std::string& listen_address,
-                                       size_t thread_count, size_t timeout_seconds) {
+                                        size_t thread_count,
+                                        size_t timeout_seconds) {
     return initialize(listen_address, thread_count, timeout_seconds, 4);
 }
 
