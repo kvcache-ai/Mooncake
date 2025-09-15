@@ -45,9 +45,8 @@ bool CoroRPCInterface::initializeClient(size_t pool_size, size_t timeout_seconds
 
 // Convenience method for server initialization  
 bool CoroRPCInterface::initializeServer(const std::string& listen_address,
-                                       size_t thread_count, size_t timeout_seconds,
-                                       size_t pool_size) {
-    return initialize(listen_address, thread_count, timeout_seconds, pool_size);
+                                       size_t thread_count, size_t timeout_seconds) {
+    return initialize(listen_address, thread_count, timeout_seconds, 4);
 }
 
 bool CoroRPCInterface::startServer() {
