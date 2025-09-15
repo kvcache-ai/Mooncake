@@ -128,7 +128,8 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
-    client_buffer_allocator_ = ClientBufferAllocator::create(local_buffer_size);
+    client_buffer_allocator_ =
+        ClientBufferAllocator::create(local_buffer_size, this->protocol);
     if (local_buffer_size > 0) {
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
@@ -154,12 +155,17 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr = allocate_buffer_allocator_memory(segment_size);
+        void *ptr =
+            allocate_buffer_allocator_memory(segment_size, this->protocol);
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        segment_ptrs_.emplace_back(ptr);
+        if (this->protocol == "ascend") {
+            ascend_segment_ptrs_.emplace_back(ptr);
+        } else {
+            segment_ptrs_.emplace_back(ptr);
+        }
         auto mount_result = client_->MountSegment(ptr, segment_size);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
