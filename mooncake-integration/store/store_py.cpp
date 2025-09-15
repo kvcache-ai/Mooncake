@@ -533,9 +533,18 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
-        .def("get_hostname", [](MooncakeStorePyWrapper &self) {
-            return self.store_.get_hostname();
-        });
+        .def("get_hostname",
+             [](MooncakeStorePyWrapper &self) {
+                 return self.store_.get_hostname();
+             })
+        .def(
+            "bind_to_numa_node",
+            [](MooncakeStorePyWrapper &self, int node) {
+                self.store_.bind_to_numa_node(node);
+            },
+            py::arg("node"),
+            "Bind the client's memory allocations and thread to the specified "
+            "NUMA node");
 }
 
 }  // namespace mooncake
