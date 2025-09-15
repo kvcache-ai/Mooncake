@@ -13,13 +13,13 @@ Since HiCache is currently used to accelerate the prefill stage, this benchmark 
 
 ## Benchmark Result
 
-![overall performance](../image/hicache_multi_turn_overall.png)
+![overall performance](../../docs/source/image/hicache_multi_turn_overall.png)
 
 We first evaluated the overall performance on a cluster consisting 3 servers, each has 2 NVIDIA A10 GPUs and 2 100Gbps eRDMA NICs.
 
 As shown in the figure, in terms of prefill performance, `populated Mooncake` achieves the best results, followed by `+Mooncake`, `+L2`, and finally `GPU only`.
 
-![overall performance](../image/hicache_multi_turn_per_turn.png)
+![overall performance](../../docs/source/image/hicache_multi_turn_per_turn.png)
 
 Next, we take a closer look at the sources of performance differences. We recorded the TTFT and cache hit rate for each conversation round. The experiment was conducted on a server equipped with 8 × H800 GPUs and 8 × mlx5 RDMA NICs. To minimize interference from the decode stage and highlight prefill performance differences, we set the output length to 1.
 
@@ -117,6 +117,8 @@ python3 -m sglang.launch_server \
 - Model: Qwen3-235B-A22B-Instruct-2507
 
 **Benchmark Script:**
+
+We used SGLang's [multiturn benchmark](https://github.com/sgl-project/sglang/blob/main/benchmark/hicache/bench_multiturn.py) for the evaluation.
 
 ```bash
 python3 benchmark/hicache/bench_multiturn.py \
