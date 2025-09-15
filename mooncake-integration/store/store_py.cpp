@@ -534,11 +534,9 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
-        .def("get_hostname",
-             [](MooncakeStorePyWrapper &self) {
-                 return self.store_.get_hostname();
-             })
-        ;
+        .def("get_hostname", [](MooncakeStorePyWrapper &self) {
+            return self.store_.get_hostname();
+        });
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
