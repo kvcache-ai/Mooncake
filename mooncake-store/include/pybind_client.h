@@ -1,12 +1,14 @@
 #pragma once
 
 #include <csignal>
-#include <mutex>
+#include <atomic>
+#include <thread>
 #include <string>
 #include <unordered_set>
 
 #include "client.h"
 #include "client_buffer.hpp"
+#include "mutex.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -62,8 +64,16 @@ class ResourceTracker {
     // Exit handler function
     static void exitHandler();
 
-    std::mutex mutex_;
-    std::unordered_set<PyClient *> instances_;
+    Mutex mutex_;
+    std::unordered_set<PyClient *> instances_ GUARDED_BY(mutex_);
+
+    // Ensure cleanup runs at most once
+    std::atomic<bool> cleaned_{false};
+
+    // Dedicated signal handling thread
+    void startSignalThread();
+    std::once_flag signal_once_{};
+    std::jthread signal_thread_{};  // joins on destruction
 };
 
 class PyClient {
