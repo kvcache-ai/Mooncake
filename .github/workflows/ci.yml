@@ -312,7 +312,6 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
-        torch-version: ['2.7.1', '2.8.0']
     env:
       BUILD_WITH_EP: "1"
       SCCACHE_GHA_ENABLED: "true"
@@ -359,7 +358,7 @@ jobs:
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         pip install toml-cli  # for updating the version
-        pip install torch==${{ matrix.torch-version }}
+        pip install torch==2.8.0
       shell: bash
 
     - name: Build transfer engine with EP
@@ -389,8 +388,7 @@ jobs:
     - name: Build Python wheel
       run: |
         BASE_VERSION=$(toml get --toml-path mooncake-wheel/pyproject.toml project.version | tr -d '"')
-        TORCH_VERSION=$(python -c "import torch; print(torch.__version__.split('+')[0])")
-        toml set --toml-path mooncake-wheel/pyproject.toml project.version "${BASE_VERSION}+ep_torch${TORCH_VERSION}"
+        toml set --toml-path mooncake-wheel/pyproject.toml project.version "${BASE_VERSION}+ep"
         # Build wheel with specific Python version
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
@@ -398,7 +396,7 @@ jobs:
     - name: Upload Python wheel artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}+ep_torch${{ matrix.torch-version }}
+        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}+ep
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
