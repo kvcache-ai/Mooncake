@@ -36,14 +36,10 @@ ResourceTracker::~ResourceTracker() {
     // Cleanup is handled by exitHandler
 }
 
-void ResourceTracker::registerInstance(PyClient *instance) {
+void ResourceTracker::registerInstance(
+    const std::shared_ptr<PyClient> &instance) {
     MutexLocker locker(&mutex_);
-    instances_.insert(instance);
-}
-
-void ResourceTracker::unregisterInstance(PyClient *instance) {
-    MutexLocker locker(&mutex_);
-    instances_.erase(instance);
+    instances_.push_back(instance);
 }
 
 void ResourceTracker::cleanupAllResources() {
@@ -54,24 +50,12 @@ void ResourceTracker::cleanupAllResources() {
         return;
     }
 
-    // Copy instances under lock, then release before calling into user code
-    std::vector<PyClient *> instances_copy;
-    {
-        MutexLocker locker(&mutex_);
-        instances_copy.reserve(instances_.size());
-        for (auto *inst : instances_) {
-            instances_copy.push_back(inst);
-        }
-    }
+    MutexLocker locker(&mutex_);
 
-    for (auto *store : instances_copy) {
-        if (store) {
-            try {
-                LOG(INFO) << "Cleaning up DistributedObjectStore instance";
-                store->tearDownAll();
-            } catch (...) {
-                // Swallow exceptions during shutdown
-            }
+    for (auto &wp : instances_) {
+        if (auto sp = wp.lock()) {
+            LOG(INFO) << "Cleaning up DistributedObjectStore instance";
+            sp->tearDownAll();
         }
     }
 }
@@ -148,14 +132,19 @@ void ResourceTracker::startSignalThread() {
 }
 
 PyClient::PyClient() {
-    // Register this instance with the global tracker
+    // Initialize logging severity (leave as before)
     easylog::set_min_severity(easylog::Severity::WARN);
-    ResourceTracker::getInstance().registerInstance(this);
 }
 
 PyClient::~PyClient() {
-    // Unregister from the tracker before cleanup
-    ResourceTracker::getInstance().unregisterInstance(this);
+    // Ensure resources are cleaned even if not explicitly closed
+    auto _ = tearDownAll_internal();
+}
+
+std::shared_ptr<PyClient> PyClient::create() {
+    auto sp = std::shared_ptr<PyClient>(new PyClient());
+    ResourceTracker::getInstance().registerInstance(sp);
+    return sp;
 }
 
 tl::expected<void, ErrorCode> PyClient::setup_internal(
@@ -275,9 +264,15 @@ int PyClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
+    // Ensure cleanup executes once across destructor/close/signal paths
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true,
+                                         std::memory_order_acq_rel)) {
+        return {};
+    }
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        // Not initialized or already cleaned; treat as success for idempotence
+        return {};
     }
     // Reset all resources
     client_.reset();
