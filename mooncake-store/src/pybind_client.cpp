@@ -21,9 +21,11 @@
 namespace mooncake {
 
 // ResourceTracker implementation using singleton pattern
+// Use a deliberately leaked heap object to avoid static destruction
+// order issues with atexit/signal handlers during process teardown.
 ResourceTracker &ResourceTracker::getInstance() {
-    static ResourceTracker instance;
-    return instance;
+    static ResourceTracker *instance = new ResourceTracker();
+    return *instance;
 }
 
 ResourceTracker::ResourceTracker() {
