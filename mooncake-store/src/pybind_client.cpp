@@ -4,36 +4,34 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <numa.h>
+#include <pthread.h>
+#include <signal.h>
+#include <thread>
+#include <stop_token>
 
 #include <cstdlib>  // for atexit
 #include <optional>
 
 #include "client_buffer.hpp"
 #include "config.h"
+#include "mutex.h"
 #include "types.h"
 #include "utils.h"
 
 namespace mooncake {
 
 // ResourceTracker implementation using singleton pattern
+// Use a deliberately leaked heap object to avoid static destruction
+// order issues with atexit/signal handlers during process teardown.
 ResourceTracker &ResourceTracker::getInstance() {
-    static ResourceTracker instance;
-    return instance;
+    static ResourceTracker *instance = new ResourceTracker();
+    return *instance;
 }
 
 ResourceTracker::ResourceTracker() {
-    // Set up signal handlers
-    struct sigaction sa;
-    sa.sa_handler = signalHandler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-
-    // Register for common termination signals
-    sigaction(SIGINT, &sa, nullptr);   // Ctrl+C
-    sigaction(SIGTERM, &sa, nullptr);  // kill command
-    sigaction(SIGHUP, &sa, nullptr);   // Terminal closed
-
-    // Register exit handler
+    // Start dedicated signal handling thread (best-effort)
+    startSignalThread();
+    // Register exit handler as a backstop
     std::atexit(exitHandler);
 }
 
@@ -41,34 +39,34 @@ ResourceTracker::~ResourceTracker() {
     // Cleanup is handled by exitHandler
 }
 
-void ResourceTracker::registerInstance(PyClient *instance) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    instances_.insert(instance);
-}
-
-void ResourceTracker::unregisterInstance(PyClient *instance) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    instances_.erase(instance);
+void ResourceTracker::registerInstance(
+    const std::shared_ptr<PyClient> &instance) {
+    MutexLocker locker(&mutex_);
+    instances_.push_back(instance);
 }
 
 void ResourceTracker::cleanupAllResources() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Ensure this runs only once
+    bool expected = false;
+    if (!cleaned_.compare_exchange_strong(expected, true,
+                                          std::memory_order_acq_rel)) {
+        return;
+    }
 
-    // Perform cleanup outside the lock to avoid potential deadlocks
-    for (void *instance : instances_) {
-        PyClient *store = static_cast<PyClient *>(instance);
-        if (store) {
+    MutexLocker locker(&mutex_);
+
+    for (auto &wp : instances_) {
+        if (auto sp = wp.lock()) {
             LOG(INFO) << "Cleaning up DistributedObjectStore instance";
-            store->tearDownAll();
+            sp->tearDownAll();
         }
     }
 }
 
 void ResourceTracker::signalHandler(int signal) {
-    LOG(INFO) << "Received signal " << signal << ", cleaning up resources";
+    // Legacy path (kept for compatibility if handlers are ever installed).
+    // Prefer dedicated signal thread; avoid doing heavy work here.
     getInstance().cleanupAllResources();
-
-    // Re-raise the signal with default handler to allow normal termination
     struct sigaction sa;
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
@@ -79,15 +77,77 @@ void ResourceTracker::signalHandler(int signal) {
 
 void ResourceTracker::exitHandler() { getInstance().cleanupAllResources(); }
 
+void ResourceTracker::startSignalThread() {
+    std::call_once(signal_once_, [this]() {
+        // Wait signal thread start
+        std::promise<void> ready;
+        auto ready_future = ready.get_future();
+
+        // Block signals in this thread; new threads inherit this mask
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGINT);
+        sigaddset(&set, SIGTERM);
+        sigaddset(&set, SIGHUP);
+        sigaddset(&set, SIGUSR1);  // used to interrupt sigwait on stop
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+
+        signal_thread_ = std::jthread(
+            [set, ready = std::move(ready)](std::stop_token st) mutable {
+                // Register a stop callback to interrupt sigwait via SIGUSR1
+                pthread_t self = pthread_self();
+                std::stop_callback cb(
+                    st, [self]() { pthread_kill(self, SIGUSR1); });
+                ready.set_value();
+                for (;;) {
+                    int sig = 0;
+                    int rc = sigwait(&set, &sig);
+                    if (rc != 0) {
+                        LOG(ERROR) << "sigwait failed: " << strerror(rc);
+                        continue;
+                    }
+
+                    if (sig == SIGUSR1) {
+                        if (st.stop_requested()) {
+                            break;  // graceful stop
+                        }
+                        continue;  // spurious
+                    }
+
+                    // Perform cleanup in normal thread context
+                    LOG(INFO) << "Received signal " << sig
+                              << ", cleaning up resources";
+                    ResourceTracker::getInstance().cleanupAllResources();
+
+                    // Restore default action and re-raise to terminate normally
+                    struct sigaction sa;
+                    sa.sa_handler = SIG_DFL;
+                    sigemptyset(&sa.sa_mask);
+                    sa.sa_flags = 0;
+                    sigaction(sig, &sa, nullptr);
+                    raise(sig);
+
+                    break;  // Should not reach due to process termination
+                }
+            });
+        ready_future.wait();  // Ensure thread is ready
+    });
+}
+
 PyClient::PyClient() {
-    // Register this instance with the global tracker
+    // Initialize logging severity (leave as before)
     easylog::set_min_severity(easylog::Severity::WARN);
-    ResourceTracker::getInstance().registerInstance(this);
 }
 
 PyClient::~PyClient() {
-    // Unregister from the tracker before cleanup
-    ResourceTracker::getInstance().unregisterInstance(this);
+    // Ensure resources are cleaned even if not explicitly closed
+    auto _ = tearDownAll_internal();
+}
+
+std::shared_ptr<PyClient> PyClient::create() {
+    auto sp = std::shared_ptr<PyClient>(new PyClient());
+    ResourceTracker::getInstance().registerInstance(sp);
+    return sp;
 }
 
 tl::expected<void, ErrorCode> PyClient::setup_internal(
@@ -207,9 +267,15 @@ int PyClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
+    // Ensure cleanup executes once across destructor/close/signal paths
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true,
+                                         std::memory_order_acq_rel)) {
+        return {};
+    }
     if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        // Not initialized or already cleaned; treat as success for idempotence
+        return {};
     }
     // Reset all resources
     client_.reset();
