@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 
@@ -171,5 +172,11 @@ class AutoPortBinder {
     int socket_fd_;
     int port_;
 };
+
+// HTTP utility: simple GET, returns body on 200, otherwise error code
+tl::expected<std::string, int> httpGet(const std::string& url);
+
+// Network utility: obtain an available TCP port on loopback by binding to 0
+int getFreeTcpPort();
 
 }  // namespace mooncake
