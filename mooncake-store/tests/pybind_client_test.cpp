@@ -35,7 +35,7 @@ class PyClientTest : public ::testing::Test {
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
-    void SetUp() override { py_client_ = std::make_unique<PyClient>(); }
+    void SetUp() override { py_client_ = PyClient::create(); }
 
     void TearDown() override {
         if (py_client_) {
@@ -43,7 +43,7 @@ class PyClientTest : public ::testing::Test {
         }
     }
 
-    std::unique_ptr<PyClient> py_client_;
+    std::shared_ptr<PyClient> py_client_;
 };
 
 // Test PyClient construction and setup
@@ -67,7 +67,7 @@ TEST_F(PyClientTest, ConstructorAndSetup) {
     EXPECT_EQ(hostname, "localhost:17813");
 
     // Same local hostname should fail
-    auto new_client = std::make_unique<PyClient>();
+    auto new_client = PyClient::create();
     int second_setup_result = new_client->setup(
         "localhost:17813",                   // local_hostname
         FLAGS_transfer_engine_metadata_url,  // metadata_server
