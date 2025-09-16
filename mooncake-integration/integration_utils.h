@@ -11,9 +11,7 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-// Avoid global py::module_ objects with static storage duration, which can
-// crash at interpreter finalization due to destructor order. Instead import
-// torch on demand while the GIL is held.
+// Avoid global py::module_ objects
 inline py::module_ torch_module() { return py::module_::import("torch"); }
 
 enum class TensorDtype : int32_t {
