@@ -44,6 +44,13 @@ mooncake_master \
   --metrics_port=9003 \
   --enable_metric_reporting=true
 ```
+## Master Startup config
+In addition to supporting flags, Master also support json configuration file and yaml configuration file
+
+```bash
+mooncake_master \
+  --config_path=/etc/conf/master.yaml 
+```
 
 ## Metrics Endpoints
 
