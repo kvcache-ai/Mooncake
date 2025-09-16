@@ -19,6 +19,18 @@ add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 add_store_test(master_metrics_test master_metrics_test.cpp)
+add_store_test(posix_file_test posix_file_test.cpp)
+add_store_test(thread_pool_test thread_pool_test.cpp)
+add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(segment_test segment_test.cpp)
+add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(utils_test utils_test.cpp)
+add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(pybind_client_test pybind_client_test.cpp)
+add_store_test(client_metrics_test client_metrics_test.cpp)
+add_store_test(serializer_test serializer_test.cpp)
+add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC mooncake_store cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
@@ -36,19 +48,3 @@ target_link_libraries(stress_workload_test PUBLIC
     gflags
     pthread
 )
-
-add_store_test(posix_file_test posix_file_test.cpp)
-add_store_test(thread_pool_test thread_pool_test.cpp)
-add_store_test(transfer_task_test transfer_task_test.cpp)
-add_store_test(segment_test segment_test.cpp)
-add_store_test(offset_allocator_test offset_allocator_test.cpp)
-add_store_test(utils_test utils_test.cpp)
-add_store_test(client_buffer_test client_buffer_test.cpp)
-add_store_test(pybind_client_test pybind_client_test.cpp)
-add_store_test(client_metrics_test client_metrics_test.cpp)
-add_store_test(serializer_test serializer_test.cpp)
-
-# New test: non-HA reconnect and remount
-add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
-
-add_subdirectory(e2e)
