@@ -6,7 +6,7 @@ namespace mooncake {
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-              int* packed_recv_count, int32_t* broken_ranks, void* mxa_buffer,
+              int* packed_recv_count, int32_t* active_ranks, void* mxa_buffer,
               int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
               void* cuda_counter_buffer, void* cuda_data_buffer, void* raddrs,
@@ -17,7 +17,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
-void combine(void* combined_x, int32_t* broken_ranks, void* mxa_buffer,
+void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
              void* cuda_counter_buffer, void* cuda_data_buffer, void* raddrs,

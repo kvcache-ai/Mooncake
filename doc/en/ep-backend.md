@@ -2,7 +2,7 @@
 
 ## Overview
 
-Mooncake EP is an adaption of [DeepEP](https://github.com/deepseek-ai/DeepEP) that supports **fault tolerance** and fast data transfer with **IBGDA**, designed as a critical component for large-scale, latency-sensitive MoE (Mixture of Experts) inference. Mooncake EP aims to retain full compatibility with the DeepEP API, with the addition of a `broken_ranks` tensor passed to both the `dispatch` and `combine` functions to capture information about any rank failures. By integrating with the EPLB module, Mooncake EP ensures fault tolerance during MoE inference, enabling robust performance even in large-scale, fault-prone environments.
+Mooncake EP is an adaption of [DeepEP](https://github.com/deepseek-ai/DeepEP) that supports **fault tolerance** and fast data transfer with **IBGDA**, designed as a critical component for large-scale, latency-sensitive MoE (Mixture of Experts) inference. Mooncake EP aims to retain full compatibility with the DeepEP API, with the addition of an `active_ranks` tensor passed to both the `dispatch` and `combine` functions to capture information about rank activeness. By integrating with the EPLB module, Mooncake EP ensures fault tolerance during MoE inference, enabling robust performance even in large-scale, fault-prone environments.
 
 Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gloo) that provides **fault-tolerant collective communication primitives** and can be seamlessly integrated into machine learning systems. Built with the [Transfer Engine](transfer-engine.md), Mooncake Backend ensures that collective communications can continue even in the event of rank failures. Furthermore, it reports these failures to the upper layers of the system, allowing for graceful error handling without disrupting ongoing operations.
 
@@ -42,7 +42,7 @@ The constructor. Ensure that only one instance is created.
 
 **Signature:** Similar to DeepEP's `low_latency_dispatch`/`low_latency_combine`, with two additional parameters:
 
-- **broken_ranks**: A tensor of shape `(num_ranks,)` containing values of 0 or 1. The indices of the broken ranks will be set to 1.
+- **active_ranks**: A tensor of shape `(num_ranks,)` containing values of 0 or 1. The indices of the broken ranks will be set to 0.
 - **timeout_us**: The timeout in microseconds for a rank to be considered broken. Set to -1 for infinite timeout.
 
 ### Mooncake Backend
@@ -54,16 +54,16 @@ import torch
 import torch.distributed as dist
 from mooncake import ep
 
-broken_ranks = torch.zeros((world_size,), dtype=torch.int32, device="cuda")
+active_ranks = torch.ones((world_size,), dtype=torch.int32, device="cuda")
 dist.init_process_group(
     backend="mooncake",
     rank=rank,
     world_size=world_size,
-    pg_options=ep.MooncakeBackendOptions(broken_ranks),
+    pg_options=ep.MooncakeBackendOptions(active_ranks),
 )
 
 dist.all_gather(...)           # Standard API usage
-assert not broken_ranks.any()  # Verify that no ranks are broken
+assert active_ranks.all()  # Verify that no ranks are broken
 ```
 
 For a full example, see `mooncake-wheel/tests/test_mooncake_backend.py`.
