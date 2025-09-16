@@ -146,7 +146,7 @@ class MooncakeStorePyWrapper {
                 py::tuple shape_tuple = py::cast(shape_vec);
                 np_array = np_array.attr("reshape")(shape_tuple);
             }
-            pybind11::object tensor = torch.attr("from_numpy")(np_array);
+            pybind11::object tensor = torch_module().attr("from_numpy")(np_array);
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
