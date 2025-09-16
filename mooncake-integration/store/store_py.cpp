@@ -146,7 +146,8 @@ class MooncakeStorePyWrapper {
                 py::tuple shape_tuple = py::cast(shape_vec);
                 np_array = np_array.attr("reshape")(shape_tuple);
             }
-            pybind11::object tensor = torch_module().attr("from_numpy")(np_array);
+            pybind11::object tensor =
+                torch_module().attr("from_numpy")(np_array);
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
@@ -289,6 +290,9 @@ PYBIND11_MODULE(store, m) {
                 const std::string &protocol = "tcp",
                 const std::string &rdma_devices = "",
                 const std::string &master_server_addr = "127.0.0.1:50051") {
+                 if (!self.store_) {
+                     self.store_ = PyClient::create();
+                 }
                  return self.store_->setup(local_hostname, metadata_server,
                                            global_segment_size,
                                            local_buffer_size, protocol,
