@@ -12,6 +12,8 @@
 #include "acl/acl.h"
 #endif
 
+#include <ylt/coro_http/coro_http_client.hpp>
+
 namespace mooncake {
 
 bool isPortAvailable(int port) {
@@ -133,6 +135,36 @@ std::vector<std::string> splitString(const std::string &str, char delimiter,
     }
 
     return result;
+}
+
+tl::expected<std::string, int> httpGet(const std::string &url) {
+    coro_http::coro_http_client client;
+    auto res = client.get(url);
+    if (res.status == 200) {
+        return std::string(res.resp_body);
+    }
+    return tl::unexpected(res.status);
+}
+
+int getFreeTcpPort() {
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        ::close(sock);
+        return -1;
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+        ::close(sock);
+        return -1;
+    }
+    int port = ntohs(addr.sin_port);
+    ::close(sock);
+    return port;
 }
 
 }  // namespace mooncake
