@@ -1,11 +1,12 @@
-file(GLOB XPORT_SOURCES "*.cpp" "coro_rpc_connector/*.cpp")
+file(GLOB XPORT_SOURCES "*.cpp")
 
 # Find Python - pybind11 is already configured at the root level
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 add_subdirectory(rdma_transport)
+add_subdirectory(coro_rpc_connector)
 
-add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>)
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:coro_rpc_connector>)
 target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread ${Python3_LIBRARIES})
 target_include_directories(transport PRIVATE ${Python3_INCLUDE_DIRS})
 
