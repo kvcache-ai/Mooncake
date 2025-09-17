@@ -50,6 +50,10 @@ struct RdmaTask {
     uint64_t padding2[8];
 };
 
+class RdmaEndPoint;
+
+enum class SliceCallbackType { SUCCESS, FAILED, TIMEOUT, RESET, NOP };
+
 struct RdmaSlice {
     void *source_addr = nullptr;
     uint64_t target_addr = 0;
@@ -63,14 +67,29 @@ struct RdmaSlice {
     int source_dev_id = -1;
     int target_dev_id = -1;
 
+    RdmaEndPoint *ep_weak_ptr = nullptr;
+    int qp_index = 0;
     int retry_count = 0;
-    volatile int *qp_inflight = nullptr;
-    volatile int *ep_inflight = nullptr;
     bool failed = false;
     uint64_t enqueue_ts = 0, submit_ts = 0;
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
+
+static inline void markSliceSuccess(RdmaSlice *slice) {
+    auto task = slice->task;
+    __sync_fetch_and_add(&task->transferred_bytes, slice->length);
+    auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
+    if (success_slices + 1 == task->num_slices) {
+        task->status_word = COMPLETED;
+    }
+}
+
+static inline void markSliceFailed(RdmaSlice *slice) {
+    auto task = slice->task;
+    __sync_fetch_and_add(&task->failed_slices, 1);
+    task->status_word = FAILED;
+}
 
 }  // namespace v1
 }  // namespace mooncake

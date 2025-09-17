@@ -230,7 +230,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = &task;
             slice->retry_count = 0;
-            slice->qp_inflight = nullptr;
+            slice->ep_weak_ptr = nullptr;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
             task.num_slices++;

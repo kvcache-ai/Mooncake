@@ -26,22 +26,6 @@
 
 namespace mooncake {
 namespace v1 {
-
-static inline void markSliceSuccess(RdmaSlice *slice) {
-    auto task = slice->task;
-    __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-    auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
-    if (success_slices + 1 == task->num_slices) {
-        task->status_word = COMPLETED;
-    }
-}
-
-static inline void markSliceFailed(RdmaSlice *slice) {
-    auto task = slice->task;
-    __sync_fetch_and_add(&task->failed_slices, 1);
-    task->status_word = FAILED;
-}
-
 Workers::Workers(RdmaTransport *transport)
     : transport_(transport), num_workers_(0), running_(false) {}
 
@@ -182,10 +166,11 @@ void Workers::asyncPostSend(int thread_id) {
         auto endpoint =
             getEndpoint(path.local_device_id, target_seg_name, target_dev_name);
         if (!endpoint) {
-            LOG(ERROR) << "[TE Worker] Unable to allocate endpoint: "
-                       << path.local_device_id << " -> "
-                       << path.remote_segment_id << ":"
-                       << path.remote_device_id;
+            static bool g_displayed = false;
+            if (!g_displayed) {
+                g_displayed = true;
+                LOG(ERROR) << "[TE Worker] Unable to allocate endpoint";
+            }
             for (auto slice : slices) markSliceFailed(slice);
             continue;
         }
@@ -217,7 +202,6 @@ void Workers::asyncPollCq(int thread_id) {
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
     int nr_poll_total = 0;
-    std::unordered_map<volatile int *, int> counter_map;
     for (int index = 0; index < num_contexts; index++) {
         auto &context = transport_->context_set_[index];
         auto cq = context->cq(thread_id % num_cq_list);
@@ -230,17 +214,10 @@ void Workers::asyncPollCq(int thread_id) {
         auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice *)wc[i].wr_id;
+            auto ep = slice->ep_weak_ptr;
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
-            if (counter_map.count(slice->qp_inflight))
-                counter_map[slice->qp_inflight]++;
-            else
-                counter_map[slice->qp_inflight] = 1;
-            if (counter_map.count(slice->ep_inflight))
-                counter_map[slice->ep_inflight]++;
-            else
-                counter_map[slice->ep_inflight] = 1;
             if (slice->retry_count == 0) {
                 worker_context_[thread_id].device_quota->release(
                     slice->source_dev_id, slice->length, inflight_lat);
@@ -260,13 +237,14 @@ void Workers::asyncPollCq(int thread_id) {
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(ERROR) << "[TE Worker] Slice retry count exceeded";
-                    markSliceFailed(slice);
+                    ep->acknowledge(slice, SliceCallbackType::FAILED);
                 } else {
+                    ep->acknowledge(slice, SliceCallbackType::NOP);
                     submit(slice);
                 }
                 resetEndpoint(slice);
             } else {
-                markSliceSuccess(slice);
+                ep->acknowledge(slice, SliceCallbackType::SUCCESS);
                 auto &worker = worker_context_[thread_id];
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
@@ -275,9 +253,6 @@ void Workers::asyncPollCq(int thread_id) {
         if (nr_poll > 0) {
             nr_poll_total += nr_poll;
         }
-    }
-    for (auto &entry : counter_map) {
-        __sync_fetch_and_sub(entry.first, entry.second);
     }
     if (nr_poll_total) {
         worker_context_[thread_id].inflight_slices.fetch_sub(nr_poll_total);

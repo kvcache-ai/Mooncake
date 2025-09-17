@@ -21,6 +21,7 @@
 
 #include "v1/common/status.h"
 #include "v1/transport/rdma/context.h"
+#include "v1/utility/system.h"
 #include "v1/utility/string_builder.h"
 
 namespace mooncake {
@@ -73,28 +74,24 @@ int RdmaEndPoint::construct(RdmaContext *context, EndPointParams *params,
             deconstruct();
             return ERR_ENDPOINT;
         }
+        slice_queue_.emplace_back(
+            new BoundedSliceQueue(params_->max_qp_wr + 16));
     }
     status_ = EP_HANDSHAKING;
     return 0;
 }
 
-void RdmaEndPoint::waitForAllInflightSlices() {
-    while (inflight_slices_ > 0) {
-        LOG(WARNING) << "Waiting for inflight slices to complete: "
-                     << inflight_slices_;
-        usleep(1000);
-    }
-}
-
 int RdmaEndPoint::deconstruct() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
-    waitForAllInflightSlices();
+    resetInflightSlices();
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (ibv_destroy_qp(qp_list_[i]))
             PLOG(ERROR) << "RdmaEndPoint Failure: ibv_destroy_qp";
+        delete slice_queue_[i];
     }
     qp_list_.clear();
+    slice_queue_.clear();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
     status_ = EP_UNINIT;
@@ -178,7 +175,7 @@ int RdmaEndPoint::reset() {
 int RdmaEndPoint::resetUnlocked() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
-    waitForAllInflightSlices();
+    resetInflightSlices();
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
@@ -265,16 +262,17 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
             sge.length = current->length;
             sge.lkey = current->source_lkey;
         }
-        current->qp_inflight = &wr_depth_list_[qp_index].value;
-        current->ep_inflight = &inflight_slices_;
+        current->ep_weak_ptr = this;
+        current->qp_index = qp_index;
         current->failed = false;
         wr.wr_id = (uint64_t)current;
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
         wr.sg_list = &sge_list[sge_idx];
-        wr.send_flags = IBV_SEND_SIGNALED;  // TODO remove it for performance
+        wr.send_flags = IBV_SEND_SIGNALED;
+        // wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
-        wr.imm_data = 0;  // TODO notification signal for remote
+        wr.imm_data = 0;
         wr.wr.rdma.remote_addr = current->target_addr;
         wr.wr.rdma.rkey = current->target_rkey;
         sge_idx += wr.num_sge;
@@ -290,11 +288,16 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
         }
     }
 
+    auto &queue = slice_queue_[qp_index];
+    for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
+        auto current = slice_list[wr_idx];
+        if (!current->failed) queue->push(current);
+    }
     return wr_count;
 }
 
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
-    RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
+    RWSpinlock::ReadGuard guard(lock_);
     if (status_ != EP_READY) return 0;
     if (qp_index < 0 || qp_index >= (int)qp_list_.size()) return 0;
     ibv_recv_wr wr, *bad_wr;
@@ -308,6 +311,49 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
         return ERR_ENDPOINT;
     }
     return 1;
+}
+
+void RdmaEndPoint::resetInflightSlices() {
+    for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
+        auto &queue = slice_queue_[qp_index];
+        while (!queue->empty()) {
+            auto current = queue->pop();
+            markSliceFailed(current);
+        }
+    }
+}
+
+void RdmaEndPoint::acknowledge(RdmaSlice *slice, SliceCallbackType status) {
+    auto qp_index = slice->qp_index;
+    auto &queue = slice_queue_[qp_index];
+    if (!queue->contains(slice)) return;
+    int num_entries = 0;
+    RdmaSlice *current = nullptr;
+    do {
+        current = queue->pop();
+        num_entries++;
+        if (status == SliceCallbackType::SUCCESS)
+            markSliceSuccess(current);
+        else if (status == SliceCallbackType::FAILED)
+            markSliceFailed(current);
+    } while (current != slice);
+    __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
+    __sync_fetch_and_sub(&inflight_slices_, num_entries);
+}
+
+void RdmaEndPoint::evictTimeoutSlices() {
+    auto current_ts = getCurrentTimeInNano();
+    const static uint64_t kTimeoutInNano = 15000000000ull;
+    for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
+        auto &queue = slice_queue_[qp_index];
+        while (!queue->empty()) {
+            auto current = queue->peek();
+            if (current_ts - current->enqueue_ts > kTimeoutInNano) {
+                markSliceFailed(current);
+                queue->pop();
+            }
+        }
+    }
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() {

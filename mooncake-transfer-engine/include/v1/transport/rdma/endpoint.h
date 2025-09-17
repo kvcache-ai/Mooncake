@@ -29,6 +29,45 @@ class RdmaEndPoint {
         uint64_t padding[7];
     };
 
+    struct BoundedSliceQueue {
+        size_t head, tail, capacity;
+        RdmaSlice **entries;
+        std::unordered_set<RdmaSlice *> slice_set;
+
+        BoundedSliceQueue(size_t capacity)
+            : head(0), tail(0), capacity(capacity) {
+            entries = new RdmaSlice *[capacity];
+        }
+
+        ~BoundedSliceQueue() { delete[] entries; }
+
+        bool empty() const { return head == tail; }
+
+        bool full() const { return (tail + 1) % capacity == head; }
+
+        void push(RdmaSlice *slice) {
+            if (full()) throw std::runtime_error("Queue overflow");
+            entries[tail] = slice;
+            tail = (tail + 1) % capacity;
+            slice_set.insert(slice);
+        }
+
+        RdmaSlice *peek() {
+            if (empty()) return nullptr;
+            return entries[head];
+        }
+
+        RdmaSlice *pop() {
+            if (empty()) return nullptr;
+            RdmaSlice *cur = entries[head];
+            head = (head + 1) % capacity;
+            slice_set.erase(cur);
+            return cur;
+        }
+
+        bool contains(RdmaSlice *slice) { return slice_set.count(slice); }
+    };
+
    public:
     RdmaEndPoint();
 
@@ -79,6 +118,10 @@ class RdmaEndPoint {
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
+    void acknowledge(RdmaSlice *slice, SliceCallbackType status);
+
+    void evictTimeoutSlices();
+
     volatile int *getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
     }
@@ -95,7 +138,8 @@ class RdmaEndPoint {
 
     void cancelQuota(int qp_index, int num_entries);
 
-    void waitForAllInflightSlices();
+   private:
+    void resetInflightSlices();
 
    private:
     std::atomic<EndPointStatus> status_;
@@ -104,6 +148,7 @@ class RdmaEndPoint {
     std::string endpoint_name_;
 
     std::vector<ibv_qp *> qp_list_;
+    std::vector<BoundedSliceQueue *> slice_queue_;
     WrDepthBlock *wr_depth_list_;
     volatile int inflight_slices_;
     uint32_t padding_[7];
