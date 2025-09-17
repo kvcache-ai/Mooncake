@@ -96,7 +96,11 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     @param total_size The total size of the memory to allocate.
     @return A pointer to the allocated memory.
 */
-void* allocate_buffer_allocator_memory(size_t total_size);
+void* allocate_buffer_allocator_memory(
+    size_t total_size, const std::string& protocol = "",
+    size_t alignment = facebook::cachelib::Slab::kSize);
+
+void free_memory(const std::string& protocol, void* ptr);
 
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;

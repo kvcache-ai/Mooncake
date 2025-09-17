@@ -8,6 +8,9 @@
 #include <boost/algorithm/string.hpp>
 
 #include <random>
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
+#endif
 
 namespace mooncake {
 
@@ -63,15 +66,38 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-void *allocate_buffer_allocator_memory(size_t total_size) {
-    const size_t alignment = facebook::cachelib::Slab::kSize;
+void *allocate_buffer_allocator_memory(size_t total_size,
+                                       const std::string &protocol,
+                                       size_t alignment) {
+    const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
-    if (total_size < alignment) {
+    if (alignment == default_alignment && total_size < alignment) {
         LOG(ERROR) << "Total size must be at least " << alignment;
         return nullptr;
     }
+#ifdef USE_ASCEND_DIRECT
+    if (protocol == "ascend" && total_size > 0) {
+        void *buffer = nullptr;
+        auto ret = aclrtMallocHost(&buffer, total_size);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to allocate memory: " << ret;
+            return nullptr;
+        }
+        return buffer;
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
+}
+
+void free_memory(const std::string &protocol, void *ptr) {
+#ifdef USE_ASCEND_DIRECT
+    if (protocol == "ascend") {
+        aclrtFreeHost(ptr);
+        return;
+    }
+#endif
+    free(ptr);
 }
 
 std::string formatDeviceNames(const std::string &device_names) {

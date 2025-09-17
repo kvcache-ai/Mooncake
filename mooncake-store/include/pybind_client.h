@@ -315,7 +315,17 @@ class PyClient {
         }
     };
 
+    struct AscendSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("ascend", ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

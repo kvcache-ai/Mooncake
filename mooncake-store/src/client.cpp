@@ -286,6 +286,24 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ascend") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "Ascend protocol does not use device names, ignoring";
+            }
+            try {
+                transport =
+                    transfer_engine_.installTransport("ascend", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install Ascend transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
