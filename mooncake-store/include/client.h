@@ -320,7 +320,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
     // Client identification
     UUID client_id_;

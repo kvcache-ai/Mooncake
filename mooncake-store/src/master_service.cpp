@@ -43,12 +43,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
 
-    if (enable_ha_) {
-        client_monitor_running_ = true;
-        client_monitor_thread_ =
-            std::thread(&MasterService::ClientMonitorFunc, this);
-        VLOG(1) << "action=start_client_monitor_thread";
-    }
+    // Start client monitor thread in all modes so TTL/heartbeat works
+    client_monitor_running_ = true;
+    client_monitor_thread_ =
+        std::thread(&MasterService::ClientMonitorFunc, this);
+    VLOG(1) << "action=start_client_monitor_thread";
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
@@ -71,18 +70,18 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
-    if (enable_ha_) {
-        // Tell the client monitor thread to start timing for this client. To
-        // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex and before the mounting operation
-        // completes:
-        // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this mounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting
-        // this segment, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
+    // Tell the client monitor thread to start timing for this client. To
+    // avoid the following undesired situations, this message must be sent
+    // after locking the segment mutex and before the mounting operation
+    // completes:
+    // 1. Sending the message before the lock: the client expires and
+    // unmouting invokes before this mounting are completed, which prevents
+    // this segment being able to be unmounted forever;
+    // 2. Sending the message after mounting the segment: After mounting
+    // this segment, when trying to push id to the queue, the queue is
+    // already full. However, at this point, the message must be sent,
+    // otherwise this client cannot be monitored and expired.
+    {
         PodUUID pod_client_id;
         pod_client_id.first = client_id.first;
         pod_client_id.second = client_id.second;
@@ -106,11 +105,6 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    if (!enable_ha_) {
-        LOG(ERROR) << "ReMountSegment is only available in HA mode";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
@@ -636,11 +630,6 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    if (!enable_ha_) {
-        LOG(ERROR) << "Ping is only available in HA mode";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
     auto it = ok_client_.find(client_id);
