@@ -11,12 +11,12 @@ namespace mooncake {
 class MooncakeBackend final : public ::c10d::Backend {
    public:
     struct MooncakeBackendOptions final : ::c10d::Backend::Options {
-        explicit MooncakeBackendOptions(at::Tensor brokenRanks)
-            : Options{"mooncake"}, brokenRanks_{brokenRanks} {}
+        explicit MooncakeBackendOptions(at::Tensor activeRanks)
+            : Options{"mooncake"}, activeRanks_{activeRanks} {}
 
         ~MooncakeBackendOptions() override = default;
 
-        at::Tensor brokenRanks_;
+        at::Tensor activeRanks_;
     };
 
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,

@@ -95,15 +95,15 @@ void MooncakeWorker::startWorker() {
                         for (int j = 0; j < group->size; ++j) {
                             group->engine->getTransferStatus(task.batchID, j,
                                                              status);
-                            if (status.s != TransferStatusEnum::COMPLETED &&
-                                !group->brokenRanks[j]) {
+                            if (group->activeRanks[j] &&
+                                status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
                                         << " as broken during transferring op "
                                         << (int)task.opType;
-                                    group->brokenRanks[j] = true;
+                                    group->activeRanks[j] = false;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -120,7 +120,7 @@ void MooncakeWorker::startWorker() {
                             .addr;
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
-                        if (group->brokenRanks[j]) {
+                        if (!group->activeRanks[j]) {
                             continue;
                         }
                         *source_ptr = 1;
@@ -153,7 +153,7 @@ void MooncakeWorker::startWorker() {
                         std::chrono::duration_cast<std::chrono::seconds>(
                             now - activeTime[i]);
                     for (int j = 0; j < group->size; ++j) {
-                        if (signal_ptr[j] != 1 && !group->brokenRanks[j]) {
+                        if (group->activeRanks[j] && signal_ptr[j] != 1) {
                             TransferMetadata::NotifyDesc msg{"ping", "ping"};
                             if (diff.count() > 1 &&
                                 group->engine->sendNotifyByName(
@@ -162,7 +162,7 @@ void MooncakeWorker::startWorker() {
                                            << " marking peer " << j
                                            << " as broken during syncing op "
                                            << (int)task.opType;
-                                group->brokenRanks[j] = true;
+                                group->activeRanks[j] = false;
                             } else {
                                 all_received = false;
                                 break;

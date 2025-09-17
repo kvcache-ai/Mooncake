@@ -15,9 +15,9 @@ struct TransferGroupMeta {
     int rank;
     int size;
     int taskCount;
-    bool* brokenRanks;
-    bool* brokenRanksDevice;
-    at::Tensor brokenRanksTensor;
+    bool* activeRanks;
+    bool* activeRanksDevice;
+    at::Tensor activeRanksTensor;
     TransferEngine* engine;
     int bufferBaseIndex;
     std::vector<TransferMetadata::SegmentID> segmentIDs;
@@ -38,7 +38,7 @@ static constexpr size_t kBufferSize = 1u << 29;
 static constexpr size_t kMaxNumRanks = 64;
 
 void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        c10d::ReduceOp op, bool* brokenRanks,
+                        c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,

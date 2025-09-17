@@ -111,26 +111,26 @@ MooncakeBackend::MooncakeBackend(
     meta_.rank = rank;
     meta_.size = size;
     meta_.taskCount = 0;
-    cudaHostAlloc(&meta_.brokenRanks, kMaxNumRanks * sizeof(bool),
+    cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
                   cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&meta_.brokenRanksDevice, meta_.brokenRanks, 0);
+    cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks, 0);
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        meta_.brokenRanks[i] = false;
+        meta_.activeRanks[i] = true;
     }
     if (options) {
-        TORCH_CHECK(options->brokenRanks_.dtype() == at::kInt,
-                    "brokenRanks must be int.");
+        TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
+                    "activeRanks must be int.");
         if (isCpu) {
-            TORCH_CHECK(options->brokenRanks_.device().is_cpu(),
-                        "brokenRanks must be on CPU.");
+            TORCH_CHECK(options->activeRanks_.device().is_cpu(),
+                        "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options->brokenRanks_.device().is_cuda(),
-                        "brokenRanks must be on CUDA.");
+            TORCH_CHECK(options->activeRanks_.device().is_cuda(),
+                        "activeRanks must be on CUDA.");
         }
-        meta_.brokenRanksTensor = options->brokenRanks_;
+        meta_.activeRanksTensor = options->activeRanks_;
     } else {
-        meta_.brokenRanksTensor =
-            at::zeros({size}, torch::dtype(torch::kInt32)
+        meta_.activeRanksTensor =
+            at::ones({size}, torch::dtype(torch::kInt32)
                                   .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
@@ -261,7 +261,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             [&](void* src) {
                 cudaMemsetAsync(tensor.data_ptr(), 0, tensorSize, stream);
                 launchReduceKernel(tensor, src, size_, opts.reduceOp,
-                                   meta_.brokenRanksDevice, stream);
+                                   meta_.activeRanksDevice, stream);
             });
     }
 }
@@ -359,7 +359,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             [&](void* src) {
                 cudaMemsetAsync(outputBuffer.data_ptr(), 0, tensorSize, stream);
                 launchReduceKernel(outputBuffer, src, size_, opts.reduceOp,
-                                   meta_.brokenRanksDevice, stream);
+                                   meta_.activeRanksDevice, stream);
             });
     }
 }
