@@ -18,7 +18,7 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-DEFINE_string(conf_path, "", "master service config file path");
+DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
 DEFINE_int32(
@@ -324,7 +324,7 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
-    std::string conf_path = FLAGS_conf_path;
+    std::string conf_path = FLAGS_config_path;
     if (!conf_path.empty()) {
         mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
