@@ -20,10 +20,46 @@
 
 using namespace mooncake::v1;
 
+void processKVCacheSimulation(BenchRunner &runner) {
+    XferBenchStats stats;
+    std::mutex mutex;
+    uint64_t nope_block_size = 128 * 1024;
+    uint64_t rope_block_size = 16 * 1024;
+    uint64_t blocks_per_layer = 32;
+    // uint64_t layers = 64;
+    uint32_t region_size =
+        (nope_block_size + rope_block_size) * blocks_per_layer;
+
+    runner.runInitiatorTasks([&](int thread_id) -> int {
+        runner.pinThread(thread_id);
+        uint64_t local_addr =
+            runner.getLocalBufferBase(thread_id, region_size, 1);
+        uint64_t target_addr =
+            runner.getTargetBufferBase(thread_id, region_size, 1);
+
+        XferBenchTimer timer;
+        std::vector<double> transfer_duration;
+        while (timer.lap_us(false) < XferBenchConfig::duration * 1000000ull) {
+            auto val = runner.runKVCacheTransfer(
+                local_addr, target_addr, nope_block_size, rope_block_size,
+                blocks_per_layer);
+            transfer_duration.push_back(val);
+        }
+        auto total_duration = timer.lap_us();
+        mutex.lock();
+        stats.total_duration.add(total_duration);
+        for (auto val : transfer_duration) stats.transfer_duration.add(val);
+        mutex.unlock();
+        return 0;
+    });
+
+    printStats(nope_block_size + rope_block_size, blocks_per_layer, stats);
+}
+
 void processBatchSizes(BenchRunner &runner, size_t block_size,
                        size_t batch_size) {
     bool mixed_opcode = false;
-    OpCode opcode;
+    OpCode opcode = READ;
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
         mixed_opcode = true;
     else if (XferBenchConfig::op_type == "read")
@@ -58,13 +94,11 @@ void processBatchSizes(BenchRunner &runner, size_t block_size,
                 if (XferBenchConfig::check_consistency)
                     pattern =
                         fillData((void *)local_addr, block_size * batch_size);
-                auto val = runner.runSingleTransfer(local_addr, target_addr,
-                                                    block_size, batch_size,
-                                                    WRITE);
+                auto val = runner.runSingleTransfer(
+                    local_addr, target_addr, block_size, batch_size, WRITE);
                 transfer_duration.push_back(val);
                 val = runner.runSingleTransfer(local_addr, target_addr,
-                                               block_size, batch_size,
-                                               READ);
+                                               block_size, batch_size, READ);
                 if (XferBenchConfig::check_consistency)
                     verifyData((void *)local_addr, block_size * batch_size,
                                pattern);
@@ -108,20 +142,25 @@ int main(int argc, char *argv[]) {
     }
     runner->startInitiator();
     printStatsHeader();
-    for (size_t block_size = XferBenchConfig::start_block_size;
-         block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
-        for (size_t batch_size = XferBenchConfig::start_batch_size;
-             batch_size <= XferBenchConfig::max_batch_size; batch_size *= 2) {
-            if (block_size * batch_size * XferBenchConfig::num_threads >
-                XferBenchConfig::total_buffer_size) {
-                LOG(INFO) << "Skipped for block_size " << block_size
-                          << " batch_size " << batch_size;
-            } else {
-                processBatchSizes(*runner, block_size, batch_size);
+    if (XferBenchConfig::op_type == "kvcache") {
+        setenv("MC_DONT_MERGE", "1", true);
+        processKVCacheSimulation(*runner);
+    } else {
+        for (size_t block_size = XferBenchConfig::start_block_size;
+             block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
+            for (size_t batch_size = XferBenchConfig::start_batch_size;
+                 batch_size <= XferBenchConfig::max_batch_size;
+                 batch_size *= 2) {
+                if (block_size * batch_size * XferBenchConfig::num_threads >
+                    XferBenchConfig::total_buffer_size) {
+                    LOG(INFO) << "Skipped for block_size " << block_size
+                              << " batch_size " << batch_size;
+                } else {
+                    processBatchSizes(*runner, block_size, batch_size);
+                }
             }
         }
     }
-
     runner->stopInitiator();
     return 0;
 }

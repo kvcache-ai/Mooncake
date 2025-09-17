@@ -69,6 +69,10 @@ class TEv1BenchRunner : public BenchRunner {
                              uint64_t block_size, uint64_t batch_size,
                              OpCode opcode);
 
+    double runKVCacheTransfer(uint64_t local_addr, uint64_t target_addr,
+                              uint64_t nope_block_size,
+                              uint64_t rope_block_size, uint64_t num_blocks);
+
    private:
     int allocateBuffers();
 

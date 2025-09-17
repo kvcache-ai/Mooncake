@@ -234,7 +234,7 @@ static ibv_wr_opcode getOpCode(RdmaSlice *slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
                                int qp_index) {
-    RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
+    // RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     const static int kSgeEntries = 1;
     if (status_ != EP_READY) return 0;
     if (qp_index < 0) qp_index = 0;

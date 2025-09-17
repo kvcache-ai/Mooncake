@@ -520,6 +520,16 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
     MergeResult result;
     if (requests.empty()) return result;
 
+    if (getenv("MC_DONT_MERGE")) {
+        size_t idx = 0;
+        for (auto &req : requests) {
+            result.request_list.push_back(req);
+            result.task_lookup[idx] = idx;
+            idx++;
+        }
+        return result;
+    }
+
     struct Item {
         Request req;
         size_t orig_idx;

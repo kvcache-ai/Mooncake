@@ -261,5 +261,55 @@ double TEv0BenchRunner::runSingleTransfer(uint64_t local_addr,
     return duration;
 }
 
+double TEv0BenchRunner::runKVCacheTransfer(uint64_t local_addr,
+                                           uint64_t target_addr,
+                                           uint64_t nope_block_size,
+                                           uint64_t rope_block_size,
+                                           uint64_t num_blocks) {
+    auto batch_id = engine_->allocateBatchID(num_blocks * 2);
+    std::vector<TransferRequest> requests;
+    for (uint64_t i = 0; i < num_blocks; ++i) {
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = nope_block_size;
+        entry.source = (void *)local_addr;
+        entry.target_id = handle_;
+        entry.target_offset = target_addr;
+        local_addr += nope_block_size;
+        target_addr += nope_block_size;
+        requests.emplace_back(entry);
+    }
+    for (uint64_t i = 0; i < num_blocks; ++i) {
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = rope_block_size;
+        entry.source = (void *)local_addr;
+        entry.target_id = handle_;
+        entry.target_offset = target_addr;
+        local_addr += rope_block_size;
+        target_addr += rope_block_size;
+        requests.emplace_back(entry);
+    }
+    XferBenchTimer timer;
+    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    while (true) {
+        uint64_t success_count = 0;
+        for (uint64_t i = 0; i < num_blocks * 2; ++i) {
+            mooncake::TransferStatus overall_status;
+            CHECK_FAIL(engine_->getTransferStatus(batch_id, i, overall_status));
+            if (overall_status.s == TransferStatusEnum::COMPLETED) {
+                success_count++;
+            } else if (overall_status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "Failed transfer detected";
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (success_count == num_blocks * 2) break;
+    }
+    auto duration = timer.lap_us();
+    CHECK_FAIL(engine_->freeBatchID(batch_id));
+    return duration;
+}
+
 }  // namespace v1
 }  // namespace mooncake
