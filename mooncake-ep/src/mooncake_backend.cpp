@@ -131,7 +131,7 @@ MooncakeBackend::MooncakeBackend(
     } else {
         meta_.activeRanksTensor =
             at::ones({size}, torch::dtype(torch::kInt32)
-                                  .device(isCpu ? torch::kCPU : torch::kCUDA));
+                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
