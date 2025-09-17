@@ -397,10 +397,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
-                    num_recv_tokens = -1;
                     active_ranks[src_rank] = 0;
                 }
                 if (!active_ranks[src_rank]) {
+                    num_recv_tokens = -1;
                     break;
                 }
             }
