@@ -45,6 +45,15 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+**Tips:**
+
+In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:
+
+```bash
+mooncake_master \
+  --config_path=mooncake-store/conf/master.yaml 
+```
+
 ## Metrics Endpoints
 
 The master exposes Prometheus-style metrics over HTTP on `--metrics_port`:
