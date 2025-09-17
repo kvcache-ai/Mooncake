@@ -26,6 +26,7 @@
 
 #include "context.h"
 #include "v1/utility/system.h"
+#include "v1/concurrency/concurrentqueue.h"
 
 namespace mooncake {
 namespace v1 {
@@ -33,56 +34,8 @@ namespace v1 {
 class RdmaTransport;
 class Workers {
    public:
-    struct BoundedSliceQueue {
-        const static size_t kCapacity = 1024 * 64;
-        std::atomic<uint64_t> head;
-        uint64_t padding1[7];
-        std::atomic<uint64_t> tail;
-        uint64_t padding2[7];
-        std::mutex mutex;
-        RdmaSliceList *entries;
-
-        BoundedSliceQueue() { entries = new RdmaSliceList[kCapacity]; }
-
-        ~BoundedSliceQueue() { delete[] entries; }
-
-        void push(RdmaSliceList &slice_list) {
-            if (slice_list.num_slices == 0) return;
-            std::lock_guard<std::mutex> lock(mutex);
-            while (true) {
-                uint64_t current_tail = tail.load(std::memory_order_relaxed);
-                uint64_t next_tail = (current_tail + 1) % kCapacity;
-                if (next_tail != head.load(std::memory_order_relaxed)) {
-                    entries[current_tail] = slice_list;
-                    tail.store(next_tail, std::memory_order_release);
-                    return;
-                }
-            }
-        }
-
-        RdmaSliceList pop() {
-            uint64_t current_head = head.load(std::memory_order_relaxed);
-            if (current_head != tail.load(std::memory_order_acquire)) {
-                RdmaSliceList result = entries[current_head];
-                head.store((current_head + 1) % kCapacity,
-                           std::memory_order_release);
-                return result;
-            } else {
-                RdmaSliceList empty_result;
-                return empty_result;
-            }
-        }
-
-        void pop(std::vector<RdmaSliceList> &result) {
-            uint64_t current_head = head.load(std::memory_order_relaxed);
-            while (current_head != tail.load(std::memory_order_acquire)) {
-                result.push_back(entries[current_head]);
-                current_head = (current_head + 1) % kCapacity;
-            }
-            if (!result.empty())
-                head.store(current_head, std::memory_order_release);
-        }
-    };
+    static constexpr size_t kCapacity = 1024 * 8;
+    using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
 
    public:
     Workers(RdmaTransport *transport);

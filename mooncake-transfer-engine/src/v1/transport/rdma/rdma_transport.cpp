@@ -205,6 +205,11 @@ Status RdmaTransport::submitTransferTasks(
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
 
+    static std::atomic<int> g_caller_threads(0);
+    thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
+    bool enable_spray =
+        g_caller_threads.load(std::memory_order_relaxed) <= num_workers;
+    int submit_slices = 0;
     for (auto &request : request_list) {
         auto opcode = request.opcode;
         // N.B. max_slice_count should be carefully tuned
@@ -235,11 +240,13 @@ Status RdmaTransport::submitTransferTasks(
             slice->enqueue_ts = enqueue_ts;
             task.num_slices++;
             offset += length;
-
-            int part_id = (slice_idx / num_devices) % num_workers;
+            int part_id =
+                ((enable_spray ? submit_slices : slice_idx) / num_devices) %
+                num_workers;
             auto &list = slice_lists[part_id];
             auto &tail = slice_tails[part_id];
             list.num_slices++;
+            submit_slices++;
             if (list.first) {
                 tail->next = slice;
                 tail = slice;
@@ -252,7 +259,7 @@ Status RdmaTransport::submitTransferTasks(
     for (int i = 0; i < num_workers; ++i) {
         if (slice_lists[i].first) {
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            workers_->submit(slice_lists[i], i);
+            workers_->submit(slice_lists[i], (tl_caller_id + i) % num_workers);
         }
     }
     return Status::OK();

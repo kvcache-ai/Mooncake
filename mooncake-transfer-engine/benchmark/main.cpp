@@ -143,7 +143,7 @@ int main(int argc, char *argv[]) {
     runner->startInitiator();
     printStatsHeader();
     if (XferBenchConfig::op_type == "kvcache") {
-        setenv("MC_DONT_MERGE", "1", true);
+        setenv("MC_DONT_MERGE", "1", false);
         processKVCacheSimulation(*runner);
     } else {
         for (size_t block_size = XferBenchConfig::start_block_size;

@@ -520,7 +520,8 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
     MergeResult result;
     if (requests.empty()) return result;
 
-    if (getenv("MC_DONT_MERGE")) {
+    // N.B. Hack option
+    if (getenv("MC_DONT_MERGE") && strcmp(getenv("MC_DONT_MERGE"), "1") == 0) {
         size_t idx = 0;
         for (auto &req : requests) {
             result.request_list.push_back(req);
