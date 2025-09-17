@@ -258,6 +258,12 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
         config.enable_dest_device_affinity = true;
     }
+
+    const char *disable_parallel_reg_mr = std::getenv("MC_DISABLE_PARALLEL_REG_MR");
+    if (disable_parallel_reg_mr) {
+        LOG(INFO) << "Disable parallel register memory region";
+        config.parallel_reg_mr = false;
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -306,6 +312,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "parallel_reg_mr = " << (config.parallel_reg_mr ? "true" : "false");
 }
 
 GlobalConfig &globalConfig() {

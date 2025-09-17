@@ -48,6 +48,7 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    bool parallel_reg_mr = true;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
