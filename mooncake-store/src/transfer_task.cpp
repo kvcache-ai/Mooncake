@@ -488,10 +488,14 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
         if (slice.ptr == nullptr) continue;
 
-        Transport::SegmentHandle seg =
-            engine_.openSegment(handle.segment_name_);
+        // Prefer transport endpoint (P2P). Fallback to logical segment name.
+        Transport::SegmentHandle seg = Transport::INVALID_BATCH_ID;
+        if (!handle.transport_endpoint_.empty()) {
+            seg = engine_.openSegment(handle.transport_endpoint_);
+        }
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
             return std::nullopt;
         }
 
@@ -575,10 +579,22 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
-    return std::all_of(handles.begin(), handles.end(),
-                       [this](const auto& handle) {
-                           return handle.segment_name_ == local_hostname_;
-                       });
+    // Prefer endpoint-based detection if available
+    std::string local_ep;
+    try {
+        local_ep = engine_.getLocalIpAndPort();
+    } catch (...) {
+        local_ep.clear();
+    }
+
+    if (!local_ep.empty()) {
+        return std::all_of(handles.begin(), handles.end(), [&local_ep](const auto& h) {
+            return !h.transport_endpoint_.empty() && h.transport_endpoint_ == local_ep;
+        });
+    }
+
+    // Without a local endpoint we cannot prove locality; disable memcpy.
+    return false;
 }
 
 bool TransferSubmitter::validateTransferParams(
