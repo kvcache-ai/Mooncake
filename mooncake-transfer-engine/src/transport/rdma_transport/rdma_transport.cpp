@@ -92,42 +92,38 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
-    // Memory region registration - parallel or sequential based on configuration
     if (globalConfig().parallel_reg_mr) {
-        // Parallel memory region registration using std::async
         std::vector<std::future<int>> registration_futures;
         registration_futures.reserve(context_list_.size());
 
-        // Launch parallel registration tasks
         for (auto &context : context_list_) {
-            registration_futures.emplace_back(
-                std::async(std::launch::async, [&context, addr, length]() -> int {
+            registration_futures.emplace_back(std::async(
+                std::launch::async, [&context, addr, length]() -> int {
                     return context->registerMemoryRegion(addr, length,
                                                          access_rights);
                 }));
         }
 
-        // Collect results and check for errors
         for (size_t i = 0; i < registration_futures.size(); ++i) {
             int ret = registration_futures[i].get();
             if (ret) {
-                LOG(ERROR) << "Failed to register memory region with context " << i;
+                LOG(ERROR) << "Failed to register memory region with context "
+                           << i;
                 return ret;
             }
         }
     } else {
-        // Sequential memory region registration
         for (size_t i = 0; i < context_list_.size(); ++i) {
             int ret = context_list_[i]->registerMemoryRegion(addr, length,
                                                              access_rights);
             if (ret) {
-                LOG(ERROR) << "Failed to register memory region with context " << i;
+                LOG(ERROR) << "Failed to register memory region with context "
+                           << i;
                 return ret;
             }
         }
     }
 
-    // Collect lkey and rkey after all registrations are complete
     for (auto &context : context_list_) {
         buffer_desc.lkey.push_back(context->lkey(addr));
         buffer_desc.rkey.push_back(context->rkey(addr));
@@ -144,7 +140,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         buffer_desc.name = name;
     }
 
-    // Set common buffer descriptor fields and add to metadata
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
     int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -157,13 +152,10 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
-    // Memory region unregistration - parallel or sequential based on configuration
     if (globalConfig().parallel_reg_mr) {
-        // Parallel memory region unregistration using std::async
         std::vector<std::future<int>> unregistration_futures;
         unregistration_futures.reserve(context_list_.size());
 
-        // Launch parallel unregistration tasks
         for (auto &context : context_list_) {
             unregistration_futures.emplace_back(
                 std::async(std::launch::async, [&context, addr]() -> int {
@@ -171,20 +163,20 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
                 }));
         }
 
-        // Collect results and check for errors
         for (size_t i = 0; i < unregistration_futures.size(); ++i) {
             int ret = unregistration_futures[i].get();
             if (ret) {
-                LOG(ERROR) << "Failed to unregister memory region with context " << i;
+                LOG(ERROR) << "Failed to unregister memory region with context "
+                           << i;
                 return ret;
             }
         }
     } else {
-        // Sequential memory region unregistration
         for (size_t i = 0; i < context_list_.size(); ++i) {
             int ret = context_list_[i]->unregisterMemoryRegion(addr);
             if (ret) {
-                LOG(ERROR) << "Failed to unregister memory region with context " << i;
+                LOG(ERROR) << "Failed to unregister memory region with context "
+                           << i;
                 return ret;
             }
         }
