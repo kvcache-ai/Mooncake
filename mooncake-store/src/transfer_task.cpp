@@ -293,7 +293,7 @@ void TransferEngineOperationState::wait_for_completion() {
     }
 
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-    constexpr int64_t timeout_seconds = 1;
+    constexpr int64_t timeout_seconds = 60;
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
     const int64_t start_ts = getCurrentTimeInNano();
@@ -353,11 +353,9 @@ TransferStrategy TransferFuture::strategy() const {
 // ============================================================================
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     const std::string& local_hostname,
                                      std::shared_ptr<StorageBackend>& backend,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
-      local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
@@ -488,11 +486,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
         if (slice.ptr == nullptr) continue;
 
-        // Prefer transport endpoint (P2P). Fallback to logical segment name.
-        Transport::SegmentHandle seg = Transport::INVALID_BATCH_ID;
-        if (!handle.transport_endpoint_.empty()) {
-            seg = engine_.openSegment(handle.transport_endpoint_);
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                       << handle.buffer_address_;
+            return std::nullopt;
         }
+
+        Transport::SegmentHandle seg =
+            engine_.openSegment(handle.transport_endpoint_);
+
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
                        << handle.transport_endpoint_ << "'";
@@ -579,13 +581,7 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
-    // Prefer endpoint-based detection if available
-    std::string local_ep;
-    try {
-        local_ep = engine_.getLocalIpAndPort();
-    } catch (...) {
-        local_ep.clear();
-    }
+    std::string local_ep = engine_.getLocalIpAndPort();
 
     if (!local_ep.empty()) {
         return std::all_of(handles.begin(), handles.end(),

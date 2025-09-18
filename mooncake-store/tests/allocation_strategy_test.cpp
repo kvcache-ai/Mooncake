@@ -35,6 +35,7 @@ class AllocationStrategyParameterizedTest
     }
 
     // Helper function to create a BufferAllocator for testing
+    // Using segment_name as transport_endpoint for simplicity
     std::shared_ptr<BufferAllocatorBase> CreateTestAllocator(
         const std::string& segment_name, size_t base_offset,
         size_t size = 64 * MB) {

@@ -351,7 +351,6 @@ class FilereadWorkerPool {
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
-                               const std::string& local_hostname,
                                std::shared_ptr<StorageBackend>& backend,
                                TransferMetric* transfer_metric = nullptr);
 
