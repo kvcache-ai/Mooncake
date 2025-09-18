@@ -91,7 +91,7 @@ class RdmaContext {
     int disconnectAllEndpoints();
 
     // Get the total number of QPs across all endpoints in this context
-    size_t getTotalQPNumber() const;
+    size_t getTotalQpNum() const;
 
    public:
     // Device name, such as `mlx5_3`

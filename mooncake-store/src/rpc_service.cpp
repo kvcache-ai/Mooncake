@@ -514,13 +514,19 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
 }
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
-    const UUID& client_id) {
+    const UUID& client_id, size_t qp_count) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 
     MasterMetricManager::instance().inc_ping_requests();
 
-    auto result = master_service_.Ping(client_id);
+    auto result = master_service_.Ping(client_id, 0);
+
+    if (result.has_value()) {
+        // Increment cluster total QP number based on client's reported QP count
+        MasterMetricManager::instance().inc_cluster_total_qp_num(
+            result.value().total_qp_num);
+    }
 
     timer.LogResponseExpected(result);
     return result;

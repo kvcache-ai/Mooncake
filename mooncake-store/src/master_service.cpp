@@ -628,7 +628,7 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-auto MasterService::Ping(const UUID& client_id)
+auto MasterService::Ping(const UUID& client_id, const size_t qp_count)
     -> tl::expected<PingResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
@@ -645,7 +645,7 @@ auto MasterService::Ping(const UUID& client_id)
                    << ", error=client_ping_queue_full";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return PingResponse(view_version_, client_status);
+    return PingResponse(view_version_, client_status, 0);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {

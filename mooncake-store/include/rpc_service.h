@@ -77,7 +77,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
-    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
+    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id,
+                                               size_t qp_count);
 
    private:
     MasterService master_service_;

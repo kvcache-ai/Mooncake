@@ -1391,7 +1391,9 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         // Ping master
-        auto ping_result = master_client_.Ping(client_id_);
+        size_t qp_num_per_client = transfer_engine_.getTotalQpNum();
+        auto ping_result =
+            master_client_.Ping(client_id_, (const size_t&)qp_num_per_client);
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
