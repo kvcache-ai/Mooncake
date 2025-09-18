@@ -162,21 +162,21 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
         // Create 4 threads, each performing repeated allocation and
         // deallocation for 1 second
         for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
-            threads.emplace_back([this, &allocator, test_duration,
-                                  segment_name]() {
-                auto start_time = std::chrono::steady_clock::now();
+            threads.emplace_back(
+                [this, &allocator, test_duration, segment_name]() {
+                    auto start_time = std::chrono::steady_clock::now();
 
-                while (std::chrono::steady_clock::now() - start_time <
-                       test_duration) {
-                    // Allocate memory of varying sizes
-                    size_t alloc_size = 477;
-                    auto bufHandle = allocator->allocate(alloc_size);
+                    while (std::chrono::steady_clock::now() - start_time <
+                           test_duration) {
+                        // Allocate memory of varying sizes
+                        size_t alloc_size = 477;
+                        auto bufHandle = allocator->allocate(alloc_size);
 
-                    ASSERT_NE(bufHandle, nullptr);
-                    VerifyAllocatedBuffer(*bufHandle, alloc_size,
-                                          segment_name, segment_name);
-                }
-            });
+                        ASSERT_NE(bufHandle, nullptr);
+                        VerifyAllocatedBuffer(*bufHandle, alloc_size,
+                                              segment_name, segment_name);
+                    }
+                });
         }
 
         // Wait for all threads to complete

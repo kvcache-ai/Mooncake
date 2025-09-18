@@ -19,7 +19,8 @@ namespace mooncake {
 namespace testing {
 
 // Lightweight in-process master server for tests (non-HA).
-// Optionally starts embedded HTTP metadata server for transfer engine (default off).
+// Optionally starts embedded HTTP metadata server for transfer engine (default
+// off).
 class InProcMaster {
    public:
     InProcMaster() = default;
@@ -33,10 +34,10 @@ class InProcMaster {
             http_metrics_port_ =
                 http_metrics_port > 0 ? http_metrics_port : getFreeTcpPort();
             http_metadata_port_ = http_metadata_port.has_value()
-                                       ? (http_metadata_port.value() > 0
-                                              ? http_metadata_port.value()
-                                              : getFreeTcpPort())
-                                       : 0;
+                                      ? (http_metadata_port.value() > 0
+                                             ? http_metadata_port.value()
+                                             : getFreeTcpPort())
+                                      : 0;
 
             // Optional HTTP metadata server
             if (http_metadata_port_ > 0) {

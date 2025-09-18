@@ -388,8 +388,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = "segment_" + std::to_string(i);
-        segment.base =
-            kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
+        segment.base = kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
         segment.size = kSegmentSize;
         segment.te_endpoint = segment.name;
         ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
@@ -1038,8 +1037,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = "segment_" + std::to_string(i);
-        segment.base =
-            kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
+        segment.base = kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
         segment.size = kSegmentSize;
         segment.te_endpoint = segment.name;
         ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
@@ -2182,8 +2180,7 @@ TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = "segment_" + std::to_string(i);
-        segment.base =
-            kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
+        segment.base = kBaseAddr + static_cast<size_t>(i) * kSegmentSize;
         segment.size = kSegmentSize;
         segment.te_endpoint = segment.name;
         ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());

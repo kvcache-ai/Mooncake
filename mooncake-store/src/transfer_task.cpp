@@ -293,7 +293,7 @@ void TransferEngineOperationState::wait_for_completion() {
     }
 
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-    constexpr int64_t timeout_seconds = 60;
+    constexpr int64_t timeout_seconds = 1;
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
     const int64_t start_ts = getCurrentTimeInNano();
@@ -588,9 +588,11 @@ bool TransferSubmitter::isLocalTransfer(
     }
 
     if (!local_ep.empty()) {
-        return std::all_of(handles.begin(), handles.end(), [&local_ep](const auto& h) {
-            return !h.transport_endpoint_.empty() && h.transport_endpoint_ == local_ep;
-        });
+        return std::all_of(handles.begin(), handles.end(),
+                           [&local_ep](const auto& h) {
+                               return !h.transport_endpoint_.empty() &&
+                                      h.transport_endpoint_ == local_ep;
+                           });
     }
 
     // Without a local endpoint we cannot prove locality; disable memcpy.

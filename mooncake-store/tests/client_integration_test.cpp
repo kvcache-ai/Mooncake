@@ -14,7 +14,7 @@
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
+DEFINE_string(device_name, "",
               "Device name to use, valid if protocol=rdma");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
@@ -26,13 +26,13 @@ namespace testing {
 class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        auto client_opt = Client::Create(
-            host_name,                  // Local hostname
-            "P2PHANDSHAKE",              // Metadata connection string
-            FLAGS_protocol,             // Transfer protocol
-            std::nullopt,               // RDMA device names (auto-discovery)
-            master_address_             // Master server address (non-HA)
-        );
+        auto client_opt =
+            Client::Create(host_name,       // Local hostname
+                           "P2PHANDSHAKE",  // Metadata connection string
+                           FLAGS_protocol,  // Transfer protocol
+                           std::nullopt,  // RDMA device names (auto-discovery)
+                           master_address_  // Master server address (non-HA)
+            );
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;

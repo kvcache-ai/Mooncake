@@ -189,8 +189,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
     ASSERT_TRUE(descriptor.is_memory_replica());
     const auto& mem_desc = descriptor.get_memory_descriptor();
     ASSERT_EQ(mem_desc.buffer_descriptors.size(), 1);
-    std::string segment_ep =
-        mem_desc.buffer_descriptors[0].transport_endpoint_;
+    std::string segment_ep = mem_desc.buffer_descriptors[0].transport_endpoint_;
     EXPECT_TRUE(segment_ep == "segment1" || segment_ep == "segment2");
     EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 1024);
 }
@@ -303,11 +302,10 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     ASSERT_TRUE(large_result.has_value());
     auto large_desc = large_result.value()[0].get_descriptor();
     ASSERT_TRUE(large_desc.is_memory_replica());
-    EXPECT_EQ(
-        large_desc.get_memory_descriptor()
-            .buffer_descriptors[0]
-            .transport_endpoint_,
-        "preferred");
+    EXPECT_EQ(large_desc.get_memory_descriptor()
+                  .buffer_descriptors[0]
+                  .transport_endpoint_,
+              "preferred");
 
     // Now try to allocate more than remaining space in preferred segment
     std::vector<size_t> small_slice = {2 * 1024 * 1024};
@@ -317,8 +315,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     auto small_desc = result.value()[0].get_descriptor();
     ASSERT_TRUE(small_desc.is_memory_replica());
     const auto& mem_desc = small_desc.get_memory_descriptor();
-    EXPECT_EQ(mem_desc.buffer_descriptors[0].transport_endpoint_,
-              "segment1");
+    EXPECT_EQ(mem_desc.buffer_descriptors[0].transport_endpoint_, "segment1");
     EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 2 * 1024 * 1024);
 }
 

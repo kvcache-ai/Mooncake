@@ -9,8 +9,7 @@
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "",
-              "Device name to use, valid if protocol=rdma");
+DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
 namespace testing {
@@ -58,7 +57,6 @@ class PyClientTest : public ::testing::Test {
 // Static members definition
 mooncake::testing::InProcMaster PyClientTest::master_;
 std::string PyClientTest::master_address_;
-
 
 // Test basic Put and Get operations
 TEST_F(PyClientTest, BasicPutGetOperations) {
