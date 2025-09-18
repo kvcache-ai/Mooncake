@@ -18,6 +18,10 @@
 #include <cuda.h>
 #endif
 
+#ifdef USE_MUSA 
+#include <musa_porting.h>
+#endif
+
 #include <fcntl.h>
 #include <sys/epoll.h>
 
