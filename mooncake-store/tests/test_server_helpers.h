@@ -1,9 +1,10 @@
 #pragma once
 
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
-#include <optional>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -58,7 +59,15 @@ class InProcMaster {
             }
 
             WrappedMasterServiceConfig cfg;
-            cfg.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+            uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+            if (const char* ttl_env = std::getenv("DEFAULT_KV_LEASE_TTL")) {
+                char* endptr = nullptr;
+                unsigned long parsed = std::strtoul(ttl_env, &endptr, 10);
+                if (endptr != ttl_env && endptr && *endptr == '\0') {
+                    default_kv_lease_ttl = static_cast<uint64_t>(parsed);
+                }
+            }
+            cfg.default_kv_lease_ttl = default_kv_lease_ttl;
             cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
             cfg.allow_evict_soft_pinned_objects = true;
             cfg.enable_metric_reporting = false;
