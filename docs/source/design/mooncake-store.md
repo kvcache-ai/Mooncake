@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## Introduction
 
@@ -44,7 +44,8 @@ Mooncake store supports two deployment methods to accommodate different availabi
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
 2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
 If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
-The leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
+
+In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
 ## Client C++ API
 
@@ -534,7 +535,7 @@ After enabling the persistence feature:
 - For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
 
 #### 3FS USRBIO Plugin
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](https://kvcache-ai.github.io/Mooncake/plugin-usage/3FS-USRBIO-Plugin.html).
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](https://kvcache-ai.github.io/Mooncake/getting_started/plugin-usage/3FS-USRBIO-Plugin.html).
 
 ## Mooncake Store Python API
 

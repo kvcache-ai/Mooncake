@@ -35,8 +35,9 @@ class Client {
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
-     * @param device_names Comma-separated RDMA device names (if protocol is
-     *        "rdma" and auto_discover is false)
+     * @param device_names Comma-separated RDMA device names.
+     *        Optional with default auto-discovery. Only required when
+     *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
      *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
      *        HA mode)
@@ -319,7 +320,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
     // Client identification
     UUID client_id_;

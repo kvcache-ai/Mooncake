@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## 概述
 
@@ -46,9 +46,9 @@ Mooncake Store 的主要特性包括：
 
 Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
 1. **默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
-2. **高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。
-如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
-leader 通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
+2. **高可用模式（不稳定）**：在该模式下 master service 以多个 master 节点组成集群，并借助 etcd 集群进行协调，从而提升系统的容错能力。多个 master 节点使用 etcd 进行 leader 选举，由 leader 负责处理客户端请求。如果当前的 leader 崩溃或发生网络故障，其余 master 节点将自动进行新的 leader 选举，以确保服务的持续可用性。
+
+在两种模式下，leader 都会通过定期心跳监控所有 client 节点的健康状态。如果某个 client 崩溃或无法访问，leader 能迅速检测到故障并采取相应措施。当 client 恢复或重新连接后，会自动重新加入集群，无需人工干预。
 
 ## Client C++ API
 

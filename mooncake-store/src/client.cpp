@@ -202,14 +202,31 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return err;
         }
 
-        // Start Ping thread to monitor master view changes and remount segments
-        // if needed
+        // Start ping thread to monitor master health and trigger remount if
+        // needed.
         ping_running_ = true;
-        ping_thread_ = std::thread(&Client::PingThreadFunc, this);
+        bool is_ha_mode = true;
+        std::string current_master_address = master_address;
+        ping_thread_ = std::thread([this, is_ha_mode,
+                                    current_master_address]() mutable {
+            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
+        });
 
         return ErrorCode::OK;
     } else {
-        return master_client_.Connect(master_server_entry);
+        auto err = master_client_.Connect(master_server_entry);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        // Non-HA mode also enables heartbeat/ping
+        ping_running_ = true;
+        bool is_ha_mode = false;
+        std::string current_master_address = master_server_entry;
+        ping_thread_ = std::thread([this, is_ha_mode,
+                                    current_master_address]() mutable {
+            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
+        });
+        return ErrorCode::OK;
     }
 }
 
@@ -284,6 +301,24 @@ ErrorCode Client::InitTransferEngine(
 
             if (!transport) {
                 LOG(ERROR) << "Failed to install TCP transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "ascend") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "Ascend protocol does not use device names, ignoring";
+            }
+            try {
+                transport =
+                    transfer_engine_.installTransport("ascend", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install Ascend transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else {
@@ -1314,7 +1349,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-void Client::PingThreadFunc() {
+void Client::PingThreadMain(bool is_ha_mode,
+                            std::string current_master_address) {
     // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -1379,32 +1415,50 @@ void Client::PingThreadFunc() {
             continue;
         }
 
-        // Too many ping failures, we need to check if the master view
-        // has changed
-        LOG(ERROR) << "Failed to ping master for " << ping_fail_count
-                   << " times, try to get latest master view and reconnect";
-        std::string master_address;
-        ViewVersionId next_version = 0;
-        auto err =
-            master_view_helper_.GetMasterView(master_address, next_version);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get new master view: " << toString(err);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
-            continue;
-        }
+        // Exceeded ping failure threshold. Reconnect based on mode.
+        if (is_ha_mode) {
+            LOG(ERROR)
+                << "Failed to ping master for " << ping_fail_count
+                << " times; fetching latest master view and reconnecting";
+            std::string master_address;
+            ViewVersionId next_version = 0;
+            auto err =
+                master_view_helper_.GetMasterView(master_address, next_version);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to get new master view: "
+                           << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
 
-        err = master_client_.Connect(master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master " << master_address
-                       << ": " << toString(err);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
-            continue;
-        }
+            err = master_client_.Connect(master_address);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to connect to master " << master_address
+                           << ": " << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
 
-        LOG(INFO) << "Reconnected to master " << master_address;
-        ping_fail_count = 0;
+            current_master_address = master_address;
+            LOG(INFO) << "Reconnected to master " << master_address;
+            ping_fail_count = 0;
+        } else {
+            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                       << " times (non-HA); reconnecting to "
+                       << current_master_address;
+            auto err = master_client_.Connect(current_master_address);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Reconnect failed to " << current_master_address
+                           << ": " << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
+            LOG(INFO) << "Reconnected to master " << current_master_address;
+            ping_fail_count = 0;
+        }
     }
     // Explicitly wait for the remount segment thread to finish
     if (remount_segment_future.valid()) {
