@@ -101,6 +101,7 @@ Status SegmentManager::getRemote(SegmentDescRef &desc,
 }
 
 Status SegmentManager::invalidateRemote(SegmentID handle) {
+    if (handle == LOCAL_SEGMENT_ID) return Status::OK();
     auto &cache = tl_remote_cache_.get();
     if (cache.id_to_desc_map.count(handle)) cache.id_to_desc_map.erase(handle);
     return Status::OK();

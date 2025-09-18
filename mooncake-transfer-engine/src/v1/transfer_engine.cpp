@@ -410,7 +410,8 @@ Status TransferEngine::registerLocalMemory(void *addr, size_t size,
                                            MemoryOptions &options) {
     return local_segment_tracker_->add(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
-            options.location = desc.location;
+            if (options.location == kWildcardLocation)
+                options.location = desc.location;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
                 auto status =
@@ -475,11 +476,15 @@ Status TransferEngine::lazyFreeBatch() {
 
 TransportType TransferEngine::getTransportType(const Request &request,
                                                int priority) {
-    SegmentDesc *remote_desc;
-    auto status = metadata_->segmentManager().getRemoteCached(
-        remote_desc, request.target_id);
-    if (!status.ok()) return UNSPEC;
-    if (remote_desc->type == SegmentType::File) {
+    SegmentDesc *desc;
+    if (request.target_id == LOCAL_SEGMENT_ID) {
+        desc = metadata_->segmentManager().getLocal().get();
+    } else {
+        auto status = metadata_->segmentManager().getRemoteCached(
+            desc, request.target_id);
+        if (!status.ok()) return UNSPEC;
+    }
+    if (desc->type == SegmentType::File) {
         if (isCudaMemory(request.source) && transport_list_[GDS]) {
             if (priority-- == 0) return GDS;
         }
@@ -488,10 +493,9 @@ TransportType TransferEngine::getTransportType(const Request &request,
         }
         return UNSPEC;
     } else {
-        auto entry =
-            getBufferDesc(remote_desc, request.target_offset, request.length);
+        auto entry = getBufferDesc(desc, request.target_offset, request.length);
         bool same_machine =
-            (remote_desc->machine_id ==
+            (desc->machine_id ==
              metadata_->segmentManager().getLocal()->machine_id);
         bool cuda_device = entry->location.starts_with("cuda");
         for (auto type : entry->transports) {
