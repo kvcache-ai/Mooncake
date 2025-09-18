@@ -373,7 +373,6 @@ class TransferSubmitter {
 
    private:
     TransferEngine& engine_;
-    const std::string local_hostname_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;

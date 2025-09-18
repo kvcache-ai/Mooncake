@@ -359,11 +359,6 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
-    if (local_hostname_.empty()) {
-        LOG(ERROR) << "Local hostname cannot be empty";
-        throw std::invalid_argument("Local hostname cannot be empty");
-    }
-
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
