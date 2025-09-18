@@ -91,8 +91,6 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    # Removed external Master startup; tests launch in-proc Master themselves.
-
     - name: Test (in build env)
       run: |
         cd build
@@ -100,8 +98,6 @@ jobs:
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
       shell: bash
-
-    # Removed external Master shutdown; no longer started in CI.
 
     - name: Generate Python version tag
       id: generate_tag_build

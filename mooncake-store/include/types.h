@@ -168,7 +168,7 @@ const static uint64_t kMaxSliceSize =
  */
 struct Segment {
     UUID id{0, 0};
-    std::string name{};  // Logical segment name used for scheduling / labels
+    std::string name{};  // Logical segment name used for preferred allocation
     uintptr_t base{0};
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing

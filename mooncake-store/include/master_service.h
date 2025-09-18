@@ -51,8 +51,8 @@ class MasterService {
      *         be mounted temporarily,
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
-    auto MountSegment(const Segment& segment,
-                      const UUID& client_id) -> tl::expected<void, ErrorCode>;
+    auto MountSegment(const Segment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -74,8 +74,8 @@ class MasterService {
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
      */
-    auto UnmountSegment(const UUID& segment_id,
-                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
+    auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Check if an object exists
@@ -155,8 +155,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key,
-                ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -164,8 +164,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key,
-                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const std::string& key, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations

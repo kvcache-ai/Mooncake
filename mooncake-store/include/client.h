@@ -238,7 +238,7 @@ class Client {
         return str;
     }
 
-    std::string GetTransportEndpoint() {
+    [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_.getLocalIpAndPort();
     }
 

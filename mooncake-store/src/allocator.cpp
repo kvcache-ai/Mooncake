@@ -27,6 +27,10 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+    } else {
+        LOG(ERROR) << "allocator=expired_or_null in get_descriptor, where "
+                      "segment_name="
+                   << segment_name_;
     }
     return {static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), status, endpoint};
