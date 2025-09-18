@@ -90,11 +90,10 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "Session::writeHeader failed. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")"
-                        << ", bytes written: " << len
-                        << ", expected: " << sizeof(SessionHeader);
+                    LOG(ERROR) << "Session::writeHeader failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << ")" << ", bytes written: " << len
+                               << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;

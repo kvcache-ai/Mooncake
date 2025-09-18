@@ -33,7 +33,12 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -80,7 +85,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -113,7 +123,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -144,7 +159,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -174,7 +194,12 @@ TEST_F(MasterServiceSSDTest, RemoveKey) {
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
 
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -206,7 +231,12 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
     constexpr size_t size = 1024 * 1024 * 16 * 15;
     constexpr size_t object_size = 1024 * 15;
     std::string segment_name = "test_segment";
-    Segment segment(generate_uuid(), segment_name, buffer, size);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());

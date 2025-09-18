@@ -199,8 +199,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                           << ", batch waitlock spent: " << duration_wait.count()
                           << "ms"
                           << ", batch call spent: " << duration_call.count()
-                          << "us"
-                          << ", batch addOpfence spent: "
+                          << "us" << ", batch addOpfence spent: "
                           << duration_addOpfence.count() << "us"
                           << ", batch sync spent: " << duration_sync.count()
                           << "us";

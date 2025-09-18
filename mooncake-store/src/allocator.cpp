@@ -23,8 +23,17 @@ AllocatedBuffer::~AllocatedBuffer() {
 
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
+    auto alloc = allocator_.lock();
+    std::string endpoint;
+    if (alloc) {
+        endpoint = alloc->getTransportEndpoint();
+    } else {
+        LOG(ERROR) << "allocator=expired_or_null in get_descriptor, where "
+                      "segment_name="
+                   << segment_name_;
+    }
+    return {static_cast<uint64_t>(size()),
+            reinterpret_cast<uintptr_t>(buffer_ptr_), status, endpoint};
 }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
@@ -38,11 +47,13 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
-                                                 size_t base, size_t size)
+                                                 size_t base, size_t size,
+                                                 std::string transport_endpoint)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      transport_endpoint_(std::move(transport_endpoint)) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -123,11 +134,13 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
-                                             size_t base, size_t size)
+                                             size_t base, size_t size,
+                                             std::string transport_endpoint)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0) {
+      cur_size_(0),
+      transport_endpoint_(std::move(transport_endpoint)) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;

@@ -238,6 +238,10 @@ class Client {
         return str;
     }
 
+    [[nodiscard]] std::string GetTransportEndpoint() {
+        return transfer_engine_.getLocalIpAndPort();
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
