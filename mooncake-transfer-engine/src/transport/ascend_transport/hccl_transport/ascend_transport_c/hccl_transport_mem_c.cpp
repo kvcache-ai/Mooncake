@@ -300,18 +300,7 @@ int initTransportMem(RankInfo *local_rank_info) {
 }
 
 void freeTransportMem() {
-    for (auto &it : target_key_to_connection_map_) {
-        auto &hccl_ctrl_socket = it.second.hccl_ctrl_socket;
-        if (hccl_ctrl_socket) {
-            hccl_ctrl_socket->Close();
-        }
-        auto &hccl_data_socket = it.second.hccl_data_socket;
-        if (hccl_data_socket) {
-            hccl_data_socket->Close();
-        }
-    }
-    target_key_to_connection_map_.clear();
-
+    clearTransportMems();
     if (vnicServerSocket_) {
         HcclNetCloseDev(vnicNetDevCtx_);
         vnicServerSocket_.reset();
@@ -324,7 +313,6 @@ void freeTransportMem() {
     if (notifyPool_) {
         notifyPool_.reset();
     }
-
     if (g_server_socket_ > 0) {
         close(g_server_socket_);
     }
@@ -757,6 +745,21 @@ int clearTransportMem(RankInfo *remote_rank_info) {
         }
         target_key_to_connection_map_.erase(key_str);
     }
+    return 0;
+}
+
+int clearTransportMems() {
+    for (auto &it : target_key_to_connection_map_) {
+        auto &hccl_ctrl_socket = it.second.hccl_ctrl_socket;
+        if (hccl_ctrl_socket) {
+            hccl_ctrl_socket->Close();
+        }
+        auto &hccl_data_socket = it.second.hccl_data_socket;
+        if (hccl_data_socket) {
+            hccl_data_socket->Close();
+        }
+    }
+    target_key_to_connection_map_.clear();
     return 0;
 }
 

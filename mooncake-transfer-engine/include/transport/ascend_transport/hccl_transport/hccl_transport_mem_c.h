@@ -100,6 +100,7 @@ extern int initTransportMem(RankInfo *local_rank_info);
 extern void freeTransportMem();
 
 extern int clearTransportMem(RankInfo *remote_rank_info);
+extern int clearTransportMems();
 
 extern int transportMemTask(RankInfo *local_rank_info,
                             RankInfo *remote_rank_info, int op_code,
