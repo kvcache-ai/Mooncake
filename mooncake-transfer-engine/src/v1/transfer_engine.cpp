@@ -251,9 +251,7 @@ Status TransferEngine::importRemoteSegment(SegmentID &handle,
 
 Status TransferEngine::openSegment(SegmentID &handle,
                                    const std::string &segment_name) {
-    if (segment_name.empty())
-        return Status::InvalidArgument("Invalid segment name" LOC_MARK);
-    if (segment_name == local_segment_name_) {
+    if (segment_name.empty() || segment_name == local_segment_name_) {
         handle = LOCAL_SEGMENT_ID;
         return Status::OK();
     }
@@ -377,6 +375,7 @@ std::vector<TransportType> TransferEngine::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
     switch (request_type) {
+        case UNSPEC:
         case RDMA:
         case NVLINK:
             if (transport_list_[NVLINK]) result.push_back(NVLINK);
@@ -411,10 +410,12 @@ Status TransferEngine::registerLocalMemory(void *addr, size_t size,
                                            MemoryOptions &options) {
     return local_segment_tracker_->add(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
+            options.location = desc.location;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
-                CHECK_STATUS(
-                    transport_list_[type]->addMemoryBuffer(desc, options));
+                auto status =
+                    transport_list_[type]->addMemoryBuffer(desc, options);
+                if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
         });
@@ -426,7 +427,8 @@ Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
     return local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
             for (auto type : desc.transports) {
-                CHECK_STATUS(transport_list_[type]->removeMemoryBuffer(desc));
+                auto status = transport_list_[type]->removeMemoryBuffer(desc);
+                if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
         });

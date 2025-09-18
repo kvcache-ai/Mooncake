@@ -431,6 +431,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
 Status MnnvlTransport::setPeerAccess() {
     int device_count = 0;
+    int cuda_dev = 0;
+    CHECK_CUDA(cudaGetDevice(&cuda_dev));
     CHECK_CUDA(cudaGetDeviceCount(&device_count));
     if (device_count < 2) return Status::OK();
     for (int i = 0; i < device_count; ++i) {
@@ -447,12 +449,14 @@ Status MnnvlTransport::setPeerAccess() {
                 if (err == cudaErrorPeerAccessAlreadyEnabled) {
                     cudaGetLastError();
                 } else {
+                    cudaSetDevice(cuda_dev);
                     return Status::InternalError(
                         "cudaDeviceEnablePeerAccess failed");
                 }
             }
         }
     }
+    cudaSetDevice(cuda_dev);
     return Status::OK();
 }
 

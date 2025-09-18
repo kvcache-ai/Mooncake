@@ -41,8 +41,11 @@ Status genericAllocateLocalMemory(void **pptr, size_t size,
     auto result = parseLocation(options.location);
     if (result.first == "cuda") {
 #ifdef USE_CUDA
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
         CHECK_CUDA(cudaSetDevice(result.second));
         CHECK_CUDA(cudaMalloc(pptr, size));
+        cudaSetDevice(cuda_dev);
         return Status::OK();
 #else
         return Status::NotImplemented("CUDA feature not supported" LOC_MARK);

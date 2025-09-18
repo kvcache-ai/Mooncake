@@ -43,9 +43,9 @@ Status SegmentManager::openRemote(SegmentID &handle,
         handle = next_id_.fetch_add(1, std::memory_order_relaxed);
         name_to_id_map_[segment_name] = handle;
         id_to_name_map_[handle] = segment_name;
+        LOG(INFO) << "Opened segment #" << handle << ": " << segment_name;
+        version_.fetch_add(1, std::memory_order_relaxed);
     }
-    LOG(INFO) << "Opened segment #" << handle << ": " << segment_name;
-    version_.fetch_add(1, std::memory_order_relaxed);
     return Status::OK();
 }
 

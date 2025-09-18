@@ -124,10 +124,9 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     (void)(protocol);
     if (g_enable_v1) {
         auto config = std::make_shared<mooncake::v1::ConfigManager>();
-        if (strcmp(metadata_type, P2PHANDSHAKE)) {
+        if (strcmp(metadata_server, P2PHANDSHAKE) == 0) {
             config->set("local_segment_name", local_hostname);
-            config->set("metadata_type", metadata_type);
-            config->set("metadata_servers", metadata_server);
+            config->set("metadata_type", "p2p");
         }
         engine_v1_ = std::make_unique<mooncake::v1::TransferEngine>(config);
         if (!engine_v1_->available()) return -1;
@@ -590,7 +589,13 @@ batch_id_t TransferEnginePy::batchTransferAsync(
             entry.target_offset = peer_buffer_addresses[i];
             entries.push_back(entry);
         }
-        return engine_v1_->allocateBatch(batch_size);
+        auto batch_id = engine_v1_->allocateBatch(batch_size);
+        auto ret = engine_v1_->submitTransfer(batch_id, entries);
+        if (!ret.ok()) {
+            LOG(ERROR) << "submitTransfer: " << ret.ToString();
+            return -1;
+        }
+        return batch_id;
     }
 
     const int max_retry = engine_->numContexts() + 1;
@@ -648,10 +653,14 @@ int TransferEnginePy::getBatchTransferStatus(
                 if (status.s == mooncake::v1::PENDING ||
                     status.s == mooncake::v1::WAITING)
                     continue;
-                engine_v1_->freeBatch(batch_id);
                 if (status.s == mooncake::v1::COMPLETED) {
+                    engine_v1_->freeBatch(batch_id);
                     completed = true;
+                } else if (status.s == mooncake::v1::FAILED) {
+                    engine_v1_->freeBatch(batch_id);
+                    return -1;
                 } else if (status.s == mooncake::v1::CANCELED) {
+                    engine_v1_->freeBatch(batch_id);
                     return -1;
                 }
             }
@@ -885,7 +894,7 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
             return 0;
         }
         ret = engine_v1_->getSegmentInfo(handle, info);
-        if (!ret.ok()) {
+        if (!ret.ok() || info.buffers.empty()) {
             LOG(ERROR) << "getSegmentInfo: " << ret.ToString();
             return 0;
         }
