@@ -95,6 +95,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     PATTERNS=(
         "libcurl.so*"
         "libibverbs.so*"
+        "libmlx5.so*"
         "libnuma.so*"
         "libstdc++.so*"
         "libgcc_s.so*"
@@ -133,6 +134,12 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libffi.so*"
         "libcuda.so*"
         "libcudart.so*"
+        "libc10.so*"
+        "libc10_cuda.so*"
+        "libtorch.so*"
+        "libtorch_cpu.so*"
+        "libtorch_cuda.so*"
+        "libtorch_python.so*"
         "libascendcl.so*"
         "libhccl.so*"
         "libmsprofiler.so*"
@@ -186,10 +193,15 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
+    if [ "$BUILD_WITH_EP" = "1" ]; then
+        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
+    else
+        python -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
+    --exclude libmlx5.so* \
     --exclude libnuma.so* \
     --exclude libstdc++.so* \
     --exclude libgcc_s.so* \
@@ -228,6 +240,12 @@ else
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libc10.so* \
+    --exclude libc10_cuda.so* \
+    --exclude libtorch.so* \
+    --exclude libtorch_cpu.so* \
+    --exclude libtorch_cuda.so* \
+    --exclude libtorch_python.so* \
     --exclude libascendcl.so* \
     --exclude libhccl.so* \
     --exclude libmsprofiler.so* \

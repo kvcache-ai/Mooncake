@@ -3,12 +3,12 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
-import mxa_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from mooncake.mooncake_ep_buffer import Buffer
+from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
-              rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: mxa_ep.Buffer, seed: int = 0):
+              rank: int, num_ranks: int, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, buffer: Buffer, seed: int = 0):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -32,13 +32,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
-    broken_nodes = torch.zeros((num_tokens, ), dtype=torch.int32, device='cuda')
+    active_ranks = torch.ones((num_tokens, ), dtype=torch.int32, device='cuda')
     for return_recv_hook in (False, True):
         for dispatch_use_fp8 in (False, True):
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = \
-                    buffer.dispatch(x, topk_idx, broken_nodes, num_tokens, num_experts, 1000000, use_fp8=dispatch_use_fp8,
+                    buffer.dispatch(x, topk_idx, active_ranks, num_tokens, num_experts, -1, use_fp8=dispatch_use_fp8,
                                     async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
                 hook() if return_recv_hook else event.current_stream_wait()
             packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
@@ -78,8 +78,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 if zero_copy:
                     buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                 out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                gathered_experts = torch.zeros((num_experts, ), dtype=torch.int32, device='cuda')
-                combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, gathered_experts, 1000000, handle,
+                combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, active_ranks, -1, handle,
                                                          async_finish=not return_recv_hook, zero_copy=zero_copy,
                                                          return_recv_hook=return_recv_hook, out=out)
                 hook() if return_recv_hook else event.current_stream_wait()
@@ -109,13 +108,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.dispatch(x, topk_idx, broken_nodes, num_tokens, num_experts, 1000000,
+            buffer.dispatch(x, topk_idx, active_ranks, num_tokens, num_experts, -1,
                             async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-        gathered_experts = torch.zeros((num_experts, ), dtype=torch.int32, device='cuda')
-        combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, gathered_experts, 1000000, handle,
+        combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, active_ranks, -1, handle,
                                                  zero_copy=zero_copy, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
@@ -134,7 +132,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
     # Separate profiling
     for return_recv_hook in (False, True):
-        group.barrier()
+        cpu_group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
                                              suppress_kineto_output=True)
@@ -150,22 +148,15 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    rank, num_ranks, group, cpu_group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
-    bytes_reserved = 2000 * 3000 * num_ranks * 4
-    num_mxa_bytes = mxa_ep.Buffer.get_mxa_size_hint(num_tokens, hidden, num_ranks, num_experts, bytes_reserved)
+    num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
-        print(f'Allocating buffer size: {num_mxa_bytes / 1e6} MB ...', flush=True)
-    buffer = mxa_ep.Buffer(group, num_mxa_bytes=num_mxa_bytes, bytes_reserved=bytes_reserved)
+        print(f'Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...', flush=True)
+    buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
 
-    x = torch.full((2000, 3000), rank, dtype=torch.int32, device='cuda')
-    broken_nodes = torch.zeros(num_ranks, dtype=torch.int32)
-    buffer.all_reduce_without(broken_nodes, x)
-    expected = torch.full((2000, 3000), sum(range(num_ranks)), dtype=torch.int32, device='cuda')
-    assert torch.equal(x, expected), "All-reduce result is incorrect!"
-
-    test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
+    test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
 
     do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
