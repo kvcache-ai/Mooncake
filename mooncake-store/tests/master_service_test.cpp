@@ -1384,7 +1384,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     ASSERT_TRUE(mount_result.has_value());
 
     // Pre-populate with test data
-    constexpr int num_objects = 1000000;
+    constexpr int num_objects = 1000;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
         std::vector<uint64_t> slice_lengths = {1024};

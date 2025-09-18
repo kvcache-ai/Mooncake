@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <optional>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -18,29 +19,27 @@ namespace mooncake {
 namespace testing {
 
 // Lightweight in-process master server for tests (non-HA).
-// Optionally starts embedded HTTP metadata server for transfer engine.
+// Optionally starts embedded HTTP metadata server for transfer engine (default off).
 class InProcMaster {
    public:
     InProcMaster() = default;
     ~InProcMaster() { Stop(); }
 
     bool Start(int rpc_port = 0, int http_metrics_port = 0,
-               bool enable_http_metadata = true, int http_metadata_port = 0) {
+               std::optional<int> http_metadata_port = std::nullopt) {
         try {
             // Choose ports if not provided
             rpc_port_ = rpc_port > 0 ? rpc_port : getFreeTcpPort();
             http_metrics_port_ =
                 http_metrics_port > 0 ? http_metrics_port : getFreeTcpPort();
-            if (enable_http_metadata) {
-                http_metadata_port_ = http_metadata_port > 0
-                                          ? http_metadata_port
-                                          : getFreeTcpPort();
-            } else {
-                http_metadata_port_ = 0;
-            }
+            http_metadata_port_ = http_metadata_port.has_value()
+                                       ? (http_metadata_port.value() > 0
+                                              ? http_metadata_port.value()
+                                              : getFreeTcpPort())
+                                       : 0;
 
             // Optional HTTP metadata server
-            if (enable_http_metadata) {
+            if (http_metadata_port_ > 0) {
                 meta_server_ = std::make_unique<HttpMetadataServer>(
                     static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
                 if (!meta_server_->start()) {

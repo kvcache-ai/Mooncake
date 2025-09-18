@@ -62,12 +62,13 @@ class ClientIntegrationTest : public ::testing::Test {
         }
         LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
 
-        // Start an in-process non-HA master with embedded HTTP metadata server
-        ASSERT_TRUE(master_.Start());
+        // Start an in-process non-HA master without HTTP metadata server
+        ASSERT_TRUE(master_.Start(/*rpc_port=*/0, /*http_metrics_port=*/0,
+                                  /*http_metadata_port=*/std::nullopt));
         master_address_ = master_.master_address();
         metadata_url_ = master_.metadata_url();
         LOG(INFO) << "Started in-proc master at " << master_address_
-                  << ", metadata_url=" << metadata_url_;
+                  << ", metadata=P2PHANDSHAKE";
 
         InitializeClients();
         InitializeSegment();
