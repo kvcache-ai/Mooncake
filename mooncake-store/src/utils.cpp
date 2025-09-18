@@ -8,6 +8,11 @@
 #include <boost/algorithm/string.hpp>
 
 #include <random>
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
+#endif
+
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
 
@@ -63,15 +68,38 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-void *allocate_buffer_allocator_memory(size_t total_size) {
-    const size_t alignment = facebook::cachelib::Slab::kSize;
+void *allocate_buffer_allocator_memory(size_t total_size,
+                                       const std::string &protocol,
+                                       size_t alignment) {
+    const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
-    if (total_size < alignment) {
+    if (alignment == default_alignment && total_size < alignment) {
         LOG(ERROR) << "Total size must be at least " << alignment;
         return nullptr;
     }
+#ifdef USE_ASCEND_DIRECT
+    if (protocol == "ascend" && total_size > 0) {
+        void *buffer = nullptr;
+        auto ret = aclrtMallocHost(&buffer, total_size);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to allocate memory: " << ret;
+            return nullptr;
+        }
+        return buffer;
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
+}
+
+void free_memory(const std::string &protocol, void *ptr) {
+#ifdef USE_ASCEND_DIRECT
+    if (protocol == "ascend") {
+        aclrtFreeHost(ptr);
+        return;
+    }
+#endif
+    free(ptr);
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
@@ -107,6 +135,36 @@ std::vector<std::string> splitString(const std::string &str, char delimiter,
     }
 
     return result;
+}
+
+tl::expected<std::string, int> httpGet(const std::string &url) {
+    coro_http::coro_http_client client;
+    auto res = client.get(url);
+    if (res.status == 200) {
+        return std::string(res.resp_body);
+    }
+    return tl::unexpected(res.status);
+}
+
+int getFreeTcpPort() {
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        ::close(sock);
+        return -1;
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+        ::close(sock);
+        return -1;
+    }
+    int port = ntohs(addr.sin_port);
+    ::close(sock);
+    return port;
 }
 
 }  // namespace mooncake

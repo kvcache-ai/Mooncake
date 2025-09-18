@@ -259,7 +259,7 @@ else
     --exclude libqos_manager.so* \
     --exclude libascend_trace.so* \
     --exclude libmetadef*.so \
-    --exclude libadxl*.so \
+    --exclude libllm_datadist*.so \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 

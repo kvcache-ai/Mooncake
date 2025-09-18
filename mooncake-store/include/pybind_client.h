@@ -1,12 +1,15 @@
 #pragma once
 
 #include <csignal>
-#include <mutex>
+#include <atomic>
+#include <thread>
 #include <string>
-#include <unordered_set>
+#include <memory>
+#include <vector>
 
 #include "client.h"
 #include "client_buffer.hpp"
+#include "mutex.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -40,10 +43,7 @@ class ResourceTracker {
     static ResourceTracker &getInstance();
 
     // Register a DistributedObjectStore instance for cleanup
-    void registerInstance(PyClient *instance);
-
-    // Unregister a DistributedObjectStore instance
-    void unregisterInstance(PyClient *instance);
+    void registerInstance(const std::shared_ptr<PyClient> &instance);
 
    private:
     ResourceTracker();
@@ -62,14 +62,25 @@ class ResourceTracker {
     // Exit handler function
     static void exitHandler();
 
-    std::mutex mutex_;
-    std::unordered_set<PyClient *> instances_;
+    Mutex mutex_;
+    std::vector<std::weak_ptr<PyClient>> instances_ GUARDED_BY(mutex_);
+
+    // Ensure cleanup runs at most once
+    std::atomic<bool> cleaned_{false};
+
+    // Dedicated signal handling thread
+    void startSignalThread();
+    std::once_flag signal_once_{};
+    std::jthread signal_thread_{};  // joins on destruction
 };
 
 class PyClient {
    public:
     PyClient();
     ~PyClient();
+
+    // Factory to create shared instances and auto-register to ResourceTracker
+    static std::shared_ptr<PyClient> create();
 
     int setup(const std::string &local_hostname,
               const std::string &metadata_server,
@@ -327,10 +338,23 @@ class PyClient {
         }
     };
 
+    struct AscendSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("ascend", ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+
+    // Ensure cleanup executes at most once across multiple entry points
+    std::atomic<bool> closed_{false};
 };
 
 }  // namespace mooncake

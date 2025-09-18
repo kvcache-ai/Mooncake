@@ -35,7 +35,7 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 
 2. Transport内部会建立一个host侧的tcp连接，会自动寻找可使用的端口，没有可用的时候会报错。
 
-3. 当使用`HCCS`通信协议时，注册的内存地址需要和页表对齐(host内存是4KB对齐，device内存是2MB对齐)。
+3. 当使用`HCCS`通信协议时，注册的内存地址需要和页表对齐(device内存是2MB对齐)。
 
 4. 请确保`/etc/hccn.conf`存在，特别是在容器内，请挂载`/etc/hccn.conf`或者把宿主机的文件复制到容器的/etc路径下。
 
@@ -43,7 +43,9 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 
 6. 通过`HCCL_RDMA_TIMEOUT` 用于配置RDMA网卡数据包重传超时时间系数，真实的数据包重传超时时间为`4.096us * 2 ^ $HCCL_RDMA_TIMEOUT`，通过`HCCL_RDMA_RETRY_CNT`来配置RDMA网卡的重传次数，建议配置`ASCEND_TRANSFER_TIMEOUT`略大于`重传时间 * HCCL_RDMA_RETRY_CNT`。
 
-7. A2 server内/A3超节点内默认通信协议为HCCS，可以通过设置`export HCCL_INTRA_ROCE_ENABLE=1`来指定走RDMA。通常在KV Cache传输场景，为避免与模型集合通信流量冲突，影响推理性能，建议走RDMA传输。
+7. A2 server内/A3超节点内默认通信协议为`HCCS`，可以通过设置`export HCCL_INTRA_ROCE_ENABLE=1`来指定走`RDMA`。通常在KV Cache传输场景，为避免与模型集合通信流量冲突，影响推理性能，建议走RDMA传输。
 
 8. 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改RDMA网卡的Traffic Class和Service Level配置，通过`ASCEND_RDMA_TC`环境变量来设置Traffic Class, 通过`ASCEND_RDMA_SL`环境变量来设置Service Level。
+
+9. 使用`RDMA`注册Host内存会按页表大小消耗device系统内存，在默认4KB页表情况下，可注册的Host的内存大约20GB, 另外`HCCS`也暂不支持Host内存传输，在这两种受约束的场景下，可通过中传Buffer的方式进行传输，具体开启方式是配置`ASCEND_BUFFER_POOL`环境变量，格式为`BUFFER_NUM:BUFFER_SIZE(单位MB)`, 推荐大小为`4:8`, 可根据实际场景调试出最合适的配置。
 
