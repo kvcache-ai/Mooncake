@@ -1143,7 +1143,14 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     segment.name = local_hostname_;
     segment.base = reinterpret_cast<uintptr_t>(buffer);
     segment.size = size;
-    segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+    } else {
+        segment.te_endpoint = local_hostname_;
+    }
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {
