@@ -102,7 +102,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-//            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
             if (desc.rpc_port == 0) {
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;

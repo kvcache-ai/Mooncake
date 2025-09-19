@@ -236,11 +236,12 @@ ErrorCode Client::InitTransferEngine(
     const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
-    if (g_transfer_engine) {
+    if ( ) {
         transfer_engine_= g_transfer_engine;
         LOG(INFO) << "Pooling multiplexing transferEngine";
     } else {
         auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        transfer_engine_ = std::make_shared<TransferEngine>();
         int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                         hostname, port);
         if (rc != 0) {
