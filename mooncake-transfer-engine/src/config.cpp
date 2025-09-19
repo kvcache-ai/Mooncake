@@ -259,11 +259,11 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.enable_dest_device_affinity = true;
     }
 
-    const char *disable_parallel_reg_mr =
-        std::getenv("MC_DISABLE_PARALLEL_REG_MR");
-    if (disable_parallel_reg_mr) {
-        LOG(INFO) << "Disable parallel register memory region";
-        config.parallel_reg_mr = false;
+    const char *enable_parallel_reg_mr =
+        std::getenv("MC_ENABLE_PARALLEL_REG_MR");
+    if (enable_parallel_reg_mr) {
+        LOG(INFO) << "Enable parallel register memory region";
+        config.parallel_reg_mr = true;
     }
 }
 
