@@ -57,7 +57,13 @@ static int getNumDevices() {
 static bool supportFabricMem() {
     if (getenv("MC_USE_NVLINK_IPC")) return false;
 
-    int num_devices = getNumDevices();
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
+                   << cudaGetErrorString(err);
+        return false;
+    }
     if (num_devices == 0) {
         LOG(ERROR) << "NvlinkTransport: no device found";
         return false;
@@ -124,30 +130,33 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     return true;
 }
 
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {
-    int num_devices = getNumDevices();
-    if (globalConfig().trace) {
-        LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
-                  << ", num_devices: " << num_devices;
-    }
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
+//     int num_devices = getNumDevices();
+//     if (globalConfig().trace) {
+//         LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
+//                   << ", num_devices: " << num_devices;
+//     }
 
-    for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
-        for (int dst_device_id = src_device_id + 1; dst_device_id < num_devices;
-             ++dst_device_id) {
-            if (enableP2PAccess(src_device_id, dst_device_id)) {
-                if (globalConfig().trace) {
-                    LOG(INFO)
-                        << "NvlinkTransport: enabled p2p access between device "
-                        << src_device_id << " and " << dst_device_id;
-                }
-            } else {
-                LOG(ERROR) << "NvlinkTransport: failed to enable p2p access "
-                              "between device "
-                           << src_device_id << " and " << dst_device_id;
-            }
-        }
-    }
-}
+//     for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id)
+//     {
+//         for (int dst_device_id = src_device_id + 1; dst_device_id <
+//         num_devices;
+//              ++dst_device_id) {
+//             if (enableP2PAccess(src_device_id, dst_device_id)) {
+//                 if (globalConfig().trace) {
+//                     LOG(INFO)
+//                         << "NvlinkTransport: enabled p2p access between
+//                         device "
+//                         << src_device_id << " and " << dst_device_id;
+//                 }
+//             } else {
+//                 LOG(ERROR) << "NvlinkTransport: failed to enable p2p access "
+//                               "between device "
+//                            << src_device_id << " and " << dst_device_id;
+//             }
+//         }
+//     }
+// }
 
 NvlinkTransport::~NvlinkTransport() {
     if (use_fabric_mem_) {
