@@ -216,6 +216,8 @@ class TransferEngine {
         return local_topology_;
     }
 
+    std::string local_server_name_;
+
    private:
     struct MemoryRegion {
         void *addr;
@@ -225,7 +227,6 @@ class TransferEngine {
     };
 
     std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
@@ -255,6 +256,7 @@ class TransferEngine {
     void StopMetricsReportingThread();
 #endif
 };
+extern __attribute__ ((visibility ("default"))) std::shared_ptr<TransferEngine> g_transfer_engine;
 }  // namespace mooncake
 
 #endif

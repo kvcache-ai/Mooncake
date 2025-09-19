@@ -112,11 +112,16 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *device_name,
                                     const char *metadata_type) {
     (void)(protocol);
+    if (g_transfer_engine) {
+        engine_ = g_transfer_engine;
+        return 0;
+    }
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_shared<TransferEngine>(true, device_filter);
+    LOG(INFO) << "TransferEnginePy InitTransferEngine";
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -129,6 +134,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         if (ret) return -1;
     }
 
+    g_transfer_engine = engine_;
+    LOG(INFO) << "TransferEnginePy InitTransferEngine end: " << g_transfer_engine;
     free_list_.resize(kSlabSizeKBTabLen);
 #if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
     !defined(USE_ASCEND_HETEROGENEOUS)

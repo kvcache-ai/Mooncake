@@ -300,7 +300,7 @@ class Client {
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
