@@ -18,7 +18,7 @@
 #include <cuda.h>
 #endif
 
-#ifdef USE_MUSA 
+#ifdef USE_MUSA
 #include <musa_porting.h>
 #endif
 

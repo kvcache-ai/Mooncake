@@ -44,11 +44,11 @@
 namespace mooncake {
 
 #ifdef USE_CUDA
-    const static std::string GPU_PREFIX = "cuda:";
+const static std::string GPU_PREFIX = "cuda:";
 #endif
 
 #ifdef USE_MUSA
-    const static std::string GPU_PREFIX = "musa:";
+const static std::string GPU_PREFIX = "musa:";
 #endif
 
 struct InfinibandDevice {

@@ -86,8 +86,7 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
-           device_names +
-           "], []]}";
+           device_names + "], []]}";
 }
 
 static void *allocateMemoryPool(size_t size, int socket_id,

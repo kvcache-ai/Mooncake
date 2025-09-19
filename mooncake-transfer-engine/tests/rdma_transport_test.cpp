@@ -89,11 +89,11 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 using namespace mooncake;
 
 #ifdef USE_CUDA
-    const static std::string GPU_PREFIX = "cuda:";
+const static std::string GPU_PREFIX = "cuda:";
 #endif
 
 #ifdef USE_MUSA
-    const static std::string GPU_PREFIX = "musa:";
+const static std::string GPU_PREFIX = "musa:";
 #endif
 
 static void *allocateMemoryPool(size_t size, int socket_id,
@@ -247,8 +247,7 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
-           device_names +
-           "], []]}";
+           device_names + "], []]}";
 }
 
 int initiator() {

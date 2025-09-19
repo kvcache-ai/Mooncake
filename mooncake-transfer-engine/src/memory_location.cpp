@@ -24,14 +24,6 @@
 
 namespace mooncake {
 
-#ifdef USE_CUDA
-    const static std::string GPU_PREFIX = "cuda:";
-#endif
-
-#ifdef USE_MUSA
-    const static std::string GPU_PREFIX = "musa:";
-#endif
-
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
 
 std::string genCpuNodeName(int node) {
@@ -40,7 +32,13 @@ std::string genCpuNodeName(int node) {
 }
 
 std::string genGpuNodeName(int node) {
-    if (node >= 0) return GPU_PREFIX + std::to_string(node);
+    if (node >= 0) {
+        std::string gpuNodeName = "cuda:" + std::to_string(node);
+#ifdef USE_MUSA
+        gpuNodeName = "musa:" + std::to_string(node);
+#endif
+        return gpuNodeName;
+    }
     return kWildcardLocation;
 }
 
