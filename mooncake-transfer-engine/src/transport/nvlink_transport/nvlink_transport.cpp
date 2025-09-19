@@ -137,13 +137,16 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 //                   << ", num_devices: " << num_devices;
 //     }
 
-//     for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
-//         for (int dst_device_id = src_device_id + 1; dst_device_id < num_devices;
+//     for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id)
+//     {
+//         for (int dst_device_id = src_device_id + 1; dst_device_id <
+//         num_devices;
 //              ++dst_device_id) {
 //             if (enableP2PAccess(src_device_id, dst_device_id)) {
 //                 if (globalConfig().trace) {
 //                     LOG(INFO)
-//                         << "NvlinkTransport: enabled p2p access between device "
+//                         << "NvlinkTransport: enabled p2p access between
+//                         device "
 //                         << src_device_id << " and " << dst_device_id;
 //                 }
 //             } else {
