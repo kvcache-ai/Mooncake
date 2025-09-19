@@ -20,6 +20,10 @@ endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
+include_directories("../mooncake-transfer-engine/include")
+
+# Find Python for pybind11 integration
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -30,7 +34,10 @@ message("${PYTHON_SYS_PATH}")
 set(PYTHON_PACKAGE_NAME "mooncake")
 
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp 
+    transfer_engine/transfer_engine_py.cpp )
+
+target_include_directories(engine PRIVATE 
+    ${Python3_INCLUDE_DIRS}
 )
 
 target_link_libraries(engine PUBLIC 
