@@ -60,6 +60,8 @@ class TcpTransport : public Transport {
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo);
 
+    int startHandshakeDaemon();
+
     int allocateLocalSegmentID(int tcp_data_port);
 
     int registerLocalMemory(void *addr, size_t length,
