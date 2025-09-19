@@ -236,21 +236,25 @@ ErrorCode Client::InitTransferEngine(
     const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
     bool auto_discover = get_auto_discover();
-    transfer_engine_.setAutoDiscover(auto_discover);
-
-    auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
-                                   hostname, port);
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
-        return ErrorCode::INTERNAL_ERROR;
+    if (g_transfer_engine) {
+        transfer_engine_= g_transfer_engine;
+        LOG(INFO) << "Pooling multiplexing transferEngine";
+    } else {
+        auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        int rc = transfer_engine_->init(metadata_connstring, local_hostname,
+                                        hostname, port);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        g_transfer_engine = transfer_engine_;
     }
-
+    transfer_engine_->setAutoDiscover(auto_discover);
     if (auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
                   << protocol;
         auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_.setWhitelistFilters(std::move(filters));
+        transfer_engine_->setWhitelistFilters(std::move(filters));
     } else {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
@@ -271,7 +275,7 @@ ErrorCode Client::InitTransferEngine(
                 splitString(device_names.value(), ',', /*skip_empty=*/true);
 
             // Manually discover topology with specified devices only
-            auto topology = transfer_engine_.getLocalTopology();
+            auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
                 topology->discover(devices);
                 LOG(INFO) << "Topology discovery complete with specified "
@@ -279,7 +283,7 @@ ErrorCode Client::InitTransferEngine(
                           << topology->getHcaList().size() << " HCAs";
             }
 
-            transport = transfer_engine_.installTransport("rdma", nullptr);
+            transport = transfer_engine_->installTransport("rdma", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install RDMA transport with specified "
                               "devices";
@@ -292,7 +296,7 @@ ErrorCode Client::InitTransferEngine(
             }
 
             try {
-                transport = transfer_engine_.installTransport("tcp", nullptr);
+                transport = transfer_engine_->installTransport("tcp", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "tcp_transport_install_failed error_message=\""
                            << e.what() << "\"";
@@ -310,7 +314,7 @@ ErrorCode Client::InitTransferEngine(
             }
             try {
                 transport =
-                    transfer_engine_.installTransport("ascend", nullptr);
+                    transfer_engine_->installTransport("ascend", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "ascend_transport_install_failed error_message=\""
                            << e.what() << "\"";
@@ -329,7 +333,7 @@ ErrorCode Client::InitTransferEngine(
 
     // Initialize TransferSubmitter after transfer engine is ready
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_,
+        *transfer_engine_, local_hostname, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -339,8 +343,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry) {
-    auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+    std::string local_name = local_hostname;
+    if (g_transfer_engine) {
+        local_name = g_transfer_engine->local_server_name_;
+        LOG(INFO) << "Pooling multiplexing local_name:" << local_name;
+    }
+    LOG(INFO) << "master_server_entry:" << master_server_entry;
+    auto client = std::shared_ptr<Client>(new Client(local_name, metadata_connstring));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1127,7 +1136,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory(
+    int rc = transfer_engine_->registerLocalMemory(
         (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
@@ -1177,7 +1186,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_.unregisterLocalMemory(
+    int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
@@ -1201,7 +1210,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
-    if (this->transfer_engine_.registerLocalMemory(
+    if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1210,7 +1219,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_.unregisterLocalMemory(addr, update_metadata) !=
+    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }

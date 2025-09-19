@@ -546,7 +546,43 @@ PYBIND11_MODULE(store, m) {
             py::arg("config") = ReplicateConfig{})
         .def("get_hostname", [](MooncakeStorePyWrapper &self) {
             return self.store_->get_hostname();
-        });
+        })
+        .def(
+            "batch_put_from_ascend",
+            [](MooncakeStorePyWrapper &self, const std::string key,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_ascend(key, buffers, sizes, config);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from pre-allocated buffers for "
+            "multiple "
+            "keys")
+        .def(
+            "batch_get_into_ascend",
+            [](MooncakeStorePyWrapper &self, const std::string key,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_ascend(key, buffers, sizes);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            "Get object data directly into pre-allocated buffers for "
+            "multiple "
+            "keys");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

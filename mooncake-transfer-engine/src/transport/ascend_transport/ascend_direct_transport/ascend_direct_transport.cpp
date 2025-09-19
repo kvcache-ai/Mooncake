@@ -423,6 +423,11 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->rank_info.hostIp = host_ip;
     int sockfd;
     desc->rank_info.hostPort = findAvailableTcpPort(sockfd);
+    if (desc->rank_info.hostPort == 0) {
+        LOG(ERROR) << "Find available port failed.";
+        return FAILED;
+    }
+    close(sockfd);
     local_adxl_engine_name_ =
         host_ip + ":" + std::to_string(desc->rank_info.hostPort);
 
