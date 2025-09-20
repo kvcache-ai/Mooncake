@@ -9,6 +9,9 @@ Heterogeneous Ascend Transport is a high-performance data transmission library d
 
 > Current version only supports WRITE semantics. READ semantics will be implemented in future releases.
 
+## Enhanced HBM-to-DRAM Data Transfer Optimization
+The copy bandwidth from HBM to DRAM is constrained by the size of data blocks. Small data blocks smaller than 2MB result in underutilized bandwidth. We have implemented an optimization using "data aggregation + pipeline parallelism": first, small data blocks are aggregated into 8MB blocks within HBM before being transferred to DRAM, while data copying and RDMA transmission are executed in parallel. This solution effectively hides the HBM-DRAM copy latency and significantly reduces the overall transmission time.
+
 ## Build Instructions
 The `USE_ASCEND_HETEROGENEOUS` compilation option has been added to `mooncake-common/common.cmake` to control this feature:
 
