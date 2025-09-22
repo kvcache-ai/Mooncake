@@ -312,10 +312,10 @@ void MooncakeEpBuffer::init_ibgda() {
         perror("Failed to reg mr");
     }
 
-    CUDA_CHECK(cudaMalloc(&ctrl_buf, ctrl_buf_size));
-    CUDA_CHECK(cudaMemset(ctrl_buf, 0, ctrl_buf_size));
+    CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
+    CUDA_CHECK(cudaMemset(ctrl_buf, 0, CTRL_BUF_SIZE));
     mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
-        ctx, ctrl_buf, ctrl_buf_size, IBV_ACCESS_LOCAL_WRITE);
+        ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
         fprintf(stderr,
@@ -323,7 +323,7 @@ void MooncakeEpBuffer::init_ibgda() {
                 "does not support GPUDirect RDMA.\n");
         exit(1);
     }
-    memheap* ctrl_buf_heap = memheap_create(ctrl_buf_size);
+    memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
         exit(1);

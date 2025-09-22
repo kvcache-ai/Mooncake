@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
@@ -17,7 +16,7 @@ class EventOverlap:
     """
 
     def __init__(self, event: Optional[ep.EventHandle] = None,
-                 extra_tensors: Optional[Tuple[torch.Tensor]] = None) -> None:
+                 extra_tensors: Optional[Tuple[torch.Tensor, ...]] = None) -> None:
         """
         Initialize the class.
 

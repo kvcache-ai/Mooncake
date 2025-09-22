@@ -71,7 +71,7 @@ struct MooncakeEpBuffer {
     void* gdr_buffer = nullptr;
 
     // IBGDA
-    const size_t ctrl_buf_size = 1024 * 1024 * 1024;  // 1024 MiB
+    constexpr size_t CTRL_BUF_SIZE = 1024 * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
     ibv_mr* mr;
     std::vector<mlx5gda_qp*> qps;
