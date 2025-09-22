@@ -328,8 +328,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Initialize TransferSubmitter after transfer engine is ready
+    // Keep using logical local_hostname for name-based behaviors; endpoint is
+    // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_,
+        transfer_engine_, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -1135,8 +1137,20 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    Segment segment(generate_uuid(), local_hostname_,
-                    reinterpret_cast<uintptr_t>(buffer), size);
+    // Build segment with logical name; attach TE endpoint for transport
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = local_hostname_;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.size = size;
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+    } else {
+        segment.te_endpoint = local_hostname_;
+    }
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {

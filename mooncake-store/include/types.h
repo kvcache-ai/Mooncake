@@ -168,16 +168,14 @@ const static uint64_t kMaxSliceSize =
  */
 struct Segment {
     UUID id{0, 0};
-    std::string name{};  // The name of the segment, also might be the
-                         // hostname of the server that owns the segment
+    std::string name{};  // Logical segment name used for preferred allocation
     uintptr_t base{0};
     size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
     Segment() = default;
-    Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size)
-        : id(id), name(name), base(base), size(size) {}
 };
-YLT_REFL(Segment, id, name, base, size);
+YLT_REFL(Segment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective

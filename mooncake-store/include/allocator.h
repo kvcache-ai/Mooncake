@@ -96,11 +96,12 @@ class AllocatedBuffer {
 
     // Represents the serializable state
     struct Descriptor {
-        std::string segment_name_;
         uint64_t size_;
         uintptr_t buffer_address_;
         BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+        std::string transport_endpoint_;
+        YLT_REFL(Descriptor, size_, buffer_address_, status_,
+                 transport_endpoint_);
     };
 
     void mark_complete() { status = BufStatus::COMPLETE; }
@@ -129,6 +130,7 @@ class BufferAllocatorBase {
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual std::string getTransportEndpoint() const = 0;
 
     /**
      * Returns the largest free region available in this allocator.
@@ -168,7 +170,8 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size);
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            std::string transport_endpoint);
 
     ~CachelibBufferAllocator() override;
 
@@ -179,6 +182,9 @@ class CachelibBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -195,6 +201,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -214,7 +221,8 @@ class OffsetBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
-    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size);
+    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
+                          std::string transport_endpoint);
 
     ~OffsetBufferAllocator() override;
 
@@ -225,6 +233,9 @@ class OffsetBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
 
     /**
      * Returns the actual largest free region from the offset allocator.
@@ -237,6 +248,7 @@ class OffsetBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
