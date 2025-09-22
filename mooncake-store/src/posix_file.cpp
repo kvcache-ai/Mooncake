@@ -1,11 +1,8 @@
-#include <string>
-#include <vector>
-#include <sys/uio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/file.h>
 #include <cerrno>
-#include <limits>
+#include <string>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <glog/logging.h>
 
 #include "file_interface.h"
 

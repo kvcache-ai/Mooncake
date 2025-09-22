@@ -52,7 +52,7 @@ AscendDirectTransport::~AscendDirectTransport() {
         for (auto &connected_segment : connected_segments_) {
             auto status =
                 adxl_->Disconnect(connected_segment.c_str(), connect_timeout_);
-            if (status != adxl::ADXL_SUCCESS) {
+            if (status != adxl::SUCCESS) {
                 LOG(ERROR) << "Failed to disconnect AdxlEngine:"
                            << connected_segment;
             } else {
@@ -67,7 +67,7 @@ AscendDirectTransport::~AscendDirectTransport() {
     std::lock_guard<std::mutex> mem_handle_lock(mem_handle_mutex_);
     for (const auto &[addr, mem_handle] : addr_to_mem_handle_) {
         auto status = adxl_->DeregisterMem(mem_handle);
-        if (status != adxl::ADXL_SUCCESS) {
+        if (status != adxl::SUCCESS) {
             LOG(ERROR) << "Failed to deregister memory at address " << addr;
         } else {
             LOG(INFO) << "Deregistered memory at address " << addr;
@@ -109,7 +109,13 @@ int AscendDirectTransport::install(std::string &local_server_name,
                    << ret;
         return ret;
     }
-
+    ret = aclrtCreateStreamWithConfig(
+        &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
+                   << ret;
+        return FAILED;
+    }
     // Start worker thread
     running_ = true;
     worker_thread_ = std::thread(&AscendDirectTransport::workerThread, this);
@@ -120,9 +126,7 @@ int AscendDirectTransport::InitAdxlEngine() {
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     std::string host_ip = local_segment_desc->rank_info.hostIp;
     uint16_t host_port = local_segment_desc->rank_info.hostPort;
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
-    adxl_ = std::make_unique<adxl::AdxlEngine>(adxl_engine_name);
+    adxl_ = std::make_unique<adxl::AdxlEngine>();
     if (!adxl_) return ERR_MEMORY;
     std::map<adxl::AscendString, adxl::AscendString> options;
     char *rdma_tc = std::getenv("ASCEND_RDMA_TC");
@@ -147,8 +151,16 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
         }
     }
-    auto status = adxl_->Initialize(options);
-    if (status != adxl::ADXL_SUCCESS) {
+    char *buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+    if (buffer_pool) {
+        options["adxl.BufferPool"] = buffer_pool;
+        LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
+        use_buffer_pool_ = true;
+    }
+    auto adxl_engine_name =
+        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    auto status = adxl_->Initialize(adxl_engine_name, options);
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
         return -1;
     }
@@ -293,25 +305,45 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     mem_desc.addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr));
     mem_desc.len = length;
     adxl::MemType mem_type;
-    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
-              << ", length:" << length << ", location:" << location;
-    if (location.starts_with("cpu:")) {
+    if (location.starts_with("cpu")) {
         mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu:") || location == kWildcardLocation) {
+    } else if (location.starts_with("npu")) {
         mem_type = adxl::MEM_DEVICE;
+    } else if (location == kWildcardLocation) {
+        aclrtPtrAttributes attributes;
+        ret = aclrtPointerGetAttributes(addr, &attributes);
+        if (ret != ACL_SUCCESS) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+            return -1;
+        }
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+            mem_type = adxl::MEM_HOST;
+        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            mem_type = adxl::MEM_DEVICE;
+        } else {
+            LOG(ERROR) << "location:" << location << " is not supported.";
+            return ERR_INVALID_ARGUMENT;
+        }
     } else {
         LOG(ERROR) << "location:" << location << " is not supported.";
         return ERR_INVALID_ARGUMENT;
     }
+    LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
+              << ", length:" << length << ", location:" << location
+              << ", mem type:" << mem_type;
     ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: "
                    << ret;
         return ret;
     }
+    // memory type is HOST and use buffer pool, do not register to ADXL
+    if (mem_type == adxl::MEM_HOST && use_buffer_pool_) {
+        return 0;
+    }
     adxl::MemHandle mem_handle;
     auto adxl_ret = adxl_->RegisterMem(mem_desc, mem_type, mem_handle);
-    if (adxl_ret != adxl::ADXL_SUCCESS) {
+    if (adxl_ret != adxl::SUCCESS) {
         LOG(ERROR) << "adxl_ret:" << adxl_ret << ".";
         return -1;
     }
@@ -391,6 +423,13 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->rank_info.hostIp = host_ip;
     int sockfd;
     desc->rank_info.hostPort = findAvailableTcpPort(sockfd);
+    if (desc->rank_info.hostPort == 0) {
+        LOG(ERROR) << "Find available port failed.";
+        return FAILED;
+    }
+    close(sockfd);
+    local_adxl_engine_name_ =
+        host_ip + ":" + std::to_string(desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -450,15 +489,6 @@ void AscendDirectTransport::processSliceList(
     auto target_adxl_engine_name =
         (target_segment_desc->rank_info.hostIp + ":" +
          std::to_string(target_segment_desc->rank_info.hostPort));
-    int ret = checkAndConnect(target_adxl_engine_name);
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to connect to segment: "
-                   << target_segment_desc->name;
-        for (auto &slice : slice_list) {
-            slice->markFailed();
-        }
-        return;
-    }
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;
@@ -466,6 +496,19 @@ void AscendDirectTransport::processSliceList(
         operation = adxl::READ;
     } else {
         LOG(ERROR) << "Unsupported opcode: " << slice_list[0]->opcode;
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+        return;
+    }
+    if (target_adxl_engine_name == local_adxl_engine_name_) {
+        VLOG(1) << "Target is local, use memory copy.";
+        return localCopy(slice_list[0]->opcode, slice_list);
+    }
+    int ret = checkAndConnect(target_adxl_engine_name);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to connect to segment: "
+                   << target_segment_desc->name;
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -483,7 +526,7 @@ void AscendDirectTransport::processSliceList(
     }
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
-    if (status == adxl::ADXL_SUCCESS) {
+    if (status == adxl::SUCCESS) {
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
@@ -498,6 +541,96 @@ void AscendDirectTransport::processSliceList(
     }
 }
 
+void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
+                                      const std::vector<Slice *> &slice_list) {
+    std::vector<Slice *> async_list;
+    for (auto &slice : slice_list) {
+        auto local_ptr = slice->source_addr;
+        auto remote_ptr =
+            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+        aclrtPtrAttributes attributes;
+        auto ret = aclrtPointerGetAttributes(slice->source_addr, &attributes);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+            slice->markFailed();
+            continue;
+        }
+        aclrtPtrAttributes dst_attributes;
+        ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+            slice->markFailed();
+            continue;
+        }
+        if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
+            attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+            LOG(ERROR) << "location of local addr is not supported.";
+            slice->markFailed();
+            continue;
+        }
+        if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
+            dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+            LOG(ERROR) << "location of remote addr is not supported.";
+            slice->markFailed();
+            continue;
+        }
+        aclrtMemcpyKind kind;
+        auto len = slice->length;
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
+            dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+            ret = aclrtMemcpy(remote_ptr, len, local_ptr, len,
+                              ACL_MEMCPY_HOST_TO_HOST);
+            if (ret == ACL_ERROR_NONE) {
+                slice->markSuccess();
+            } else {
+                LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
+                slice->markFailed();
+            }
+            continue;
+        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
+                   dst_attributes.location.type ==
+                       ACL_MEM_LOCATION_TYPE_DEVICE) {
+            kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
+        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+            kind = (opcode == TransferRequest::WRITE)
+                       ? ACL_MEMCPY_HOST_TO_DEVICE
+                       : ACL_MEMCPY_DEVICE_TO_HOST;
+        } else {
+            kind = (opcode == TransferRequest::WRITE)
+                       ? ACL_MEMCPY_DEVICE_TO_HOST
+                       : ACL_MEMCPY_HOST_TO_DEVICE;
+        }
+        if (opcode == TransferRequest::WRITE) {
+            ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
+                                   stream_);
+        } else {
+            ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind,
+                                   stream_);
+        }
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
+            slice->markFailed();
+            continue;
+        }
+        async_list.emplace_back(slice);
+    }
+    auto ret = aclrtSynchronizeStreamWithTimeout(stream_, transfer_timeout_);
+    if (ret == ACL_ERROR_NONE) {
+        for (auto &slice : async_list) {
+            slice->markSuccess();
+        }
+    } else {
+        LOG(ERROR) << "Memory copy timeout.";
+        ret = aclrtStreamAbort(stream_);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to abort stream, ret:" << ret;
+        }
+        for (auto &slice : async_list) {
+            slice->markFailed();
+        }
+    }
+}
+
 int AscendDirectTransport::checkAndConnect(
     const std::string &target_adxl_engine_name) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
@@ -509,7 +642,7 @@ int AscendDirectTransport::checkAndConnect(
     }
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
-    if (status != adxl::ADXL_SUCCESS) {
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to connect to target: " << target_adxl_engine_name
                    << ", status: " << status;
         return -1;
@@ -530,7 +663,7 @@ int AscendDirectTransport::disconnect(
     }
     auto status =
         adxl_->Disconnect(target_adxl_engine_name.c_str(), timeout_in_millis);
-    if (status != adxl::ADXL_SUCCESS) {
+    if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
                    << ", status: " << status;
         connected_segments_.erase(target_adxl_engine_name);

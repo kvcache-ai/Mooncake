@@ -27,6 +27,12 @@ This repository also hosts its technical report and the open sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+ - **Sept 10, 2025**: SGLang officially supports Mooncake Store as a [hierarchical KV caching storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/). The integration extends RadixAttention with multi-tier KV cache storage across device, host, and remote storage layers.
+ - **Sept 10, 2025**: The official & high-performance version of Mooncake P2P Store is open-sourced as [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine/). It has been successfully applied in K1.5 and K2 production training, updating Kimi-K2 model (1T parameters) across thousands of GPUs in ~20s.
+ - **Aug 23, 2025**: [xLLM](https://github.com/jd-opensource/xllm) high-performance inference engine builds hybrid KV cache management based on Mooncake, supporting global KV cache management with intelligent offloading and prefetching.
+ - **Aug 18, 2025**: vLLM-Ascend [integrates Mooncake Transfer Engine](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/mooncake_connector_deployment_guide.md) for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
+ - **Jul 20, 2025**: Mooncake powers [the deployment of Kimi K2](https://lmsys.org/blog/2025-07-20-k2-large-scale-ep/) on 128 H200 GPUs with PD disaggregation and large-scale expert parallelism, achieving 224k tokens/sec prefill throughput and 288k tokens/sec decode throughput.
+ - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmdeploy-integration-v0.9.md) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
  - **May 8, 2025**: Mooncake x LMCache <a href="https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmcache-integration.md" target="_blank">unite</a> to pioneer KVCache-centric LLM serving system.
  - **May 5, 2025**: Supported by Mooncake Team, SGLang release <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/" target="_blank">guidance</a> to deploy DeepSeek with PD Disaggregation on 96 H100 GPUs.
@@ -37,7 +43,7 @@ This repository also hosts its technical report and the open sourced traces.
  - **Feb 21, 2025**: The updated <a href="https://github.com/kvcache-ai/Mooncake/tree/main/FAST25-release/traces" target="_blank">traces</a> used in our FAST'25 paper have been released.
  - **Dec 16, 2024**: vLLM officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
  - **Nov 28, 2024**: We open sourced the Transfer Engine, the central component of Mooncake. We also provide two demonstrations of Transfer Engine: a P2P Store and vLLM integration.
- - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/mooncake_trace.jsonl" target="_blank">jsonl file</a>.
+ - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl" target="_blank">jsonl file</a>.
  - **June 27, 2024**: We present a series of Chinese blogs with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/705910725">2</a>, <a href="https://zhuanlan.zhihu.com/p/706204757">3</a>, <a href="https://zhuanlan.zhihu.com/p/707997501">4</a>.
  - **June 26, 2024**: Initial technical report release.
 
@@ -50,11 +56,13 @@ This repository also hosts its technical report and the open sourced traces.
 :maxdepth: 2
 
 getting_started/build
+getting_started/quick-start
+getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
-getting_started/examples/vllm-integration-v0.2
-getting_started/examples/vllm-integration-v1
+getting_started/examples/sglang-integration/hicache-integration-v1
+getting_started/examples/vllm-integration/index
 :::
 
 % Making the most out of Mooncake
@@ -66,15 +74,18 @@ getting_started/examples/vllm-integration-v1
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
+performance/sglang-hicache-benchmark-results-v1
+performance/allocator-benchmark-result.md
 :::
 
 % API Documentation
 
 :::{toctree}
-:caption: Mooncake Store API
+:caption: Python API Reference
 :maxdepth: 1
 
-mooncake-store-api/python-binding
+python-api-reference/mooncake-store
+python-api-reference/transfer-engine
 :::
 
 % Explanation of Mooncake internals
@@ -84,18 +95,9 @@ mooncake-store-api/python-binding
 :maxdepth: 1
 
 design/architecture
-design/mooncake-store-preview
+design/mooncake-store
 design/p2p-store
 design/transfer-engine
-:::
-
-:::{toctree}
-:caption: V1 Design Documents
-:maxdepth: 2
-
-design/v1/torch_compile
-design/v1/prefix_caching
-design/v1/metrics
 :::
 
 % Q&A for Mooncake
@@ -106,4 +108,13 @@ design/v1/metrics
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
+:::
+
+% Deployment docs
+
+:::{toctree}
+:caption: Deployment
+:maxdepth: 1
+
+deployment/mooncake-store-deployment-guide
 :::

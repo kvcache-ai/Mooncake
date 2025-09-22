@@ -47,10 +47,29 @@ if (USE_CUDA)
   endif()
 endif()
 
-if (USE_ASCEND OR USE_ASCEND_DIRECT)
-  if (USE_ASCEND)
-    target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+if (USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+endif()
+
+if (USE_ASCEND_DIRECT)
+  find_library(
+          FOUND_METADEF
+          NAMES libmetadef.so
+          PATHS ${ASCEND_LIB_DIR}
+          NO_DEFAULT_PATH
+          NO_CMAKE_FIND_ROOT_PATH
+  )
+  if(FOUND_METADEF)
+    message(STATUS "Found library: ${FOUND_METADEF}")
+    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist metadef)
   else()
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl adxl metadef)
+    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
   endif()
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  link_directories(${ASCEND_LIB_DIR})
+  target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
 endif()

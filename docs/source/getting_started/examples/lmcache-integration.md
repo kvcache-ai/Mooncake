@@ -17,7 +17,13 @@ LMCache is an open-source Knowledge Delivery Network (KDN), specifically designe
 This strategic alliance delivers substantial mutual technological advancements:
 
 *   **LMCache Integrates Mooncake for Enhanced Performance**: LMCache leverages Mooncake’s advanced transfer engine and KVCache storage solutions, significantly enhancing data distribution efficiency and overall system performance.
-*   **Mooncake Integrates LMCache for Enhanced Functionality**: Mooncake now includes LMCache as its KVCache management layer, benefiting from LMCache’s flexible cache control mechanisms and future-oriented functionalities, such as CacheBlend. This integration enables Mooncake to offer more sophisticated features and improved operational flexibility.
+*   **Mooncake Integrates LMCache for Enhanced Functionality**: Mooncake now includes LMCache as its KVCache management layer, benefiting from LMCache's flexible cache control mechanisms and future-oriented functionalities, such as CacheBlend. This integration enables Mooncake to offer more sophisticated features and improved operational flexibility.
+
+## Getting Started
+
+For a complete deployment guide with step-by-step instructions, see:
+
+👉 **[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](vllm-integration/vllmv1-lmcache-integration.md)**
 
 ## Performance Benchmarking and Results
 

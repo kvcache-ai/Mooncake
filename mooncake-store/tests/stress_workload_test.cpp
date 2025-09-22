@@ -94,13 +94,10 @@ void cleanup_segment() {
 }
 
 bool initialize_client() {
-    void** args =
-        (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-
     auto client_opt = Client::Create(
         FLAGS_local_hostname,              // Local hostname
         FLAGS_metadata_connection_string,  // Metadata connection string
-        FLAGS_protocol, args, FLAGS_master_address);
+        FLAGS_protocol, FLAGS_master_address);
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";

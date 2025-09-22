@@ -2,6 +2,7 @@
 
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
+#include <numa.h>
 
 #include "pybind_client.h"
 
@@ -16,10 +17,12 @@ namespace mooncake {
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
-    PyClient store_;
+    std::shared_ptr<PyClient> store_{nullptr};
+
+    MooncakeStorePyWrapper() : store_(PyClient::create()) {}
 
     pybind11::bytes get(const std::string &key) {
-        if (!store_.client_) {
+        if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
         }
@@ -28,7 +31,7 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto buffer_handle = store_.get_buffer(key);
+            auto buffer_handle = store_->get_buffer(key);
             if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
                 return kNullString;
@@ -43,7 +46,7 @@ class MooncakeStorePyWrapper {
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
         const auto kNullString = pybind11::bytes("\\0", 0);
-        if (!store_.client_) {
+        if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
@@ -51,7 +54,7 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto batch_data = store_.batch_get_buffer(keys);
+            auto batch_data = store_->batch_get_buffer(keys);
             if (batch_data.empty()) {
                 py::gil_scoped_acquire acquire_gil;
                 return {kNullString};
@@ -72,59 +75,21 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::object get_tensor(const std::string &key) {
-        if (!store_.client_) {
+        if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
         }
 
         try {
-            // Query object info first
-            auto query_result = store_.client_->Query(key);
-            if (!query_result) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Query failed: " << query_result.error();
-                return pybind11::none();
-            }
-
-            std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
-            if (replica_list.empty()) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(INFO) << "No replicas found for key: " << key;
-                return pybind11::none();
-            }
-
-            const auto &replica = replica_list[0];
-            uint64_t total_length = calculate_total_size(replica);
-
-            if (total_length == 0) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Failed to allocate slices for key: " << key;
-                return pybind11::none();
-            }
-
-            // Allocate buffer using the new allocator
-            auto alloc_result =
-                store_.client_buffer_allocator_->allocate(total_length);
-            if (!alloc_result) {
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
+            auto buffer_handle = store_->get_buffer(key);
+            if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
                 return pybind11::none();
             }
-
-            auto &buffer_handle = *alloc_result;
-
-            // Create slices for the allocated buffer
-            std::vector<Slice> slices;
-            allocateSlices(slices, replica, buffer_handle);
-
-            // Get the object data
-            auto get_result = store_.client_->Get(key, query_result.value(), slices);
-            if (!get_result) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Get failed for key: " << key;
-                return pybind11::none();
-            }
-
             // Create contiguous buffer and copy data
+            auto total_length = buffer_handle->size();
             char *exported_data = new char[total_length];
             if (!exported_data) {
                 py::gil_scoped_acquire acquire_gil;
@@ -133,9 +98,8 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
             TensorMetadata metadata;
-
             // Copy data from buffer to contiguous memory
-            memcpy(exported_data, buffer_handle.ptr(), total_length);
+            memcpy(exported_data, buffer_handle->ptr(), total_length);
             memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
             if (metadata.ndim < 0 || metadata.ndim > 4) {
@@ -161,6 +125,7 @@ class MooncakeStorePyWrapper {
                 return pybind11::none();
             }
 
+            py::gil_scoped_acquire acquire_gil;
             // Convert bytes to tensor using torch.from_numpy
             pybind11::object np_array;
             int dtype_index = static_cast<int>(dtype_enum);
@@ -169,7 +134,6 @@ class MooncakeStorePyWrapper {
                 np_array = array_creators[dtype_index](
                     exported_data, sizeof(TensorMetadata), tensor_size);
             } else {
-                py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
                 return pybind11::none();
             }
@@ -182,19 +146,18 @@ class MooncakeStorePyWrapper {
                 py::tuple shape_tuple = py::cast(shape_vec);
                 np_array = np_array.attr("reshape")(shape_tuple);
             }
-            py::gil_scoped_acquire acquire_gil;
-            pybind11::object tensor = torch.attr("from_numpy")(np_array);
+            pybind11::object tensor =
+                torch_module().attr("from_numpy")(np_array);
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
-            py::gil_scoped_acquire acquire_gil;
             LOG(ERROR) << "Failed to get tensor data: " << e.what();
             return pybind11::none();
         }
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
-        if (!store_.client_) {
+        if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return -static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
@@ -241,6 +204,8 @@ class MooncakeStorePyWrapper {
                 }
             }
 
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
             char *buffer = reinterpret_cast<char *>(data_ptr);
             char *metadata_buffer = reinterpret_cast<char *>(&metadata);
             std::vector<std::span<const char>> values;
@@ -248,21 +213,8 @@ class MooncakeStorePyWrapper {
                 std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
             values.emplace_back(std::span<const char>(buffer, tensor_size));
 
-            auto register_result = store_.register_buffer_internal(
-                reinterpret_cast<void *>(data_ptr), tensor_size);
-            if (!register_result) {
-                return -static_cast<int>(register_result.error());
-            }
-
             // Use put_parts to put metadata and tensor together
-            auto put_result = store_.put_parts_internal(key, values);
-
-            auto unregister_result = store_.unregister_buffer_internal(
-                reinterpret_cast<void *>(data_ptr));
-            if (!unregister_result) {
-                LOG(WARNING) << "Failed to unregister buffer after put_tensor";
-            }
-
+            auto put_result = store_->put_parts_internal(key, values);
             if (!put_result) {
                 return -static_cast<int>(put_result.error());
             }
@@ -338,17 +290,20 @@ PYBIND11_MODULE(store, m) {
                 const std::string &protocol = "tcp",
                 const std::string &rdma_devices = "",
                 const std::string &master_server_addr = "127.0.0.1:50051") {
-                 return self.store_.setup(local_hostname, metadata_server,
-                                          global_segment_size,
-                                          local_buffer_size, protocol,
-                                          rdma_devices, master_server_addr);
+                 if (!self.store_) {
+                     self.store_ = PyClient::create();
+                 }
+                 return self.store_->setup(local_hostname, metadata_server,
+                                           global_segment_size,
+                                           local_buffer_size, protocol,
+                                           rdma_devices, master_server_addr);
              })
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16) {
-                 return self.store_.initAll(protocol, device_name,
-                                            mount_segment_size);
+                 return self.store_->initAll(protocol, device_name,
+                                             mount_segment_size);
              })
         .def("get", &MooncakeStorePyWrapper::get)
         .def("get_batch", &MooncakeStorePyWrapper::get_batch)
@@ -356,7 +311,7 @@ PYBIND11_MODULE(store, m) {
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
                 py::gil_scoped_release release;
-                return self.store_.get_buffer(key);
+                return self.store_->get_buffer(key);
             },
             py::return_value_policy::take_ownership)
         .def(
@@ -364,19 +319,19 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                return self.store_.batch_get_buffer(keys);
+                return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
         .def("remove",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
-                 return self.store_.remove(key);
+                 return self.store_->remove(key);
              })
         .def(
             "remove_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str) {
                 py::gil_scoped_release release;
-                return self.store_.removeByRegex(str);
+                return self.store_->removeByRegex(str);
             },
             py::arg("regex_pattern"),
             "Removes objects from the store whose keys match the given "
@@ -384,31 +339,34 @@ PYBIND11_MODULE(store, m) {
         .def("remove_all",
              [](MooncakeStorePyWrapper &self) {
                  py::gil_scoped_release release;
-                 return self.store_.removeAll();
+                 return self.store_->removeAll();
              })
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
-                 return self.store_.isExist(key);
+                 return self.store_->isExist(key);
              })
         .def(
             "batch_is_exist",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                return self.store_.batchIsExist(keys);
+                return self.store_->batchIsExist(keys);
             },
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
-                 return self.store_.tearDownAll();
+                 if (!self.store_) return 0;
+                 int rc = self.store_->tearDownAll();
+                 self.store_.reset();
+                 return rc;
              })
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
-                 return self.store_.getSize(key);
+                 return self.store_->getSize(key);
              })
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
              "Get a PyTorch tensor from the store")
@@ -421,7 +379,7 @@ PYBIND11_MODULE(store, m) {
                 // Register memory buffer for RDMA operations
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_.register_buffer(buffer, size);
+                return self.store_->register_buffer(buffer, size);
             },
             py::arg("buffer_ptr"), py::arg("size"),
             "Register a memory buffer for direct access operations")
@@ -431,7 +389,7 @@ PYBIND11_MODULE(store, m) {
                 // Unregister memory buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_.unregister_buffer(buffer);
+                return self.store_->unregister_buffer(buffer);
             },
             py::arg("buffer_ptr"),
             "Unregister a previously registered memory "
@@ -443,7 +401,7 @@ PYBIND11_MODULE(store, m) {
                 // Get data directly into user-provided buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_.get_into(key, buffer, size);
+                return self.store_->get_into(key, buffer, size);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
@@ -459,7 +417,7 @@ PYBIND11_MODULE(store, m) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_.batch_get_into(keys, buffers, sizes);
+                return self.store_->batch_get_into(keys, buffers, sizes);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             "Get object data directly into pre-allocated buffers for "
@@ -473,7 +431,7 @@ PYBIND11_MODULE(store, m) {
                 // Put data directly from user-provided buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_.put_from(key, buffer, size, config);
+                return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
@@ -490,7 +448,7 @@ PYBIND11_MODULE(store, m) {
                 void *metadata_buffer =
                     reinterpret_cast<void *>(metadata_buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_.put_from_with_metadata(
+                return self.store_->put_from_with_metadata(
                     key, buffer, metadata_buffer, size, metadata_size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"),
@@ -511,7 +469,8 @@ PYBIND11_MODULE(store, m) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_.batch_put_from(keys, buffers, sizes, config);
+                return self.store_->batch_put_from(keys, buffers, sizes,
+                                                   config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             py::arg("config") = ReplicateConfig{},
@@ -525,7 +484,7 @@ PYBIND11_MODULE(store, m) {
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
-                return self.store_.put(
+                return self.store_->put(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
                                           static_cast<size_t>(info.size)),
@@ -558,7 +517,7 @@ PYBIND11_MODULE(store, m) {
 
                 // 2) Call C++ function
                 py::gil_scoped_release unlock;
-                return self.store_.put_parts(key, spans, config);
+                return self.store_->put_parts(key, spans, config);
             },
             py::arg("key"), py::arg("config") = ReplicateConfig{})
         .def(
@@ -581,13 +540,41 @@ PYBIND11_MODULE(store, m) {
                 }
 
                 py::gil_scoped_release release;
-                return self.store_.put_batch(keys, spans, config);
+                return self.store_->put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
         .def("get_hostname", [](MooncakeStorePyWrapper &self) {
-            return self.store_.get_hostname();
+            return self.store_->get_hostname();
         });
+
+    // Expose NUMA binding as a module-level function (no self required)
+    m.def(
+        "bind_to_numa_node",
+        [](int node) {
+            if (numa_available() < 0) {
+                LOG(WARNING)
+                    << "NUMA is not available on this system; binding skipped";
+                return;
+            }
+
+            int max_node = numa_max_node();
+            if (node < 0 || node > max_node) {
+                LOG(WARNING) << "Invalid NUMA node: " << node
+                             << ". Valid range: 0-" << max_node;
+            }
+
+            if (numa_run_on_node(node) != 0) {
+                LOG(WARNING) << "numa_run_on_node failed for node " << node;
+            }
+
+            // Prefer this NUMA node for future allocations but allow fallback
+            numa_set_bind_policy(0);  // non-strict binding
+            numa_set_preferred(node);
+        },
+        py::arg("node"),
+        "Bind the current thread and memory allocation preference to the "
+        "specified NUMA node");
 }
 
 }  // namespace mooncake

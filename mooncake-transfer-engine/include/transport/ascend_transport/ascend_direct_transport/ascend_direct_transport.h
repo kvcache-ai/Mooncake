@@ -81,6 +81,9 @@ class AscendDirectTransport : public Transport {
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
+    void localCopy(TransferRequest::OpCode opcode,
+                   const std::vector<Slice *> &slice_list);
+
    private:
     int InitAdxlEngine();
 
@@ -108,6 +111,9 @@ class AscendDirectTransport : public Transport {
     aclrtContext rt_context_{nullptr};
     int32_t connect_timeout_ = 3000;
     int32_t transfer_timeout_ = 3000;
+    std::string local_adxl_engine_name_{};
+    aclrtStream stream_{};
+    bool use_buffer_pool_{false};
 };
 
 }  // namespace mooncake

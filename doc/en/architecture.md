@@ -1,10 +1,10 @@
 # Mooncake Architecture
 
-Mooncake aims to enhance the inference efficiency of large language models (LLMs), especially in slow object storage environments, by constructing a multi-level caching pool on high-speed interconnected DRAM/SSD resources. Compared to traditional caching, Mooncake utilizes (GPUDirect) RDMA technology to transfer data directly from the initiator's DRAM/VRAM to the target's DRAM/SSD in a zero-copy manner, while maximizing the use of multi-NIC resources on a single machine.
+Mooncake aims to enhance the inference efficiency of large language models (LLMs), especially in slow object storage environments, by constructing a multi-level caching pool on high-speed interconnected DRAM/SSD resources. Compared to traditional caching system, Mooncake utilizes (GPUDirect) RDMA technology to transfer data directly from the initiator's DRAM/VRAM to the target's DRAM/VRAM in a zero-copy manner, while maximizing the use of multi-NIC resources on a single machine.
 
 Mooncake:
 - provides object-level data storage services
-- supports data replication in the cache layer, with a lightweight design due to not guaranteeing high availability
+- supports data replication in the cache layer with slice-level placement guarantees and best-effort allocation, with a lightweight design due to not guaranteeing high availability
 - ensures the atomicity of object write operations, meaning a `Get` operation will always read one consistent version, but not necessarily the latest one
 - supports striping and parallel I/O transfer for larger objects to utilize the aggregated bandwidth of multiple network cards
 - supports multiple modes for flushing slow object storage

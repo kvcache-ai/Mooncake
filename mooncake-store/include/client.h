@@ -18,6 +18,7 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 
@@ -52,7 +53,9 @@ class Client {
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
-     * @param protocol_args Protocol-specific arguments
+     * @param device_names Comma-separated RDMA device names.
+     *        Optional with default auto-discovery. Only required when
+     *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
      *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
      *        HA mode)
@@ -62,7 +65,7 @@ class Client {
     static std::optional<std::shared_ptr<Client>> Create(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
-        void** protocol_args,
+        const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress);
 
     /**
@@ -91,6 +94,12 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(
         const std::string& object_key);
 
+    /**
+     * @brief Queries replica lists for object keys that match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
@@ -159,6 +168,12 @@ class Client {
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
+    /**
+     * @brief Removes objects from the store whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
     tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
     /**
@@ -241,6 +256,10 @@ class Client {
         return str;
     }
 
+    [[nodiscard]] std::string GetTransportEndpoint() {
+        return transfer_engine_.getLocalIpAndPort();
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -252,10 +271,10 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    ErrorCode InitTransferEngine(const std::string& local_hostname,
-                                 const std::string& metadata_connstring,
-                                 const std::string& protocol,
-                                 void** protocol_args);
+    ErrorCode InitTransferEngine(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names);
     ErrorCode TransferData(const Replica::Descriptor& replica,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -323,7 +342,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
     // Client identification
     UUID client_id_;

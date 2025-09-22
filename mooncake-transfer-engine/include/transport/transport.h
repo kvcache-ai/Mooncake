@@ -200,7 +200,13 @@ class Transport {
         BatchID batch_id = 0;
 
         // record the origin request
+#ifdef USE_ASCEND_HETEROGENEOUS
+        // need to modify the request's source address, changing it from an NPU
+        // address to a CPU address.
+        TransferRequest *request = nullptr;
+#else
         const TransferRequest *request = nullptr;
+#endif
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {

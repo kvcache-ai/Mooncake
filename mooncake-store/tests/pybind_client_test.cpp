@@ -6,12 +6,10 @@
 #include <string>
 
 #include "pybind_client.h"
+#include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "http://localhost:8080/metadata",
-              "Metadata connection string for transfer engine");
+DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
 namespace testing {
@@ -25,17 +23,23 @@ class PyClientTest : public ::testing::Test {
         // Override flags from environment variables if present
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
-        if (getenv("MC_METADATA_SERVER"))
-            FLAGS_transfer_engine_metadata_url = getenv("MC_METADATA_SERVER");
 
         LOG(INFO) << "Protocol: " << FLAGS_protocol
                   << ", Device name: " << FLAGS_device_name
-                  << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
+                  << ", Metadata: P2PHANDSHAKE";
+        ASSERT_TRUE(master_.Start(/*rpc_port=*/0, /*http_metrics_port=*/0,
+                                  /*http_metadata_port=*/std::nullopt))
+            << "Failed to start in-proc master";
+        master_address_ = master_.master_address();
+        LOG(INFO) << "Started in-proc master at " << master_address_;
     }
 
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
+    static void TearDownTestSuite() {
+        master_.Stop();
+        google::ShutdownGoogleLogging();
+    }
 
-    void SetUp() override { py_client_ = std::make_unique<PyClient>(); }
+    void SetUp() override { py_client_ = PyClient::create(); }
 
     void TearDown() override {
         if (py_client_) {
@@ -43,38 +47,27 @@ class PyClientTest : public ::testing::Test {
         }
     }
 
-    std::unique_ptr<PyClient> py_client_;
+    std::shared_ptr<PyClient> py_client_;
+
+    // In-proc master for tests
+    static mooncake::testing::InProcMaster master_;
+    static std::string master_address_;
 };
 
-// Test PyClient construction and setup
-TEST_F(PyClientTest, ConstructorAndSetup) {
-    ASSERT_TRUE(py_client_ != nullptr);
-
-    // Test setup
-    int setup_result = py_client_->setup(
-        "localhost:17813",                   // local_hostname
-        FLAGS_transfer_engine_metadata_url,  // metadata_server
-        16 * 1024 * 1024,                    // global_segment_size (16MB)
-        16 * 1024 * 1024,                    // local_buffer_size (16MB)
-        FLAGS_protocol,                      // protocol
-        FLAGS_device_name,                   // rdma_devices
-        "localhost:50051"                    // master_server_addr
-    );
-    EXPECT_EQ(setup_result, 0) << "Setup should succeed";
-
-    // Verify hostname
-    std::string hostname = py_client_->get_hostname();
-    EXPECT_EQ(hostname, "localhost:17813");
-}
+// Static members definition
+mooncake::testing::InProcMaster PyClientTest::master_;
+std::string PyClientTest::master_address_;
 
 // Test basic Put and Get operations
 TEST_F(PyClientTest, BasicPutGetOperations) {
     // Setup the client
-    ASSERT_EQ(
-        py_client_->setup("localhost:17813", FLAGS_transfer_engine_metadata_url,
-                          16 * 1024 * 1024, 16 * 1024 * 1024, FLAGS_protocol,
-                          FLAGS_device_name, "localhost:50051"),
-        0);
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
+                                16 * 1024 * 1024, 16 * 1024 * 1024,
+                                FLAGS_protocol, rdma_devices, master_address_),
+              0);
 
     const std::string test_data = "Hello, PyClient!";
     const std::string key = "test_key_pyclient";

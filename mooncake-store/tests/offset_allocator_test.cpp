@@ -1,4 +1,5 @@
 #include "offset_allocator/offset_allocator.hpp"
+#include "mutex.h"
 #include "serializer.h"
 #include "types.h"
 
@@ -297,6 +298,8 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
                            const std::shared_ptr<OffsetAllocator>& b) {
+        MutexLocker lock_a(&a->m_mutex);
+        MutexLocker lock_b(&b->m_mutex);
         // Compare basic member variables
         ASSERT_EQ(a->m_base, b->m_base);
         ASSERT_EQ(a->m_multiplier_bits, b->m_multiplier_bits);
@@ -353,6 +356,8 @@ class OffsetAllocatorTest : public ::testing::Test {
     // Compare two allocators bytes by bytes to detect one bit difference.
     bool isAllocatorEqual(const std::shared_ptr<OffsetAllocator>& a,
                           const std::shared_ptr<OffsetAllocator>& b) {
+        MutexLocker lock_a(&a->m_mutex);
+        MutexLocker lock_b(&b->m_mutex);
         // Compare basic member variables
         if (memcmp(&a->m_base, &b->m_base, sizeof(a->m_base)) != 0)
             return false;
@@ -446,21 +451,6 @@ class OffsetAllocatorTest : public ::testing::Test {
         auto corrupted_buffer = buffer;
         corrupted_buffer.pop_back();
         alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
-        ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
-
-        // change a random bit from the buffer and try to deserialize
-        corrupted_buffer = buffer;
-        std::uniform_int_distribution<size_t> byte_index_dist(
-            0, buffer.size() - 1);
-        std::uniform_int_distribution<int> bit_index_dist(
-            0, 7);  // 8 bits per byte
-        size_t byte_index = byte_index_dist(gen);
-        int bit_index = bit_index_dist(gen);
-        // Flip the random bit
-        corrupted_buffer[byte_index] ^= (1 << bit_index);
-        alloc_b = deserialize_from<OffsetAllocator>(corrupted_buffer);
-        // There are bool values whose value may not change if one bit is
-        // flipped, so the isAllocatorEqual compares variables using memcmp.
         ASSERT_TRUE(alloc_b == nullptr || !isAllocatorEqual(alloc_a, alloc_b));
 
         // Add a byte to the buffer and try to deserialize

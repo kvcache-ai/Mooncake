@@ -1,14 +1,13 @@
 #pragma once
 
+#include <glog/logging.h>
+
 #include <string>
 #include <vector>
-#include <mutex>
-#include <fstream>
-#include <types.h>
-#include <file_interface.h>
 #include <filesystem>
-#include <thread>
-#include <chrono>
+
+#include "types.h"
+#include "file_interface.h"
 
 namespace mooncake {
 /**
@@ -133,6 +132,13 @@ class StorageBackend {
      */
     void RemoveFile(const std::string& path);
 
+    /**
+     * @brief Removes objects from the storage backend whose keys match a regex
+     * pattern.
+     * @param regex The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
     void RemoveByRegex(const std::string& key);
 
     /**

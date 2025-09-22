@@ -1,4 +1,4 @@
-# Mooncake Store Preview
+# Mooncake Store
 
 ## Introduction
 
@@ -10,7 +10,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
-- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
+- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
@@ -44,7 +44,8 @@ Mooncake store supports two deployment methods to accommodate different availabi
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
 2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
 If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
-The leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
+
+In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
 ## Client C++ API
 
@@ -89,7 +90,14 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​ The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​
+
+**Replication Guarantees and Best Effort Behavior:**
+- Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
+- Different slices from different objects may be placed in the same segment
+- Replication operates on a best-effort basis: if insufficient space is available for all requested replicas, the object will still be written with as many replicas as possible
+
+The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
 struct ReplicateConfig {
@@ -106,6 +114,23 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
+
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+Used to query the replica information for all objects whose keys match the given regular expression. This is useful for batch operations or for retrieving a group of related objects. The operation is performed on the Master and returns a map of keys to their replica lists.
+
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+Used to delete all objects from the store whose keys match the specified regular expression. This provides a powerful way to perform bulk deletions. The command returns the number of objects that were successfully removed.
 
 ### Master Service
 
@@ -150,6 +175,9 @@ service MasterService {
   // Get the list of replicas for an object
   rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
 
+  // Get replica lists for objects matching a regex
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -158,6 +186,9 @@ service MasterService {
 
   // Delete all replicas of an object
   rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Remove objects matching a regex
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
   // Storage node (Client) registers a storage segment
   rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
@@ -184,7 +215,28 @@ message GetReplicaListResponse {
 - **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
 - **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
 
-2. PutStart
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
+};
+```
+
+- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
+- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+
+3. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -202,9 +254,9 @@ message PutStartResponse {
 
 - **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
+- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-3. PutEnd
+4. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -220,7 +272,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-4. Remove
+5. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -236,7 +288,24 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-5. MountSegment
+6. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // The number of objects removed.
+};
+```
+
+- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
+- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
+
+7. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -252,7 +321,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-6. UnmountSegment
+8. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -309,17 +378,20 @@ Before writing an object, the Client calls PutStart to request storage space all
 ```C++
 ErrorCode GetReplicaList(const std::string& key,
                          std::vector<ReplicaInfo>& replica_list);
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+GetReplicaListByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to retrieve the replica list for a specified key, allowing the Client to select an appropriate replica for reading based on this information.
+The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.
 
 - Remove
 
 ```C++
 tl::expected<void, ErrorCode> Remove(const std::string& key);
+tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 ```
 
-The Client requests the Master Service to delete all replicas corresponding to the specified key.
+The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
 ### Buffer Allocator
 
@@ -393,15 +465,9 @@ The strategy automatically handles cases where the preferred segment is unavaila
 
 ### Eviction Policy
 
-When the mounted segments are full, i.e., when a `PutStart` request fails due to insufficient memory, an eviction task will be launched to free up space by evicting some objects. Just like `Remove`, evicted objects are simply marked as deleted. No data transfer is needed.
+When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark (95% by default, configurable via `-eviction_high_watermark_ratio`), an eviction task is triggered to free up space by evicting a portion of objects (5% by default, configurable via `-eviction_ratio`). Similar to `Remove`, evicted objects are simply marked as deleted, with no data transfer required.
 
 Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
-
-Each time the eviction task is triggered, in default it will try to evict about 10% of objects. This ratio is configurable via a startup parameter of `master_service`.
-
-To minimize put failures, you can set the eviction high watermark via the `master_service` startup parameter `-eviction_high_watermark_ratio=<RATIO>`(Default to 1). When the eviction thread detects that current space usage reaches the configured high watermark,
-it initiates evict operations. The eviction target is to clean an additional `-eviction_ratio` specified proportion beyond the high watermark, thereby reaching the space low watermark.
-
 ### Lease
 
 To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
@@ -469,7 +535,7 @@ After enabling the persistence feature:
 - For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
 
 #### 3FS USRBIO Plugin
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](https://kvcache-ai.github.io/Mooncake/plugin-usage/3FS-USRBIO-Plugin.html).
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](https://kvcache-ai.github.io/Mooncake/getting_started/plugin-usage/3FS-USRBIO-Plugin.html).
 
 ## Mooncake Store Python API
 

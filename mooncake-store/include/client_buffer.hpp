@@ -5,6 +5,7 @@
 
 #include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 
@@ -23,9 +24,10 @@ class BufferHandle;
 class ClientBufferAllocator
     : public std::enable_shared_from_this<ClientBufferAllocator> {
    public:
-    static std::shared_ptr<ClientBufferAllocator> create(size_t size) {
+    static std::shared_ptr<ClientBufferAllocator> create(
+        size_t size, const std::string& protocol = "") {
         return std::shared_ptr<ClientBufferAllocator>(
-            new ClientBufferAllocator(size));
+            new ClientBufferAllocator(size, protocol));
     }
 
     ~ClientBufferAllocator();
@@ -45,9 +47,10 @@ class ClientBufferAllocator
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
    private:
-    ClientBufferAllocator(size_t size);
+    ClientBufferAllocator(size_t size, const std::string& protocol);
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
+    std::string protocol;
     void* buffer_;
     size_t buffer_size_;
 };

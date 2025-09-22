@@ -353,19 +353,12 @@ TransferStrategy TransferFuture::strategy() const {
 // ============================================================================
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     const std::string& local_hostname,
                                      std::shared_ptr<StorageBackend>& backend,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
-      local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
-    if (local_hostname_.empty()) {
-        LOG(ERROR) << "Local hostname cannot be empty";
-        throw std::invalid_argument("Local hostname cannot be empty");
-    }
-
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
@@ -445,6 +438,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const auto& handle = handles[i];
         const auto& slice = slices[i];
 
+        if (slice.ptr == nullptr) continue;
+
         void* dest;
         const void* src;
 
@@ -484,10 +479,20 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         const auto& handle = handles[i];
         const auto& slice = slices[i];
 
+        if (slice.ptr == nullptr) continue;
+
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                       << handle.buffer_address_;
+            return std::nullopt;
+        }
+
         Transport::SegmentHandle seg =
-            engine_.openSegment(handle.segment_name_);
+            engine_.openSegment(handle.transport_endpoint_);
+
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
             return std::nullopt;
         }
 
@@ -571,10 +576,18 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
-    return std::all_of(handles.begin(), handles.end(),
-                       [this](const auto& handle) {
-                           return handle.segment_name_ == local_hostname_;
-                       });
+    std::string local_ep = engine_.getLocalIpAndPort();
+
+    if (!local_ep.empty()) {
+        return std::all_of(handles.begin(), handles.end(),
+                           [&local_ep](const auto& h) {
+                               return !h.transport_endpoint_.empty() &&
+                                      h.transport_endpoint_ == local_ep;
+                           });
+    }
+
+    // Without a local endpoint we cannot prove locality; disable memcpy.
+    return false;
 }
 
 bool TransferSubmitter::validateTransferParams(

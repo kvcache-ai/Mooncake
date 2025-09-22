@@ -404,6 +404,7 @@ The general form is `[proto]://[hostname:port]`. For example, the following meta
 Reclaims all allocated resources and also deletes the global meta data server information.
 
 ## Using Transfer Engine to Your Projects
+
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
 
