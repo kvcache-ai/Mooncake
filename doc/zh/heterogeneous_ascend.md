@@ -9,6 +9,9 @@ Heterogeneous Ascend Transport 是一款面向异构推理场景的高性能数�
 
 > 当前版本仅支持 WRITE 语义，READ 语义支持将在后续版本中实现。
 
+## 新增优化
+HBM 到 DRAM 的拷贝带宽受数据块大小制约，2MB 以下的小数据块会导致带宽无法打满。我们通过 “数据聚合 + 流水线并行” 优化：先在 HBM 内将小数据块合并为 8MB 再搬运至 DRAM，同时让数据拷贝与 RDMA 传输并行执行。该方案有效掩盖了 HBM-DRAM 拷贝时延，显著降低了整体传输耗时。
+
 ## 编译说明
 在 `mooncake-common/common.cmake` 配置文件中新增 `USE_ASCEND_HETEROGENEOUS` 编译选项，用于控制本功能的启用状态：
 
