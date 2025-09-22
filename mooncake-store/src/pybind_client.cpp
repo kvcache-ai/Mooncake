@@ -853,18 +853,57 @@ std::vector<int> PyClient::batch_put_from(const std::vector<std::string> &keys,
     return results;
 }
 
-std::vector<int> PyClient::batch_get_into(const std::vector<std::string> &keys,
-                                          const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes) {
-    auto internal_results = batch_get_into_internal(keys, buffers, sizes);
-    std::vector<int> results;
-    results.reserve(internal_results.size());
-
-    for (const auto &result : internal_results) {
-        results.push_back(to_py_ret(result));
+std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    return results;
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+
+    // Create slices from user buffers
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const std::string &key = keys[i];
+        void *buffer = buffers[i];
+        size_t size = sizes[i];
+
+        std::vector<mooncake::Slice> slices;
+        uint64_t offset = 0;
+
+        while (offset < size) {
+            auto chunk_size = std::min(size - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+
+        all_slices[key] = std::move(slices);
+    }
+
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+    for (const auto &key : keys) {
+        auto it = all_slices.find(key);
+        if (it != all_slices.end()) {
+            ordered_batched_slices.emplace_back(it->second);
+        } else {
+            LOG(ERROR) << "Missing slices for key: " << key;
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    // Call client BatchPut and return the vector<expected> directly
+    return client_->BatchPut(keys, ordered_batched_slices, config);
 }
 
 tl::expected<void, ErrorCode> PyClient::put_from_internal(
@@ -906,6 +945,20 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
 int PyClient::put_from(const std::string &key, void *buffer, size_t size,
                        const ReplicateConfig &config) {
     return to_py_ret(put_from_internal(key, buffer, size, config));
+}
+
+std::vector<int> PyClient::batch_get_into(const std::vector<std::string> &keys,
+                                          const std::vector<void *> &buffers,
+                                          const std::vector<size_t> &sizes) {
+    auto internal_results = batch_get_into_internal(keys, buffers, sizes);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+
+    return results;
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
@@ -1050,59 +1103,6 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     }
 
     return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
-    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
-        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
-    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
-
-    // Create slices from user buffers
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string &key = keys[i];
-        void *buffer = buffers[i];
-        size_t size = sizes[i];
-
-        std::vector<mooncake::Slice> slices;
-        uint64_t offset = 0;
-
-        while (offset < size) {
-            auto chunk_size = std::min(size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-
-        all_slices[key] = std::move(slices);
-    }
-
-    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
-    ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
-        auto it = all_slices.find(key);
-        if (it != all_slices.end()) {
-            ordered_batched_slices.emplace_back(it->second);
-        } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-    }
-
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
 }
 
 std::vector<tl::expected<bool, ErrorCode>> PyClient::batchIsExist_internal(
