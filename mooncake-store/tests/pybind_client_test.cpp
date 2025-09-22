@@ -21,9 +21,7 @@ class PyClientTest : public ::testing::Test {
         FLAGS_logtostderr = 1;
     }
 
-    static void TearDownTestSuite() {
-        google::ShutdownGoogleLogging();
-    }
+    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
     void SetUp() override {
         // Override flags from environment variables if present
@@ -33,7 +31,7 @@ class PyClientTest : public ::testing::Test {
         LOG(INFO) << "Protocol: " << FLAGS_protocol
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata: P2PHANDSHAKE";
-        
+
         py_client_ = PyClient::create();
     }
 
@@ -41,7 +39,7 @@ class PyClientTest : public ::testing::Test {
         if (py_client_) {
             py_client_->tearDownAll();
         }
-        
+
         master_.Stop();
     }
 
@@ -52,12 +50,11 @@ class PyClientTest : public ::testing::Test {
     std::string master_address_;
 };
 
-
 // Test basic Put and Get operations
 TEST_F(PyClientTest, BasicPutGetOperations) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
-    << "Failed to start in-proc master";
+        << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
 
@@ -96,6 +93,44 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
     // Test isExist
     int exist_result = py_client_->isExist(key);
     EXPECT_EQ(exist_result, 1) << "Key should exist";
+}
+
+// Test Get Operation will fail if the lease has expired.
+// Set the lease time to 1ms and use large data size to ensure the lease will
+// expire.
+TEST_F(PyClientTest, GetWithLeaseTimeOut) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1).build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
+                                512 * 1024 * 1024, 512 * 1024 * 1024,
+                                FLAGS_protocol, rdma_devices, master_address_),
+              0);
+
+    // Test Get Operation
+    const size_t data_size = 256 * 1024 * 1024;  // 256MB
+    std::string test_data(data_size, 'A');       // Fill with 'A' characters
+    const std::string key = "test_key_pyclient";
+
+    // Put the data
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    int put_result = py_client_->put(key, data_span, config);
+    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+
+    // Test Get operation using buffer handle
+    auto buffer_handle = py_client_->get_buffer(key);
+    ASSERT_TRUE(buffer_handle == nullptr) << "Get buffer should fail";
 }
 
 }  // namespace testing

@@ -30,10 +30,14 @@ class InProcMaster {
     bool Start(InProcMasterConfig config) {
         try {
             // Choose ports if not provided
-            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value() : getFreeTcpPort();
-            http_metrics_port_ =
-                config.http_metrics_port.has_value() ? config.http_metrics_port.value() : getFreeTcpPort();
-            http_metadata_port_ = config.http_metadata_port.has_value() ? config.http_metadata_port.value() : getFreeTcpPort();
+            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
+                                                    : getFreeTcpPort();
+            http_metrics_port_ = config.http_metrics_port.has_value()
+                                     ? config.http_metrics_port.value()
+                                     : getFreeTcpPort();
+            http_metadata_port_ = config.http_metadata_port.has_value()
+                                      ? config.http_metadata_port.value()
+                                      : getFreeTcpPort();
 
             // Optional HTTP metadata server
             if (http_metadata_port_ > 0) {
@@ -56,7 +60,8 @@ class InProcMaster {
             uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
             if (config.default_kv_lease_ttl.has_value()) {
                 default_kv_lease_ttl = config.default_kv_lease_ttl.value();
-            } else if (const char* ttl_env = std::getenv("DEFAULT_KV_LEASE_TTL")) {
+            } else if (const char* ttl_env =
+                           std::getenv("DEFAULT_KV_LEASE_TTL")) {
                 char* endptr = nullptr;
                 unsigned long parsed = std::strtoul(ttl_env, &endptr, 10);
                 if (endptr != ttl_env && endptr && *endptr == '\0') {

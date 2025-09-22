@@ -22,7 +22,7 @@ namespace testing {
 TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Start master (auto-pick ports) without HTTP metadata server
     InProcMaster master;
-        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
 
     // Create client (non-HA), mount a segment
     std::string local_hostname = "127.0.0.1:18001";
@@ -56,8 +56,11 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
         << "Segment should not be visible after master stop";
 
     // Restart master on the same ports
-    ASSERT_TRUE(master.Start(
-        InProcMasterConfigBuilder().set_rpc_port(master.rpc_port()).set_http_metrics_port(master.http_metrics_port()).build()));
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder()
+                         .set_rpc_port(master.rpc_port())
+                         .set_http_metrics_port(master.http_metrics_port())
+                         .build()));
 
     // Wait until remount is reflected in master
     bool found = false;
