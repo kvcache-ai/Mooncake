@@ -540,7 +540,8 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
         return tl::unexpected(query_result.error());
     }
 
-    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
+    std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
@@ -577,7 +578,8 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
         return nullptr;
     }
 
-    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
+    std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
         return nullptr;
@@ -679,11 +681,12 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         std::vector<Slice> slices;
         allocateSlices(slices, replica, *buffer_handle);
 
-        valid_ops.emplace_back(KeyOp{.original_index = i,
-                                     .key = key,
-                                     .query_result = std::move(query_result_values),
-                                     .buffer_handle = std::move(buffer_handle),
-                                     .slices = std::move(slices)});
+        valid_ops.emplace_back(
+            KeyOp{.original_index = i,
+                  .key = key,
+                  .query_result = std::move(query_result_values),
+                  .buffer_handle = std::move(buffer_handle),
+                  .slices = std::move(slices)});
     }
 
     if (valid_ops.empty()) {
@@ -781,7 +784,8 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(query_result.error());
     }
 
-    std::vector<Replica::Descriptor>& replica_list = query_result.value().replicas;
+    std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
 
     // Calculate total size from replica list
     if (replica_list.empty()) {
@@ -1057,11 +1061,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         }
 
         // Store operation info for batch processing
-        valid_operations.push_back({.key = key,
-                                    .original_index = i,
-                                    .query_result = std::move(query_result_values),
-                                    .slices = std::move(key_slices),
-                                    .total_size = total_size});
+        valid_operations.push_back(
+            {.key = key,
+             .original_index = i,
+             .query_result = std::move(query_result_values),
+             .slices = std::move(key_slices),
+             .total_size = total_size});
 
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));

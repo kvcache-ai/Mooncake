@@ -80,7 +80,8 @@ void WrappedMasterService::init_http_server() {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             if (get_result) {
                 std::string ss = "";
-                const std::vector<Replica::Descriptor>& replicas = get_result.value().replicas;
+                const std::vector<Replica::Descriptor>& replicas =
+                    get_result.value().replicas;
                 for (size_t i = 0; i < replicas.size(); i++) {
                     if (replicas[i].is_memory_replica()) {
                         auto& memory_descriptors =
@@ -251,8 +252,7 @@ WrappedMasterService::BatchGetReplicaList(
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_keys);
 
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-        results;
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
     for (const auto& key : keys) {

@@ -7,7 +7,7 @@ namespace mooncake {
 /**
  * @brief Response structure for Ping operation
  */
- struct PingResponse {
+struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
 
@@ -34,7 +34,8 @@ struct GetReplicaListResponse {
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
                            uint64_t lease_ttl_ms_param)
-        : replicas(std::move(replicas_param)), lease_ttl_ms(lease_ttl_ms_param) {}
+        : replicas(std::move(replicas_param)),
+          lease_ttl_ms(lease_ttl_ms_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
 

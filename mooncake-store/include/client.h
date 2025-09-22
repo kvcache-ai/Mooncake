@@ -31,7 +31,8 @@ class QueryResult {
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param)
-        : replicas(std::move(replicas_param)), lease_timeout(lease_timeout_param) {}
+        : replicas(std::move(replicas_param)),
+          lease_timeout(lease_timeout_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -89,10 +90,10 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @return QueryResult containing replicas and lease timeout, or ErrorCode indicating failure
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode
+     * indicating failure
      */
-    tl::expected<QueryResult, ErrorCode> Query(
-        const std::string& object_key);
+    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.
@@ -111,21 +112,21 @@ class Client {
      * @param object_infos Output parameter for object metadata
      */
 
-    std::vector<tl::expected<QueryResult, ErrorCode>>
-    BatchQuery(const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
      * @param replica_list Previously queried replica list
      * @param slices Vector of slices to store the data
-     * @param lease_timeout Lease timeout, data transfer must be completed before this time
+     * @param lease_timeout Lease timeout, data transfer must be completed
+     * before this time
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Get(
-        const std::string& object_key,
-        const QueryResult& query_result,
-        std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects

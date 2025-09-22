@@ -107,16 +107,16 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
 
     // Engine operation errors (Range: -700 to -799)
-    INVALID_WRITE = -700,          ///< Invalid write operation.
-    INVALID_READ = -701,           ///< Invalid read operation.
-    INVALID_REPLICA = -702,        ///< Invalid replica operation.
+    INVALID_WRITE = -700,    ///< Invalid write operation.
+    INVALID_READ = -701,     ///< Invalid read operation.
+    INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
     // Object errors (Range: -703 to -707)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
-    LEASE_EXPIRED = -707,          ///< Lease expired before data transfer completed.
+    LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

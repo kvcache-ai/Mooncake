@@ -448,26 +448,29 @@ Client::QueryByRegex(const std::string& str) {
 
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
-    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(std::move(result.value().replicas), start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+    return QueryResult(
+        std::move(result.value().replicas),
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
-std::vector<tl::expected<QueryResult, ErrorCode>>
-Client::BatchQuery(const std::vector<std::string>& object_keys) {
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
+    const std::vector<std::string>& object_keys) {
     auto response = master_client_.BatchGetReplicaList(object_keys);
-    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
         LOG(ERROR) << "BatchQuery response size mismatch. Expected: "
                    << object_keys.size() << ", Got: " << response.size();
         // Return vector of RPC_FAIL errors
-        std::vector<tl::expected<QueryResult, ErrorCode>>
-            results;
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
@@ -478,7 +481,10 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(QueryResult(std::move(response[i].value().replicas), start_time + std::chrono::milliseconds(response[i].value().lease_ttl_ms)));
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas),
+                start_time + std::chrono::milliseconds(
+                                 response[i].value().lease_ttl_ms)));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -486,10 +492,9 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
     return results;
 }
 
-tl::expected<void, ErrorCode> Client::Get(
-    const std::string& object_key,
-    const QueryResult& query_result,
-    std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -514,7 +519,8 @@ tl::expected<void, ErrorCode> Client::Get(
         return tl::unexpected(err);
     }
     if (query_result.IsLeaseExpired()) {
-        LOG(ERROR) << "lease_expired_before_data_transfer_completed key=" << object_key;
+        LOG(ERROR) << "lease_expired_before_data_transfer_completed key="
+                   << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
@@ -568,7 +574,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+        ErrorCode err =
+            FindFirstCompleteReplica(query_result.replicas, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -606,11 +613,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
-    // As lease expired is a rare case, we check all the results with the same time_point to avoid too many syscalls
-    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    // As lease expired is a rare case, we check all the results with the same
+    // time_point to avoid too many syscalls
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
     for (size_t i = 0; i < object_keys.size(); ++i) {
         if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
-            LOG(ERROR) << "lease_expired_before_data_transfer_completed key=" << object_keys[i];
+            LOG(ERROR) << "lease_expired_before_data_transfer_completed key="
+                       << object_keys[i];
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
