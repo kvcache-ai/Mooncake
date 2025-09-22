@@ -562,7 +562,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
     struct KeyOp {
         size_t original_index;
         std::string key;
-        std::vector<Replica::Descriptor> replica_list;
+        QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
     };
@@ -580,13 +580,13 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto replica_list = query_results[i].value();
-        if (replica_list.empty()) {
+        auto query_result_values = query_results[i].value();
+        if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
         }
 
-        const auto &replica = replica_list[0];
+        const auto &replica = query_result_values.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
             continue;
@@ -605,7 +605,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
 
         valid_ops.emplace_back(KeyOp{.original_index = i,
                                      .key = key,
-                                     .replica_list = std::move(replica_list),
+                                     .query_result = std::move(query_result_values),
                                      .buffer_handle = std::move(buffer_handle),
                                      .slices = std::move(slices)});
     }
@@ -616,19 +616,19 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
 
     // 3. Execute batch get
     std::vector<std::string> batch_keys;
-    std::vector<std::vector<Replica::Descriptor>> batch_replica_lists;
+    std::vector<QueryResult> batch_query_results;
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
     batch_keys.reserve(valid_ops.size());
-    batch_replica_lists.reserve(valid_ops.size());
+    batch_query_results.reserve(valid_ops.size());
 
     for (auto &op : valid_ops) {
         batch_keys.push_back(op.key);
-        batch_replica_lists.push_back(op.replica_list);
+        batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
     }
 
     auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_replica_lists, batch_slices);
+        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
     // 4. Process results and create BufferHandles
     for (size_t i = 0; i < valid_ops.size(); ++i) {
@@ -865,7 +865,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     struct ValidKeyInfo {
         std::string key;
         size_t original_index;
-        std::vector<Replica::Descriptor> replica_list;
+        QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
     };
@@ -888,15 +888,15 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         }
 
         // Validate replica list
-        auto replica_list = query_results[i].value();
-        if (replica_list.empty()) {
+        auto query_result_values = query_results[i].value();
+        if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
 
         // Calculate required buffer size
-        const auto &replica = replica_list[0];
+        const auto &replica = query_result_values.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -930,7 +930,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         // Store operation info for batch processing
         valid_operations.push_back({.key = key,
                                     .original_index = i,
-                                    .replica_list = std::move(replica_list),
+                                    .query_result = std::move(query_result_values),
                                     .slices = std::move(key_slices),
                                     .total_size = total_size});
 
@@ -945,21 +945,21 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
 
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
-    std::vector<std::vector<Replica::Descriptor>> batch_replica_lists;
+    std::vector<QueryResult> batch_query_results;
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
-    batch_replica_lists.reserve(valid_operations.size());
+    batch_query_results.reserve(valid_operations.size());
 
     for (const auto &op : valid_operations) {
         batch_keys.push_back(op.key);
-        batch_replica_lists.push_back(op.replica_list);
+        batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
     }
 
     // Execute batch transfer
     const auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_replica_lists, batch_slices);
+        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {

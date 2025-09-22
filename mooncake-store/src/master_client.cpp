@@ -284,13 +284,13 @@ MasterClient::GetReplicaList(const std::string& object_key) {
     return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   std::vector<Replica::Descriptor>>(
+                                   GetReplicaListResponse>(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;

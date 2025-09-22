@@ -69,7 +69,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]]
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**

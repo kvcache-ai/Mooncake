@@ -35,6 +35,9 @@ class QueryResult {
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
     }
+    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        return now >= lease_timeout;
+    }
 };
 
 /**
@@ -99,7 +102,7 @@ class Client {
      * @param object_infos Output parameter for object metadata
      */
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<QueryResult, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys);
 
     /**
@@ -123,7 +126,7 @@ class Client {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
-        const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
+        const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
