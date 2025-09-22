@@ -62,8 +62,7 @@ class ClientIntegrationTest : public ::testing::Test {
         LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
 
         // Start an in-process non-HA master without HTTP metadata server
-        ASSERT_TRUE(master_.Start(/*rpc_port=*/0, /*http_metrics_port=*/0,
-                                  /*http_metadata_port=*/std::nullopt));
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
         master_address_ = master_.master_address();
         metadata_url_ = master_.metadata_url();
         LOG(INFO) << "Started in-proc master at " << master_address_

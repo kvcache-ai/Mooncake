@@ -19,7 +19,13 @@ class PyClientTest : public ::testing::Test {
     static void SetUpTestSuite() {
         google::InitGoogleLogging("PyClientTest");
         FLAGS_logtostderr = 1;
+    }
 
+    static void TearDownTestSuite() {
+        google::ShutdownGoogleLogging();
+    }
+
+    void SetUp() override {
         // Override flags from environment variables if present
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
@@ -27,39 +33,34 @@ class PyClientTest : public ::testing::Test {
         LOG(INFO) << "Protocol: " << FLAGS_protocol
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata: P2PHANDSHAKE";
-        ASSERT_TRUE(master_.Start(/*rpc_port=*/0, /*http_metrics_port=*/0,
-                                  /*http_metadata_port=*/std::nullopt))
-            << "Failed to start in-proc master";
-        master_address_ = master_.master_address();
-        LOG(INFO) << "Started in-proc master at " << master_address_;
+        
+        py_client_ = PyClient::create();
     }
-
-    static void TearDownTestSuite() {
-        master_.Stop();
-        google::ShutdownGoogleLogging();
-    }
-
-    void SetUp() override { py_client_ = PyClient::create(); }
 
     void TearDown() override {
         if (py_client_) {
             py_client_->tearDownAll();
         }
+        
+        master_.Stop();
     }
 
     std::shared_ptr<PyClient> py_client_;
 
     // In-proc master for tests
-    static mooncake::testing::InProcMaster master_;
-    static std::string master_address_;
+    mooncake::testing::InProcMaster master_;
+    std::string master_address_;
 };
 
-// Static members definition
-mooncake::testing::InProcMaster PyClientTest::master_;
-std::string PyClientTest::master_address_;
 
 // Test basic Put and Get operations
 TEST_F(PyClientTest, BasicPutGetOperations) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+    << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
     // Setup the client
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
