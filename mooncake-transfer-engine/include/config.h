@@ -48,6 +48,10 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+#ifdef USE_NVMEOF_GENERIC
+    bool nvmeof_generic_direct_io = false;
+    uint32_t nvmeof_generic_num_workers = 8;
+#endif
 };
 
 void loadGlobalConfig(GlobalConfig &config);
