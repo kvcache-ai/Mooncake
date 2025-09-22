@@ -141,7 +141,7 @@ PyClient::PyClient() {
 
 PyClient::~PyClient() {
     // Ensure resources are cleaned even if not explicitly closed
-    auto _ = tearDownAll_internal();
+    tearDownAll_internal();
 }
 
 std::shared_ptr<PyClient> PyClient::create() {
