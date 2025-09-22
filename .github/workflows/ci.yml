@@ -91,25 +91,12 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    - name: Start Mooncake Master
-      run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Set a small kv lease ttl to make the test faster.
-        # Must be consistent with the client test parameters.
-        mooncake_master --default_kv_lease_ttl=500 &
-      shell: bash
-
     - name: Test (in build env)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
-      shell: bash
-
-    - name: Stop Mooncake Master Service
-      run: |
-        pkill mooncake_master || true
       shell: bash
 
     - name: Generate Python version tag
