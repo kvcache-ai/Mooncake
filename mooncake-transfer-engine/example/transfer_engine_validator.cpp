@@ -65,7 +65,6 @@ DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
-DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
 
@@ -306,16 +305,6 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
 Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
                        int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
-    TransferRequest::OpCode opcode;
-    if (FLAGS_operation == "read")
-        opcode = TransferRequest::READ;
-    else if (FLAGS_operation == "write")
-        opcode = TransferRequest::WRITE;
-    else {
-        LOG(ERROR) << "Unsupported operation: must be 'read' or 'write'";
-        exit(EXIT_FAILURE);
-    }
-
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     if (!segment_desc) {
         LOG(ERROR) << "Unable to get target segment ID, please recheck";
