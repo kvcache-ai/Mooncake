@@ -373,18 +373,16 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ## Topology & Devices
 
-- Auto-discovery: Enabled by default. You do not need to specify RDMA devices.
-- Manual control (optional):
-  - `MC_MS_AUTO_DISC=0` disables auto-discovery; then pass `rdma_devices` (comma-separated) in `setup(...)`, e.g. `"mlx5_0,mlx5_1"`.
-  - `MC_MS_AUTO_DISC=1` (default) keeps auto-discovery on; optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+- Auto-discovery: Disabled by default. For `protocol="rdma"`, you must specify RDMA devices.
+- Enable auto-discovery (optional):
+  - `MC_MS_AUTO_DISC=1` enables auto-discovery; then `rdma_devices` is not required.
+  - Optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+  - If `MC_MS_AUTO_DISC` is not set or set to `0`, auto-discovery remains disabled and `rdma_devices` is required for RDMA.
 
 Examples:
 
 ```bash
-# Use default auto-discovery (no device list needed)
-export MC_MS_AUTO_DISC=1
-
-# Or manually select RDMA devices (auto-discovery off)
+# Default: auto-discovery OFF → pass devices for RDMA
 export MC_MS_AUTO_DISC=0
 python - <<'PY'
 from mooncake.store import MooncakeDistributedStore as S
@@ -392,8 +390,10 @@ s = S()
 s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
 PY
 
-# Keep auto-discovery but limit to specific NICs
+# Enable auto-discovery (devices not needed)
 export MC_MS_AUTO_DISC=1
+
+# Optional: limit auto-discovery to specific NICs
 export MC_MS_FILTERS=mlx5_0,mlx5_2
 ```
 
@@ -462,7 +462,7 @@ def setup(
 - `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
 - `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
 - `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): Hardware device identifier(s) for RDMA (e.g., "mlx5_0" or "mlx5_0,mlx5_1"). Optional with default auto-discovery; required only if `MC_MS_AUTO_DISC=0`. Leave empty for TCP.
+- `rdma_devices` (str): Hardware device identifier(s) for RDMA (e.g., "mlx5_0" or "mlx5_0,mlx5_1"). Required when auto-discovery is disabled (default); optional if `MC_MS_AUTO_DISC=1`. Leave empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
 
 **Returns:**
@@ -477,7 +477,11 @@ def setup(
 # TCP initialization
 store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA initialization (devices optional; auto-discovery is default)
+# RDMA initialization (default: auto-discovery OFF → specify devices)
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
+
+# RDMA with auto-discovery (enable via env; devices optional)
+#   export MC_MS_AUTO_DISC=1
 store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
 ```
 

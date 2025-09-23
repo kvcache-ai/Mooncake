@@ -111,7 +111,7 @@ static bool get_auto_discover() {
                 << ", should be 0 or 1, using default: auto discovery not set";
         }
     }
-    return true;
+    return false;
 }
 
 static inline void ltrim(std::string& s) {
