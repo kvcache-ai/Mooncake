@@ -115,23 +115,25 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     target_seg_name = hint.segment->name;
     target_dev_name = hint.topo->getDeviceName(device_id);
     if (target_seg_name.empty() || target_dev_name.empty()) {
-        LOG(ERROR) << "[TE Worker] Empty target segment or device name";
+        LOG(ERROR) << "Empty target segment or device name";
         return nullptr;
     }
     auto context = transport_->context_set_[path.local_device_id].get();
     std::shared_ptr<RdmaEndPoint> endpoint;
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (!endpoint) return nullptr;
-    if (endpoint->status() == RdmaEndPoint::EP_RESET) {
+    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
         context->endpointStore()->remove(peer_name, endpoint);
         endpoint = context->endpointStore()->getOrInsert(peer_name);
-        if (!endpoint) return nullptr;
+    }
+    if (!endpoint) {
+        LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         auto status = endpoint->connect(target_seg_name, target_dev_name);
         if (!status.ok()) {
-            LOG(ERROR) << "[TE Worker] Unable to connect endpoint: "
+            LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                        << status.ToString();
             return nullptr;
         }
@@ -149,8 +151,8 @@ void Workers::asyncPostSend(int thread_id) {
         for (int id = 0; id < slice_list.num_slices; ++id) {
             auto status = generatePostPath(thread_id, slice);
             if (!status.ok()) {
-                LOG(ERROR) << "[TE Worker] Detected asynchronous error: "
-                           << status.ToString();
+                LOG(ERROR) << "Failed to generate post path for slice " << slice
+                           << ": " << status.ToString();
                 updateSliceStatus(slice, FAILED);
             } else {
                 PostPath path{
@@ -169,11 +171,6 @@ void Workers::asyncPostSend(int thread_id) {
         if (slices.empty()) continue;
         auto endpoint = getEndpoint(path);
         if (!endpoint) {
-            static bool g_displayed = false;
-            if (!g_displayed) {
-                g_displayed = true;
-                LOG(ERROR) << "[TE Worker] Unable to allocate endpoint";
-            }
             for (auto slice : slices) updateSliceStatus(slice, FAILED);
             continue;
         }
@@ -185,7 +182,8 @@ void Workers::asyncPostSend(int thread_id) {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(ERROR) << "[TE Worker] Slice retry count exceeded";
+                    LOG(WARNING)
+                        << "Slice " << slice << " failed: retry count exceeded";
                     updateSliceStatus(slice, FAILED);
                 } else {
                     submit(slice);
@@ -210,10 +208,7 @@ void Workers::asyncPollCq(int thread_id) {
         auto cq = context->cq(thread_id % num_cq_list);
         ibv_wc wc[kPollCount];
         int nr_poll = cq->poll(kPollCount, wc);
-        if (nr_poll < 0) {
-            LOG(ERROR) << "[TE Worker] Failed to poll completion queue";
-            continue;
-        }
+        if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice *)wc[i].wr_id;
@@ -229,8 +224,8 @@ void Workers::asyncPollCq(int thread_id) {
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     LOG(ERROR)
-                        << "[TE Worker] Process failed for slice (opcode: "
-                        << slice->task->request.opcode
+                        << "Process failed for slice " << slice
+                        << " (opcode: " << slice->task->request.opcode
                         << ", source_addr: " << (void *)slice->source_addr
                         << ", dest_addr: " << (void *)slice->target_addr
                         << ", length: " << slice->length
@@ -240,7 +235,8 @@ void Workers::asyncPollCq(int thread_id) {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(ERROR) << "[TE Worker] Slice retry count exceeded";
+                    LOG(WARNING)
+                        << "Slice " << slice << " failed: retry count exceeded";
                     num_slices += ep->acknowledge(slice, FAILED);
                     ep->reset();
                 } else {
@@ -320,8 +316,7 @@ void Workers::workerThread(int thread_id) {
 
 int Workers::handleContextEvents(std::shared_ptr<RdmaContext> &context) {
     ibv_async_event event;
-    if (ibv_get_async_event(context->nativeContext(), &event) < 0)
-        return ERR_CONTEXT;
+    if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
     LOG(WARNING) << "Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context->name();
@@ -346,7 +341,7 @@ void Workers::monitorThread() {
             struct epoll_event event;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
             if (num_events < 0) {
-                PLOG(ERROR) << "Worker: epoll_wait()";
+                PLOG(ERROR) << "epoll_wait()";
                 continue;
             }
             if (num_events == 0) continue;
@@ -402,7 +397,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
 
     if (slice->source_dev_id < 0)
         return Status::DeviceNotFound(
-            "No device could access the slice memory region");
+            "No device could access the slice memory region" LOC_MARK);
 
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
@@ -435,7 +430,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
 
     if (slice->target_dev_id < 0)
         return Status::DeviceNotFound(
-            "No device could access the slice memory region");
+            "No device could access the slice memory region" LOC_MARK);
 
     return Status::OK();
 }
@@ -464,7 +459,7 @@ Status Workers::selectFallbackDevice(RouteHint &source, RouteHint &target,
 
     size_t total_combos = src_total * dst_total;
     if ((size_t)slice->retry_count >= total_combos)
-        return Status::DeviceNotFound("All devices are tried but failed");
+        return Status::DeviceNotFound("No available path" LOC_MARK);
 
     size_t idx = slice->retry_count;
     while (idx < total_combos) {
@@ -500,7 +495,7 @@ Status Workers::selectFallbackDevice(RouteHint &source, RouteHint &target,
         ++idx;
     }
 
-    return Status::DeviceNotFound("All devices are tried but failed");
+    return Status::DeviceNotFound("No available path" LOC_MARK);
 }
 
 Status Workers::generatePostPath(int thread_id, RdmaSlice *slice) {

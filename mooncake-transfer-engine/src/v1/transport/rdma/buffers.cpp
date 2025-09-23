@@ -45,7 +45,7 @@ Status LocalBufferManager::addBuffer(BufferDesc &desc,
             context->registerMemReg((void *)desc.addr, desc.length, access);
         if (!mem_reg)
             return Status::RdmaError(
-                "Failed to register memory region" LOC_MARK);
+                "Unable to register buffer of local memory segment" LOC_MARK);
         item.mem_reg_map[context] = mem_reg;
         auto keys = context->queryMemRegKey(mem_reg);
         desc.lkey.push_back(keys.first);
@@ -80,9 +80,10 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
     bool found = false;
     for (auto &device : topology_->getDeviceList()) {
         if (device == context->name()) {
-            if (context_list_[index])
-                return Status::InvalidArgument(
-                    "Context existed in local buffer manager" LOC_MARK);
+            if (context_list_[index]) {
+                LOG(WARNING) << "Device " << context->name()
+                             << " already exists in the local segment";
+            }
             context_list_[index] = context;
             found = true;
             break;
@@ -90,7 +91,12 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
             index++;
         }
     }
-    if (!found) return Status::DeviceNotFound("Not matched device" LOC_MARK);
+    if (!found) {
+        LOG(ERROR) << "Device " << context->name()
+                   << " not found in the local segment";
+        return Status::DeviceNotFound(
+            "Device not found in the local segment" LOC_MARK);
+    }
     for (auto &buffer : buffer_list_) {
         auto range = buffer.first;
         auto &options = buffer.second.options;
@@ -100,7 +106,7 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
             context->registerMemReg(range.addr, range.length, access);
         if (!mem_reg)
             return Status::RdmaError(
-                "Failed to register memory region" LOC_MARK);
+                "Device cannot register memory buffer" LOC_MARK);
         buffer.second.mem_reg_map[context] = mem_reg;
     }
     return Status::OK();

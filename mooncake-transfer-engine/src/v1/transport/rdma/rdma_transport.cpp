@@ -120,7 +120,8 @@ Status RdmaTransport::install(std::string &local_segment_name,
         int ret = context->construct(device_name, params_);
         if (ret) {
             local_topology_->disableDevice(device_name);
-            LOG(WARNING) << "Disable device " << device_name;
+            LOG(WARNING) << "Disable RDMA device " << device_name << " because "
+                         << "of initialization failure";
             continue;
         }
         context_name_lookup_[device_name] = context_set_.size();
@@ -162,7 +163,8 @@ Status RdmaTransport::uninstall() {
 Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto rdma_batch = Slab<RdmaSubBatch>::Get().allocate();
     if (!rdma_batch)
-        return Status::InternalError("Unable to allocate RDMA sub-batch");
+        return Status::InternalError(
+            "Unable to allocate RDMA sub-batch" LOC_MARK);
     batch = rdma_batch;
     rdma_batch->task_list.reserve(max_size);
     rdma_batch->max_size = max_size;
@@ -307,22 +309,28 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
                                           BootstrapDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name)) {
-        local_desc.reply_msg =
-            "Unable to find RDMA device " + peer_desc.peer_nic_path;
-        return ERR_ENDPOINT;
+        std::stringstream ss;
+        ss << "No device found in local segment: " << local_nic_name;
+        LOG(ERROR) << ss.str();
+        local_desc.reply_msg = ss.str();
+        return -1;
     }
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
     auto endpoint =
         context->endpointStore()->getOrInsert(peer_desc.local_nic_path);
     if (!endpoint) {
-        local_desc.reply_msg = "Unable to create endpoint object";
-        return ERR_ENDPOINT;
+        std::stringstream ss;
+        ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
+        LOG(ERROR) << ss.str();
+        local_desc.reply_msg = ss.str();
+        return -1;
     }
     auto status = endpoint->accept(peer_desc, local_desc);
     if (!status.ok()) {
+        LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
-        return ERR_ENDPOINT;
+        return -1;
     }
     return 0;
 }

@@ -19,8 +19,6 @@
 
 #include "context.h"
 
-#define ERR_ENDPOINT (-102)
-
 namespace mooncake {
 namespace v1 {
 class RdmaEndPoint {
@@ -157,6 +155,9 @@ class RdmaEndPoint {
     volatile int inflight_slices_;
     uint32_t padding_[7];
     RWSpinlock lock_;
+
+    std::string peer_server_name_;
+    std::string peer_nic_name_;
 };
 }  // namespace v1
 }  // namespace mooncake

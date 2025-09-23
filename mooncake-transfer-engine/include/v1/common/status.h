@@ -33,7 +33,7 @@
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
-#define LOC_MARK ", at " __FILE__ ":" TOSTRING(__LINE__)
+#define LOC_MARK "\n    Raised at " __FILE__ ":" TOSTRING(__LINE__)
 
 #define CHECK_STATUS(call)               \
     do {                                 \

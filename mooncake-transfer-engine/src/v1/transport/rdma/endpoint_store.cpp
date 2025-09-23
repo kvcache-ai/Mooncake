@@ -44,7 +44,10 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getOrInsert(
         return endpoint_map_[key];
     endpoint = std::make_shared<RdmaEndPoint>();
     int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
-    if (ret) return nullptr;
+    if (ret) {
+        LOG(ERROR) << "Failed to construct endpoint for key " << key;
+        return nullptr;
+    }
     while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = endpoint;
     fifo_list_.push_back(key);
@@ -119,7 +122,10 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getOrInsert(
     }
     endpoint = std::make_shared<RdmaEndPoint>();
     int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
-    if (ret) return nullptr;
+    if (ret) {
+        LOG(ERROR) << "Failed to construct endpoint for key " << key;
+        return nullptr;
+    }
     while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = std::make_pair(endpoint, false);
     fifo_list_.push_front(key);
@@ -169,6 +175,7 @@ void SIEVEEndpointStore::evictOne() {
     waiting_list_len_++;
     waiting_list_.insert(victim_instance);
     endpoint_map_.erase(victim);
+    LOG(INFO) << "Endpoint " << victim << " has been evicted";
     return;
 }
 

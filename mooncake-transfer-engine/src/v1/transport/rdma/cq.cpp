@@ -48,7 +48,7 @@ int RdmaCQ::construct(RdmaContext *context, int cqe_limit, int index) {
     cq_ = ibv_create_cq(native_context, cqe_limit, nullptr, comp_channel,
                         comp_vector);
     if (!cq_) {
-        PLOG(ERROR) << "Failed to create completion queue";
+        PLOG(ERROR) << "ibv_create_cq";
         return -1;
     }
     return 0;
@@ -69,7 +69,11 @@ void RdmaCQ::cancelQuota(int num_entries) {
 
 int RdmaCQ::poll(int num_entries, ibv_wc *wc) {
     if (!cqe_now_) return 0;
-    return ibv_poll_cq(cq_, num_entries, wc);
+    int rc = ibv_poll_cq(cq_, num_entries, wc);
+    if (rc < 0) {
+        PLOG(ERROR) << "ibv_poll_cq";
+    }
+    return rc;
 }
 }  // namespace v1
 }  // namespace mooncake

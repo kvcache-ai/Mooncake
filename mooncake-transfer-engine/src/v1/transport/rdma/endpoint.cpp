@@ -70,9 +70,9 @@ int RdmaEndPoint::construct(RdmaContext *context, EndPointParams *params,
         attr.cap.max_inline_data = params_->max_inline_bytes;
         qp_list_[i] = ibv_create_qp(context_->nativePD(), &attr);
         if (!qp_list_[i]) {
-            PLOG(ERROR) << "RdmaEndPoint Failure: ibv_create_qp";
+            PLOG(ERROR) << "ibv_create_qp";
             deconstruct();
-            return ERR_ENDPOINT;
+            return -1;
         }
         slice_queue_.emplace_back(params_->max_qp_wr);
     }
@@ -85,8 +85,7 @@ int RdmaEndPoint::deconstruct() {
     status_ = EP_RESET;
     resetInflightSlices();
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_destroy_qp(qp_list_[i]))
-            PLOG(ERROR) << "RdmaEndPoint Failure: ibv_destroy_qp";
+        if (ibv_destroy_qp(qp_list_[i])) PLOG(ERROR) << "ibv_destroy_qp";
         cancelQuota(i, wr_depth_list_[i].value);
     }
     qp_list_.clear();
@@ -99,13 +98,13 @@ int RdmaEndPoint::deconstruct() {
 
 Status RdmaEndPoint::connect(const std::string &peer_server_name,
                              const std::string &peer_nic_name) {
-    if (peer_server_name.empty() || peer_nic_name.empty())
-        return Status::InvalidArgument(
-            "Empty peer server or nic name" LOC_MARK);
     RWSpinlock::WriteGuard guard(lock_);
+    if (peer_server_name.empty() || peer_nic_name.empty())
+        return Status::InvalidArgument("Invalid peer path" LOC_MARK);
     if (status_ == EP_READY) return Status::OK();
     if (status_ != EP_HANDSHAKING)
-        return Status::InvalidArgument("Endpoint not in HANDSHAKING state");
+        return Status::InvalidArgument(
+            "Endpoint not in handshaking state" LOC_MARK);
     auto &transport = context_->transport_;
     auto &manager = transport.metadata_->segmentManager();
     auto qp_num = qpNum();
@@ -127,8 +126,13 @@ Status RdmaEndPoint::connect(const std::string &peer_server_name,
     }
     assert(qp_num.size() && segment_desc);
     auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
-    if (!dev_desc)
-        return Status::InvalidArgument("Unable to find RDMA device" LOC_MARK);
+    if (!dev_desc) {
+        LOG(ERROR) << "Unable to find RDMA device: " << peer_nic_name
+                   << " in segment " << segment_desc->name;
+        return Status::DeviceNotFound("Unable to find RDMA device" LOC_MARK);
+    }
+    peer_server_name_ = peer_server_name;
+    peer_nic_name_ = peer_nic_name;
     int rc = setupAllQPs(dev_desc->gid, dev_desc->lid, qp_num);
     if (rc) {
         return Status::InternalError(
@@ -141,18 +145,23 @@ Status RdmaEndPoint::accept(const BootstrapDesc &peer_desc,
                             BootstrapDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (status_ == EP_READY) {
-        LOG(WARNING) << "EndPoint in READY state, convert to RESET state";
+        LOG(WARNING) << "Endpoint is established with " << peer_nic_name_
+                     << " of " << peer_server_name_ << ", resetting first";
         resetUnlocked();
         status_ = EP_HANDSHAKING;
-    } else if (status_ != EP_HANDSHAKING)
-        return Status::InvalidArgument("Endpoint not in HANDSHAKING state");
+    } else if (status_ != EP_HANDSHAKING) {
+        LOG(ERROR) << "Endpoint not in handshaking state: "
+                   << statusToString(status_);
+        return Status::InvalidArgument(
+            "Endpoint not in handshaking state" LOC_MARK);
+    }
     auto &transport = context_->transport_;
     auto &manager = transport.metadata_->segmentManager();
     auto peer_nic_path = peer_desc.local_nic_path;
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path);
     if (peer_server_name.empty() || peer_nic_name.empty())
-        return Status::InvalidArgument("Invalid peer_nic_path in request");
+        return Status::InvalidArgument("Invalid peer path" LOC_MARK);
     local_desc.local_nic_path =
         MakeNicPath(transport.local_segment_name_, context_->name());
     local_desc.peer_nic_path = peer_nic_path;
@@ -160,8 +169,13 @@ Status RdmaEndPoint::accept(const BootstrapDesc &peer_desc,
     SegmentDescRef segment_desc;
     CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
     auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
-    if (!dev_desc)
-        return Status::InvalidArgument("Unable to find RDMA device" LOC_MARK);
+    if (!dev_desc) {
+        LOG(ERROR) << "Unable to find RDMA device: " << peer_nic_name
+                   << " in segment " << segment_desc->name;
+        return Status::DeviceNotFound("Unable to find RDMA device" LOC_MARK);
+    }
+    peer_server_name_ = peer_server_name;
+    peer_nic_name_ = peer_nic_name;
     int rc = setupAllQPs(dev_desc->gid, dev_desc->lid, peer_desc.qp_num);
     if (rc) {
         return Status::InternalError(
@@ -185,9 +199,9 @@ int RdmaEndPoint::resetUnlocked() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
+            PLOG(ERROR) << "ibv_modify_qp(RESET)";
             deconstruct();
-            return ERR_ENDPOINT;
+            return -1;
         }
         cancelQuota(i, wr_depth_list_[i].value);
     }
@@ -199,18 +213,18 @@ int RdmaEndPoint::setupAllQPs(const std::string &peer_gid, uint16_t peer_lid,
                               std::string *reply_msg) {
     if (status_ == EP_READY) {
         status_ = EP_RESET;
-        return ERR_ENDPOINT;
+        return -1;
     }
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
-        std::string message =
-            "[ERR-01] Inconsistent qp_mul_factor: local (expected) " +
-            std::to_string(qp_list_.size()) + ", peer " +
-            std::to_string(peer_qp_num_list.size());
-        LOG(ERROR) << "[TE ConnEst] Handshake error detected: " << message;
-        if (reply_msg) *reply_msg = message;
+        std::stringstream ss;
+        ss << "Inconsistent qp_mul_factor: local " << qp_list_.size()
+           << " peer " << peer_qp_num_list.size() << " for endpoint "
+           << peer_nic_name_ << " of " << peer_server_name_;
+        LOG(ERROR) << ss.str();
+        if (reply_msg) *reply_msg = ss.str();
         status_ = EP_RESET;
-        return ERR_ENDPOINT;
+        return -1;
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
@@ -317,7 +331,7 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     if (rc) {
         cancelQuota(qp_index, 1);
         PLOG(ERROR) << "ibv_post_recv";
-        return ERR_ENDPOINT;
+        return -1;
     }
     return 1;
 }
@@ -397,14 +411,14 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string &peer_gid,
         qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
-        std::string message =
-            "[ERR-02] Failed to modify QP's state to INIT, check local context "
-            "port num. Error code: " +
-            std::to_string(ret);
-        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
-                   << message;
-        if (reply_msg) *reply_msg = message;
-        return ERR_ENDPOINT;
+        std::stringstream ss;
+        ss << "Failed to modify QP's state to INIT in endpoint "
+           << peer_nic_name_ << " of " << peer_server_name_
+           << ", check local context port num " << context().portNum()
+           << ", error code " << errno << ":" << strerror(errno);
+        LOG(ERROR) << ss.str();
+        if (reply_msg) *reply_msg = ss.str();
+        return -1;
     }
 
     // INIT -> RTR
@@ -440,15 +454,15 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string &peer_gid,
                             IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC |
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
-        std::string message =
-            "[ERR-03] Failed to modify QP to RTR, check the connectivity "
-            "between two NICs and detected value of MTU, GID, LID. "
-            "Error code: " +
-            std::to_string(ret);
-        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
-                   << message;
-        if (reply_msg) *reply_msg = message;
-        return ERR_ENDPOINT;
+        std::stringstream ss;
+        ss << "Failed to modify QP's state to RTR in endpoint "
+           << peer_nic_name_ << " of " << peer_server_name_
+           << ", check peer endpoint reachability, MTU " << params_->path_mtu
+           << ", GID " << peer_gid << " and LID " << peer_lid << ", error code "
+           << errno << ":" << strerror(errno);
+        LOG(ERROR) << ss.str();
+        if (reply_msg) *reply_msg = ss.str();
+        return -1;
     }
 
     // RTR -> RTS
@@ -464,13 +478,13 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string &peer_gid,
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
-        std::string message =
-            "[ERR-04] Failed to modify QP to RTS. Error code: " +
-            std::to_string(ret);
-        LOG(ERROR) << "[TE ConnEst] Connection establish error detected: "
-                   << message;
-        if (reply_msg) *reply_msg = message;
-        return ERR_ENDPOINT;
+        std::stringstream ss;
+        ss << "Failed to modify QP's state to RTS in endpoint "
+           << peer_nic_name_ << " of " << peer_server_name_ << ", error code "
+           << errno << ":" << strerror(errno);
+        LOG(ERROR) << ss.str();
+        if (reply_msg) *reply_msg = ss.str();
+        return -1;
     }
 
     return 0;

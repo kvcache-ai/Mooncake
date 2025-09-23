@@ -78,19 +78,19 @@ static inline int joinNonblockingPollList(int event_fd, int data_fd) {
     int flags = fcntl(data_fd, F_GETFL, 0);
     if (flags == -1) {
         PLOG(ERROR) << "fcntl(F_GETFL)";
-        return ERR_CONTEXT;
+        return -1;
     }
 
     if (fcntl(data_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         PLOG(ERROR) << "fcntl(F_SETFL)";
-        return ERR_CONTEXT;
+        return -1;
     }
 
     event.events = EPOLLIN | EPOLLET;
     event.data.fd = data_fd;
     if (epoll_ctl(event_fd, EPOLL_CTL_ADD, event.data.fd, &event)) {
         PLOG(ERROR) << "epoll_ctl(EPOLL_CTL_ADD)";
-        return ERR_CONTEXT;
+        return -1;
     }
 
     return 0;
@@ -171,26 +171,26 @@ int RdmaContext::enable() {
                    << params_->device.port << "] with GID index ["
                    << params_->device.gid_index << "]";
         disable();
-        return ERR_CONTEXT;
+        return -1;
     }
 
     native_pd_ = ibv_alloc_pd(native_context_);
     if (!native_pd_) {
         PLOG(ERROR) << "ibv_alloc_pd";
         disable();
-        return ERR_CONTEXT;
+        return -1;
     }
 
     event_fd_ = epoll_create1(0);
     if (event_fd_ < 0) {
         PLOG(ERROR) << "epoll_create1";
         disable();
-        return ERR_CONTEXT;
+        return -1;
     }
 
     if (joinNonblockingPollList(event_fd_, native_context_->async_fd)) {
         disable();
-        return ERR_CONTEXT;
+        return -1;
     }
 
     num_comp_channel_ = params_->device.num_comp_channels;
@@ -201,12 +201,12 @@ int RdmaContext::enable() {
         if (!comp_channel_[i]) {
             PLOG(ERROR) << "ibv_create_comp_channel";
             disable();
-            return ERR_CONTEXT;
+            return -1;
         }
 
         if (joinNonblockingPollList(event_fd_, comp_channel_[i]->fd)) {
             disable();
-            return ERR_CONTEXT;
+            return -1;
         }
     }
 
@@ -273,7 +273,8 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void *addr, size_t length,
     ibv_mr *entry = ibv_reg_mr(native_pd_, addr, length, access);
     if (!entry) {
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
-                    << (char *)addr + length << " in device " << device_name_;
+                    << (char *)addr + length << " in RDMA device "
+                    << device_name_;
         return nullptr;
     }
     mr_set_mutex_.lock();
@@ -292,7 +293,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     if (ibv_dereg_mr(entry)) {
         LOG(ERROR) << "Failed to unregister memory from " << entry->addr
                    << " to " << (char *)entry->addr + entry->length
-                   << " in device " << device_name_;
+                   << " in RDMA device " << device_name_;
     }
 
     return 0;
@@ -322,7 +323,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
     if (!devices || num_devices <= 0) {
         PLOG(ERROR) << "ibv_get_device_list";
-        return ERR_CONTEXT;
+        return -1;
     }
 
     for (int i = 0; i < num_devices; ++i) {
@@ -331,14 +332,14 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (!context) {
             PLOG(ERROR) << "ibv_open_device";
             ibv_free_device_list(devices);
-            return ERR_CONTEXT;
+            return -1;
         }
     }
 
     ibv_free_device_list(devices);
     if (!context) {
         LOG(ERROR) << "No matched device found in this server: " << device_name;
-        return ERR_CONTEXT;
+        return -1;
     }
 
     ibv_port_attr port_attr;
@@ -348,7 +349,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (ibv_close_device(context)) {
             PLOG(ERROR) << "ibv_close_device";
         }
-        return ERR_CONTEXT;
+        return -1;
     }
 
     if (port_attr.state != IBV_PORT_ACTIVE) {
@@ -357,7 +358,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (ibv_close_device(context)) {
             PLOG(ERROR) << "ibv_close_device";
         }
-        return ERR_CONTEXT;
+        return -1;
     }
 
     ibv_device_attr device_attr;
@@ -367,7 +368,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (ibv_close_device(context)) {
             PLOG(ERROR) << "ibv_close_device";
         }
-        return ERR_CONTEXT;
+        return -1;
     }
 
     MIN(params_->device.max_cqe, device_attr.max_cqe);
@@ -380,9 +381,6 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
     if (gid_index_ <= 0) {
         int ret = getBestGidIndex(device_name, context, port_attr, port);
         if (ret >= 0) {
-            // LOG(INFO) << "Find best GID " << ret << " on " << device_name <<
-            // "/"
-            //           << port;
             gid_index_ = ret;
         }
     }
@@ -394,7 +392,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (ibv_close_device(context)) {
             PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
         }
-        return ERR_CONTEXT;
+        return -1;
     }
 
     if (isNullGid(&gid_)) {
@@ -403,7 +401,7 @@ int RdmaContext::openDevice(const std::string &device_name, uint8_t port) {
         if (ibv_close_device(context)) {
             PLOG(ERROR) << "ibv_close_device";
         }
-        return ERR_CONTEXT;
+        return -1;
     }
 
     native_context_ = context;

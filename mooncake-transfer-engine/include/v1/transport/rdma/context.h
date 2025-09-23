@@ -33,8 +33,6 @@
 #include "rdma_transport.h"
 #include "v1/common/status.h"
 
-#define ERR_CONTEXT (-101)
-
 namespace mooncake {
 namespace v1 {
 
