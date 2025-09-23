@@ -45,7 +45,7 @@ store.setup(
     512*1024*1024,          # 512MB segment size
     128*1024*1024,          # 128MB local buffer
     "tcp",                             # Use TCP (RDMA for high performance)
-    "",                            # Empty for TCP, specify device for RDMA
+    "",                            # Leave empty; Mooncake auto-picks RDMA devices when needed
     "localhost"        # Master service
 )
 
@@ -59,6 +59,8 @@ print(data.decode())  # Output: Hello, Mooncake Store!
 # 5. Clean up
 store.close()
 ```
+
+**RDMA device selection**: Leave `rdma_devices` as `""` (with `MC_MS_AUTO_DISC` unset or `1`) to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
 
 Mooncake selects available ports internally at `setup() `, so you do not need to fix specific port numbers in these examples. Internally, ports are chosen from a dynamic range (currently 12300–14300).
 
@@ -76,7 +78,7 @@ store.setup(
     512*1024*1024,                # 512MB segment size
     128*1024*1024,                # 128MB local buffer
     "tcp",                       # Use TCP (RDMA for high performance)
-    "",                          # Empty for TCP, specify device for RDMA
+    "",                          # Leave empty; Mooncake auto-picks RDMA devices when needed
     "localhost:50051"           # Master service
 )
 
@@ -382,19 +384,29 @@ print("Retrieved all keys successfully:", retrieved == values)
 Examples:
 
 ```bash
-# Default: auto-discovery OFF → pass devices for RDMA
-export MC_MS_AUTO_DISC=0
+# Auto-select with default settings
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+PY
+
+# Manual device list 
+unset MC_MS_AUTO_DISC
 python - <<'PY'
 from mooncake.store import MooncakeDistributedStore as S
 s = S()
 s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
 PY
 
-# Enable auto-discovery (devices not needed)
+# Auto-select with filters
 export MC_MS_AUTO_DISC=1
-
-# Optional: limit auto-discovery to specific NICs
 export MC_MS_FILTERS=mlx5_0,mlx5_2
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+PY
 ```
 
 ## get_buffer Buffer Protocol
@@ -462,7 +474,7 @@ def setup(
 - `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
 - `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
 - `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): Hardware device identifier(s) for RDMA (e.g., "mlx5_0" or "mlx5_0,mlx5_1"). Required when auto-discovery is disabled (default); optional if `MC_MS_AUTO_DISC=1`. Leave empty for TCP.
+- `rdma_devices` (str): RDMA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-select NICs. Provide device names to pin the NICs. Always empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
 
 **Returns:**
@@ -477,12 +489,11 @@ def setup(
 # TCP initialization
 store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA initialization (default: auto-discovery OFF → specify devices)
-store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
-
-# RDMA with auto-discovery (enable via env; devices optional)
-#   export MC_MS_AUTO_DISC=1
+# RDMA auto-detect 
 store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+
+# RDMA with explicit device list
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
 ```
 
 </details>
