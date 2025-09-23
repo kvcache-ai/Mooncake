@@ -13,6 +13,7 @@
         "rdma": {
             "enable" : true,
             "shared_quota_shm_path" : "mooncake_quota_shm",
+            "max_timeout_ns": 10000000000,
             "device": {
                 "num_cq_list": 1,
                 "num_comp_channels": 1,

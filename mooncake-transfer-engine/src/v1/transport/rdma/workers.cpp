@@ -34,10 +34,13 @@ Workers::~Workers() {
 }
 
 Status Workers::start() {
+    const static uint64_t kDefaultMaxTimeoutNs = 10000000000ull;
     if (!running_) {
         running_ = true;
         monitor_ = std::thread([this] { monitorThread(); });
         num_workers_ = transport_->params_->workers.num_workers;
+        slice_timeout_ns_ = transport_->conf_->get(
+            "transports/rdma/max_timeout_ns", kDefaultMaxTimeoutNs);
         worker_context_ = new WorkerContext[num_workers_];
         for (size_t id = 0; id < num_workers_; ++id) {
             worker_context_[id].thread =
@@ -193,16 +196,37 @@ void Workers::asyncPostSend(int thread_id) {
             }
         }
 
-        if (num_submitted)
+        if (num_submitted) {
+            worker.inflight_slice_set.insert(slices.begin(),
+                                             slices.begin() + num_submitted);
             slices.erase(slices.begin(), slices.begin() + num_submitted);
+        }
     }
 }
 
 void Workers::asyncPollCq(int thread_id) {
+    auto &worker = worker_context_[thread_id];
     const static size_t kPollCount = 64;
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
     int num_slices = 0;
+
+    uint64_t current_ts = getCurrentTimeInNano();
+    std::vector<RdmaSlice *> slice_to_remove;
+    for (auto &slice : worker.inflight_slice_set) {
+        if (slice->word != PENDING) continue;
+        if (current_ts - slice->enqueue_ts > slice_timeout_ns_) {
+            auto ep = slice->ep_weak_ptr;
+            LOG(WARNING) << "Slice " << slice
+                         << " failed: transfer timeout (software)";
+            auto num_slices = ep->acknowledge(slice, TIMEOUT);
+            ep->reset();
+            worker.inflight_slices.fetch_sub(num_slices);
+            slice_to_remove.push_back(slice);
+        }
+    }
+    for (auto &slice : slice_to_remove) worker.inflight_slice_set.erase(slice);
+
     for (int index = 0; index < num_contexts; index++) {
         auto &context = transport_->context_set_[index];
         auto cq = context->cq(thread_id % num_cq_list);
@@ -212,13 +236,14 @@ void Workers::asyncPollCq(int thread_id) {
         auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice *)wc[i].wr_id;
+            worker.inflight_slice_set.erase(slice);
             auto ep = slice->ep_weak_ptr;
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
             if (slice->retry_count == 0) {
-                worker_context_[thread_id].device_quota->release(
-                    slice->source_dev_id, slice->length, inflight_lat);
+                worker.device_quota->release(slice->source_dev_id,
+                                             slice->length, inflight_lat);
             }
             if (slice->word != PENDING) continue;
             if (wc[i].status != IBV_WC_SUCCESS) {
@@ -246,14 +271,13 @@ void Workers::asyncPollCq(int thread_id) {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
-                auto &worker = worker_context_[thread_id];
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
             }
         }
     }
     if (num_slices) {
-        worker_context_[thread_id].inflight_slices.fetch_sub(num_slices);
+        worker.inflight_slices.fetch_sub(num_slices);
     }
 }
 

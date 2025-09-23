@@ -177,6 +177,7 @@ class Workers {
         std::thread thread;
         BoundedSliceQueue queue;
         GroupedRequests requests;
+        std::unordered_set<RdmaSlice *> inflight_slice_set;
         std::atomic<int64_t> inflight_slices = 0;
 
         std::mutex mutex;
@@ -190,6 +191,7 @@ class Workers {
     };
 
     WorkerContext *worker_context_;
+    uint64_t slice_timeout_ns_;
 };
 }  // namespace v1
 }  // namespace mooncake
