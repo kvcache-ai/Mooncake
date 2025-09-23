@@ -131,14 +131,6 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
-     * @brief Get list of replicas for a batch of objects
-     * @param[out] batch_replica_list Vector to store replicas information for
-     * slices
-     */
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
-
-    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for slices
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,

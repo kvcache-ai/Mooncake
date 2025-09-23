@@ -336,17 +336,6 @@ auto MasterService::GetReplicaList(std::string_view key)
                                   default_kv_lease_ttl_);
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(GetReplicaList(key).value().replicas);
-    }
-    return results;
-}
-
 auto MasterService::PutStart(const std::string& key,
                              const std::vector<uint64_t>& slice_lengths,
                              const ReplicateConfig& config)
