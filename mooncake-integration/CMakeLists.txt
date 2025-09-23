@@ -22,9 +22,7 @@ include_directories("/usr/include/jsoncpp")
 include_directories("./")
 include_directories("../mooncake-transfer-engine/include")
 
-# Find Python for pybind11 integration
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
