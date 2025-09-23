@@ -123,6 +123,11 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) return nullptr;
+    if (endpoint->status() == RdmaEndPoint::EP_RESET) {
+        context->endpointStore()->remove(peer_name, endpoint);
+        endpoint = context->endpointStore()->getOrInsert(peer_name);
+        if (!endpoint) return nullptr;
+    }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         auto status = endpoint->connect(target_seg_name, target_dev_name);
         if (!status.ok()) {
@@ -132,19 +137,6 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         }
     }
     return endpoint;
-}
-
-Status Workers::resetEndpoint(RdmaSlice *slice) {
-    RouteHint target;
-    auto target_id = slice->task->request.target_id;
-    CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
-                              slice->length));
-    auto target_dev_name = target.topo->getDeviceName(slice->target_dev_id);
-    auto context = transport_->context_set_[slice->source_dev_id].get();
-    auto peer_name = MakeNicPath(target.segment->name, target_dev_name);
-    auto endpoint = context->endpointStore()->get(peer_name);
-    if (endpoint) endpoint->reset();
-    return Status::OK();
 }
 
 void Workers::asyncPostSend(int thread_id) {
@@ -159,7 +151,7 @@ void Workers::asyncPostSend(int thread_id) {
             if (!status.ok()) {
                 LOG(ERROR) << "[TE Worker] Detected asynchronous error: "
                            << status.ToString();
-                markSliceFailed(slice);
+                updateSliceStatus(slice, FAILED);
             } else {
                 PostPath path{
                     .local_device_id = slice->source_dev_id,
@@ -182,7 +174,7 @@ void Workers::asyncPostSend(int thread_id) {
                 g_displayed = true;
                 LOG(ERROR) << "[TE Worker] Unable to allocate endpoint";
             }
-            for (auto slice : slices) markSliceFailed(slice);
+            for (auto slice : slices) updateSliceStatus(slice, FAILED);
             continue;
         }
 
@@ -194,7 +186,7 @@ void Workers::asyncPostSend(int thread_id) {
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(ERROR) << "[TE Worker] Slice retry count exceeded";
-                    markSliceFailed(slice);
+                    updateSliceStatus(slice, FAILED);
                 } else {
                     submit(slice);
                 }
@@ -233,6 +225,7 @@ void Workers::asyncPollCq(int thread_id) {
                 worker_context_[thread_id].device_quota->release(
                     slice->source_dev_id, slice->length, inflight_lat);
             }
+            if (slice->word != PENDING) continue;
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     LOG(ERROR)
@@ -248,17 +241,15 @@ void Workers::asyncPollCq(int thread_id) {
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(ERROR) << "[TE Worker] Slice retry count exceeded";
-                    num_slices +=
-                        ep->acknowledge(slice, SliceCallbackType::FAILED);
+                    num_slices += ep->acknowledge(slice, FAILED);
+                    ep->reset();
                 } else {
-                    num_slices +=
-                        ep->acknowledge(slice, SliceCallbackType::NOP);
+                    num_slices += ep->acknowledge(slice, PENDING);
+                    ep->reset();
                     submit(slice);
                 }
-                resetEndpoint(slice);
             } else {
-                num_slices +=
-                    ep->acknowledge(slice, SliceCallbackType::SUCCESS);
+                num_slices += ep->acknowledge(slice, COMPLETED);
                 auto &worker = worker_context_[thread_id];
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);

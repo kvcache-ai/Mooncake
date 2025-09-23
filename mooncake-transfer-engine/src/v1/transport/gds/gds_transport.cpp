@@ -69,7 +69,7 @@ class GdsFileContext {
 TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
     switch (status) {
         case CUFILE_WAITING:
-            return WAITING;
+            return PENDING;
         case CUFILE_PENDING:
             return PENDING;
         case CUFILE_INVALID:
@@ -232,14 +232,14 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InternalError(
             std::string("Failed to get GDS batch status: Code ") +
             std::to_string(result.err) + LOC_MARK);
-    status.s = WAITING;
+    status.s = PENDING;
     size_t complete_count = 0;
     for (size_t index = range.base; index < range.base + range.count; ++index) {
         auto &event = gds_batch->io_events[index];
         auto s = parseTransferStatus(event.status);
         if (s == COMPLETED)
             complete_count++;
-        else if (s != WAITING)
+        else if (s != PENDING)
             status.s = s;
         status.transferred_bytes += event.ret;
     }

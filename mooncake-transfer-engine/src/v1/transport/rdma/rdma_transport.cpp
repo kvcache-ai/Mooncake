@@ -218,7 +218,7 @@ Status RdmaTransport::submitTransferTasks(
         auto &task = rdma_batch->task_list.back();
         task.request = request;
         task.num_slices = 0;
-        task.status_word = WAITING;
+        task.status_word = PENDING;
         task.transferred_bytes = 0;
 
         uint64_t num_slices = std::min<uint64_t>(
@@ -236,6 +236,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->task = &task;
             slice->retry_count = 0;
             slice->ep_weak_ptr = nullptr;
+            slice->word = PENDING;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
             task.num_slices++;
@@ -272,11 +273,6 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
     auto &task = rdma_batch->task_list[task_id];
-    // failure injection
-    // if (task.status_word == COMPLETED && SimpleRandom::Get().next(100) == 0)
-    // {
-    //     task.status_word = FAILED;
-    // }
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }

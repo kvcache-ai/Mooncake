@@ -458,7 +458,7 @@ Status TransferEngine::lazyFreeBatch() {
         auto &batch = *it;
         TransferStatus overall_status;
         CHECK_STATUS(getTransferStatus((BatchID)batch, overall_status));
-        if (overall_status.s == WAITING) {
+        if (overall_status.s == PENDING) {
             it++;
             continue;
         }
@@ -754,7 +754,7 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
                                          TransferStatus &overall_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch *batch = (Batch *)(batch_id);
-    overall_status.s = WAITING;
+    overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
     size_t total_tasks = 0;

@@ -53,10 +53,11 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getOrInsert(
     return endpoint;
 }
 
-int FIFOEndpointStore::remove(const std::string &key) {
+int FIFOEndpointStore::remove(const std::string &key,
+                              std::shared_ptr<RdmaEndPoint> ep) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
-    if (iter != endpoint_map_.end()) {
+    if (iter != endpoint_map_.end() && iter->second == ep) {
         waiting_list_.insert(iter->second);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[key];
@@ -126,10 +127,11 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getOrInsert(
     return endpoint;
 }
 
-int SIEVEEndpointStore::remove(const std::string &key) {
+int SIEVEEndpointStore::remove(const std::string &key,
+                               std::shared_ptr<RdmaEndPoint> ep) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
-    if (iter != endpoint_map_.end()) {
+    if (iter != endpoint_map_.end() && iter->second.first == ep) {
         waiting_list_len_++;
         waiting_list_.insert(iter->second.first);
         endpoint_map_.erase(iter);

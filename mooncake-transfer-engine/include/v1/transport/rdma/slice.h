@@ -43,16 +43,10 @@ struct RdmaTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
-    uint64_t padding1[8];
-
     volatile int success_slices = 0;
-    volatile int failed_slices = 0;
-    uint64_t padding2[8];
 };
 
 class RdmaEndPoint;
-
-enum class SliceCallbackType { SUCCESS, FAILED, TIMEOUT, RESET, NOP };
 
 struct RdmaSlice {
     void *source_addr = nullptr;
@@ -68,27 +62,30 @@ struct RdmaSlice {
     int target_dev_id = -1;
 
     RdmaEndPoint *ep_weak_ptr = nullptr;
+    TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     int retry_count = 0;
     bool failed = false;
-    uint64_t enqueue_ts = 0, submit_ts = 0;
+    uint64_t enqueue_ts = 0;
+    uint64_t submit_ts = 0;
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
 
-static inline void markSliceSuccess(RdmaSlice *slice) {
+static inline void updateSliceStatus(RdmaSlice *slice,
+                                     TransferStatusEnum status) {
     auto task = slice->task;
-    __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-    auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
-    if (success_slices + 1 == task->num_slices) {
-        task->status_word = COMPLETED;
+    if (slice->word != PENDING || status == PENDING) return;
+    if (status == COMPLETED) {
+        __sync_fetch_and_add(&task->transferred_bytes, slice->length);
+        auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
+        if (success_slices + 1 == task->num_slices) {
+            __sync_bool_compare_and_swap(&task->status_word, PENDING,
+                                         COMPLETED);
+        }
+    } else {
+        __sync_bool_compare_and_swap(&task->status_word, PENDING, status);
     }
-}
-
-static inline void markSliceFailed(RdmaSlice *slice) {
-    auto task = slice->task;
-    __sync_fetch_and_add(&task->failed_slices, 1);
-    task->status_word = FAILED;
 }
 
 }  // namespace v1

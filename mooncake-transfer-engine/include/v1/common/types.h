@@ -55,7 +55,7 @@ struct Request {
 };
 
 enum TransferStatusEnum {
-    WAITING,
+    INITIAL,
     PENDING,
     INVALID,
     CANCELED,

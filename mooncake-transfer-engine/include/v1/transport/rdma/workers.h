@@ -121,8 +121,6 @@ class Workers {
 
     std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
 
-    Status resetEndpoint(RdmaSlice *slice);
-
     using GroupedRequests =
         std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;
 

@@ -143,6 +143,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc &peer_desc,
     if (status_ == EP_READY) {
         LOG(WARNING) << "EndPoint in READY state, convert to RESET state";
         resetUnlocked();
+        status_ = EP_HANDSHAKING;
     } else if (status_ != EP_HANDSHAKING)
         return Status::InvalidArgument("Endpoint not in HANDSHAKING state");
     auto &transport = context_->transport_;
@@ -175,7 +176,7 @@ int RdmaEndPoint::reset() {
 }
 
 int RdmaEndPoint::resetUnlocked() {
-    if (status_ == EP_UNINIT) return 0;
+    if (status_ != EP_READY) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
     ibv_qp_attr attr;
@@ -190,7 +191,6 @@ int RdmaEndPoint::resetUnlocked() {
         }
         cancelQuota(i, wr_depth_list_[i].value);
     }
-    status_ = EP_HANDSHAKING;
     return 0;
 }
 
@@ -198,9 +198,8 @@ int RdmaEndPoint::setupAllQPs(const std::string &peer_gid, uint16_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
                               std::string *reply_msg) {
     if (status_ == EP_READY) {
-        LOG(WARNING) << "Reconfigure an already READY endpoint ["
-                     << endpoint_name_ << "]";
-        if (reset()) return ERR_ENDPOINT;
+        status_ = EP_RESET;
+        return ERR_ENDPOINT;
     }
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
@@ -210,13 +209,17 @@ int RdmaEndPoint::setupAllQPs(const std::string &peer_gid, uint16_t peer_lid,
             std::to_string(peer_qp_num_list.size());
         LOG(ERROR) << "[TE ConnEst] Handshake error detected: " << message;
         if (reply_msg) *reply_msg = message;
+        status_ = EP_RESET;
         return ERR_ENDPOINT;
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret = setupOneQP(qp_index, peer_gid, peer_lid,
                              peer_qp_num_list[qp_index], reply_msg);
-        if (ret) return ret;
+        if (ret) {
+            status_ = EP_RESET;
+            return ret;
+        }
     }
 
     status_ = EP_READY;
@@ -271,8 +274,10 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
         wr.sg_list = &sge_list[sge_idx];
-        // wr.send_flags = IBV_SEND_SIGNALED;
-        wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        // TODO the quota algorithm should be changed as well to keep optimal
+        // allocation
+        // wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
         wr.imm_data = 0;
         wr.wr.rdma.remote_addr = current->target_addr;
@@ -322,12 +327,12 @@ void RdmaEndPoint::resetInflightSlices() {
         auto &queue = slice_queue_[qp_index];
         while (!queue.empty()) {
             auto current = queue.pop();
-            markSliceFailed(current);
+            updateSliceStatus(current, TransferStatusEnum::CANCELED);
         }
     }
 }
 
-size_t RdmaEndPoint::acknowledge(RdmaSlice *slice, SliceCallbackType status) {
+size_t RdmaEndPoint::acknowledge(RdmaSlice *slice, TransferStatusEnum status) {
     auto qp_index = slice->qp_index;
     auto &queue = slice_queue_[qp_index];
     if (!queue.contains(slice)) return 0;
@@ -337,33 +342,10 @@ size_t RdmaEndPoint::acknowledge(RdmaSlice *slice, SliceCallbackType status) {
         current = queue.pop();
         if (!current) break;
         num_entries++;
-        if (status == SliceCallbackType::SUCCESS)
-            markSliceSuccess(current);
-        else if (status == SliceCallbackType::FAILED)
-            markSliceFailed(current);
+        updateSliceStatus(current, status);
     } while (current != slice);
     cancelQuota(qp_index, num_entries);
     return num_entries;
-}
-
-void RdmaEndPoint::evictTimeoutSlices() {
-    auto current_ts = getCurrentTimeInNano();
-    const static uint64_t kTimeoutInNano = 15000000000ull;
-    int num_entries = 0;
-    for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        auto &queue = slice_queue_[qp_index];
-        while (!queue.empty()) {
-            auto current = queue.peek();
-            if (current_ts - current->enqueue_ts > kTimeoutInNano) {
-                markSliceFailed(current);
-                num_entries++;
-                queue.pop();
-            } else {
-                break;
-            }
-        }
-        if (num_entries) cancelQuota(qp_index, num_entries);
-    }
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() {

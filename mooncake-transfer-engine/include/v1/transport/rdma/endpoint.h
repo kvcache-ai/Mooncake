@@ -124,9 +124,7 @@ class RdmaEndPoint {
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
-    size_t acknowledge(RdmaSlice *slice, SliceCallbackType status);
-
-    void evictTimeoutSlices();
+    size_t acknowledge(RdmaSlice *slice, TransferStatusEnum status);
 
     volatile int *getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
