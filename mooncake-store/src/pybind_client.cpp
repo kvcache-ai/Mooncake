@@ -237,11 +237,7 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
             std::min(max_threads, std::max<size_t>(threads_by_size, 1));
 
         if (threads_by_size < 1 || num_threads == 1) {
-            // Too small to benefit from threading; touch inline.
-            for (size_t offset = 0; offset < segment_size;
-                 offset += page_size) {
-                static_cast<char *>(ptr)[offset] = 0;
-            }
+            // Too small to benefit from threading; Skip
         } else {
             std::vector<std::thread> threads;
             threads.reserve(num_threads);
