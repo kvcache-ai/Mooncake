@@ -60,7 +60,7 @@ print(data.decode())  # Output: Hello, Mooncake Store!
 store.close()
 ```
 
-**RDMA device selection**: Leave `rdma_devices` as `""` (with `MC_MS_AUTO_DISC` unset or `1`) to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
+**RDMA device selection**: Leave `rdma_devices` as `""` to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
 
 Mooncake selects available ports internally at `setup() `, so you do not need to fix specific port numbers in these examples. Internally, ports are chosen from a dynamic range (currently 12300–14300).
 
