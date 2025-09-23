@@ -81,6 +81,7 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
 )
 
