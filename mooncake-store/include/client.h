@@ -24,10 +24,15 @@ namespace mooncake {
 
 class PutOperation;
 
+/**
+ * @brief Result of a query operation containing replica information and lease timeout
+ */
 class QueryResult {
    public:
-    std::vector<Replica::Descriptor> replicas;
-    std::chrono::steady_clock::time_point lease_timeout;
+    /** @brief List of available replicas for the queried key */
+    const std::vector<Replica::Descriptor> replicas;
+    /** @brief Time point when the lease for this key expires */
+    const std::chrono::steady_clock::time_point lease_timeout;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param)
@@ -37,6 +42,7 @@ class QueryResult {
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
     }
+
     bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
         return now >= lease_timeout;
     }
@@ -109,19 +115,16 @@ class Client {
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
+     * @return Vector of QueryResult objects containing replicas and lease timeouts
      */
-
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
 
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
-     * @param replica_list Previously queried replica list
+     * @param query_result Previously queried object metadata containing replicas and lease timeout
      * @param slices Vector of slices to store the data
-     * @param lease_timeout Lease timeout, data transfer must be completed
-     * before this time
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
@@ -130,9 +133,9 @@ class Client {
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
-     * @param object_infos Previously queried object metadata
+     * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
-     * @return ErrorCode indicating success/failure
+     * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
@@ -233,8 +236,7 @@ class Client {
     /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
-     * @param exist_results Output vector of existence results for each key
-     * @return ErrorCode indicating success/failure of the batch operation
+     * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
@@ -276,12 +278,12 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    ErrorCode TransferData(const Replica::Descriptor& replica,
+    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica,
+    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
-    ErrorCode TransferRead(const Replica::Descriptor& replica,
+    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
 
     /**
