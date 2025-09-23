@@ -95,7 +95,7 @@ Client::~Client() {
     }
 }
 
-static bool get_auto_discover() {
+static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
         int iv = std::stoi(ev_ad);
@@ -111,7 +111,7 @@ static bool get_auto_discover() {
                 << ", should be 0 or 1, using default: auto discovery not set";
         }
     }
-    return true;
+    return std::nullopt;
 }
 
 static inline void ltrim(std::string& s) {
@@ -235,7 +235,20 @@ ErrorCode Client::InitTransferEngine(
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
-    bool auto_discover = get_auto_discover();
+    std::optional<bool> env_auto_discover = get_auto_discover();
+    bool auto_discover = false;
+    if (env_auto_discover.has_value()) {
+        // Use user-specified auto-discover setting
+        auto_discover = env_auto_discover.value();
+    } else {
+        // Enable auto-discover for RDMA if no devices are specified
+        if (protocol == "rdma" && !device_names.has_value()) {
+            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
+                         "since no "
+                         "device names provided";
+            auto_discover = true;
+        }
+    }
     transfer_engine_.setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
