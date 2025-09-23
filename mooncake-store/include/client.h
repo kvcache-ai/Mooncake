@@ -25,7 +25,8 @@ namespace mooncake {
 class PutOperation;
 
 /**
- * @brief Result of a query operation containing replica information and lease timeout
+ * @brief Result of a query operation containing replica information and lease
+ * timeout
  */
 class QueryResult {
    public:
@@ -115,7 +116,8 @@ class Client {
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
-     * @return Vector of QueryResult objects containing replicas and lease timeouts
+     * @return Vector of QueryResult objects containing replicas and lease
+     * timeouts
      */
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
@@ -123,7 +125,8 @@ class Client {
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
-     * @param query_result Previously queried object metadata containing replicas and lease timeout
+     * @param query_result Previously queried object metadata containing
+     * replicas and lease timeout
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */

@@ -520,7 +520,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                   << object_key;
+                     << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
@@ -620,7 +620,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
             LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                       << object_keys[i];
+                         << object_keys[i];
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
