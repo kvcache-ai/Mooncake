@@ -238,9 +238,10 @@ ErrorCode Client::InitTransferEngine(
     std::optional<bool> env_auto_discover = get_auto_discover();
     bool auto_discover = false;
     if (env_auto_discover.has_value()) {
+        // Use user-specified auto-discover setting
         auto_discover = env_auto_discover.value();
     } else {
-        // default settings
+        // Enable auto-discover for RDMA if no devices are specified
         if (protocol == "rdma" && !device_names.has_value()) {
             LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
                          "since no "
@@ -248,7 +249,6 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = true;
         }
     }
-
     transfer_engine_.setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
