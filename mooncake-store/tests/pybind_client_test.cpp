@@ -100,8 +100,10 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
 // expire.
 TEST_F(PyClientTest, GetWithLeaseTimeOut) {
     // Start in-proc master
-    ASSERT_TRUE(master_.Start(
-        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1).build()))
+    const uint64_t kv_lease_ttl_ = 1;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl_)
+                                  .build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
@@ -115,22 +117,101 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
                                 FLAGS_protocol, rdma_devices, master_address_),
               0);
 
-    // Test Get Operation
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
-    const std::string key = "test_key_pyclient";
+    // Register buffers for zero-copy operations
+    int reg_result =
+        py_client_->register_buffer(test_data.data(), test_data.size());
+    EXPECT_EQ(reg_result, 0) << "Buffer registration should succeed";
 
-    // Put the data
-    std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
+    // Test Single Get Operation
+    {
+        const std::string key = "test_key_pyclient";
 
-    int put_result = py_client_->put(key, data_span, config);
-    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+        // Put the data
+        std::span<const char> data_span(test_data.data(), test_data.size());
+        ReplicateConfig config;
+        config.replica_num = 1;
 
-    // Test Get operation using buffer handle
-    auto buffer_handle = py_client_->get_buffer(key);
-    ASSERT_TRUE(buffer_handle == nullptr) << "Get buffer should fail";
+        int put_result = py_client_->put(key, data_span, config);
+        EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+
+        // Test Get operation using buffer handle
+        auto buffer_handle = py_client_->get_buffer(key);
+        ASSERT_TRUE(buffer_handle == nullptr) << "Get buffer should fail";
+
+        // Test Get operation using buffer handle
+        auto bytes_read =
+            py_client_->get_into(key, test_data.data(), test_data.size());
+        ASSERT_TRUE(bytes_read < 0) << "Get into should fail";
+
+        // Clear the data for the next test
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl_));
+        ASSERT_EQ(py_client_->remove(key), 0)
+            << "Remove operation should succeed";
+    }
+
+    // Test Batch Get Operation
+    {
+        const size_t num_slices = 128;
+        const size_t slice_size = data_size / num_slices;
+        const std::string key_prefix = "batch_test_key_";
+
+        // Prepare batch data
+        std::vector<std::string> keys;
+        std::vector<std::span<const char>> data_spans;
+        std::vector<void*> buffers;
+        std::vector<size_t> sizes;
+
+        for (size_t i = 0; i < num_slices; ++i) {
+            const std::string key = key_prefix + std::to_string(i);
+            keys.push_back(key);
+
+            const char* slice_data = test_data.data() + (i * slice_size);
+            data_spans.emplace_back(slice_data, slice_size);
+            buffers.push_back(const_cast<char*>(slice_data));
+            sizes.push_back(slice_size);
+        }
+
+        // Batch Put operation
+        ReplicateConfig config;
+        config.replica_num = 1;
+        int batch_put_result = py_client_->put_batch(keys, data_spans, config);
+        EXPECT_EQ(batch_put_result, 0) << "Batch put operation should succeed";
+
+        // Test Batch Get operation using batch_get_buffer
+        auto buffer_handles = py_client_->batch_get_buffer(keys);
+        ASSERT_EQ(buffer_handles.size(), num_slices)
+            << "Should return handles for all keys";
+        int fail_count = 0;
+        for (size_t i = 0; i < buffer_handles.size(); ++i) {
+            if (buffer_handles[i] == nullptr) {
+                fail_count++;
+            }
+        }
+        LOG(INFO) << "Batch get buffer " << fail_count << " out of "
+                  << num_slices << " keys failed";
+        ASSERT_NE(fail_count, 0) << "Should fail for some keys";
+
+        // Test Batch Get operation using batch_get_into
+        auto bytes_read_results =
+            py_client_->batch_get_into(keys, buffers, sizes);
+        ASSERT_EQ(bytes_read_results.size(), num_slices)
+            << "Should return results for all keys";
+        fail_count = 0;
+        for (size_t i = 0; i < bytes_read_results.size(); ++i) {
+            if (bytes_read_results[i] < 0) {
+                fail_count++;
+            }
+        }
+        LOG(INFO) << "Batch get into " << fail_count << " out of " << num_slices
+                  << " keys failed";
+        ASSERT_NE(fail_count, 0) << "Should fail for some keys";
+    }
+
+    // Unregister buffers
+    int unreg_result = py_client_->unregister_buffer(test_data.data());
+    EXPECT_EQ(unreg_result, 0) << "Buffer unregistration should succeed";
 }
 
 }  // namespace testing
