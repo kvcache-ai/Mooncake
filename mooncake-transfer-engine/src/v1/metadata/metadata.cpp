@@ -236,6 +236,9 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
                                         const std::string &segment_name) {
     std::string request, response;
+    if (segment_name.empty())
+        return Status::InvalidArgument("Empty segment name" LOC_MARK);
+
     auto status =
         tl_rpc_agent.call(segment_name, GetSegmentDesc, request, response);
     if (!status.ok()) return status;

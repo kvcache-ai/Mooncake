@@ -30,38 +30,44 @@ class RdmaEndPoint {
     };
 
     struct BoundedSliceQueue {
-        size_t head, tail, capacity;
-        RdmaSlice **entries;
+        size_t head, tail, capacity, count;
+        std::vector<RdmaSlice *> entries;
         std::unordered_set<RdmaSlice *> slice_set;
 
-        BoundedSliceQueue(size_t capacity)
-            : head(0), tail(0), capacity(capacity) {
-            entries = new RdmaSlice *[capacity];
+        BoundedSliceQueue(size_t num_wr)
+            : head(0),
+              tail(0),
+              capacity(num_wr * 2),
+              count(0),
+              entries(capacity) {
+            assert(capacity > 0);
         }
 
-        ~BoundedSliceQueue() { delete[] entries; }
+        ~BoundedSliceQueue() {}
 
-        bool empty() const { return head == tail; }
+        bool empty() const { return count == 0; }
 
-        bool full() const { return (tail + 1) % capacity == head; }
+        bool full() const { return count == capacity; }
 
         void push(RdmaSlice *slice) {
-            if (full()) throw std::runtime_error("Queue overflow");
+            if (count == capacity) throw std::runtime_error("queue overflow");
             entries[tail] = slice;
             tail = (tail + 1) % capacity;
             slice_set.insert(slice);
+            count++;
         }
 
         RdmaSlice *peek() {
-            if (empty()) return nullptr;
+            if (count == 0) return nullptr;
             return entries[head];
         }
 
         RdmaSlice *pop() {
-            if (empty()) return nullptr;
+            if (count == 0) return nullptr;
             RdmaSlice *cur = entries[head];
             head = (head + 1) % capacity;
             slice_set.erase(cur);
+            count--;
             return cur;
         }
 
@@ -118,7 +124,7 @@ class RdmaEndPoint {
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
-    void acknowledge(RdmaSlice *slice, SliceCallbackType status);
+    size_t acknowledge(RdmaSlice *slice, SliceCallbackType status);
 
     void evictTimeoutSlices();
 
@@ -148,7 +154,7 @@ class RdmaEndPoint {
     std::string endpoint_name_;
 
     std::vector<ibv_qp *> qp_list_;
-    std::vector<BoundedSliceQueue *> slice_queue_;
+    std::vector<BoundedSliceQueue> slice_queue_;
     WrDepthBlock *wr_depth_list_;
     volatile int inflight_slices_;
     uint32_t padding_[7];

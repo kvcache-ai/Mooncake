@@ -65,9 +65,7 @@ class Workers {
 
     int handleContextEvents(std::shared_ptr<RdmaContext> &context);
 
-    Status generatePostPath(int thread_id, RdmaSlice *slice,
-                            std::string &target_seg_name,
-                            std::string &target_dev_name);
+    Status generatePostPath(int thread_id, RdmaSlice *slice);
 
    private:
     struct RouteHint {
@@ -121,9 +119,7 @@ class Workers {
         }
     };
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(
-        int local_device_id, const std::string &target_seg_name,
-        const std::string &target_dev_name);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
 
     Status resetEndpoint(RdmaSlice *slice);
 

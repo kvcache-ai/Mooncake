@@ -69,11 +69,7 @@ void RdmaCQ::cancelQuota(int num_entries) {
 
 int RdmaCQ::poll(int num_entries, ibv_wc *wc) {
     if (!cqe_now_) return 0;
-    int ret = ibv_poll_cq(cq_, num_entries, wc);
-    if (ret > 0) {
-        __sync_fetch_and_sub(&cqe_now_, ret);
-    }
-    return ret;
+    return ibv_poll_cq(cq_, num_entries, wc);
 }
 }  // namespace v1
 }  // namespace mooncake

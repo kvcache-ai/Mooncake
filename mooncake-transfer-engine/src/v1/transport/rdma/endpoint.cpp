@@ -74,8 +74,7 @@ int RdmaEndPoint::construct(RdmaContext *context, EndPointParams *params,
             deconstruct();
             return ERR_ENDPOINT;
         }
-        slice_queue_.emplace_back(
-            new BoundedSliceQueue(params_->max_qp_wr + 16));
+        slice_queue_.emplace_back(params_->max_qp_wr);
     }
     status_ = EP_HANDSHAKING;
     return 0;
@@ -88,7 +87,7 @@ int RdmaEndPoint::deconstruct() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (ibv_destroy_qp(qp_list_[i]))
             PLOG(ERROR) << "RdmaEndPoint Failure: ibv_destroy_qp";
-        delete slice_queue_[i];
+        cancelQuota(i, wr_depth_list_[i].value);
     }
     qp_list_.clear();
     slice_queue_.clear();
@@ -100,6 +99,9 @@ int RdmaEndPoint::deconstruct() {
 
 Status RdmaEndPoint::connect(const std::string &peer_server_name,
                              const std::string &peer_nic_name) {
+    if (peer_server_name.empty() || peer_nic_name.empty())
+        return Status::InvalidArgument(
+            "Empty peer server or nic name" LOC_MARK);
     RWSpinlock::WriteGuard guard(lock_);
     if (status_ == EP_READY) return Status::OK();
     if (status_ != EP_HANDSHAKING)
@@ -186,8 +188,8 @@ int RdmaEndPoint::resetUnlocked() {
             deconstruct();
             return ERR_ENDPOINT;
         }
+        cancelQuota(i, wr_depth_list_[i].value);
     }
-    for (size_t i = 0; i < qp_list_.size(); ++i) wr_depth_list_[i].value = 0;
     status_ = EP_HANDSHAKING;
     return 0;
 }
@@ -269,8 +271,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
         wr.sg_list = &sge_list[sge_idx];
-        wr.send_flags = IBV_SEND_SIGNALED;
-        // wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
+        // wr.send_flags = IBV_SEND_SIGNALED;
+        wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
         wr.imm_data = 0;
         wr.wr.rdma.remote_addr = current->target_addr;
@@ -291,7 +293,9 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice *> &slice_list,
     auto &queue = slice_queue_[qp_index];
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
         auto current = slice_list[wr_idx];
-        if (!current->failed) queue->push(current);
+        if (!current->failed) {
+            queue.push(current);
+        }
     }
     return wr_count;
 }
@@ -316,43 +320,49 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
 void RdmaEndPoint::resetInflightSlices() {
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         auto &queue = slice_queue_[qp_index];
-        while (!queue->empty()) {
-            auto current = queue->pop();
+        while (!queue.empty()) {
+            auto current = queue.pop();
             markSliceFailed(current);
         }
     }
 }
 
-void RdmaEndPoint::acknowledge(RdmaSlice *slice, SliceCallbackType status) {
+size_t RdmaEndPoint::acknowledge(RdmaSlice *slice, SliceCallbackType status) {
     auto qp_index = slice->qp_index;
     auto &queue = slice_queue_[qp_index];
-    if (!queue->contains(slice)) return;
+    if (!queue.contains(slice)) return 0;
     int num_entries = 0;
     RdmaSlice *current = nullptr;
     do {
-        current = queue->pop();
+        current = queue.pop();
+        if (!current) break;
         num_entries++;
         if (status == SliceCallbackType::SUCCESS)
             markSliceSuccess(current);
         else if (status == SliceCallbackType::FAILED)
             markSliceFailed(current);
     } while (current != slice);
-    __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
-    __sync_fetch_and_sub(&inflight_slices_, num_entries);
+    cancelQuota(qp_index, num_entries);
+    return num_entries;
 }
 
 void RdmaEndPoint::evictTimeoutSlices() {
     auto current_ts = getCurrentTimeInNano();
     const static uint64_t kTimeoutInNano = 15000000000ull;
+    int num_entries = 0;
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         auto &queue = slice_queue_[qp_index];
-        while (!queue->empty()) {
-            auto current = queue->peek();
+        while (!queue.empty()) {
+            auto current = queue.peek();
             if (current_ts - current->enqueue_ts > kTimeoutInNano) {
                 markSliceFailed(current);
-                queue->pop();
+                num_entries++;
+                queue.pop();
+            } else {
+                break;
             }
         }
+        if (num_entries) cancelQuota(qp_index, num_entries);
     }
 }
 
@@ -371,17 +381,18 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
     if (!cq->reserveQuota(num_entries)) return false;
     auto prev_depth_list =
         __sync_fetch_and_add(&wr_depth_list_[qp_index].value, num_entries);
+    __sync_fetch_and_add(&inflight_slices_, num_entries);
     if (prev_depth_list + num_entries > params_->max_qp_wr) {
         cancelQuota(qp_index, num_entries);
         return false;
     }
-    __sync_fetch_and_add(&inflight_slices_, num_entries);
     return true;
 }
 
 void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
+    __sync_fetch_and_sub(&inflight_slices_, num_entries);
     auto cq = context_->cq(qp_index % context_->cqCount());
     cq->cancelQuota(num_entries);
 }
