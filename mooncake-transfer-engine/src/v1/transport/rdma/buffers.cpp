@@ -78,7 +78,7 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
     assert(topology_ && context);
     int index = 0;
     bool found = false;
-    for (auto &device : topology_->getDeviceList()) {
+    for (auto &device : topology_->getNicList()) {
         if (device == context->name()) {
             if (context_list_[index]) {
                 LOG(WARNING) << "Device " << context->name()

@@ -65,6 +65,7 @@ int RdmaEndPoint::construct(RdmaContext *context, EndPointParams *params,
         attr.recv_cq = cq;
         attr.sq_sig_all = false;
         attr.qp_type = IBV_QPT_RC;
+        attr.qp_context = this;
         attr.cap.max_send_wr = attr.cap.max_recv_wr = params_->max_qp_wr;
         attr.cap.max_send_sge = attr.cap.max_recv_sge = params_->max_sge;
         attr.cap.max_inline_data = params_->max_inline_bytes;

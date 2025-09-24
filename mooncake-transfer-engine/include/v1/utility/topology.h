@@ -77,9 +77,9 @@ class Topology {
 
     Status discover(std::shared_ptr<ConfigManager> conf = nullptr);
 
-    Status parse(const std::string &topology_json);
+    Status parse(const std::string &content);
 
-    Status disableDevice(const std::string &device_name);
+    Status disableNic(const std::string &nic_name);
 
     std::string toString() const;
 
@@ -89,17 +89,17 @@ class Topology {
 
     const TopologyMatrix &getMatrix() const { return matrix_; }
 
-    const std::vector<std::string> &getDeviceList() const {
+    const std::vector<std::string> &getNicList() const {
         return rdma_device_list_;
     }
 
-    std::string getDeviceName(int device_id) const {
+    std::string getNicName(int device_id) const {
         if (device_id < 0 || device_id >= (int)rdma_device_list_.size())
             return "";
         return rdma_device_list_[device_id];
     }
 
-    int findDeviceID(const std::string &name) const {
+    int getNicID(const std::string &name) const {
         int index = 0;
         for (auto &entry : rdma_device_list_)
             if (entry == name)
@@ -109,17 +109,19 @@ class Topology {
         return -1;
     }
 
-    int findDeviceNumaID(int dev_id) const;
+    int getNicNumaID(int dev_id) const;
 
-    double findDeviceBandwidth(int dev_id) const { return 200; /* dummy */ }
+    double getNicBandwidth(int dev_id) const { return 200; /* dummy */ }
 
     const ResolvedTopologyMatrix &getResolvedMatrix() const {
         return resolved_matrix_;
     }
 
-    int getCudaDeviceCount() const;
+    int getNpuCount() const;
 
-    int getBestRdmaDeviceID(int cuda_dev_id) const;
+    int findNicByNpu(int npu_id) const;
+
+    int findNpuByNic(int nic_id) const;
 
    private:
     Status resolve();
@@ -129,46 +131,6 @@ class Topology {
     std::vector<std::string> rdma_device_list_;
     ResolvedTopologyMatrix resolved_matrix_;
     std::map<int, int> cuda_to_rdma_dev_map_;
-};
-
-class RailTopology {
-    const static size_t kMaxNuma = 4;
-
-   public:
-    RailTopology() = default;
-
-    ~RailTopology() = default;
-
-    RailTopology(const RailTopology &) = delete;
-    RailTopology &operator=(const RailTopology &) = delete;
-
-   public:
-    Status load(const Topology *local, const Topology *remote,
-                const std::string &rail_topo_json_path = "",
-                const std::string &local_machine_id = "",
-                const std::string &remote_machine_id = "");
-
-    bool connected(int local_dev_id, int remote_dev_id);
-
-    int findRemoteDeviceID(int local_dev_id, int dst_numa = -1);
-
-   private:
-    Status loadFromJson(const std::string &rail_topo_json_path,
-                        const std::string &local_machine_id,
-                        const std::string &remote_machine_id);
-
-    Status loadFromSelf();
-
-   private:
-    const Topology *local_, *remote_;
-    struct PairHash {
-        std::size_t operator()(const std::pair<int, int> &p) const noexcept {
-            return std::hash<int>()(p.first) ^
-                   (std::hash<int>()(p.second) << 1);
-        }
-    };
-    std::unordered_set<std::pair<int, int>, PairHash> connected_set_;
-    std::unordered_map<int, int> best_mapping_[kMaxNuma];
 };
 
 int getCudaDeviceNumaID(int cuda_id);

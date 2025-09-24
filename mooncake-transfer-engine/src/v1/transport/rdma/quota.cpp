@@ -23,11 +23,11 @@ namespace v1 {
 Status DeviceQuota::loadTopology(std::shared_ptr<Topology> &local_topology) {
     local_topology_ = local_topology;
     std::unordered_set<int> used_numa_id;
-    for (size_t dev_id = 0; dev_id < local_topology->getDeviceList().size();
+    for (size_t dev_id = 0; dev_id < local_topology->getNicList().size();
          ++dev_id) {
         devices_[dev_id].dev_id = dev_id;
-        devices_[dev_id].bw_gbps = local_topology->findDeviceBandwidth(dev_id);
-        devices_[dev_id].numa_id = local_topology->findDeviceNumaID(dev_id);
+        devices_[dev_id].bw_gbps = local_topology->getNicBandwidth(dev_id);
+        devices_[dev_id].numa_id = local_topology->getNicNumaID(dev_id);
         devices_[dev_id].local_quota = UINT64_MAX;
         used_numa_id.insert(devices_[dev_id].numa_id);
     }
@@ -97,7 +97,7 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
     }
 
     if (score_map.empty()) {
-        const int num_devices = (int)local_topology_->getDeviceList().size();
+        const int num_devices = (int)local_topology_->getNicList().size();
         for (int dev_id = 0; dev_id < num_devices; ++dev_id) {
             if (devices_[dev_id].bw_gbps) {
                 score_map[dev_id] = 1.0;

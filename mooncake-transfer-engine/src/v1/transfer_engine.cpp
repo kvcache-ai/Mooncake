@@ -152,7 +152,7 @@ Status TransferEngine::construct() {
     CHECK_STATUS(setupLocalSegment());
 
     if (conf_->get("transports/rdma/enable", true) &&
-        !topology_->getDeviceList().empty()) {
+        !topology_->getNicList().empty()) {
         transport_list_[RDMA] = std::make_unique<RdmaTransport>();
     }
 

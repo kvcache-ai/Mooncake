@@ -25,6 +25,7 @@
 #include <numeric>
 
 #include "context.h"
+#include "rail_monitor.h"
 #include "v1/utility/system.h"
 #include "v1/concurrency/concurrentqueue.h"
 
@@ -57,15 +58,15 @@ class Workers {
 
     void workerThread(int thread_id);
 
-    void asyncPostSend(int thread_id);
+    void asyncPostSend();
 
-    void asyncPollCq(int thread_id);
+    void asyncPollCq();
 
     void monitorThread();
 
     int handleContextEvents(std::shared_ptr<RdmaContext> &context);
 
-    Status generatePostPath(int thread_id, RdmaSlice *slice);
+    Status generatePostPath(RdmaSlice *slice);
 
    private:
     struct RouteHint {
@@ -80,16 +81,16 @@ class Workers {
                         uint64_t length);
 
     Status selectOptimalDevice(RouteHint &source, RouteHint &target,
-                               RdmaSlice *slice, int thread_id);
+                               RdmaSlice *slice);
 
     Status selectFallbackDevice(RouteHint &source, RouteHint &target,
-                                RdmaSlice *slice, int thread_id);
+                                RdmaSlice *slice);
 
     int getDeviceByFlatIndex(const RouteHint &hint, size_t flat_idx);
 
     int getDeviceRank(const RouteHint &hint, int device_id);
 
-    void showLatencyInfo(int thread_id);
+    void showLatencyInfo();
 
    private:
     RdmaTransport *transport_;
@@ -187,8 +188,7 @@ class Workers {
         volatile bool in_suspend = false;
 
         std::unique_ptr<DeviceQuota> device_quota;
-        std::unordered_map<std::string, std::shared_ptr<RailTopology>>
-            rail_topology_map_;
+        std::unordered_map<std::string, RailMonitor> rails;
         PerfMetricSummary perf;
     };
 

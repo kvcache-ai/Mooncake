@@ -102,7 +102,7 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "RDMA transport has been installed" LOC_MARK);
     }
 
-    if (local_topology == nullptr || local_topology->getDeviceList().empty()) {
+    if (local_topology == nullptr || local_topology->getNicList().empty()) {
         return Status::DeviceNotFound(
             "No RDMA device found in topology" LOC_MARK);
     }
@@ -114,12 +114,12 @@ Status RdmaTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
-    auto hca_list = local_topology_->getDeviceList();
+    auto hca_list = local_topology_->getNicList();
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this);
         int ret = context->construct(device_name, params_);
         if (ret) {
-            local_topology_->disableDevice(device_name);
+            local_topology_->disableNic(device_name);
             LOG(WARNING) << "Disable RDMA device " << device_name << " because "
                          << "of initialization failure";
             continue;
@@ -202,7 +202,7 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const int num_devices = (size_t)local_topology_->getDeviceList().size();
+    const int num_devices = (size_t)local_topology_->getNicList().size();
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
@@ -317,6 +317,13 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
     }
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
+    if (context->status() == RdmaContext::DEVICE_DISABLED) {
+        std::stringstream ss;
+        ss << "Device is down: " << peer_desc.local_nic_path;
+        LOG(ERROR) << ss.str();
+        local_desc.reply_msg = ss.str();
+        return -1;
+    }
     auto endpoint =
         context->endpointStore()->getOrInsert(peer_desc.local_nic_path);
     if (!endpoint) {

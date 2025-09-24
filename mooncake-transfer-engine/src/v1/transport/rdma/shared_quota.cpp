@@ -111,15 +111,15 @@ Status SharedQuotaManager::initializeHeader(
     // called only by creator
     memset(hdr_, 0, size_);
     hdr_->version = SHM_VERSION;
-    hdr_->num_devices = static_cast<int>(topology->getDeviceList().size());
+    hdr_->num_devices = static_cast<int>(topology->getNicList().size());
     CHECK_STATUS(initMutex(&hdr_->global_mutex));
 
     // initialize device entries (caller can fill real values later under
     // lock)
     for (int i = 0; i < (int)hdr_->num_devices; ++i) {
         hdr_->devices[i].dev_id = i;
-        hdr_->devices[i].numa_id = topology->findDeviceNumaID(i);
-        hdr_->devices[i].bw_gbps = topology->findDeviceBandwidth(i);
+        hdr_->devices[i].numa_id = topology->getNicNumaID(i);
+        hdr_->devices[i].bw_gbps = topology->getNicBandwidth(i);
         hdr_->devices[i].active_bytes = 0;
         for (int s = 0; s < MAX_PID_SLOTS; ++s) {
             hdr_->devices[i].pid_usages[s].pid = 0;

@@ -448,7 +448,7 @@ Status Topology::resolve() {
     return Status::OK();
 }
 
-Status Topology::disableDevice(const std::string &device_name) {
+Status Topology::disableNic(const std::string &device_name) {
     for (auto &record : matrix_) {
         for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
             auto &device_list = record.second.device_list[rank];
@@ -460,7 +460,7 @@ Status Topology::disableDevice(const std::string &device_name) {
     return resolve();
 }
 
-int Topology::findDeviceNumaID(int dev_id) const {
+int Topology::getNicNumaID(int dev_id) const {
     int numa_id = -1;
     for (const auto &kv : getResolvedMatrix()) {
         const auto &entry = kv.second;
@@ -477,142 +477,17 @@ int Topology::findDeviceNumaID(int dev_id) const {
     return numa_id >= 0 ? numa_id : 0;
 }
 
-int Topology::getCudaDeviceCount() const {
-    return cuda_to_rdma_dev_map_.size();
-}
+int Topology::getNpuCount() const { return cuda_to_rdma_dev_map_.size(); }
 
-int Topology::getBestRdmaDeviceID(int cuda_dev_id) const {
-    if (cuda_to_rdma_dev_map_.count(cuda_dev_id))
-        return cuda_to_rdma_dev_map_.at(cuda_dev_id);
+int Topology::findNicByNpu(int npu_id) const {
+    if (cuda_to_rdma_dev_map_.count(npu_id))
+        return cuda_to_rdma_dev_map_.at(npu_id);
     return -1;
 }
 
-Status RailTopology::loadFromJson(const std::string &rail_topo_json_path,
-                                  const std::string &local_machine_id,
-                                  const std::string &remote_machine_id) {
-    connected_set_.clear();
-    for (size_t i = 0; i < kMaxNuma; ++i) best_mapping_[i].clear();
-    std::ifstream ifs(rail_topo_json_path);
-    if (!ifs.is_open())
-        return Status::InvalidArgument("Unable to open rail topology file");
-
-    Json::Value root;
-    Json::CharReaderBuilder builder;
-    std::string errs;
-    if (!Json::parseFromStream(builder, ifs, &root, &errs))
-        return Status::MalformedJson("Failed to parse json: " + errs);
-
-    for (const auto &entry : root) {
-        if (entry["src_host"].asString() != local_machine_id ||
-            entry["dst_host"].asString() != remote_machine_id)
-            continue;
-
-        for (const auto &ep : entry["endpoints"]) {
-            int local_id = local_->findDeviceID(ep["src_dev"].asString());
-            int remote_id = remote_->findDeviceID(ep["dst_dev"].asString());
-            if (local_id < 0 || remote_id < 0) continue;
-            connected_set_.emplace(std::make_pair(local_id, remote_id));
-        }
-
-        const auto &matchings = entry["partition_matchings"];
-        for (const auto &key : matchings.getMemberNames()) {
-            for (const auto &ep : matchings[key]) {
-                int local_id = local_->findDeviceID(ep["src_dev"].asString());
-                int remote_id = remote_->findDeviceID(ep["dst_dev"].asString());
-                int dst_numa = ep["dst_numa"].asInt();
-                if (local_id < 0 || remote_id < 0) continue;
-                best_mapping_[dst_numa][local_id] = remote_id;
-            }
-        }
-        return Status::OK();
-    }
-
-    // try reverse lookup
-    for (const auto &entry : root) {
-        if (entry["src_host"].asString() != remote_machine_id ||
-            entry["dst_host"].asString() != local_machine_id)
-            continue;
-
-        for (const auto &ep : entry["endpoints"]) {
-            int local_id = local_->findDeviceID(ep["dst_dev"].asString());
-            int remote_id = remote_->findDeviceID(ep["src_dev"].asString());
-            if (local_id < 0 || remote_id < 0) continue;
-            connected_set_.emplace(std::make_pair(local_id, remote_id));
-        }
-
-        const auto &matchings = entry["partition_matchings"];
-        for (const auto &key : matchings.getMemberNames()) {
-            for (const auto &ep : matchings[key]) {
-                int local_id = local_->findDeviceID(ep["dst_dev"].asString());
-                int remote_id = remote_->findDeviceID(ep["src_dev"].asString());
-                int dst_numa = ep["src_numa"].asInt();
-                if (local_id < 0 || remote_id < 0) continue;
-                best_mapping_[dst_numa][local_id] = remote_id;
-            }
-        }
-        return Status::OK();
-    }
-
-    return Status::InvalidArgument("No entry found in config file");
-}
-
-Status RailTopology::loadFromSelf() {
-    connected_set_.clear();
-    for (size_t i = 0; i < kMaxNuma; ++i) best_mapping_[i].clear();
-    std::vector<int> local_dev_numa_id[kMaxNuma], remote_dev_numa_id[kMaxNuma];
-    const int local_dev_count = (int)local_->getDeviceList().size();
-    const int remote_dev_count = (int)remote_->getDeviceList().size();
-    for (int dev_id = 0; dev_id < local_dev_count; ++dev_id)
-        local_dev_numa_id[local_->findDeviceNumaID(dev_id)].push_back(dev_id);
-    for (int dev_id = 0; dev_id < remote_dev_count; ++dev_id)
-        remote_dev_numa_id[remote_->findDeviceNumaID(dev_id)].push_back(dev_id);
-    for (int local_dev_id = 0; local_dev_id < local_dev_count; ++local_dev_id)
-        for (int remote_dev_id = 0; remote_dev_id < remote_dev_count;
-             ++remote_dev_id)
-            connected_set_.emplace(std::make_pair(local_dev_id, remote_dev_id));
-    for (size_t src_numa = 0; src_numa < kMaxNuma; ++src_numa) {
-        for (size_t dst_numa = 0; dst_numa < kMaxNuma; ++dst_numa) {
-            auto &mapping = best_mapping_[dst_numa];
-            size_t local_cnt = local_dev_numa_id[src_numa].size();
-            size_t remote_cnt = remote_dev_numa_id[dst_numa].size();
-            if (!local_cnt || !remote_cnt) continue;
-            for (size_t i = 0; i < local_cnt; i++)
-                mapping[local_dev_numa_id[src_numa][i]] =
-                    remote_dev_numa_id[dst_numa][i % remote_cnt];
-        }
-    }
-    return Status::OK();
-}
-
-Status RailTopology::load(const Topology *local, const Topology *remote,
-                          const std::string &rail_topo_json_path,
-                          const std::string &local_machine_id,
-                          const std::string &remote_machine_id) {
-    local_ = local;
-    remote_ = remote;
-    if (!rail_topo_json_path.empty() && !local_machine_id.empty() &&
-        !remote_machine_id.empty() && local_machine_id != remote_machine_id) {
-        auto status = loadFromJson(rail_topo_json_path, local_machine_id,
-                                   remote_machine_id);
-        if (status.ok()) return status;
-    }
-    return loadFromSelf();
-}
-
-bool RailTopology::connected(int local_dev_id, int remote_dev_id) {
-    return connected_set_.count(std::make_pair(local_dev_id, remote_dev_id));
-}
-
-int RailTopology::findRemoteDeviceID(int local_dev_id, int dst_numa) {
-    if (dst_numa >= 0 && dst_numa < (int)kMaxNuma) {
-        if (best_mapping_[dst_numa].count(local_dev_id))
-            return best_mapping_[dst_numa][local_dev_id];
-        else
-            return -1;
-    }
-    for (dst_numa = 0; dst_numa < (int)kMaxNuma; ++dst_numa) {
-        if (best_mapping_[dst_numa].count(local_dev_id))
-            return best_mapping_[dst_numa][local_dev_id];
+int Topology::findNpuByNic(int nic_id) const {
+    for (auto &entry : cuda_to_rdma_dev_map_) {
+        if (entry.second == nic_id) return entry.first;
     }
     return -1;
 }
