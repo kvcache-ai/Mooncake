@@ -99,18 +99,20 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
         return query_result.error();
     }
 
-    auto replica_list = query_result.value();
+    const std::vector<Replica::Descriptor>& replica_list =
+        query_result.value().replicas;
     if (replica_list.empty()) {
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
     // Create slices
-    std::vector<AllocatedBuffer::Descriptor>& descriptors =
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors =
         replica_list[0].get_memory_descriptor().buffer_descriptors;
     SliceGuard slice_guard(descriptors, allocator_);
 
     // Perform get operation
-    auto get_result = client_->Get(key, replica_list, slice_guard.slices_);
+    auto get_result =
+        client_->Get(key, query_result.value(), slice_guard.slices_);
     ErrorCode error_code =
         get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {
@@ -150,7 +152,7 @@ ErrorCode ClientTestWrapper::Delete(const std::string& key) {
 }
 
 ClientTestWrapper::SliceGuard::SliceGuard(
-    std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
     std::shared_ptr<SimpleAllocator> allocator)
     : allocator_(allocator) {
     slices_.resize(descriptors.size());

@@ -62,8 +62,7 @@ class ClientIntegrationTest : public ::testing::Test {
         LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
 
         // Start an in-process non-HA master without HTTP metadata server
-        ASSERT_TRUE(master_.Start(/*rpc_port=*/0, /*http_metrics_port=*/0,
-                                  /*http_metadata_port=*/std::nullopt));
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
         master_address_ = master_.master_address();
         metadata_url_ = master_.metadata_url();
         LOG(INFO) << "Started in-proc master at " << master_address_
@@ -305,7 +304,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
         << "Query operation failed: " << toString(query_result.error());
-    auto replica_list = query_result.value();
+    auto replica_list = query_result.value().replicas;
     ASSERT_EQ(replica_list.size(), 1);
     ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(),
               1);
@@ -315,7 +314,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
                   .transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
-    auto get_result = test_client_->Get(key, replica_list, slices);
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);

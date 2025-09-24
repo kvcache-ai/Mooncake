@@ -475,7 +475,9 @@ virtual std::unique_ptr<AllocatedBuffer> Allocate(
 
 ### 租约机制
 
-为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。
+为避免数据冲突，每当 `ExistKey` 请求或 `GetReplicaListRequest` 请求成功时，系统会为对应对象授予一个租约。在租约过期前，该对象将受到保护，不会被 `Remove`、`RemoveAll` 或替换任务删除。对有租约的对象执行 `Remove` 请求会失败；`RemoveAll` 请求则只会删除没有租约的对象。这保证了只要租约未过期，就可以安全地读取该对象的数据。
+
+然而，如果在 `Get` 操作完成读取数据之前租约已过期，该操作将被视为失败，并且不会返回任何数据，以防止潜在的数据损坏。
 
 默认的租约时间为 5 秒，并可通过 `master_service` 的启动参数进行配置。
 

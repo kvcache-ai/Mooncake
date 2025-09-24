@@ -72,9 +72,9 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
 
     get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(2, get_result.value().size());
+    EXPECT_EQ(2, get_result.value().replicas.size());
 
-    for (const auto& r : get_result.value()) {
+    for (const auto& r : get_result.value().replicas) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, r.status);
     }
 }
@@ -106,15 +106,15 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
 
     auto get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(1, get_result.value().size());
-    ASSERT_TRUE(get_result.value()[0].is_memory_replica());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+    ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
 
     EXPECT_TRUE(service_->PutRevoke(key, ReplicaType::DISK).has_value());
 
     get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(1, get_result.value().size());
-    ASSERT_TRUE(get_result.value()[0].is_memory_replica());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+    ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
 }
 
 TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
@@ -149,8 +149,8 @@ TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
     EXPECT_TRUE(service_->PutEnd(key, ReplicaType::DISK).has_value());
     get_result = service_->GetReplicaList(key);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(1, get_result.value().size());
-    ASSERT_TRUE(get_result.value()[0].is_disk_replica());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+    ASSERT_TRUE(get_result.value().replicas[0].is_disk_replica());
 }
 
 TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
