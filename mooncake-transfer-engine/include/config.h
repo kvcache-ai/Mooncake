@@ -45,6 +45,8 @@ struct GlobalConfig {
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    uint16_t rpc_min_port = 15000;
+    uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
