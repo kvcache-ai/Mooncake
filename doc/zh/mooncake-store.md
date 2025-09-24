@@ -79,10 +79,7 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
 
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
 
-
-用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。（当启用了持久化功能时，若内存的 `Query` 请求失败，会尝试从SSD中寻找并载入对应的数据）
-
-> 在目前的实现中，Get 接口可选 TTL 功能。当首次获取 `object_key` 对应的值后一段时间（默认为 1s），相应的条目会被自动删除。
+`Get` 将 `object_key` 对应的值写入到提供的 `slices` 中。返回的数据保证完整且正确。每个 slice 必须指向通过 `registerLocalMemory(addr, len)` 预先注册的本地 DRAM/VRAM 内存空间（而不是贡献给分布式内存池的全局 segment）。当开启持久化功能并且在分布式内存池中未找到请求的数据时，`Get` 会回退到从 SSD 加载数据。
 
 ### Put 接口
 
@@ -94,7 +91,7 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，`Put`除了对memory pool的写入之外，还会异步发起一次向SSD的数据持久化操作）
+`Put` 将 `key` 对应的值存储到分布式内存池中。通过 `config` 参数，可以指定所需的副本数量以及优先选择哪个 segment 用于存储该值。当启用持久化功能时，`Put` 还会异步地将数据持久化到 SSD。
 
 **副本保证和尽力而为行为：**
 - 保证对象的每个slice被复制到不同的segment，确保分布在不同的存储节点上
