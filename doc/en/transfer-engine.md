@@ -62,11 +62,9 @@ To further maximize bandwidth utilization, if a single request's transfer is int
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
 ### Endpoint Management
-Mooncake Store employs a pair of end-
-points to represent the connection between a local RDMA
+Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint
-includes one or more RDMA queue pair objects. Connec-
-tions in Mooncake Store are established in an on demand manner;
+includes one or more RDMA queue pair objects. Connections in Mooncake Store are established in an on demand manner;
 endpoints remain unpaired until the first request is made.
 To prevent a large number of endpoints from slowing down
 request processing, Mooncake Store employs endpoint pooling,
@@ -82,8 +80,7 @@ Mooncake Store is designed to adeptly manage such temporary
 failures effectively. If a connection is identified as unavailable,
 Mooncake Store automatically identifies an alternative, reachable
 path and resubmits the request to a different RDMA NIC
-device. Furthermore, Mooncake Store is capable of detecting prob-
-lems with other RDMA resources, including RDMA contexts
+device. Furthermore, Mooncake Store is capable of detecting problems with other RDMA resources, including RDMA contexts
 and completion queues. It temporarily avoids using these
 resources until the issue, such as a downed link, is resolved.
 

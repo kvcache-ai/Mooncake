@@ -10,9 +10,9 @@ Mooncake Store 提供了底层的对象存储和管理能力，包括可配置�
 
 Mooncake Store 的主要特性包括：
 
-*   **对象级存储操作**：提供简单易用的对象级 API，包括 Put、Get 和 Remove 等操作，方便用户进行数据管理。
-*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。保证同一对象的每个slice被放置在不同的segment中，不同对象的slice可以共享segment。采用尽力而为的副本分配策略。
-*   **强一致性**：保证 `Get` 操作读取到完整且正确的数据，并且数据写入成功后，后续的 `Get` 操作一定能读取到最新写入的值。
+*   **对象级存储操作**：提供简单易用的对象级 API，包括 `Put`、`Get` 和 `Remove` 等操作，方便用户进行数据管理。
+*   **多副本支持**：支持为同一对象保存多个数据副本，有效缓解热点访问压力。保证同一对象的每个 slice 被放置在不同的 segment 中，不同对象的 slice 可以共享 segment。采用尽力而为的副本分配策略。
+*   **强一致性**：Mooncake Store 保证 `Get` 操作始终返回正确且完整的数据。一旦一个对象成功 `Put`，它在被删除之前保持不可变，从而确保所有后续的 `Get` 请求都能获取到最新的值。
 *   **零拷贝、高带宽利用**：由 Transfer Engine 提供支持, 数据链路零拷贝，对大型对象进行条带化和并行 I/O 传输，充分利用多网卡聚合带宽，实现高速数据读写。
 *   **动态资源伸缩**：支持动态添加和删除节点，灵活应对系统负载变化，实现资源的弹性管理。
 *   **容错能力**: 任意数量的 master 节点和 client 节点故障都不会导致读取到错误数据。只要至少有一个 master 和一个 client 处于正常运行状态，Mooncake Store 就能继续正常工作并对外提供服务。
@@ -79,10 +79,7 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
 
 ![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
 
-
-用于获取 `object_key` 对应的值。该接口保证读取到的数据是完整且正确的。读取到的值将通过 TransferEngine 存储到 `slices` 所指向的内存区域中，可以是用户提前通过 `registerLocalMemory(addr, len)` 注册的本地 DRAM/VRAM 内存空间，注意非 Mooncake Store 内部管理的逻辑存储空间池（Logical Memory Pool）。（当启用了持久化功能时，若内存的 `Query` 请求失败，会尝试从SSD中寻找并载入对应的数据）
-
-> 在目前的实现中，Get 接口可选 TTL 功能。当首次获取 `object_key` 对应的值后一段时间（默认为 1s），相应的条目会被自动删除。
+`Get` 将 `object_key` 对应的值写入到提供的 `slices` 中。返回的数据保证完整且正确。每个 slice 必须指向通过 `registerLocalMemory(addr, len)` 预先注册的本地 DRAM/VRAM 内存空间（而不是贡献给分布式内存池的全局 segment）。当开启持久化功能并且在分布式内存池中未找到请求的数据时，`Get` 会回退到从 SSD 加载数据。
 
 ### Put 接口
 
@@ -94,7 +91,7 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 
 ![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
 
-用于存储 `key` 对应的值。可通过 `config` 参数设置所需的副本数量。（当启用了持久化功能时，`Put`除了对memory pool的写入之外，还会异步发起一次向SSD的数据持久化操作）
+`Put` 将 `key` 对应的值存储到分布式内存池中。通过 `config` 参数，可以指定所需的副本数量以及优先选择哪个 segment 用于存储该值。当启用持久化功能时，`Put` 还会异步地将数据持久化到 SSD。
 
 **副本保证和尽力而为行为：**
 - 保证对象的每个slice被复制到不同的segment，确保分布在不同的存储节点上
@@ -407,11 +404,11 @@ tl::expected<void, ErrorCode> Remove(const std::string& key);
 
 Mooncake Store 提供了 `BufferAllocatorBase` 的两个具体实现：
 
-**CachelibBufferAllocator**：该分配器基于 Facebook 的 [CacheLib](https://github.com/facebook/CacheLib)，采用基于 slab 的分配策略进行内存管理，具有良好的碎片控制能力，适用于高性能场景。
+**OffsetBufferAllocator（默认且推荐）**：该分配器源自 [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator)，采用自定义的基于 bin 的分配策略，支持实时性要求较高的 `O(1)` 级偏移分配，并能最大限度地减少内存碎片。Mooncake Store 根据大语言模型推理任务的特定内存使用特性，对该内存分配器进行了优化，从而提升了在 LLM 场景下的内存利用率。
 
-**OffsetBufferAllocator**：该分配器源自 [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator)，采用自定义的基于 bin 的分配策略，支持实时性要求较高的 `O(1)` 级偏移分配，并能最大限度地减少内存碎片。
+**CachelibBufferAllocator（不推荐）**：该分配器基于 Facebook 的 [CacheLib](https://github.com/facebook/CacheLib)，采用基于 slab 的分配策略进行内存管理，具有良好的碎片控制能力，适用于高性能场景。不过，我们修改后的版本目前在处理对象大小剧烈变化的工作负载时表现不佳，因此暂时将其标记为不推荐。
 
-Mooncake Store 针对 LLM 推理任务的内存使用特性对这两种分配器进行了优化，从而提升了在大模型场景下的内存利用率。用户可以根据具体的性能需求和内存使用模式选择不同的分配器，具体通过 `master_service` 的启动参数 `--memory-allocator` 进行配置。
+用户可以通过 `master_service` 的启动参数 `--memory-allocator` 选择最符合其性能需求和内存使用模式的分配器。
 
 这两种分配器都实现了 `BufferAllocatorBase` 接口。`BufferAllocatorBase` 类的主要接口如下：
 
