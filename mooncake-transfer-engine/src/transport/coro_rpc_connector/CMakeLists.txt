@@ -2,7 +2,6 @@ file(GLOB CORO_RPC_SOURCES "*.cpp")
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-# Ensure pybind11 is available (standalone build fallback)
 if (NOT TARGET pybind11::headers)
     find_package(pybind11 CONFIG QUIET)
     if (NOT pybind11_FOUND)
@@ -19,7 +18,6 @@ endif()
 
 add_library(coro_rpc_connector OBJECT ${CORO_RPC_SOURCES})
 
-# Ensure pybind11 include dirs are applied to this target's compilation
 set(_PYBIND11_INC_DIRS "")
 if(TARGET pybind11::headers)
     get_target_property(_PYBIND11_INC_DIRS pybind11::headers INTERFACE_INCLUDE_DIRECTORIES)
