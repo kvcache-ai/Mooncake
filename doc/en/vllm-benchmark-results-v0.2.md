@@ -1,4 +1,4 @@
-# Benchmark performance on NVIDIA A10
+# Benchmark performance on NVIDIA A10 (V0.2)
 Here are some preview mooncake benchmark results on A10 with up to 2 RDMA NICs. We are currently having some trouble benchmarking `PyNcclConnector` now. For some unknown reasons, it crashes a lot for inter-node disaggregated scenarios. So the benchmark results haven't included the `PyNcclConnector` yet.
 
 In addition, we are also coordinating resources to integrate some machines with more RDMA NICs and more advanced GPUs. The official benchmark results will be released in due time.
