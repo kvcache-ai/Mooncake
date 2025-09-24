@@ -527,6 +527,11 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     return result;
 }
 
+tl::expected<bool, ErrorCode> WrappedMasterService::ServiceReady() {
+    // Simply return true to indicate the service is ready
+    return true;
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -569,6 +574,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
 }
 

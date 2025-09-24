@@ -80,6 +80,8 @@ class WrappedMasterService {
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
+    tl::expected<bool, ErrorCode> ServiceReady();
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
