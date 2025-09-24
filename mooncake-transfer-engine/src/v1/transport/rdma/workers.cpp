@@ -126,7 +126,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(peer_name, endpoint);
+        context->endpointStore()->remove(endpoint.get());
         endpoint = context->endpointStore()->getOrInsert(peer_name);
     }
     if (!endpoint) {
@@ -142,6 +142,11 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         }
     }
     return endpoint;
+}
+
+void Workers::disableEndpoint(RdmaSlice *slice) {
+    // TODO record link failure and prevent use in a near future
+    slice->ep_weak_ptr->reset();
 }
 
 void Workers::asyncPostSend(int thread_id) {
@@ -220,7 +225,7 @@ void Workers::asyncPollCq(int thread_id) {
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
-            ep->reset();
+            disableEndpoint(slice);
             worker.inflight_slices.fetch_sub(num_slices);
             slice_to_remove.push_back(slice);
         }
@@ -263,10 +268,10 @@ void Workers::asyncPollCq(int thread_id) {
                     LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
                     num_slices += ep->acknowledge(slice, FAILED);
-                    ep->reset();
+                    disableEndpoint(slice);
                 } else {
                     num_slices += ep->acknowledge(slice, PENDING);
-                    ep->reset();
+                    disableEndpoint(slice);
                     submit(slice);
                 }
             } else {
@@ -344,16 +349,21 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext> &context) {
     LOG(WARNING) << "Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context->name();
-    if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-        event.event_type == IBV_EVENT_CQ_ERR ||
-        event.event_type == IBV_EVENT_WQ_FATAL ||
-        event.event_type == IBV_EVENT_PORT_ERR ||
-        event.event_type == IBV_EVENT_LID_CHANGE) {
-        // context->disable();
-        LOG(INFO) << "Disabling context " << context->name();
+    if (event.event_type == IBV_EVENT_QP_FATAL ||
+        event.event_type == IBV_EVENT_WQ_FATAL) {
+        auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
+        context->endpointStore()->remove(endpoint);
+    } else if (event.event_type == IBV_EVENT_CQ_ERR) {
+        context->disable();
+        context->enable();
+        LOG(WARNING) << "Action: " << context->name() << " restarted";
+    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
+               event.event_type == IBV_EVENT_PORT_ERR) {
+        context->disable();
+        LOG(WARNING) << "Action: " << context->name() << " disabled";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        // context->enable();
-        LOG(INFO) << "Enable context " << context->name();
+        context->enable();
+        LOG(WARNING) << "Action: " << context->name() << " reconnected";
     }
     ibv_ack_async_event(&event);
     return 0;

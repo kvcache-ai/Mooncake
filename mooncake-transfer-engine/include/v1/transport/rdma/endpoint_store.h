@@ -35,8 +35,7 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> getOrInsert(
         const std::string &key) = 0;
 
-    virtual int remove(const std::string &key,
-                       std::shared_ptr<RdmaEndPoint> ep) = 0;
+    virtual int remove(RdmaEndPoint *ep) = 0;
 
     virtual void clear() = 0;
 
@@ -56,8 +55,7 @@ class FIFOEndpointStore : public EndpointStore {
 
     std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
 
-    int remove(const std::string &key,
-               std::shared_ptr<RdmaEndPoint> ep) override;
+    int remove(RdmaEndPoint *ep) override;
 
     void clear();
 
@@ -93,8 +91,7 @@ class SIEVEEndpointStore : public EndpointStore {
 
     size_t size() override;
 
-    int remove(const std::string &key,
-               std::shared_ptr<RdmaEndPoint> ep) override;
+    int remove(RdmaEndPoint *ep) override;
     void evictOne() override;
     void reclaim() override;
 

@@ -100,6 +100,8 @@ class RdmaEndPoint {
 
     RdmaContext &context() const { return *context_; }
 
+    std::string name() const { return endpoint_name_; }
+
    public:
     struct Request {
         struct SglEntry {

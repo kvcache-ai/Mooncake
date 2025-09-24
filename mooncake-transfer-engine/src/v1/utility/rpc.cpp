@@ -99,7 +99,12 @@ Status CoroRpcAgent::call(const std::string &server_addr, int func_id,
         auto conn_result =
             async_simple::coro::syncAwait(client->connect(server_addr));
         if (conn_result.val() != 0) {
-            return Status::RpcServiceError(conn_result.message());
+            LOG(ERROR) << "Failed to connect RPC server. "
+                       << "server " << server_addr << ", "
+                       << "func_id " << func_id << ", "
+                       << "message " << conn_result.message();
+            return Status::RpcServiceError(
+                "Failed to connect RPC server" LOC_MARK);
         }
         it = sessions_.emplace(server_addr, client).first;
     }
@@ -108,7 +113,10 @@ Status CoroRpcAgent::call(const std::string &server_addr, int func_id,
     auto call_result = async_simple::coro::syncAwait(
         client->call<&CoroRpcAgent::process>(func_id));
     if (!call_result.has_value()) {
-        return Status::RpcServiceError("RPC invocation failed");
+        LOG(ERROR) << "Failed to call RPC function."
+                   << "server " << server_addr << ", "
+                   << "func_id " << func_id;
+        return Status::RpcServiceError("Failed to call RPC function" LOC_MARK);
     }
     response = client->get_resp_attachment();
     client->release_resp_attachment();
