@@ -34,8 +34,8 @@ MooncakeBackend::MooncakeBackend(
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        //transport_ = engine_.installTransport("rdma", nullptr);
-        transport_ = engine_.installTransport("nvlink", nullptr);
+        transport_ = engine_.installTransport("rdma", nullptr);
+        //transport_ = engine_.installTransport("nvlink", nullptr);
         TORCH_CHECK(transport_ != nullptr,
                     c10::str("Failed to install transport"));
     }
