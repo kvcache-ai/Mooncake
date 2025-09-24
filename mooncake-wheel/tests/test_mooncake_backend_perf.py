@@ -75,6 +75,10 @@ class TestMooncakeBackendPerf(unittest.TestCase):
         # After all processes have completed, check the results
         mooncake_latency = max(mooncake_results[r] for r in mooncake_results)
         baseline_latency = max(baseline_results[r] for r in baseline_results)
+
+        print(f"mooncake: {mooncake_latency}")
+        print(f"baseline: {baseline_latency}")
+
         self.assertLessEqual(mooncake_latency, 10 * baseline_latency,
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
@@ -100,7 +104,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
     # cuda + broadcast
     def test_cuda_broadcast_1024(self):
-        self.do_test("cuda", "broadcast", 1024)
+        self.do_test("cuda", "broadcast", 1024 * 1024)
 
 
 if __name__ == "__main__":
