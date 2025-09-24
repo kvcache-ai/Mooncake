@@ -107,13 +107,16 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
 
     // Engine operation errors (Range: -700 to -799)
-    INVALID_WRITE = -700,          ///< Invalid write operation.
-    INVALID_READ = -701,           ///< Invalid read operation.
-    INVALID_REPLICA = -702,        ///< Invalid replica operation.
+    INVALID_WRITE = -700,    ///< Invalid write operation.
+    INVALID_READ = -701,     ///< Invalid read operation.
+    INVALID_REPLICA = -702,  ///< Invalid replica operation.
+
+    // Object errors (Range: -703 to -707)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
+    LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -201,26 +204,6 @@ inline std::ostream& operator<<(std::ostream& os,
                                         : "UNKNOWN");
     return os;
 }
-
-/**
- * @brief Response structure for Ping operation
- */
-struct PingResponse {
-    ViewVersionId view_version_id;
-    ClientStatus client_status;
-
-    PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status)
-        : view_version_id(view_version), client_status(status) {}
-
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const PingResponse& response) noexcept {
-        return os << "PingResponse: { view_version_id: "
-                  << response.view_version_id
-                  << ", client_status: " << response.client_status << " }";
-    }
-};
-YLT_REFL(PingResponse, view_version_id, client_status);
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator

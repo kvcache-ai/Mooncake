@@ -440,3 +440,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.

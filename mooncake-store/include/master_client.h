@@ -10,6 +10,7 @@
 #include "client_metric.h"
 #include "replica.h"
 #include "types.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -67,7 +68,7 @@ class MasterClient {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
 
     /**
@@ -88,8 +89,8 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]]
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
