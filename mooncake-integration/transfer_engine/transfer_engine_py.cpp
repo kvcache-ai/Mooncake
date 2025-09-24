@@ -21,6 +21,9 @@
 #include <pybind11/stl.h>
 
 #ifdef USE_MNNVL
+#include <ATen/cuda/CUDAContext.h>  // pytorch dependencies
+#include <cuda_runtime.h>
+
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
     return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
@@ -28,9 +31,18 @@ static void *allocateMemory(size_t size) {
 static void freeMemory(void *ptr) {
     mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
 }
+static void synchronizePyTorchEvents() {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaEvent_t ev;
+    cudaEventCreate(&ev);
+    cudaEventRecord(ev, stream);
+    cudaEventSynchronize(ev);
+    cudaEventDestroy(ev);
+}
 #else
 static void *allocateMemory(size_t size) { return malloc(size); }
 static void freeMemory(void *ptr) { free(ptr); }
+static void synchronizePyTorchEvents() {}
 #endif
 
 TransferEnginePy::TransferEnginePy() {
@@ -259,6 +271,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t peer_buffer_address, size_t length,
                                    TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
+    synchronizePyTorchEvents();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -332,6 +345,7 @@ int TransferEnginePy::batchTransferSync(
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
     TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
+    synchronizePyTorchEvents();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -420,6 +434,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const std::vector<uintptr_t> &peer_buffer_addresses,
     const std::vector<size_t> &lengths, TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
+    synchronizePyTorchEvents();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -542,6 +557,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
                                                  uintptr_t peer_buffer_address,
                                                  size_t length) {
     pybind11::gil_scoped_release release;
+    synchronizePyTorchEvents();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
