@@ -404,11 +404,11 @@ tl::expected<void, ErrorCode> Remove(const std::string& key);
 
 Mooncake Store 提供了 `BufferAllocatorBase` 的两个具体实现：
 
-**OffsetBufferAllocator**：该分配器源自 [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator)，采用自定义的基于 bin 的分配策略，支持实时性要求较高的 `O(1)` 级偏移分配，并能最大限度地减少内存碎片。
+**OffsetBufferAllocator（默认且推荐）**：该分配器源自 [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator)，采用自定义的基于 bin 的分配策略，支持实时性要求较高的 `O(1)` 级偏移分配，并能最大限度地减少内存碎片。Mooncake Store 根据大语言模型推理任务的特定内存使用特性，对该内存分配器进行了优化，从而提升了在 LLM 场景下的内存利用率。
 
-**CachelibBufferAllocator**：该分配器基于 Facebook 的 [CacheLib](https://github.com/facebook/CacheLib)，采用基于 slab 的分配策略进行内存管理，具有良好的碎片控制能力，适用于高性能场景。
+**CachelibBufferAllocator（不推荐）**：该分配器基于 Facebook 的 [CacheLib](https://github.com/facebook/CacheLib)，采用基于 slab 的分配策略进行内存管理，具有良好的碎片控制能力，适用于高性能场景。不过，我们修改后的版本目前在处理对象大小剧烈变化的工作负载时表现不佳，因此暂时将其标记为不推荐。
 
-Mooncake Store 根据大语言模型推理任务的特定内存使用特性，对两种内存分配器进行了优化，从而提升了在 LLM 场景下的内存利用率。用户可以通过 `master_service` 的启动参数 `--memory-allocator` 选择最符合其性能需求和内存使用模式的分配器。默认且推荐的选项是 **OffsetBufferAllocator**。
+用户可以通过 `master_service` 的启动参数 `--memory-allocator` 选择最符合其性能需求和内存使用模式的分配器。
 
 这两种分配器都实现了 `BufferAllocatorBase` 接口。`BufferAllocatorBase` 类的主要接口如下：
 
