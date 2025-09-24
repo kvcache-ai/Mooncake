@@ -142,6 +142,14 @@ class ClientIntegrationTest : public ::testing::Test {
         if (segment_provider_client_) {
             segment_provider_client_.reset();
         }
+
+        // Free segment memory
+        if (test_client_segment_ptr_) {
+            free(test_client_segment_ptr_);
+        }
+        if (segment_ptr_) {
+            free(segment_ptr_);
+        }
     }
 
     static void CleanupSegment() {
