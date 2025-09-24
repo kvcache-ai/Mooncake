@@ -45,8 +45,9 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
     return os << "AllocatedBuffer: { "
               << "segment_name: "
-              << (buffer.allocator_.lock() ? buffer.allocator_.lock()->getSegmentName()
-                                           : std::string("<expired>"))
+              << (buffer.allocator_.lock()
+                      ? buffer.allocator_.lock()->getSegmentName()
+                      : std::string("<expired>"))
               << ", "
               << "size: " << buffer.size() << ", "
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
@@ -204,8 +205,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size,
-            std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
