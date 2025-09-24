@@ -34,8 +34,8 @@ MooncakeBackend::MooncakeBackend(
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        transport_ = engine_.installTransport("rdma", nullptr);
-        //transport_ = engine_.installTransport("nvlink", nullptr);
+        //transport_ = engine_.installTransport("rdma", nullptr);
+        transport_ = engine_.installTransport("nvlink", nullptr);
         TORCH_CHECK(transport_ != nullptr,
                     c10::str("Failed to install transport"));
     }
@@ -67,8 +67,8 @@ MooncakeBackend::MooncakeBackend(
         }
     } else {
         for (size_t i = 0; i < 2; i++) {
-            send_buffer_[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(kBufferSize);
-            // err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            //send_buffer_[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(kBufferSize);
+            err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
@@ -77,8 +77,8 @@ MooncakeBackend::MooncakeBackend(
         }
 
         for (size_t i = 0; i < 2; i++) {
-            recv_buffer_[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(kBufferSize);
-            //err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            //recv_buffer_[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(kBufferSize);
+            err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
