@@ -222,47 +222,6 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        // Prefault/touch pages to ensure backing memory is realized.
-        // - Cap threads by hardware_concurrency.
-        // - Ensure each thread handles at least 10 GiB; otherwise do it inline.
-        long ps = sysconf(_SC_PAGESIZE);
-        const size_t page_size = ps > 0 ? static_cast<size_t>(ps) : 4096;
-        constexpr size_t kMinBytesPerThread =
-            10ULL * 1024 * 1024 * 1024;  // 10 GiB
-        unsigned int hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 1;
-        size_t max_threads = static_cast<size_t>(hw);
-        size_t threads_by_size = segment_size / kMinBytesPerThread;  // floor
-        size_t num_threads =
-            std::min(max_threads, std::max<size_t>(threads_by_size, 1));
-
-        if (threads_by_size < 1 || num_threads == 1) {
-            // Too small to benefit from threading; Skip
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(num_threads);
-            for (size_t t = 0; t < num_threads; ++t) {
-                size_t start_offset = (t * segment_size) / num_threads;
-                size_t end_offset = ((t + 1) * segment_size) / num_threads;
-                // Align to page boundaries
-                start_offset =
-                    (start_offset + page_size - 1) & ~(page_size - 1);
-                end_offset = end_offset & ~(page_size - 1);
-                if (start_offset >= end_offset) continue;
-                threads.emplace_back(
-                    [ptr, start_offset, end_offset, page_size]() {
-                        for (size_t offset = start_offset; offset < end_offset;
-                             offset += page_size) {
-                            static_cast<char *>(ptr)[offset] = 0;
-                        }
-                    });
-            }
-            for (auto &thread : threads) {
-                if (thread.joinable()) {
-                    thread.join();
-                }
-            }
-        }
 
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
