@@ -13,18 +13,16 @@
 // limitations under the License.
 
 #include "v1/metadata/plugin.h"
-
-#ifdef USE_REDIS
-#include "v1/metadata/plugins/redis.h"
-#endif
-
-#ifdef USE_HTTP
-#include "v1/metadata/plugins/http.h"
-#endif
-
 #ifdef USE_ETCD
-#include "v1/metadata/plugins/etcd.h"
+#include "v1/kvstore/etcd.h"
 #endif
+#ifdef USE_REDIS
+#include "v1/kvstore/redis.h"
+#endif
+#ifdef USE_HTTP
+#include "v1/kvstore/http.h"
+#endif
+
 #include <glog/logging.h>
 
 namespace mooncake {

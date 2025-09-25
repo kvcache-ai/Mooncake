@@ -15,7 +15,7 @@
 #ifndef CONFIG_MANAGER_H
 #define CONFIG_MANAGER_H
 
-#include <jsoncpp/json/json.h>
+#include <v1/thirdparty/nlohmann/json.h>
 #include <v1/common/status.h>
 #include <v1/common/types.h>
 
@@ -26,45 +26,64 @@
 
 namespace mooncake {
 namespace v1 {
+using json = nlohmann::json;
+
 class ConfigManager {
+    static const char kDelimiter = '/';
+
    public:
     Status loadConfig(const std::filesystem::path& config_path);
 
     Status loadConfigContent(const std::string& content);
 
-    void set(const std::string& key_path, const std::string& value);
-
-    std::string get(const std::string& key_path,
-                    const char* default_value) const {
-        return get(key_path, std::string(default_value));
+    template <typename T>
+    T get(const std::string& key_path, const T& default_value) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const json* val = findValue(key_path);
+        if (val && !val->is_null()) {
+            try {
+                return val->get<T>();
+            } catch (...) {
+                return default_value;
+            }
+        }
+        return default_value;
     }
 
-    std::string get(const std::string& key_path,
-                    const std::string& default_value) const;
+    std::string get(const std::string& key, const char* def) const {
+        return get<std::string>(key, std::string(def));
+    }
 
-    int get(const std::string& key_path, int default_value) const;
+    template <typename T>
+    std::vector<T> getArray(const std::string& key) const {
+        return get<std::vector<T>>(key, {});
+    }
 
-    uint32_t get(const std::string& key_path, uint32_t default_value) const;
+    template <typename T>
+    void set(const std::string& key_path, const T& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        json* target = &config_data_;
+        size_t start = 0, end = key_path.find(kDelimiter);
+        while (end != std::string::npos) {
+            std::string part = key_path.substr(start, end - start);
+            target = &((*target)[part]);
+            start = end + 1;
+            end = key_path.find(kDelimiter, start);
+        }
+        std::string last = key_path.substr(start);
+        (*target)[last] = value;
+    }
 
-    uint64_t get(const std::string& key_path, uint64_t default_value) const;
+    std::string dump(int indent = 2) const;
 
-    double get(const std::string& key_path, double default_value) const;
-
-    bool get(const std::string& key_path, bool default_value) const;
-
-    std::vector<std::string> getArray(const std::string& key_path) const;
-
-    std::vector<int> getArrayInt(const std::string& key_path) const;
-
-    void reload() { loadConfig(config_path_); }
+    Status save(const std::filesystem::path& out_path) const;
 
    private:
-    Json::Value config_data_;
+    json config_data_;
     std::filesystem::path config_path_;
-    std::unordered_map<std::string, std::string> mutable_entries_;
     mutable std::mutex mutex_;
 
-    const Json::Value* findValue(const std::string& key_path) const;
+    const json* findValue(const std::string& key_path) const;
 };
 }  // namespace v1
 }  // namespace mooncake

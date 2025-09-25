@@ -18,250 +18,59 @@ namespace mooncake {
 namespace v1 {
 Status ConfigManager::loadConfig(const std::filesystem::path& config_path) {
     std::lock_guard<std::mutex> lock(mutex_);
-    config_path_ = config_path;
-
+    std::ifstream ifs(config_path);
+    if (!ifs.is_open()) {
+        return Status::InvalidArgument("Failed to open config file" LOC_MARK);
+    }
     try {
-        if (std::filesystem::exists(config_path)) {
-            std::ifstream file(config_path);
-            Json::CharReaderBuilder readerBuilder;
-            std::string errs;
-            if (!Json::parseFromStream(readerBuilder, file, &config_data_,
-                                       &errs)) {
-                std::string msg = "Json parse error: " + errs + LOC_MARK;
-                return Status::MalformedJson(msg);
-            }
-            return Status::OK();
-        } else {
-            std::string msg = "Unable to load config file" LOC_MARK;
-            return Status::InvalidArgument(msg);
-        }
+        ifs >> config_data_;
+        config_path_ = config_path;
+        return Status::OK();
     } catch (const std::exception& e) {
-        std::string msg =
-            "Detected C++ exception: " + std::string(e.what()) + LOC_MARK;
-        return Status::InternalError(msg);
+        return Status::InvalidArgument(std::string("Invalid JSON: ") +
+                                       e.what() + LOC_MARK);
     }
 }
 
 Status ConfigManager::loadConfigContent(const std::string& content) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Json::Reader reader;
-    if (content.empty() || !reader.parse(content, config_data_)) {
-        fprintf(stderr, "OK %s\n", content.c_str());
-        return Status::MalformedJson(
-            "Unrecognized format of json content" LOC_MARK);
+    try {
+        config_data_ = json::parse(content);
+        return Status::OK();
+    } catch (const std::exception& e) {
+        return Status::InvalidArgument(std::string("Invalid JSON: ") +
+                                       e.what() + LOC_MARK);
     }
+}
+
+std::string ConfigManager::dump(int indent) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_data_.dump(indent);
+}
+
+Status ConfigManager::save(const std::filesystem::path& out_path) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ofstream ofs(out_path);
+    if (!ofs.is_open()) {
+        return Status::InvalidArgument("Failed to open file for writing" +
+                                       out_path.string() + LOC_MARK);
+    }
+    ofs << config_data_.dump(2);
     return Status::OK();
 }
 
-const Json::Value* ConfigManager::findValue(const std::string& key_path) const {
-    size_t start = 0;
-    size_t end = key_path.find('/');
-    const Json::Value* current = &config_data_;
-
+const json* ConfigManager::findValue(const std::string& key_path) const {
+    const json* current = &config_data_;
+    size_t start = 0, end = key_path.find(kDelimiter);
     while (end != std::string::npos) {
         std::string part = key_path.substr(start, end - start);
-        if (!current->isObject() || !current->isMember(part)) return nullptr;
-
+        if (!current->contains(part)) return nullptr;
         current = &((*current)[part]);
         start = end + 1;
-        end = key_path.find('/', start);
+        end = key_path.find(kDelimiter, start);
     }
-
-    std::string lastKey = key_path.substr(start);
-    if (current->isObject() && current->isMember(lastKey)) {
-        return &((*current)[lastKey]);
-    }
-
-    return nullptr;
-}
-
-void ConfigManager::set(const std::string& key_path, const std::string& value) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    mutable_entries_[key_path] = value;
-}
-
-std::string ConfigManager::get(const std::string& key_path,
-                               const std::string& default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) return mutable_entries_.at(key_path);
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isString()) return val->asString();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-int ConfigManager::get(const std::string& key_path, int default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        try {
-            auto value = mutable_entries_.at(key_path);
-            return std::stoi(value);
-        } catch (...) {
-            return default_value;
-        }
-    }
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isConvertibleTo(Json::ValueType::intValue))
-                return val->asInt();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-uint32_t ConfigManager::get(const std::string& key_path,
-                            uint32_t default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        try {
-            auto value = mutable_entries_.at(key_path);
-            return std::stoul(value);
-        } catch (...) {
-            return default_value;
-        }
-    }
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isConvertibleTo(Json::ValueType::intValue))
-                return val->asUInt();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-uint64_t ConfigManager::get(const std::string& key_path,
-                            uint64_t default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        try {
-            auto value = mutable_entries_.at(key_path);
-            return std::stoull(value);
-        } catch (...) {
-            return default_value;
-        }
-    }
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isConvertibleTo(Json::ValueType::intValue))
-                return val->asUInt64();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-double ConfigManager::get(const std::string& key_path,
-                          double default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        try {
-            auto value = mutable_entries_.at(key_path);
-            return std::stod(value);
-        } catch (...) {
-            return default_value;
-        }
-    }
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isConvertibleTo(Json::ValueType::realValue))
-                return val->asDouble();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-bool ConfigManager::get(const std::string& key_path, bool default_value) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        return mutable_entries_.at(key_path) == "true";
-    }
-    if (const Json::Value* val = findValue(key_path)) {
-        try {
-            if (val && val->isConvertibleTo(Json::ValueType::booleanValue))
-                return val->asBool();
-        } catch (...) {
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
-std::vector<std::string> ConfigManager::getArray(
-    const std::string& key_path) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mutable_entries_.count(key_path)) {
-        std::vector<std::string> result;
-        auto rep = mutable_entries_.at(key_path);
-        Json::Value root;
-        Json::Reader reader;
-        try {
-            if (reader.parse(rep, root) && root.isArray())
-                for (const auto& item : root) result.push_back(item.asString());
-        } catch (...) {
-            return {};
-        }
-        return result;
-    }
-
-    if (const Json::Value* val = findValue(key_path)) {
-        if (val->isArray()) {
-            std::vector<std::string> result;
-            for (const auto& item : *val) {
-                try {
-                    if (val->isString()) result.push_back(item.asString());
-                } catch (...) {
-                    return {};
-                }
-            }
-            return result;
-        }
-    }
-    return {};
-}
-
-std::vector<int> ConfigManager::getArrayInt(const std::string& key_path) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (mutable_entries_.count(key_path)) {
-        std::vector<int> result;
-        auto rep = mutable_entries_.at(key_path);
-        Json::Value root;
-        Json::Reader reader;
-        try {
-            if (reader.parse(rep, root) && root.isArray())
-                for (const auto& item : root) result.push_back(item.asInt());
-        } catch (...) {
-            return {};
-        }
-        return result;
-    }
-
-    if (const Json::Value* val = findValue(key_path)) {
-        if (val->isArray()) {
-            std::vector<int> result;
-            for (const auto& item : *val) {
-                try {
-                    if (val->isConvertibleTo(Json::ValueType::intValue))
-                        result.push_back(item.asInt());
-                } catch (...) {
-                    return {};
-                }
-            }
-            return result;
-        }
-    }
-    return {};
+    std::string last = key_path.substr(start);
+    return current->contains(last) ? &((*current)[last]) : nullptr;
 }
 }  // namespace v1
 }  // namespace mooncake

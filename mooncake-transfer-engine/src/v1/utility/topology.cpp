@@ -90,8 +90,8 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
 
 static void filterInfiniBandDevices(std::vector<InfinibandDevice> &devices,
                                     std::shared_ptr<ConfigManager> conf) {
-    auto whitelist = conf->getArray("topology/rdma_whitelist");
-    auto blacklist = conf->getArray("topology/rdma_blacklist");
+    auto whitelist = conf->getArray<std::string>("topology/rdma_whitelist");
+    auto blacklist = conf->getArray<std::string>("topology/rdma_blacklist");
     std::vector<InfinibandDevice> new_devices;
     if (!whitelist.empty()) {
         for (auto &entry : devices) {
