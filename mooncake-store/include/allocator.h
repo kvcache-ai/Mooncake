@@ -5,7 +5,6 @@
 #include <limits>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.hpp"
@@ -20,33 +19,6 @@ namespace mooncake {
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
-/**
- * @brief Status of a buffer in the system
- */
-enum class BufStatus {
-    INIT = 0,      // Initial state
-    COMPLETE = 1,  // Complete state (buffer has been used)
-    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
-                 // to this state)
-    UNREGISTERED = 3,  // Buffer metadata has been deleted
-};
-
-/**
- * @brief Stream operator for BufStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const BufStatus& status) noexcept {
-    static const std::unordered_map<BufStatus, std::string_view> status_strings{
-        {BufStatus::INIT, "INIT"},
-        {BufStatus::COMPLETE, "COMPLETE"},
-        {BufStatus::FAILED, "FAILED"},
-        {BufStatus::UNREGISTERED, "UNREGISTERED"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
 // Forward declarations
 class BufferAllocatorBase;
 
@@ -58,12 +30,10 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, void* buffer_ptr,
-                    std::size_t size,
+                    void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
-          segment_name_(std::move(segment_name)),
           buffer_ptr_(buffer_ptr),
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
@@ -86,9 +56,7 @@ class AllocatedBuffer {
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] std::string getSegmentName() const noexcept {
-        return segment_name_;
-    }
+    [[nodiscard]] std::string getSegmentName() const noexcept;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -98,18 +66,12 @@ class AllocatedBuffer {
     struct Descriptor {
         uint64_t size_;
         uintptr_t buffer_address_;
-        BufStatus status_;
         std::string transport_endpoint_;
-        YLT_REFL(Descriptor, size_, buffer_address_, status_,
-                 transport_endpoint_);
+        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_);
     };
-
-    void mark_complete() { status = BufStatus::COMPLETE; }
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    std::string segment_name_;
-    BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     // RAII handle for buffer allocated by offset allocator

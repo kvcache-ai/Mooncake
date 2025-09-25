@@ -960,7 +960,6 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
              i++) {
             const auto& handle =
                 replica.get_memory_descriptor().buffer_descriptors[i];
-            EXPECT_EQ(BufStatus::INIT, handle.status_);
 
             EXPECT_EQ(slice_lengths[i], handle.size_);
         }
@@ -986,10 +985,6 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica.status);
         ASSERT_EQ(slice_lengths.size(),
                   replica.get_memory_descriptor().buffer_descriptors.size());
-        for (const auto& handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            EXPECT_EQ(BufStatus::COMPLETE, handle.status_);
-        }
     }
 }
 

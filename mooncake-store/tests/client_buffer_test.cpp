@@ -273,17 +273,14 @@ TEST_F(ClientBufferTest, CalculateTotalSizeMemoryReplica) {
     AllocatedBuffer::Descriptor buf1;
     buf1.size_ = 1024;
     buf1.buffer_address_ = 0x1000;
-    buf1.status_ = BufStatus::COMPLETE;
 
     AllocatedBuffer::Descriptor buf2;
     buf2.size_ = 2048;
     buf2.buffer_address_ = 0x2000;
-    buf2.status_ = BufStatus::COMPLETE;
 
     AllocatedBuffer::Descriptor buf3;
     buf3.size_ = 512;
     buf3.buffer_address_ = 0x3000;
-    buf3.status_ = BufStatus::COMPLETE;
 
     mem_desc.buffer_descriptors = {buf1, buf2, buf3};
     replica.descriptor_variant = mem_desc;
