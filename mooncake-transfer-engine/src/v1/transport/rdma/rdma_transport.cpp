@@ -24,13 +24,13 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/memory/location.h"
+#include "v1/platform/location.h"
 #include "v1/transport/rdma/buffers.h"
 #include "v1/transport/rdma/endpoint_store.h"
 #include "v1/transport/rdma/workers.h"
-#include "v1/utility/string_builder.h"
-#include "v1/utility/topology.h"
-#include "v1/utility/random.h"
+#include "v1/common/utils/string_builder.h"
+#include "v1/runtime/topology.h"
+#include "v1/common/utils/random.h"
 
 #define SET_DEVICE(key, param) \
     param = conf->get("transports/rdma/device/" #key, param)

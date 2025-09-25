@@ -18,7 +18,7 @@
 #include <atomic>
 #include <libetcd_wrapper.h>
 
-#include "v1/metadata/plugin.h"
+#include "v1/runtime/plugin.h"
 
 namespace mooncake {
 namespace v1 {

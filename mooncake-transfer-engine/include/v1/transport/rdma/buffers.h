@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "v1/transport/transport.h"
+#include "v1/runtime/transport.h"
 
 namespace mooncake {
 namespace v1 {

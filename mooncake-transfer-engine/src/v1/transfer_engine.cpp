@@ -18,13 +18,13 @@
 #include <random>
 
 #include "v1/common/status.h"
-#include "v1/memory/location.h"
-#include "v1/metadata/metadata.h"
-#include "v1/metadata/segment.h"
+#include "v1/platform/location.h"
+#include "v1/runtime/metadata.h"
+#include "v1/runtime/segment.h"
 #include "v1/transport/rdma/rdma_transport.h"
 #include "v1/transport/shm/shm_transport.h"
 #include "v1/transport/tcp/tcp_transport.h"
-#include "v1/transport/transport.h"
+#include "v1/runtime/transport.h"
 #ifdef USE_CUDA
 #include "v1/transport/nvlink/nvlink_transport.h"
 #include "v1/transport/mnnvl/mnnvl_transport.h"
@@ -33,8 +33,8 @@
 #include "v1/transport/gds/gds_transport.h"
 #endif
 #include "v1/transport/io_uring/io_uring_transport.h"
-#include "v1/utility/ip.h"
-#include "v1/utility/random.h"
+#include "v1/platform/ip.h"
+#include "v1/common/utils/random.h"
 
 namespace mooncake {
 namespace v1 {

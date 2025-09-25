@@ -32,9 +32,9 @@
 #include "context.h"
 #include "slice.h"
 #include "quota.h"
-#include "v1/metadata/metadata.h"
-#include "v1/transport/transport.h"
-#include "v1/utility/topology.h"
+#include "v1/runtime/metadata.h"
+#include "v1/runtime/transport.h"
+#include "v1/runtime/topology.h"
 
 namespace mooncake {
 namespace v1 {

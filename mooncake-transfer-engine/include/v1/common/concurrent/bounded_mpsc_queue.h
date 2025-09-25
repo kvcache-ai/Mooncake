@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CONCURRENCY_QUEUE
-#define CONCURRENCY_QUEUE
+#ifndef BOUNDED_MPSC_QUEUE
+#define BOUNDED_MPSC_QUEUE
 
 #include <atomic>
 #include <thread>
@@ -106,4 +106,4 @@ struct BoundedMPSCQueue {
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // CONCURRENCY_QUEUE
+#endif  // BOUNDED_MPSC_QUEUE

@@ -1,0 +1,12 @@
+file(GLOB TEV1_RUNTIME_SOURCES "*.cpp")
+add_library(runtime_v1 OBJECT ${TEV1_RUNTIME_SOURCES})
+
+if (USE_ETCD)
+  target_link_libraries(runtime_v1 PUBLIC etcd)
+endif()
+if (USE_HTTP)
+  target_link_libraries(runtime_v1 PUBLIC http)
+endif()
+if (USE_REDIS)
+  target_link_libraries(runtime_v1 PUBLIC redis)
+endif()

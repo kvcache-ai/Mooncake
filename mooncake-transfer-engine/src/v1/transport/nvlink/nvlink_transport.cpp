@@ -26,10 +26,10 @@
 #include <memory>
 
 #include "v1/common/status.h"
-#include "v1/memory/slab.h"
-#include "v1/metadata/metadata.h"
-#include "v1/utility/random.h"
-#include "v1/utility/string_builder.h"
+#include "v1/runtime/slab.h"
+#include "v1/runtime/metadata.h"
+#include "v1/common/utils/random.h"
+#include "v1/common/utils/string_builder.h"
 
 namespace mooncake {
 namespace v1 {

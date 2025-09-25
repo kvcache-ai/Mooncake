@@ -26,8 +26,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "v1/transport/transport.h"
-#include "v1/memory/slab.h"
+#include "v1/runtime/transport.h"
+#include "v1/runtime/slab.h"
 
 namespace mooncake {
 namespace v1 {

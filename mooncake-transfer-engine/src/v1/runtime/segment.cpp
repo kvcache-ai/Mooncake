@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/metadata/segment.h"
+#include "v1/runtime/segment.h"
 
 #include <jsoncpp/json/value.h>
 
@@ -21,9 +21,9 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/memory/location.h"
-#include "v1/metadata/metadata.h"
-#include "v1/utility/system.h"
+#include "v1/platform/location.h"
+#include "v1/runtime/metadata.h"
+#include "v1/platform/system.h"
 
 namespace mooncake {
 namespace v1 {

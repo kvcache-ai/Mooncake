@@ -15,7 +15,7 @@
 #ifndef METASTORE_HTTP_H
 #define METASTORE_HTTP_H
 
-#include "v1/metadata/plugin.h"
+#include "v1/runtime/plugin.h"
 
 #include <atomic>
 #include <curl/curl.h>

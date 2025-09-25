@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/memory/location.h"
+#include "v1/platform/location.h"
 
 #include "v1/common/status.h"
 #include "v1/common/types.h"

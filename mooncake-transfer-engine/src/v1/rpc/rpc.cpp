@@ -16,12 +16,12 @@
 // - Caching sockets, and supporting multiple calls
 // - Keep it lightweighted and tidy
 
-#include "v1/utility/rpc.h"
+#include "v1/rpc/rpc.h"
 
 #include <glog/logging.h>
 
-#include "v1/utility/ip.h"
-#include "v1/utility/random.h"
+#include "v1/platform/ip.h"
+#include "v1/common/utils/random.h"
 
 namespace mooncake {
 namespace v1 {

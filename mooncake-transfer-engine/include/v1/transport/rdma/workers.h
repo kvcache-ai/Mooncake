@@ -26,8 +26,8 @@
 
 #include "context.h"
 #include "rail_monitor.h"
-#include "v1/utility/system.h"
-#include "v1/concurrency/concurrentqueue.h"
+#include "v1/platform/system.h"
+#include "v1/common/concurrent/bounded_mpsc_queue.h"
 
 namespace mooncake {
 namespace v1 {

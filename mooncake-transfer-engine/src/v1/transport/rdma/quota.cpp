@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "v1/transport/rdma/quota.h"
-#include "v1/utility/random.h"
+#include "v1/common/utils/random.h"
 
 #include <assert.h>
 #include <unordered_set>

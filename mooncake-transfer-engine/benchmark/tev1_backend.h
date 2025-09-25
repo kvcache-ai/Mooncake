@@ -27,8 +27,8 @@
 #include <sys/time.h>
 
 #include "v1/transfer_engine.h"
-#include "v1/utility/random.h"
-#include "v1/utility/system.h"
+#include "v1/common/utils/random.h"
+#include "v1/platform/system.h"
 
 namespace mooncake {
 namespace v1 {

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/metadata/plugin.h"
+#include "v1/runtime/plugin.h"
 #ifdef USE_ETCD
-#include "v1/kvstore/etcd.h"
+#include "v1/metastore/etcd.h"
 #endif
 #ifdef USE_REDIS
-#include "v1/kvstore/redis.h"
+#include "v1/metastore/redis.h"
 #endif
 #ifdef USE_HTTP
-#include "v1/kvstore/http.h"
+#include "v1/metastore/http.h"
 #endif
 
 #include <glog/logging.h>

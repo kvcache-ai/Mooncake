@@ -16,7 +16,7 @@
 #define SHARED_MEMORY_H
 
 #include "v1/common/status.h"
-#include "v1/utility/topology.h"
+#include "v1/runtime/topology.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>

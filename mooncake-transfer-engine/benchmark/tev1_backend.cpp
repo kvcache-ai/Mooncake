@@ -14,8 +14,8 @@
 
 #include "tev1_backend.h"
 #include "utils.h"
-#include "v1/memory/location.h"
-#include "v1/utility/topology.h"
+#include "v1/platform/location.h"
+#include "v1/runtime/topology.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>

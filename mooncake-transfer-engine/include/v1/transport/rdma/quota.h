@@ -25,7 +25,7 @@
 #include <mutex>
 
 #include "v1/common/status.h"
-#include "v1/utility/topology.h"
+#include "v1/runtime/topology.h"
 
 #include "shared_quota.h"
 

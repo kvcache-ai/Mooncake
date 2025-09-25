@@ -17,7 +17,7 @@
 
 #include <atomic>
 
-#include "v1/utility/system.h"
+#include "v1/platform/system.h"
 
 namespace mooncake {
 namespace v1 {

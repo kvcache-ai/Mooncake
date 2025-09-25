@@ -20,8 +20,8 @@
 
 #include <atomic>
 
-#include "v1/metadata/plugin.h"
-#include "v1/utility/ip.h"
+#include "v1/runtime/plugin.h"
+#include "v1/platform/ip.h"
 
 namespace mooncake {
 namespace v1 {

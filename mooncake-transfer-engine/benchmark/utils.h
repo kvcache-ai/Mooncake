@@ -27,8 +27,8 @@
 #include <stdexcept>
 #include <chrono>
 
-#include "v1/utility/system.h"
-#include "v1/utility/random.h"
+#include "v1/platform/system.h"
+#include "v1/common/utils/random.h"
 
 #define CHECK_FAIL(call)                                        \
     do {                                                        \

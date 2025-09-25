@@ -28,9 +28,9 @@
 #include <string>
 
 #include "v1/common/status.h"
-#include "v1/metadata/metadata.h"
-#include "v1/memory/allocator.h"
-#include "v1/memory/location.h"
+#include "v1/runtime/metadata.h"
+#include "v1/platform/allocator.h"
+#include "v1/platform/location.h"
 
 namespace mooncake {
 namespace v1 {

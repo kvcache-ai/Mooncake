@@ -28,7 +28,7 @@
 #include "v1/common/config.h"
 #include "v1/common/status.h"
 #include "v1/common/types.h"
-#include "v1/concurrency/tls.h"
+#include "v1/common/concurrent/thread_local_storage.h"
 
 namespace mooncake {
 namespace v1 {

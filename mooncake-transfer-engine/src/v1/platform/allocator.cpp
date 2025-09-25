@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/memory/allocator.h"
+#include "v1/platform/allocator.h"
 
 #ifdef USE_CUDA
 #include <bits/stdint-uintn.h>

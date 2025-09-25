@@ -17,7 +17,7 @@
 
 #include "v1/common/config.h"
 #include "v1/common/status.h"
-#include "v1/utility/topology.h"
+#include "v1/runtime/topology.h"
 
 namespace mooncake {
 namespace v1 {

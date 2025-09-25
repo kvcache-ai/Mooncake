@@ -24,7 +24,7 @@
 #include <iomanip>
 #include <memory>
 
-#include "v1/memory/slab.h"
+#include "v1/runtime/slab.h"
 
 namespace mooncake {
 namespace v1 {

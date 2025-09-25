@@ -28,10 +28,10 @@
 #include <unordered_map>
 #include <variant>
 
-#include "v1/metadata/plugin.h"
-#include "v1/metadata/segment.h"
-#include "v1/utility/rpc.h"
-#include "v1/utility/topology.h"
+#include "v1/runtime/plugin.h"
+#include "v1/runtime/segment.h"
+#include "v1/rpc/rpc.h"
+#include "v1/runtime/topology.h"
 
 namespace mooncake {
 namespace v1 {

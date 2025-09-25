@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/utility/topology.h"
+#include "v1/runtime/topology.h"
 
 #include <glog/logging.h>
 #include <jsoncpp/json/json.h>
@@ -40,8 +40,8 @@
 #include <unordered_set>
 
 #include "v1/common/status.h"
-#include "v1/memory/location.h"
-#include "v1/utility/random.h"
+#include "v1/platform/location.h"
+#include "v1/common/utils/random.h"
 
 namespace mooncake {
 namespace v1 {

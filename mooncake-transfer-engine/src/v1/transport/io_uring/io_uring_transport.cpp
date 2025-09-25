@@ -24,8 +24,8 @@
 #include <iomanip>
 #include <memory>
 
-#include "v1/memory/slab.h"
-#include "v1/utility/system.h"
+#include "v1/runtime/slab.h"
+#include "v1/platform/system.h"
 
 #ifdef USE_CUDA
 #include <cuda.h>
