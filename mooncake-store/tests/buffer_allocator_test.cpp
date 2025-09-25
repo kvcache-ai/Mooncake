@@ -53,7 +53,6 @@ class BufferAllocatorTest : public ::testing::Test {
         EXPECT_EQ(bufHandle.getSegmentName(), segment_name);
         EXPECT_EQ(descriptor.transport_endpoint_, transport_endpoint);
         EXPECT_EQ(descriptor.size_, alloc_size);
-        EXPECT_EQ(descriptor.status_, BufStatus::INIT);
         EXPECT_NE(bufHandle.data(), nullptr);
     }
 
