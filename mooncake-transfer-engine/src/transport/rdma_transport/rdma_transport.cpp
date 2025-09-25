@@ -149,7 +149,11 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         
         for (size_t i = 0; i < context_list_.size(); ++i) {
             reg_threads.emplace_back([this, &ret_codes, i, addr, length]() {
+                auto start_time_thread = std::chrono::high_resolution_clock::now();
                 ret_codes[i] = context_list_[i]->registerMemoryRegion(addr, length, access_rights);
+                auto end_time_thread = std::chrono::high_resolution_clock::now();
+                auto duration_thread = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_thread - start_time_thread);
+                LOG(ERROR) << "\tregisterMemoryRegion execution time: " << duration_thread.count() << " ms";
             });
         }
         
@@ -201,7 +205,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     }
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - end_time);
-    LOG(ERROR) << "metadata_->addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
+    LOG(ERROR) << "getMemoryLocation + addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
+    LOG(ERROR) << "total execution time: " << duration.count() + duration2.count() << " ms";
     return 0;
 }
 
