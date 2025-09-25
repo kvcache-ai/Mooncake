@@ -111,6 +111,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
+    std::atomic<int> endpoints_count_{0};
 };
 }  // namespace v1
 }  // namespace mooncake

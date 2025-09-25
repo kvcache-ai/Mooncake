@@ -83,7 +83,8 @@ class RdmaEndPoint {
     int reset();
 
     int construct(RdmaContext *context, EndPointParams *params,
-                  const std::string &endpoint_name);
+                  const std::string &endpoint_name,
+                  std::atomic<int> *endpoints_count = nullptr);
 
     int deconstruct();
 
@@ -160,6 +161,7 @@ class RdmaEndPoint {
 
     std::string peer_server_name_;
     std::string peer_nic_name_;
+    std::atomic<int> *endpoints_count_;
 };
 }  // namespace v1
 }  // namespace mooncake

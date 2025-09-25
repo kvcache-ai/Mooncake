@@ -65,6 +65,14 @@ struct ResolvedTopologyEntry {
 using ResolvedTopologyMatrix =
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>;
 
+// What we need from Topology
+// - NIC List (RDMA/Eth/...) -> rdma:X, tcp:X, ...
+// - GPU List (CUDA/ROCM/...) -> cuda:Y, rocm:Y, ...
+// - CPU List -> cpu:Z
+// - Topology Matrix (Storage Type -> {[Tier 1], [Tier 2], [Tier 3]})
+//     where: storage type = cuda:0|rocm:0|cpu:0
+//            tier N = [rdma:0, rdma:1, ...] or [tcp:0, tcp:1, ...]
+
 class Topology {
    public:
     Topology();

@@ -45,14 +45,18 @@ RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
     if (status_ != EP_UNINIT) deconstruct();
+    if (endpoints_count_)
+        endpoints_count_->fetch_sub(1, std::memory_order_relaxed);
 }
 
 int RdmaEndPoint::construct(RdmaContext *context, EndPointParams *params,
-                            const std::string &endpoint_name) {
+                            const std::string &endpoint_name,
+                            std::atomic<int> *endpoints_count) {
     context_ = context;
     params_ = params;
     endpoint_name_ = endpoint_name;
     inflight_slices_ = 0;
+    endpoints_count_ = endpoints_count;
     qp_list_.resize(params_->qp_mul_factor);
     wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor];
 

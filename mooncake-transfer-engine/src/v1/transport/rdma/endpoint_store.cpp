@@ -121,11 +121,13 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getOrInsert(
         return endpoint_map_[key].first;
     }
     endpoint = std::make_shared<RdmaEndPoint>();
-    int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
+    int ret = endpoint->construct(&context_, &context_.params().endpoint, key,
+                                  &endpoints_count_);
     if (ret) {
         LOG(ERROR) << "Failed to construct endpoint for key " << key;
         return nullptr;
     }
+    endpoints_count_.fetch_add(1, std::memory_order_relaxed);
     while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = std::make_pair(endpoint, false);
     fifo_list_.push_front(key);
@@ -205,6 +207,16 @@ void SIEVEEndpointStore::clear() {
         }
         fifo_list_.erase(fifo_iter);
         fifo_map_.erase(key);
+    }
+
+    const int max_retries = 5000;
+    int retries = 0;
+    while (endpoints_count_.load(std::memory_order_relaxed) > 0) {
+        if (++retries > max_retries) {
+            LOG(ERROR) << "Some endpoints not cleared after 5 seconds";
+            break;
+        }
+        usleep(1000);
     }
 }
 }  // namespace v1

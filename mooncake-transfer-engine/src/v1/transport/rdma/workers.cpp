@@ -425,13 +425,10 @@ Status Workers::getRouteHint(RouteHint &hint, SegmentID segment_id,
         return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
     auto &matrix = hint.topo->getResolvedMatrix();
-    auto &raw_matrix = hint.topo->getMatrix();
     if (!matrix.count(hint.buffer->location)) {
         hint.topo_entry = &matrix.at(kWildcardLocation);
-        hint.topo_entry_raw = &raw_matrix.at(kWildcardLocation);
     } else {
         hint.topo_entry = &matrix.at(hint.buffer->location);
-        hint.topo_entry_raw = &raw_matrix.at(hint.buffer->location);
     }
     return Status::OK();
 }
@@ -456,11 +453,11 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
+    auto &rail = worker.rails[target.segment->machine_id];
+    if (!rail.ready()) rail.load(source.topo, target.topo);
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
     if (!same_machine && slice->target_dev_id < 0) {
-        auto &rail = worker.rails[target.segment->machine_id];
-        if (!rail.ready()) rail.load(source.topo, target.topo);
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
         for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
@@ -481,6 +478,9 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
     if (slice->target_dev_id < 0)
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
+
+    if (!rail.available(slice->source_dev_id, slice->target_dev_id))
+        return selectFallbackDevice(source, target, slice);
 
     return Status::OK();
 }
