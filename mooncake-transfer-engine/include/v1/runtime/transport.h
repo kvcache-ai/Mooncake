@@ -28,7 +28,7 @@
 #include <string>
 
 #include "v1/common/status.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 #include "v1/platform/allocator.h"
 #include "v1/platform/location.h"
 
@@ -50,7 +50,7 @@ class Transport {
     virtual ~Transport() = default;
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<MetadataService> metadata,
+                           std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<ConfigManager> conf = nullptr) {
         return Status::OK();

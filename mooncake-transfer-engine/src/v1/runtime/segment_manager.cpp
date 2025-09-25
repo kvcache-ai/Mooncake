@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/runtime/segment.h"
+#include "v1/runtime/segment_manager.h"
 
 #include <jsoncpp/json/value.h>
 
@@ -22,13 +22,14 @@
 
 #include "v1/common/status.h"
 #include "v1/platform/location.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
+#include "v1/runtime/segment_registry.h"
 #include "v1/platform/system.h"
 
 namespace mooncake {
 namespace v1 {
-SegmentManager::SegmentManager(std::unique_ptr<MetadataStore> agent)
-    : next_id_(1), version_(0), store_(std::move(agent)) {
+SegmentManager::SegmentManager(std::unique_ptr<SegmentRegistry> agent)
+    : next_id_(1), version_(0), registry_(std::move(agent)) {
     local_desc_ = std::make_shared<SegmentDesc>();
 }
 
@@ -90,14 +91,14 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
     if (segment_name.starts_with(kLocalFileSegmentPrefix)) {
         CHECK_STATUS(makeFileRemote(desc, segment_name));
     } else {
-        CHECK_STATUS(store_->getSegmentDesc(desc, segment_name));
+        CHECK_STATUS(registry_->getSegmentDesc(desc, segment_name));
     }
     return Status::OK();
 }
 
 Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
-    return store_->getSegmentDesc(desc, segment_name);
+    return registry_->getSegmentDesc(desc, segment_name);
 }
 
 Status SegmentManager::invalidateRemote(SegmentID handle) {
@@ -136,104 +137,11 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
 }
 
 Status SegmentManager::synchronizeLocal() {
-    return store_->putSegmentDesc(local_desc_);
+    return registry_->putSegmentDesc(local_desc_);
 }
 
 Status SegmentManager::deleteLocal() {
-    return store_->deleteSegmentDesc(local_desc_->name);
-}
-
-Status LocalSegmentTracker::query(uint64_t base, size_t length,
-                                  std::vector<BufferDesc *> &result) {
-    assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-    assert(length);
-    for (auto &buf : detail.buffers) {
-        if (buf.addr > base) continue;
-        if (buf.addr + buf.length <= base) break;
-        result.push_back(&buf);
-        if (buf.addr + buf.length >= base + length) {
-            return Status::OK();
-        } else {
-            auto new_base = buf.addr + buf.length;
-            auto new_length = base + length - new_base;
-            return query(new_base, new_length, result);
-        }
-    }
-    return Status::InvalidArgument("Some buffers are not registered");
-}
-
-Status LocalSegmentTracker::add(uint64_t base, size_t length,
-                                std::function<Status(BufferDesc &)> callback) {
-    assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-    mutex_.lock();
-    for (auto &buf : detail.buffers) {
-        if (buf.addr == base && buf.length == length) {
-            buf.ref_count++;
-            mutex_.unlock();
-            return Status::OK();
-        }
-    }
-    mutex_.unlock();
-    BufferDesc new_desc;
-    new_desc.addr = base;
-    new_desc.length = length;
-    auto entries = getMemoryLocation((void *)base, length);
-    if (!entries.empty())
-        new_desc.location = entries[0].location;
-    else
-        new_desc.location = kWildcardLocation;
-    new_desc.ref_count = 1;
-    auto status = callback(new_desc);
-    if (!status.ok()) return status;
-    mutex_.lock();
-    detail.buffers.push_back(new_desc);
-    std::sort(detail.buffers.begin(), detail.buffers.end(),
-              [](const BufferDesc &lhs, BufferDesc &rhs) -> bool {
-                  if (lhs.addr < rhs.addr) return true;
-                  if (lhs.addr > rhs.addr) return false;
-                  return lhs.length > rhs.length;  // prefer large interval
-              });
-    mutex_.unlock();
-    return Status::OK();
-}
-
-Status LocalSegmentTracker::remove(
-    uint64_t base, size_t length,
-    std::function<Status(BufferDesc &)> callback) {
-    assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-    mutex_.lock();
-    for (auto it = detail.buffers.begin(); it != detail.buffers.end(); ++it) {
-        if (it->addr == base && (!length || it->length == length)) {
-            it->ref_count--;
-            Status status = Status::OK();
-            if (it->ref_count == 0) {
-                BufferDesc clone = *it;
-                detail.buffers.erase(it);
-                mutex_.unlock();
-                status = callback(clone);
-            } else {
-                mutex_.unlock();
-            }
-            return status;
-        }
-    }
-    mutex_.unlock();
-    return Status::OK();
-}
-
-Status LocalSegmentTracker::forEach(
-    std::function<Status(BufferDesc &)> callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-    for (auto &buf : detail.buffers) {
-        auto status = callback(buf);
-        if (!status.ok()) return status;
-    }
-    return Status::OK();
+    return registry_->deleteSegmentDesc(local_desc_->name);
 }
 
 }  // namespace v1

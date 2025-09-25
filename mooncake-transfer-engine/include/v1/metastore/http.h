@@ -15,18 +15,18 @@
 #ifndef METASTORE_HTTP_H
 #define METASTORE_HTTP_H
 
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 
 #include <atomic>
 #include <curl/curl.h>
 
 namespace mooncake {
 namespace v1 {
-class HttpMetadataPlugin : public MetadataPlugin {
+class HttpMetaStore : public MetaStore {
    public:
-    HttpMetadataPlugin();
+    HttpMetaStore();
 
-    virtual ~HttpMetadataPlugin();
+    virtual ~HttpMetaStore();
 
     virtual Status connect(const std::string &endpoint);
 

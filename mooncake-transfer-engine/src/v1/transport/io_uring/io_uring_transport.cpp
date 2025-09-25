@@ -74,7 +74,7 @@ IOUringTransport::IOUringTransport() : installed_(false) {}
 IOUringTransport::~IOUringTransport() { uninstall(); }
 
 Status IOUringTransport::install(std::string &local_segment_name,
-                                 std::shared_ptr<MetadataService> metadata,
+                                 std::shared_ptr<ControlService> metadata,
                                  std::shared_ptr<Topology> local_topology,
                                  std::shared_ptr<ConfigManager> conf) {
     if (installed_) {

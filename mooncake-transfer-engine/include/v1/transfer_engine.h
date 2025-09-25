@@ -39,8 +39,8 @@ class Topology;
 class Transport;
 class SegmentDesc;
 class AllocatedMemory;
-class MetadataService;
-class LocalSegmentTracker;
+class ControlService;
+class SegmentTracker;
 
 class TransferEngine {
    public:
@@ -147,13 +147,13 @@ class TransferEngine {
 
    private:
     std::shared_ptr<ConfigManager> conf_;
-    std::shared_ptr<MetadataService> metadata_;
+    std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     bool available_;
 
     std::array<std::unique_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
-    std::unique_ptr<LocalSegmentTracker> local_segment_tracker_;
+    std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
     ThreadLocalStorage<BatchSet> batch_set_;
 

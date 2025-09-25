@@ -19,8 +19,9 @@
 
 #include "v1/common/status.h"
 #include "v1/platform/location.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment.h"
+#include "v1/runtime/segment_tracker.h"
 #include "v1/transport/rdma/rdma_transport.h"
 #include "v1/transport/shm/shm_transport.h"
 #include "v1/transport/tcp/tcp_transport.h"
@@ -120,7 +121,7 @@ Status TransferEngine::setupLocalSegment() {
     auto &detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
     detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
-    local_segment_tracker_ = std::make_unique<LocalSegmentTracker>(segment);
+    local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
     return manager.synchronizeLocal();
 }
 
@@ -140,7 +141,7 @@ Status TransferEngine::construct() {
     CHECK_STATUS(topology_->discover(conf_));
 
     metadata_ =
-        std::make_shared<MetadataService>(metadata_type, metadata_servers);
+        std::make_shared<ControlService>(metadata_type, metadata_servers);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 

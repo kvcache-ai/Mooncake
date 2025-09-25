@@ -126,7 +126,7 @@ Status RdmaEndPoint::connect(const std::string &peer_server_name,
         auto rpc_server_addr = getRpcServerAddr(segment_desc.get());
         assert(!rpc_server_addr.empty());
         CHECK_STATUS(
-            RpcClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
+            ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
         qp_num = peer_desc.qp_num;
     }
     assert(qp_num.size() && segment_desc);

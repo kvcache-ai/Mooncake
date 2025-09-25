@@ -29,7 +29,7 @@
 
 #include "v1/common/status.h"
 #include "v1/runtime/slab.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 #include "v1/common/utils/string_builder.h"
 
 namespace mooncake {
@@ -87,7 +87,7 @@ MnnvlTransport::MnnvlTransport() : installed_(false) {}
 MnnvlTransport::~MnnvlTransport() { uninstall(); }
 
 Status MnnvlTransport::install(std::string &local_segment_name,
-                               std::shared_ptr<MetadataService> metadata,
+                               std::shared_ptr<ControlService> metadata,
                                std::shared_ptr<Topology> local_topology,
                                std::shared_ptr<ConfigManager> conf) {
     if (installed_) {

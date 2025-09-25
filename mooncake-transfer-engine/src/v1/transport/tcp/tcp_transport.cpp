@@ -26,7 +26,7 @@
 
 #include "v1/common/status.h"
 #include "v1/runtime/slab.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 
 namespace mooncake {
 namespace v1 {
@@ -35,7 +35,7 @@ TcpTransport::TcpTransport() : installed_(false) {}
 TcpTransport::~TcpTransport() { uninstall(); }
 
 Status TcpTransport::install(std::string &local_segment_name,
-                             std::shared_ptr<MetadataService> metadata,
+                             std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> local_topology,
                              std::shared_ptr<ConfigManager> conf) {
     if (installed_) {
@@ -133,11 +133,11 @@ void TcpTransport::startTransfer(TcpTask *task) {
     }
     if (task->request.opcode == Request::WRITE) {
         status =
-            RpcClient::sendData(rpc_server_addr, task->request.target_offset,
+            ControlClient::sendData(rpc_server_addr, task->request.target_offset,
                                 task->request.source, task->request.length);
     } else {
         status =
-            RpcClient::recvData(rpc_server_addr, task->request.target_offset,
+            ControlClient::recvData(rpc_server_addr, task->request.target_offset,
                                 task->request.source, task->request.length);
     }
     if (!status.ok()) {
@@ -171,7 +171,7 @@ Status TcpTransport::sendNotification(SegmentID target_id,
     rpc_server_addr = getRpcServerAddr(desc);
     if (rpc_server_addr.empty())
         return Status::InvalidArgument("Requested segment type error" LOC_MARK);
-    return RpcClient::notify(rpc_server_addr, message);
+    return ControlClient::notify(rpc_server_addr, message);
 }
 
 Status TcpTransport::receiveNotification(

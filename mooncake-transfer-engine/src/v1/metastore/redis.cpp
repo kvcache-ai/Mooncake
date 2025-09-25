@@ -19,11 +19,11 @@
 namespace mooncake {
 namespace v1 {
 
-RedisMetadataPlugin::RedisMetadataPlugin() {}
+RedisMetaStore::RedisMetaStore() {}
 
-RedisMetadataPlugin::~RedisMetadataPlugin() { disconnect(); }
+RedisMetaStore::~RedisMetaStore() { disconnect(); }
 
-Status RedisMetadataPlugin::connect(const std::string &endpoint) {
+Status RedisMetaStore::connect(const std::string &endpoint) {
     if (connected_) {
         return Status::MetadataError(
             "Redis connection already established" LOC_MARK);
@@ -40,7 +40,7 @@ Status RedisMetadataPlugin::connect(const std::string &endpoint) {
     return Status::OK();
 }
 
-Status RedisMetadataPlugin::disconnect() {
+Status RedisMetaStore::disconnect() {
     if (connected_) {
         redisFree(client_);
         connected_ = false;
@@ -48,7 +48,7 @@ Status RedisMetadataPlugin::disconnect() {
     return Status::OK();
 }
 
-Status RedisMetadataPlugin::get(const std::string &key, std::string &value) {
+Status RedisMetaStore::get(const std::string &key, std::string &value) {
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }
@@ -68,8 +68,7 @@ Status RedisMetadataPlugin::get(const std::string &key, std::string &value) {
     return Status::OK();
 }
 
-Status RedisMetadataPlugin::set(const std::string &key,
-                                const std::string &value) {
+Status RedisMetaStore::set(const std::string &key, const std::string &value) {
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }
@@ -83,7 +82,7 @@ Status RedisMetadataPlugin::set(const std::string &key,
     return Status::OK();
 }
 
-Status RedisMetadataPlugin::remove(const std::string &key) {
+Status RedisMetaStore::remove(const std::string &key) {
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }

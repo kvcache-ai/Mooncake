@@ -28,68 +28,14 @@
 #include <unordered_map>
 #include <variant>
 
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 #include "v1/runtime/segment.h"
+#include "v1/runtime/segment_manager.h"
 #include "v1/rpc/rpc.h"
 #include "v1/runtime/topology.h"
 
 namespace mooncake {
 namespace v1 {
-class MetadataStore {
-   public:
-    MetadataStore() {}
-
-    virtual ~MetadataStore() {}
-
-    MetadataStore(const MetadataStore &) = delete;
-    MetadataStore &operator=(const MetadataStore &) = delete;
-
-   public:
-    virtual Status getSegmentDesc(SegmentDescRef &desc,
-                                  const std::string &segment_name) = 0;
-
-    virtual Status putSegmentDesc(SegmentDescRef &desc) = 0;
-
-    virtual Status deleteSegmentDesc(const std::string &segment_name) = 0;
-};
-
-class CentralMetadataStore : public MetadataStore {
-   public:
-    CentralMetadataStore(const std::string &type, const std::string &servers);
-
-    virtual ~CentralMetadataStore() {}
-
-   public:
-    virtual Status getSegmentDesc(SegmentDescRef &desc,
-                                  const std::string &segment_name);
-
-    virtual Status putSegmentDesc(SegmentDescRef &desc);
-
-    virtual Status deleteSegmentDesc(const std::string &segment_name);
-
-   private:
-    std::shared_ptr<MetadataPlugin> plugin_;
-};
-
-class P2PMetadataStore : public MetadataStore {
-   public:
-    P2PMetadataStore() {}
-
-    virtual ~P2PMetadataStore() {}
-
-   public:
-    virtual Status getSegmentDesc(SegmentDescRef &desc,
-                                  const std::string &segment_name);
-
-    virtual Status putSegmentDesc(SegmentDescRef &desc) {
-        return Status::OK();  // no operation in purpose
-    }
-
-    virtual Status deleteSegmentDesc(const std::string &segment_name) {
-        return Status::OK();  // no operation in purpose
-    }
-};
-
 struct BootstrapDesc {
     std::string local_nic_path;
     std::string peer_nic_path;
@@ -107,13 +53,16 @@ using OnReceiveBootstrap =
 
 using OnNotify = std::function<int(const Notification &)>;
 
-class RpcClient {
+class ControlClient {
    public:
-    RpcClient() {}
+    ControlClient() {}
 
-    ~RpcClient() {}
+    ~ControlClient() {}
 
    public:
+    static Status getSegmentDesc(const std::string &server_addr,
+                                 std::string &response);
+
     static Status bootstrap(const std::string &server_addr,
                             const BootstrapDesc &request,
                             BootstrapDesc &response);
@@ -130,14 +79,14 @@ class RpcClient {
                          const Notification &message);
 };
 
-class MetadataService {
+class ControlService {
    public:
-    MetadataService(const std::string &type, const std::string &servers);
+    ControlService(const std::string &type, const std::string &servers);
 
-    ~MetadataService();
+    ~ControlService();
 
-    MetadataService(const MetadataService &) = delete;
-    MetadataService &operator=(const MetadataService &) = delete;
+    ControlService(const ControlService &) = delete;
+    ControlService &operator=(const ControlService &) = delete;
 
     SegmentManager &segmentManager() { return *manager_.get(); }
 

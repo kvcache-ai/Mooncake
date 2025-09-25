@@ -19,11 +19,11 @@
 namespace mooncake {
 namespace v1 {
 
-HttpMetadataPlugin::HttpMetadataPlugin() {}
+HttpMetaStore::HttpMetaStore() {}
 
-HttpMetadataPlugin::~HttpMetadataPlugin() { disconnect(); }
+HttpMetaStore::~HttpMetaStore() { disconnect(); }
 
-Status HttpMetadataPlugin::connect(const std::string &endpoint) {
+Status HttpMetaStore::connect(const std::string &endpoint) {
     if (connected_) {
         return Status::MetadataError(
             "HTTP connection already established" LOC_MARK);
@@ -39,7 +39,7 @@ Status HttpMetadataPlugin::connect(const std::string &endpoint) {
     return Status::OK();
 }
 
-Status HttpMetadataPlugin::disconnect() {
+Status HttpMetaStore::disconnect() {
     if (connected_) {
         curl_easy_cleanup(client_);
         curl_global_cleanup();
@@ -48,7 +48,7 @@ Status HttpMetadataPlugin::disconnect() {
     return Status::OK();
 }
 
-Status HttpMetadataPlugin::get(const std::string &key, std::string &value) {
+Status HttpMetaStore::get(const std::string &key, std::string &value) {
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }
@@ -85,8 +85,7 @@ Status HttpMetadataPlugin::get(const std::string &key, std::string &value) {
     return Status::OK();
 }
 
-Status HttpMetadataPlugin::set(const std::string &key,
-                               const std::string &value) {
+Status HttpMetaStore::set(const std::string &key, const std::string &value) {
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }
@@ -129,7 +128,7 @@ Status HttpMetadataPlugin::set(const std::string &key,
     return Status::OK();
 }
 
-Status HttpMetadataPlugin::remove(const std::string &key) {
+Status HttpMetaStore::remove(const std::string &key) {
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }

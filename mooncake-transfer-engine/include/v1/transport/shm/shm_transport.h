@@ -20,7 +20,7 @@
 #include <queue>
 #include <string>
 
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 #include "v1/runtime/transport.h"
 
 namespace mooncake {
@@ -46,7 +46,7 @@ class ShmTransport : public Transport {
     ~ShmTransport();
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<MetadataService> metadata,
+                           std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<ConfigManager> conf = nullptr);
 
@@ -86,7 +86,7 @@ class ShmTransport : public Transport {
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<MetadataService> metadata_;
+    std::shared_ptr<ControlService> metadata_;
 
     struct OpenedShmEntry {
         int shm_fd;

@@ -18,11 +18,11 @@
 namespace mooncake {
 namespace v1 {
 
-EtcdMetadataPlugin::EtcdMetadataPlugin() {}
+EtcdMetaStore::EtcdMetaStore() {}
 
-EtcdMetadataPlugin::~EtcdMetadataPlugin() { disconnect(); }
+EtcdMetaStore::~EtcdMetaStore() { disconnect(); }
 
-Status EtcdMetadataPlugin::connect(const std::string &endpoint) {
+Status EtcdMetaStore::connect(const std::string &endpoint) {
     char *err_str;
     if (connected_) {
         return Status::MetadataError(
@@ -39,7 +39,7 @@ Status EtcdMetadataPlugin::connect(const std::string &endpoint) {
     return Status::OK();
 }
 
-Status EtcdMetadataPlugin::disconnect() {
+Status EtcdMetaStore::disconnect() {
     if (connected_) {
         EtcdCloseWrapper();
         connected_ = false;
@@ -47,7 +47,7 @@ Status EtcdMetadataPlugin::disconnect() {
     return Status::OK();
 }
 
-Status EtcdMetadataPlugin::get(const std::string &key, std::string &value) {
+Status EtcdMetaStore::get(const std::string &key, std::string &value) {
     char *raw_value = nullptr;
     char *err_str;
     if (!connected_) {
@@ -66,8 +66,7 @@ Status EtcdMetadataPlugin::get(const std::string &key, std::string &value) {
     return Status::OK();
 }
 
-Status EtcdMetadataPlugin::set(const std::string &key,
-                               const std::string &value) {
+Status EtcdMetaStore::set(const std::string &key, const std::string &value) {
     char *err_str;
     if (!connected_) {
         return Status::MetadataError("Etcd connection not available" LOC_MARK);
@@ -82,7 +81,7 @@ Status EtcdMetadataPlugin::set(const std::string &key,
     return Status::OK();
 }
 
-Status EtcdMetadataPlugin::remove(const std::string &key) {
+Status EtcdMetaStore::remove(const std::string &key) {
     char *err_str;
     if (!connected_) {
         return Status::MetadataError("Etcd connection not available" LOC_MARK);

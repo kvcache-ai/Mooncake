@@ -18,15 +18,15 @@
 #include <atomic>
 #include <libetcd_wrapper.h>
 
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 
 namespace mooncake {
 namespace v1 {
-class EtcdMetadataPlugin : public MetadataPlugin {
+class EtcdMetaStore : public MetaStore {
    public:
-    EtcdMetadataPlugin();
+    EtcdMetaStore();
 
-    virtual ~EtcdMetadataPlugin();
+    virtual ~EtcdMetaStore();
 
     virtual Status connect(const std::string &endpoint);
 

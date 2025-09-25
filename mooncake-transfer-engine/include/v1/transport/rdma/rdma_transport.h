@@ -32,7 +32,7 @@
 #include "context.h"
 #include "slice.h"
 #include "quota.h"
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 #include "v1/runtime/transport.h"
 #include "v1/runtime/topology.h"
 
@@ -63,7 +63,7 @@ class RdmaTransport : public Transport {
     ~RdmaTransport();
 
     virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<MetadataService> metadata,
+                           std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<ConfigManager> conf = nullptr);
 
@@ -98,7 +98,7 @@ class RdmaTransport : public Transport {
     std::shared_ptr<ConfigManager> conf_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
-    std::shared_ptr<MetadataService> metadata_;
+    std::shared_ptr<ControlService> metadata_;
     LocalBufferManager local_buffer_manager_;
     RdmaContextSet context_set_;
     std::unordered_map<std::string, int> context_name_lookup_;

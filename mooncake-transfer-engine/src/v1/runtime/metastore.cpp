@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 #ifdef USE_ETCD
 #include "v1/metastore/etcd.h"
 #endif
@@ -27,23 +27,23 @@
 
 namespace mooncake {
 namespace v1 {
-std::shared_ptr<MetadataPlugin> MetadataPlugin::Create(
-    const std::string &type, const std::string &servers) {
-    std::shared_ptr<MetadataPlugin> plugin;
+std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
+                                             const std::string &servers) {
+    std::shared_ptr<MetaStore> plugin;
 #ifdef USE_ETCD
     if (type == "etcd") {
-        plugin = std::make_shared<EtcdMetadataPlugin>();
+        plugin = std::make_shared<EtcdMetaStore>();
     }
 #endif  // USE_ETCD
 #ifdef USE_REDIS
     if (type == "redis") {
-        plugin = std::make_shared<RedisMetadataPlugin>();
+        plugin = std::make_shared<RedisMetaStore>();
     }
 #endif  // USE_REDIS
 
 #ifdef USE_HTTP
     if (type == "http") {
-        plugin = std::make_shared<HttpMetadataPlugin>();
+        plugin = std::make_shared<HttpMetaStore>();
     }
 #endif  // USE_HTTP
     if (!plugin) {

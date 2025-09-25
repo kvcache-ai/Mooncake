@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef METADATA_PLUGIN_H
-#define METADATA_PLUGIN_H
+#ifndef METASTORE_H
+#define METASTORE_H
 
 #include <memory>
 #include <string>
@@ -22,13 +22,13 @@
 
 namespace mooncake {
 namespace v1 {
-struct MetadataPlugin {
-    static std::shared_ptr<MetadataPlugin> Create(const std::string &type,
-                                                  const std::string &servers);
+struct MetaStore {
+    static std::shared_ptr<MetaStore> Create(const std::string &type,
+                                             const std::string &servers);
 
-    MetadataPlugin() {}
+    MetaStore() {}
 
-    virtual ~MetadataPlugin() {}
+    virtual ~MetaStore() {}
 
     virtual Status connect(const std::string &endpoint) = 0;
 
@@ -41,4 +41,4 @@ struct MetadataPlugin {
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // METADATA_PLUGIN_H
+#endif  // METASTORE_H

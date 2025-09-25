@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/runtime/metadata.h"
+#include "v1/runtime/control_plane.h"
 
 #include <jsoncpp/json/value.h>
 
@@ -21,6 +21,7 @@
 
 #include "v1/common/status.h"
 #include "v1/platform/system.h"
+#include "v1/runtime/segment_registry.h"
 
 namespace mooncake {
 namespace v1 {
@@ -112,156 +113,6 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
     }
 }
 
-static std::shared_ptr<SegmentDesc> importSegmentDesc(
-    const Json::Value &segmentJSON) {
-    try {
-        auto desc = std::make_shared<SegmentDesc>();
-        desc->name = getItem(segmentJSON, "name");
-        auto type_str = getItem(segmentJSON, "type");
-        desc->machine_id = getItem(segmentJSON, "machine_id");
-        if (desc->name.empty() || type_str.empty()) return nullptr;
-        if (type_str == "memory") {
-            desc->type = SegmentType::Memory;
-            desc->detail = MemorySegmentDesc{};
-            auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-            if (segmentJSON.isMember("devices"))
-                for (const auto &deviceJSON : segmentJSON["devices"]) {
-                    DeviceDesc device;
-                    device.name = getItem(deviceJSON, "name");
-                    device.lid = getItemUInt64(deviceJSON, "lid");
-                    device.gid = getItem(deviceJSON, "gid");
-                    if (device.name.empty() || device.gid.empty()) {
-                        return nullptr;
-                    }
-                    detail.devices.push_back(device);
-                }
-
-            if (segmentJSON.isMember("buffers"))
-                for (const auto &bufferJSON : segmentJSON["buffers"]) {
-                    BufferDesc buffer;
-                    buffer.location = getItem(bufferJSON, "name");
-                    buffer.addr = getItemUInt64(bufferJSON, "addr");
-                    buffer.length = getItemUInt64(bufferJSON, "length");
-                    for (const auto &rkeyJSON : bufferJSON["rkey"])
-                        buffer.rkey.push_back(rkeyJSON.asUInt());
-                    buffer.shm_path = getItem(bufferJSON, "shm_path");
-                    buffer.mnnvl_handle = getItem(bufferJSON, "mnnvl_handle");
-                    if (buffer.location.empty() || !buffer.addr ||
-                        !buffer.length ||
-                        detail.devices.size() != buffer.rkey.size()) {
-                        return nullptr;
-                    }
-                    for (const auto &typeJSON : bufferJSON["transports"]) {
-                        buffer.transports.push_back(
-                            (TransportType)typeJSON.asInt());
-                    }
-                    detail.buffers.push_back(buffer);
-                }
-
-            auto topo_string = getStyledJsonString(segmentJSON, "topology");
-            if (!topo_string.empty()) detail.topology.parse(topo_string);
-            detail.rpc_server_addr = getItem(segmentJSON, "rpc_server_addr");
-        } else if (type_str == "file") {
-            desc->type = SegmentType::File;
-            desc->detail = FileSegmentDesc{};
-            auto &detail = std::get<FileSegmentDesc>(desc->detail);
-            if (segmentJSON.isMember("buffers")) {
-                for (const auto &bufferJSON : segmentJSON["buffers"]) {
-                    FileBufferDesc buffer;
-                    buffer.path = getItem(bufferJSON, "path");
-                    buffer.length = getItemUInt64(bufferJSON, "length");
-                    buffer.offset = getItemUInt64(bufferJSON, "offset");
-                    detail.buffers.push_back(buffer);
-                }
-            }
-        }
-        return desc;
-    } catch (std::exception &ex) {
-        LOG(ERROR) << "importSegmentDesc: Found internal exception: "
-                   << ex.what();
-        return nullptr;
-    }
-}
-
-CentralMetadataStore::CentralMetadataStore(const std::string &type,
-                                           const std::string &servers) {
-    plugin_ = MetadataPlugin::Create(type, servers);
-}
-
-Status CentralMetadataStore::getSegmentDesc(SegmentDescRef &desc,
-                                            const std::string &segment_name) {
-    if (!plugin_)
-        return Status::MetadataError(
-            "Central metadata store not started" LOC_MARK);
-    std::string jstr;
-    desc = nullptr;
-
-    auto status = plugin_->get(getFullMetadataKey(segment_name), jstr);
-    if (!status.ok()) return status;
-
-    Json::Value j;
-    if (Json::Reader{}.parse(jstr, j)) {
-        desc = importSegmentDesc(j);
-        desc->name = segment_name;
-    }
-
-    if (!desc)
-        return Status::MalformedJson(
-            "Failed to parse segment from json" LOC_MARK);
-    return Status::OK();
-}
-
-Status CentralMetadataStore::putSegmentDesc(SegmentDescRef &desc) {
-    if (!plugin_)
-        return Status::MetadataError(
-            "Central metadata store not started" LOC_MARK);
-    auto j = exportSegmentDesc(*desc);
-    if (j.empty())
-        return Status::MalformedJson(
-            "Failed to serialize segment descriptor" LOC_MARK);
-    const std::string jstr = Json::FastWriter{}.write(j);
-    return plugin_->set(getFullMetadataKey(desc->name), jstr);
-}
-
-Status CentralMetadataStore::deleteSegmentDesc(
-    const std::string &segment_name) {
-    if (!plugin_)
-        return Status::MetadataError(
-            "Central metadata store not started" LOC_MARK);
-    return plugin_->remove(getFullMetadataKey(segment_name));
-}
-
-thread_local CoroRpcAgent tl_rpc_agent;
-
-Status P2PMetadataStore::getSegmentDesc(SegmentDescRef &desc,
-                                        const std::string &segment_name) {
-    std::string request, response;
-    if (segment_name.empty())
-        return Status::InvalidArgument("Empty segment name" LOC_MARK);
-
-    auto status =
-        tl_rpc_agent.call(segment_name, GetSegmentDesc, request, response);
-    if (!status.ok()) return status;
-    if (response.empty()) {
-        return Status::InvalidEntry(std::string("Segment ") + segment_name +
-                                    "not found" + LOC_MARK);
-    }
-
-    Json::Value j;
-    if (Json::Reader{}.parse(response, j)) {
-        desc = importSegmentDesc(j);
-        if (!desc)
-            return Status::MalformedJson(
-                "Failed to import segment from json" LOC_MARK);
-        desc->name = segment_name;
-    }
-
-    if (!desc)
-        return Status::MalformedJson(
-            "Failed to import segment from json" LOC_MARK);
-    return Status::OK();
-}
-
 static Json::Value exportBootstrapDesc(const BootstrapDesc &desc) {
     try {
         Json::Value root;
@@ -311,9 +162,17 @@ Status deserializeBootstrapDesc(BootstrapDesc &desc,
         "Failed to import handshake message from json" LOC_MARK);
 }
 
-Status RpcClient::bootstrap(const std::string &server_addr,
-                            const BootstrapDesc &request,
-                            BootstrapDesc &response) {
+thread_local CoroRpcAgent tl_rpc_agent;
+
+Status ControlClient::getSegmentDesc(const std::string &server_addr,
+                                     std::string &response) {
+    std::string request;
+    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+}
+
+Status ControlClient::bootstrap(const std::string &server_addr,
+                                const BootstrapDesc &request,
+                                BootstrapDesc &response) {
     std::string request_raw, response_raw;
     auto status = serializeBootstrapDesc(request, request_raw);
     if (!status.ok()) return status;
@@ -323,9 +182,9 @@ Status RpcClient::bootstrap(const std::string &server_addr,
     return deserializeBootstrapDesc(response, response_raw);
 }
 
-Status RpcClient::sendData(const std::string &server_addr,
-                           uint64_t peer_mem_addr, void *local_mem_addr,
-                           size_t length) {
+Status ControlClient::sendData(const std::string &server_addr,
+                               uint64_t peer_mem_addr, void *local_mem_addr,
+                               size_t length) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc) + length);
@@ -334,9 +193,9 @@ Status RpcClient::sendData(const std::string &server_addr,
     return tl_rpc_agent.call(server_addr, SendData, request, response);
 }
 
-Status RpcClient::recvData(const std::string &server_addr,
-                           uint64_t peer_mem_addr, void *local_mem_addr,
-                           size_t length) {
+Status ControlClient::recvData(const std::string &server_addr,
+                               uint64_t peer_mem_addr, void *local_mem_addr,
+                               size_t length) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc) + length);
@@ -347,22 +206,22 @@ Status RpcClient::recvData(const std::string &server_addr,
     return Status::OK();
 }
 
-Status RpcClient::notify(const std::string &server_addr,
-                         const Notification &message) {
+Status ControlClient::notify(const std::string &server_addr,
+                             const Notification &message) {
     std::string request, response;
     request.resize(message.size());
     memcpy(&request[0], message.c_str(), message.size());
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
-MetadataService::MetadataService(const std::string &type,
-                                 const std::string &servers)
+ControlService::ControlService(const std::string &type,
+                               const std::string &servers)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr) {
     if (type == "p2p") {
-        auto agent = std::make_unique<P2PMetadataStore>();
+        auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralMetadataStore>(type, servers);
+        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
@@ -392,20 +251,20 @@ MetadataService::MetadataService(const std::string &type,
         });
 }
 
-MetadataService::~MetadataService() {}
+ControlService::~ControlService() {}
 
-Status MetadataService::start(uint16_t &port, bool ipv6_) {
+Status ControlService::start(uint16_t &port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
 }
 
-void MetadataService::onGetSegmentDesc(const std::string_view &request,
-                                       std::string &response) {
+void ControlService::onGetSegmentDesc(const std::string_view &request,
+                                      std::string &response) {
     auto local_json = exportSegmentDesc(*manager_->getLocal());
     response = Json::FastWriter{}.write(local_json);
 }
 
-void MetadataService::onBootstrapRdma(const std::string_view &request,
-                                      std::string &response) {
+void ControlService::onBootstrapRdma(const std::string_view &request,
+                                     std::string &response) {
     BootstrapDesc request_desc, response_desc;
     std::string mutable_request(request);
     auto status = deserializeBootstrapDesc(request_desc, mutable_request);
@@ -414,8 +273,8 @@ void MetadataService::onBootstrapRdma(const std::string_view &request,
     serializeBootstrapDesc(response_desc, response);
 }
 
-void MetadataService::onSendData(const std::string_view &request,
-                                 std::string &response) {
+void ControlService::onSendData(const std::string_view &request,
+                                std::string &response) {
     XferDataDesc *desc = (XferDataDesc *)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
@@ -425,8 +284,8 @@ void MetadataService::onSendData(const std::string_view &request,
     }
 }
 
-void MetadataService::onRecvData(const std::string_view &request,
-                                 std::string &response) {
+void ControlService::onRecvData(const std::string_view &request,
+                                std::string &response) {
     XferDataDesc *desc = (XferDataDesc *)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
@@ -437,8 +296,8 @@ void MetadataService::onRecvData(const std::string_view &request,
     }
 }
 
-void MetadataService::onNotify(const std::string_view &request,
-                               std::string &response) {
+void ControlService::onNotify(const std::string_view &request,
+                              std::string &response) {
     std::string message(request.data(), request.size());
     if (notify_callback_) notify_callback_(message);
 }

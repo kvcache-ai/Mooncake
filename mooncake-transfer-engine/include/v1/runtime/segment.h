@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SEGMENT_MANAGER_H
-#define SEGMENT_MANAGER_H
+#ifndef SEGMENT_H
+#define SEGMENT_H
 
 #include <glog/logging.h>
 #include <jsoncpp/json/json.h>
@@ -30,7 +30,7 @@
 
 #include "v1/common/concurrent/rw_spinlock.h"
 #include "v1/common/concurrent/thread_local_storage.h"
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 #include "v1/rpc/rpc.h"
 #include "v1/runtime/topology.h"
 
@@ -85,92 +85,6 @@ struct SegmentDesc {
 
 using SegmentDescRef = std::shared_ptr<SegmentDesc>;
 
-class MetadataStore;
-
-class SegmentManager {
-   public:
-    SegmentManager(std::unique_ptr<MetadataStore> agent);
-
-    ~SegmentManager();
-
-    SegmentManager(const SegmentManager &) = delete;
-    SegmentManager &operator=(const SegmentManager &) = delete;
-
-   public:
-    Status openRemote(SegmentID &handle, const std::string &segment_name);
-
-    Status closeRemote(SegmentID handle);
-
-    Status getRemoteCached(SegmentDesc *&desc, SegmentID handle);
-
-    Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
-
-    Status invalidateRemote(SegmentID handle);
-
-   public:
-    SegmentDescRef getLocal() { return local_desc_; }
-
-    Status synchronizeLocal();
-
-    Status deleteLocal();
-
-   private:
-    Status getRemote(SegmentDescRef &desc, SegmentID handle);
-
-    Status makeFileRemote(SegmentDescRef &desc,
-                          const std::string &segment_name);
-
-   private:
-    struct RemoteSegmentCache {
-        uint64_t last_refresh = 0;
-        uint64_t version = 0;
-        std::unordered_map<SegmentID, SegmentDescRef> id_to_desc_map;
-    };
-
-   private:
-    RWSpinlock lock_;
-    std::unordered_map<SegmentID, std::string> id_to_name_map_;
-    std::unordered_map<std::string, SegmentID> name_to_id_map_;
-    std::atomic<SegmentID> next_id_;
-
-    std::atomic<uint64_t> version_;
-
-    SegmentDescRef local_desc_;
-    ThreadLocalStorage<RemoteSegmentCache> tl_remote_cache_;
-
-    std::unique_ptr<MetadataStore> store_;
-
-    std::string file_desc_basepath_;
-    uint64_t ttl_ms_ = 10 * 1000;  // N.B. Frequent TTL harms p999
-};
-
-class LocalSegmentTracker {
-   public:
-    LocalSegmentTracker(const SegmentDescRef &local_desc)
-        : local_desc_(local_desc) {}
-
-    ~LocalSegmentTracker() {}
-
-    LocalSegmentTracker(const LocalSegmentTracker &) = delete;
-    LocalSegmentTracker &operator==(const LocalSegmentTracker &) = delete;
-
-   public:
-    Status query(uint64_t base, size_t length,
-                 std::vector<BufferDesc *> &result);
-
-    Status add(uint64_t base, size_t length,
-               std::function<Status(BufferDesc &)> callback);
-
-    Status remove(uint64_t base, size_t length,
-                  std::function<Status(BufferDesc &)> callback);
-
-    Status forEach(std::function<Status(BufferDesc &)> callback);
-
-   private:
-    SegmentDescRef local_desc_;
-    std::mutex mutex_;
-};
-
 static inline BufferDesc *getBufferDesc(SegmentDesc *desc, uint64_t base,
                                         uint64_t length) {
     if (desc->type != SegmentType::Memory) return nullptr;
@@ -204,4 +118,4 @@ static inline DeviceDesc *getDeviceDesc(SegmentDesc *desc,
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // SEGMENT_MANAGER_H
+#endif  // SEGMENT_H

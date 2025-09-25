@@ -20,16 +20,16 @@
 
 #include <atomic>
 
-#include "v1/runtime/plugin.h"
+#include "v1/runtime/metastore.h"
 #include "v1/platform/ip.h"
 
 namespace mooncake {
 namespace v1 {
-class RedisMetadataPlugin : public MetadataPlugin {
+class RedisMetaStore : public MetaStore {
    public:
-    RedisMetadataPlugin();
+    RedisMetaStore();
 
-    virtual ~RedisMetadataPlugin();
+    virtual ~RedisMetaStore();
 
     virtual Status connect(const std::string &endpoint);
 
