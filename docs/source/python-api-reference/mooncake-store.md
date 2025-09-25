@@ -46,7 +46,7 @@ store.setup(
     128*1024*1024,          # 128MB local buffer
     "tcp",                             # Use TCP (RDMA for high performance)
     "",                            # Leave empty; Mooncake auto-picks RDMA devices when needed
-    "localhost"        # Master service
+    "localhost:50051"        # Master service
 )
 
 # 3. Store data
