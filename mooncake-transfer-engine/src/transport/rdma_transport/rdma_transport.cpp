@@ -132,9 +132,22 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
-    bool do_pre_touch = context_list_.size() > 0
-    && std::thread::hardware_concurrency() >= 4
-    && length >= (size_t) 4 * 1024 * 1024 * 1024;
+
+    // Only do pre-touch if the address is not on device.
+    bool addr_maybe_on_device = false;
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    if (result != CUDA_SUCCESS && memType != CU_MEMORYTYPE_HOST) {
+        addr_maybe_on_device = true;
+    }
+#endif
+
+    bool do_pre_touch =
+        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        length >= (size_t)4 * 1024 * 1024 * 1024 && !addr_maybe_on_device;
     if (do_pre_touch) {
         // Parallell Pre-touch the memory to speedup the registration process.
         preTouchMemory(addr, length);
@@ -142,26 +155,34 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
     auto start_time = std::chrono::high_resolution_clock::now();
     if (context_list_.size() > 1 && do_pre_touch) {
-        // Parallel register the memory region
+        // Parallel register the memory region. If the memory address has not
+        // been touched before, parallel register will be much slower than
+        // sequential register.
+        // Details in: https://github.com/kvcache-ai/Mooncake/issues/848
         std::vector<std::thread> reg_threads;
         reg_threads.reserve(context_list_.size());
         std::vector<int> ret_codes(context_list_.size(), 0);
-        
+
         for (size_t i = 0; i < context_list_.size(); ++i) {
             reg_threads.emplace_back([this, &ret_codes, i, addr, length]() {
-                auto start_time_thread = std::chrono::high_resolution_clock::now();
-                ret_codes[i] = context_list_[i]->registerMemoryRegion(addr, length, access_rights);
-                auto end_time_thread = std::chrono::high_resolution_clock::now();
-                auto duration_thread = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_thread - start_time_thread);
-                LOG(ERROR) << "\tregisterMemoryRegion execution time: " << duration_thread.count() << " ms";
+                auto start_time_thread =
+                    std::chrono::high_resolution_clock::now();
+                ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                    addr, length, access_rights);
+                auto end_time_thread =
+                    std::chrono::high_resolution_clock::now();
+                auto duration_thread =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        end_time_thread - start_time_thread);
+                LOG(ERROR) << "\tregisterMemoryRegion execution time: "
+                           << duration_thread.count() << " ms";
             });
         }
-        
+
         for (auto &thread : reg_threads) {
             thread.join();
         }
-        
-        // Check for any registration failures
+
         for (size_t i = 0; i < ret_codes.size(); ++i) {
             if (ret_codes[i] != 0) {
                 return ret_codes[i];
@@ -169,7 +190,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         }
     } else {
         for (auto &context : context_list_) {
-            int ret = context->registerMemoryRegion(addr, length, access_rights);
+            int ret =
+                context->registerMemoryRegion(addr, length, access_rights);
             if (ret) return ret;
         }
     }
@@ -206,7 +228,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - end_time);
     LOG(ERROR) << "getMemoryLocation + addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
-    LOG(ERROR) << "total execution time: " << duration.count() + duration2.count() << " ms";
+    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time).count() << " ms";
     return 0;
 }
 
