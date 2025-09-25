@@ -144,7 +144,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         addr_maybe_on_device = true;
     }
 #endif
-
+    auto start_time_pre_touch = std::chrono::high_resolution_clock::now();
     bool do_pre_touch =
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024 && !addr_maybe_on_device;
@@ -228,7 +228,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - end_time);
     LOG(ERROR) << "getMemoryLocation + addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
-    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time).count() << " ms";
+    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time_pre_touch).count() << " ms";
     return 0;
 }
 
