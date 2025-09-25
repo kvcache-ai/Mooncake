@@ -223,14 +223,10 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
-    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, bool>();
+    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, void>();
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
-    }
-    if (!result.value()) {
-        timer.LogResponse("error_code=", ErrorCode::RPC_FAIL);
-        return ErrorCode::RPC_FAIL;
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;

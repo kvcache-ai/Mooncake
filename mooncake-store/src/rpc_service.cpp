@@ -527,9 +527,8 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     return result;
 }
 
-tl::expected<bool, ErrorCode> WrappedMasterService::ServiceReady() {
-    // Simply return true to indicate the service is ready
-    return true;
+tl::expected<void, ErrorCode> WrappedMasterService::ServiceReady() {
+    return {};
 }
 
 void RegisterRpcService(
