@@ -39,6 +39,11 @@ if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
 
+option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+if (STORE_USE_JEMALLOC)
+  add_compile_definitions(STORE_USE_JEMALLOC)
+endif()
+
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/include)
