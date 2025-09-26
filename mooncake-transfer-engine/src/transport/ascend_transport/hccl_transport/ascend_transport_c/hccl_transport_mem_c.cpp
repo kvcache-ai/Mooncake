@@ -77,6 +77,16 @@ static int getEpollWaitTimeoutMs() {
     return g_default_epoll_wait_timeout_ms;
 }
 
+static int getHcclRdmaTrafficClass() {
+    static char *env = getenv("HCCL_RDMA_TC");
+    return env ? std::stoi(env) : 132;
+}
+
+static int getHcclRdmaServiceLevel() {
+    static char *env = getenv("HCCL_RDMA_SL");
+    return env ? std::stoi(env) : 4;
+}
+
 uint16_t findAvailableTcpPort(int &sockfd, bool use_ipv6) {
     static std::random_device rand_gen;
     std::mt19937 gen(rand_gen());
@@ -300,18 +310,7 @@ int initTransportMem(RankInfo *local_rank_info) {
 }
 
 void freeTransportMem() {
-    for (auto &it : target_key_to_connection_map_) {
-        auto &hccl_ctrl_socket = it.second.hccl_ctrl_socket;
-        if (hccl_ctrl_socket) {
-            hccl_ctrl_socket->Close();
-        }
-        auto &hccl_data_socket = it.second.hccl_data_socket;
-        if (hccl_data_socket) {
-            hccl_data_socket->Close();
-        }
-    }
-    target_key_to_connection_map_.clear();
-
+    clearTransportMems();
     if (vnicServerSocket_) {
         HcclNetCloseDev(vnicNetDevCtx_);
         vnicServerSocket_.reset();
@@ -324,7 +323,6 @@ void freeTransportMem() {
     if (notifyPool_) {
         notifyPool_.reset();
     }
-
     if (g_server_socket_ > 0) {
         close(g_server_socket_);
     }
@@ -582,8 +580,8 @@ int createTransportMem(RankInfo *local_rank_info, RankInfo *remote_rank_info,
     attrInfo.remoteRankId = remote_rank_info->deviceLogicId;
     attrInfo.sdid = 0xFFFFFFFF;
     attrInfo.serverId = local_rank_info->serverIdx;
-    attrInfo.trafficClass = 132;
-    attrInfo.serviceLevel = 4;
+    attrInfo.trafficClass = getHcclRdmaTrafficClass();
+    attrInfo.serviceLevel = getHcclRdmaServiceLevel();
     if (is_cross_hccs) {
         transport_mem = hccl::TransportMem::Create(
             hccl::TransportMem::TpType::ROCE, notifyPool_, nicNetDevCtx_,
@@ -757,6 +755,21 @@ int clearTransportMem(RankInfo *remote_rank_info) {
         }
         target_key_to_connection_map_.erase(key_str);
     }
+    return 0;
+}
+
+int clearTransportMems() {
+    for (auto &it : target_key_to_connection_map_) {
+        auto &hccl_ctrl_socket = it.second.hccl_ctrl_socket;
+        if (hccl_ctrl_socket) {
+            hccl_ctrl_socket->Close();
+        }
+        auto &hccl_data_socket = it.second.hccl_data_socket;
+        if (hccl_data_socket) {
+            hccl_data_socket->Close();
+        }
+    }
+    target_key_to_connection_map_.clear();
     return 0;
 }
 
@@ -997,8 +1010,8 @@ int transportMemAccept(RankInfo *local_rank_info) {
     attrInfo.remoteRankId = remote_control_info.deviceLogicId;
     attrInfo.sdid = 0xFFFFFFFF;
     attrInfo.serverId = local_rank_info->serverIdx;
-    attrInfo.trafficClass = 132;
-    attrInfo.serviceLevel = 4;
+    attrInfo.trafficClass = getHcclRdmaTrafficClass();
+    attrInfo.serviceLevel = getHcclRdmaServiceLevel();
     if (is_cross_hccs) {
         transport_mem = hccl::TransportMem::Create(
             hccl::TransportMem::TpType::ROCE, notifyPool_, nicNetDevCtx_,
