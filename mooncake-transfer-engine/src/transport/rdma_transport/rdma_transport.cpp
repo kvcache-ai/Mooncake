@@ -90,14 +90,12 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         // At least one context is required for pre-touch.
         return 0;
     }
-    auto start_time = std::chrono::high_resolution_clock::now();
 
     auto hwc = std::thread::hardware_concurrency();
     auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
-    }
-    
+    }   
     size_t block_size = length / num_threads;
     if (block_size == 0) {
         return 0;
@@ -105,32 +103,19 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
     
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
-    
-    // Shared data structure to collect return values from each thread
     std::vector<int> thread_results(num_threads, 0);
     
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void *block_addr = static_cast<char*>(addr) + thread_i * block_size;   
-        threads.emplace_back([this, thread_i, block_addr, block_size, &thread_results]() {
-            auto start_time_thread = std::chrono::high_resolution_clock::now();
-            
+        threads.emplace_back([this, thread_i, block_addr, block_size, &thread_results]() { 
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
-            
             thread_results[thread_i] = ret;
-
-            auto end_time_thread = std::chrono::high_resolution_clock::now();
-            auto duration_thread = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_thread - start_time_thread);
-            LOG(ERROR) << "\tpreTouchMemory execution time: " << duration_thread.count() << " ms";
         });
     }
     
     for (auto &thread : threads) {
         thread.join();
     }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    LOG(ERROR) << "preTouchMemory execution time: " << duration.count() << " ms";
 
     for (size_t i = 0; i < num_threads; ++i) {
         if (thread_results[i] != 0) {
@@ -151,7 +136,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
 
-    auto start_time_pre_touch = std::chrono::high_resolution_clock::now();
     bool do_pre_touch =
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
@@ -163,7 +147,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         }
     }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
     if (context_list_.size() > 1 && do_pre_touch) {
         // Parallel register the memory region. If the memory address has not
         // been touched before, parallel register will be much slower than
@@ -175,17 +158,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
             reg_threads.emplace_back([this, &ret_codes, i, addr, length]() {
-                auto start_time_thread =
-                    std::chrono::high_resolution_clock::now();
                 ret_codes[i] = context_list_[i]->registerMemoryRegion(
                     addr, length, access_rights);
-                auto end_time_thread =
-                    std::chrono::high_resolution_clock::now();
-                auto duration_thread =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        end_time_thread - start_time_thread);
-                LOG(ERROR) << "\tregisterMemoryRegion execution time: "
-                           << duration_thread.count() << " ms";
             });
         }
 
@@ -205,9 +179,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
             if (ret) return ret;
         }
     }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    LOG(ERROR) << "registerMemoryRegion execution time: " << duration.count() << " ms";
 
     // Collect keys from all contexts
     for (auto &context : context_list_) {
@@ -235,11 +206,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
         if (rc) return rc;
     }
-    auto end_time2 = std::chrono::high_resolution_clock::now();
-    auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - end_time);
-    LOG(ERROR) << "getMemoryLocation + addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
-    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time_pre_touch).count() << " ms"
-        << ", size: " << length * 1.0 / (1024 * 1024 * 1024) << " GB";
     return 0;
 }
 
