@@ -642,8 +642,10 @@ auto MasterService::Ping(const UUID& client_id)
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
-        LOG(ERROR) << "root_fs_dir or cluster_id is not set";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO)
+            << "Storage root directory or cluster ID is not set. persisting "
+               "data is disabled.";
+        return std::string();
     }
     return root_fs_dir_ + "/" + cluster_id_;
 }
