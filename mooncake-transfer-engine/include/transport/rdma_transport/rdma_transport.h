@@ -90,7 +90,7 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
     
-    void preTouchMemory(void *addr, size_t length);
+    int preTouchMemory(void *addr, size_t length);
 
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,

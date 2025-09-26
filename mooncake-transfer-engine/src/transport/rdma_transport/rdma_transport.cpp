@@ -85,29 +85,39 @@ int RdmaTransport::install(std::string &local_server_name,
     return 0;
 }
 
-void RdmaTransport::preTouchMemory(void *addr, size_t length) {
+int RdmaTransport::preTouchMemory(void *addr, size_t length) {
+    if (context_list_.size() == 0) {
+        // At least one context is required for pre-touch.
+        return 0;
+    }
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    auto num_threads = std::min(std::thread::hardware_concurrency(), 16u);
+    auto hwc = std::thread::hardware_concurrency();
+    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
     }
     
     size_t block_size = length / num_threads;
     if (block_size == 0) {
-        return;
+        return 0;
     }
     
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     
+    // Shared data structure to collect return values from each thread
+    std::vector<int> thread_results(num_threads, 0);
+    
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void *block_addr = static_cast<char*>(addr) + thread_i * block_size;   
-        threads.emplace_back([block_addr, block_size]() {
+        threads.emplace_back([this, thread_i, block_addr, block_size, &thread_results]() {
             auto start_time_thread = std::chrono::high_resolution_clock::now();
-            for (size_t i = 0; i < block_size; i += pagesize) {
-                static_cast<char *>(block_addr)[i] = 0;
-            }
+            
+            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+            
+            thread_results[thread_i] = ret;
+
             auto end_time_thread = std::chrono::high_resolution_clock::now();
             auto duration_thread = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_thread - start_time_thread);
             LOG(ERROR) << "\tpreTouchMemory execution time: " << duration_thread.count() << " ms";
@@ -121,6 +131,14 @@ void RdmaTransport::preTouchMemory(void *addr, size_t length) {
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     LOG(ERROR) << "preTouchMemory execution time: " << duration.count() << " ms";
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        if (thread_results[i] != 0) {
+            return thread_results[i];
+        }
+    }
+
+    return 0;
 }
 
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
@@ -133,24 +151,16 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
 
-    // Only do pre-touch if the address is not on device.
-    bool addr_maybe_on_device = false;
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-    CUmemorytype memType;
-    CUresult result = cuPointerGetAttribute(
-        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
-
-    if (result != CUDA_SUCCESS && memType != CU_MEMORYTYPE_HOST) {
-        addr_maybe_on_device = true;
-    }
-#endif
     auto start_time_pre_touch = std::chrono::high_resolution_clock::now();
     bool do_pre_touch =
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
-        length >= (size_t)4 * 1024 * 1024 * 1024 && !addr_maybe_on_device;
+        length >= (size_t)4 * 1024 * 1024 * 1024;
     if (do_pre_touch) {
         // Parallell Pre-touch the memory to speedup the registration process.
-        preTouchMemory(addr, length);
+        int ret = preTouchMemory(addr, length);
+        if (ret != 0) {
+            return ret;
+        }
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
