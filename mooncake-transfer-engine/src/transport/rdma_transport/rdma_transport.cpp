@@ -228,7 +228,8 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     auto end_time2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - end_time);
     LOG(ERROR) << "getMemoryLocation + addLocalMemoryBuffer execution time: " << duration2.count() << " ms";
-    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time_pre_touch).count() << " ms";
+    LOG(ERROR) << "total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time2 - start_time_pre_touch).count() << " ms"
+        << ", size: " << length * 1.0 / (1024 * 1024 * 1024) << " GB";
     return 0;
 }
 
