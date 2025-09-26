@@ -48,10 +48,11 @@ def main():
     server_len = server_buffer.nbytes
     
     # Register memory with Mooncake
-    ret_value = server_engine.register_memory(server_ptr, server_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
+    if PROTOCOL == "rdma":
+        ret_value = server_engine.register_memory(server_ptr, server_len)
+        if ret_value != 0:
+            print("Mooncake memory registration failed.")
+            raise RuntimeError("Mooncake memory registration failed.")
 
     print(f"Server initialized with session ID: {session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
@@ -73,10 +74,11 @@ def main():
         print("\nShutting down server...")
     finally:
         # Cleanup
-        ret_value = server_engine.unregister_memory(server_ptr)
-        if ret_value != 0:
-            print("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
+        if PROTOCOL == "rdma":
+            ret_value = server_engine.unregister_memory(server_ptr)
+            if ret_value != 0:
+                print("Mooncake memory deregistration failed.")
+                raise RuntimeError("Mooncake memory deregistration failed.")
 
         socket.close()
         context.term()
@@ -170,19 +172,17 @@ Please refer to the [Transfer Engine Python API](../python-api-reference/transfe
 
 ## Mooncake Store Quick Start
 
-### Start Mooncake Store
+### Start Master (with HTTP enabled)
 
-Before using the store, start the master and metadata services, which are included in the `mooncake-transfer-engine` package:
+Enable the built-in HTTP metadata server when starting the master:
 
 ```bash
-# Start master service (default port 50051)
-mooncake_master
+mooncake_master \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
 ```
-Start the HTTP metadata server (default port 8080) for transfer engine metadata:
-```bash
-# Start HTTP metadata server (default port 8080) 
-mooncake_http_metadata_server
-```
+This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
 ### Hello World Example
 
@@ -194,13 +194,13 @@ store = MooncakeDistributedStore()
 
 # 2. Setup with all required parameters
 store.setup(
-    "localhost:12345",      # Your node's address
+    "localhost",           # Your node's address
     "http://localhost:8080/metadata",    # HTTP metadata server
     512*1024*1024,          # 512MB segment size
     128*1024*1024,          # 128MB local buffer
     "tcp",                  # Use TCP (RDMA for high performance)
-    "",                     # Empty for TCP, specify device for RDMA
-    "localhost:50051"       # Master service
+    "",                      # Leave empty; Mooncake auto-picks RDMA devices when needed
+    "localhost:50051"        # Master service
 )
 
 # 3. Store data
