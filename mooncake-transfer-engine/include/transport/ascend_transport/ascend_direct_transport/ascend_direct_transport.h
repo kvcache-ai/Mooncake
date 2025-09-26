@@ -31,6 +31,7 @@
 #include <acl/acl.h>
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "thread_pool.h"
 #include "adxl/adxl_engine.h"
 
 namespace mooncake {
@@ -114,6 +115,9 @@ class AscendDirectTransport : public Transport {
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
+
+    ThreadPool thread_pool_;
+    int32_t device_id_{-1};
 };
 
 }  // namespace mooncake
