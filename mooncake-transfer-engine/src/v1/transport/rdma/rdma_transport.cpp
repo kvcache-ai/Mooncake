@@ -102,7 +102,8 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "RDMA transport has been installed" LOC_MARK);
     }
 
-    if (local_topology == nullptr || local_topology->getNicList().empty()) {
+    if (local_topology == nullptr ||
+        !local_topology->getNicCount(Topology::NIC_RDMA)) {
         return Status::DeviceNotFound(
             "No RDMA device found in topology" LOC_MARK);
     }
@@ -114,18 +115,18 @@ Status RdmaTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
-    auto hca_list = local_topology_->getNicList();
-    for (auto &device_name : hca_list) {
+    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
+        auto entry = local_topology_->getNicEntry(i);
+        if (entry->type != Topology::NIC_RDMA) continue;
         auto context = std::make_shared<RdmaContext>(*this);
-        int ret = context->construct(device_name, params_);
+        int ret = context->construct(entry->name, params_);
+        context_name_lookup_[entry->name] = context_set_.size();
+        context_set_.push_back(context);
         if (ret) {
-            local_topology_->disableNic(device_name);
-            LOG(WARNING) << "Disable RDMA device " << device_name << " because "
+            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
                          << "of initialization failure";
             continue;
         }
-        context_name_lookup_[device_name] = context_set_.size();
-        context_set_.push_back(context);
         local_buffer_manager_.addDevice(context.get());
     }
     if (local_topology_->empty()) {
@@ -202,7 +203,7 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const int num_devices = (size_t)local_topology_->getNicList().size();
+    const int num_devices = (size_t)local_topology_->getNicCount();
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();

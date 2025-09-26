@@ -424,17 +424,14 @@ Status Workers::getRouteHint(RouteHint &hint, SegmentID segment_id,
     if (hint.segment->type != SegmentType::Memory)
         return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
-    auto &matrix = hint.topo->getResolvedMatrix();
-    if (!matrix.count(hint.buffer->location)) {
-        hint.topo_entry = &matrix.at(kWildcardLocation);
-    } else {
-        hint.topo_entry = &matrix.at(hint.buffer->location);
-    }
+    auto mem_id = hint.topo->getMemId(hint.buffer->location);
+    if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
+    hint.topo_entry = hint.topo->getMemEntry(mem_id);
     return Status::OK();
 }
 
 int Workers::getDeviceRank(const RouteHint &hint, int device_id) {
-    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         auto &list = hint.topo_entry->device_list[rank];
         for (auto &entry : list)
             if (entry == device_id) return rank;
@@ -460,7 +457,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
     if (!same_machine && slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
-        for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             auto &list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
             auto it = std::find(list.begin(), list.end(), mapped_dev_id);
@@ -486,7 +483,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
 }
 
 int Workers::getDeviceByFlatIndex(const RouteHint &hint, size_t flat_idx) {
-    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         auto &list = hint.topo_entry->device_list[rank];
         if (flat_idx < list.size()) return list[flat_idx];
         flat_idx -= list.size();
@@ -500,11 +497,11 @@ Status Workers::selectFallbackDevice(RouteHint &source, RouteHint &target,
         (source.segment->machine_id == target.segment->machine_id);
 
     size_t src_total = 0;
-    for (size_t srank = 0; srank < DevicePriorityRanks; ++srank)
+    for (size_t srank = 0; srank < Topology::DevicePriorityRanks; ++srank)
         src_total += source.topo_entry->device_list[srank].size();
 
     size_t dst_total = 0;
-    for (size_t trank = 0; trank < DevicePriorityRanks; ++trank)
+    for (size_t trank = 0; trank < Topology::DevicePriorityRanks; ++trank)
         dst_total += target.topo_entry->device_list[trank].size();
 
     size_t total_combos = src_total * dst_total;

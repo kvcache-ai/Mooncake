@@ -38,13 +38,6 @@ static inline std::string getItem(const Json::Value &parent,
     return (data == kEmpty) ? "" : data.asString();
 }
 
-static inline std::string getStyledJsonString(const Json::Value &parent,
-                                              const std::string &key) {
-    const static Json::Value kEmpty;
-    auto data = parent.get(key, kEmpty);
-    return (data == kEmpty) ? "" : data.toStyledString();
-}
-
 static inline uint64_t getItemUInt64(const Json::Value &parent,
                                      const std::string &key) {
     const static Json::Value kEmpty;
@@ -92,7 +85,7 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
                 buffersJSON.append(bufferJSON);
             }
             if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
-            segmentJSON["topology"] = detail.topology.toJson();
+            segmentJSON["topology"] = detail.topology.toString();
             segmentJSON["rpc_server_addr"] = detail.rpc_server_addr;
         } else if (desc.type == SegmentType::File) {
             segmentJSON["type"] = "file";
@@ -159,7 +152,7 @@ static std::shared_ptr<SegmentDesc> importSegmentDesc(
                     detail.buffers.push_back(buffer);
                 }
 
-            auto topo_string = getStyledJsonString(segmentJSON, "topology");
+            auto topo_string = getItem(segmentJSON, "topology");
             if (!topo_string.empty()) detail.topology.parse(topo_string);
             detail.rpc_server_addr = getItem(segmentJSON, "rpc_server_addr");
         } else if (type_str == "file") {

@@ -92,7 +92,7 @@ static Json::Value exportSegmentDesc(const SegmentDesc &desc) {
                 buffersJSON.append(bufferJSON);
             }
             if (!detail.buffers.empty()) segmentJSON["buffers"] = buffersJSON;
-            segmentJSON["topology"] = detail.topology.toJson();
+            segmentJSON["topology"] = detail.topology.toString();
             segmentJSON["rpc_server_addr"] = detail.rpc_server_addr;
         } else if (desc.type == SegmentType::File) {
             segmentJSON["type"] = "file";

@@ -23,11 +23,12 @@ namespace v1 {
 Status DeviceQuota::loadTopology(std::shared_ptr<Topology> &local_topology) {
     local_topology_ = local_topology;
     std::unordered_set<int> used_numa_id;
-    for (size_t dev_id = 0; dev_id < local_topology->getNicList().size();
-         ++dev_id) {
+    for (size_t dev_id = 0; dev_id < local_topology->getNicCount(); ++dev_id) {
+        auto entry = local_topology->getNicEntry(dev_id);
+        if (entry->type != Topology::NIC_RDMA) continue;
         devices_[dev_id].dev_id = dev_id;
-        devices_[dev_id].bw_gbps = local_topology->getNicBandwidth(dev_id);
-        devices_[dev_id].numa_id = local_topology->getNicNumaID(dev_id);
+        devices_[dev_id].bw_gbps = 200;  // entry->bw_gbps
+        devices_[dev_id].numa_id = entry->numa_node;
         devices_[dev_id].local_quota = UINT64_MAX;
         used_numa_id.insert(devices_[dev_id].numa_id);
     }
@@ -44,11 +45,9 @@ Status DeviceQuota::enableSharedQuota(const std::string &shm_name) {
 
 Status DeviceQuota::allocate(uint64_t length, const std::string &location,
                              int &chosen_dev_id) {
-    auto it_loc = local_topology_->getResolvedMatrix().find(location);
-    if (it_loc == local_topology_->getResolvedMatrix().end())
-        return Status::InvalidArgument("Unknown location: " + location);
+    auto entry = local_topology_->getMemEntry(location);
+    if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
 
-    const ResolvedTopologyEntry &entry = it_loc->second;
     static constexpr double penalty[] = {1.0, 10.0, 10.0};
     std::unordered_map<int, double> score_map;
 
@@ -66,10 +65,11 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
         max_latency = 1.0;
     }
 
-    for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
-        for (int dev_id : entry.device_list[rank]) {
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        for (int dev_id : entry->device_list[rank]) {
+            if (!devices_.count(dev_id)) continue;
             auto &device = devices_[dev_id];
-            if (!allow_cross_numa_ && device.numa_id != entry.numa_node)
+            if (!allow_cross_numa_ && device.numa_id != entry->numa_node)
                 continue;
             if (shared_quota_ && device.local_quota <= 0) {
                 const uint64_t acquire_size =
@@ -97,9 +97,11 @@ Status DeviceQuota::allocate(uint64_t length, const std::string &location,
     }
 
     if (score_map.empty()) {
-        const int num_devices = (int)local_topology_->getNicList().size();
+        const int num_devices = (int)local_topology_->getNicCount();
         for (int dev_id = 0; dev_id < num_devices; ++dev_id) {
-            if (devices_[dev_id].bw_gbps) {
+            if (local_topology_->getNicEntry(dev_id)->type ==
+                    Topology::NIC_RDMA &&
+                devices_[dev_id].bw_gbps > 0) {
                 score_map[dev_id] = 1.0;
                 break;
             }

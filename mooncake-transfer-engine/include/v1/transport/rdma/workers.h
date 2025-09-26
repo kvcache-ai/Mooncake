@@ -72,7 +72,7 @@ class Workers {
     struct RouteHint {
         SegmentDesc *segment;
         BufferDesc *buffer;
-        const ResolvedTopologyEntry *topo_entry;
+        const Topology::MemEntry *topo_entry;
         const Topology *topo;
     };
 

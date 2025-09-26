@@ -16,12 +16,10 @@
 #define TOPOLOGY_H
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -30,50 +28,33 @@
 
 #include "v1/common/config.h"
 #include "v1/common/status.h"
-
 namespace mooncake {
 namespace v1 {
-const static size_t DevicePriorityRanks = 3;
-
-struct TopologyEntry {
-    std::string name;
-    int numa_node = 0;
-    std::vector<std::string> device_list[DevicePriorityRanks];
-
-    Json::Value toJson() const {
-        Json::Value jout;
-        Json::Value jdevice(Json::arrayValue);
-        for (size_t rank = 0; rank < DevicePriorityRanks; ++rank) {
-            Json::Value jlist(Json::arrayValue);
-            for (auto &device : device_list[rank]) jlist.append(device);
-            jdevice.append(jlist);
-        }
-        jout["numa_node"] = numa_node;
-        jout["devices"] = jdevice;
-        return jout;
-    }
-};
-
-using TopologyMatrix =
-    std::unordered_map<std::string /* storage type */, TopologyEntry>;
-
-struct ResolvedTopologyEntry {
-    int numa_node;
-    std::vector<int> device_list[DevicePriorityRanks];
-};
-
-using ResolvedTopologyMatrix =
-    std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>;
-
-// What we need from Topology
-// - NIC List (RDMA/Eth/...) -> rdma:X, tcp:X, ...
-// - GPU List (CUDA/ROCM/...) -> cuda:Y, rocm:Y, ...
-// - CPU List -> cpu:Z
-// - Topology Matrix (Storage Type -> {[Tier 1], [Tier 2], [Tier 3]})
-//     where: storage type = cuda:0|rocm:0|cpu:0
-//            tier N = [rdma:0, rdma:1, ...] or [tcp:0, tcp:1, ...]
-
+class Platform;
 class Topology {
+   public:
+    const static size_t DevicePriorityRanks = 3;
+
+    enum NicType { NIC_RDMA, NIC_TCP, NIC_UNKNOWN };
+    enum MemType { MEM_HOST, MEM_CUDA, MEM_ROCM, MEM_ASCEND, MEM_UNKNOWN };
+
+    using NicID = int;
+    struct NicEntry {
+        std::string name;
+        std::string pci_bus_id;
+        NicType type;
+        int numa_node;
+    };
+
+    using MemID = int;
+    struct MemEntry {
+        std::string name;
+        std::string pci_bus_id;
+        MemType type;
+        int numa_node;
+        std::vector<NicID> device_list[DevicePriorityRanks];
+    };
+
    public:
     Topology();
 
@@ -83,65 +64,38 @@ class Topology {
 
     void clear();
 
-    Status discover(std::shared_ptr<ConfigManager> conf = nullptr);
+    Status discover(const std::vector<Platform *> &platforms);
 
-    Status parse(const std::string &content);
-
-    Status disableNic(const std::string &nic_name);
+    Status parse(const std::string &json_content);
 
     std::string toString() const;
 
-    Json::Value toJson() const;
-
     void print() const;
 
-    const TopologyMatrix &getMatrix() const { return matrix_; }
+    size_t getNicCount(NicType type = NIC_UNKNOWN) const;
 
-    const std::vector<std::string> &getNicList() const {
-        return rdma_device_list_;
-    }
+    size_t getMemCount(MemType type = MEM_UNKNOWN) const;
 
-    std::string getNicName(int device_id) const {
-        if (device_id < 0 || device_id >= (int)rdma_device_list_.size())
-            return "";
-        return rdma_device_list_[device_id];
-    }
+    const NicEntry *getNicEntry(NicID id) const;
 
-    int getNicID(const std::string &name) const {
-        int index = 0;
-        for (auto &entry : rdma_device_list_)
-            if (entry == name)
-                return index;
-            else
-                index++;
-        return -1;
-    }
+    const MemEntry *getMemEntry(MemID id) const;
 
-    int getNicNumaID(int dev_id) const;
+    const NicEntry *getNicEntry(const std::string &name) const;
 
-    double getNicBandwidth(int dev_id) const { return 200; /* dummy */ }
+    const MemEntry *getMemEntry(const std::string &name) const;
 
-    const ResolvedTopologyMatrix &getResolvedMatrix() const {
-        return resolved_matrix_;
-    }
+    NicID getNicId(const std::string &name) const;
 
-    int getNpuCount() const;
+    MemID getMemId(const std::string &name) const;
 
-    int findNicByNpu(int npu_id) const;
+    std::string getNicName(NicID id) const;
 
-    int findNpuByNic(int nic_id) const;
+    NicType getNicType(NicID id) const;
 
-   private:
-    Status resolve();
-
-   private:
-    TopologyMatrix matrix_;
-    std::vector<std::string> rdma_device_list_;
-    ResolvedTopologyMatrix resolved_matrix_;
-    std::map<int, int> cuda_to_rdma_dev_map_;
+   public:
+    std::vector<NicEntry> nic_list_;
+    std::vector<MemEntry> mem_list_;
 };
-
-int getCudaDeviceNumaID(int cuda_id);
 
 }  // namespace v1
 }  // namespace mooncake

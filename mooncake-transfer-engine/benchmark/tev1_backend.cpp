@@ -150,6 +150,8 @@ static int parseIndex(const std::string &loc) {
     return std::stoi(loc.substr(pos + 1));
 }
 
+int getCudaDeviceNumaID(int cuda_id);
+
 void TEv1BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];

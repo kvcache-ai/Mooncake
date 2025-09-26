@@ -14,6 +14,8 @@
 
 #include "v1/transport/rdma/rail_monitor.h"
 
+#include <jsoncpp/json/json.h>
+
 namespace mooncake {
 namespace v1 {
 
@@ -124,9 +126,14 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
             for (const auto &entry : root["all"]) {
                 if (!entry.isMember("local") || !entry.isMember("remote"))
                     continue;
-                int local_nic = local_->getNicID(entry["local"].asString());
-                int remote_nic = remote_->getNicID(entry["remote"].asString());
-                rail_states_[{local_nic, remote_nic}] = RailState{};
+                int local_nic = local_->getNicId(entry["local"].asString());
+                int remote_nic = remote_->getNicId(entry["remote"].asString());
+                if (local_nic < 0 || remote_nic < 0) {
+                    LOG(WARNING) << "Ignore path " << entry["local"].asString()
+                                 << "->" << entry["remote"].asString();
+                } else {
+                    rail_states_[{local_nic, remote_nic}] = RailState{};
+                }
             }
         }
 
@@ -134,9 +141,14 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
             for (const auto &entry : root["direct"]) {
                 if (!entry.isMember("local") || !entry.isMember("remote"))
                     continue;
-                int local_nic = local_->getNicID(entry["local"].asString());
-                int remote_nic = remote_->getNicID(entry["remote"].asString());
-                direct_rails_[local_nic] = remote_nic;
+                int local_nic = local_->getNicId(entry["local"].asString());
+                int remote_nic = remote_->getNicId(entry["remote"].asString());
+                if (local_nic < 0 || remote_nic < 0) {
+                    LOG(WARNING) << "Ignore path " << entry["local"].asString()
+                                 << "->" << entry["remote"].asString();
+                } else {
+                    direct_rails_[local_nic] = remote_nic;
+                }
             }
         }
     } catch (const std::exception &e) {
@@ -149,23 +161,44 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
     return Status::OK();
 }
 
+static int matchRemoteNicId(const Topology *local, const Topology *remote,
+                            int local_nic) {
+    std::string mem_name;
+    for (size_t i = 0; i < local->getMemCount(); ++i) {
+        auto entry = local->getMemEntry(i);
+        auto &prior_devices = entry->device_list[0];
+        if (entry->type == Topology::MEM_CUDA && !prior_devices.empty() &&
+            prior_devices[0] == local_nic) {
+            mem_name = entry->name;
+            break;
+        }
+    }
+    if (mem_name.empty()) return -1;
+    auto mem_id = remote->getMemId(mem_name);
+    if (mem_id < 0) return -1;
+    auto entry = remote->getMemEntry(mem_id);
+    auto &prior_devices = entry->device_list[0];
+    if (entry->type == Topology::MEM_CUDA && !prior_devices.empty())
+        return prior_devices[0];
+    return -1;
+}
+
 Status RailMonitor::loadDefault() {
-    const int local_count = static_cast<int>(local_->getNicList().size());
-    const int remote_count = static_cast<int>(remote_->getNicList().size());
     rail_states_.clear();
     direct_rails_.clear();
-    std::vector<int> remote_load(remote_count, 0);
-
-    for (int local_nic = 0; local_nic < local_count; ++local_nic) {
-        for (int remote_nic = 0; remote_nic < remote_count; ++remote_nic) {
+    int local_nic_count = (int)local_->getNicCount();
+    int remote_nic_count = (int)remote_->getNicCount();
+    std::vector<int> remote_load(remote_nic_count, 0);
+    for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
+        for (int remote_nic = 0; remote_nic < remote_nic_count; ++remote_nic) {
             rail_states_[{local_nic, remote_nic}] = RailState{};
         }
     }
-    for (int local_nic = 0; local_nic < local_count; ++local_nic) {
-        int numa_id = local_->getNicNumaID(local_nic);
-        int npu_id = local_->findNpuByNic(local_nic);
-        int remote_nic = remote_->findNicByNpu(npu_id);
-
+    for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
+        auto local_entry = local_->getNicEntry(local_nic);
+        if (local_entry->type != Topology::NIC_RDMA) continue;
+        int numa_id = local_entry->numa_node;
+        int remote_nic = matchRemoteNicId(local_, remote_, local_nic);
         if (remote_nic >= 0) {
             remote_load[remote_nic]++;
             direct_rails_[local_nic] = remote_nic;
@@ -174,8 +207,11 @@ Status RailMonitor::loadDefault() {
 
         int best_nic = -1;
         int best_nic_load = INT32_MAX;
-        for (int cand = 0; cand < remote_count; ++cand) {
-            if (numa_id != remote_->getNicNumaID(cand)) continue;
+        for (int cand = 0; cand < remote_nic_count; ++cand) {
+            auto cand_entry = remote_->getNicEntry(cand);
+            if (!cand_entry || cand_entry->type != Topology::NIC_RDMA ||
+                numa_id != cand_entry->numa_node)
+                continue;
             if (remote_load[cand] < best_nic_load) {
                 best_nic_load = remote_load[cand];
                 best_nic = cand;
@@ -187,7 +223,9 @@ Status RailMonitor::loadDefault() {
             continue;
         }
 
-        for (int cand = 0; cand < remote_count; ++cand) {
+        for (int cand = 0; cand < remote_nic_count; ++cand) {
+            auto cand_entry = remote_->getNicEntry(cand);
+            if (!cand_entry || cand_entry->type != Topology::NIC_RDMA) continue;
             if (remote_load[cand] < best_nic_load) {
                 best_nic_load = remote_load[cand];
                 best_nic = cand;
@@ -206,21 +244,28 @@ void RailMonitor::updateBestMapping() {
     for (size_t i = 0; i < kMaxNuma; ++i) best_mapping_[i].clear();
     std::vector<int> local_devices[kMaxNuma], remote_devices[kMaxNuma];
     std::unordered_set<int> remote_nic_set;
-    const int local_nic_count = (int)local_->getNicList().size();
-    const int remote_nic_count = (int)remote_->getNicList().size();
+    const int local_nic_count = (int)local_->getNicCount();
+    const int remote_nic_count = (int)remote_->getNicCount();
     for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
-        local_devices[local_->getNicNumaID(local_nic)].push_back(local_nic);
+        auto local_entry = local_->getNicEntry(local_nic);
+        if (!local_entry || local_entry->type != Topology::NIC_RDMA) continue;
+        local_devices[local_entry->numa_node].push_back(local_nic);
         auto remote_nic = direct_rails_[local_nic];
         if (!remote_nic_set.count(remote_nic)) {
-            remote_devices[remote_->getNicNumaID(remote_nic)].push_back(
-                remote_nic);
+            auto remote_entry = remote_->getNicEntry(remote_nic);
+            if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
+                continue;
+            remote_devices[remote_entry->numa_node].push_back(remote_nic);
             remote_nic_set.insert(remote_nic);
         }
     }
     for (int remote_nic = 0; remote_nic < remote_nic_count; ++remote_nic) {
-        if (!remote_nic_set.count(remote_nic))
-            remote_devices[remote_->getNicNumaID(remote_nic)].push_back(
-                remote_nic);
+        if (!remote_nic_set.count(remote_nic)) {
+            auto remote_entry = remote_->getNicEntry(remote_nic);
+            if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
+                continue;
+            remote_devices[remote_entry->numa_node].push_back(remote_nic);
+        }
     }
 
     for (size_t local_numa = 0; local_numa < kMaxNuma; ++local_numa) {

@@ -86,7 +86,7 @@ class LocalBufferManager {
 
     void setTopology(std::shared_ptr<Topology> &topology) {
         topology_ = topology;
-        context_list_.resize(topology->getNicList().size(), nullptr);
+        context_list_.resize(topology->getNicCount(), nullptr);
     }
 
     Status addBuffer(BufferDesc &desc, const MemoryOptions &options);
@@ -98,8 +98,6 @@ class LocalBufferManager {
     Status removeDevice(RdmaContext *context, bool do_unreg = true);
 
     Status clear();
-
-    const std::string deviceName(int id);
 
    private:
     struct BufferEntryForRdma {
@@ -113,10 +111,6 @@ class LocalBufferManager {
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;
 };
-
-Status queryRemoteSegment(SegmentDesc *desc, const AddressRange &range,
-                          std::vector<BufferQueryResult> &result,
-                          int retry_count = 0);
 
 }  // namespace v1
 }  // namespace mooncake

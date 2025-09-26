@@ -19,6 +19,7 @@
 
 #include "v1/common/status.h"
 #include "v1/platform/location.h"
+#include "v1/platform/cuda.h"
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment.h"
 #include "v1/runtime/segment_tracker.h"
@@ -138,7 +139,8 @@ Status TransferEngine::construct() {
         CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
     topology_ = std::make_shared<Topology>();
-    CHECK_STATUS(topology_->discover(conf_));
+    auto loader = std::make_shared<CudaPlatform>(conf_);
+    CHECK_STATUS(topology_->discover({loader.get()}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers);
@@ -153,7 +155,7 @@ Status TransferEngine::construct() {
     CHECK_STATUS(setupLocalSegment());
 
     if (conf_->get("transports/rdma/enable", true) &&
-        !topology_->getNicList().empty()) {
+        topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_unique<RdmaTransport>();
     }
 

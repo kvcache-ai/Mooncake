@@ -76,27 +76,19 @@ Status LocalBufferManager::removeBuffer(BufferDesc &desc) {
 Status LocalBufferManager::addDevice(RdmaContext *context) {
     RWSpinlock::WriteGuard guard(lock_);
     assert(topology_ && context);
-    int index = 0;
-    bool found = false;
-    for (auto &device : topology_->getNicList()) {
-        if (device == context->name()) {
-            if (context_list_[index]) {
-                LOG(WARNING) << "Device " << context->name()
-                             << " already exists in the local segment";
-            }
-            context_list_[index] = context;
-            found = true;
-            break;
-        } else {
-            index++;
-        }
-    }
-    if (!found) {
+    int index = topology_->getNicId(context->name());
+    if (index < 0) {
         LOG(ERROR) << "Device " << context->name()
                    << " not found in the local segment";
         return Status::DeviceNotFound(
             "Device not found in the local segment" LOC_MARK);
     }
+
+    if (context_list_[index]) {
+        LOG(WARNING) << "Device " << context->name()
+                     << " already exists in the local segment";
+    }
+    context_list_[index] = context;
     for (auto &buffer : buffer_list_) {
         auto range = buffer.first;
         auto &options = buffer.second.options;
@@ -136,12 +128,6 @@ Status LocalBufferManager::clear() {
     buffer_list_.clear();
     context_list_.clear();
     return Status::OK();
-}
-
-const std::string LocalBufferManager::deviceName(int id) {
-    RWSpinlock::ReadGuard guard(lock_);
-    assert(id >= 0 && id < (int)context_list_.size());
-    return context_list_[id] ? context_list_[id]->name() : "unknown";
 }
 
 }  // namespace v1
