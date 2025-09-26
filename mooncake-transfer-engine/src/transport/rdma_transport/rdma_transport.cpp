@@ -19,7 +19,6 @@
 #include <sys/time.h>
 
 #include <cassert>
-#include <chrono>
 #include <cstddef>
 #include <future>
 #include <set>
@@ -95,24 +94,25 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
     auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
-    }   
+    }
     size_t block_size = length / num_threads;
     if (block_size == 0) {
         return 0;
     }
-    
+
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     std::vector<int> thread_results(num_threads, 0);
-    
+
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
-        void *block_addr = static_cast<char*>(addr) + thread_i * block_size;   
-        threads.emplace_back([this, thread_i, block_addr, block_size, &thread_results]() { 
+        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        threads.emplace_back([this, thread_i, block_addr, block_size,
+                              &thread_results]() {
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
     }
-    
+
     for (auto &thread : threads) {
         thread.join();
     }
@@ -136,11 +136,11 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
 
-    bool do_pre_touch =
-        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
-        length >= (size_t)4 * 1024 * 1024 * 1024;
+    bool do_pre_touch = context_list_.size() > 0 &&
+                        std::thread::hardware_concurrency() >= 4 &&
+                        length >= (size_t)4 * 1024 * 1024 * 1024;
     if (do_pre_touch) {
-        // Parallell Pre-touch the memory to speedup the registration process.
+        // Parallel Pre-touch the memory to speedup the registration process.
         int ret = preTouchMemory(addr, length);
         if (ret != 0) {
             return ret;

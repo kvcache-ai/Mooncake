@@ -198,7 +198,9 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length, int access, MemoryRegionMeta &mrMeta) {
+int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
+                                              int access,
+                                              MemoryRegionMeta &mrMeta) {
     if (length > (size_t)globalConfig().max_mr_size) {
         PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
                       << "shrink it to " << globalConfig().max_mr_size;
@@ -282,7 +284,8 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
     MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE, mrMeta);
+    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
+                                           mrMeta);
     if (ret != 0) {
         return ret;
     }

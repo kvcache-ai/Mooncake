@@ -94,7 +94,8 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     // not page aligned
     void *start = (void *)((uint64_t)addr + 1024 * 2);
 
-    auto entries = mooncake::getMemoryLocation(start, size - 1024 * 4, only_first_page);
+    auto entries =
+        mooncake::getMemoryLocation(start, size - 1024 * 4, only_first_page);
 
     if (nodea == nodeb) {
         // only one numa node

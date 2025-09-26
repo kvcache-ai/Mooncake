@@ -80,7 +80,8 @@ class RdmaContext {
     uint32_t lkey(void *addr);
 
    private:
-    int registerMemoryRegionInternal(void *addr, size_t length, int access, MemoryRegionMeta &mrMeta);
+    int registerMemoryRegionInternal(void *addr, size_t length, int access,
+                                     MemoryRegionMeta &mrMeta);
 
    public:
     bool active() const { return active_; }

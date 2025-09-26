@@ -222,7 +222,6 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
         } else {
