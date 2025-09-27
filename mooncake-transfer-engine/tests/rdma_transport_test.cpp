@@ -42,6 +42,15 @@
 #include <cufile.h>
 #endif
 
+#endif
+
+#ifdef USE_MUSA
+#include <bits/stdint-uintn.h>
+#include <musa_porting.h>
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+
 #include <cassert>
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -72,16 +81,24 @@ DEFINE_string(nic_priority_matrix, "",
 
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
 using namespace mooncake;
 
+#ifdef USE_CUDA
+const static std::string GPU_PREFIX = "cuda:";
+#endif
+
+#ifdef USE_MUSA
+const static std::string GPU_PREFIX = "musa:";
+#endif
+
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -95,7 +112,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -227,6 +244,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"musa:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -257,9 +277,9 @@ int initiator() {
     LOG_ASSERT(xport);
 
     void *addr = nullptr;
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
-    std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+    std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
     int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
     int rc = engine->registerLocalMemory(
         addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
