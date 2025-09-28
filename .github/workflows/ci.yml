@@ -223,10 +223,10 @@ jobs:
       run: ${SCCACHE_PATH} --show-stats
 
     - name: Install dependencies
-      shell: bash
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+      shell: bash
 
 
     - name: Build transfer engine only
