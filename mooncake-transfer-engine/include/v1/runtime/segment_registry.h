@@ -16,7 +16,6 @@
 #define SEGMENT_REGISTRY_H
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>

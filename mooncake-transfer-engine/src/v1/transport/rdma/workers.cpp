@@ -416,7 +416,7 @@ Status Workers::getRouteHint(RouteHint &hint, SegmentID segment_id,
     } else {
         CHECK_STATUS(segment_manager.getRemoteCached(hint.segment, segment_id));
     }
-    hint.buffer = getBufferDesc(hint.segment, addr, length);
+    hint.buffer = hint.segment->findBuffer(addr, length);
     if (!hint.buffer) {
         return Status::AddressNotRegistered(
             "No matched buffer in given address range" LOC_MARK);

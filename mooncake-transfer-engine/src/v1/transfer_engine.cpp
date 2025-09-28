@@ -19,7 +19,13 @@
 
 #include "v1/common/status.h"
 #include "v1/platform/location.h"
+
+#ifdef USE_CUDA
 #include "v1/platform/cuda.h"
+#else
+#include "v1/platform/cpu.h"
+#endif
+
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment.h"
 #include "v1/runtime/segment_tracker.h"
@@ -139,8 +145,12 @@ Status TransferEngine::construct() {
         CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
     topology_ = std::make_shared<Topology>();
-    auto loader = std::make_shared<CudaPlatform>(conf_);
-    CHECK_STATUS(topology_->discover({loader.get()}));
+#ifdef USE_CUDA
+    loader_ = std::make_shared<CudaPlatform>(conf_);
+#else
+    loader_ = std::make_shared<CpuPlatform>(conf_);
+#endif
+    CHECK_STATUS(topology_->discover({loader_.get()}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers);
@@ -496,7 +506,7 @@ TransportType TransferEngine::getTransportType(const Request &request,
         }
         return UNSPEC;
     } else {
-        auto entry = getBufferDesc(desc, request.target_offset, request.length);
+        auto entry = desc->findBuffer(request.target_offset, request.length);
         bool same_machine =
             (desc->machine_id ==
              metadata_->segmentManager().getLocal()->machine_id);

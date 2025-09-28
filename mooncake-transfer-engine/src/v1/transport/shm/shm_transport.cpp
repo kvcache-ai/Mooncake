@@ -260,7 +260,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
 
-    auto buffer = getBufferDesc(desc, dest_addr, length);
+    auto buffer = desc->findBuffer(dest_addr, length);
     if (!buffer || buffer->shm_path.empty())
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);

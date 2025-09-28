@@ -16,7 +16,6 @@
 #define TRANSFER_METADATA_V1_H
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>
@@ -33,6 +32,7 @@
 #include "v1/runtime/segment_manager.h"
 #include "v1/rpc/rpc.h"
 #include "v1/runtime/topology.h"
+#include "v1/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace v1 {
@@ -41,6 +41,10 @@ struct BootstrapDesc {
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
     std::string reply_msg;  // on error
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
+                                   qp_num, reply_msg);
 };
 
 struct XferDataDesc {

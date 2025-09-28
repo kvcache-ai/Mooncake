@@ -14,8 +14,6 @@
 
 #include "v1/transport/rdma/rail_monitor.h"
 
-#include <jsoncpp/json/json.h>
-
 namespace mooncake {
 namespace v1 {
 
@@ -111,48 +109,45 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
  * }
  */
 Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
-    Json::CharReaderBuilder builder;
-    Json::Value root;
-    std::string errs;
-    std::istringstream iss(rail_topo_json);
-    if (!Json::parseFromStream(builder, iss, &root, &errs)) {
-        LOG(ERROR) << "Failed to parse JSON data: " << errs;
-        return Status::InvalidArgument("Failed to parse JSON" LOC_MARK);
-    }
-
     try {
+        auto root = json::parse(rail_topo_json);
+
         rail_states_.clear();
-        if (root.isMember("all")) {
-            for (const auto &entry : root["all"]) {
-                if (!entry.isMember("local") || !entry.isMember("remote"))
-                    continue;
-                int local_nic = local_->getNicId(entry["local"].asString());
-                int remote_nic = remote_->getNicId(entry["remote"].asString());
-                if (local_nic < 0 || remote_nic < 0) {
-                    LOG(WARNING) << "Ignore path " << entry["local"].asString()
-                                 << "->" << entry["remote"].asString();
+        direct_rails_.clear();
+
+        if (root.contains("all")) {
+            for (const auto &path_entry : root["all"]) {
+                std::string local_nic_name = path_entry.value("local", "");
+                std::string remote_nic_name = path_entry.value("remote", "");
+                int local_nic_id = local_->getNicId(local_nic_name);
+                int remote_nic_id = remote_->getNicId(remote_nic_name);
+
+                if (local_nic_id >= 0 && remote_nic_id >= 0) {
+                    rail_states_[{local_nic_id, remote_nic_id}] = RailState{};
                 } else {
-                    rail_states_[{local_nic, remote_nic}] = RailState{};
+                    LOG(WARNING) << "Ignore invalid path " << local_nic_name
+                                 << " -> " << remote_nic_name;
                 }
             }
         }
 
-        if (root.isMember("direct")) {
-            for (const auto &entry : root["direct"]) {
-                if (!entry.isMember("local") || !entry.isMember("remote"))
-                    continue;
-                int local_nic = local_->getNicId(entry["local"].asString());
-                int remote_nic = remote_->getNicId(entry["remote"].asString());
-                if (local_nic < 0 || remote_nic < 0) {
-                    LOG(WARNING) << "Ignore path " << entry["local"].asString()
-                                 << "->" << entry["remote"].asString();
+        if (root.contains("direct")) {
+            for (const auto &path_entry : root["direct"]) {
+                std::string local_nic_name = path_entry.value("local", "");
+                std::string remote_nic_name = path_entry.value("remote", "");
+                int local_nic_id = local_->getNicId(local_nic_name);
+                int remote_nic_id = remote_->getNicId(remote_nic_name);
+
+                if (local_nic_id >= 0 && remote_nic_id >= 0) {
+                    direct_rails_[local_nic_id] = remote_nic_id;
                 } else {
-                    direct_rails_[local_nic] = remote_nic;
+                    LOG(WARNING) << "Ignore invalid direct path "
+                                 << local_nic_name << " -> " << remote_nic_name;
                 }
             }
         }
-    } catch (const std::exception &e) {
-        LOG(ERROR) << "Failed to parse JSON data: " << e.what();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Failed to parse rail_topo_json: " << ex.what();
         return Status::InvalidArgument("Failed to parse JSON" LOC_MARK);
     }
 

@@ -123,14 +123,14 @@ Status RdmaEndPoint::connect(const std::string &peer_server_name,
         segment_desc = manager.getLocal();
     } else {
         CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
-        auto rpc_server_addr = getRpcServerAddr(segment_desc.get());
+        auto rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
         assert(!rpc_server_addr.empty());
         CHECK_STATUS(
             ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
         qp_num = peer_desc.qp_num;
     }
     assert(qp_num.size() && segment_desc);
-    auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+    auto dev_desc = segment_desc->findDevice(peer_nic_name);
     if (!dev_desc) {
         LOG(ERROR) << "Unable to find RDMA device: " << peer_nic_name
                    << " in segment " << segment_desc->name;
@@ -173,7 +173,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc &peer_desc,
     local_desc.qp_num = qpNum();
     SegmentDescRef segment_desc;
     CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
-    auto dev_desc = getDeviceDesc(segment_desc.get(), peer_nic_name);
+    auto dev_desc = segment_desc->findDevice(peer_nic_name);
     if (!dev_desc) {
         LOG(ERROR) << "Unable to find RDMA device: " << peer_nic_name
                    << " in segment " << segment_desc->name;

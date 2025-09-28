@@ -384,7 +384,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     SegmentDesc *desc = nullptr;
     CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
 
-    auto buffer = getBufferDesc(desc, dest_addr, length);
+    auto buffer = desc->findBuffer(dest_addr, length);
     if (!buffer || buffer->mnnvl_handle.empty())
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);

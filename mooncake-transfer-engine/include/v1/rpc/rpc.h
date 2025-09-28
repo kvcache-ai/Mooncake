@@ -15,8 +15,6 @@
 #ifndef RPC_STUB_H
 #define RPC_STUB_H
 
-#include <jsoncpp/json/json.h>
-
 #include <atomic>
 #include <cstdint>
 #include <functional>

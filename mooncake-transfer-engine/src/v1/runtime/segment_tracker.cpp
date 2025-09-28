@@ -14,8 +14,6 @@
 
 #include "v1/runtime/segment_tracker.h"
 
-#include <jsoncpp/json/value.h>
-
 #include <cassert>
 #include <filesystem>
 #include <set>

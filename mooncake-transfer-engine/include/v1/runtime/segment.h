@@ -16,7 +16,6 @@
 #define SEGMENT_H
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
 #include <netdb.h>
 
 #include <atomic>
@@ -33,87 +32,136 @@
 #include "v1/runtime/metastore.h"
 #include "v1/rpc/rpc.h"
 #include "v1/runtime/topology.h"
+#include "v1/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace v1 {
+using json = nlohmann::json;
 using SegmentID = uint64_t;
 
 struct DeviceDesc {
     std::string name;
     uint16_t lid;
     std::string gid;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DeviceDesc, name, lid, gid);
 };
 
 struct BufferDesc {
     uint64_t addr;
     uint64_t length;
     std::string location;
+    std::vector<TransportType> transports;
+    std::unordered_map<TransportType, std::string> attrs;
+
+    // mutable elements
     std::vector<uint32_t> rkey;
     std::string shm_path;
     std::string mnnvl_handle;
-    std::vector<TransportType> transports;
-
-    int ref_count;
+    int ref_count{0};
     std::vector<uint32_t> lkey;  // not uploaded, available in local only
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
+                                   transports, attrs, rkey, shm_path,
+                                   mnnvl_handle);
 };
 
 struct FileBufferDesc {
     std::string path;
     uint64_t length;
     uint64_t offset;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(FileBufferDesc, path, length, offset);
 };
 
 struct MemorySegmentDesc {
     Topology topology;
-    std::vector<DeviceDesc> devices;
+    std::unordered_map<std::string, std::string> device_attrs;
     std::vector<BufferDesc> buffers;
     std::string rpc_server_addr;
+    std::vector<DeviceDesc> devices;
 };
+
+inline void to_json(json &j, const MemorySegmentDesc &m) {
+    j = json{{"device_attrs", m.device_attrs},
+             {"buffers", m.buffers},
+             {"rpc_server_addr", m.rpc_server_addr},
+             {"devices", m.devices},
+             {"topology", m.topology.toString()}};
+}
+
+inline void from_json(const json &j, MemorySegmentDesc &m) {
+    j.at("device_attrs").get_to(m.device_attrs);
+    j.at("buffers").get_to(m.buffers);
+    j.at("rpc_server_addr").get_to(m.rpc_server_addr);
+    j.at("devices").get_to(m.devices);
+    if (j.contains("topology")) {
+        auto s = j.at("topology").get<std::string>();
+        m.topology.parse(s);
+    }
+}
 
 struct FileSegmentDesc {
     std::vector<FileBufferDesc> buffers;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(FileSegmentDesc, buffers);
 };
 
 enum class SegmentType { Memory, File };
+
+inline void to_json(json &j, const SegmentType &t) {
+    j = (t == SegmentType::Memory ? "memory" : "file");
+}
+
+inline void from_json(const json &j, SegmentType &t) {
+    auto s = j.get<std::string>();
+    if (s == "memory")
+        t = SegmentType::Memory;
+    else if (s == "file")
+        t = SegmentType::File;
+    else
+        throw std::runtime_error("unknown segment type: " + s);
+}
 
 struct SegmentDesc {
     std::string name;
     SegmentType type;
     std::string machine_id;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
+
+   public:
+    BufferDesc *findBuffer(uint64_t base, uint64_t length);
+    DeviceDesc *findDevice(const std::string &name);
+    const MemorySegmentDesc &getMemory() const {
+        return std::get<MemorySegmentDesc>(detail);
+    }
 };
 
+inline void to_json(json &j, const SegmentDesc &s) {
+    j = json{{"name", s.name}, {"type", s.type}, {"machine_id", s.machine_id}};
+    if (s.type == SegmentType::Memory) {
+        j["detail"] = std::get<MemorySegmentDesc>(s.detail);
+    } else {
+        j["detail"] = std::get<FileSegmentDesc>(s.detail);
+    }
+}
+
+inline void from_json(const json &j, SegmentDesc &s) {
+    j.at("name").get_to(s.name);
+    j.at("type").get_to(s.type);
+    j.at("machine_id").get_to(s.machine_id);
+    if (s.type == SegmentType::Memory) {
+        s.detail = j.at("detail").get<MemorySegmentDesc>();
+    } else {
+        s.detail = j.at("detail").get<FileSegmentDesc>();
+    }
+}
+
 using SegmentDescRef = std::shared_ptr<SegmentDesc>;
-
-static inline BufferDesc *getBufferDesc(SegmentDesc *desc, uint64_t base,
-                                        uint64_t length) {
-    if (desc->type != SegmentType::Memory) return nullptr;
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (auto &entry : detail.buffers) {
-        if (entry.addr <= base && base + length <= entry.addr + entry.length) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
-
-static inline std::string getRpcServerAddr(SegmentDesc *desc) {
-    if (desc->type != SegmentType::Memory) return "";
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    return detail.rpc_server_addr;
-}
-
-static inline DeviceDesc *getDeviceDesc(SegmentDesc *desc,
-                                        const std::string &device_name) {
-    if (desc->type != SegmentType::Memory) return nullptr;
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    for (auto &entry : detail.devices) {
-        if (entry.name == device_name) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
 
 }  // namespace v1
 }  // namespace mooncake

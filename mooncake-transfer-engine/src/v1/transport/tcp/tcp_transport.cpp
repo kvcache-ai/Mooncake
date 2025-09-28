@@ -132,13 +132,13 @@ void TcpTransport::startTransfer(TcpTask *task) {
         return;
     }
     if (task->request.opcode == Request::WRITE) {
-        status =
-            ControlClient::sendData(rpc_server_addr, task->request.target_offset,
-                                task->request.source, task->request.length);
+        status = ControlClient::sendData(
+            rpc_server_addr, task->request.target_offset, task->request.source,
+            task->request.length);
     } else {
-        status =
-            ControlClient::recvData(rpc_server_addr, task->request.target_offset,
-                                task->request.source, task->request.length);
+        status = ControlClient::recvData(
+            rpc_server_addr, task->request.target_offset, task->request.source,
+            task->request.length);
     }
     if (!status.ok()) {
         task->status_word = TransferStatusEnum::FAILED;
@@ -154,8 +154,8 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
     SegmentDesc *desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
-    auto buffer = getBufferDesc(desc, dest_addr, length);
-    rpc_server_addr = getRpcServerAddr(desc);
+    auto buffer = desc->findBuffer(dest_addr, length);
+    rpc_server_addr = desc->getMemory().rpc_server_addr;
     if (!buffer || rpc_server_addr.empty())
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);
@@ -168,7 +168,7 @@ Status TcpTransport::sendNotification(SegmentID target_id,
     SegmentDesc *desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
-    rpc_server_addr = getRpcServerAddr(desc);
+    rpc_server_addr = desc->getMemory().rpc_server_addr;
     if (rpc_server_addr.empty())
         return Status::InvalidArgument("Requested segment type error" LOC_MARK);
     return ControlClient::notify(rpc_server_addr, message);
