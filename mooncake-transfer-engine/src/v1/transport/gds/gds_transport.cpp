@@ -249,8 +249,8 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
-    auto location = parseLocation(options.location);
-    if (location.first != "cuda") return Status::OK();
+    LocationParser location(options.location);
+    if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void *)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
@@ -261,8 +261,8 @@ Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
 }
 
 Status GdsTransport::removeMemoryBuffer(BufferDesc &desc) {
-    auto location = parseLocation(desc.location);
-    if (location.first != "cuda") return Status::OK();
+    LocationParser location(desc.location);
+    if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufDeregister((void *)desc.addr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(

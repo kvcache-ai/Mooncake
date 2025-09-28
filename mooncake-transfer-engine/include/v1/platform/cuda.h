@@ -29,6 +29,15 @@ class CudaPlatform : public Platform {
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list);
 
+    virtual Status allocate(void **pptr, size_t size, MemoryOptions &options);
+
+    virtual Status free(void *ptr, size_t size);
+
+    virtual Status copy(void *dst, void *src, size_t length);
+
+    virtual const std::vector<MemoryLocationEntry> getLocation(void *start,
+                                                               size_t len);
+
    private:
     std::shared_ptr<ConfigManager> conf;
 };

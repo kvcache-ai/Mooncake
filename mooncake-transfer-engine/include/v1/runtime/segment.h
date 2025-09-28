@@ -41,11 +41,14 @@ using SegmentID = uint64_t;
 
 struct DeviceDesc {
     std::string name;
+    std::unordered_map<TransportType, std::string> transport_attrs;
+
+    // backward compatilble
     uint16_t lid;
     std::string gid;
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DeviceDesc, name, lid, gid);
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DeviceDesc, name, lid, gid, transport_attrs);
 };
 
 struct BufferDesc {
@@ -53,18 +56,19 @@ struct BufferDesc {
     uint64_t length;
     std::string location;
     std::vector<TransportType> transports;
-    std::unordered_map<TransportType, std::string> attrs;
-
+    std::unordered_map<TransportType, std::string> transport_attrs;
     // mutable elements
+    int ref_count{0};
+
+    // backward compatilble
     std::vector<uint32_t> rkey;
     std::string shm_path;
     std::string mnnvl_handle;
-    int ref_count{0};
     std::vector<uint32_t> lkey;  // not uploaded, available in local only
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
-                                   transports, attrs, rkey, shm_path,
+                                   transports, transport_attrs, rkey, shm_path,
                                    mnnvl_handle);
 };
 

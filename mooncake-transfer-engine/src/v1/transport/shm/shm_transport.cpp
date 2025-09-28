@@ -116,14 +116,16 @@ Status ShmTransport::submitTransferTasks(
 }
 
 void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
-    bool success;
+    Status status;
     if (task->request.opcode == Request::READ)
-        success = genericMemcpy(task->request.source, (void *)task->target_addr,
-                                task->request.length);
+        status = Platform::getLoader().copy(task->request.source,
+                                            (void *)task->target_addr,
+                                            task->request.length);
     else
-        success = genericMemcpy((void *)task->target_addr, task->request.source,
-                                task->request.length);
-    if (success) {
+        status = Platform::getLoader().copy((void *)task->target_addr,
+                                            task->request.source,
+                                            task->request.length);
+    if (status.ok()) {
         task->transferred_bytes = task->request.length;
         task->status_word = TransferStatusEnum::COMPLETED;
     } else {
@@ -175,7 +177,8 @@ static inline std::string joinPath(const std::string &path,
 
 Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
                                          MemoryOptions &options) {
-    if (parseLocation(options.location).first != "cpu") {
+    LocationParser location(options.location);
+    if (location.type() != "cpu") {
         return Status::InvalidArgument("ShmTransport allocates DRAM only");
     }
     options.shm_path = randomFileName();
@@ -267,8 +270,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
     if (!relocate_map.count(buffer->addr)) {
         void *shm_addr = nullptr;
-        auto location = parseLocation(buffer->location);
-        if (location.first == "cuda") {
+        LocationParser location(buffer->location);
+        if (location.type() == "cuda") {
             return Status::NotImplemented(
                 "CUDA supported not enabled in this package " LOC_MARK);
         } else {

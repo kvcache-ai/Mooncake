@@ -25,7 +25,7 @@
 #include <memory>
 
 #include "v1/runtime/slab.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 
 #ifdef USE_CUDA
 #include <cuda.h>

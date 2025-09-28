@@ -89,20 +89,12 @@ static inline std::string getCurrentDateTime() {
 }
 
 #ifdef USE_CUDA
-static inline bool genericMemcpy(void *dst, void *src, size_t length) {
-    auto ret = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
-    return ret == cudaSuccess;
-}
 static inline bool isCudaMemory(void *ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
     return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
 }
 #else
-static inline bool genericMemcpy(void *dst, void *src, size_t length) {
-    memcpy(dst, src, length);
-    return true;
-}
 static inline bool isCudaMemory(void *ptr) { return false; }
 #endif
 

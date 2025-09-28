@@ -18,7 +18,8 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
+#include "v1/runtime/platform.h"
 #include "v1/runtime/segment_registry.h"
 
 namespace mooncake {
@@ -50,7 +51,7 @@ Status ControlClient::sendData(const std::string &server_addr,
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc) + length);
     memcpy(&request[0], &desc, sizeof(desc));
-    genericMemcpy(&request[sizeof(desc)], local_mem_addr, length);
+    Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
     return tl_rpc_agent.call(server_addr, SendData, request, response);
 }
 
@@ -63,7 +64,7 @@ Status ControlClient::recvData(const std::string &server_addr,
     memcpy(&request[0], &desc, sizeof(desc));
     auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
-    genericMemcpy(local_mem_addr, response.data(), length);
+    Platform::getLoader().copy(local_mem_addr, response.data(), length);
     return Status::OK();
 }
 
@@ -142,7 +143,7 @@ void ControlService::onSendData(const std::string_view &request,
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        genericMemcpy((void *)peer_mem_addr, &desc[1], length);
+        Platform::getLoader().copy((void *)peer_mem_addr, &desc[1], length);
     }
 }
 
@@ -154,7 +155,7 @@ void ControlService::onRecvData(const std::string_view &request,
     auto length = le64toh(desc->length);
     response.resize(length);
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        genericMemcpy(response.data(), (void *)peer_mem_addr, length);
+        Platform::getLoader().copy(response.data(), (void *)peer_mem_addr, length);
     }
 }
 

@@ -18,14 +18,6 @@
 #include <random>
 
 #include "v1/common/status.h"
-#include "v1/platform/location.h"
-
-#ifdef USE_CUDA
-#include "v1/platform/cuda.h"
-#else
-#include "v1/platform/cpu.h"
-#endif
-
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment.h"
 #include "v1/runtime/segment_tracker.h"
@@ -41,7 +33,7 @@
 #include "v1/transport/gds/gds_transport.h"
 #endif
 #include "v1/transport/io_uring/io_uring_transport.h"
-#include "v1/platform/ip.h"
+#include "v1/common/utils/ip.h"
 #include "v1/common/utils/random.h"
 
 namespace mooncake {
@@ -145,12 +137,8 @@ Status TransferEngine::construct() {
         CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
     topology_ = std::make_shared<Topology>();
-#ifdef USE_CUDA
-    loader_ = std::make_shared<CudaPlatform>(conf_);
-#else
-    loader_ = std::make_shared<CpuPlatform>(conf_);
-#endif
-    CHECK_STATUS(topology_->discover({loader_.get()}));
+    auto loader = &Platform::getLoader(conf_);
+    CHECK_STATUS(topology_->discover({loader}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers);
@@ -309,7 +297,8 @@ Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
                                            Location location) {
     MemoryOptions options;
     options.location = location;
-    if (location == kWildcardLocation || location.starts_with("cpu")) {
+    if (location == kWildcardLocation ||
+        LocationParser(location).type() == "cpu") {
         if (transport_list_[SHM])
             options.type = SHM;
         else if (transport_list_[RDMA])
@@ -510,7 +499,7 @@ TransportType TransferEngine::getTransportType(const Request &request,
         bool same_machine =
             (desc->machine_id ==
              metadata_->segmentManager().getLocal()->machine_id);
-        bool cuda_device = entry->location.starts_with("cuda");
+        bool cuda_device = LocationParser(entry->location).type() == "cuda";
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
             if ((type == NVLINK || type == MNNVL) && !cuda_device) continue;

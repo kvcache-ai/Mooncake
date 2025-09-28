@@ -19,9 +19,9 @@
 #include <cassert>
 
 #include "v1/transport/rdma/endpoint_store.h"
-#include "v1/platform/ip.h"
+#include "v1/common/utils/ip.h"
 #include "v1/common/utils/string_builder.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 #include "v1/common/utils/random.h"
 
 namespace mooncake {

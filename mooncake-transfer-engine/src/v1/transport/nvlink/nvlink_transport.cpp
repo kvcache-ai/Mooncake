@@ -202,8 +202,8 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
                                         const MemoryOptions &options) {
-    auto location = parseLocation(options.location);
-    if (location.first == "cuda") {
+    LocationParser location(options.location);
+    if (location.type() == "cuda") {
         // If the memory region is allocated using cuMemAlloc,
         // we cannot use cudaIpcGetMemHandle, so skip it
         if (options.type == MNNVL) return Status::OK();
@@ -211,7 +211,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
         CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void *)desc.addr));
         desc.shm_path =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-    } else if (location.first == "cpu") {
+    } else if (location.type() == "cpu") {
         CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                     cudaHostRegisterDefault));
     } else
@@ -223,7 +223,8 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
 
 Status NVLinkTransport::removeMemoryBuffer(BufferDesc &desc) {
     desc.shm_path.clear();
-    if (parseLocation(desc.location).first == "cpu") {
+    LocationParser location(desc.location);
+    if (location.type() == "cpu") {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
     }
     return Status::OK();
@@ -260,8 +261,8 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
     if (!relocate_map.count(buffer->addr)) {
         void *shm_addr = nullptr;
-        auto location = parseLocation(buffer->location);
-        if (location.first == "cuda") {
+        LocationParser location(buffer->location);
+        if (location.type() == "cuda") {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->shm_path, output_buffer);
             cudaIpcMemHandle_t handle;
@@ -271,7 +272,7 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             OpenedShmEntry shm_entry;
             shm_entry.shm_addr = shm_addr;
             shm_entry.length = buffer->length;
-            shm_entry.cuda_id = location.second;
+            shm_entry.cuda_id = location.index();
             relocate_map[buffer->addr] = shm_entry;
         } else {
             return Status::InvalidArgument(

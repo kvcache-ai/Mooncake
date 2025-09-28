@@ -20,7 +20,7 @@
 
 #include <glog/logging.h>
 
-#include "v1/platform/ip.h"
+#include "v1/common/utils/ip.h"
 #include "v1/common/utils/random.h"
 
 namespace mooncake {

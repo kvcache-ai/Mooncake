@@ -28,9 +28,8 @@
 #include <string>
 
 #include "v1/common/status.h"
+#include "v1/runtime/platform.h"
 #include "v1/runtime/control_plane.h"
-#include "v1/platform/allocator.h"
-#include "v1/platform/location.h"
 
 namespace mooncake {
 namespace v1 {
@@ -81,11 +80,11 @@ class Transport {
 
     virtual Status allocateLocalMemory(void **addr, size_t size,
                                        MemoryOptions &options) {
-        return genericAllocateLocalMemory(addr, size, options);
+        return Platform::getLoader().allocate(addr, size, options);
     }
 
     virtual Status freeLocalMemory(void *addr, size_t size) {
-        return genericFreeLocalMemory(addr, size);
+        return Platform::getLoader().free(addr, size);
     }
 
     virtual Status addMemoryBuffer(BufferDesc &desc,

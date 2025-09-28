@@ -14,7 +14,7 @@
 
 #include "tev1_backend.h"
 #include "utils.h"
-#include "v1/platform/location.h"
+#include "v1/runtime/platform.h"
 #include "v1/runtime/topology.h"
 
 #ifdef USE_CUDA
@@ -142,25 +142,18 @@ int TEv1BenchRunner::stopInitiator() {
     return 0;
 }
 
-static int parseIndex(const std::string &loc) {
-    auto pos = loc.find(':');
-    if (pos == std::string::npos || pos + 1 >= loc.size()) {
-        throw std::invalid_argument("Invalid loc format: " + loc);
-    }
-    return std::stoi(loc.substr(pos + 1));
-}
-
 int getCudaDeviceNumaID(int cuda_id);
 
 void TEv1BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
-    auto result = getMemoryLocation((void *)addr, 1);
-    if (result[0].location.starts_with("cpu")) {
-        auto socket_id = parseIndex(result[0].location);
+    auto result = Platform::getLoader().getLocation((void *)addr, 1);
+    LocationParser location(result[0].location);
+    if (location.type() == "cpu") {
+        auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (result[0].location.starts_with("cuda")) {
-        auto device_id = parseIndex(result[0].location);
+    } else if (location.type() == "cuda") {
+        auto device_id = location.index();
         auto socket_id = getCudaDeviceNumaID(device_id);
         bindToSocket(socket_id);
     }

@@ -165,8 +165,6 @@ class TransferEngine {
     uint16_t port_;
     bool ipv6_;
     std::string local_segment_name_;
-
-    std::shared_ptr<Platform> loader_;
 };
 }  // namespace v1
 }  // namespace mooncake

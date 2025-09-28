@@ -12,56 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/platform/allocator.h"
+#include "v1/platform/cuda.h"
+#include "v1/common/status.h"
 
-#ifdef USE_CUDA
 #include <bits/stdint-uintn.h>
 #include <cuda_runtime.h>
-#endif
 #include <numa.h>
 #include <glog/logging.h>
 
 namespace mooncake {
 namespace v1 {
-
-std::pair<std::string, int> parseLocation(const std::string &location) {
-    size_t colonPos = location.find(':');
-    if (colonPos == std::string::npos) return std::make_pair("", -1);
-    std::string type = location.substr(0, colonPos);
-    std::string indexStr = location.substr(colonPos + 1);
-    try {
-        return std::make_pair(type, std::stoi(indexStr));
-    } catch (const std::exception &e) {
-        return std::make_pair("", -1);
-    }
-}
-
-Status genericAllocateLocalMemory(void **pptr, size_t size,
-                                  MemoryOptions &options) {
-    auto result = parseLocation(options.location);
-    if (result.first == "cuda") {
-#ifdef USE_CUDA
+Status CudaPlatform::allocate(void **pptr, size_t size,
+                              MemoryOptions &options) {
+    LocationParser location(options.location);
+    if (location.type() == "cuda") {
         int cuda_dev = 0;
         CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        CHECK_CUDA(cudaSetDevice(result.second));
+        CHECK_CUDA(cudaSetDevice(location.index()));
         CHECK_CUDA(cudaMalloc(pptr, size));
         cudaSetDevice(cuda_dev);
         return Status::OK();
-#else
-        return Status::NotImplemented("CUDA feature not supported" LOC_MARK);
-#endif
     }
     int socket_id = 0;
-    if (result.first == "cpu") socket_id = result.second;
+    if (location.type() == "cpu") socket_id = location.index();
     *pptr = numa_alloc_onnode(size, socket_id);
     if (!(*pptr))
         return Status::InternalError("Unable to allocate DRAM memory");
     return Status::OK();
 }
 
-Status genericFreeLocalMemory(void *ptr, size_t size) {
-#ifdef USE_CUDA
-    // Check pointer on GPU
+Status CudaPlatform::free(void *ptr, size_t size) {
     cudaPointerAttributes attributes;
     CHECK_CUDA(cudaPointerGetAttributes(&attributes, ptr));
     if (attributes.type == cudaMemoryTypeDevice) {
@@ -72,9 +52,11 @@ Status genericFreeLocalMemory(void *ptr, size_t size) {
     } else {
         LOG(ERROR) << "Unknown memory type, " << ptr << " " << attributes.type;
     }
-#else
-    numa_free(ptr, size);
-#endif
+    return Status::OK();
+}
+
+Status CudaPlatform::copy(void *dst, void *src, size_t length) {
+    CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
     return Status::OK();
 }
 }  // namespace v1

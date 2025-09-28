@@ -19,10 +19,9 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/platform/location.h"
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment_registry.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 
 namespace mooncake {
 namespace v1 {

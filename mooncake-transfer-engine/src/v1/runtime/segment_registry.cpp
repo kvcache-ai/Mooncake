@@ -18,7 +18,7 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 #include "v1/runtime/control_plane.h"
 
 namespace mooncake {

@@ -19,10 +19,10 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/platform/location.h"
+#include "v1/runtime/platform.h"
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment_registry.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 
 namespace mooncake {
 namespace v1 {
@@ -62,7 +62,7 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     BufferDesc new_desc;
     new_desc.addr = base;
     new_desc.length = length;
-    auto entries = getMemoryLocation((void *)base, length);
+    auto entries = Platform::getLoader().getLocation((void *)base, length);
     if (!entries.empty())
         new_desc.location = entries[0].location;
     else

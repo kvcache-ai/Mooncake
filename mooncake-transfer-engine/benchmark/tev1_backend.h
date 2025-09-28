@@ -28,7 +28,7 @@
 
 #include "v1/transfer_engine.h"
 #include "v1/common/utils/random.h"
-#include "v1/platform/system.h"
+#include "v1/common/utils/os.h"
 
 namespace mooncake {
 namespace v1 {

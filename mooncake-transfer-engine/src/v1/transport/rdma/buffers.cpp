@@ -54,7 +54,7 @@ Status LocalBufferManager::addBuffer(BufferDesc &desc,
     item.options = options;
     auto &location = item.options.location;
     if (location == kWildcardLocation) {
-        auto entries = getMemoryLocation((void *)desc.addr, desc.length);
+        auto entries = Platform::getLoader().getLocation((void *)desc.addr, desc.length);
         if (!entries.empty()) location = entries[0].location;
     }
     desc.location = location;

@@ -14,7 +14,6 @@
 
 #include "v1/platform/cpu.h"
 #include "v1/common/status.h"
-#include "v1/platform/location.h"
 #include "v1/common/utils/random.h"
 
 #include <glog/logging.h>
@@ -160,5 +159,61 @@ Status CpuPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
     discoverCpuTopology(nic_list, mem_list);
     return Status::OK();
 }
+
+static inline uintptr_t alignPage(uintptr_t address) {
+    const static size_t kPageSize = 4096;
+    return address & ~(kPageSize - 1);
+}
+
+static inline std::string genCpuNodeName(int node) {
+    if (node >= 0) return "cpu:" + std::to_string(node);
+    return kWildcardLocation;
+}
+
+const std::vector<MemoryLocationEntry> CpuPlatform::getLocation(void *start,
+                                                                size_t len) {
+    const static size_t kPageSize = 4096;
+    std::vector<MemoryLocationEntry> entries;
+
+    // start and end address may not be page aligned.
+    uintptr_t aligned_start = alignPage((uintptr_t)start);
+    int n =
+        (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
+    void **pages = (void **)malloc(sizeof(void *) * n);
+    int *status = (int *)malloc(sizeof(int) * n);
+
+    for (int i = 0; i < n; i++) {
+        pages[i] = (void *)((char *)aligned_start + i * kPageSize);
+    }
+
+    int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
+    if (rc != 0) {
+        // PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
+        //               << ", len: " << len;
+        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+        ::free(pages);
+        ::free(status);
+        return entries;
+    }
+
+    int node = status[0];
+    uint64_t start_addr = (uint64_t)start;
+    uint64_t new_start_addr;
+    for (int i = 1; i < n; i++) {
+        if (status[i] != node) {
+            new_start_addr = alignPage((uint64_t)start) + i * kPageSize;
+            entries.push_back({start_addr, size_t(new_start_addr - start_addr),
+                               genCpuNodeName(node)});
+            start_addr = new_start_addr;
+            node = status[i];
+        }
+    }
+    entries.push_back(
+        {start_addr, (uint64_t)start + len - start_addr, genCpuNodeName(node)});
+    ::free(pages);
+    ::free(status);
+    return entries;
+}
+
 }  // namespace v1
 }  // namespace mooncake

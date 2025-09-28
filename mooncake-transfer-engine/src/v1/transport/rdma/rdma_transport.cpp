@@ -24,7 +24,6 @@
 #include <set>
 
 #include "v1/common/status.h"
-#include "v1/platform/location.h"
 #include "v1/transport/rdma/buffers.h"
 #include "v1/transport/rdma/endpoint_store.h"
 #include "v1/transport/rdma/workers.h"

@@ -21,7 +21,7 @@
 #include <atomic>
 
 #include "v1/runtime/metastore.h"
-#include "v1/platform/ip.h"
+#include "v1/common/utils/ip.h"
 
 namespace mooncake {
 namespace v1 {

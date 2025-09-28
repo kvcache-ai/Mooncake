@@ -1,4 +1,4 @@
-// Copyright 2025 KVCache.AI
+// Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef ALLOCATOR_H
-#define ALLOCATOR_H
+#include "v1/runtime/platform.h"
 
-#include "v1/common/status.h"
-#include "v1/common/types.h"
+#ifdef USE_CUDA
+#include "v1/platform/cuda.h"
+#else
+#include "v1/platform/cpu.h"
+#endif
 
 namespace mooncake {
 namespace v1 {
 
-std::pair<std::string, int> parseLocation(const std::string &location);
-
-Status genericAllocateLocalMemory(void **pptr, size_t size,
-                                  MemoryOptions &options);
-
-Status genericFreeLocalMemory(void *ptr, size_t size);
+Platform &Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
+    static std::shared_ptr<Platform> g_instance;
+    if (!g_instance) {
+#ifdef USE_CUDA
+        g_instance = std::make_shared<CudaPlatform>(conf);
+#else
+        g_instance = std::make_shared<CpuPlatform>(conf);
+#endif
+    }
+    return *g_instance;
+}
 
 }  // namespace v1
 }  // namespace mooncake
-
-#endif  // ALLOCATOR_H

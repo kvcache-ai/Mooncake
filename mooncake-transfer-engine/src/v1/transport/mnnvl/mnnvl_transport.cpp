@@ -247,12 +247,12 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
-    auto location = parseLocation(desc.location);
-    if (location.first == "cpu") {
+    LocationParser location(desc.location);
+    if (location.type() == "cpu") {
         CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                     cudaHostRegisterDefault));
         return Status::OK();
-    } else if (location.first != "cuda")
+    } else if (location.type() != "cuda")
         return Status::InvalidArgument(
             "Unrecognized location - neither cpu or cuda");
 
@@ -266,7 +266,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
+    CHECK_STATUS(buildCUmemAllocationProp(prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
     CUmemFabricHandle export_handle;
@@ -281,7 +281,8 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
 Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     desc.mnnvl_handle.clear();
-    if (parseLocation(desc.location).first == "cpu") {
+    LocationParser location(desc.location);
+    if (location.type() == "cpu") {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
     }
     return Status::OK();
@@ -289,14 +290,14 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
 
 Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
-    auto location = parseLocation(options.location);
-    if (location.first != "cuda") {
-        return genericAllocateLocalMemory(addr, size, options);
+    LocationParser location(options.location);
+    if (location.type() != "cuda") {
+        return Platform::getLoader().allocate(addr, size, options);
     }
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(prop, location.second));
+    CHECK_STATUS(buildCUmemAllocationProp(prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, size));
 
     CUmemGenericAllocationHandle handle;
@@ -350,7 +351,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
 Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     std::lock_guard<std::mutex> lock(allocate_mutex_);
     if (!allocate_set_.count(addr)) {
-        return genericFreeLocalMemory(addr, size);
+        return Platform::getLoader().free(addr, size);
     }
     CUmemGenericAllocationHandle handle;
     cuMemRetainAllocationHandle(&handle, addr);
@@ -419,8 +420,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
-        auto location = parseLocation(buffer->location);
-        mnnvl_entry.cuda_id = location.second;
+        LocationParser location(buffer->location);
+        mnnvl_entry.cuda_id = location.index();
         relocate_map[buffer->addr] = mnnvl_entry;
     }
 

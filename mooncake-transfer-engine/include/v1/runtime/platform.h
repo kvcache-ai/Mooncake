@@ -22,8 +22,20 @@ namespace v1 {
 
 class Platform {
    public:
+    static Platform &getLoader(std::shared_ptr<ConfigManager> conf = nullptr);
+
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list) = 0;
+
+    virtual Status allocate(void **pptr, size_t size,
+                            MemoryOptions &options) = 0;
+
+    virtual Status free(void *ptr, size_t size) = 0;
+
+    virtual Status copy(void *dst, void *src, size_t length) = 0;
+
+    virtual const std::vector<MemoryLocationEntry> getLocation(void *start,
+                                                               size_t len) = 0;
 };
 
 }  // namespace v1

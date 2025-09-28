@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/platform/ip.h"
+#include "v1/common/utils/ip.h"
 #include <glog/logging.h>
 
 namespace mooncake {

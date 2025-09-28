@@ -25,7 +25,6 @@
 
 #include "v1/common/status.h"
 #include "v1/runtime/platform.h"
-#include "v1/platform/location.h"
 #include "v1/common/utils/random.h"
 #include "v1/thirdparty/nlohmann/json.h"
 

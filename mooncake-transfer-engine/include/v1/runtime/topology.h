@@ -97,6 +97,39 @@ class Topology {
     std::vector<MemEntry> mem_list_;
 };
 
+class LocationParser {
+   public:
+    LocationParser(const std::string &location) {
+        size_t colonPos = location.find(':');
+        if (colonPos == std::string::npos) {
+            index_ = -1;
+            return;
+        }
+        std::string type = location.substr(0, colonPos);
+        std::string indexStr = location.substr(colonPos + 1);
+        try {
+            type_ = type;
+            index_ = std::stoi(indexStr);
+        } catch (const std::exception &e) {
+            index_ = -1;
+        }
+    }
+
+    std::string type() const { return type_; }
+
+    int index() const { return index_; }
+
+   private:
+    std::string type_;
+    int index_;
+};
+
+struct MemoryLocationEntry {
+    uint64_t start;
+    size_t len;
+    std::string location;
+};
+
 }  // namespace v1
 }  // namespace mooncake
 
