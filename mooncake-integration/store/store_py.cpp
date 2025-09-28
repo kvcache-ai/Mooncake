@@ -9,6 +9,7 @@
 #include <cstdlib>  // for atexit
 
 #include "integration_utils.h"
+#include "transfer_engine/transfer_engine_py.h"
 
 namespace py = pybind11;
 
@@ -295,6 +296,23 @@ PYBIND11_MODULE(store, m) {
                  }
                  return self.store_->setup(local_hostname, metadata_server,
                                            global_segment_size,
+                                           local_buffer_size, protocol,
+                                           rdma_devices, master_server_addr);
+             })
+        .def("setup",
+             [](MooncakeStorePyWrapper &self,
+                const TransferEnginePy &transfer_engine,
+                const std::string &metadata_server,
+                size_t global_segment_size = 1024 * 1024 * 16,
+                size_t local_buffer_size = 1024 * 1024 * 16,
+                const std::string &protocol = "tcp",
+                const std::string &rdma_devices = "",
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 if (!self.store_) {
+                     self.store_ = PyClient::create();
+                 }
+                 return self.store_->setup(transfer_engine.getEngine(),
+                                           metadata_server, global_segment_size,
                                            local_buffer_size, protocol,
                                            rdma_devices, master_server_addr);
              })

@@ -232,111 +232,124 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
 ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol,
-    const std::optional<std::string>& device_names) {
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
-    bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::optional<std::shared_ptr<TransferEngine>> transfer_engine) {
+    if (transfer_engine) {
+        transfer_engine_ = transfer_engine.value();
     } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
+        // get auto_discover and filters from env
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        bool auto_discover = false;
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
         }
-    }
-    transfer_engine_.setAutoDiscover(auto_discover);
+        transfer_engine_ = std::make_shared<TransferEngine>();
+        transfer_engine_->setAutoDiscover(auto_discover);
 
-    auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
-                                   hostname, port);
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
-        return ErrorCode::INTERNAL_ERROR;
-    }
+        auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        int rc = transfer_engine_->init(metadata_connstring, local_hostname,
+                                        hostname, port);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+            return ErrorCode::INTERNAL_ERROR;
+        }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_.setWhitelistFilters(std::move(filters));
-    } else {
-        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
-                  << protocol;
+        if (auto_discover) {
+            LOG(INFO)
+                << "Transfer engine auto discovery is enabled for protocol: "
+                << protocol;
+            auto filters = get_auto_discover_filters(auto_discover);
+            transfer_engine_->setWhitelistFilters(std::move(filters));
+        } else {
+            LOG(INFO)
+                << "Transfer engine auto discovery is disabled for protocol: "
+                << protocol;
 
-        Transport* transport = nullptr;
+            Transport* transport = nullptr;
 
-        if (protocol == "rdma") {
-            if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << "RDMA protocol requires device names when auto "
-                              "discovery is disabled";
+            if (protocol == "rdma") {
+                if (!device_names.has_value() || device_names->empty()) {
+                    LOG(ERROR)
+                        << "RDMA protocol requires device names when auto "
+                           "discovery is disabled";
+                    return ErrorCode::INVALID_PARAMS;
+                }
+
+                LOG(INFO) << "Using specified RDMA devices: "
+                          << device_names.value();
+
+                std::vector<std::string> devices =
+                    splitString(device_names.value(), ',', /*skip_empty=*/true);
+
+                // Manually discover topology with specified devices only
+                auto topology = transfer_engine_->getLocalTopology();
+                if (topology) {
+                    topology->discover(devices);
+                    LOG(INFO) << "Topology discovery complete with specified "
+                                 "devices. Found "
+                              << topology->getHcaList().size() << " HCAs";
+                }
+
+                transport = transfer_engine_->installTransport("rdma", nullptr);
+                if (!transport) {
+                    LOG(ERROR)
+                        << "Failed to install RDMA transport with specified "
+                           "devices";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (protocol == "tcp") {
+                if (device_names.has_value()) {
+                    LOG(WARNING)
+                        << "TCP protocol does not use device names, ignoring";
+                }
+
+                try {
+                    transport =
+                        transfer_engine_->installTransport("tcp", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "tcp_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install TCP transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (protocol == "ascend") {
+                if (device_names.has_value()) {
+                    LOG(WARNING) << "Ascend protocol does not use device "
+                                    "names, ignoring";
+                }
+                try {
+                    transport =
+                        transfer_engine_->installTransport("ascend", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "ascend_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install Ascend transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else {
+                LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
                 return ErrorCode::INVALID_PARAMS;
             }
-
-            LOG(INFO) << "Using specified RDMA devices: "
-                      << device_names.value();
-
-            std::vector<std::string> devices =
-                splitString(device_names.value(), ',', /*skip_empty=*/true);
-
-            // Manually discover topology with specified devices only
-            auto topology = transfer_engine_.getLocalTopology();
-            if (topology) {
-                topology->discover(devices);
-                LOG(INFO) << "Topology discovery complete with specified "
-                             "devices. Found "
-                          << topology->getHcaList().size() << " HCAs";
-            }
-
-            transport = transfer_engine_.installTransport("rdma", nullptr);
-            if (!transport) {
-                LOG(ERROR) << "Failed to install RDMA transport with specified "
-                              "devices";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else if (protocol == "tcp") {
-            if (device_names.has_value()) {
-                LOG(WARNING)
-                    << "TCP protocol does not use device names, ignoring";
-            }
-
-            try {
-                transport = transfer_engine_.installTransport("tcp", nullptr);
-            } catch (std::exception& e) {
-                LOG(ERROR) << "tcp_transport_install_failed error_message=\""
-                           << e.what() << "\"";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-
-            if (!transport) {
-                LOG(ERROR) << "Failed to install TCP transport";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else if (protocol == "ascend") {
-            if (device_names.has_value()) {
-                LOG(WARNING)
-                    << "Ascend protocol does not use device names, ignoring";
-            }
-            try {
-                transport =
-                    transfer_engine_.installTransport("ascend", nullptr);
-            } catch (std::exception& e) {
-                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
-                           << e.what() << "\"";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-
-            if (!transport) {
-                LOG(ERROR) << "Failed to install Ascend transport";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else {
-            LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
-            return ErrorCode::INVALID_PARAMS;
         }
     }
 
@@ -344,7 +357,7 @@ ErrorCode Client::InitTransferEngine(
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, storage_backend_,
+        *transfer_engine_, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -353,7 +366,8 @@ ErrorCode Client::InitTransferEngine(
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
-    const std::string& master_server_entry) {
+    const std::string& master_server_entry,
+    const std::optional<std::shared_ptr<TransferEngine>> transfer_engine) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -386,7 +400,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                     protocol, device_names);
+                                     protocol, device_names, transfer_engine);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize transfer engine";
         return std::nullopt;
@@ -1179,7 +1193,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory(
+    int rc = transfer_engine_->registerLocalMemory(
         (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
@@ -1197,7 +1211,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
         segment.te_endpoint = local_hostname_;
     }
@@ -1241,7 +1255,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_.unregisterLocalMemory(
+    int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
@@ -1265,7 +1279,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
-    if (this->transfer_engine_.registerLocalMemory(
+    if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1274,7 +1288,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_.unregisterLocalMemory(addr, update_metadata) !=
+    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
