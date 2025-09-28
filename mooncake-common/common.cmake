@@ -57,7 +57,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
-option(USE_MUSA "option for enabling gpu features" OFF)
+option(USE_MUSA "option for enabling Moore Threads gpu features by leveraging MUSA (Meta-computing Unified System Architecture)" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
