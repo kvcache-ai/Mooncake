@@ -474,9 +474,9 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
-    auto response = master_client_.BatchGetReplicaList(object_keys);
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
+    auto response = master_client_.BatchGetReplicaList(object_keys);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
