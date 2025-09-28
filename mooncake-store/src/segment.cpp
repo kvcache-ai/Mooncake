@@ -50,11 +50,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.file_id);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    segment.file_id);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.file_id);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    segment.file_id);
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name

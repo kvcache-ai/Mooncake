@@ -271,22 +271,19 @@ TEST_F(ClientBufferTest, CalculateTotalSizeMemoryReplica) {
 
     // Add some buffer descriptors with proper initialization
     AllocatedBuffer::Descriptor buf1;
-    buf1.segment_name_ = "test1";
     buf1.size_ = 1024;
     buf1.buffer_address_ = 0x1000;
-    buf1.status_ = BufStatus::COMPLETE;
+    buf1.file_id_ = 0;
 
     AllocatedBuffer::Descriptor buf2;
-    buf2.segment_name_ = "test2";
     buf2.size_ = 2048;
     buf2.buffer_address_ = 0x2000;
-    buf2.status_ = BufStatus::COMPLETE;
+    buf2.file_id_ = 0;
 
     AllocatedBuffer::Descriptor buf3;
-    buf3.segment_name_ = "test3";
     buf3.size_ = 512;
     buf3.buffer_address_ = 0x3000;
-    buf3.status_ = BufStatus::COMPLETE;
+    buf3.file_id_ = 0;
 
     mem_desc.buffer_descriptors = {buf1, buf2, buf3};
     replica.descriptor_variant = mem_desc;

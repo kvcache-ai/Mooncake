@@ -3,8 +3,6 @@
 #include <string>
 #include <exception>
 
-#include "configs.cuh"
-
 #ifndef EP_STATIC_ASSERT
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
 #endif

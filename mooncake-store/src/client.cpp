@@ -151,7 +151,7 @@ Client::~Client() {
     }
 }
 
-static bool get_auto_discover() {
+static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
         int iv = std::stoi(ev_ad);
@@ -167,7 +167,7 @@ static bool get_auto_discover() {
                 << ", should be 0 or 1, using default: auto discovery not set";
         }
     }
-    return true;
+    return std::nullopt;
 }
 
 static inline void ltrim(std::string& s) {
@@ -291,7 +291,20 @@ ErrorCode Client::InitTransferEngine(
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
-    bool auto_discover = get_auto_discover();
+    std::optional<bool> env_auto_discover = get_auto_discover();
+    bool auto_discover = false;
+    if (env_auto_discover.has_value()) {
+        // Use user-specified auto-discover setting
+        auto_discover = env_auto_discover.value();
+    } else {
+        // Enable auto-discover for RDMA if no devices are specified
+        if (protocol == "rdma" && !device_names.has_value()) {
+            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
+                         "since no "
+                         "device names provided";
+            auto_discover = true;
+        }
+    }
     transfer_engine_.setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
@@ -397,8 +410,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Initialize TransferSubmitter after transfer engine is ready
+    // Keep using logical local_hostname for name-based behaviors; endpoint is
+    // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_,
+        transfer_engine_, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -468,13 +483,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_keys.size());
 
-    std::vector<std::vector<Replica::Descriptor>> valid_replica_lists;
+    std::vector<QueryResult> valid_query_results;
     std::vector<size_t> valid_indices;
     std::vector<std::string> valid_keys;
 
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
-            valid_replica_lists.emplace_back(batched_query_results[i].value());
+            valid_query_results.emplace_back(batched_query_results[i].value());
             valid_indices.emplace_back(i);
             valid_keys.emplace_back(object_keys[i]);
             results.emplace_back();  // placeholder for successful results
@@ -495,7 +510,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         auto valid_results =
-            BatchGet(valid_keys, valid_replica_lists, valid_slices);
+            BatchGet(valid_keys, valid_query_results, valid_slices);
 
         // Merge results back
         for (size_t i = 0; i < valid_indices.size(); ++i) {
@@ -513,14 +528,23 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Client::Query(
+tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
-    return result;
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return QueryResult(
+        std::move(result.value().replicas),
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-Client::BatchQuery(const std::vector<std::string>& object_keys) {
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
+    const std::vector<std::string>& object_keys) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys);
 
     // Check if we got the expected number of responses
@@ -528,24 +552,34 @@ Client::BatchQuery(const std::vector<std::string>& object_keys) {
         LOG(ERROR) << "BatchQuery response size mismatch. Expected: "
                    << object_keys.size() << ", Got: " << response.size();
         // Return vector of RPC_FAIL errors
-        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-            results;
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
         }
         return results;
     }
-    return response;
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (response[i]) {
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas),
+                start_time + std::chrono::milliseconds(
+                                 response[i].value().lease_ttl_ms)));
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
 }
 
-tl::expected<void, ErrorCode> Client::Get(
-    const std::string& object_key,
-    const std::vector<Replica::Descriptor>& replica_list,
-    std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -566,12 +600,17 @@ tl::expected<void, ErrorCode> Client::Get(
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
+    if (query_result.IsLeaseExpired()) {
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     return {};
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
-    const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
+    const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
@@ -584,8 +623,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Validate input size consistency
-    if (replica_lists.size() != object_keys.size()) {
-        LOG(ERROR) << "Replica lists size (" << replica_lists.size()
+    if (query_results.size() != object_keys.size()) {
+        LOG(ERROR) << "Query results size (" << query_results.size()
                    << ") doesn't match object keys size (" << object_keys.size()
                    << ")";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -606,7 +645,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
-        const auto& replica_list = replica_lists[i];
+        const auto& query_result = query_results[i];
 
         auto slices_it = slices.find(key);
         if (slices_it == slices.end()) {
@@ -617,7 +656,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+        ErrorCode err =
+            FindFirstCompleteReplica(query_result.replicas, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -652,6 +692,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         } else {
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
+        }
+    }
+
+    // As lease expired is a rare case, we check all the results with the same
+    // time_point to avoid too many syscalls
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << object_keys[i];
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
 
@@ -1208,8 +1260,19 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::string te_endpoint;
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        te_endpoint = transfer_engine_.getLocalIpAndPort();
+    } else {
+        te_endpoint = local_hostname_;
+    }
+
+    // Build segment with logical name; attach TE endpoint for transport
     Segment segment(generate_uuid(), local_hostname_,
-                    reinterpret_cast<uintptr_t>(buffer), size);
+                    reinterpret_cast<uintptr_t>(buffer), size, te_endpoint);
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {
@@ -1299,7 +1362,18 @@ tl::expected<void, ErrorCode> Client::MountFileSegment(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    Segment segment(generate_uuid(), local_hostname_, 0, size, path, file_id);
+    std::string te_endpoint;
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        te_endpoint = transfer_engine_.getLocalIpAndPort();
+    } else {
+        te_endpoint = local_hostname_;
+    }
+
+    Segment segment(generate_uuid(), local_hostname_, 0, size, te_endpoint,
+                    path, file_id);
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {

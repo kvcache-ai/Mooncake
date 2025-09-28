@@ -10,15 +10,13 @@ The vLLM v1 version has been released with support for PD disaggregation. The de
 
 2. Start the Mooncake Master node on Machine A:
 ```bash
-mooncake_master -port 50052 -max_threads 64 -metrics_port 9004
+mooncake_master -port 50052 -max_threads 64 -metrics_port 9004 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
 ```
 
-3. Start the HTTP metadata server (default port 8080) on Machine A for transfer engine metadata:
-```bash
-mooncake_http_metadata_server
-```
-
-4. Launch the Decoder instance on machine A
+3. Launch the Decoder instance on machine A
 - Modify the vllm/examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
 ```diff
 diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
@@ -62,7 +60,7 @@ extra_config:
 bash disagg_vllm_launcher.sh decoder Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
 ```
 
-5. Launch the Prefiller instance on machine B
+4. Launch the Prefiller instance on machine B
 - Modify the vllm/examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh file.
 ```diff
 diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
@@ -101,6 +99,10 @@ extra_config:
 ```bash
 bash disagg_vllm_launcher.sh prefiller Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
 ```
+
+5. Prepare the router `disagg_proxy_server`
+
+We use the [disagg_proxy_server](https://github.com/LMCache/LMCache/blob/dev/examples/disagg_prefill/disagg_proxy_server.py) provided by LMCache. According to [LMCache/LMCache#1342](https://github.com/LMCache/LMCache/issues/1342), when using Mooncake Store as the backend, you need to comment out `wait_decode_kv_ready(req_id)` in the proxy code.
 
 6. Launch the `disagg_proxy_server` using command
 

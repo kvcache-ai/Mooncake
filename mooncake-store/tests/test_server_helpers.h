@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -18,29 +20,27 @@ namespace mooncake {
 namespace testing {
 
 // Lightweight in-process master server for tests (non-HA).
-// Optionally starts embedded HTTP metadata server for transfer engine.
+// Optionally starts embedded HTTP metadata server for transfer engine (default
+// off).
 class InProcMaster {
    public:
     InProcMaster() = default;
     ~InProcMaster() { Stop(); }
 
-    bool Start(int rpc_port = 0, int http_metrics_port = 0,
-               bool enable_http_metadata = true, int http_metadata_port = 0) {
+    bool Start(InProcMasterConfig config) {
         try {
             // Choose ports if not provided
-            rpc_port_ = rpc_port > 0 ? rpc_port : getFreeTcpPort();
-            http_metrics_port_ =
-                http_metrics_port > 0 ? http_metrics_port : getFreeTcpPort();
-            if (enable_http_metadata) {
-                http_metadata_port_ = http_metadata_port > 0
-                                          ? http_metadata_port
-                                          : getFreeTcpPort();
-            } else {
-                http_metadata_port_ = 0;
-            }
+            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
+                                                    : getFreeTcpPort();
+            http_metrics_port_ = config.http_metrics_port.has_value()
+                                     ? config.http_metrics_port.value()
+                                     : getFreeTcpPort();
+            http_metadata_port_ = config.http_metadata_port.has_value()
+                                      ? config.http_metadata_port.value()
+                                      : getFreeTcpPort();
 
             // Optional HTTP metadata server
-            if (enable_http_metadata) {
+            if (http_metadata_port_ > 0) {
                 meta_server_ = std::make_unique<HttpMetadataServer>(
                     static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
                 if (!meta_server_->start()) {
@@ -57,23 +57,35 @@ class InProcMaster {
                 server_->init_ibv();
             }
 
-            WrappedMasterServiceConfig cfg;
-            cfg.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
-            cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-            cfg.allow_evict_soft_pinned_objects = true;
-            cfg.enable_metric_reporting = false;
-            cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
-            cfg.eviction_high_watermark_ratio =
-                DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-            cfg.view_version = 0;
-            // Use default client_live_ttl_sec to align with production defaults
-            cfg.enable_ha = false;
-            cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
-            cfg.cluster_id = DEFAULT_CLUSTER_ID;
-            cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
-            cfg.memory_allocator = BufferAllocatorType::OFFSET;
+            uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+            if (config.default_kv_lease_ttl.has_value()) {
+                default_kv_lease_ttl = config.default_kv_lease_ttl.value();
+            } else if (const char* ttl_env =
+                           std::getenv("DEFAULT_KV_LEASE_TTL")) {
+                char* endptr = nullptr;
+                unsigned long parsed = std::strtoul(ttl_env, &endptr, 10);
+                if (endptr != ttl_env && endptr && *endptr == '\0') {
+                    default_kv_lease_ttl = static_cast<uint64_t>(parsed);
+                }
+            }
 
-            wrapped_ = std::make_unique<WrappedMasterService>(cfg);
+            WrappedMasterServiceConfig wms_cfg;
+            wms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
+            wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+            wms_cfg.allow_evict_soft_pinned_objects = true;
+            wms_cfg.enable_metric_reporting = false;
+            wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
+            wms_cfg.eviction_high_watermark_ratio =
+                DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+            wms_cfg.view_version = 0;
+            // Use default client_live_ttl_sec to align with production defaults
+            wms_cfg.enable_ha = false;
+            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
+            wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
+            wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
+            wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+
+            wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
             RegisterRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();

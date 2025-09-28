@@ -152,12 +152,6 @@ class Replica {
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
-            if (is_memory_replica()) {
-                auto& mem_data = std::get<MemoryReplicaData>(data_);
-                for (const auto& buf_ptr : mem_data.buffers) {
-                    buf_ptr->mark_complete();
-                }
-            }
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {

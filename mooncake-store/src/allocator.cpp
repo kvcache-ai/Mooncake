@@ -9,12 +9,19 @@
 
 namespace mooncake {
 
+std::string AllocatedBuffer::getSegmentName() const noexcept {
+    auto alloc = allocator_.lock();
+    if (alloc) {
+        return alloc->getSegmentName();
+    }
+    return std::string();
+}
+
 AllocatedBuffer::~AllocatedBuffer() {
     auto alloc = allocator_.lock();
     if (alloc) {
         alloc->deallocate(this);
-        VLOG(1) << "buf_handle_deallocated segment_name=" << segment_name_
-                << " size=" << size_;
+        VLOG(1) << "buf_handle_deallocated size=" << size_;
     } else {
         MasterMetricManager::instance().dec_allocated_size(size_);
         VLOG(1) << "allocator=expired_or_null in buf_handle_destructor";
@@ -23,28 +30,41 @@ AllocatedBuffer::~AllocatedBuffer() {
 
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
-    return {segment_name_, file_id_, static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), status};
+    auto alloc = allocator_.lock();
+    std::string endpoint;
+    FileBufferID file_id = 0;
+    if (alloc) {
+        endpoint = alloc->getTransportEndpoint();
+        file_id = alloc->getFileID();
+    } else {
+        LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
+    }
+    return {static_cast<uint64_t>(size()),
+            reinterpret_cast<uintptr_t>(buffer_ptr_), endpoint, file_id};
 }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
+    auto alloc = buffer.allocator_.lock();
     return os << "AllocatedBuffer: { "
-              << "segment_name: " << buffer.segment_name_ << ", "
-              << "file_id: " << buffer.file_id_ << ", "
+              << "segment_name: "
+              << (alloc ? alloc->getSegmentName() : std::string("<expired>"))
+              << ", "
               << "size: " << buffer.size() << ", "
-              << "status: " << buffer.status << ", "
-              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
+              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << ","
+              << "file_id: " << (alloc ? alloc->getFileID() : 0) << " }";
 }
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
+                                                 std::string transport_endpoint,
                                                  FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
+      transport_endpoint_(std::move(transport_endpoint)),
       file_id_(file_id) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
@@ -109,8 +129,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
             << " segment=" << segment_name_ << " address=" << buffer;
     cur_size_.fetch_add(size);
     MasterMetricManager::instance().inc_allocated_size(size);
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), segment_name_,
-                                             file_id_, buffer, size);
+    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -120,7 +139,6 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
             reinterpret_cast<uintptr_t>(handle->buffer_ptr_) +
             facebook::cachelib::Slab::kSize);
         memory_allocator_->free(buffer);
-        handle->status = BufStatus::UNREGISTERED;
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         cur_size_.fetch_sub(freed_size);
@@ -137,11 +155,13 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
+                                             std::string transport_endpoint,
                                              FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
+      transport_endpoint_(std::move(transport_endpoint)),
       file_id_(file_id) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
@@ -201,8 +221,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), segment_name_, file_id_, buffer_ptr, size,
-            std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
@@ -224,7 +243,6 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         // when the OffsetAllocationHandle goes out of scope
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
-        handle->status = BufStatus::UNREGISTERED;
         cur_size_.fetch_sub(freed_size);
         MasterMetricManager::instance().dec_allocated_size(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->data()

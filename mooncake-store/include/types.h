@@ -108,13 +108,16 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
 
     // Engine operation errors (Range: -700 to -799)
-    INVALID_WRITE = -700,          ///< Invalid write operation.
-    INVALID_READ = -701,           ///< Invalid read operation.
-    INVALID_REPLICA = -702,        ///< Invalid replica operation.
+    INVALID_WRITE = -700,    ///< Invalid write operation.
+    INVALID_READ = -701,     ///< Invalid read operation.
+    INVALID_REPLICA = -702,  ///< Invalid replica operation.
+
+    // Object errors (Range: -703 to -707)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
+    LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -197,29 +200,33 @@ struct Segment {
                          // hostname of the server that owns the segment
     uintptr_t base{0};
     size_t size{0};
+    std::string te_endpoint{};
     // For a file segment, this will be the path of the file.
     std::string path{};
     // For a file segment, this will be the id of the file buffer.
     FileBufferID file_id{0};
     Segment() = default;
     Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size)
+            size_t size, const std::string& te_endpoint)
         : id(id),
           type(SegmentType::MEMORY),
           name(name),
           base(base),
-          size(size) {}
+          size(size),
+          te_endpoint(te_endpoint) {}
     Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size, const std::string& path, FileBufferID file_id)
+            size_t size, const std::string& te_endpoint,
+            const std::string& path, FileBufferID file_id)
         : id(id),
           type(SegmentType::FILE),
           name(name),
           base(base),
           size(size),
+          te_endpoint(te_endpoint),
           path(path),
           file_id(file_id) {}
 };
-YLT_REFL(Segment, id, type, name, base, size, path, file_id);
+YLT_REFL(Segment, id, type, name, base, size, te_endpoint, path, file_id);
 
 /**
  * @brief Client status from the master's perspective
@@ -245,26 +252,6 @@ inline std::ostream& operator<<(std::ostream& os,
                                         : "UNKNOWN");
     return os;
 }
-
-/**
- * @brief Response structure for Ping operation
- */
-struct PingResponse {
-    ViewVersionId view_version_id;
-    ClientStatus client_status;
-
-    PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status)
-        : view_version_id(view_version), client_status(status) {}
-
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const PingResponse& response) noexcept {
-        return os << "PingResponse: { view_version_id: "
-                  << response.view_version_id
-                  << ", client_status: " << response.client_status << " }";
-    }
-};
-YLT_REFL(PingResponse, view_version_id, client_status);
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator

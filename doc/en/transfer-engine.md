@@ -62,11 +62,9 @@ To further maximize bandwidth utilization, if a single request's transfer is int
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
 ### Endpoint Management
-Mooncake Store employs a pair of end-
-points to represent the connection between a local RDMA
+Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint
-includes one or more RDMA queue pair objects. Connec-
-tions in Mooncake Store are established in an on demand manner;
+includes one or more RDMA queue pair objects. Connections in Mooncake Store are established in an on demand manner;
 endpoints remain unpaired until the first request is made.
 To prevent a large number of endpoints from slowing down
 request processing, Mooncake Store employs endpoint pooling,
@@ -82,8 +80,7 @@ Mooncake Store is designed to adeptly manage such temporary
 failures effectively. If a connection is identified as unavailable,
 Mooncake Store automatically identifies an alternative, reachable
 path and resubmits the request to a different RDMA NIC
-device. Furthermore, Mooncake Store is capable of detecting prob-
-lems with other RDMA resources, including RDMA contexts
+device. Furthermore, Mooncake Store is capable of detecting problems with other RDMA resources, including RDMA contexts
 and completion queues. It temporarily avoids using these
 resources until the issue, such as a downed link, is resolved.
 
@@ -443,3 +440,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.

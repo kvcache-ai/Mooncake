@@ -20,15 +20,14 @@ namespace testing {
 
 // Non-HA: client auto-reconnects to master and remounts segments
 TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
-    // Start master (auto-pick ports) and embedded HTTP metadata server
+    // Start master (auto-pick ports) without HTTP metadata server
     InProcMaster master;
-    ASSERT_TRUE(master.Start());
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
 
     // Create client (non-HA), mount a segment
-    std::string metadata_url = master.metadata_url();
     std::string local_hostname = "127.0.0.1:18001";
     std::string master_addr = master.master_address();
-    auto client_opt = Client::Create(local_hostname, metadata_url, "tcp",
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
@@ -57,9 +56,11 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
         << "Segment should not be visible after master stop";
 
     // Restart master on the same ports
-    ASSERT_TRUE(master.Start(master.rpc_port(), master.http_metrics_port(),
-                             /*enable_http_metadata=*/true,
-                             master.http_metadata_port()));
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder()
+                         .set_rpc_port(master.rpc_port())
+                         .set_http_metrics_port(master.http_metrics_port())
+                         .build()));
 
     // Wait until remount is reflected in master
     bool found = false;

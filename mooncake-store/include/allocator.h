@@ -5,7 +5,6 @@
 #include <limits>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.hpp"
@@ -20,33 +19,6 @@ namespace mooncake {
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
-/**
- * @brief Status of a buffer in the system
- */
-enum class BufStatus {
-    INIT = 0,      // Initial state
-    COMPLETE = 1,  // Complete state (buffer has been used)
-    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
-                 // to this state)
-    UNREGISTERED = 3,  // Buffer metadata has been deleted
-};
-
-/**
- * @brief Stream operator for BufStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const BufStatus& status) noexcept {
-    static const std::unordered_map<BufStatus, std::string_view> status_strings{
-        {BufStatus::INIT, "INIT"},
-        {BufStatus::COMPLETE, "COMPLETE"},
-        {BufStatus::FAILED, "FAILED"},
-        {BufStatus::UNREGISTERED, "UNREGISTERED"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
 // Forward declarations
 class BufferAllocatorBase;
 
@@ -58,13 +30,10 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, FileBufferID file_id,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
-          segment_name_(std::move(segment_name)),
-          file_id_(file_id),
           buffer_ptr_(buffer_ptr),
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
@@ -87,9 +56,7 @@ class AllocatedBuffer {
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] std::string getSegmentName() const noexcept {
-        return segment_name_;
-    }
+    [[nodiscard]] std::string getSegmentName() const noexcept;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -97,22 +64,16 @@ class AllocatedBuffer {
 
     // Represents the serializable state
     struct Descriptor {
-        std::string segment_name_;
-        FileBufferID file_id_;
         uint64_t size_;
         uintptr_t buffer_address_;
-        BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, file_id_, size_, buffer_address_,
-                 status_);
+        std::string transport_endpoint_;
+        FileBufferID file_id_;
+        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_,
+                 file_id_);
     };
-
-    void mark_complete() { status = BufStatus::COMPLETE; }
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    std::string segment_name_;
-    FileBufferID file_id_;
-    BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     // RAII handle for buffer allocated by offset allocator
@@ -133,6 +94,8 @@ class BufferAllocatorBase {
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual std::string getTransportEndpoint() const = 0;
+    virtual FileBufferID getFileID() const = 0;
 
     /**
      * Returns the largest free region available in this allocator.
@@ -173,6 +136,7 @@ class CachelibBufferAllocator
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            std::string transport_endpoint,
                             FileBufferID file_id = 0);
 
     ~CachelibBufferAllocator() override;
@@ -184,6 +148,10 @@ class CachelibBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+    FileBufferID getFileID() const override { return file_id_; }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -200,6 +168,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
     const FileBufferID file_id_;
 
     // metrics - removed allocated_bytes_ member
@@ -221,6 +190,7 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
+                          std::string transport_endpoint,
                           FileBufferID file_id = 0);
 
     ~OffsetBufferAllocator() override;
@@ -232,6 +202,10 @@ class OffsetBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+    FileBufferID getFileID() const override { return file_id_; }
 
     /**
      * Returns the actual largest free region from the offset allocator.
@@ -244,6 +218,7 @@ class OffsetBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
     const FileBufferID file_id_;
 
     // offset allocator implementation
