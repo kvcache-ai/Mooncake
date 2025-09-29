@@ -1,6 +1,8 @@
-# SGLang HiCache with Mooncake Backend
+# Complete Guide: SGLang HiCache with Mooncake Backend
 
 This document describes how to use Mooncake as the storage backend for SGLang HiCache.
+
+> Looking for a streamlined setup? Start with the [Quick Start guide](quick-start.md) and return here for deeper explanations and advanced configuration.
 
 ## Introduction
 
@@ -216,24 +218,76 @@ The following parameters control SGLang HiCache behavior when using Mooncake as 
   - `direct`: Standard CUDA memory copy operations
   - `kernel`: GPU-assisted I/O kernels (recommended for better performance)
 
-- **`--hicache-mem-layout {layer_first,page_first}`**: Memory layout for the host memory pool:
+- **`--hicache-mem-layout {layer_first,page_first,page_first_direct}`**: Memory layout for the host memory pool. `page_first` or `page_first_direct` are required if use Mooncake backend:
   - `layer_first`: Compatible with GPU computation kernels (default for GPU memory)
-  - `page_first`: Optimized for I/O efficiency (required if use Mooncake backend)
+  - `page_first`: Optimized for I/O efficiency
+  - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
 
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl}`**: Choose the storage backend for the L3 tier
+- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier
 
 - **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}`**: Control when prefetching from storage should stop:
   - `best_effort`: Prefetch as much as possible without blocking
   - `wait_complete`: Wait for prefetch to complete before proceeding
   - `timeout`: Use timeout-based prefetching (recommended for Mooncake)
 
-- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: JSON string containing extra configuration for the storage backend. For Mooncake, this can include parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc.
+- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: A JSON string that provides additional configuration options for the storage backend. This includes general parameters such as `prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, etc., as well as Mooncake-specific parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc. Mooncake-specific parameters can be configured either via environment variables or through this option.
 
 ### Distributed Deployment
 
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
+
+### Prefill/Decode Disaggregation
+
+In **PD disaggregation**, the configurations for the `metadata service`, `mooncake master`, and the optional `store service` remain the same as described above. The difference is that SGLang introduces three distinct roles: `prefill worker`, `decode worker`, and `router`.
+
+Among these, the `prefill worker` supports enabling **HiCache**. To run with PD disaggregation, start from the [PD configuration](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration-v1.html), and add the HiCache-related parameters (as previously described for the `SGLang server`) to the `prefill worker`.
+
+In the example below, one `prefill worker`, one `decode worker`, and one `router` are launched. HiCache is enabled on the `prefill worker` to optimize prefill performance.
+
+**Prefill worker**:
+
+```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="mlx5_1" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+python -m sglang.launch_server \
+    --model-path [model_path] \
+    --page-size 64 \
+    --enable-hierarchical-cache \
+    --hicache-storage-prefetch-policy timeout \
+    --hicache-storage-backend mooncake \
+    --disaggregation-mode prefill \
+    --disaggregation-ib-device "mlx5_1" \
+    --base-gpu-id 0 \
+    --port 30000
+```
+
+**Decode worker**:
+
+```bash
+python -m sglang.launch_server \
+    --model-path [model_path] \
+    --page-size 64 \
+    --disaggregation-mode decode \
+    --disaggregation-ib-device "mlx5_1" \
+    --base-gpu-id 1 \
+    --port 30001
+```
+
+**Router**:
+
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill "http://127.0.0.1:30000" \
+    --decode "http://127.0.0.1:30001" \
+    --host 0.0.0.0 \
+    --port 8000
+```
 
 ## Troubleshooting
 
