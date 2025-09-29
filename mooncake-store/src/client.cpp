@@ -236,6 +236,15 @@ ErrorCode Client::InitTransferEngine(
     const std::optional<std::shared_ptr<TransferEngine>> transfer_engine) {
     if (transfer_engine) {
         transfer_engine_ = transfer_engine.value();
+        if (local_hostname != transfer_engine_->getLocalIpAndPort()) {
+            LOG(ERROR)
+                << "the local_hostname should be consistent with the "
+                   "transfer engine local ip and port. local_hostname is "
+                << local_hostname
+                << ", but the transfer engine local ip and port is "
+                << transfer_engine_->getLocalIpAndPort();
+            return ErrorCode::INVALID_PARAMS;
+        }
     } else {
         // get auto_discover and filters from env
         std::optional<bool> env_auto_discover = get_auto_discover();
