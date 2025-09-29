@@ -39,6 +39,9 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#ifdef USE_NVMEOF_GENERIC
+#include "transport/nvmeof_generic_transport/nvmeof_transport.h"
+#endif
 
 #include <cassert>
 
@@ -250,6 +253,41 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
     return transport;
+}
+
+bool MultiTransport::transportNeedArgs(const std::string &proto) {
+#ifdef USE_NVMEOF_GENERIC
+    if (proto == "nvmeof_generic") {
+        return true;
+    }
+#endif
+    return false;
+}
+
+Transport *MultiTransport::installTransportWithArgs(const std::string &proto,
+                                                    void **args) {
+    std::shared_ptr<Transport> transport = nullptr;
+
+#ifdef USE_NVMEOF_GENERIC
+    if (proto == "nvmeof_generic") {
+        transport = std::make_shared<NVMeoFGenericTransport>();
+    }
+#endif
+
+    if (!transport) {
+        LOG(ERROR) << "Unsupported transport " << proto
+                   << ", please rebuild Mooncake";
+        return nullptr;
+    }
+
+    int rc = transport->installWithArgs(local_server_name_, metadata_, args);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to install transport " << proto << ", rc=" << rc;
+        return nullptr;
+    }
+
+    transport_map_[proto] = transport;
+    return transport.get();
 }
 
 Status MultiTransport::selectTransport(const TransferRequest &entry,

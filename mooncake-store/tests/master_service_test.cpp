@@ -35,6 +35,7 @@ class MasterServiceTest : public ::testing::Test {
                         size_t size = kDefaultSegmentSize) const {
         Segment segment;
         segment.id = generate_uuid();
+        segment.type = SegmentType::MEMORY;
         segment.name = std::move(name);
         segment.base = base;
         segment.size = size;
