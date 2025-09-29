@@ -51,8 +51,8 @@ endif()
 # Master binary
 add_executable(mooncake_master master.cpp)
 
-set(MASTER_EXTRA_INCS "")
-set(MASTER_EXTRA_LIBS "")
+set(MASTER_EXTRA_INCS)
+set(MASTER_EXTRA_LIBS)
 
 if (STORE_USE_JEMALLOC)
     find_package(PkgConfig REQUIRED)
