@@ -218,7 +218,7 @@ The following parameters control SGLang HiCache behavior when using Mooncake as 
   - `direct`: Standard CUDA memory copy operations
   - `kernel`: GPU-assisted I/O kernels (recommended for better performance)
 
-- **`--hicache-mem-layout {layer_first,page_first}`**: Memory layout for the host memory pool. `page_first` or `page_first_direct` are required if use Mooncake backend:
+- **`--hicache-mem-layout {layer_first,page_first,page_first_direct}`**: Memory layout for the host memory pool. `page_first` or `page_first_direct` are required if use Mooncake backend:
   - `layer_first`: Compatible with GPU computation kernels (default for GPU memory)
   - `page_first`: Optimized for I/O efficiency
   - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
