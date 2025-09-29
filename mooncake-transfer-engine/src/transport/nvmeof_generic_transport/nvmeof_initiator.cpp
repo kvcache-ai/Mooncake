@@ -15,8 +15,74 @@
 #include "transport/nvmeof_generic_transport/nvmeof_initiator.h"
 
 #include <fcntl.h>
+#include <unordered_set>
 
 namespace mooncake {
+static constexpr auto kMaxRescanDuration = std::chrono::seconds(15);
+
+static nvme_ctrl_t nvme_find_ctrl(nvme_root_t root, nvme_host_t host,
+                                  const std::string &trtype,
+                                  const std::string &traddr,
+                                  const std::string &trsvcid,
+                                  const std::string &subnqn) {
+    nvme_subsystem_t subsys;
+    nvme_ctrl_t ctrl;
+
+    // Scan the topology first.
+    nvme_scan_topology(root, NULL, NULL);
+
+    nvme_for_each_subsystem(host, subsys) {
+        nvme_subsystem_for_each_ctrl(subsys, ctrl) {
+            if (strcasecmp(nvme_ctrl_get_transport(ctrl), trtype.c_str())) {
+                continue;
+            }
+
+            if (strcmp(nvme_ctrl_get_traddr(ctrl), traddr.c_str())) {
+                continue;
+            }
+
+            if (strcmp(nvme_ctrl_get_trsvcid(ctrl), trsvcid.c_str())) {
+                continue;
+            }
+
+            if (strcmp(nvme_ctrl_get_subsysnqn(ctrl), subnqn.c_str())) {
+                continue;
+            }
+
+            return ctrl;
+        }
+    }
+
+    return nullptr;
+}
+
+static int nvme_get_active_ns_list(nvme_ctrl_t ctrl,
+                                   std::unordered_set<uint32_t> &ns_list) {
+    struct nvme_ns_list ns_list_ = {0};
+
+    int fd = nvme_ctrl_get_fd(ctrl);
+    if (fd < 0) {
+        LOG(ERROR) << "Invalid fd " << fd << " of controller "
+                   << nvme_ctrl_get_subsysnqn(ctrl);
+        return -EINVAL;
+    }
+
+    int rc = nvme_identify_active_ns_list(fd, 0, &ns_list_);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to identify active ns list of controller "
+                   << nvme_ctrl_get_subsysnqn(ctrl) << ", rc=" << rc;
+        return -EIO;
+    }
+
+    for (size_t i = 0; i < NVME_ID_NS_LIST_MAX; i++) {
+        if (ns_list_.ns[i] > 0) {
+            ns_list.insert(ns_list_.ns[i]);
+        }
+    }
+
+    return 0;
+}
+
 std::shared_ptr<NVMeoFInitiator> NVMeoFInitiator::create(bool direct_io) {
     auto initiator =
         std::shared_ptr<NVMeoFInitiator>(new NVMeoFInitiator(direct_io));
@@ -104,40 +170,9 @@ NVMeoFController::~NVMeoFController() {
     }
 }
 
-nvme_ctrl_t NVMeoFController::findCtrl() {
-    nvme_subsystem_t subsys;
-    nvme_ctrl_t ctrl;
-
-    // Scan the topology first.
-    nvme_scan_topology(initiator->root, NULL, NULL);
-
-    nvme_for_each_subsystem(initiator->host, subsys) {
-        nvme_subsystem_for_each_ctrl(subsys, ctrl) {
-            if (strcasecmp(nvme_ctrl_get_transport(ctrl), trtype.c_str())) {
-                continue;
-            }
-
-            if (strcmp(nvme_ctrl_get_traddr(ctrl), traddr.c_str())) {
-                continue;
-            }
-
-            if (strcmp(nvme_ctrl_get_trsvcid(ctrl), trsvcid.c_str())) {
-                continue;
-            }
-
-            if (strcmp(nvme_ctrl_get_subsysnqn(ctrl), subnqn.c_str())) {
-                continue;
-            }
-
-            return ctrl;
-        }
-    }
-
-    return nullptr;
-}
-
 int NVMeoFController::connect() {
-    ctrl = findCtrl();
+    ctrl = nvme_find_ctrl(initiator->root, initiator->host, trtype, traddr,
+                          trsvcid, subnqn);
     if (ctrl != nullptr) {
         // The controller has been connected.
         rescan();
@@ -161,9 +196,6 @@ int NVMeoFController::connect() {
     // We connected the controller, so we are responsible for disconnecting it.
     should_disconnect_ctrl = true;
 
-    // Wait a moment to ensure all namespaces are attached.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
     // Trigger rescan to open namespaces.
     rescan();
 
@@ -176,41 +208,100 @@ void NVMeoFController::rescan() {
         return;
     }
 
-    // Rescan the topology.
-    nvme_scan_topology(initiator->root, NULL, NULL);
-
     RWSpinlock::WriteGuard guard(ns_lock);
-    nvme_ns_t ns;
-    char ns_dev[64];
+    const auto rescan_timeout =
+        std::chrono::steady_clock::now() + kMaxRescanDuration;
 
-    nvme_ctrl_for_each_ns(ctrl, ns) {
-        auto nsid = static_cast<NamespaceID>(nvme_ns_get_nsid(ns));
-        auto it = namespaces.find(nsid);
-        if (it != namespaces.end() && it->second.fd >= 0) {
-            // Namespace has been open.
-            continue;
+    while (true) {
+        // Retrieve active namespace list via NVMe Identify command.
+        std::unordered_set<uint32_t> active_ns;
+        int rc = nvme_get_active_ns_list(ctrl, active_ns);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to get active ns list of controller "
+                       << nvme_ctrl_get_name(ctrl) << ", rc=" << rc;
+            break;
         }
 
-        const char *name = nvme_ns_get_name(ns);
-        int rc = snprintf(ns_dev, sizeof(ns_dev), "/dev/%s", name);
-        if (rc <= 0) {
-            LOG(ERROR) << "Invalid namespace device name " << name;
-            continue;
+        // Remove invalid namespaces.
+        auto it = namespaces.begin();
+        while (it != namespaces.end()) {
+            if (!active_ns.contains(it->first)) {
+                it = namespaces.erase(it);
+            } else {
+                it++;
+            }
         }
 
-        int flags = O_RDWR;
-        if (initiator->direct_io) flags |= O_DIRECT;
-
-        int fd = open(ns_dev, flags);
-        if (fd < 0) {
-            LOG(ERROR) << "Failed to open nvme namespace " << ns_dev
-                       << ", errno=" << errno;
-            continue;
+        // Scan controller sysfs directory to get attached namespaces.
+        struct dirent **ns_dirents = NULL;
+        int num_ns_dirents = nvme_scan_ctrl_namespaces(ctrl, &ns_dirents);
+        if (num_ns_dirents < 0) {
+            LOG(ERROR) << "Failed to scan namespaces of controller "
+                       << nvme_ctrl_get_name(ctrl) << ", errno=" << errno;
+            break;
         }
 
-        LOG(INFO) << "Added namespace " << nsid << " to controller "
-                  << nvme_ctrl_get_name(ctrl);
-        namespaces[nsid] = {nsid, fd};
+        // Open namespace block devices.
+        for (int i = 0; i < num_ns_dirents; i++) {
+            char ns_dev[256];
+            rc = snprintf(ns_dev, sizeof(ns_dev), "/dev/%s",
+                          ns_dirents[i]->d_name);
+            if (rc <= 0) {
+                LOG(ERROR) << "Invalid namespace device name "
+                           << ns_dirents[i]->d_name;
+                continue;
+            }
+
+            int flags = O_RDWR;
+            if (initiator->direct_io) flags |= O_DIRECT;
+
+            int fd = open(ns_dev, flags);
+            if (fd < 0) {
+                LOG(ERROR) << "Failed to open nvme namespace " << ns_dev
+                           << ", errno=" << errno;
+                continue;
+            }
+
+            uint32_t nsid;
+            rc = nvme_get_nsid(fd, &nsid);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to get nsid of namespace "
+                           << ns_dirents[i]->d_name << ", errno=" << errno;
+                close(fd);
+                continue;
+            }
+
+            if (namespaces.contains(nsid) && namespaces[nsid].fd >= 0) {
+                // The namespace has been open.
+                close(fd);
+                continue;
+            }
+
+            LOG(INFO) << "Added namespace " << nsid << " of controller "
+                      << nvme_ctrl_get_name(ctrl);
+            namespaces[nsid] = {nsid, fd};
+        }
+
+        // Free dirents.
+        for (int i = 0; i < num_ns_dirents; i++) {
+            free(ns_dirents[i]);
+        }
+        free(ns_dirents);
+
+        // Check if all active namespaces are open.
+        if (namespaces.size() == active_ns.size()) {
+            break;
+        }
+
+        if (std::chrono::steady_clock::now() >= rescan_timeout) {
+            LOG(ERROR) << "Timedout to wait for namespaces of " << subnqn
+                       << " to be attached, expected " << active_ns.size()
+                       << ", attached " << namespaces.size();
+            break;
+        }
+
+        // Wait a moment for namespaces to be attached.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 

@@ -81,8 +81,6 @@ class NVMeoFController : public std::enable_shared_from_this<NVMeoFController> {
                      const std::string &traddr, const std::string &trsvcid,
                      const std::string &subnqn);
 
-    nvme_ctrl_t findCtrl();
-
     int connect();
 
     int disconnect();
