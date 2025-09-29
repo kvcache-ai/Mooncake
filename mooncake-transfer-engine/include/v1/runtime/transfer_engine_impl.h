@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TRANSFER_ENGINE_V1_H_
-#define TRANSFER_ENGINE_V1_H_
+#ifndef TRANSFER_ENGINE_IMPL_H_
+#define TRANSFER_ENGINE_IMPL_H_
 
 #include <array>
 #include <cstddef>
@@ -28,24 +28,35 @@
 #include "v1/common/config.h"
 #include "v1/common/status.h"
 #include "v1/common/types.h"
+#include "v1/common/concurrent/thread_local_storage.h"
 
 namespace mooncake {
 namespace v1 {
-class TransferEngineImpl;
-class TransferEngine {
+
+class Batch;
+class BatchSet;
+class Topology;
+class Transport;
+class SegmentDesc;
+class AllocatedMemory;
+class ControlService;
+class SegmentTracker;
+class Platform;
+
+class TransferEngineImpl {
    public:
-    TransferEngine();
+    TransferEngineImpl();
 
-    TransferEngine(std::shared_ptr<ConfigManager> config);
+    TransferEngineImpl(std::shared_ptr<ConfigManager> config);
 
-    ~TransferEngine();
+    ~TransferEngineImpl();
 
-    TransferEngine(const TransferEngine &) = delete;
+    TransferEngineImpl(const TransferEngineImpl &) = delete;
 
-    TransferEngine &operator=(const TransferEngine &) = delete;
+    TransferEngineImpl &operator=(const TransferEngineImpl &) = delete;
 
    public:
-    bool available() const;
+    bool available() const { return available_; }
 
     const std::string getSegmentName() const;
 
@@ -104,7 +115,56 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, TransferStatus &overall_status);
 
    private:
-    std::unique_ptr<TransferEngineImpl> impl_;
+    Status construct();
+
+    Status deconstruct();
+
+    Status setupLocalSegment();
+
+    Status lazyFreeBatch();
+
+    TransportType getTransportType(const Request &request, int priority = 0);
+
+    std::vector<TransportType> getSupportedTransports(
+        TransportType request_type);
+
+    Status resubmitTransferTask(Batch *batch, size_t task_id);
+
+    TransportType resolveTransport(const Request &req, int priority,
+                                   bool invalidate_on_fail = true);
+
+   private:
+    struct AllocatedMemory {
+        void *addr;
+        size_t size;
+        Transport *transport;
+        MemoryOptions options;
+    };
+
+    struct BatchSet {
+        std::unordered_set<Batch *> active;
+        std::vector<Batch *> freelist;
+    };
+
+   private:
+    std::shared_ptr<ConfigManager> conf_;
+    std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<Topology> topology_;
+    bool available_;
+
+    std::array<std::unique_ptr<Transport>, kSupportedTransportTypes>
+        transport_list_;
+    std::unique_ptr<SegmentTracker> local_segment_tracker_;
+
+    ThreadLocalStorage<BatchSet> batch_set_;
+
+    std::vector<AllocatedMemory> allocated_memory_;
+    std::mutex mutex_;
+
+    std::string hostname_;
+    uint16_t port_;
+    bool ipv6_;
+    std::string local_segment_name_;
 };
 }  // namespace v1
 }  // namespace mooncake

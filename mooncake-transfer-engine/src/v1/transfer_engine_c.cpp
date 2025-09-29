@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/transfer_engine_inl.h"
+#include "v1/transfer_engine_c.h"
 
 #include <glog/logging.h>
 
-#include "v1/transfer_engine.h"
+#include "v1/runtime/transfer_engine_impl.h"
 
-#define CAST(ptr) ((mooncake::v1::TransferEngine *)ptr)
+#define CAST(ptr) ((mooncake::v1::TransferEngineImpl *)ptr)
 #define CHECK_POINTER(ptr)                       \
     if (!ptr) {                                  \
         LOG(ERROR) << "Invalid argument: " #ptr; \
@@ -48,7 +48,7 @@ mc_engine_t mc_create_engine() {
         }
     }
     for (auto &attr : tl_settings.attrs) config->set(attr.first, attr.second);
-    auto engine = new mooncake::v1::TransferEngine(config);
+    auto engine = new mooncake::v1::TransferEngineImpl(config);
     return (mc_engine_t)engine;
 }
 

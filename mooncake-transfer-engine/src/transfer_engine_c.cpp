@@ -271,7 +271,6 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg) {
     if (g_enable_v1) return -1;
-    uint64_t target_id = entries[0].target_id;
     int rc = submitTransfer(engine, batch_id, entries, count);
     if (rc) {
         return rc;
