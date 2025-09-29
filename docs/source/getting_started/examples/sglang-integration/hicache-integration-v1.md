@@ -230,7 +230,7 @@ The following parameters control SGLang HiCache behavior when using Mooncake as 
   - `wait_complete`: Wait for prefetch to complete before proceeding
   - `timeout`: Use timeout-based prefetching (recommended for Mooncake)
 
-- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: JSON string containing extra configuration for the storage backend. This includes general parameters like `prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, etc., and Mooncake-specific parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc.
+- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: A JSON string that provides additional configuration options for the storage backend. This includes general parameters such as `prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, etc., as well as Mooncake-specific parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc. Mooncake-specific parameters can be configured either via environment variables or through this option.
 
 ### Distributed Deployment
 
