@@ -158,16 +158,6 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     const std::optional<std::shared_ptr<TransferEngine>> transfer_engine) {
     this->protocol = protocol;
 
-    if (transfer_engine &&
-        local_hostname != transfer_engine.value()->getLocalIpAndPort()) {
-        LOG(ERROR) << "the local_hostname should be consistent with the "
-                      "transfer engine local ip and port. local_hostname is "
-                   << local_hostname
-                   << ", but the transfer engine local ip and port is "
-                   << transfer_engine.value()->getLocalIpAndPort();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
     size_t colon_pos = hostname.find(":");
