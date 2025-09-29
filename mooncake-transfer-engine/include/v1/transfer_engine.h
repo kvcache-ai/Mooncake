@@ -25,16 +25,18 @@
 #include <unordered_set>
 #include <vector>
 
-#include "v1/common/config.h"
 #include "v1/common/status.h"
 #include "v1/common/types.h"
 
 namespace mooncake {
 namespace v1 {
 class TransferEngineImpl;
+class ConfigManager;
 class TransferEngine {
    public:
     TransferEngine();
+
+    TransferEngine(const std::string config_path);
 
     TransferEngine(std::shared_ptr<ConfigManager> config);
 

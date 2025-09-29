@@ -1,2 +1,19 @@
-file(GLOB TEV1_XPORT_RDMA_SOURCES "*.cpp")
-add_library(transport_rdma_v1 OBJECT ${TEV1_XPORT_RDMA_SOURCES})
+find_library(IBVERBS_LIB ibverbs PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
+find_path(IBVERBS_INCLUDE infiniband/verbs.h PATHS /usr/include /usr/local/include)
+
+if (IBVERBS_LIB AND IBVERBS_INCLUDE)
+    message(STATUS "Found RDMA (libibverbs) at ${IBVERBS_LIB}")
+
+    file(GLOB TEV1_XPORT_RDMA_SOURCES "*.cpp")
+
+    add_library(transport_rdma_obj OBJECT ${TEV1_XPORT_RDMA_SOURCES})
+    target_include_directories(transport_rdma_obj PUBLIC ${IBVERBS_INCLUDE})
+
+    add_library(transport_rdma_static STATIC $<TARGET_OBJECTS:transport_rdma_obj>)
+    target_link_libraries(transport_rdma_static PUBLIC ${IBVERBS_LIB})
+
+    add_library(transport_rdma_shared SHARED $<TARGET_OBJECTS:transport_rdma_obj>)
+    target_link_libraries(transport_rdma_shared PUBLIC ${IBVERBS_LIB})
+else()
+    message(STATUS "RDMA (libibverbs) not found, skipping transport_rdma")
+endif()

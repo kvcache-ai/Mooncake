@@ -1,12 +1,16 @@
-file(GLOB TEV1_RUNTIME_SOURCES "*.cpp")
-add_library(runtime_v1 OBJECT ${TEV1_RUNTIME_SOURCES})
+file(GLOB TENT_RUNTIME_SOURCES "*.cpp")
+add_library(tent_runtime OBJECT ${TENT_RUNTIME_SOURCES})
 
-if (USE_ETCD)
-  target_link_libraries(runtime_v1 PUBLIC etcd)
+if (TARGET redis_static)
+  target_link_libraries(tent_runtime PUBLIC redis_static)
 endif()
-if (USE_HTTP)
-  target_link_libraries(runtime_v1 PUBLIC http)
+
+if (TARGET http_static)
+  target_link_libraries(tent_runtime PUBLIC http_static)
 endif()
-if (USE_REDIS)
-  target_link_libraries(runtime_v1 PUBLIC redis)
+
+if (TARGET etcd_static)
+  target_link_libraries(tent_runtime PUBLIC etcd_static)
 endif()
+
+target_link_libraries(tent_runtime PUBLIC tent_common tent_rpc platform_all transport_all)

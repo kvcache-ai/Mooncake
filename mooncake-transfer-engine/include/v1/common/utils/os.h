@@ -30,8 +30,11 @@
 #include <sstream>
 #include <thread>
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define PAUSE() _mm_pause()
+#else
+#define PAUSE()
 #endif
 
 namespace mooncake {

@@ -31,6 +31,7 @@
 #include "transport/transport.h"
 
 #include "v1/transfer_engine.h"
+#include "v1/common/config.h"
 
 using namespace mooncake;
 

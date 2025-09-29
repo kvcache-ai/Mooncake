@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include "v1/transfer_engine.h"
+#include "v1/common/config.h"
 #include "v1/runtime/transfer_engine_impl.h"
+#include <glog/logging.h>
 
 namespace mooncake {
 namespace v1 {
@@ -21,14 +23,21 @@ namespace v1 {
 TransferEngine::TransferEngine()
     : impl_(std::make_unique<TransferEngineImpl>()) {}
 
+TransferEngine::TransferEngine(const std::string config_path) {
+    auto conf = std::make_shared<ConfigManager>();
+    auto status = conf->loadConfig(config_path);
+    if (!status.ok()) {
+        LOG(WARNING) << "Failed to read config file " << config_path;
+    }
+    impl_ = std::make_unique<TransferEngineImpl>(conf);
+}
+
 TransferEngine::TransferEngine(std::shared_ptr<ConfigManager> conf)
     : impl_(std::make_unique<TransferEngineImpl>(conf)) {}
 
 TransferEngine::~TransferEngine() {}
 
-bool TransferEngine::available() const {
-    return impl_->available();
-}
+bool TransferEngine::available() const { return impl_->available(); }
 
 const std::string TransferEngine::getSegmentName() const {
     return impl_->getSegmentName();

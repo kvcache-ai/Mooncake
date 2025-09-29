@@ -19,6 +19,7 @@
 #include <thread>
 
 #include "v1/common/types.h"
+#include "v1/common/utils/os.h"
 
 namespace mooncake {
 namespace v1 {

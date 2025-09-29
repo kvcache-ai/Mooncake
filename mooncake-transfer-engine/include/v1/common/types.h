@@ -22,18 +22,6 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__x86_64__)
-#include <immintrin.h>
-#define PAUSE() _mm_pause()
-#else
-#define PAUSE()
-#endif
-
-#ifndef likely
-#define likely(x) __glibc_likely(x)
-#define unlikely(x) __glibc_unlikely(x)
-#endif
-
 namespace mooncake {
 namespace v1 {
 

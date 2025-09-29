@@ -30,6 +30,10 @@
 #include "v1/common/utils/os.h"
 #include "v1/common/utils/random.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #define CHECK_FAIL(call)                                        \
     do {                                                        \
         auto status_ = call;                                    \
