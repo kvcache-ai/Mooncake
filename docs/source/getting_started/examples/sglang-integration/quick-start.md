@@ -57,7 +57,7 @@ MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
 ### Decode worker
 
 ```bash
-MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
+python -m sglang.launch_server \
     --model-path [model_path] \
     --page-size 64 \
     --disaggregation-mode decode \
