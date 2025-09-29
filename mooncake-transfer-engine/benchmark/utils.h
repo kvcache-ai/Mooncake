@@ -135,6 +135,14 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats);
 
+#ifdef USE_CUDA
+static inline bool isCudaMemory(void *ptr) {
+    cudaPointerAttributes attr;
+    auto ret = cudaPointerGetAttributes(&attr, ptr);
+    return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
+}
+#endif
+
 static inline uint8_t fillData(void *addr, size_t length) {
     uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
 #ifdef USE_CUDA

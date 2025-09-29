@@ -88,16 +88,6 @@ static inline std::string getCurrentDateTime() {
     return oss.str();
 }
 
-#ifdef USE_CUDA
-static inline bool isCudaMemory(void *ptr) {
-    cudaPointerAttributes attr;
-    auto ret = cudaPointerGetAttributes(&attr, ptr);
-    return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
-}
-#else
-static inline bool isCudaMemory(void *ptr) { return false; }
-#endif
-
 }  // namespace v1
 }  // namespace mooncake
 

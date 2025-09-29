@@ -337,8 +337,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                 engine_v1_->freeBatch(batch_id);
                 return -1;
             }
-            if (status.s == mooncake::v1::PENDING)
-                continue;
+            if (status.s == mooncake::v1::PENDING) continue;
             engine_v1_->freeBatch(batch_id);
             if (status.s == mooncake::v1::COMPLETED) {
                 return 0;
@@ -465,8 +464,7 @@ int TransferEnginePy::batchTransferSync(
                 engine_v1_->freeBatch(batch_id);
                 return -1;
             }
-            if (status.s == mooncake::v1::PENDING)
-                continue;
+            if (status.s == mooncake::v1::PENDING) continue;
             engine_v1_->freeBatch(batch_id);
             if (status.s == mooncake::v1::COMPLETED) {
                 return 0;
@@ -648,8 +646,7 @@ int TransferEnginePy::getBatchTransferStatus(
                     engine_v1_->freeBatch(batch_id);
                     return -1;
                 }
-                if (status.s == mooncake::v1::PENDING)
-                    continue;
+                if (status.s == mooncake::v1::PENDING) continue;
                 if (status.s == mooncake::v1::COMPLETED) {
                     engine_v1_->freeBatch(batch_id);
                     completed = true;

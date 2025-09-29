@@ -124,7 +124,7 @@ class LocationParser {
     int index_;
 };
 
-struct MemoryLocationEntry {
+struct RangeLocation {
     uint64_t start;
     size_t len;
     std::string location;

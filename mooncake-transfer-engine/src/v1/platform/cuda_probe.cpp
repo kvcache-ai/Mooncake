@@ -285,10 +285,10 @@ static inline std::string genCudaNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<MemoryLocationEntry> CudaPlatform::getLocation(void *start,
-                                                                size_t len) {
+const std::vector<RangeLocation> CudaPlatform::getLocation(void *start,
+                                                           size_t len) {
     const static size_t kPageSize = 4096;
-    std::vector<MemoryLocationEntry> entries;
+    std::vector<RangeLocation> entries;
 
     cudaPointerAttributes attributes;
     cudaError_t result;
@@ -308,7 +308,8 @@ const std::vector<MemoryLocationEntry> CudaPlatform::getLocation(void *start,
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
-    int n = (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
+    int n =
+        (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
     void **pages = (void **)malloc(sizeof(void *) * n);
     int *status = (int *)malloc(sizeof(int) * n);
 

@@ -487,7 +487,9 @@ TransportType TransferEngine::getTransportType(const Request &request,
         if (!status.ok()) return UNSPEC;
     }
     if (desc->type == SegmentType::File) {
-        if (isCudaMemory(request.source) && transport_list_[GDS]) {
+        auto location =
+            Platform::getLoader().getLocation(request.source, 1)[0].location;
+        if (LocationParser(location).type() == "cuda" && transport_list_[GDS]) {
             if (priority-- == 0) return GDS;
         }
         if (transport_list_[IOURING]) {

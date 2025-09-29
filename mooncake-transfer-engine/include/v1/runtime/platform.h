@@ -34,8 +34,8 @@ class Platform {
 
     virtual Status copy(void *dst, void *src, size_t length) = 0;
 
-    virtual const std::vector<MemoryLocationEntry> getLocation(void *start,
-                                                               size_t len) = 0;
+    virtual const std::vector<RangeLocation> getLocation(void *start,
+                                                         size_t len) = 0;
 };
 
 }  // namespace v1

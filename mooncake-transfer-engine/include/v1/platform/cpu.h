@@ -35,8 +35,8 @@ class CpuPlatform : public Platform {
 
     virtual Status copy(void *dst, void *src, size_t length);
 
-    virtual const std::vector<MemoryLocationEntry> getLocation(void *start,
-                                                               size_t len);
+    virtual const std::vector<RangeLocation> getLocation(void *start,
+                                                         size_t len);
 
    private:
     std::shared_ptr<ConfigManager> conf;

@@ -170,10 +170,10 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<MemoryLocationEntry> CpuPlatform::getLocation(void *start,
-                                                                size_t len) {
+const std::vector<RangeLocation> CpuPlatform::getLocation(void *start,
+                                                          size_t len) {
     const static size_t kPageSize = 4096;
-    std::vector<MemoryLocationEntry> entries;
+    std::vector<RangeLocation> entries;
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
