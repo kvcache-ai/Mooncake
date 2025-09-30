@@ -159,7 +159,7 @@ size_t Topology::getNicCount(NicType type) const {
 }
 
 size_t Topology::getMemCount(MemType type) const {
-    if (type == MEM_UNKNOWN) return nic_list_.size();
+    if (type == MEM_UNKNOWN) return mem_list_.size();
     size_t count = 0;
     for (auto &entry : mem_list_) {
         if (entry.type == type) count++;

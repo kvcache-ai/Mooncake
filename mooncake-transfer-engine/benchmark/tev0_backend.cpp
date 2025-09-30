@@ -23,7 +23,20 @@
 namespace mooncake {
 namespace v1 {
 
-int getCudaDeviceNumaID(int cuda_id);
+#ifdef USE_CUDA
+static inline int getCudaDeviceNumaID(int cuda_id) {
+    char pci_bus_id[20];
+    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_id);
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
+        return 0;
+    }
+    for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+}
+#else
+static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
+#endif
 
 volatile bool g_tev0_running = true;
 volatile bool g_tev0_triggered_sig = false;
