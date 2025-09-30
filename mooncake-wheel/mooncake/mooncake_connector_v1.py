@@ -3,11 +3,12 @@ Usage:
 Adding the following params to vllm command:
 Prefill: --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer", "kv_connector_module_path":"mooncake.mooncake_connector_v1"}'
 Decode: --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer", "kv_connector_module_path":"mooncake.mooncake_connector_v1"}'
-Proxy: Running tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
+Proxy: Running vllm_v1_proxy_server.py
 """
 
 import contextlib
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ from os import getenv
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
+import numpy as np
 import torch
 import zmq
 
@@ -45,6 +47,8 @@ ReqId = str
 TRANS_DONE = b"trans_done"
 
 logger = init_logger(__name__)
+VLLM_MOONCAKE_SIDE_CHANNEL_PORT = int(getenv("VLLM_MOONCAKE_SIDE_CHANNEL_PORT", 6557))
+VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT = int(getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 120))
 
 
 class MooncakeAgentMetadata(
@@ -70,6 +74,7 @@ class RecvReqMeta:
 class SendBlockMeta:
     local_block_ids: list[int]
     ready: threading.Event
+    expire_time: float = float("inf")
 
 
 @dataclass
@@ -194,7 +199,7 @@ class MooncakeConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.side_channel_host = get_ip()
         self.side_channel_port = (
-            int(getenv("VLLM_MOONCAKE_SIDE_CHANNEL_PORT", 6557)) +
+            VLLM_MOONCAKE_SIDE_CHANNEL_PORT +
             vllm_config.parallel_config.data_parallel_rank *
             vllm_config.parallel_config.tensor_parallel_size)
 
@@ -381,7 +386,7 @@ class MooncakeConnectorWorker:
 
         # Mooncake handshake port.
         self.side_channel_port: int = (
-            int(getenv("VLLM_MOONCAKE_SIDE_CHANNEL_PORT", 6557)) +
+            VLLM_MOONCAKE_SIDE_CHANNEL_PORT +
             vllm_config.parallel_config.data_parallel_rank *
             vllm_config.parallel_config.tensor_parallel_size)
 
@@ -486,6 +491,8 @@ class MooncakeConnectorWorker:
                     logger.warning("Request %s not found in reqs_need_send",
                                    req_id)
                     return
+                # Mark it as not expired. We will send it now.
+                send_meta.expire_time = float("inf")
                 send_reqs.append((req_id, send_meta))
 
         self._send_blocks(send_reqs, meta)
@@ -524,15 +531,19 @@ class MooncakeConnectorWorker:
             if num_local_blocks > num_remote_blocks:
                 local_block_ids = local_block_ids[-num_remote_blocks:]
 
+            # Group by indices
+            group_local_block_ids, group_remote_block_ids = group_concurrent_contiguous(
+                local_block_ids, remote_block_ids)
+
             for local_layer_addr, remote_layer_addr in zip(
                     local_base_addr, remote_base_addr):
-                for local_block_id, remote_block_id in zip(
-                        local_block_ids, remote_block_ids):
+                for group_local_block_id, group_remote_block_id in zip(
+                        group_local_block_ids, group_remote_block_ids):
                     src_ptrs.append(local_layer_addr +
-                                    local_block_id * block_len)
+                                    group_local_block_id[0] * block_len)
                     dst_ptrs.append(remote_layer_addr +
-                                    remote_block_id * block_len)
-                    lengths.append(block_len)
+                                    group_remote_block_id[0] * block_len)
+                    lengths.append(block_len * len(group_local_block_id))
 
             logger.debug("Sending kv_caches for request %s (%d blocks) to %s",
                          req_id, num_remote_blocks, remote_session)
@@ -629,6 +640,23 @@ class MooncakeConnectorWorker:
                 "and %s requests done recving", self.tp_rank,
                 len(finished_sending_reqs), len(finished_recving_reqs))
 
+        # Handle timeout to avoid stranding blocks on remote.
+        now = time.perf_counter()
+        with self.reqs_need_send.lock:
+            expired_reqs = [
+                req_id
+                for req_id, send_meta in self.reqs_need_send.reqs.items()
+                if send_meta.expire_time < now
+            ]
+            for req_id in expired_reqs:
+                logger.warning(
+                    "Request %s timed out after %d seconds without "
+                    "being sent. Freeing its blocks on the producer side.",
+                    req_id, VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT)
+                del self.reqs_need_send.reqs[req_id]
+            if expired_reqs:
+                finished_sending_reqs.update(expired_reqs)
+
         return finished_sending_reqs or None, finished_recving_reqs or None
 
     def receive_kv(self, path: str, req_blocks: list[tuple[str, list[int]]]):
@@ -682,12 +710,14 @@ class MooncakeConnectorWorker:
 
         if self.kv_role != "kv_consumer":
             with self.reqs_need_send.lock:
-                for req_id, send_meta in metadata.reqs_to_send.items():
-                    if send_meta:
+                for req_id, block_ids in metadata.reqs_to_send.items():
+                    if block_ids:
                         # Already gone through request_finished()
-                        self.reqs_need_send.reqs[
-                            req_id].local_block_ids = send_meta
-                        self.reqs_need_send.reqs[req_id].ready.set()
+                        send_meta = self.reqs_need_send.reqs[req_id]
+                        send_meta.local_block_ids = block_ids
+                        send_meta.ready.set()
+                        send_meta.expire_time = time.perf_counter(
+                        ) + VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                     else:
                         # From update_state_after_alloc(),
                         # but not reach request_finished() yet
@@ -712,3 +742,21 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
     finally:
         if ctx is not None:
             ctx.destroy(linger=0)
+
+
+def group_concurrent_contiguous(
+        src_indices: list[int],
+        dst_indices: list[int]) -> tuple[list[list[int]], list[list[int]]]:
+    """Vectorised NumPy implementation."""
+    if len(src_indices) == 0:
+        return [], []
+
+    brk = np.where((np.diff(src_indices) != 1)
+                   | (np.diff(dst_indices) != 1))[0] + 1
+    src_groups = np.split(src_indices, brk)
+    dst_groups = np.split(dst_indices, brk)
+
+    src_groups = [g.tolist() for g in src_groups]
+    dst_groups = [g.tolist() for g in dst_groups]
+
+    return src_groups, dst_groups

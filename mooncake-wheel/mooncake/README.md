@@ -22,7 +22,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --port 8020 --kv-transfer-config '{"kv_conne
 
 #### Proxy
 ```bash
-python {your_vllm_path}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py --prefiller-host 192.168.0.2 --prefiller-port 8010 --decoder-host 192.168.0.3 --decoder-port 8020
+python -m mooncake.vllm_v1_proxy_server --prefiller-host 192.168.0.2 --prefiller-port 8010 --decoder-host 192.168.0.3 --decoder-port 8020
 ```
 
 Now you can send requests to the proxy server on default port 8000.
