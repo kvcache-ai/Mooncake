@@ -258,6 +258,9 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
         config.enable_dest_device_affinity = true;
     }
+    if (std::getenv("MC_ALLOC_SAME_NODE_FIRST")) {
+        config.alloc_same_node_first = true;
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

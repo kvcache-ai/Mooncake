@@ -239,7 +239,7 @@ class Client {
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
-        return transfer_engine_.getLocalIpAndPort();
+        return transfer_engine_->getLocalIpAndPort();
     }
 
    private:
@@ -300,11 +300,20 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
+    void StartBatchPutWhenSameNodeFirst(std::vector<PutOperation>& ops,
+                                        const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenSameNodeFirst(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenSameNodeFirst(
+        const std::vector<std::string>& object_keys,
+        const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

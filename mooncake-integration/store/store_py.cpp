@@ -546,7 +546,57 @@ PYBIND11_MODULE(store, m) {
             py::arg("config") = ReplicateConfig{})
         .def("get_hostname", [](MooncakeStorePyWrapper &self) {
             return self.store_->get_hostname();
-        });
+        })
+        .def(
+            "batch_put_from_multi_buffers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                std::vector<std::vector<void *>> all_buffers;
+                all_buffers.reserve(all_buffer_ptrs.size());
+                for (auto &buffer_ptrs : all_buffer_ptrs) {
+                    std::vector<void *> ptrs;
+                    ptrs.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        ptrs.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    all_buffers.emplace_back(std::move(ptrs));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_multi_buffers(
+                    keys, all_buffers, all_sizes, config);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from multiple pre-allocated buffers for "
+            "multiple "
+            "keys")
+        .def(
+            "batch_get_into_multi_buffers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes) {
+                std::vector<std::vector<void *>> all_buffers;
+                all_buffers.reserve(all_buffer_ptrs.size());
+                for (auto &buffer_ptrs : all_buffer_ptrs) {
+                    std::vector<void *> ptrs;
+                    ptrs.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        ptrs.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    all_buffers.emplace_back(std::move(ptrs));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers(
+                    keys, all_buffers, all_sizes);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            "Get object data directly into multiple pre-allocated buffers for "
+            "multiple "
+            "keys");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

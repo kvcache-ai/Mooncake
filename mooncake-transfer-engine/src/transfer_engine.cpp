@@ -27,7 +27,7 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-
+__attribute__ ((visibility ("default"))) std::shared_ptr<TransferEngine> g_transfer_engine = nullptr;
 static bool setFilesLimit() {
     struct rlimit filesLimit;
     if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
