@@ -15,6 +15,11 @@ if (CUDAToolkit_FOUND AND CUFILE_LIB AND CUFILE_INCLUDE)
 
     add_library(transport_gds_shared SHARED $<TARGET_OBJECTS:transport_gds_obj>)
     target_link_libraries(transport_gds_shared PUBLIC CUDA::cuda_driver CUDA::cudart ${CUFILE_LIB})
+
+    install(TARGETS transport_gds_static transport_gds_shared
+        ARCHIVE DESTINATION lib/transport
+        LIBRARY DESTINATION lib/transport
+        RUNTIME DESTINATION bin)
 else()
     message(STATUS "Platform gds: excluded")
 endif()

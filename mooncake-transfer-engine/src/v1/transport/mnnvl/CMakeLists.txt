@@ -10,6 +10,11 @@ if (CUDAToolkit_FOUND)
 
     add_library(transport_mnnvl_shared SHARED $<TARGET_OBJECTS:transport_mnnvl_obj>)
     target_link_libraries(transport_mnnvl_shared PUBLIC CUDA::cuda_driver CUDA::cudart)
+
+    install(TARGETS transport_mnnvl_static transport_mnnvl_shared
+        ARCHIVE DESTINATION lib/transport
+        LIBRARY DESTINATION lib/transport
+        RUNTIME DESTINATION bin)
 else()
     message(STATUS "Transport mnnvl: excluded")
 endif()

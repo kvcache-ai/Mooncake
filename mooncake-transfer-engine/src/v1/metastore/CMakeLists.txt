@@ -23,8 +23,8 @@ function(add_metastore_module name)
 
     install(TARGETS ${name}_static ${name}_shared
             EXPORT metastoreTargets
-            ARCHIVE DESTINATION lib
-            LIBRARY DESTINATION lib
+            ARCHIVE DESTINATION lib/metastore
+            LIBRARY DESTINATION lib/metastore
             RUNTIME DESTINATION bin)
 endfunction()
 

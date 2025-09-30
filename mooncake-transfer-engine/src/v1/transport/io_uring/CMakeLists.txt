@@ -19,6 +19,11 @@ if (URING_LIB AND URING_INCLUDE)
 
     add_library(transport_uring_shared SHARED $<TARGET_OBJECTS:transport_uring_obj>)
     target_link_libraries(transport_uring_shared PUBLIC ${URING_LIB})
+    
+    install(TARGETS transport_uring_static transport_uring_shared
+        ARCHIVE DESTINATION lib/transport
+        LIBRARY DESTINATION lib/transport
+        RUNTIME DESTINATION bin)
 else()
     message(STATUS "Transport io_uring: excluded")
 endif()

@@ -23,7 +23,7 @@
 namespace mooncake {
 namespace v1 {
 
-Platform &Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
+Platform& Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
     static std::shared_ptr<Platform> g_instance;
     if (!g_instance) {
 #ifdef USE_CUDA

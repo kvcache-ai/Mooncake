@@ -10,8 +10,8 @@ if (CUDAToolkit_FOUND)
         CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
     install(TARGETS platform_cuda_static platform_cuda_shared
-            ARCHIVE DESTINATION lib
-            LIBRARY DESTINATION lib
+            ARCHIVE DESTINATION lib/platform
+            LIBRARY DESTINATION lib/platform
             RUNTIME DESTINATION bin)
 else()
     message(STATUS "Platform cuda: excluded")
