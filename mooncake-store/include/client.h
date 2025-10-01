@@ -74,7 +74,9 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
-        const std::string& master_server_entry = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::optional<std::shared_ptr<TransferEngine>> transfer_engine =
+            std::nullopt);
 
     /**
      * @brief Retrieves data for a given key
@@ -263,7 +265,7 @@ class Client {
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
-        return transfer_engine_.getLocalIpAndPort();
+        return transfer_engine_->getLocalIpAndPort();
     }
 
    private:
@@ -280,7 +282,9 @@ class Client {
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
-        const std::optional<std::string>& device_names);
+        const std::optional<std::string>& device_names,
+        const std::optional<std::shared_ptr<TransferEngine>> transfer_engine =
+            std::nullopt);
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -328,7 +332,7 @@ class Client {
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

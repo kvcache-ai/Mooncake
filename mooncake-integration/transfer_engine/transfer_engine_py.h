@@ -59,6 +59,8 @@ class TransferEnginePy {
                       const char *protocol, const char *device_name,
                       const char *metadata_type);
 
+    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+
     int getRpcPort();
 
     uintptr_t allocateManagedBuffer(size_t length);
