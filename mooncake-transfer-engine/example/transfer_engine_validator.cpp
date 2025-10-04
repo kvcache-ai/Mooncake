@@ -42,6 +42,14 @@
 #ifdef USE_MNNVL
 #include <transport/nvlink_transport/nvlink_transport.h>
 #endif
+#endif
+
+#ifdef USE_MUSA
+#include <bits/stdint-uintn.h>
+#include <musa_porting.h>
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
 
 #include <cassert>
 
@@ -83,16 +91,22 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
 #endif
 
 using namespace mooncake;
+#ifdef USE_CUDA
+const static std::string GPU_PREFIX = "cuda:";
+#endif
 
+#ifdef USE_MUSA
+const static std::string GPU_PREFIX = "musa:";
+#endif
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -116,7 +130,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 #ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
@@ -218,7 +232,7 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     return Status::OK();
 }
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 class PinnedBuffer {
    public:
     explicit PinnedBuffer(size_t size) : size_(size), ptr_(nullptr) {
@@ -253,7 +267,7 @@ thread_local std::vector<uint8_t> user_buf(FLAGS_block_size);
 #endif
 
 void fillData(int thread_id, void *addr, uint8_t seed) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     memset(ref_buf.data(), seed, FLAGS_block_size);
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -282,7 +296,7 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
         uint8_t *local_addr =
             (uint8_t *)(addr) +
             FLAGS_block_size * (i * FLAGS_threads + thread_id);
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
         cudaStream_t s;
         cudaStreamCreate(&s);
         cudaMemcpyAsync(user_buf.data(), local_addr, FLAGS_block_size,
@@ -374,6 +388,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"musa:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -404,7 +421,7 @@ int initiator() {
     }
 
     std::vector<void *> addr;
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -426,7 +443,7 @@ int initiator() {
         std::string name_prefix;
         int name_suffix;
         if (FLAGS_use_vram) {
-            name_prefix = "cuda:";
+            name_prefix = GPU_PREFIX;
             if (FLAGS_gpu_id == -1) {
                 name_suffix = i;
             } else {
@@ -523,7 +540,7 @@ int target() {
     }
 
     std::vector<void *> addr;
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -545,7 +562,7 @@ int target() {
         std::string name_prefix;
         int name_suffix;
         if (FLAGS_use_vram) {
-            name_prefix = "cuda:";
+            name_prefix = GPU_PREFIX;
             if (FLAGS_gpu_id == -1) {
                 name_suffix = i;
             } else {

@@ -83,6 +83,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"musa:0\": [[" +
            device_names + "], []]}";
 }
 
