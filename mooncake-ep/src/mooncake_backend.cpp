@@ -100,12 +100,15 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Sync metadata
-    store->set("server_name_" + std::to_string(rank), localServerName);
+    store->set("server_name_" + std::to_string(backendIndex_) + "_" +
+                   std::to_string(rank),
+               localServerName);
 
     std::vector<std::string> server_names;
     for (int i = 0; i < size; i++) {
         server_names.push_back(
-            store->get_to_str({"server_name_" + std::to_string(i)}));
+            store->get_to_str({"server_name_" + std::to_string(backendIndex_) +
+                               "_" + std::to_string(i)}));
     }
 
     meta_.rank = rank;
@@ -187,6 +190,10 @@ MooncakeBackend::MooncakeBackend(
 
 MooncakeBackend::~MooncakeBackend() {
     for (size_t i = 0; i < 2; i++) {
+        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
+        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
+        engine_.unregisterLocalMemory(send_buffer_[i]);
+        engine_.unregisterLocalMemory(recv_buffer_[i]);
         delete[] cpu_sync_send_region_[i];
         delete[] cpu_sync_recv_region_[i];
         if (isCpu_) {
@@ -197,6 +204,7 @@ MooncakeBackend::~MooncakeBackend() {
             cudaFree(recv_buffer_[i]);
         }
     }
+    --backendIndex_;
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
