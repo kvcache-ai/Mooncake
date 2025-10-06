@@ -29,6 +29,7 @@ def worker(rank, num_processes, sync_dict):
             rank=rank,
             world_size=num_processes,
         )
+        dist.barrier()
         while "done" not in sync_dict:
             time.sleep(1)
     else:
