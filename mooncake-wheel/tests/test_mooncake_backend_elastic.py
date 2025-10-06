@@ -23,8 +23,7 @@ def worker(rank, num_processes, sync_dict):
         dist.barrier()
         print(f"rank {rank} after barrier")
         dist.destroy_process_group()
-        if rank == 0:
-            sync_dict["sync"] = 1
+        sync_dict[f"sync{rank}"] = 1
         dist.init_process_group(
             backend="mooncake-cpu",
             rank=rank,
@@ -33,7 +32,9 @@ def worker(rank, num_processes, sync_dict):
         while "done" not in sync_dict:
             time.sleep(1)
     else:
-        while "sync" not in sync_dict:
+        while "sync0" not in sync_dict:
+            time.sleep(1)
+        while "sync1" not in sync_dict:
             time.sleep(1)
         print(f"rank {rank} after sync")
         dist.init_process_group(
