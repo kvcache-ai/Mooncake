@@ -67,10 +67,17 @@ class MooncakeBackend final : public ::c10d::Backend {
         return matrix[location].preferred_hca[0];
     }
 
+    static void extendWorld(int newSize) {
+        worldGroup_->syncMetadata(newSize, 0);
+    }
+
    private:
     static TransferEngine engine_;
     static Transport* transport_;
     static int backendIndex_;
+    static MooncakeBackend* worldGroup_;
+    c10::intrusive_ptr<::c10d::Store> store_;
+    std::string localServerName_;
     bool isCpu_{false};
     static std::string hostIp_;
     void* send_buffer_[2];
@@ -79,6 +86,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* cpu_sync_recv_region_[2];
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
+
+    void syncMetadata(int size, int backendIndex);
 };
 
 }  // namespace mooncake

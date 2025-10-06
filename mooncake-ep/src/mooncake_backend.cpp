@@ -19,12 +19,13 @@ std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
 Transport* MooncakeBackend::transport_ = nullptr;
 int MooncakeBackend::backendIndex_ = 0;
+MooncakeBackend* MooncakeBackend::worldGroup_ = nullptr;
 MooncakeWorker MooncakeBackend::worker_;
 
 MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size), isCpu_(isCpu) {
+    : Backend(rank, size), store_(store), isCpu_(isCpu) {
     // Get device data
     int deviceId_;
     cudaError err = cudaGetDevice(&deviceId_);
@@ -38,8 +39,8 @@ MooncakeBackend::MooncakeBackend(
                     c10::str("Failed to install transport"));
     }
     auto localRpcMeta = transport_->meta()->localRpcMeta();
-    std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
-                                  std::to_string(localRpcMeta.rpc_port);
+    localServerName_ = localRpcMeta.ip_or_host_name + ":" +
+                       std::to_string(localRpcMeta.rpc_port);
 
     // Register buffers
     std::string location = "cuda:" + std::to_string(deviceId_);
@@ -100,30 +101,11 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Sync metadata
-    store->set("server_name_" + std::to_string(backendIndex_) + "_" +
-                   std::to_string(rank),
-               localServerName);
-
-    std::vector<std::string> server_names;
-    for (int i = 0; i < size; i++) {
-        server_names.push_back(
-            store->get_to_str({"server_name_" + std::to_string(backendIndex_) +
-                               "_" + std::to_string(i)}));
-    }
-
-    meta_.rank = rank;
-    meta_.size = size;
-    meta_.taskCount = 0;
-    cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
-                  cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks, 0);
-    for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        meta_.activeRanks[i] = true;
-    }
+    syncMetadata(size, backendIndex_);
     if (options) {
         TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
                     "activeRanks must be int.");
-        if (isCpu) {
+        if (isCpu_) {
             TORCH_CHECK(options->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
@@ -134,54 +116,7 @@ MooncakeBackend::MooncakeBackend(
     } else {
         meta_.activeRanksTensor =
             at::ones({size}, torch::dtype(torch::kInt32)
-                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
-    }
-    meta_.engine = &engine_;
-    meta_.bufferBaseIndex = backendIndex_ * 8;
-    for (int i = 0; i < size_; ++i) {
-        auto segment_id = engine_.openSegment(server_names[i]);
-        meta_.segmentIDs.emplace_back(segment_id);
-        auto segment_desc =
-            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
-        meta_.segmentDescs.emplace_back(segment_desc);
-    }
-
-    // Let the default process group warm up the transfer engine
-    if (backendIndex_ == 0) {
-        std::vector<TransferRequest> entries;
-        for (int i = rank_; i < size_; ++i) {
-            entries.push_back(TransferRequest{
-                .opcode = TransferRequest::READ,
-                .source =
-                    (int32_t*)meta_.segmentDescs[rank_]->buffers[4].addr + 1,
-                .target_id = meta_.segmentIDs[i],
-                .target_offset = meta_.segmentDescs[i]->buffers[6].addr,
-                .length = sizeof(int32_t),
-            });
-        }
-        auto batchID = engine_.allocateBatchID(entries.size());
-        engine_.submitTransfer(batchID, entries);
-
-        while (true) {
-            bool batch_done = true;
-            TransferStatus status;
-            for (int i = 0; i < size_ - rank_; ++i) {
-                engine_.getTransferStatus(batchID, i, status);
-                if (status.s != TransferStatusEnum::COMPLETED &&
-                    status.s != TransferStatusEnum::FAILED) {
-                    batch_done = false;
-                    break;
-                }
-            }
-            if (batch_done) {
-                break;
-            }
-        }
-
-        store->set("warmup_done_" + std::to_string(rank_), "1");
-        for (int i = 0; i < size_; i++) {
-            store->get_to_str("warmup_done_" + std::to_string(i));
-        }
+                                 .device(isCpu_ ? torch::kCPU : torch::kCUDA));
     }
 
     // Increment backend index
@@ -418,5 +353,79 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
         c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*) {}, [=](void*) {});
+}
+
+void MooncakeBackend::syncMetadata(int size, int backendIndex) {
+    store_->set("server_name_" + std::to_string(backendIndex) + "_" +
+                    std::to_string(rank_),
+                localServerName_);
+    store_->deleteKey("warmup_done_" + std::to_string(rank_));
+
+    std::vector<std::string> server_names;
+    for (int i = 0; i < size; i++) {
+        server_names.push_back(
+            store_->get_to_str({"server_name_" + std::to_string(backendIndex) +
+                               "_" + std::to_string(i)}));
+    }
+
+    meta_.rank = rank_;
+    meta_.size = size;
+    meta_.taskCount = 0;
+    cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
+                  cudaHostAllocMapped);
+    cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks, 0);
+    for (size_t i = 0; i < kMaxNumRanks; ++i) {
+        meta_.activeRanks[i] = true;
+    }
+    meta_.engine = &engine_;
+    meta_.bufferBaseIndex = backendIndex * 8;
+    meta_.segmentIDs.clear();
+    meta_.segmentDescs.clear();
+    for (int i = 0; i < size; ++i) {
+        auto segment_id = engine_.openSegment(server_names[i]);
+        meta_.segmentIDs.emplace_back(segment_id);
+        auto segment_desc =
+            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
+        meta_.segmentDescs.emplace_back(segment_desc);
+    }
+
+    // Let the default process group warm up the transfer engine
+    if (backendIndex == 0) {
+        worldGroup_ = this;
+        std::vector<TransferRequest> entries;
+        for (int i = rank_; i < size; ++i) {
+            entries.push_back(TransferRequest{
+                .opcode = TransferRequest::READ,
+                .source =
+                    (int32_t*)meta_.segmentDescs[rank_]->buffers[4].addr + 1,
+                .target_id = meta_.segmentIDs[i],
+                .target_offset = meta_.segmentDescs[i]->buffers[6].addr,
+                .length = sizeof(int32_t),
+            });
+        }
+        auto batchID = engine_.allocateBatchID(entries.size());
+        engine_.submitTransfer(batchID, entries);
+
+        while (true) {
+            bool batch_done = true;
+            TransferStatus status;
+            for (int i = 0; i < size - rank_; ++i) {
+                engine_.getTransferStatus(batchID, i, status);
+                if (status.s != TransferStatusEnum::COMPLETED &&
+                    status.s != TransferStatusEnum::FAILED) {
+                    batch_done = false;
+                    break;
+                    }
+            }
+            if (batch_done) {
+                break;
+            }
+        }
+
+        store_->set("warmup_done_" + std::to_string(rank_), "1");
+        for (int i = 0; i < size; i++) {
+            store_->get_to_str("warmup_done_" + std::to_string(i));
+        }
+    }
 }
 }  // namespace mooncake

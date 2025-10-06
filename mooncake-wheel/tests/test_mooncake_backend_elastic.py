@@ -20,15 +20,10 @@ def worker(rank, num_processes, sync_dict):
             rank=rank,
             world_size=world_size,
         )
-        dist.destroy_process_group()
-        time.sleep(1)
+        dist.barrier()
         if rank == 0:
             sync_dict["sync"] = 1
-        dist.init_process_group(
-            backend="mooncake-cpu",
-            rank=rank,
-            world_size=num_processes,
-        )
+        ep.extend_world(num_processes)
         dist.barrier()
         while "done" not in sync_dict:
             time.sleep(1)

@@ -63,6 +63,7 @@ PYBIND11_MODULE(ep, m) {
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("get_preferred_hca", &getPreferredHca);
+    m.def("extend_world", &MooncakeBackend::extendWorld);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
