@@ -260,22 +260,28 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
+    //TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     // Alternately use even-odd items to maintain tasks
-    int taskId = cudaTaskCount % 2 + 2;
-    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
-    tensorToBuffer(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
+    size_t chunkSize = (kBufferSize - 1) / meta->size;
 
-    hasCallback_[taskId] = false;
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, meta, tasks_device_,
-        meta->size, meta->activeRanksDevice,
-        meta->activeRanksTensor.data_ptr<int>(), taskId);
-    bufferToTensor(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset + 2].addr);
-    ++cudaTaskCount;
-    ++meta->taskCount;
+    for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
+        size_t realSize = min(tensorSize, pos + chunkSize) - pos;
+        int taskId = cudaTaskCount % 2 + 2;
+        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+        tensorToBuffer(
+            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr, pos, realSize);
+
+        hasCallback_[taskId] = false;
+        enqueueTaskKernel<<<1, 1, 0, stream>>>(
+            opType, realSize, broadcastRoot, bufferOffset, meta, tasks_device_,
+            meta->size, meta->activeRanksDevice,
+            meta->activeRanksTensor.data_ptr<int>(), taskId);
+        bufferToTensor(
+            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset + 2].addr, pos, realSize);
+        ++cudaTaskCount;
+        ++meta->taskCount;
+    }
+    
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event);
