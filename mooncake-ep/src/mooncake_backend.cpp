@@ -115,7 +115,7 @@ MooncakeBackend::MooncakeBackend(
         meta_.activeRanksTensor = options->activeRanks_;
     } else {
         meta_.activeRanksTensor =
-            at::ones({size}, torch::dtype(torch::kInt32)
+            at::ones({size * 2}, torch::dtype(torch::kInt32)
                                  .device(isCpu_ ? torch::kCPU : torch::kCUDA));
     }
 
