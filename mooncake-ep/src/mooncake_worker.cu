@@ -78,54 +78,57 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     }
 }
 
-void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
+void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src, size_t numRanks,
                         c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only support SUM for reduction.");
+    auto ptr = (char*) dst.data_ptr() + pos;
+    size_t num = realSize / dst.element_size();
+
     switch (dst.scalar_type()) {
         case c10::kByte:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<uint8_t>(),
-                                                 (uint8_t*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*) ptr,
+                                                 (uint8_t*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int8_t>(),
-                                                 (int8_t*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*) ptr,
+                                                 (int8_t*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kShort:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int16_t>(),
-                                                 (int16_t*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((int16_t*) ptr,
+                                                 (int16_t*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kInt:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
-                                                 dst.numel(), numRanks,
+            reduceKernel<<<64, 256, 0, stream>>>((int*) ptr, (int*)src,
+                                                 num, numRanks,
                                                  activeRanks);
             break;
         case c10::kLong:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int64_t>(),
-                                                 (int64_t*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((int64_t*) ptr,
+                                                 (int64_t*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kFloat:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<float>(),
-                                                 (float*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((float*) ptr,
+                                                 (float*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kDouble:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<double>(),
-                                                 (double*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((double*) ptr,
+                                                 (double*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kBool:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<bool>(),
-                                                 (bool*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((bool*) ptr,
+                                                 (bool*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kBFloat16:
             reduceKernel<<<64, 256, 0, stream>>>(
-                dst.data_ptr<at::BFloat16>(), (at::BFloat16*)src, dst.numel(),
+                (at::BFloat16*) ptr, (at::BFloat16*)src, num,
                 numRanks, activeRanks);
             break;
         default:
@@ -262,7 +265,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     const std::function<void(void* src)>& bufferToTensor) {
     //TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     // Alternately use even-odd items to maintain tasks
-    size_t chunkSize = (kBufferSize - 1) / meta->size;
+    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;

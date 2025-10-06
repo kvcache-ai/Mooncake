@@ -37,7 +37,7 @@ __global__ struct Task {
 static constexpr size_t kBufferSize = 1u << 29;
 static constexpr size_t kMaxNumRanks = 64;
 
-void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
+void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src, size_t numRanks,
                         c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
 
@@ -57,8 +57,8 @@ class MooncakeWorker {
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
-        const std::function<void(void* dst)>& tensorToBuffer,
-        const std::function<void(void* src)>& bufferToTensor);
+        const std::function<void(void* dst, size_t pos, size_t realSize)>& tensorToBuffer,
+        const std::function<void(void* src, size_t pos, size_t realSize)>& bufferToTensor);
 
     void startWorker();
 
