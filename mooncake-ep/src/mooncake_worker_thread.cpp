@@ -177,6 +177,7 @@ void MooncakeWorker::startWorker() {
                         for (int j = 0; j < group->size; ++j) {
                             signal_ptr[j] = 0;
                         }
+                        LOG(INFO) << "Rank "<<group->rank<<" task "<<i<<" done.";
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
                         if (hasCallback_[i]) {
