@@ -20,7 +20,9 @@ def worker(rank, world_size, results, collective):
     if collective == "all_reduce":
         tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        results[rank] = tensor.item()
+        #results[rank] = tensor.item()
+        results[rank] = tensor[0].item()
+        print(tensor)
 
     elif collective == "all_gather":
         tensor = torch.tensor([rank], device="cuda")
@@ -62,7 +64,7 @@ class TestMooncakeBackend(unittest.TestCase):
 
     def test_allreduce(self):
         # Expected sum = 1 + 2 + 3 + 4 = 10
-        self._spawn_and_check("all_reduce", lambda size: sum(range(1, size + 1)) * N)
+        self._spawn_and_check("all_reduce", lambda size: sum(range(1, size + 1)))
 
     def test_allgather(self):
         # Expected gather = [0, 1, 2, 3]
