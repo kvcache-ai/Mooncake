@@ -291,9 +291,8 @@ void MooncakeEpBuffer::init_ibgda() {
         }
     }
     if (nic_id == -1) {
-        fprintf(stderr, "Device matching name %s not found.\n",
-                device_name.c_str());
-        exit(1);
+        throw std::runtime_error("Device matching name '" + device_name +
+                                 "' not found.");
     }
     LOG(INFO) << "[EP] GPU " << device_id << " uses NIC " << nic_id
               << " out of " << num_devices << " NIC(s)";
