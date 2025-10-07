@@ -258,7 +258,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                 cudaMemcpyAsync(dst, (char*) tensor.data_ptr() + pos, realSize,
                                 cudaMemcpyHostToDevice, stream);
             },
-            [&](void* src) {
+            [&](void* src, size_t pos, size_t realSize) {
                 cudaMemsetAsync((char*) tensor.data_ptr() + pos, 0, realSize, stream);
                 launchReduceKernel(tensor, pos, realSize, src, size_, opts.reduceOp,
                                    meta_.activeRanksDevice, stream);
