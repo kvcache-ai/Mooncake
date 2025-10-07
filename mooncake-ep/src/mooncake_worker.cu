@@ -92,7 +92,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src, 
                                                  numRanks, activeRanks);
             break;
         case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*) ptr,
+            reduceKernel<<<64, 256, 0, stream>>>((int8_t*) ptr,
                                                  (int8_t*)src, num,
                                                  numRanks, activeRanks);
             break;
@@ -261,8 +261,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
-    const std::function<void(void* dst)>& tensorToBuffer,
-    const std::function<void(void* src)>& bufferToTensor) {
+    const std::function<void(void* dst, size_t pos, size_t realSize)>& tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize)>& bufferToTensor) {
     //TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     // Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
