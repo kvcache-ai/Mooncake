@@ -72,8 +72,7 @@ class Buffer:
         # Get the index of the closest NIC
         backend = self.group._get_backend(torch.device('cuda'))
         preferred_hca = ep.get_preferred_hca(backend, f'cuda:{torch.cuda.current_device()}')
-        nic_id = int(preferred_hca.split('_')[1])
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, nic_id)
+        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
 
         (raddr, rkey) = self.runtime.get_mr_info()
 

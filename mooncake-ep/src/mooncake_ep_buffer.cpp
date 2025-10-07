@@ -3,11 +3,12 @@
 namespace mooncake {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
-                                   int64_t num_ep_buffer_bytes, int nic_id)
+                                   int64_t num_ep_buffer_bytes,
+                                   std::string device_name)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      nic_id(nic_id),
+      device_name(std::move(device_name)),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -281,6 +282,19 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 void MooncakeEpBuffer::init_ibgda() {
     int num_devices;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
+    int nic_id = -1;
+    for (int i = 0; i < num_devices; ++i) {
+        const char* name = ibv_get_device_name(dev_list[i]);
+        if (name && device_name == name) {
+            nic_id = i;
+            break;
+        }
+    }
+    if (nic_id == -1) {
+        fprintf(stderr, "Device matching name %s not found.\n",
+                device_name.c_str());
+        exit(1);
+    }
     LOG(INFO) << "[EP] GPU " << device_id << " uses NIC " << nic_id
               << " out of " << num_devices << " NIC(s)";
     ibv_context* ctx = ibv_open_device(dev_list[nic_id]);
