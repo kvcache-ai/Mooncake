@@ -6,6 +6,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import ep
 
+N = 2 ** 27
 
 def worker(rank, world_size, results, collective):
     torch.cuda.set_device(rank)
@@ -17,7 +18,7 @@ def worker(rank, world_size, results, collective):
     )
 
     if collective == "all_reduce":
-        tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cuda")
+        tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor.item()
 
@@ -61,7 +62,7 @@ class TestMooncakeBackend(unittest.TestCase):
 
     def test_allreduce(self):
         # Expected sum = 1 + 2 + 3 + 4 = 10
-        self._spawn_and_check("all_reduce", lambda size: sum(range(1, size + 1)))
+        self._spawn_and_check("all_reduce", lambda size: sum(range(1, size + 1)) * N)
 
     def test_allgather(self):
         # Expected gather = [0, 1, 2, 3]
