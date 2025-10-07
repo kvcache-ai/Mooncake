@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import ep
 
-N = 2 ** 27
+N = 2 ** 32
 
 def worker(rank, world_size, results, collective):
     torch.cuda.set_device(rank)
