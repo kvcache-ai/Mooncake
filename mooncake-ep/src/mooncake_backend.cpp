@@ -119,6 +119,7 @@ MooncakeBackend::MooncakeBackend(
                                  .device(isCpu_ ? torch::kCPU : torch::kCUDA));
     }
 
+    LOG(INFO) << "Rank " << rank << " init " << backendIndex_ << ".";
     // Increment backend index
     ++backendIndex_;
 }
@@ -140,6 +141,7 @@ MooncakeBackend::~MooncakeBackend() {
         }
     }
     --backendIndex_;
+    LOG(INFO) << "Rank " << rank_ << " destroy -> " << backendIndex_ << ".";
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
