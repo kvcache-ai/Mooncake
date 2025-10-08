@@ -389,8 +389,11 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
         meta_.segmentDescs.emplace_back(segment_desc);
     }
 
+    LOG(INFO) << "Rank " << rank_ << " size " << size << " sync metadata " << backendIndex;
+
     // Let the default process group warm up the transfer engine
     if (backendIndex == 0) {
+        LOG(INFO) << "Rank " << rank_ << " size " << size << " will warmup";
         worldGroup_ = this;
         std::vector<TransferRequest> entries;
         for (int i = rank_; i < size; ++i) {
@@ -422,6 +425,7 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
             }
         }
 
+        LOG(INFO) << "Rank " << rank_ << " size " << size << " warmup_done";
         store_->set("warmup_done_" + std::to_string(rank_), "1");
         for (int i = 0; i < size; i++) {
             store_->get_to_str("warmup_done_" + std::to_string(i));
