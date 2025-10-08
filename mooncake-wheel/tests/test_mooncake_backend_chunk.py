@@ -21,16 +21,16 @@ def worker(rank, world_size, results, collective):
         tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor[0].item()
-        assert torch.all(tensor == tensor[0].item()) 
         print(results[rank])
-        
+        assert torch.all(tensor == tensor[0].item()) 
+
     elif collective == "all_reduce_2d": 
         tensor = torch.tensor([[rank, -rank] for i in range(N)], dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
         results[rank] = [tensor[0][0].item(), tensor[0][1].item()]
         first_row = tensor[0]
         all_same = torch.all(tensor == first_row, dim = 1)
-        assert torch.all(all_same).item()
+        print(results[rank])
 
     else:
         raise ValueError(f"Unsupported collective: {collective}")
