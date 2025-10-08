@@ -78,7 +78,7 @@ PYBIND11_MODULE(ep, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, int>())
+        .def(py::init<int, int, int64_t, std::string>())
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)
