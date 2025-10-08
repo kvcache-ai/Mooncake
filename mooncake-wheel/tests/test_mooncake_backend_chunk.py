@@ -17,20 +17,12 @@ def worker(rank, world_size, results, collective):
         pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cuda")),
     )
 
-    if collective == "all_reduce_sum":
+    if collective == "all_reduce":
         tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor[0].item()
         print(results[rank])
         assert torch.all(tensor == tensor[0].item()) 
-
-    elif collective == "all_reduce_2d": 
-        tensor = torch.tensor([[rank, -rank] for i in range(N)], dtype=torch.int32, device="cuda")
-        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
-        results[rank] = [tensor[0][0].item(), tensor[0][1].item()]
-        first_row = tensor[0]
-        all_same = torch.all(tensor == first_row, dim = 1)
-        print(results[rank])
 
     else:
         raise ValueError(f"Unsupported collective: {collective}")
@@ -60,15 +52,13 @@ class TestMooncakeBackend(unittest.TestCase):
             join=True,
         )
 
-        #expected = 36 if collective == "all_reduce_sum" else [7, 0]
-        #for r in range(self.world_size):
-            #self.assertEqual(results[r], expected)
+        expected = 36
+        for r in range(self.world_size):
+            self.assertEqual(results[r], expected)
 
-    #def test_allreduce_sum(self):
-        #self._spawn_and_check("all_reduce_sum")
-    
-    def test_allreduce_2d(self):
-        self._spawn_and_check("all_reduce_2d")
+    def test_allreduce_sum(self):
+        self._spawn_and_check("all_reduce")
+
 
 
 if __name__ == "__main__":
