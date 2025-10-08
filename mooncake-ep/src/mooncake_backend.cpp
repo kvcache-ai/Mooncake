@@ -363,6 +363,7 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
 
     std::vector<std::string> server_names;
     for (int i = 0; i < size; i++) {
+        LOG(INFO) << "Rank " << rank_ << " size " << size << " waiting " << backendIndex << "_" << i;
         server_names.push_back(
             store_->get_to_str({"server_name_" + std::to_string(backendIndex) +
                                "_" + std::to_string(i)}));
