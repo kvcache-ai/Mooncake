@@ -79,7 +79,7 @@ struct MooncakeEpBuffer {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
-    int nic_id;
+    std::string device_name;
     bool is_roce_ = false;
 
     // Stream for communication
@@ -90,7 +90,7 @@ struct MooncakeEpBuffer {
 
    public:
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     int nic_id);
+                     std::string device_name);
 
     ~MooncakeEpBuffer() noexcept(false);
 
