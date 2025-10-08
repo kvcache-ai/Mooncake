@@ -124,26 +124,6 @@ MooncakeBackend::MooncakeBackend(
     ++backendIndex_;
 }
 
-MooncakeBackend::~MooncakeBackend() {
-    for (size_t i = 0; i < 2; i++) {
-        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
-        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
-        engine_.unregisterLocalMemory(send_buffer_[i]);
-        engine_.unregisterLocalMemory(recv_buffer_[i]);
-        delete[] cpu_sync_send_region_[i];
-        delete[] cpu_sync_recv_region_[i];
-        if (isCpu_) {
-            free(send_buffer_[i]);
-            free(recv_buffer_[i]);
-        } else {
-            cudaFree(send_buffer_[i]);
-            cudaFree(recv_buffer_[i]);
-        }
-    }
-    --backendIndex_;
-    LOG(INFO) << "Rank " << rank_ << " destroy -> " << backendIndex_ << ".";
-}
-
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
@@ -355,6 +335,26 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
         c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*) {}, [=](void*) {});
+}
+
+void MooncakeBackend::shutdown() {
+    for (size_t i = 0; i < 2; i++) {
+        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
+        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
+        engine_.unregisterLocalMemory(send_buffer_[i]);
+        engine_.unregisterLocalMemory(recv_buffer_[i]);
+        delete[] cpu_sync_send_region_[i];
+        delete[] cpu_sync_recv_region_[i];
+        if (isCpu_) {
+            free(send_buffer_[i]);
+            free(recv_buffer_[i]);
+        } else {
+            cudaFree(send_buffer_[i]);
+            cudaFree(recv_buffer_[i]);
+        }
+    }
+    --backendIndex_;
+    LOG(INFO) << "Rank " << rank_ << " destroy -> " << backendIndex_ << ".";
 }
 
 void MooncakeBackend::syncMetadata(int size, int backendIndex) {

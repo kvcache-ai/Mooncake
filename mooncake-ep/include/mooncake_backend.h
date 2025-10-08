@@ -23,7 +23,7 @@ class MooncakeBackend final : public ::c10d::Backend {
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
-    ~MooncakeBackend() override;
+    ~MooncakeBackend() override = default;
 
     const std::string getBackendName() const override;
 
@@ -55,6 +55,8 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     c10::intrusive_ptr<c10d::Work> barrier(
         const c10d::BarrierOptions& opts) override;
+
+    void shutdown() override;
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
