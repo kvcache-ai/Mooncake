@@ -119,7 +119,6 @@ MooncakeBackend::MooncakeBackend(
                                  .device(isCpu_ ? torch::kCPU : torch::kCUDA));
     }
 
-    LOG(INFO) << "Rank " << rank << " init " << backendIndex_ << ".";
     // Increment backend index
     ++backendIndex_;
 }
@@ -164,6 +163,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
+    LOG(INFO) << "MooncakeBackend::allreduce offset " << meta_.bufferBaseIndex;
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
     if (isCpu_) {
@@ -354,7 +354,6 @@ void MooncakeBackend::shutdown() {
         }
     }
     --backendIndex_;
-    LOG(INFO) << "Rank " << rank_ << " destroy -> " << backendIndex_ << ".";
 }
 
 void MooncakeBackend::syncMetadata(int size, int backendIndex) {
@@ -365,7 +364,6 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
 
     std::vector<std::string> server_names;
     for (int i = 0; i < size; i++) {
-        LOG(INFO) << "Rank " << rank_ << " size " << size << " waiting " << backendIndex << "_" << i;
         server_names.push_back(
             store_->get_to_str({"server_name_" + std::to_string(backendIndex) +
                                "_" + std::to_string(i)}));
@@ -392,11 +390,8 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
         meta_.segmentDescs.emplace_back(segment_desc);
     }
 
-    LOG(INFO) << "Rank " << rank_ << " size " << size << " sync metadata " << backendIndex;
-
     // Let the default process group warm up the transfer engine
     if (backendIndex == 0) {
-        LOG(INFO) << "Rank " << rank_ << " size " << size << " will warmup";
         worldGroup_ = this;
         std::vector<TransferRequest> entries;
         for (int i = rank_; i < size; ++i) {
