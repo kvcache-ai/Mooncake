@@ -428,8 +428,8 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
         for (int i = 0; i < size; i++) {
             store_->get_to_str("warmup_done_" + std::to_string(i));
         }
-        store_->deleteKey("server_name_" + std::to_string(backendIndex) + "_" +
-                    std::to_string(rank_));
     }
+    store_->deleteKey("server_name_" + std::to_string(backendIndex) + "_" +
+                std::to_string(rank_));
 }
 }  // namespace mooncake
