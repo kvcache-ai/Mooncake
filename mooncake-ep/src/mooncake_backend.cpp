@@ -163,7 +163,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
-    LOG(INFO) << "MooncakeBackend::allreduce offset " << meta_.bufferBaseIndex;
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
     if (isCpu_) {
