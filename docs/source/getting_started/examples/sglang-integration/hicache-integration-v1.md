@@ -20,7 +20,7 @@ HiCache introduces a **HiRadixTree** that acts as a page table for referencing K
 
 The system includes an intelligent cache controller that automatically manages data movement between tiers, implementing optimized prefetching strategies and multiple write policies (write-through, write-through-selective, and write-back).
 
-For more details about SGLang HiCache, please refer to [SGLang project](https://github.com/sgl-project/sglang) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+For more details about SGLang HiCache, please refer to [HiCache system design document](https://docs.sglang.ai/advanced_features/hicache_design.html) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
 
 ### Mooncake & SGLang HiCache
 
@@ -56,6 +56,8 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
+For more details, please refer to [SGLang official installation guide](https://docs.sglang.ai/get_started/install.html).
+
 ### Install Mooncake
 
 **Method 1: with pip**
@@ -79,7 +81,7 @@ cd Mooncake
 bash dependencies.sh
 ```
 
-Build the project. For additional build options, please refer to [the official guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
+Build the project:
 
 ```bash
 mkdir build
@@ -93,6 +95,8 @@ Install Mooncake:
 ```bash
 sudo make install
 ```
+
+For more details, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ## Deployment
 
@@ -201,36 +205,10 @@ Adjust this value according to system’s available memory and expected cache re
 
 **HiCache Related Parameters for SGLang Server**
 
-The following parameters control SGLang HiCache behavior when using Mooncake as the storage backend:
+For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.ai/advanced_features/hicache_design.html#related-parameters).
 
-- **`--enable-hierarchical-cache`**: Enable hierarchical cache functionality. This is required to use HiCache with Mooncake.
 
-- **`--hicache-ratio HICACHE_RATIO`**: The ratio of the size of host KV cache memory pool to the size of device pool. For example, setting this to 2 means the host memory pool will be twice the size of the device memory pool.
-
-- **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool.
-
-- **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers:
-  - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
-  - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
-  - `write_back`: Writes data back to slower tiers only when eviction is needed (reduces I/O load)
-
-- **`--hicache-io-backend {direct,kernel}`**: Choose the I/O backend for KV cache transfer between CPU and GPU:
-  - `direct`: Standard CUDA memory copy operations
-  - `kernel`: GPU-assisted I/O kernels (recommended for better performance)
-
-- **`--hicache-mem-layout {layer_first,page_first,page_first_direct}`**: Memory layout for the host memory pool. `page_first` or `page_first_direct` are required if use Mooncake backend:
-  - `layer_first`: Compatible with GPU computation kernels (default for GPU memory)
-  - `page_first`: Optimized for I/O efficiency
-  - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
-
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier
-
-- **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}`**: Control when prefetching from storage should stop:
-  - `best_effort`: Prefetch as much as possible without blocking
-  - `wait_complete`: Wait for prefetch to complete before proceeding
-  - `timeout`: Use timeout-based prefetching (recommended for Mooncake)
-
-- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: A JSON string that provides additional configuration options for the storage backend. This includes general parameters such as `prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, etc., as well as Mooncake-specific parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc. Mooncake-specific parameters can be configured either via environment variables or through this option.
+Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.
 
 ### Distributed Deployment
 

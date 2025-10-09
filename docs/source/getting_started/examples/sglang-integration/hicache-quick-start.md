@@ -8,7 +8,7 @@ Follow this streamlined workflow to get SGLang HiCache running with Mooncake as 
 
 Before you begin, make sure that:
 
-- SGLang is installed with HiCache support on the machine hosting your SGLang server. Refer to the [official installation guide](https://docs.sglang.ai/start/install.html) if needed.
+- SGLang is installed with HiCache support on the machine hosting your SGLang server. Refer to the [official installation guide](https://docs.sglang.ai/get_started/install.html) if needed.
 - Mooncake is installed and accessible as the hierarchical cache backend. Detailed build steps live in the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 - The router package is installed to provide the `sglang_router` entrypoint:
 
