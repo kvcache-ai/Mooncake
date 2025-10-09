@@ -2,7 +2,7 @@
 
 This document describes how to use Mooncake as the storage backend for SGLang HiCache.
 
-> Looking for a streamlined setup? Start with the [Quick Start guide](quick-start.md) and return here for deeper explanations and advanced configuration.
+> Looking for a streamlined setup? Start with the [Quick Start guide](hicache-quick-start.md) and return here for deeper explanations and advanced configuration.
 
 ## Introduction
 
