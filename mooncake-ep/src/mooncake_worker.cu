@@ -255,7 +255,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
         
         tasks_[taskId].opType = opType;
-        tasks_[taskId].tensorSize = tensorSize;
+        tasks_[taskId].tensorSize = realSize;
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta;
@@ -286,7 +286,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         ++cpuTaskCount;
         ++meta->taskCount;
     };
-    
+
     (*processNextChunk)();
     
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
