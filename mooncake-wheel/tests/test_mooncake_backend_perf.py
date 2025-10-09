@@ -84,7 +84,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
     # cpu + allreduce
     def test_cpu_allreduce_1024(self):
-        self.do_test("cpu", "allreduce", 1024 * 1024)
+        self.do_test("cpu", "allreduce", 2 ** 30)
 
     # cpu + broadcast
     def test_cpu_broadcast_1024(self):
@@ -96,7 +96,7 @@ class TestMooncakeBackendPerf(unittest.TestCase):
 
     # cuda + allreduce
     def test_cuda_allreduce_1024(self):
-        self.do_test("cuda", "allreduce", 1024 * 1024)
+        self.do_test("cuda", "allreduce", 2 ** 30)
 
     # cuda + broadcast
     def test_cuda_broadcast_1024(self):
