@@ -14,11 +14,11 @@ def worker(rank, world_size, results, collective):
         backend="mooncake",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cuda")),
+        pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
     )
 
     if collective == "all_reduce":
-        tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
+        tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor[0].item()
         print(results[rank])
