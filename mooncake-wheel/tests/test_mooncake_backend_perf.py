@@ -79,28 +79,28 @@ class TestMooncakeBackendPerf(unittest.TestCase):
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
     # cpu + allgather
-    def test_cpu_allgather_1024(self):
-        self.do_test("cpu", "allgather", 1024)
+    #def test_cpu_allgather_1024(self):
+    #    self.do_test("cpu", "allgather", 1024)
 
     # cpu + allreduce
-    def test_cpu_allreduce_1024(self):
-        self.do_test("cpu", "allreduce", 1024)
+    #def test_cpu_allreduce_1024(self):
+    #    self.do_test("cpu", "allreduce", 1024)
 
     # cpu + broadcast
-    def test_cpu_broadcast_1024(self):
-        self.do_test("cpu", "broadcast", 1024)
+    #def test_cpu_broadcast_1024(self):
+    #    self.do_test("cpu", "broadcast", 1024)
 
     # cuda + allgather
-    #def test_cuda_allgather_1024(self):
-        #self.do_test("cuda", "allgather", 1024)
+    def test_cuda_allgather_1024(self):
+        self.do_test("cuda", "allgather", 1024)
 
     # cuda + allreduce
-    #def test_cuda_allreduce_1024(self):
-        #self.do_test("cuda", "allreduce", 1024)
+    def test_cuda_allreduce_1024(self):
+        self.do_test("cuda", "allreduce", 1024)
 
     # cuda + broadcast
-    #def test_cuda_broadcast_1024(self):
-        #self.do_test("cuda", "broadcast", 1024)
+    def test_cuda_broadcast_1024(self):
+        self.do_test("cuda", "broadcast", 1024)
 
 
 if __name__ == "__main__":
