@@ -419,7 +419,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
         c10d::OpType::BARRIER, 0, 0, &meta_, 
-        [=](void* dst, size_t pos, size_t realSize) {}, 
-        [=](void* src, size_t pos, size_t realSize) {});
+        [=](void*, size_t, size_t) {}, 
+        [=](void*, size_t, size_t) {});
 }
 }  // namespace mooncake
