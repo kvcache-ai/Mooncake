@@ -1,4 +1,4 @@
-# Quick Start: SGLang HiCache with Mooncake
+# Quick Start: SGLang HiCache with Mooncake Backend
 
 Follow this streamlined workflow to get SGLang HiCache running with Mooncake as the L3 storage backend.
 
