@@ -234,23 +234,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         c10::ListType::create(c10::TensorType::get()));
     
     struct IterState {
-        size_t pos = 0;
+        size_t currentPos = 0;
     };
     auto state = std::make_shared<IterState>();
     
-    std::function<void()> processNextChunk;
-    processNextChunk = [this, &processNextChunk, state, opType, tensorSize, chunkSize, broadcastRoot,
+    auto processNextChunk = std::make_shared<std::function<void()>>();
+    
+    *processNextChunk = [this, processNextChunk, state, opType, tensorSize, chunkSize, broadcastRoot,
                        meta, tensorToBuffer, bufferToTensor, future]() {
         
-        if (state->pos >= tensorSize) {
+        if (state->currentPos >= tensorSize) {
             future->markCompleted(c10::IValue());
             return;
         }
-
+        
         int taskId = cpuTaskCount % 2;
         TORCH_CHECK(!tasks_[taskId].active);
         
-        size_t realSize = std::min(chunkSize, tensorSize - state->pos);
+        size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
         
         tasks_[taskId].opType = opType;
@@ -261,21 +262,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         
         tensorToBuffer(
             (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr, 
-            state->pos, realSize);
+            state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
         
-        callbacks_[taskId] = [this, &processNextChunk, state, meta, bufferToTensor, 
+        callbacks_[taskId] = [this, processNextChunk, state, meta, bufferToTensor, 
                             bufferOffset, realSize, future]() {
+
             for (int i = 0; i < meta->size; ++i) {
                 meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
             }
             
             bufferToTensor((void*)meta->segmentDescs[meta->rank]
                             ->buffers[bufferOffset + 2].addr, 
-                          state->pos, realSize);
-            state->pos += realSize;
-            processNextChunk();
+                          state->currentPos, realSize);
+            
+            state->currentPos += realSize;
+            
+            (*processNextChunk)();
         };
 
         tasks_[taskId].active = true;
@@ -283,7 +287,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         ++meta->taskCount;
     };
     
-    processNextChunk();
+    (*processNextChunk)();
     
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }

@@ -303,7 +303,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
             [&](void* src, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(outputTensors_.size())) {
                     cudaMemcpyAsync((char*) outputTensors_[j].data_ptr() + pos,
-                                    (char*) (char*) src +  j * realSize, realSize,
+                                    (char*) src +  j * realSize, realSize,
                                     cudaMemcpyDeviceToHost, stream);
                 }
             });
