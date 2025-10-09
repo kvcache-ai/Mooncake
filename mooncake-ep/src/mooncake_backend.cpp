@@ -352,8 +352,6 @@ void MooncakeBackend::shutdown() {
             cudaFree(recv_buffer_[i]);
         }
     }
-    store_->deleteKey("server_name_" + std::to_string(backendIndex_) + "_" +
-                std::to_string(rank_));
     --backendIndex_;
 }
 
@@ -430,5 +428,7 @@ void MooncakeBackend::syncMetadata(int size, int backendIndex) {
             store_->get_to_str("warmup_done_" + std::to_string(i));
         }
     }
+    store_->deleteKey("server_name_" + std::to_string(backendIndex) + "_" +
+                std::to_string(rank_));
 }
 }  // namespace mooncake
